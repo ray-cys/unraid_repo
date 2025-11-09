@@ -579,7 +579,13 @@ run_rsync() {
     last_status=${PIPESTATUS[0]}
 
     if [ -f "$tmp_rslog" ]; then
-      rsync_summaries["$label"]=$(parse_rsync_stats "$tmp_rslog" "$label") || rsync_summaries["$label"]="$label: no stats"
+      tmp_summary_file=$(mktemp /tmp/rsync_summary.XXXXXX)
+      if parse_rsync_stats "$tmp_rslog" "$label" > "$tmp_summary_file" 2>/dev/null; then
+        rsync_summaries["$label"]="$(cat "$tmp_summary_file")"
+      else
+        rsync_summaries["$label"]="$label: no stats"
+      fi
+      rm -f "$tmp_summary_file" 2>/dev/null || true
       ts=$(date +%Y%m%d_%H%M%S)
       safe_label=${label// /_}
       saved_copy="$preserved_raw_log_dir/rsync_raw_${safe_label}_${ts}"
