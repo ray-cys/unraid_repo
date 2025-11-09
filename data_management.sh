@@ -199,8 +199,56 @@ rename_patterns() {
   local patterns=("hhd800.com@" "gg5.co@" "-C_GG5" "ch")
 
   for pattern in "${patterns[@]}"; do
+    mapfile -d '' dirs < <(find "$dir" -not \( -path "$dir/incomplete" -prune \) -depth -type d -name "*${pattern}*" -print0 2>/dev/null)
+    local dcount=${#dirs[@]}
+    if [[ $dcount -gt 0 ]]; then
+      local total_dbytes=0
+      for ed in "${dirs[@]}"; do
+        ed="${ed%$'\0'}"
+        while IFS= read -r -d '' ff; do
+          total_dbytes=$((total_dbytes + $(filesize "$ff")))
+        done < <(find "$ed" -type f -print0 2>/dev/null)
+      done
+      log_info "Rename dirs: removing literal pattern '$pattern' from $dcount directories under $dir (total size: $(human_readable "$total_dbytes"))"
+
+      for d in "${dirs[@]}"; do
+        d="${d%$'\0'}"
+        local ddirpath dbase dnewbase dnewpath
+        ddirpath=$(dirname -- "$d")
+        dbase=$(basename -- "$d")
+        dnewbase="${dbase//${pattern}/}"
+        if [[ "$dnewbase" == "$dbase" ]]; then
+          continue
+        fi
+        dnewpath="$ddirpath/$dnewbase"
+
+        if [[ -e "$dnewpath" ]]; then
+          local i=1 candidate
+          while :; do
+            candidate="${dnewpath}.dup${i}"
+            if [[ ! -e "$candidate" ]]; then
+              dnewpath="$candidate"
+              break
+            fi
+            i=$((i+1))
+          done
+        fi
+
+        if mv -n -- "$d" "$dnewpath"; then
+          log_info "Rename directory: renamed '$d' -> '$dnewpath'"
+        else
+          log_warn "Rename directory: failed to rename '$d' -> '$dnewpath'"
+        fi
+      done
+      log_info "Rename directory: finished pattern '$pattern'"
+    else
+      log_info "Rename directory: no directories match pattern '$pattern' in $dir"
+    fi
+
+    # --- Rebuild file list after any directory moves ---
     mapfile -d '' files < <(find "$dir" -not \( -path "$dir/incomplete" -prune \) -type f -name "*${pattern}*" -print0 2>/dev/null)
     local count=${#files[@]}
+    
     if [[ $count -eq 0 ]]; then
       log_info "Rename files: no files match pattern '$pattern' in $dir"
       continue
