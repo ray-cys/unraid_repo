@@ -138,6 +138,32 @@ bytes_human() {
   fi
 }
 
+# Convert a human-readable size like "54.34T" or "18.74G bytes" -> integer bytes
+human_to_bytes() {
+  local s="$1"
+  # normalize: remove trailing 'bytes', commas
+  s=$(printf '%s' "$s" | sed -E 's/[[:space:]]*bytes$//I' | tr -d ',')
+  # parse number and optional unit
+  awk 'BEGIN{IGNORECASE=1}
+  {
+    if (match($0, /([0-9]+(\.[0-9]+)?)\s*([KMGTPE]?)/, a)) {
+      v = a[1] + 0
+      u = toupper(a[3])
+      mult = 1
+      if (u == "K") mult = 1024
+      else if (u == "M") mult = 1024^2
+      else if (u == "G") mult = 1024^3
+      else if (u == "T") mult = 1024^4
+      else if (u == "P") mult = 1024^5
+      printf("%.0f", v * mult)
+    } else if (match($0, /([0-9]+)/, b)) {
+      printf("%s", b[1])
+    } else {
+      print 0
+    }
+  }' <<<"$s"
+}
+
 # Returns human runtime string computed from start time
 format_runtime() {
   if [ -z "${start_time:-}" ]; then
@@ -355,11 +381,37 @@ parse_rsync_stats() {
   local total_bytes_sent=0
   local deletes=0
 
-  num_files_transferred=$(grep -i 'Number of files transferred' "$file" | tail -n1 | awk -F: '{gsub(/[^0-9]/,"",$2); print $2}' || echo 0)
-  total_file_size=$(grep -i 'Total file size' "$file" | tail -n1 | awk -F: '{gsub(/[^0-9]/,"",$2); print $2}' || echo 0)
-  total_transferred_size=$(grep -i 'Total transferred file size' "$file" | tail -n1 | awk -F: '{gsub(/[^0-9]/,"",$2); print $2}' || echo 0)
-  total_bytes_sent=$(grep -i 'Total bytes sent' "$file" | tail -n1 | awk -F: '{gsub(/[^0-9]/,"",$2); print $2}' || echo 0)
-  deletes=$(grep -E '^[[:space:]]*deleting ' "$file" | wc -l || echo 0)
+  # extract raw RHS strings, then convert
+  total_file_size_raw=$(grep -i 'Total file size' "$file" | tail -n1 | sed -E 's/^[^:]*:[[:space:]]*//')
+  total_file_size=$(human_to_bytes "$total_file_size_raw")
+
+  total_transferred_raw=$(grep -i 'Total transferred file size' "$file" | tail -n1 | sed -E 's/^[^:]*:[[:space:]]*//')
+  total_transferred_size=$(human_to_bytes "$total_transferred_raw")
+
+  total_bytes_sent_raw=$(grep -i 'Total bytes sent' "$file" | tail -n1 | sed -E 's/^[^:]*:[[:space:]]*//')
+  total_bytes_sent=$(human_to_bytes "$total_bytes_sent_raw")
+
+  # Files transferred: prefer explicit 'Number of regular files transferred' then fallback
+  num_files_transferred=$(grep -i -E 'Number of (regular )?files transferred' "$file" | tail -n1 | sed -E 's/^[^:]*:[[:space:]]*([0-9,]+).*/\1/' | tr -d ',' )
+  if [ -z "$num_files_transferred" ]; then
+    # try the summary 'Number of files:' which contains (reg: N)
+    line=$(grep -i '^Number of files:' "$file" | tail -n1 || true)
+    if [ -n "$line" ]; then
+      # extract 'reg: N' if present, else take the first number
+      if echo "$line" | grep -qi 'reg:'; then
+        num_files_transferred=$(echo "$line" | sed -E 's/.*reg:[[:space:]]*([0-9,]+).*/\1/' | tr -d ',')
+      else
+        num_files_transferred=$(echo "$line" | sed -E 's/^[^:]*:[[:space:]]*([0-9,]+).*/\1/' | tr -d ',')
+      fi
+    fi
+  fi
+
+  # Deletes: prefer the summary line
+  deletes=$(grep -i 'Number of deleted files' "$file" | tail -n1 | sed -E 's/^[^:]*:[[:space:]]*([0-9,]+).*/\1/' | tr -d ',' )
+  if [ -z "$deletes" ]; then
+    # fallback: count 'deleting ' lines
+    deletes=$(grep -E '^[[:space:]]*deleting ' "$file" | wc -l || echo 0)
+  fi
 
   num_files_transferred=${num_files_transferred:-0}
   total_file_size=${total_file_size:-0}
@@ -378,7 +430,7 @@ parse_rsync_stats() {
   rsync_bytes_sent["$label"]="$total_bytes_sent"
 
   if [ "$total_transferred_size" -gt 0 ] || [ "$num_files_transferred" -gt 0 ] || [ "$deletes" -gt 0 ]; then
-    printf '%s: %s sent %s, del %s' "$label" "$human_transferred" "$num_files_transferred" "$deletes"
+    printf '%s: %s transferred, files %s, del %s, sent %s' "$label" "$human_transferred" "$num_files_transferred" "$deletes" "$human_sent"
   else
     printf '%s: no stats' "$label"
   fi
