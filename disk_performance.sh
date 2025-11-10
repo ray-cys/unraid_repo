@@ -7,6 +7,7 @@
 # - notification rate limiting
 # - small log rotation
 
+
 set -euo pipefail
 
 # Config (tune these as needed)
@@ -38,11 +39,21 @@ NOTIFY_RATE_LIMIT=3600  # 1 hour
 # Rotation: max log size before rotate (bytes)
 LOG_MAX_BYTES=$((5 * 1024 * 1024))
 
-dry_run=false
-test_notify=false
+# Runtime mode flags — set here to follow repo style (no CLI flags)
+# Set to true for testing or dry-run behavior; leave false for production
+DRY_RUN=false
+TEST_NOTIFY=false
 
 timestamp(){ date '+%F %T'; }
 log(){ echo "$(timestamp) $*" >> "$LOG"; }
+
+# Locking to avoid concurrent runs (match repo pattern)
+LOCKFILE="/tmp/disk_performance.lock"
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+  log "Another disk_performance.sh run is active, exiting (lock: $LOCKFILE)"
+  exit 0
+fi
 
 rotate_log_if_needed(){
   if [ -f "$LOG" ] && [ $(stat -f%z "$LOG") -ge $LOG_MAX_BYTES ]; then
@@ -115,7 +126,7 @@ check_deps(){
   return 0
 }
 
-get_disks(){
+disks_ids(){
   # prefer by-id (stable), fall back to lsblk
   if [ -d /dev/disk/by-id ]; then
     (cd /dev/disk/by-id && for f in *; do [ -L "$f" ] || continue; readlink -f "$f"; done) | xargs -n1 basename | sort -u
@@ -124,21 +135,61 @@ get_disks(){
   fi
 }
 
-get_iostat_for_device(){
+iostat_for_device(){
   local dev="$1"
-  # iostat -x -p ALL interval count -> parse device lines
+  # iostat -x -p ALL interval count -> robustly parse columns by header name and average across samples
   out=$(iostat -x -p ALL $IOSTAT_INTERVAL $SAMPLE_COUNT 2>/dev/null || true)
   if [ -z "$out" ]; then
-    echo "NA NA"
+    echo "NA NA NA NA NA NA NA NA NA NA"
     return 0
   fi
-  # extract lines that start with device name
-  # fields vary; attempt to find avg r_await and w_await by column position
-  echo "$out" | awk -v dev="$dev" 'BEGIN{collect=0} /Device:/ {collect=1; next} collect && NF && $1==dev {print $0}' \
-    | awk '{r+=$10; w+=$11; c++} END{if(c>0) printf("%.3f %.3f\n", r/c, w/c); else print "NA NA"}'
+
+  echo "$out" | awk -v dev="$dev" '
+    BEGIN{
+      c=0; r_await_sum=0; w_await_sum=0; await_sum=0; svctm_sum=0; util_sum=0;
+      rkb_sum=0; wkb_sum=0; rps_sum=0; wps_sum=0; aqu_sum=0;
+      r_await_idx=w_await_idx=await_idx=svctm_idx=util_idx=0;
+      rkb_idx=wkb_idx=rps_idx=wps_idx=aqu_idx=0;
+    }
+    /^Device:/ {
+      for(i=1;i<=NF;i++){
+        h=$i; gsub(/%/,"",h);
+        if(h=="r_await") r_await_idx=i;
+        if(h=="w_await") w_await_idx=i;
+        if(h=="await") await_idx=i;
+        if(h=="svctm") svctm_idx=i;
+        # some iostat versions use "%util" or "%util"
+        if(h=="util" || h=="%util") util_idx=i;
+        if(h=="rkB/s"||h=="rkBs"||h=="rKB/s") rkb_idx=i;
+        if(h=="wkB/s"||h=="wkBs"||h=="wKB/s") wkb_idx=i;
+        if(h=="r/s"||h=="rps") rps_idx=i;
+        if(h=="w/s"||h=="wps") wps_idx=i;
+        if(h=="aqu-sz"||h=="aqu_sz") aqu_idx=i;
+      }
+      collect=1; next
+    }
+    collect && NF && $1==dev {
+      if(r_await_idx) r_await_sum += $(r_await_idx);
+      if(w_await_idx) w_await_sum += $(w_await_idx);
+      if(await_idx) await_sum += $(await_idx);
+      if(svctm_idx) svctm_sum += $(svctm_idx);
+      if(util_idx) util_sum += $(util_idx);
+      if(rkb_idx) rkb_sum += $(rkb_idx);
+      if(wkb_idx) wkb_sum += $(wkb_idx);
+      if(rps_idx) rps_sum += $(rps_idx);
+      if(wps_idx) wps_sum += $(wps_idx);
+      if(aqu_idx) aqu_sum += $(aqu_idx);
+      c++
+    }
+    END{
+      if(c>0) printf("%.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n",
+        r_await_sum/c, w_await_sum/c, await_sum/c, svctm_sum/c, util_sum/c,
+        rkb_sum/c, wkb_sum/c, rps_sum/c, wps_sum/c, aqu_sum/c);
+      else print "NA NA NA NA NA NA NA NA NA NA"
+    }'
 }
 
-get_smart_temp_crc(){
+smart_temp_crc(){
   local dev="$1"
   # Improve parsing robustness across devices
   smartctl -A "/dev/$dev" 2>/dev/null | awk '
@@ -163,29 +214,30 @@ main(){
     log "Created baseline file skeleton at $BASE"
   fi
 
-  for dev in $(get_disks); do
+  for dev in $(disks_ids); do
     [[ "$dev" =~ loop ]] && continue
 
-    io=$(get_iostat_for_device "$dev")
-    if [[ "$io" == "NA NA" ]]; then
+    io=$(iostat_for_device "$dev")
+    if [[ "$io" =~ ^NA ]]; then
       log "No iostat data for $dev; skipping"
       continue
     fi
-    read -r rlat wlat <<< "$io"
-    # choose the larger of read/write await
-    maxlat=$(awk -v r="$rlat" -v w="$wlat" 'BEGIN{print (r>w? r:w)}')
+  read -r read_await_ms write_await_ms await_ms svc_time_ms util_pct read_kb_s write_kb_s read_ops_s write_ops_s aq_sz <<< "$io"
+  # choose the larger of read/write await and overall await
+  maxlat=$(awk -v r="$read_await_ms" -v w="$write_await_ms" -v a="$await_ms" 'BEGIN{m=r; if(w>m) m=w; if(a>m) m=a; print m}')
 
-    read tmp crc <<< $(get_smart_temp_crc "$dev")
+  read tmp crc <<< $(smart_temp_crc "$dev")
     tmp=${tmp:-0}; crc=${crc:-0}
 
-    bl_lat=$(jq -r --arg d "$dev" '.[$d].latency // "null"' "$BASE")
-    bl_temp=$(jq -r --arg d "$dev" '.[$d].temp // "null"' "$BASE")
-    bl_crc=$(jq -r --arg d "$dev" '.[$d].crc // "null"' "$BASE")
+  bl_lat=$(jq -r --arg d "$dev" '.[$d].latency // "null"' "$BASE")
+  bl_temp=$(jq -r --arg d "$dev" '.[$d].temp // "null"' "$BASE")
+  bl_crc=$(jq -r --arg d "$dev" '.[$d].crc // "null"' "$BASE")
+  bl_util=$(jq -r --arg d "$dev" '.[$d].util // "null"' "$BASE")
 
     if [ "$bl_lat" == "null" ]; then
-      # initialize baseline with measured values
-      jq --arg d "$dev" --argjson lat "$maxlat" --argjson tmp "$tmp" --argjson crc "$crc" '.[$d] = {latency:$lat, temp:$tmp, crc:$crc, first_seen:now}' "$BASE" > "$BASE.tmp" && mv "$BASE.tmp" "$BASE"
-      log "Baseline created for $dev latency=${maxlat} temp=${tmp} crc=${crc}"
+      # initialize baseline with measured values (include util)
+  jq --arg d "$dev" --arg lat "$maxlat" --arg tmp "$tmp" --arg crc "$crc" --arg util "$util_pct" '.[$d] = {latency:(($lat)|try tonumber catch 0), temp:(($tmp)|try tonumber catch 0), crc:(($crc)|try tonumber catch 0), util:(($util)|try tonumber catch 0), first_seen:now}' "$BASE" > "$BASE.tmp" && mv "$BASE.tmp" "$BASE"
+      log "Baseline created for $dev latency=${maxlat} temp=${tmp} crc=${crc} util=${util_pct}"
       continue
     fi
 
@@ -219,7 +271,7 @@ main(){
 
     if [ -n "$warn_msgs" ]; then
       title="Disk performance warning: $dev"
-      body="Device: $dev\nLatency (ms): ${maxlat}\nBaseline latency: ${bl_lat}\nTemp: ${tmp}C\nCRC: ${crc} (baseline ${bl_crc})\nNotes: $warn_msgs\nSee $LOG"
+  body="Device: $dev\nLatency (ms): ${maxlat}\nBaseline latency: ${bl_lat}\nAwait: ${await_ms}ms (r=${read_await_ms} w=${write_await_ms})\nSvcTm: ${svc_time_ms}ms Util: ${util_pct}%\nRead KB/s: ${read_kb_s} Write KB/s: ${write_kb_s}\nTPS: r=${read_ops_s} w=${write_ops_s} Aqu: ${aq_sz}\nTemp: ${tmp}C\nCRC: ${crc} (baseline ${bl_crc})\nNotes: $warn_msgs\nSee $LOG"
       log "$title - $warn_msgs"
       send_notify "$title" "$body" "$ALERT_LEVEL_WARN" "$dev"
 
@@ -259,10 +311,10 @@ main(){
     alpha=0.02
     new_lat=$(awk -v b="$bl_lat" -v m="$maxlat" -v a="$alpha" 'BEGIN{print (b*(1-a)+m*a)}')
     new_temp=$(awk -v b="$bl_temp" -v t="$tmp" -v a="$alpha" 'BEGIN{print (b*(1-a)+t*a)}')
-    jq --arg d "$dev" --argjson lat "$new_lat" --argjson tmp "$new_temp" --argjson crc "$crc" '.[$d].latency=$lat | .[$d].temp=$tmp | .[$d].crc=$crc' "$BASE" > "$BASE.tmp" && mv "$BASE.tmp" "$BASE"
+  jq --arg d "$dev" --arg lat "$new_lat" --arg tmp "$new_temp" --arg crc "$crc" '.[$d].latency = (($lat)|try tonumber catch .[$d].latency) | .[$d].temp = (($tmp)|try tonumber catch .[$d].temp) | .[$d].crc = (($crc)|try tonumber catch .[$d].crc)' "$BASE" > "$BASE.tmp" && mv "$BASE.tmp" "$BASE"
   done
 
-  log "Disk perf check complete."
+  log "Disk performance check complete."
 }
 
 # argument parsing
