@@ -189,6 +189,27 @@ spin_up_device() {
         return 0
     fi
 
+    # If base_dev is part of an md device (e.g., /dev/md1p1 or /dev/md1), prefer spinning the member disks
+    if echo "$base_dev" | grep -Eq '^/dev/md[0-9]+' || [ -e "/sys/block/$(basename "$base_dev")/slaves" ]; then
+        # normalize md base (md1p1 -> md1)
+        mdname=$(basename "$base_dev" | sed -E 's/^(md[0-9]+).*/\1/')
+        if [ -d "/sys/block/$mdname/slaves" ]; then
+            for s in /sys/block/$mdname/slaves/*; do
+                [ -e "$s" ] || continue
+                slave_dev="/dev/$(basename "$s")"
+                log "spin_up_device: attempting hdparm spin on md slave $slave_dev"
+                # call recursively on the physical slave (short timeout)
+                spin_up_device "$slave_dev" 15 || true
+            done
+            # after attempting slaves, check parent device state
+            state=$(lsblk -n -o STATE "$base_dev" 2>/dev/null | tr -d '[:space:]' || true)
+            if [ -n "$state" ] && echo "$state" | grep -Ei 'running|active|online|ready' >/dev/null 2>&1; then
+                log "spin_up_device: $base_dev active after spinning slaves (state=$state)"
+                return 0
+            fi
+        fi
+    fi
+
     # Find hdparm binary explicitly to avoid PATH differences
     local hdparm_cmd
     hdparm_cmd=$(command -v hdparm || echo "/sbin/hdparm")
@@ -196,6 +217,10 @@ spin_up_device() {
         log "spin_up_device: hdparm not found at $hdparm_cmd"
         return 1
     fi
+
+    # Optional: allow falling back to sg_start for SCSI-attached devices (disabled by default)
+    USE_SGSTART=${USE_SGSTART:-NO}
+    sg_start_cmd=$(command -v sg_start 2>/dev/null || true)
 
     # Helper: get current power state via hdparm -C
     get_powstate() {
@@ -251,6 +276,23 @@ spin_up_device() {
     fi
 
     log "spin_up_device: failed to activate $base_dev after $retries attempts and ${timeout}s poll"
+    # If sg_start is available and allowed, try it for SCSI devices (useful for some HBAs)
+    if [ "$USE_SGSTART" = "YES" ] && [ -x "$sg_start_cmd" ]; then
+        log "spin_up_device: attempting sg_start on $base_dev"
+        $sg_start_cmd --start $base_dev >/dev/null 2>&1 || true
+        sleep 2
+        state=$(lsblk -n -o STATE "$base_dev" 2>/dev/null | tr -d '[:space:]' || true)
+        if [ -n "$state" ] && echo "$state" | grep -Ei 'running|active|online|ready' >/dev/null 2>&1; then
+            log "spin_up_device: sg_start succeeded for $base_dev (state=$state)"
+            return 0
+        fi
+    fi
+
+    # Capture recent kernel messages for debugging controller/backplane errors
+    if command -v dmesg >/dev/null 2>&1; then
+        log "spin_up_device: dmesg (last 40 lines) for context:"
+        dmesg | tail -n 40 | sed -e 's/^/    /'
+    fi
     return 1
 }
 
@@ -261,31 +303,44 @@ check_disk_smart() {
     local rc=0
     # Resolve md/mapper/lvm style top-level devices to underlying physical disks
     local targets=()
-    # If device looks like md device or device mapper, try to expand
-    if echo "$dev" | grep -Eq '/dev/(md|md[0-9]+|mapper|dm-)'; then
-        # list children from lsblk, then map partitions to parent disks
-        mapfile -t parts < <(lsblk -ln -o NAME -r "$dev" 2>/dev/null | awk '{print $1}' || true)
-        for p in "${parts[@]}"; do
-            # skip the top device itself
-            [ "$p" = "$(basename "$dev")" ] && continue
-            # Try to get parent (PKNAME) for a partition; PKNAME gives the disk name
-            parent=$(lsblk -n -o PKNAME "/dev/$p" 2>/dev/null | tr -d '[:space:]' || true)
-            if [ -n "$parent" ]; then
-                targets+=("/dev/$parent")
-            else
-                # fallback: if p itself looks like a disk name (sda, nvme0n1), use it
-                if echo "$p" | grep -Eq '^[a-z]+[0-9]*'; then
+    local bname
+    bname=$(basename "$dev")
+    # Handle md devices (including partitioned forms like md1p1)
+    if echo "$bname" | grep -Eq '^md[0-9]+'; then
+        local mdbase
+        mdbase=$(echo "$bname" | sed -E 's/^(md[0-9]+).*/\1/')
+        # Prefer sysfs slaves listing (reliable for md devices)
+        if [ -d "/sys/block/$mdbase/slaves" ]; then
+            for s in /sys/block/$mdbase/slaves/*; do
+                [ -e "$s" ] || continue
+                targets+=("/dev/$(basename "$s")")
+            done
+        else
+            # Fallback to lsblk child resolution
+            mapfile -t parts < <(lsblk -ln -o NAME -r "/dev/$mdbase" 2>/dev/null | awk '{print $1}' || true)
+            for p in "${parts[@]}"; do
+                [ "$p" = "$mdbase" ] && continue
+                parent=$(lsblk -n -o PKNAME "/dev/$p" 2>/dev/null | tr -d '[:space:]' || true)
+                if [ -n "$parent" ]; then
+                    targets+=("/dev/$parent")
+                else
                     targets+=("/dev/$p")
                 fi
-            fi
-        done
-        # dedupe targets
-        if [ ${#targets[@]} -gt 0 ]; then
-            IFS=$'\n' read -r -d '' -a targets < <(printf "%s\n" "${targets[@]}" | awk '!x[$0]++' && printf '\0')
+            done
         fi
     fi
+    # Map device-mapper / mapper / dm- devices via lsblk
+    if [ ${#targets[@]} -eq 0 ] && echo "$dev" | grep -Eq '/dev/mapper|/dev/dm-'; then
+        mapfile -t parts < <(lsblk -ln -o NAME,TYPE "$dev" 2>/dev/null | awk '$2=="disk"{print $1}' || true)
+        for p in "${parts[@]}"; do
+            targets+=("/dev/$p")
+        done
+    fi
+    # Final fallback: if no targets found, strip partition suffix (sda1 -> sda) and act on base device
     if [ ${#targets[@]} -eq 0 ]; then
-        targets=("$dev")
+        local base_dev
+        base_dev=$(echo "$dev" | sed -E 's/p?[0-9]+$//')
+        targets=("$base_dev")
     fi
     # Probe sequence: try default, then common -d options
     local probes=("" "-d sat" "-d ata" "-d scsi")
