@@ -13,38 +13,34 @@ clearLog=false
 # --------------------------------------------------------------------------------
 # SETTINGS
 
-POOLS=(/mnt/cache)                    # explicit list of btrfs pools to snapshot, enter directory with spaces for multiple
-SHARES=("appdata" "domains" "system") # list of shares (subvolumes) to snapshot per pool
-AUTO_DISCOVER_POOLS=false             # set true to auto-discover all mounted btrfs filesystems
-EXCLUDE_POOLS=()                      # exact mountpoints to exclude
-EXCLUDE_PATTERNS=(                    # regex patterns to exclude
-  '^/var/lib/docker'
-  '^/var/lib/libvirt'
-  '^/mnt/removable'
-  '^/mnt/user/system'
-  '^/boot'
-  '^/run'
-  '^/tmp'
-)
-SNAPSHOT_USAGE_WARN_PCT=20           # warn if snapshots exceed % of pool
-SNAPSHOT_USAGE_CRITICAL_PCT=75       # percent threshold for CRITICAL
-SNAPSHOT_USAGE_WARNING_PCT=55        # percent threshold for WARNING
-FORCE_PRUNE_FREE_GB=300              # force prune if free < X GB
-RESCAN_IF_QGROUPS_ENABLED=true       # if true, run a quota rescan even when qgroups already enabled
-MIN_SNAPSHOTS_KEEP=3                 # minimum number of snapshots to keep
-DEFAULT_KEEP_RAID1=14                # default snapshots to keep for RAID1
-DEFAULT_KEEP_SINGLE=7                # default snapshots to keep for single disk
-DEFAULT_KEEP_RAID0=5                 # default snapshots to keep for RAID0
-STOP_DOCKER_VMS=false                # set true to stopping Docker/VMs
-NOTIFY_ICON="normal"                 # notification icon
-REQUIRE_PHYSICAL_FOR_CRITICAL=true   # if true, only trigger CRITICAL when qgroup (physical) totals are available
-SUPPRESS_LOGICAL_WARNINGS=true       # if true, do not warn/critical on logical-only totals unless free space is low
+POOLS=(/mnt/cache)                    # List of BTRFS pools to snapshot, enter directory with spaces for multiple
+SHARES=("appdata" "domains" "system") # List of shares (subvolumes) to snapshot per pool
+SNAPSHOT_USAGE_WARN_PCT=20            # Warn if snapshots exceed % of pool
+SNAPSHOT_USAGE_CRITICAL_PCT=90        # Percent threshold for CRITICAL
+SNAPSHOT_USAGE_WARNING_PCT=65         # Percent threshold for WARNING
+FORCE_PRUNE_FREE_GB=300               # Force prune if free < X GB
+MIN_SNAPSHOTS_KEEP=1                  # Minimum number of snapshots to keep
+DEFAULT_KEEP_RAID1=5                  # Default snapshots to keep for RAID1
+DEFAULT_KEEP_SINGLE=3                 # Default snapshots to keep for single disk
+DEFAULT_KEEP_RAID0=2                  # Default snapshots to keep for RAID0
+STOP_DOCKER_VMS=false                 # Set true to stopping Docker/VMs
+SUPPRESS_LOGICAL_WARNINGS=true        # If true, do not warn/critical on logical-only totals unless free space is low
+LOG_LEVEL="INFO"                      # INFO (default) or DEBUG for verbose per-snapshot logs
+SEND_THROTTLE="200m"                  # pv throttle limit for streamed sends (empty = no throttle)
 
 # --------------------------------------------------------------------------------
 
 # Logging function
 timestamp() { date +"%Y-%m-%d_%H-%M-%S"; }
 log() { echo "[$(timestamp)] $*"; }
+
+# Logging helpers
+log_info() { echo "[$(timestamp)] $*"; }
+log_debug() {
+  if [ "${LOG_LEVEL:-INFO}" = "DEBUG" ]; then
+    echo "[$(timestamp)] DEBUG: $*"
+  fi
+}
 
 # Human-readable bytes helper used in debug logging. Uses numfmt if available.
 bytes_human() {
@@ -78,62 +74,97 @@ human_to_bytes() {
   }'
 }
 
-# Ensure btrfs qgroups (quota) are enabled for a list of pools and run a rescan with progress logging.
-ensure_qgroups_enabled_for_pools() {
-  local pool rc
+# Helper: get pool-level usage using btrfs filesystem df
+get_pool_usage() {
+  local pool="$1"
+  local alloc=0 avail=0
+  if command -v btrfs >/dev/null 2>&1; then
+    out=$(btrfs filesystem df -b "$pool" 2>/dev/null || true)
+    if [ -n "$out" ]; then
+      alloc=$(printf '%s' "$out" | awk -F"[ =,]+" '/Data,/ {for(i=1;i<=NF;i++) if($i=="used") {print $(i+1); exit}}' || true)
+      meta=$(printf '%s' "$out" | awk -F"[ =,]+" '/Metadata,/ {for(i=1;i<=NF;i++) if($i=="used") {print $(i+1); exit}}' || true)
+      if [ -n "$meta" ] && [ -n "$alloc" ]; then
+        alloc=$((alloc + meta))
+      elif [ -z "$alloc" ] && [ -n "$meta" ]; then
+        alloc=$meta
+      fi
+    fi
+  fi
+  if [ -z "$alloc" ] || [ "$alloc" -eq 0 ]; then
+    alloc=0
+  fi
+  if [ -d "$pool" ]; then
+    avail=$(df -B1 "$pool" 2>/dev/null | awk 'NR==2 {gsub(/,/,""); print $4}' || echo 0)
+  fi
+  printf '%s %s' "$alloc" "$avail"
+}
+
+# Helper: best-effort physical bytes used by a snapshot path
+get_snapshot_physical_bytes() {
+  local snap="$1"
+  if command -v btrfs >/dev/null 2>&1; then
+    out=$(btrfs filesystem du -s -b "$snap" 2>/dev/null || true)
+    if [ -n "$out" ]; then
+      bytes=$(printf '%s' "$out" | awk '/Exclusive:/ {for(i=1;i<=NF;i++) if($i ~ /^[0-9]+$/) {print $i; exit}}')
+      if [ -n "$bytes" ]; then
+        printf '%s' "$bytes"
+        return 0
+      fi
+      bytes=$(printf '%s' "$out" | awk '/Total:/ {for(i=1;i<=NF;i++) if($i ~ /^[0-9]+$/) {print $i; exit}}')
+      if [ -n "$bytes" ]; then
+        printf '%s' "$bytes"
+        return 0
+      fi
+    fi
+  fi
+  if command -v du >/dev/null 2>&1; then
+    du -sB1 "$snap" 2>/dev/null | awk '{print $1}' || echo 0
+    return 0
+  fi
+  echo 0
+}
+
+# Helper: estimate send-stream size between parent and snapshot
+estimate_send_size() {
+  local parent="$1" snap="$2"
+  local cmd_bytes=0
   if ! command -v btrfs >/dev/null 2>&1; then
-    log "BTRFS binary not found; skipping qgroup enable/rescan"
+    echo 0; return 0
+  fi
+
+  # Build the send command with optional parent
+  if [ -n "$parent" ]; then
+    send_cmd=(btrfs send -p "$parent" "$snap")
+  else
+    send_cmd=(btrfs send "$snap")
+  fi
+
+  # If SEND_THROTTLE is set and pv is available, use it to throttle the stream
+  if [ -n "${SEND_THROTTLE:-}" ] && command -v pv >/dev/null 2>&1; then
+    if ! cmd_out=$("${send_cmd[@]}" 2>/dev/null | pv -q -L "$SEND_THROTTLE" | wc -c); then
+      cmd_bytes=0
+    else
+      cmd_bytes=${cmd_out:-0}
+    fi
+  else
+    if ! cmd_out=$("${send_cmd[@]}" 2>/dev/null | wc -c); then
+      cmd_bytes=0
+    else
+      cmd_bytes=${cmd_out:-0}
+    fi
+  fi
+
+  # If the send-based measurement failed or returned zero, fall back to du
+  if ! printf '%s' "$cmd_bytes" | grep -Eq '^[0-9]+$' || [ "$cmd_bytes" -le 0 ]; then
+    if command -v du >/dev/null 2>&1; then
+      du -sB1 "$snap" 2>/dev/null | awk '{print $1}' || echo 0
+      return 0
+    fi
+    echo 0
     return 0
   fi
 
-  for pool in "$@"; do
-    [ -n "$pool" ] || continue
-    if [ ! -d "$pool" ]; then
-      log "Pool $pool not mounted or path missing; skipping"
-      continue
-    fi
-
-    # Detect current qgroup state
-    if btrfs qgroup show "$pool" >/dev/null 2>&1; then
-        log "Metadata quota accounting already enabled on $pool"
-        if [ "$RESCAN_IF_QGROUPS_ENABLED" = true ]; then
-          log "Rescanning metadata quota accounting on $pool"
-          btrfs quota rescan -w "$pool" 2>&1 | while IFS= read -r _line; do
-            log "BTRFS $_line"
-          done
-        rc=${PIPESTATUS[0]:-1}
-        if [ "$rc" -ne 0 ]; then
-          log "BTRFS metadata rescan failed on $pool (rc=$rc). Physical qgroup sizes may be stale."
-        else
-          log "BTRFS metadata rescan completed for $pool"
-        fi
-      fi
-      continue
-    fi
-
-  log "Quota accounting not enabled on $pool — enabling quota subsystem"
-    # Run enable and stream any output to the log
-    btrfs quota enable "$pool" 2>&1 | while IFS= read -r _line; do
-      log "quota-enable: $_line"
-    done
-    rc=${PIPESTATUS[0]:-1}
-    if [ "$rc" -ne 0 ]; then
-      log "Failed to enable qgroups on $pool (rc=$rc); continuing without qgroups for this pool"
-      continue
-    fi
-
-  log "Starting BTRFS metadata rescan on $pool (this can take a long time). Progress will be logged."
-    # Stream progress lines into the log while preserving the rescan exit code
-    btrfs quota rescan -w "$pool" 2>&1 | while IFS= read -r _line; do
-      log "qgroup-rescan: $_line"
-    done
-    rc=${PIPESTATUS[0]:-1}
-    if [ "$rc" -ne 0 ]; then
-      log "BTRFS metadata rescan failed on $pool (rc=$rc). The script will continue but physical qgroup sizes may be missing."
-    else
-      log "BTRFS metadata rescan completed for $pool"
-    fi
-  done
+  printf '%s' "$cmd_bytes"
 }
 
 # Stop Docker & VMs if enabled
@@ -152,33 +183,6 @@ fi
 DATE=$(timestamp)
 START_TS=$(date +%s)
 
-# Determine POOLS to process
-if [ "$AUTO_DISCOVER_POOLS" = true ]; then
-  mapfile -t _DISCOVERED_POOLS < <(findmnt -t btrfs -n -o TARGET || true)
-  POOLS=()
-  for _p in "${_DISCOVERED_POOLS[@]}"; do
-    skip=false
-    for ex in "${EXCLUDE_POOLS[@]}"; do
-      if [ "$_p" = "$ex" ]; then
-        skip=true
-        break
-      fi
-    done
-    [ "$skip" = true ] && continue
-
-    for pat in "${EXCLUDE_PATTERNS[@]}"; do
-      if printf '%s\n' "$_p" | grep -Eq "$pat"; then
-        skip=true
-        break
-      fi
-    done
-    [ "$skip" = true ] && continue
-
-    POOLS+=("$_p")
-  done
-  log "Autodiscover: discovered ${#_DISCOVERED_POOLS[@]} btrfs mount(s), using ${#POOLS[@]} after filtering"
-fi
-
 for POOL in "${POOLS[@]}"; do
   [ -d "$POOL" ] || { log "Pool $POOL not found, skipping"; continue; }
   POOL_SNAP_BASE="$POOL/.snapshots"
@@ -189,7 +193,7 @@ for POOL in "${POOLS[@]}"; do
   RAID_TYPE=$(btrfs fi df "$POOL" 2>/dev/null | grep -m1 "Data," | awk -F',' '{print $2}' | awk '{print tolower($1)}')
   RAID_TYPE=${RAID_TYPE%:}
   RAID_TYPE=${RAID_TYPE:-unknown}
-  log "Pool $POOL detected RAID type: $RAID_TYPE"
+  log "Pool $POOL: Detected RAID = $RAID_TYPE"
 
   # Compute pool size/avail in GB
   POOL_SIZE_BYTES=$(df -B1 "$POOL" | awk 'NR==2 {gsub(/,/,""); print $2}')
@@ -197,9 +201,9 @@ for POOL in "${POOLS[@]}"; do
   POOL_SIZE=$(( POOL_SIZE_BYTES / 1024 / 1024 / 1024 ))
   POOL_AVAIL=$(( POOL_AVAIL_BYTES / 1024 / 1024 / 1024 ))
   FREE_PCT=$(( POOL_AVAIL * 100 / (POOL_SIZE>0?POOL_SIZE:1) ))
-  log "Pool $POOL size ${POOL_SIZE}G, avail ${POOL_AVAIL}G (${FREE_PCT}% free)"
+  log "Pool $POOL: Pool size ${POOL_SIZE}G, available ${POOL_AVAIL}G (${FREE_PCT}% free)"
 
-  # Determine SNAPSHOTS_TO_KEEP per pool (reuse existing logic)
+  # Determine snapshots to keep per pool
   case "$RAID_TYPE" in
     *raid1*) KEEP_DEFAULT=$DEFAULT_KEEP_RAID1 ;;
     *raid0*) KEEP_DEFAULT=$DEFAULT_KEEP_RAID0 ;;
@@ -216,7 +220,7 @@ for POOL in "${POOLS[@]}"; do
     SNAPSHOTS_TO_KEEP=$KEEP_DEFAULT
   fi
   (( SNAPSHOTS_TO_KEEP < MIN_SNAPSHOTS_KEEP )) && SNAPSHOTS_TO_KEEP=$MIN_SNAPSHOTS_KEEP
-  log "Pool $POOL retention policy: keep last ${SNAPSHOTS_TO_KEEP} snapshots per share"
+  log "Pool $POOL: Retained last ${SNAPSHOTS_TO_KEEP} snapshots per shares"
   POOL_KEEP+=("$SNAPSHOTS_TO_KEEP")
 
   for SHARE in "${SHARES[@]}"; do
@@ -241,9 +245,15 @@ for POOL in "${POOLS[@]}"; do
       log "Pool $POOL: ERROR: Snapshot failed for $SHARE"
       continue
     fi
-
-    # Prune old snapshots — prefer deleting oldest by btrfs creation time, fall back to mtime
-    mapfile -d $'\0' snaps < <(find "$POOL_SNAP_BASE/$SHARE" -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null || true)
+  done
+  
+  # Default: prune per-share (retain SNAPSHOTS_TO_KEEP per share)
+  for SHARE in "${SHARES[@]}"; do
+    share_dir="$POOL_SNAP_BASE/$SHARE"
+    if [ ! -d "$share_dir" ]; then
+      continue
+    fi
+    mapfile -d $'\0' snaps < <(find "$share_dir" -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null || true)
     num_snaps=${#snaps[@]}
     if [ "$num_snaps" -gt "$SNAPSHOTS_TO_KEEP" ]; then
       to_delete=$(( num_snaps - SNAPSHOTS_TO_KEEP ))
@@ -264,8 +274,6 @@ for POOL in "${POOLS[@]}"; do
         fi
         entries+=("${mtime}|${s}")
       done
-
-      # Sort entries (oldest first) and delete the oldest snapshots
       IFS=$'\n' sorted=( $(printf '%s\n' "${entries[@]}" | sort -n) )
       unset IFS
       i=0
@@ -289,9 +297,6 @@ for POOL in "${POOLS[@]}"; do
   done
 done
 
-# Ensure qgroups are enabled and rescanned for all pools before starting snapshots creation.
-ensure_qgroups_enabled_for_pools "${POOLS[@]}"
-
 # Restart Docker & VMs if stopped
 if [ "$STOP_DOCKER_VMS" = true ]; then
   if ! docker info &>/dev/null; then
@@ -309,6 +314,10 @@ TOTAL_SNAP_BYTES=0
 TOTAL_POOL_BYTES=0
 TOTAL_POOL_AVAIL_BYTES=0
 declare -A POOL_SNAP_PHYS_BYTES
+declare -A POOL_MATCHED_COUNT
+declare -A POOL_DU_COUNT
+declare -A POOL_MATCHED_PHYS_BYTES
+declare -A POOL_MATCHED_DU_BYTES
 for POOL in "${POOLS[@]}"; do
   POOL_SNAP_BASE="$POOL/.snapshots"
   if [ -d "$POOL_SNAP_BASE" ]; then
@@ -317,114 +326,71 @@ for POOL in "${POOLS[@]}"; do
     p_snap_bytes=0
   fi
   p_pool_bytes=$(df -B1 "$POOL" 2>/dev/null | awk 'NR==2 {gsub(/,/,""); print $2}' || echo 0)
-  p_pool_avail=$(df -B1 "$POOL" 2>/dev/null | awk 'NR==2 {gsub(/,/,""); print $4}' || echo 0)
-
-# Attempt to get physical snapshot usage via btrfs qgroup (exclusive bytes)
-p_snap_phys_bytes=0
-if command -v btrfs >/dev/null 2>&1; then
-  if btrfs qgroup show "$POOL" >/dev/null 2>&1; then
-    qout=$(btrfs qgroup show -p "$POOL" 2>/dev/null || true)
-
-    # Build a map of path->exclusive_bytes from qout (handles human units)
-    declare -A QPATH_EXCL
-    while IFS= read -r _line; do
-      # Skip header or empty lines
-      [ -z "$_line" ] && continue
-      case "$_line" in
-        Qgroupid*|--------*) continue ;;
-      esac
-      path_field=$(printf '%s' "$_line" | awk '{print $NF}')
-      excl_field=$(printf '%s' "$_line" | awk '{print $3}')
-      excl_bytes=$(human_to_bytes "$excl_field" 2>/dev/null || echo 0)
-      QPATH_EXCL["$path_field"]=$excl_bytes
-    done <<EOF
-${qout}
-EOF
-
-    # Find snapshots under the pool snap base (share/timestamp dirs).
-    mapfile -d $'\0' _snaps < <(find "$POOL_SNAP_BASE" -mindepth 2 -maxdepth 2 -type d -print0 2>/dev/null || true)
-    filtered_snaps=()
-    for snap in "${_snaps[@]:-}"; do
-      [ -n "$snap" ] || continue
-      if btrfs subvolume show "$snap" >/dev/null 2>&1; then
-        filtered_snaps+=("$snap")
-      else
-        :
-      fi
-    done
-
-    # Counters for summary
-    matched_count=0; du_count=0; matched_qgroup_bytes=0; matched_du_bytes=0
-
-    for snap in "${filtered_snaps[@]:-}"; do
-      [ -n "$snap" ] || continue
-      subvol_id=$(btrfs subvolume show "$snap" 2>/dev/null | awk -F: '/Subvolume ID/ {gsub(/ /,"",$2); print $2; exit}' || true)
-
-      matched=0
-      match_method=""
-      excl_bytes=0
-
-      if [ -n "$subvol_id" ]; then
-        qline=$(printf '%s
-' "$qout" | awk -v id="$subvol_id" '$1==("0/"id){print $0; exit}' || true)
-        if [ -n "$qline" ]; then
-          excl_field=$(printf '%s' "$qline" | awk '{print $3}' || echo 0)
-          excl_bytes=$(human_to_bytes "$excl_field" 2>/dev/null || echo 0)
-          matched=1; match_method="id"
-        fi
-      fi
-
-      # Try match by path (last field) — use relative path under pool (strip leading pool/)
-      if [ $matched -eq 0 ]; then
-        snap_rel=${snap#"$POOL"/}
-        for k in "${!QPATH_EXCL[@]}"; do
-          if [ "$k" = "$snap_rel" ] || printf '%s' "$k" | grep -qE "/${snap_rel}$"; then
-            excl_bytes=${QPATH_EXCL[$k]}
-            matched=1; match_method="path"
-            break
-          fi
-        done
-      fi
-
-      # If still not matched, try basename match on the last path component (timestamp)
-      if [ $matched -eq 0 ]; then
-        snap_base=$(basename "$snap")
-        for k in "${!QPATH_EXCL[@]}"; do
-          if [ "$(basename "$k")" = "$snap_base" ]; then
-            excl_bytes=${QPATH_EXCL[$k]}
-            matched=1; match_method="basename"
-            break
-          fi
-        done
-      fi
-
-      if [ $matched -eq 1 ] && [[ "$excl_bytes" =~ ^[0-9]+$ ]] && [ "$excl_bytes" -gt 0 ]; then
-        p_snap_phys_bytes=$(( p_snap_phys_bytes + excl_bytes ))
-        matched_count=$((matched_count+1))
-        matched_qgroup_bytes=$((matched_qgroup_bytes + excl_bytes))
-      fi
-    done
-
-    # If found nothing via qgroups (phys=0) optionally fall back to btrfs filesystem du per-snapshot
-    if [ "$p_snap_phys_bytes" -eq 0 ]; then
-      log "No quota accounting matched snapshots on $POOL; using slow per-snapshot scan for physical usage"
-      for snap in "${filtered_snaps[@]:-}"; do
-        [ -n "$snap" ] || continue
-        du_out=$(btrfs filesystem du -s -B1 "$snap" 2>/dev/null || true)
-        du_excl=$(printf '%s' "$du_out" | awk '/Exclusive/ {print $2; exit}' || true)
-        if [ -z "$du_excl" ]; then
-          du_excl=$(printf '%s' "$du_out" | awk 'match($0, /([0-9]+)/,m){print m[1]; exit}' || true)
-        fi
-        du_excl=${du_excl//,/}
-        if [[ "$du_excl" =~ ^[0-9]+$ ]] && [ "$du_excl" -gt 0 ]; then
-          p_snap_phys_bytes=$(( p_snap_phys_bytes + du_excl ))
-          du_count=$((du_count+1))
-          matched_du_bytes=$((matched_du_bytes + du_excl))
-        fi
-      done
-    fi
+  p_pool_avail=$(df -B1 "$POOL" 2>/dev/null | awk 'NR==2 {gsub(/,/,"" ); print $4}' || echo 0)
+  p_snap_phys_bytes=0
+  matched_count=0; du_count=0; matched_phys_bytes=0; matched_du_bytes=0
+  p_pct_est_trigger=0
+  if [ "$p_pool_bytes" -gt 0 ]; then
+    p_pct_est_trigger=$(( p_snap_bytes * 100 / p_pool_bytes ))
   fi
-fi
+  allow_estimate=true
+
+  # Process snapshots per-share so parent-based estimates are computed within the same share
+  for SHARE in "${SHARES[@]}"; do
+    share_snap_dir="$POOL_SNAP_BASE/$SHARE"
+    if [ ! -d "$share_snap_dir" ]; then
+      continue
+    fi
+    mapfile -d $'\0' share_snaps < <(find "$share_snap_dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null || true)
+    j=0
+    for snap in "${share_snaps[@]:-}"; do
+      [ -n "$snap" ] || { j=$((j+1)); continue; }
+      if command -v btrfs >/dev/null 2>&1 && ! btrfs subvolume show "$snap" >/dev/null 2>&1; then
+        j=$((j+1)); continue
+      fi
+      phys=$(get_snapshot_physical_bytes "$snap" 2>/dev/null || echo 0)
+      phys=${phys:-0}
+      if printf '%s' "$phys" | grep -Eq '^[0-9]+$' && [ "$phys" -gt 0 ]; then
+        p_snap_phys_bytes=$(( p_snap_phys_bytes + phys ))
+        matched_count=$((matched_count+1))
+        matched_phys_bytes=$((matched_phys_bytes + phys))
+        log_debug "$snap method=filesystem_du bytes=$phys"
+      else
+        if [ "$allow_estimate" = true ]; then
+          parent=""
+          if [ "$j" -gt 0 ]; then
+            parent=${share_snaps[$((j-1))]}
+          fi
+          est=$(estimate_send_size "$parent" "$snap" 2>/dev/null || echo 0)
+          est=${est:-0}
+          if printf '%s' "$est" | grep -Eq '^[0-9]+$' && [ "$est" -gt 0 ]; then
+            p_snap_phys_bytes=$(( p_snap_phys_bytes + est ))
+            matched_count=$((matched_count+1))
+            matched_phys_bytes=$((matched_phys_bytes + est))
+            log_debug "$snap method=send_estimate parent=$(basename "$parent") bytes=$est"
+            j=$((j+1))
+            continue
+          fi
+        fi
+        duv=$(du -sB1 "$snap" 2>/dev/null | awk '{print $1}' || echo 0)
+        duv=${duv:-0}
+        if [ "$duv" -gt 0 ]; then
+          p_snap_phys_bytes=$(( p_snap_phys_bytes + duv ))
+          du_count=$((du_count+1))
+          matched_du_bytes=$((matched_du_bytes + duv))
+          log_debug "$snap method=du bytes=$duv"
+        fi
+      fi
+      j=$((j+1))
+    done
+  done
+
+  # Store per-pool counters for later reporting
+  POOL_SNAP_PHYS_BYTES["$POOL"]=$p_snap_phys_bytes
+  POOL_MATCHED_COUNT["$POOL"]=$matched_count
+  POOL_DU_COUNT["$POOL"]=$du_count
+  POOL_MATCHED_PHYS_BYTES["$POOL"]=$matched_phys_bytes
+  POOL_MATCHED_DU_BYTES["$POOL"]=$matched_du_bytes
 
   TOTAL_SNAP_BYTES=$(( TOTAL_SNAP_BYTES + p_snap_bytes ))
   TOTAL_SNAP_PHYS_BYTES=$(( ${TOTAL_SNAP_PHYS_BYTES:-0} + p_snap_phys_bytes ))
@@ -439,8 +405,14 @@ TOTAL_POOL_AVAIL_GB=$(awk -v b="$TOTAL_POOL_AVAIL_BYTES" 'BEGIN{printf "%.0f", b
 
 if [ "$TOTAL_POOL_BYTES" -gt 0 ]; then
   if [ -n "${TOTAL_SNAP_PHYS_BYTES:-}" ] && [ "${TOTAL_SNAP_PHYS_BYTES:-0}" -gt 0 ]; then
-    TOTAL_SNAP_PCT=$(( TOTAL_SNAP_PHYS_BYTES * 100 / TOTAL_POOL_BYTES ))
-    USED_MODE="physical"
+    if [ "${TOTAL_SNAP_PHYS_BYTES:-0}" -gt "$TOTAL_POOL_BYTES" ] && [ "${SUPPRESS_LOGICAL_WARNINGS:-true}" = "true" ] && [ "$TOTAL_POOL_AVAIL_GB" -gt "$FORCE_PRUNE_FREE_GB" ]; then
+      TOTAL_SNAP_PCT=$(( TOTAL_SNAP_BYTES * 100 / TOTAL_POOL_BYTES ))
+      USED_MODE="logical"
+      LOGICAL_SUPPRESSED=1
+    else
+      TOTAL_SNAP_PCT=$(( TOTAL_SNAP_PHYS_BYTES * 100 / TOTAL_POOL_BYTES ))
+      USED_MODE="physical"
+    fi
   else
     TOTAL_SNAP_PCT=$(( TOTAL_SNAP_BYTES * 100 / TOTAL_POOL_BYTES ))
     USED_MODE="logical"
@@ -461,18 +433,10 @@ fi
 if [ "${OVERCOUNT_WARNING:-0}" -eq 1 ]; then
   notify_body+=$'\n\nNote: total snapshot size exceeded pool capacity when summing logical snapshot sizes.'
   notify_body+=$'\nThis often happens because shared data between snapshots is counted multiple times.'
-  notify_body+=$'\nEnable BTRFS qgroups (quota) and use btrfs qgroup or btrfs filesystem du to get physical usage per subvolume.'
+  notify_body+=$'\nUse `btrfs filesystem du` or `btrfs send` (streaming parent-based) for per-subvolume physical usage; `du` is a logical fallback.'
 fi
 
-# If logical snapshot totals exceed pool size (shared extents counted multiple times) cap displayed percentage at 100% and mark a warning
-if [ "$TOTAL_SNAP_PCT" -gt 100 ]; then
-  OVERCOUNT_WARNING=1
-  TOTAL_SNAP_PCT=100
-else
-  OVERCOUNT_WARNING=0
-fi
-
-log "Snapshots occupy ${TOTAL_SNAP_GB}G (${TOTAL_SNAP_PCT}% of configured pools total ${TOTAL_POOL_GB}G, ${TOTAL_POOL_AVAIL_GB}G free)."
+log "Snapshots: Occupy ${TOTAL_SNAP_GB}G (${TOTAL_SNAP_PCT}% of configured pools total ${TOTAL_POOL_GB}G, ${TOTAL_POOL_AVAIL_GB}G free)."
 
 # Build per-pool breakdown
 POOL_LINES=()
@@ -509,23 +473,20 @@ for POOL in "${POOLS[@]}"; do
     p_overcount=1
     p_pct=100
   fi
-  summary_parts=()
-  if [ "$matched_count" -gt 0 ]; then
-    summary_parts+=("${matched_count} snaps via metadata scans: $(bytes_human ${matched_qgroup_bytes:-0})")
+  num_snaps=0
+  if [ -d "$POOL_SNAP_BASE" ]; then
+    num_snaps=$(find "$POOL_SNAP_BASE" -mindepth 1 -maxdepth 2 -type d 2>/dev/null | wc -l || echo 0)
   fi
-  if [ "$du_count" -gt 0 ]; then
-    summary_parts+=("${du_count} snaps via slow scan: $(bytes_human ${matched_du_bytes:-0})")
-  fi
-  if [ ${#summary_parts[@]} -gt 0 ]; then
-    log "Snapshot for $POOL: ${summary_parts[*]} — total physical: $(bytes_human ${p_snap_phys_bytes:-0})"
+  if [ "$p_snap_phys_bytes" -gt 0 ]; then
+    log "Pool $POOL: Snapshots physical total: $(bytes_human ${p_snap_phys_bytes}) across ${num_snaps} snapshots"
   else
-    log "Snapshot for $POOL: no physical metadata available; logical total: $(bytes_human ${p_snap_bytes:-0})"
+    log "Pool $POOL: Snapshot physical accounting unavailable; logical total: $(bytes_human ${p_snap_bytes:-0}) across ${num_snaps} snapshots (may overcount shared data)"
   fi
 p_snap_gb=$(awk -v b="$p_snap_bytes" 'BEGIN{printf "%.0f", b/1024/1024/1024}')
 p_emoji="✅"
   if [ "$p_pct" -ge "$SNAPSHOT_USAGE_CRITICAL_PCT" ]; then
-    if [ "$p_snap_phys_bytes" -gt 0 ] || [ "$REQUIRE_PHYSICAL_FOR_CRITICAL" = false ]; then
-      p_emoji="⛔"
+      if [ "$p_snap_phys_bytes" -gt 0 ]; then
+        p_emoji="⛔"
     else
       p_emoji="⚠️"
     fi
@@ -536,7 +497,7 @@ p_emoji="✅"
 # Include physical/logical note if physical data present
   if [ "$p_snap_phys_bytes" -gt 0 ]; then
     p_snap_phys_gb=$(awk -v b="$p_snap_phys_bytes" 'BEGIN{printf "%.0f", b/1024/1024/1024}')
-    line_text="$p_emoji $POOL — ${p_snap_phys_gb}G phys / ${p_snap_gb}G logical (${p_pct}%)"
+    line_text="$p_emoji $POOL — ${p_snap_phys_gb}G physical / ${p_snap_gb}G logical (${p_pct}%)"
   else
     line_text="$p_emoji $POOL — ${p_snap_gb}G (${p_pct}%)"
     if [ "$p_overcount" -eq 1 ]; then
@@ -551,26 +512,32 @@ POOL_LINES+=("$line_text")
 idx=$((idx+1))
 done
 
-# Overall emoji/status
-overall_emoji="🟢"; status_text="OK"
-CRITICAL_SUPPRESSED=0
-LOGICAL_SUPPRESSED=0
-if [ "$TOTAL_SNAP_PCT" -ge "$SNAPSHOT_USAGE_CRITICAL_PCT" ]; then
-  if [ "$USED_MODE" = "physical" ] || [ "$REQUIRE_PHYSICAL_FOR_CRITICAL" = false ]; then
-    overall_emoji="🔴"; status_text="CRITICAL"
-  else
-    if [ "$SUPPRESS_LOGICAL_WARNINGS" = true ] && [ "$TOTAL_POOL_AVAIL_GB" -gt "$FORCE_PRUNE_FREE_GB" ]; then
-      overall_emoji="🟢"; status_text="OK"
-      CRITICAL_SUPPRESSED=1
-      LOGICAL_SUPPRESSED=1
+decide_status() {
+  # Centralized status decision and suppression logic
+  overall_emoji="🟢"; status_text="OK"
+  CRITICAL_SUPPRESSED=0
+  LOGICAL_SUPPRESSED=0
+
+  if [ "$TOTAL_SNAP_PCT" -ge "$SNAPSHOT_USAGE_CRITICAL_PCT" ]; then
+    if [ "$USED_MODE" = "physical" ]; then
+      overall_emoji="🔴"; status_text="CRITICAL"
     else
-      overall_emoji="🟡"; status_text="WARNING"
-      CRITICAL_SUPPRESSED=1
+      if [ "${SUPPRESS_LOGICAL_WARNINGS:-true}" = "true" ] && [ "$TOTAL_POOL_AVAIL_GB" -gt "$FORCE_PRUNE_FREE_GB" ]; then
+        overall_emoji="🟢"; status_text="OK"
+        CRITICAL_SUPPRESSED=1
+        LOGICAL_SUPPRESSED=1
+      else
+        overall_emoji="🟡"; status_text="WARNING"
+        CRITICAL_SUPPRESSED=1
+      fi
     fi
+  elif [ "$TOTAL_SNAP_PCT" -ge "$SNAPSHOT_USAGE_WARNING_PCT" ]; then
+    overall_emoji="🟡"; status_text="WARNING"
   fi
-elif [ "$TOTAL_SNAP_PCT" -ge "$SNAPSHOT_USAGE_WARNING_PCT" ]; then
-  overall_emoji="🟡"; status_text="WARNING"
-fi
+}
+
+# Decide final overall status using centralized logic
+decide_status
 
 notify_subject="${overall_emoji} BTRFS Snapshot — ${status_text} (${TOTAL_SNAP_PCT}% used)"
 TOTAL_SNAP_PHYS_GB=$(awk -v b="${TOTAL_SNAP_PHYS_BYTES:-0}" 'BEGIN{printf "%.0f", b/1024/1024/1024}')
@@ -587,13 +554,25 @@ for line in "${POOL_LINES[@]}"; do
   notify_body+="$line"$'\n'
 done
 
+# Add per-pool detailed counts
+notify_body+=$'\nPer-pool detail:\n'
+for POOL in "${POOLS[@]}"; do
+  p_mc=${POOL_MATCHED_COUNT["$POOL"]:-0}
+  p_dc=${POOL_DU_COUNT["$POOL"]:-0}
+  p_mp=${POOL_MATCHED_PHYS_BYTES["$POOL"]:-0}
+  p_md=${POOL_MATCHED_DU_BYTES["$POOL"]:-0}
+  p_mp_gb=$(awk -v b="$p_mp" 'BEGIN{printf "%dG", (b/1024/1024/1024)}')
+  p_md_gb=$(awk -v b="$p_md" 'BEGIN{printf "%dG", (b/1024/1024/1024)}')
+  notify_body+="$POOL: ${p_mc} via estimate (${p_mp_gb}), ${p_dc} via du (${p_md_gb})"$'\n'
+done
+
 if [ "$TOTAL_SNAP_PCT" -ge "$SNAPSHOT_USAGE_WARN_PCT" ]; then
   notify_body+=$'\n🔧 Suggested: run snapshot prune or reduce per-pool retention for high-usage pools.'
 fi
 
 if [ "${OVERCOUNT_WARNING:-0}" -eq 1 ] || [ "${CRITICAL_SUPPRESSED:-0}" -eq 1 ]; then
-  notify_body+=$'\n\n\u26A0\ufe0f Note: snapshot size calculations may be inflated because logical totals can double-count shared extents.'
-  notify_body+=$'\nEnable BTRFS metadata quota (qgroups) and run a quota rescan for accurate physical accounting, or use `btrfs filesystem du` as a fallback.'
+  notify_body+=$'\n\nNote: snapshot size calculations may be inflated because logical totals can double-count shared extents.'
+  notify_body+=$'\nUse `btrfs filesystem du` or streaming `btrfs send` (parent-based) for accurate physical accounting; `du` is a logical fallback.'
   if [ "${OVERCOUNT_WARNING:-0}" -eq 1 ]; then
     notify_body+=$'\n(Reason: logical totals exceeded pool capacity when summed.)'
   fi
@@ -617,17 +596,27 @@ else
 fi
 
 # Add runtime to notification
-notify_body+=$'\n\n⏱ Runtime: '
+notify_body+=$'\n\nRuntime: '
 notify_body+="$runtime"
 
-if [ "$TOTAL_SNAP_PCT" -ge "$SNAPSHOT_USAGE_WARN_PCT" ] && [ -x /usr/local/emhttp/webGui/scripts/notify ]; then
-  /usr/local/emhttp/webGui/scripts/notify \
-    -e "BTRFS Snapshot" \
-    -s "$notify_subject" \
-    -d "$notify_body" \
-    -i "warning"
+# Immediate notification
+log_debug "Summary: $notify_subject - $notify_short"
+if [ -x /usr/local/emhttp/webGui/scripts/notify ]; then
+  if [ "$LOG_LEVEL" = "DEBUG" ]; then
+    log_info "DEBUG mode: Notification suppressed. Summary: $notify_subject - $notify_short"
+  else
+    if [ "${status_text:-OK}" != "OK" ]; then
+      /usr/local/emhttp/webGui/scripts/notify \
+        -e "BTRFS Snapshot" \
+        -s "$notify_subject" \
+        -d "$notify_body" \
+        -i "warning"
+    else
+      log_info "Status OK: Notification suppressed. Summary: $notify_subject - $notify_short"
+    fi
+  fi
 fi
 
-log "BTRFS snapshot run completed. Runtime: ${runtime}"
+log_info "BTRFS snapshot run completed. Runtime: ${runtime}"
 
 exit 0
