@@ -53,11 +53,17 @@ fi
 EOL=$'\n'
 errors=""
 while read -r line; do
+  skip_line=0
   for ignore_line in "${ignore_lines[@]}"; do
     IFS=\* read -r one two three four <<< "$ignore_line"
     if [[ $line == *"$one"*"$two"*"$three"*"$four" ]]; then
-      continue 2
+      skip_line=1
+      break
     fi
+  done
+  if [ $skip_line -eq 1 ]; then
+    continue
+  fi
   last_line="$line"
   errors="$errors$EOL$line"
 done < <(tail -n +"$((line_number_start+1))" "$syslog_file" | grep -iP "($words)")

@@ -13,8 +13,9 @@ clearLog=false
 # --------------------------------------------------------------------------------
 # SETTINGS
 
-threshold=90
-pool_excludes=("ramtmp" "user0")
+THRESHOLD=90
+POOL_EXCLUDES=("ramtmp" "user0")
+NEAR_THRESHOLD_DELTA=5
 
 # --------------------------------------------------------------------------------
 
@@ -23,7 +24,7 @@ is_excluded() {
     local path=$1
     local base
     base=$(basename "$path")
-    for ex in "${pool_excludes[@]:-}"; do
+    for ex in "${POOL_EXCLUDES[@]:-}"; do
         [ -z "$ex" ] && continue
         if [ "$ex" = "$path" ] || [ "$ex" = "$base" ]; then
             return 0
@@ -149,11 +150,9 @@ array_used_h=$(human_readable $array_used_b)
 pool_total_h=$(human_readable $pool_total_b)
 pool_used_h=$(human_readable $pool_used_b)
 
-near_threshold_delta=5
-
 # Helper: notification classify a percentage relative to threshold
 classify_pct() {
-    awk -v a="$1" -v p="$threshold" -v d="$near_threshold_delta" 'BEGIN{if(a>p) print 2; else if(a + d >= p) print 1; else print 0}'
+    awk -v a="$1" -v p="$THRESHOLD" -v d="$NEAR_THRESHOLD_DELTA" 'BEGIN{if(a>p) print 2; else if(a + d >= p) print 1; else print 0}'
 }
 
 map_emoji() {
@@ -173,7 +172,6 @@ pool_icon="⚡"
 if [ "$array_code" -eq 2 ] || [ "$pool_code" -eq 2 ]; then overall_code=2
 elif [ "$array_code" -eq 1 ] || [ "$pool_code" -eq 1 ]; then overall_code=1
 else overall_code=0; fi
-status_emoji=$(map_emoji "$overall_code")
 array_report=$(printf '%s' "$array_report" | sed "0,/^\[Array Summary\]/s//${array_icon} [Array Summary]/")
 cache_report=$(printf '%s' "$cache_report" | sed "0,/^\[Pools Summary\]/s//${pool_icon} [Pools Summary]/")
 
@@ -182,32 +180,30 @@ summary=$(printf "%s Array (%d): %s%% — %s used of %s\n%s Pools (%d): %s%% —
     "$pool_status_emoji" "$pool_count" "$pool_percent" "$pool_used_h" "$pool_total_h")
 description=$(printf "\n%s\n\n--------------------------------------------------\n%s\n--------------------------------------------------\n%s" "$summary" "$array_report" "$cache_report")
 
-subject_metric=$(printf "%s Array: %s%% | Pools: %s%%" "$status_emoji" "$array_percent" "$pool_percent")
-
 /usr/local/emhttp/webGui/scripts/notify \
-    -e "💾 Unraid Storage Report" \
-    -s "$subject_metric" \
+    -e "Unraid Notice" \
+    -s "Disk Storage Report" \
     -i "normal" \
     -d "$description"
 
 # Consolidated alert notification(s)
 exceed_array=0; exceed_pool=0
-if awk -v p="$array_percent" -v t="$threshold" 'BEGIN{exit (p>t)?0:1}'; then exceed_array=1; fi
-if awk -v p="$pool_percent" -v t="$threshold" 'BEGIN{exit (p>t)?0:1}'; then exceed_pool=1; fi
+if awk -v p="$array_percent" -v t="$THRESHOLD" 'BEGIN{exit (p>t)?0:1}'; then exceed_array=1; fi
+if awk -v p="$pool_percent" -v t="$THRESHOLD" 'BEGIN{exit (p>t)?0:1}'; then exceed_pool=1; fi
 
 if [ "$exceed_array" -eq 1 ] || [ "$exceed_pool" -eq 1 ]; then
     alert_subject="⚠️ Storage threshold exceeded"
     alert_body=""
     if [ "$exceed_array" -eq 1 ]; then
-        over_pct=$(awk -v p="$array_percent" -v t="$threshold" 'BEGIN{printf "%.1f", p - t}')
-        over_bytes=$(awk -v used=$array_used_b -v tot=$array_total_b -v t=$threshold 'BEGIN{ex=used - (t/100)*tot; if(ex<0) ex=0; printf "%d", ex}')
+    over_pct=$(awk -v p="$array_percent" -v t="$THRESHOLD" 'BEGIN{printf "%.1f", p - t}')
+    over_bytes=$(awk -v used=$array_used_b -v tot=$array_total_b -v t=$THRESHOLD 'BEGIN{ex=used - (t/100)*tot; if(ex<0) ex=0; printf "%d", ex}')
         alert_body+=$(printf "[Array]\nTotal: %s\nUsed: %s (%s%%)\nFree: %s\nExceeded by: %s%% (~%s)\n\n" \
             "$array_total_h" "$array_used_h" "$array_percent" "$(human_readable $((array_total_b - array_used_b)))" "$over_pct" "$(human_readable $over_bytes)")
         alert_body+="$array_report\n"
     fi
     if [ "$exceed_pool" -eq 1 ]; then
-        over_pct_p=$(awk -v p="$pool_percent" -v t="$threshold" 'BEGIN{printf "%.1f", p - t}')
-        over_bytes_p=$(awk -v used=$pool_used_b -v tot=$pool_total_b -v t=$threshold 'BEGIN{ex=used - (t/100)*tot; if(ex<0) ex=0; printf "%d", ex}')
+    over_pct_p=$(awk -v p="$pool_percent" -v t="$THRESHOLD" 'BEGIN{printf "%.1f", p - t}')
+    over_bytes_p=$(awk -v used=$pool_used_b -v tot=$pool_total_b -v t=$THRESHOLD 'BEGIN{ex=used - (t/100)*tot; if(ex<0) ex=0; printf "%d", ex}')
         alert_body+=$(printf "[Pools]\nTotal: %s\nUsed: %s (%s%%)\nFree: %s\nExceeded by: %s%% (~%s)\n\n" \
             "$pool_total_h" "$pool_used_h" "$pool_percent" "$(human_readable $((pool_total_b - pool_used_b)))" "$over_pct_p" "$(human_readable $over_bytes_p)")
         alert_body+="$cache_report\n"

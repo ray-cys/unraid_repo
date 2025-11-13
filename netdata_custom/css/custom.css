@@ -1,0 +1,39 @@
+/* General Background & Font */
+body {
+    background-color: #1e1e2f;
+    font-family: "Roboto", sans-serif;
+    color: #f1f1f1;
+}
+
+/* Chart Container */
+.chart-container {
+    border-radius: 10px;
+    box-shadow: 0px 0px 8px rgba(0,0,0,0.4);
+    background-color: #2b2b3a;
+    margin-bottom: 10px;
+}
+
+/* Chart Titles */
+.chart-title {
+    font-weight: bold;
+    color: #ffffff;
+}
+
+/* Chart Lines */
+.chart-line {
+    stroke-width: 2;
+}
+
+/* Warning & Critical Colors */
+.chart-warning {
+    stroke: #ffb74d !important;
+}
+.chart-critical {
+    stroke: #e57373 !important;
+}
+
+/* Tooltip */
+.tooltip {
+    background-color: #2b2b3a !important;
+    color: #f1f1f1 !important;
+}

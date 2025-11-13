@@ -20,8 +20,8 @@ SNAPSHOT_USAGE_CRITICAL_PCT=90        # Percent threshold for CRITICAL
 SNAPSHOT_USAGE_WARNING_PCT=65         # Percent threshold for WARNING
 FORCE_PRUNE_FREE_GB=300               # Force prune if free < X GB
 MIN_SNAPSHOTS_KEEP=1                  # Minimum number of snapshots to keep
-DEFAULT_KEEP_RAID1=5                  # Default snapshots to keep for RAID1
-DEFAULT_KEEP_SINGLE=3                 # Default snapshots to keep for single disk
+DEFAULT_KEEP_RAID1=3                  # Default snapshots to keep for RAID1
+DEFAULT_KEEP_SINGLE=2                 # Default snapshots to keep for single disk
 DEFAULT_KEEP_RAID0=2                  # Default snapshots to keep for RAID0
 STOP_DOCKER_VMS=false                 # Set true to stopping Docker/VMs
 SUPPRESS_LOGICAL_WARNINGS=true        # If true, do not warn/critical on logical-only totals unless free space is low
@@ -220,7 +220,7 @@ for POOL in "${POOLS[@]}"; do
     SNAPSHOTS_TO_KEEP=$KEEP_DEFAULT
   fi
   (( SNAPSHOTS_TO_KEEP < MIN_SNAPSHOTS_KEEP )) && SNAPSHOTS_TO_KEEP=$MIN_SNAPSHOTS_KEEP
-  log "Pool $POOL: Retained last ${SNAPSHOTS_TO_KEEP} snapshots per shares"
+  log "Pool $POOL: Retained last ${SNAPSHOTS_TO_KEEP} snapshots per share"
   POOL_KEEP+=("$SNAPSHOTS_TO_KEEP")
 
   for SHARE in "${SHARES[@]}"; do
@@ -539,7 +539,7 @@ decide_status() {
 # Decide final overall status using centralized logic
 decide_status
 
-notify_subject="${overall_emoji} BTRFS Snapshot — ${status_text} (${TOTAL_SNAP_PCT}% used)"
+notify_subject="BTRFS Snapshot — ${status_text} (${TOTAL_SNAP_PCT}% used)"
 TOTAL_SNAP_PHYS_GB=$(awk -v b="${TOTAL_SNAP_PHYS_BYTES:-0}" 'BEGIN{printf "%.0f", b/1024/1024/1024}')
 notify_short="💾 ${TOTAL_SNAP_GB}G logical / ${TOTAL_SNAP_PHYS_GB}G phys (${TOTAL_SNAP_PCT}% of ${TOTAL_POOL_GB}G), ${TOTAL_POOL_AVAIL_GB}G free"
 
@@ -561,13 +561,31 @@ for POOL in "${POOLS[@]}"; do
   p_dc=${POOL_DU_COUNT["$POOL"]:-0}
   p_mp=${POOL_MATCHED_PHYS_BYTES["$POOL"]:-0}
   p_md=${POOL_MATCHED_DU_BYTES["$POOL"]:-0}
-  p_mp_gb=$(awk -v b="$p_mp" 'BEGIN{printf "%dG", (b/1024/1024/1024)}')
-  p_md_gb=$(awk -v b="$p_md" 'BEGIN{printf "%dG", (b/1024/1024/1024)}')
-  notify_body+="$POOL: ${p_mc} via estimate (${p_mp_gb}), ${p_dc} via du (${p_md_gb})"$'\n'
+  # Build a human summary only for available methods
+  details=()
+  if [ "$p_mp" -gt 0 ]; then
+    p_mp_gb=$(awk -v b="$p_mp" 'BEGIN{printf "%dG", (b/1024/1024/1024)}')
+    details+=("${p_mc} via estimate (${p_mp_gb})")
+  fi
+  if [ "$p_md" -gt 0 ]; then
+    p_md_gb=$(awk -v b="$p_md" 'BEGIN{printf "%dG", (b/1024/1024/1024)}')
+    details+=("${p_dc} via du (${p_md_gb})")
+  fi
+  if [ ${#details[@]} -eq 0 ]; then
+    # Fallback to logical snapshot directory size (may overcount shared extents)
+    p_snap_bytes=0
+    POOL_SNAP_BASE="$POOL/.snapshots"
+    if [ -d "$POOL_SNAP_BASE" ]; then
+      p_snap_bytes=$(du -sB1 "$POOL_SNAP_BASE" 2>/dev/null | awk '{print $1}' || echo 0)
+    fi
+    p_snap_gb=$(awk -v b="$p_snap_bytes" 'BEGIN{printf "%dG", (b/1024/1024/1024)}')
+    details+=("logical total ${p_snap_gb} (may overcount)")
+  fi
+  notify_body+="$POOL: ${details[*]}"$'\n'
 done
 
 if [ "$TOTAL_SNAP_PCT" -ge "$SNAPSHOT_USAGE_WARN_PCT" ]; then
-  notify_body+=$'\n🔧 Suggested: run snapshot prune or reduce per-pool retention for high-usage pools.'
+  notify_body+=$'\n🔧 Suggested: run snapshot prune or reduce per-share retention for high-usage pools (or lower the default keep counts).'
 fi
 
 if [ "${OVERCOUNT_WARNING:-0}" -eq 1 ] || [ "${CRITICAL_SUPPRESSED:-0}" -eq 1 ]; then
