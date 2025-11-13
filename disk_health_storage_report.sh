@@ -24,6 +24,25 @@ SMARTCTL_CMD="/usr/sbin/smartctl"
 BTRFS_CMD="/sbin/btrfs"
 XFS_CHECK_CMD="/sbin/xfs_repair" # used for quick check invocation (we'll run -n)
 
+# Spin-up sleep (seconds) used when waking drives via small read
+SPINUP_SLEEP=${SPINUP_SLEEP:-6}
+SPINUP_RETRIES=${SPINUP_RETRIES:-3}
+
+# Directory to save smartctl full output per device for diagnostics
+SMART_DUMP_DIR=${SMART_DUMP_DIR:-/mnt/user/system/disk_health_smart_dumps}
+
+# Ensure SMART_DUMP_DIR is usable; if not, fall back to /tmp
+if ! mkdir -p "$SMART_DUMP_DIR" 2>/dev/null || [ ! -w "$SMART_DUMP_DIR" ]; then
+    log "SMART_DUMP_DIR '$SMART_DUMP_DIR' not writable or cannot be created; falling back to /tmp/disk_health_smart_dumps"
+    SMART_DUMP_DIR=/tmp/disk_health_smart_dumps
+    mkdir -p "$SMART_DUMP_DIR" 2>/dev/null || true
+fi
+
+# SMART thresholds (used for decisioning in checks)
+SMART_REALLOC_WARN=${SMART_REALLOC_WARN:-1}
+SMART_REALLOC_CRIT=${SMART_REALLOC_CRIT:-10}
+UDMA_CRC_WARN=${UDMA_CRC_WARN:-1}
+
 # --------------------------------------------------------------------------------
 
 # Return 0 if path should be excluded, 1 otherwise
@@ -40,45 +59,11 @@ is_excluded() {
     return 1
 }
 
-# Spin up all rotational disks sequentially using hdparm -S0 -y.
-# Uses /dev/disk/by-id symlinks for a more persistent identifier when available.
-spin_up_all_disks() {
-    local timeout=${1:-30}
-    if ! command -v hdparm >/dev/null 2>&1; then
-        log "spin_up_all_disks: hdparm not available"
-        return 1
-    fi
-    # Find all rotational disks (ROTA==1)
-    mapfile -t disks < <(lsblk -dn -o NAME,ROTA | awk '$2==1 {print "/dev/"$1}')
-    if [ ${#disks[@]} -eq 0 ]; then
-        log "spin_up_all_disks: no rotational disks found"
-        return 0
-    fi
-    local succ=()
-    local fail=()
-    for d in "${disks[@]}"; do
-        # prefer a persistent by-id label for logging, but act on the real /dev/sdX
-        local byid
-        byid=$(ls -l /dev/disk/by-id 2>/dev/null | awk -v dev="$(basename "$d")" '$0~dev{print $9; exit}' || true)
-        local label
-        if [ -n "$byid" ]; then label="/dev/disk/by-id/$byid"; else label="$d"; fi
-        log "spin_up_all_disks: attempting spin for $label -> $d"
-        if spin_up_device "$d" "$timeout"; then
-            succ+=("$label")
-        else
-            fail+=("$label")
-        fi
-        # small pause between drives to avoid overloading backplanes
-        sleep 1
-    done
-    if [ ${#succ[@]} -gt 0 ]; then
-        log "spin_up_all_disks: succeeded: ${succ[*]}"
-    fi
-    if [ ${#fail[@]} -gt 0 ]; then
-        log "spin_up_all_disks: failed: ${fail[*]}"
-    fi
-    return 0
-}
+# The hdparm-based bulk spin helpers were removed in favor of the tested
+# smartctl + tiny-dd spin behaviour implemented in check_disk_smart().
+# If you need hdparm/sg_start-based wake behaviour for specific HBAs,
+# reintroduce a spin helper and guard it behind a config flag (e.g.
+# USE_HDPARM=YES) so the default remains broadly compatible.
 
 # Convert bytes to human-readable (decimal units)
 human_readable() {
@@ -116,7 +101,9 @@ map_emoji() {
 
 # Simple logger to stdout with timestamp
 log() {
-    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+    # write logs to stderr so that callers which capture stdout (e.g. sm=$(...))
+    # don't swallow diagnostic messages
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
 }
 
 # Find the block device(s) backing a mountpoint. Returns space-separated device paths.
@@ -155,268 +142,183 @@ get_block_devices_from_mount() {
     printf "%s\n" "$src"
 }
 
-# Attempt to spin up / wake a block device so SMART can be read.
-# Uses hdparm -S0 -y exclusively (user preference). Returns 0 if device appears active, non-zero otherwise.
-spin_up_device() {
-    local dev=$1
-    local timeout=${2:-30}
-    local retries=3
-    local poll_interval=2
+# NOTE: hdparm-style per-device spin logic removed. The script now relies on the
+# conservative tiny-read spin in check_disk_smart() which was copied from the
+# validated `disk_health.sh` implementation. If you need controller-specific
+# hdparm/sg_start behaviour re-add a guarded helper and enable it via a
+# config flag (USE_HDPARM=YES).
 
-    # Special-case: spin up all rotational disks sequentially
-    if [ "$dev" = "all" ]; then
-        spin_up_all_disks "$timeout"
-        return $?
-    fi
-
-    # Ensure we're root (hdparm requires privileges)
-    if [ "$(id -u)" -ne 0 ]; then
-        log "spin_up_device: WARNING: not running as root; hdparm may fail"
-    fi
-
-    # Resolve to the real block device (follow symlinks). Prefer base device (/dev/sdX)
-    local real_dev
-    real_dev=$(readlink -f "$dev" 2>/dev/null || true)
-    if [ -z "$real_dev" ]; then real_dev="$dev"; fi
-    # strip partition suffix (sda1 -> sda)
-    local base_dev
-    base_dev=$(basename "$real_dev")
-    base_dev="/dev/$(echo "$base_dev" | sed -E 's/p?[0-9]+$//')"
-
-    # NVMe devices don't need hdparm
-    if echo "$base_dev" | grep -qi '^/dev/nvme'; then
-        log "spin_up_device: $base_dev appears NVMe, no hdparm required"
-        return 0
-    fi
-
-    # If base_dev is part of an md device (e.g., /dev/md1p1 or /dev/md1), prefer spinning the member disks
-    if echo "$base_dev" | grep -Eq '^/dev/md[0-9]+' || [ -e "/sys/block/$(basename "$base_dev")/slaves" ]; then
-        # normalize md base (md1p1 -> md1)
-        mdname=$(basename "$base_dev" | sed -E 's/^(md[0-9]+).*/\1/')
-        if [ -d "/sys/block/$mdname/slaves" ]; then
-            for s in /sys/block/$mdname/slaves/*; do
-                [ -e "$s" ] || continue
-                slave_dev="/dev/$(basename "$s")"
-                log "spin_up_device: attempting hdparm spin on md slave $slave_dev"
-                # call recursively on the physical slave (short timeout)
-                spin_up_device "$slave_dev" 15 || true
-            done
-            # after attempting slaves, check parent device state
-            state=$(lsblk -n -o STATE "$base_dev" 2>/dev/null | tr -d '[:space:]' || true)
-            if [ -n "$state" ] && echo "$state" | grep -Ei 'running|active|online|ready' >/dev/null 2>&1; then
-                log "spin_up_device: $base_dev active after spinning slaves (state=$state)"
-                return 0
-            fi
-        fi
-    fi
-
-    # Find hdparm binary explicitly to avoid PATH differences
-    local hdparm_cmd
-    hdparm_cmd=$(command -v hdparm || echo "/sbin/hdparm")
-    if [ ! -x "$hdparm_cmd" ]; then
-        log "spin_up_device: hdparm not found at $hdparm_cmd"
-        return 1
-    fi
-
-    # Optional: allow falling back to sg_start for SCSI-attached devices (disabled by default)
-    USE_SGSTART=${USE_SGSTART:-NO}
-    sg_start_cmd=$(command -v sg_start 2>/dev/null || true)
-
-    # Helper: get current power state via hdparm -C
-    get_powstate() {
-        local out
-        out=$($hdparm_cmd -C "$base_dev" 2>/dev/null || true)
-        # sample output: /dev/sda:
-        # drive state is:  active/idle
-        echo "$out" | tr '\n' ' ' | sed -n 's/.*drive state is: *\([^ ]*\).*/\1/p' || true
-    }
-
-    local state
-    state=$(get_powstate)
-    if [ -n "$state" ] && echo "$state" | grep -Ei 'active|running|idle|ready|online' >/dev/null 2>&1; then
-        log "spin_up_device: $base_dev already in state=$state"
-        return 0
-    fi
-
-    # Attempt retries of hdparm wake and poll until timeout
-    local attempt=1
-    local start_ts=$(date +%s)
-    while [ $attempt -le $retries ]; do
-        log "spin_up_device: attempt $attempt -> $hdparm_cmd -S0 -y $base_dev"
-        # capture output for debugging
-        out=$($hdparm_cmd -S0 -y "$base_dev" 2>&1) || rc=$?
-        rc=${rc:-$?}
-        log "spin_up_device: hdparm exit=$rc output: $(echo "$out" | tr '\n' ' ' | sed -e 's/  */ /g' -e 's/^ *//')"
-
-        # After issuing wake, poll power state until active or until timeout
-        local now
-        now=$(date +%s)
-        local elapsed=$((now - start_ts))
-        while [ $elapsed -lt $timeout ]; do
-            state=$(get_powstate)
-            if [ -n "$state" ] && echo "$state" | grep -Ei 'active|running|idle|ready|online' >/dev/null 2>&1; then
-                log "spin_up_device: $base_dev became active (state=$state) after attempt $attempt"
-                return 0
-            fi
-            sleep $poll_interval
-            now=$(date +%s)
-            elapsed=$((now - start_ts))
+# Return space-separated list of physical slave devices for an md device name
+# Tries (in order): /sys/block/<md>/slaves, lsblk child disks, /proc/mdstat parsing
+get_md_slaves() {
+    local mdname=$1
+    local slaves=()
+    # 1) sysfs
+    if [ -d "/sys/block/$mdname/slaves" ]; then
+        for s in /sys/block/$mdname/slaves/*; do
+            [ -e "$s" ] || continue
+            slaves+=("/dev/$(basename "$s")")
         done
-
-        attempt=$((attempt + 1))
-        # small backoff before retry
-        sleep 1
-    done
-
-    # fallback: check lsblk STATE if hdparm power state parsing failed
-    state=$(lsblk -n -o STATE "$base_dev" 2>/dev/null | tr -d '[:space:]' || true)
-    if [ -n "$state" ] && echo "$state" | grep -Ei 'running|active|online|ready' >/dev/null 2>&1; then
-        log "spin_up_device: $base_dev appears active by lsblk (state=$state)"
-        return 0
+        if [ ${#slaves[@]} -gt 0 ]; then printf "%s\n" "${slaves[@]}"; return 0; fi
     fi
 
-    log "spin_up_device: failed to activate $base_dev after $retries attempts and ${timeout}s poll"
-    # If sg_start is available and allowed, try it for SCSI devices (useful for some HBAs)
-    if [ "$USE_SGSTART" = "YES" ] && [ -x "$sg_start_cmd" ]; then
-        log "spin_up_device: attempting sg_start on $base_dev"
-        $sg_start_cmd --start $base_dev >/dev/null 2>&1 || true
-        sleep 2
-        state=$(lsblk -n -o STATE "$base_dev" 2>/dev/null | tr -d '[:space:]' || true)
-        if [ -n "$state" ] && echo "$state" | grep -Ei 'running|active|online|ready' >/dev/null 2>&1; then
-            log "spin_up_device: sg_start succeeded for $base_dev (state=$state)"
-            return 0
-        fi
+    # 2) lsblk children (disk/part)
+    if command -v lsblk >/dev/null 2>&1; then
+        mapfile -t ll < <(lsblk -ln -o NAME,TYPE "/dev/$mdname" 2>/dev/null | awk '$2=="disk" || $2=="part" {print "/dev/"$1}') || true
+        if [ ${#ll[@]} -gt 0 ]; then printf "%s\n" "${ll[@]}"; return 0; fi
     fi
 
-    # Capture recent kernel messages for debugging controller/backplane errors
-    if command -v dmesg >/dev/null 2>&1; then
-        log "spin_up_device: dmesg (last 40 lines) for context:"
-        dmesg | tail -n 40 | sed -e 's/^/    /'
+    # 3) /proc/mdstat parsing fallback (handle Unraid key=value style)
+    if [ -r /proc/mdstat ]; then
+        # try matching both the provided name and its partition-stripped form
+        md_alt=$(echo "$mdname" | sed -E 's/p[0-9]+$//')
+        # read /proc/mdstat lines and collect diskName.N entries
+        while IFS= read -r line; do
+            # look for diskName.N=<name>
+            if echo "$line" | grep -qE '^diskName\.[0-9]+=.*'; then
+                idx=$(echo "$line" | awk -F'[.=]' '{print $1}' | sed -E 's/diskName\.//'; )
+                # extract name after =
+                name=$(echo "$line" | awk -F= '{print $2}' | tr -d '\r' | tr -d ' ')
+                if [ "$name" = "$mdname" ] || [ "$name" = "$md_alt" ]; then
+                    # find corresponding rdevName.N line
+                    rline=$(grep -E "^rdevName\.${idx}=" /proc/mdstat 2>/dev/null || true)
+                    if [ -n "$rline" ]; then
+                        rval=$(echo "$rline" | awk -F= '{print $2}' | tr -d '\r' | tr -d ' ')
+                        # strip partition numbers
+                        rval_base=$(echo "$rval" | sed -E 's/[0-9]+$//')
+                        slaves+=("/dev/$rval_base")
+                    fi
+                fi
+            fi
+        done < /proc/mdstat
+        if [ ${#slaves[@]} -gt 0 ]; then printf "%s\n" "${slaves[@]}"; return 0; fi
     fi
     return 1
 }
 
-# SMART check for a block device. Prints summary line and returns 0 if passed, 1 if failed.
-check_disk_smart() {
-    local dev=$1
-    local out=""
-    local rc=0
-    # Resolve md/mapper/lvm style top-level devices to underlying physical disks
-    local targets=()
-    local bname
-    bname=$(basename "$dev")
-    # Handle md devices (including partitioned forms like md1p1)
-    if echo "$bname" | grep -Eq '^md[0-9]+'; then
-        local mdbase
-        mdbase=$(echo "$bname" | sed -E 's/^(md[0-9]+).*/\1/')
-        # Prefer sysfs slaves listing (reliable for md devices)
-        if [ -d "/sys/block/$mdbase/slaves" ]; then
-            for s in /sys/block/$mdbase/slaves/*; do
-                [ -e "$s" ] || continue
-                targets+=("/dev/$(basename "$s")")
-            done
-        else
-            # Fallback to lsblk child resolution
-            mapfile -t parts < <(lsblk -ln -o NAME -r "/dev/$mdbase" 2>/dev/null | awk '{print $1}' || true)
-            for p in "${parts[@]}"; do
-                [ "$p" = "$mdbase" ] && continue
-                parent=$(lsblk -n -o PKNAME "/dev/$p" 2>/dev/null | tr -d '[:space:]' || true)
-                if [ -n "$parent" ]; then
-                    targets+=("/dev/$parent")
-                else
-                    targets+=("/dev/$p")
-                fi
-            done
-        fi
+# Internal helper: check a resolved physical device node (e.g. /dev/sda)
+_check_disk_smart_dev() {
+    local devnode="$1"
+    local out
+
+    log "_check_disk_smart_dev: starting checks for $devnode"
+
+    # If smartctl missing, bail
+    if [ ! -x "$SMARTCTL_CMD" ]; then
+        SMARTCTL_CMD=$(command -v smartctl || true)
     fi
-    # Map device-mapper / mapper / dm- devices via lsblk
-    if [ ${#targets[@]} -eq 0 ] && echo "$dev" | grep -Eq '/dev/mapper|/dev/dm-'; then
-        mapfile -t parts < <(lsblk -ln -o NAME,TYPE "$dev" 2>/dev/null | awk '$2=="disk"{print $1}' || true)
-        for p in "${parts[@]}"; do
-            targets+=("/dev/$p")
-        done
-    fi
-    # Final fallback: if no targets found, strip partition suffix (sda1 -> sda) and act on base device
-    if [ ${#targets[@]} -eq 0 ]; then
-        local base_dev
-        base_dev=$(echo "$dev" | sed -E 's/p?[0-9]+$//')
-        targets=("$base_dev")
-    fi
-    # Probe sequence: try default, then common -d options
-    local probes=("" "-d sat" "-d ata" "-d scsi")
-    local probe
-    local last_err=""
-    local smart_bin
-    smart_bin=${SMARTCTL_CMD:-$(command -v smartctl 2>/dev/null || true)}
-    if [ -z "$smart_bin" ] || [ ! -x "$smart_bin" ]; then
-        log "check_disk_smart: smartctl not found ($SMARTCTL_CMD)"
+    if [ -z "$SMARTCTL_CMD" ] || [ ! -x "$SMARTCTL_CMD" ]; then
+        log "_check_disk_smart_dev: smartctl not found ($SMARTCTL_CMD)"
         printf "FAILED: SMART_TOOL_MISSING"
         return 2
     fi
 
-    # We'll probe each physical target until we get a meaningful SMART result
-    local any_passed=0
-    local any_failed=0
-    local combined_fail_msg=""
-    for t in "${targets[@]}"; do
-        for probe in "${probes[@]}"; do
-            # build command
-            cmd=("$smart_bin")
-            if [ -n "$probe" ]; then
-                for a in $probe; do cmd+=("$a"); done
+    # If device is indicated to be in standby, perform tiny harmless reads to spin it
+    # and verify it actually left standby. Retry a few times before giving up.
+    if "$SMARTCTL_CMD" -n standby "$devnode" >/dev/null 2>&1; then
+        log "_check_disk_smart_dev: $devnode in standby, attempting gentle spin via dd (retries=${SPINUP_RETRIES})"
+        for attempt in $(seq 1 $SPINUP_RETRIES); do
+            log "_check_disk_smart_dev: $devnode spin attempt $attempt"
+            dd if="$devnode" of=/dev/null bs=1 count=1 >/dev/null 2>&1 || true
+            sleep $SPINUP_SLEEP
+            if ! "$SMARTCTL_CMD" -n standby "$devnode" >/dev/null 2>&1; then
+                log "_check_disk_smart_dev: $devnode left standby on attempt $attempt"
+                break
+            else
+                log "_check_disk_smart_dev: $devnode still in standby after attempt $attempt"
             fi
-            cmd+=("-H" "-i" "-A" "$t")
-            out=$( "${cmd[@]}" 2>&1 ) || rc=$?
-            rc=${rc:-0}
-            log "check_disk_smart: target=$t probe='$probe' rc=$rc output='$(echo "$out" | tr '\n' ' ' | sed -e 's/  */ /g' -e 's/^ *//')'"
-
-            if echo "$out" | grep -qi "SMART support is: Disabled"; then
-                log "check_disk_smart: SMART disabled on $t, attempting to enable"
-                "$smart_bin" -s on "$t" >/dev/null 2>&1 || true
-                out=$( "${cmd[@]}" 2>&1 ) || rc=$?
-                rc=${rc:-0}
-                log "check_disk_smart: re-probe target=$t rc=$rc output='$(echo "$out" | tr '\n' ' ' | sed -e 's/  */ /g' -e 's/^ *//')'"
-            fi
-
-            if echo "$out" | grep -Eqi "SMART|SMART overall-health|SMART Health"; then
-                if echo "$out" | grep -iq "PASSED"; then
-                    temp=$(echo "$out" | grep -iE 'temperature|temperature_celsius|temperature_internal' | grep -oE '[0-9]{1,3}' | head -n1 || true)
-                    if [ -n "$temp" ]; then
-                        printf "PASSED;TEMP=%s" "$temp"
-                    else
-                        printf "PASSED"
-                    fi
-                    return 0
-                else
-                    # SMART present but not PASSED -> gather attributes and mark failed
-                    any_failed=1
-                    local reallocated=$(echo "$out" | awk '/Reallocated_Sector_Ct|Reallocated_Sector_Count/ {print $10; exit}')
-                    local pending=$(echo "$out" | awk '/Current_Pending_Sector/ {print $10; exit}')
-                    local crc=$(echo "$out" | awk '/UDMA_CRC_Error_Count/ {print $10; exit}')
-                    local selftest=$( "$smart_bin" -c "$t" 2>/dev/null | awk '/Self-test execution status/ {print; exit}' || true)
-                    local temp=$(echo "$out" | grep -iE 'temperature|temperature_celsius|temperature_internal' | grep -oE '[0-9]{1,3}' | head -n1 || true)
-                    combined_fail_msg+="$t: Reallocated=${reallocated:-0} Pending=${pending:-0} CRC=${crc:-0} Temp=${temp:-N/A} SelfTest='${selftest:-N/A}'; "
-                    # continue checking other targets
-                    break
-                fi
-            fi
-
-            last_err=$(echo "$out" | tail -n5 | tr '\n' ' ' | sed -e 's/  */ /g' -e 's/^ *//')
         done
-    done
-
-    if [ $any_failed -eq 1 ]; then
-        # return aggregated failure info for all physical targets
-        printf "FAILED: %s" "${combined_fail_msg:-SMART_PRESENT_BUT_FAILED}"
-        return 1
     fi
 
-    # All probes failed to retrieve SMART info. Return clear failure reason.
-    log "check_disk_smart: all probes failed for $dev; last_err='$last_err'"
-    # sanitize last_err: replace double-quotes with single-quotes and collapse whitespace
-    processed=$(echo "$last_err" | tr '"' "'" | sed -E 's/[[:space:]]+/ /g' | cut -c1-200)
-    printf "FAILED: SMART_UNREADABLE (%s)" "$processed"
-    return 1
+    # Ensure dump directory exists for diagnostics
+    mkdir -p "$SMART_DUMP_DIR" 2>/dev/null || true
+    local ts safe_name dumpfile
+    ts=$(date +%Y%m%dT%H%M%S)
+    safe_name=$(basename "$devnode" | sed 's/[^a-zA-Z0-9._-]/_/g')
+    dumpfile="$SMART_DUMP_DIR/${safe_name}_${ts}.smartctl.log"
+
+    # Run smartctl and capture both stdout and stderr to the dumpfile for diagnostics
+    log "_check_disk_smart_dev: running smartctl for $devnode, dumpfile=$dumpfile"
+    if ! $SMARTCTL_CMD -A -d sat "$devnode" >"$dumpfile" 2>&1; then
+        log "_check_disk_smart_dev: sat transport failed for $devnode, trying auto transport (appending to $dumpfile)"
+        $SMARTCTL_CMD -A -d auto "$devnode" >>"$dumpfile" 2>&1 || true
+    fi
+    out=$(cat "$dumpfile" 2>/dev/null || true)
+    if [ -z "$out" ]; then
+        log "_check_disk_smart_dev: smartctl produced no output for $devnode; dump=$dumpfile"
+        printf "FAILED: SMART_UNREADABLE"
+        return 1
+    fi
+    log "_check_disk_smart_dev: smartctl output captured for $devnode (dump=$dumpfile, length=$(printf "%s" "$out" | wc -c))"
+
+    # Parse key attributes
+    local reallocated pending crc temp
+    reallocated=$(printf "%s" "$out" | awk 'tolower($0) ~ /reallocated_sector/ {print $NF; exit}' || true)
+    pending=$(printf "%s" "$out" | awk 'tolower($0) ~ /current_pending_sector/ {print $NF; exit}' || true)
+    crc=$(printf "%s" "$out" | awk 'tolower($0) ~ /udma_crc|udma_crc_error_count/ {print $NF; exit}' || true)
+    temp=$(printf "%s" "$out" | awk 'tolower($0) ~ /temperature_celsius|temperature/ {for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) {print $i; exit}}' | head -n1 || true)
+
+    reallocated=${reallocated:-0}
+    pending=${pending:-0}
+    crc=${crc:-0}
+    temp=${temp:-N/A}
+    log "_check_disk_smart_dev: parsed $devnode -> Reallocated=$reallocated Pending=$pending CRC=$crc TEMP=$temp"
+
+    if [ "$reallocated" -eq 0 ] && [ "$pending" -eq 0 ] && [ "$crc" -eq 0 ]; then
+        if [ "$temp" = "N/A" ]; then
+            printf "PASSED"
+        else
+            printf "PASSED;TEMP=%s" "$temp"
+        fi
+        return 0
+    else
+        printf "FAILED: Reallocated=%s Pending=%s CRC=%s Temp=%s SelfTest='N/A'" "$reallocated" "$pending" "$crc" "$temp"
+        return 1
+    fi
+}
+
+
+# SMART check wrapper: expand md parents to physical slaves and call helper
+check_disk_smart() {
+    local dev=$1
+    local devnode
+    devnode=$(readlink -f "$dev" 2>/dev/null || echo "$dev")
+    if [ -z "$devnode" ]; then
+        log "check_disk_smart: FAILED to resolve device for '$dev'"
+        printf "FAILED: CANNOT_RESOLVE_DEVICE"
+        return 2
+    fi
+    log "check_disk_smart: resolved $dev -> $devnode"
+
+    # If this device is an md parent, try to resolve the physical slaves and run checks
+    local mdname
+    mdname=$(basename "$devnode")
+    mapfile -t mdslaves < <(get_md_slaves "$mdname" 2>/dev/null || true)
+    if [ ${#mdslaves[@]} -gt 0 ]; then
+        local health_status=0
+        local desc=""
+        local temp="N/A"
+        for slave_dev in "${mdslaves[@]}"; do
+            [ -n "$slave_dev" ] || continue
+            log "check_disk_smart: md parent $devnode -> member $slave_dev"
+            sm=$(_check_disk_smart_dev "$slave_dev" ) || true
+            desc+="$slave_dev:$sm; "
+            s_temp=$(echo "$sm" | sed -n 's/.*TEMP=\([0-9]*\).*/\1/p' || true)
+            if [ -n "$s_temp" ]; then temp="$s_temp"; fi
+            if echo "$sm" | grep -qi "FAILED"; then health_status=1; fi
+        done
+        if [ $health_status -eq 0 ]; then
+            if [ "$temp" = "N/A" ]; then printf "%s" "PASSED"; else printf "PASSED;TEMP=%s" "$temp"; fi
+            return 0
+        else
+            printf "%s" "FAILED: MEMBERS=%s" "$desc"
+            return 1
+        fi
+    fi
+    # No md slaves discovered; operate on the device itself
+    log "check_disk_smart: invoking _check_disk_smart_dev on $devnode"
+    _check_disk_smart_dev "$devnode"
+    return $?
 }
 
 # Check NVMe attributes (wear, thermal throttle, media errors)
@@ -430,6 +332,7 @@ check_nvme_health() {
     local throttle=$(echo "$out" | awk -F: '/thermal throttling|throttle/ {gsub(/ /, "", $2); print $2; exit}')
     local media_errs=$(echo "$out" | awk -F: '/media_errors/ {gsub(/ /, "", $2); print $2; exit}')
     local temp=$(echo "$out" | grep -iE 'temperature|temp' | grep -oE '[0-9]{1,3}' | head -n1 || true)
+    log "check_nvme_health: $dev -> WEAR=${wear:-N/A} THROTTLE=${throttle:-0} MEDIA_ERRS=${media_errs:-0} TEMP=${temp:-N/A}"
     printf "WEAR=%s THROTTLE=%s MEDIA_ERRS=%s TEMP=%s" "${wear:-N/A}" "${throttle:-0}" "${media_errs:-0}" "${temp:-N/A}"
     return 0
 }
@@ -438,14 +341,17 @@ check_nvme_health() {
 check_xfs_quick() {
     local dev=$1
     if [ ! -x "$XFS_CHECK_CMD" ]; then
+        log "check_xfs_quick: XFS tool missing for $dev"
         printf "XFS_TOOL_MISSING"
         return 2
     fi
     # xfs_repair -n returns 0 when no errors found (and non-zero otherwise)
     if $XFS_CHECK_CMD -n "$dev" >/dev/null 2>&1; then
+        log "check_xfs_quick: $dev -> PASSED"
         printf "PASSED"
         return 0
     else
+        log "check_xfs_quick: $dev -> FAILED"
         printf "FAILED"
         return 1
     fi
@@ -455,6 +361,7 @@ check_xfs_quick() {
 check_btrfs_pool() {
     local mount=$1
     if [ ! -x "$BTRFS_CMD" ]; then
+        log "check_btrfs_pool: btrfs tool missing for $mount"
         printf "BTRFS_TOOL_MISSING"
         return 2
     fi
@@ -496,15 +403,17 @@ check_btrfs_pool() {
 
     if [ "$profile" = "raid1" ] && [ "$degraded" -eq 1 ]; then
         local miss_str="${missing[*]:-none}"
-        log "BTRFS RAID1 degraded on $mount; missing devices: $miss_str"
+        log "check_btrfs_pool: RAID1 degraded on $mount; missing devices: $miss_str"
         printf "FAILED: RAID1_DEGRADED MISSING=%s" "$miss_str"
         return 1
     fi
     # For our purposes, treat scrub_errors>0 as FAILED
     if [ -n "$scrub_errors" ] && [ "$scrub_errors" -gt 0 ] 2>/dev/null; then
+        log "check_btrfs_pool: $mount -> SCRUB_ERRORS=$scrub_errors"
         printf "FAILED: SCRUB_ERRORS=%s" "$scrub_errors"
         return 1
     fi
+    log "check_btrfs_pool: $mount -> PASSED"
     printf "PASSED"
     return 0
 }
@@ -593,20 +502,39 @@ for d in "${array_disks[@]}"; do
                     health_status="FAILED"
                 fi
             else
-                # Ensure drive is spun up/woken before reading SMART
-                spin_up_device "$base_dev" 20 >/dev/null 2>&1 || true
-                sm=$(check_disk_smart "$base_dev" ) || true
-                if echo "$sm" | grep -qi "PASSED"; then
-                    health_desc+="SMART=PASSED; "
-                    # extract TEMP if provided by helper
-                    s_temp=$(echo "$sm" | sed -n 's/.*TEMP=\([0-9]*\).*/\1/p') || true
-                    if [ -n "$s_temp" ]; then temp="$s_temp"; fi
+                # If this resolves to an md device, run SMART against the underlying
+                # physical slaves (/dev/sdX) instead of the md parent device.
+                if echo "$base_dev" | grep -Eq '^/dev/md[0-9]+' ; then
+                    mdname=$(basename "$base_dev")
+                    mapfile -t mdslaves < <(get_md_slaves "$mdname" 2>/dev/null || true)
+                    if [ ${#mdslaves[@]} -gt 0 ]; then
+                        for slave_dev in "${mdslaves[@]}"; do
+                            [ -n "$slave_dev" ] || continue
+                            log "array: running SMART on md member $slave_dev (parent $mdname)"
+                            sm=$(check_disk_smart "$slave_dev" ) || true
+                            health_desc+="$slave_dev:$sm; "
+                            # update temp if provided
+                            s_temp=$(echo "$sm" | sed -n 's/.*TEMP=\([0-9]*\).*/\1/p') || true
+                            if [ -n "$s_temp" ]; then temp="$s_temp"; fi
+                            if echo "$sm" | grep -qi "FAILED"; then health_status="FAILED"; fi
+                        done
+                    fi
                 else
-                    health_desc+="$sm; "
-                    # extract temp from failed output too
-                    s_temp=$(echo "$sm" | sed -n "s/.*Temp=\([0-9]*\).*/\1/p") || true
-                    if [ -n "$s_temp" ]; then temp="$s_temp"; fi
-                    health_status="FAILED"
+                    # Rely on the tested check_disk_smart() gentle-read spin instead
+                    # of hdparm-based wake logic for broader HBA compatibility.
+                    sm=$(check_disk_smart "$base_dev" ) || true
+                    if echo "$sm" | grep -qi "PASSED"; then
+                        health_desc+="SMART=PASSED; "
+                        # extract TEMP if provided by helper
+                        s_temp=$(echo "$sm" | sed -n 's/.*TEMP=\([0-9]*\).*/\1/p') || true
+                        if [ -n "$s_temp" ]; then temp="$s_temp"; fi
+                    else
+                        health_desc+="$sm; "
+                        # extract temp from failed output too
+                        s_temp=$(echo "$sm" | sed -n "s/.*Temp=\([0-9]*\).*/\1/p") || true
+                        if [ -n "$s_temp" ]; then temp="$s_temp"; fi
+                        health_status="FAILED"
+                    fi
                 fi
             fi
     done <<< "$devs"
@@ -683,7 +611,7 @@ for p in "${pool_mounts[@]}"; do
             health_out=$(check_btrfs_pool "$p" ) || true
             if echo "$health_out" | grep -qi "PASSED"; then
                     pool_icon="✅"
-                    pool_info="BTRFS PASSED"
+                    pool_info="FS: btrfs PASSED"
                 else
                     pool_icon="⛔"
                     pool_info=$(echo "$health_out" | sed 's/FAILED: *//')
@@ -707,7 +635,7 @@ for p in "${pool_mounts[@]}"; do
                 pool_health_failures+=("$(basename "$p") - $xdesc")
             else
                 pool_icon="✅"
-                pool_info="XFS PASSED"
+                pool_info="FS: xfs PASSED"
             fi
         fi
         percent=$(awk "BEGIN {printf \"%.1f\", ($u/$size)*100}")
@@ -757,7 +685,7 @@ subject_metric=$(printf "%s Array: %s%% | Pools: %s%%" "$status_emoji" "$array_p
 
 log "Sending standard notification: $subject_metric"
 /usr/local/emhttp/webGui/scripts/notify \
-    -e "💾 Unraid Storage Report" \
+    -e "Disk Health & Storage" \
     -s "$subject_metric" \
     -i "normal" \
     -d "$description"
