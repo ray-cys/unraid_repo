@@ -1,0 +1,275 @@
+#####################################
+#          Collections YAML         #
+#####################################
+
+## This file is a Kometa collections file using builders
+## Kometa reads this file as default directory as /config/collections.yml
+
+collections:
+  ## IMDb Watchlist
+  # IMDb Watchlist:
+  #   imdb_watchlist:
+  #     user_id: ur170668654
+  #   smart_label: release.desc
+  #   sync_mode: sync
+  #   file_poster: config/assets/collection/Must-See-Shows.jpg
+  #   summary: >-
+  #           A collection of IMDb Watchlist.
+  #   content_rating: TV-MA
+  #   sort_title: +1
+  #   sonarr_add_missing: true
+  #   sonarr_search: true
+  #   sonarr_monitor: all
+  #   item_sonarr_tag: imdb-watchlist
+
+  ## IMDb Most Popular
+  # IMDb Most Popular TV Shows:
+  #   schedule: weekly(wednesday|saturday)
+  #   imdb_chart: popular
+  #   filters:
+  #     original_language: en, ja, th, zh
+  #   smart_label: release.desc
+  #   sync_mode: sync
+  #   file_poster: config/assets/collection/IMDb-Popular.jpg
+  #   summary: >-
+  #           A collection of IMDb user determined popular TV Shows.
+  #   content_rating: TV-MA
+  #   sort_title: +1
+
+  ## TMDb On The Air
+  TMDb On The Air:
+    tmdb_on_the_air: 30
+    collection_order: custom  
+    sync_mode: sync
+    file_poster: config/assets/collection/TMDb-On-The-Air.jpg
+    summary: >-
+            A collection of shows that are still actively airing episodes.
+    content_rating: TV-MA
+    sort_title: +
+      
+  ## TMDb Airing Today
+  TMDb Airing Today:
+    tmdb_airing_today: 100
+    collection_order: custom
+    sync_mode: sync
+    file_poster: config/assets/collection/TMDb-Airing-Today.jpg
+    summary: >-
+            A collection of shows with episodes airing today.
+    content_rating: TV-MA
+    sort_title: +
+    
+  ## TMDb Apple TV+
+  Apple TV+:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 2552
+    filters:
+      genre.not: Animation, Family, Reality
+    file_poster: config/assets/collection/Apple-TV+.jpg
+    summary: >-
+            A collection of Apple TV shows.
+    content_rating: TV-MA
+    sort_title: +2
+
+  ## TMDb AMC+
+  AMC+:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 174
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/AMC+.jpg
+    summary: >-
+            A collection of AMC+ shows.
+    content_rating: TV-MA
+    sort_title: +2
+      
+  ## TMDb Disney+
+  Disney+:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 2739
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/Disney+.jpg
+    summary: >-
+            A collection of Disney+ shows.
+    content_rating: TV-MA
+    sort_title: +2
+
+  ## TMDb Netflix
+  Netflix:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 213
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/Netflix.jpg
+    summary: >-
+            A collection of Netflix shows.
+    content_rating: TV-MA
+    sort_title: +2
+
+  ## TMDb HBO Max
+  HBO Max:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 3186
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/HBO-Max.jpg
+    summary: >-
+            A collection of HBO Max shows.
+    content_rating: TV-MA
+    sort_title: +2
+
+  ## TMDb Paramount+
+  Paramount+:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 4330
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/Paramount+.jpg
+    summary: >-
+            A collection of Paramount+ shows.
+    content_rating: TV-MA
+    sort_title: +2
+
+  ## TMDb Amazon Prime Video
+  Amazon Prime Video:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 1024
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/Prime-Video.jpg
+    summary: >-
+            A collection of Amazon Prime Video shows.
+    content_rating: TV-MA
+    sort_title: +2
+  
+  ## TMDb Hulu
+  Hulu:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 453
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/Hulu.jpg
+    summary: >-
+            A collection of Hulu shows.
+    content_rating: TV-MA
+    sort_title: +2
+
+  ## TMDb Showtime
+  Showtime:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 67
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/Showtime.jpg
+    summary: >-
+            A collection of Showtime shows.
+    content_rating: TV-MA
+    sort_title: +2
+  
+  ## TMDb Peacock
+  Peacock:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 3353
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/Peacock.jpg
+    summary: >-
+            A collection of Peacock shows.
+    content_rating: TV-MA
+    sort_title: +2
+
+  ## TMDb BET+
+  BET+:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 3343
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/BET+.jpg
+    summary: >-
+            A collection of BET+ shows.
+    content_rating: TV-MA
+    sort_title: +2
+
+  ## TMDb Channel 4
+  Channel 4:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 26
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/Channel4.jpg
+    summary: >-
+            A collection of Channel 4 shows.
+    content_rating: TV-MA
+    sort_title: +2
+
+  ## TMDb Crave
+  Crave:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 1344
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/Crave.jpg
+    summary: >-
+            A collection of Crave shows.
+    content_rating: TV-MA
+    sort_title: +2
+
+  ## TMDb Crunchyroll
+  Crunchyroll:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 1112
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/Crunchyroll.jpg
+    summary: >-
+            A collection of Crunchyroll shows.
+    content_rating: TV-MA
+    sort_title: +2
+
+  ## TMDb discovery+
+  discovery+:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 4353
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/discovery+.jpg
+    summary: >-
+            A collection of discovery+ shows.
+    content_rating: TV-MA
+    sort_title: +2
+
+  ## TMDb ITVX
+  ITVX:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 5871
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/ITVX.jpg
+    summary: >-
+            A collection of ITVX shows.
+    content_rating: TV-MA
+    sort_title: +2
+
+  ## TMDb Tubi
+  Tubi:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 5187
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/tubi.jpg
+    summary: >-
+            A collection of Tubi shows.
+    content_rating: TV-MA
+    sort_title: +2
+
+  ## TMDb YouTube
+  YouTube:
+    schedule: weekly(wednesday|saturday)
+    tmdb_network: 247
+    filters:
+      genre.not: Reality
+    file_poster: config/assets/collection/YouTube.jpg
+    summary: >-
+            A collection of YouTube shows.
+    content_rating: TV-MA
+    sort_title: +2

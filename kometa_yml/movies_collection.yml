@@ -1,0 +1,143 @@
+#####################################
+#          Collections YAML         #
+#####################################
+
+## This file is a Kometa collections file using builders
+## Kometa reads this file as default directory as /config/collections.yml
+
+collections:
+  ## IMDb Watchlist
+  # IMDb Watchlist:
+  #   imdb_watchlist:
+  #     user_id: ur170668654
+  #   smart_label: release.desc
+  #   sync_mode: sync
+  #   file_poster: config/assets/collection/Must-See-Movies.jpg
+  #   summary: >-
+  #           A collection of IMDb Watchlist.
+  #   content_rating: R
+  #   sort_title: +1
+  #   radarr_add_missing: true
+  #   radarr_search: true
+  #   radarr_monitor: true
+  #   item_radarr_tag: imdb-watchlist
+    
+   ## IMDb Box Office
+#   IMDb Box Office:
+#     schedule: weekly(monday)
+#     imdb_chart: box_office
+#     filters:
+#       original_language: en, ja, th, zh
+#     smart_label: release.desc
+#     sync_mode: sync
+#     file_poster: config/assets/collection/IMDb-Box-Office.jpg
+#     summary: >-
+#             A collection of IMDb weekly box office in United States
+#     content_rating: R
+#     sort_title: +
+    
+  ## IMDb Most Popular
+  # IMDb Most Popular Movies:
+  #   schedule: weekly(wednesday|saturday)
+  #   imdb_chart: popular_movies
+  #   filters:
+  #     original_language: en, ja, th, zh
+  #   smart_label: release.desc
+  #   sync_mode: sync
+  #   file_poster: config/assets/collection/IMDb-Popular.jpg
+  #   summary: >-
+  #           A collection of IMDb user determined popular Movies.
+  #   content_rating: R
+  #   sort_title: +
+      
+  ## TMDb Apple Studios
+#   Apple Studios:
+#     schedule: weekly(friday)
+#     tmdb_company: 194232
+#     filters:
+#       genre.not: Family, Animation
+#     sync_mode: sync
+#     file_poster: config/assets/collection/Apple-TV+.jpg
+#     summary: >-
+#             A collection of Apple TV movies.
+#     content_rating: R
+#     sort_title: +2
+#     radarr_add_missing: true
+#     item_radarr_tag: appletv
+
+## TMDb Franchises      
+dynamic_collections:
+  TMDb Collections:
+    type: tmdb_collection
+    sync: true
+    remove_suffix: 
+      - "Collection"
+      - "Trilogy"
+    key_name_override:
+      The White Storm Collection: 掃毒
+      A Chinese Odyssey Collection: 大话西游
+      Cold War Collection: 寒戰
+      Creation of the Gods Trilogy: 封神三部曲
+      Death Whisperer Collection: ตำนาน ธี่หยด
+      Detective Chinatown Collection: 唐人街探案
+      Detective vs. Sleuths Collection: 神探大战
+      Election Collection: 黑社會
+      The Ex-Files Collection: 前任攻略
+      Eye for an Eye Collection: 目中无人
+      Iceman Collection: 冰封侠
+      Infernal Affairs Collection: 無間道
+      Ip Man Collection: 葉問
+      Kingdom Collection: キングダム
+      Line Walker Collection: 使徒行者
+      The Monkey King Collection: 西游记
+      Ne Zha Collection: 哪吒
+      New Kung Fu Cult Master Collection: 新倚天屠龙记
+      Overheard Collection: 竊聽風雲
+      Red Cliff Collection: 赤壁
+      Shock Wave Collection: 拆彈專家
+      SPL Collection: 殺破狼
+      Storm Series: 反貪風暴
+      The Tag-Along: 紅衣小女孩
+      Triad Collection: 紮職
+      Twilight of the Warrriors Collection: 九龙城寨
+      Wandering Earth Collection: 流浪地球
+      Young and Dangerous Collection: 古惑仔
+      Gatao Collection: 角头
+    title_override:
+      233112: 掃毒
+      1403134: 紮職系列
+      1073029: 流浪地球
+      1180127: 古惑仔
+      505857:  紅衣小女孩
+      470522: 反貪風暴
+      436982: 殺破狼
+      392206: 西游记
+      627716: 使徒行者
+      982641: キングダム
+      528179: 冰封侠
+      1242377: 目中无人
+      832241: 前任攻略
+      159613: 黑社會
+      1257541: 神探大战
+      525451: 唐人街探案
+      1394075: 九龙城寨
+      201544: 大话西游
+      1211317: 封神三部曲
+      1254578: ตำนาน ธี่หยด
+      70068: 葉問
+      58588: 無間道
+      935154: 新倚天屠龙记
+      324703: 竊聽風雲
+      644309: 扫毒
+      404302: 寒戰
+      96677: 赤壁
+      1449595: 哪吒
+      762278: 拆彈專家
+      222639: 神探狄仁傑
+      717062: 角头
+    exclude:
+      - Godzilla (MonsterVerse)
+      - Godzilla One Collection
+      - Kong Collection
+      - Detective vs. Sleuths Collection
+      - Lucy Collection

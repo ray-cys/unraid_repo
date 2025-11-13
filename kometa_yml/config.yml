@@ -1,0 +1,354 @@
+#####################################
+#         Configuration YAML        #
+#####################################
+
+## This file is a Kometa config file using pre-created Metadata, Operations, Collections and Overlays
+## Kometa reads this file as default directory as /config/config.yml
+## For default or advanced configuration, see wiki for how to use local files, folders, URLs, or files https://kometa.wiki/en/latest/
+
+libraries:
+
+#####################################
+#              Movies               #
+#####################################
+
+  Movies:                            # Movies library in Plex
+    ## Missing Reports
+    report_path: config/reports/movie_report.yml
+    ## Metadata
+    metadata_files:
+    - file: config/metadata/movie_metadata.yml
+
+    ## Collections
+    collection_files:
+    - file: config/collections/movie_collection.yml
+      schedule: daily
+
+    ## Overlays
+    reapply_overlays: false
+    remove_overlays: false           # Set to true to remove all overlays
+    schedule_overlays: non_existing
+    overlay_files:
+    - file: config/overlays/media_info.yml
+    - file: config/overlays/audience_rating.yml
+    settings:
+      asset_directory: config/assets/movie
+      prioritize_assets: true
+      only_filter_missing: true
+      show_unfiltered: false
+      show_filtered: true
+
+    ## Operations
+    operations:
+    - schedule: daily
+      assets_for_all: true
+      show_missing_assets: true
+      metadata_backup:
+        path: config/backups/movie_backup.yml
+        sync_tags: true
+        add_blank_entries: false
+        exclude:
+          - DV
+          - HDR
+          - Plus
+          - DV-HDR
+          - DV-Plus
+          - DigitalPlus
+          - DTS-HD
+          - Atmos
+          - TrueHD-Atmos
+          - DV-DigitalPlus
+          - HDR-DigitalPlus
+          - Plus-DigitalPlus
+          - DV-HDR-DigitalPlus
+          - DV-Plus-DigitalPlus
+          - DV-DTS-HD
+          - HDR-DTS-HD
+          - Plus-DTS-HD
+          - DV-HDR-DTS-HD
+          - DV-Plus-DTS-HD
+          - DV-Atmos
+          - HDR-Atmos
+          - Plus-Atmos
+          - DV-HDR-Atmos
+          - DV-Plus-Atmos
+          - DV-TrueHD-Atmos
+          - HDR-TrueHD-Atmos
+          - Plus-TrueHD-Atmos
+          - DV-HDR-TrueHD-Atmos
+          - DV-Plus-TrueHD-Atmos
+          - 720P
+          - 1080P
+          - Ultra-HD
+    - schedule: weekly(wednesday|saturday|sunday)
+      mass_user_rating_update: imdb
+      mass_genre_update: tmdb
+      mass_content_rating_update: 
+        - mdb_commonsense
+      mass_studio_update: tmdb
+      mass_originally_available_update: tmdb
+
+#####################################
+#              TV Shows             #
+#####################################
+
+  TV Shows:                          # TV Shows library in Plex
+    ## Missing Reports
+    report_path: config/reports/tv_report.yml
+    ## Metadata
+    metadata_files:
+    - file: config/metadata/tv_metadata.yml
+
+    ## Collections
+    collection_files:
+    - file: config/collections/tv_collection.yml
+      schedule: daily
+
+    ## Overlays
+    reapply_overlays: false
+    remove_overlays: false           # Set to true to remove all overlays
+    schedule_overlays: non_existing
+    overlay_files:
+    - file: config/overlays/media_info.yml
+      template_variables:
+        resolution_only: true
+    - default: status
+      template_variables:
+        text_airing: A  I  R  I  N  G
+        text_returning: R  E  T  U  R  N  I  N  G
+        text_canceled: C  A  N  C  E  L  E  D
+        text_ended: E  N  D  E  D
+        horizontal_align: center
+        vertical_offset: 45
+        vertical_align: bottom
+        font_color_airing: '#27C24C'
+        font_color_returning: '#FFA500'
+        font_color_canceled: '#ED1F1F'
+        font_color_ended: '#FF0000'
+        back_color: '#00000000'
+        back_width_airing: 300
+        back_width_returning: 480
+        back_width_canceled: 430
+        back_width_ended: 280
+        back_height: 34
+        font: config/fonts/Arial.ttf
+        font_size: 46
+    - file: config/overlays/media_info.yml
+      template_variables:
+        builder_level: season
+        resolution_only: true
+    - default: network
+      template_variables:
+        builder_level: season
+        vertical_align: bottom
+        back_color: '#00000000'
+    - file: config/overlays/media_info.yml
+      template_variables:
+        builder_level: episode
+        audio_only: true
+    - default: runtimes
+      template_variables:
+        builder_level: episode
+        vertical_align: bottom
+        text: 'R U N T I M E: '
+        format: <<runtimeH>> H <<runtimeM>> M
+        back_color: '#00000000'
+        font: config/fonts/Arial.ttf
+        font_size: 46
+    settings:
+      asset_directory: config/assets/tv
+      prioritize_assets: true
+      only_filter_missing: true
+      show_unfiltered: false
+      show_filtered: true
+
+    ## Operations
+    operations:
+    - schedule: daily
+      assets_for_all: true
+      show_missing_assets: true
+      metadata_backup:
+        path: config/backups/tv_backup.yml
+        sync_tags: true
+        add_blank_entries: false
+        exclude:
+          - DV
+          - HDR
+          - Plus
+          - DV-HDR
+          - DV-Plus
+          - DigitalPlus
+          - DTS-HD
+          - Atmos
+          - TrueHD-Atmos
+          - DV-DigitalPlus
+          - HDR-DigitalPlus
+          - Plus-DigitalPlus
+          - DV-HDR-DigitalPlus
+          - DV-Plus-DigitalPlus
+          - DV-DTS-HD
+          - HDR-DTS-HD
+          - Plus-DTS-HD
+          - DV-HDR-DTS-HD
+          - DV-Plus-DTS-HD
+          - DV-Atmos
+          - HDR-Atmos
+          - Plus-Atmos
+          - DV-HDR-Atmos
+          - DV-Plus-Atmos
+          - DV-TrueHD-Atmos
+          - HDR-TrueHD-Atmos
+          - Plus-TrueHD-Atmos
+          - DV-HDR-TrueHD-Atmos
+          - DV-Plus-TrueHD-Atmos
+          - 720P
+          - 1080P
+          - Ultra-HD
+    - schedule: weekly(wednesday|saturday|sunday)
+      mass_user_rating_update: imdb
+      mass_episode_user_rating_update: tmdb
+      mass_genre_update: tmdb
+      mass_content_rating_update: 
+        - mdb_commonsense
+      mass_studio_update: tmdb
+      mass_originally_available_update: tmdb
+
+#####################################
+#           Formula 1               #
+#####################################
+
+  Formula 1:                          # Formula 1 library in Plex
+    ## Metadata
+    metadata_files:
+    - file: config/metadata/formula1.yml
+      schedule: daily
+    settings:
+      save_report: false
+      create_asset_folders: false
+      asset_directory: config/assets/formula1
+      show_missing_assets: false
+    operations:
+      assets_for_all: false
+      
+#####################################
+#       Global Configuration        #
+#####################################
+
+## Global Settings
+settings:
+  run_order:
+  - operations
+  - metadata
+  - collections
+  - overlays
+  cache: true
+  cache_expiration: 2           # Cache files expiration in days
+  asset_directory:              # config/assets
+  - config/assets/movie
+  - config/assets/tv
+  - config/assets/collection
+  asset_folders: true
+  asset_depth: 1
+  create_asset_folders: true
+  prioritize_assets: true
+  dimensional_asset_rename: false
+  download_url_assets: true
+  show_missing_assets: true
+  show_missing_season_assets: false
+  show_missing_episode_assets: false
+  show_asset_not_needed: true
+  sync_mode: sync
+  minimum_items: 2
+  default_collection_order: release
+  delete_below_minimum: true
+  delete_not_scheduled: false
+  run_again_delay: 2
+  missing_only_released: false
+  only_filter_missing: false
+  show_unmanaged: true
+  show_unconfigured: true
+  show_filtered: false
+  show_unfiltered: false
+  show_options: false
+  show_missing: true
+  save_report: true
+  playlist_report: true
+  tvdb_language: eng
+  ignore_ids:
+  ignore_imdb_ids:
+  item_refresh_delay: 0
+  playlist_sync_to_user: all
+  playlist_exclude_users:
+  verify_ssl: true
+  custom_repo:
+  check_nightly: false
+  overlay_artwork_filetype: jpg
+  overlay_artwork_quality: 95
+
+## Plex Media Server
+plex:                            # REQUIRED for script to run
+  url: http://172.20.0.1:32400
+  token: mCchr9sBsF-Xfc5DpUzn
+  timeout: 360
+  db_cache: 8192
+  clean_bundles: false
+  empty_trash: false
+  optimize: true
+  verify_ssl:
+
+## TMDb API
+tmdb:                            # TMDb API REQUIRED for script to run
+  apikey: f4d8afd8ed2c6aec5bfe776420a54659
+  language: en
+  region: US
+  cache_expiration: 30
+
+## Tautulli
+tautulli:
+  url: http://tautulli:8181
+  apikey: f6f75978a22c4db2aa5f61b9bbcab8d3
+
+## Radarr
+radarr:                          # Used for automate downloading Movies
+  url: http://radarr:7878
+  token: b4ed2a7712a94452af292abd28f0f195
+  add_missing: false
+  add_existing: true
+  root_folder_path: /data/movies
+  monitor: false
+  availability: announced
+  quality_profile: UHD Bluray + WEB
+  tag:
+  search: false
+  radarr_path:
+  plex_path:
+  upgrade_existing: false
+  monitor_existing: false
+  ignore_cache: false
+
+## Sonarr
+sonarr:                          # Used for automate downloading TV Shows
+  url: http://sonarr:8989
+  token: feda53a1ba44401fb441f3f0cd77d6bb
+  add_missing: false
+  add_existing: true
+  root_folder_path: /data/series
+  monitor: none
+  quality_profile: WEB-1080p
+  language_profile: English
+  series_type: standard
+  season_folder: true
+  tag:
+  search: false
+  cutoff_search: false
+  sonarr_path:
+  plex_path:
+  upgrade_existing: false
+  monitor_existing: false
+  ignore_cache: false
+
+## mDBlist
+mdblist:                        # MDbList API for ratings
+  apikey: hdi17n2ropa80hbr8jjl7rhpq
+  cache_expiration: 60
+
