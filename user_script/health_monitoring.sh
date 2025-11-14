@@ -1,7 +1,17 @@
 #!/bin/bash
+set -euo pipefail
+LOCKFILE="/tmp/health_monitoring.lock"
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - Another run active, exiting (lock: $LOCKFILE)" >&2
+    exit 1
+fi
+
+# Refactored per recommendations: improved notify usage, SMART scheduling, Btrfs/XFS parsing,
+# corrected usage thresholds, temperature fallback, and lightweight locking.
 # Unified Unraid SMART + Btrfs + XFS Monitor (Enhanced)
 # Features added/updated per user request:
-# 1) Timestamped logs/reports
+# 1) Timestamped logs
 # 2) Use Unraid notify for failures (warning = notify type)
 # 3) SMART parsing: pending sectors, reallocated, temperature etc. -> OK/WARNING/CRITICAL
 # 4) Per-disk storage used/available + percentage + threshold reporting
@@ -10,13 +20,35 @@
 # 7) NVMe detailed parsing (wear, life left) - see function nvme_parse_details
 
 # ---------------- Configuration ----------------
-SMART_TEST_TYPE="long"       # "short" or "long"
-SMART_INTERVAL_DAYS=30        # Days between long tests per disk
-ENABLE_NOTIFY=1               # 1 = yes, 0 = no
+SMART_TEST_TYPE="short"       # "short" or "long" (long will only start if interval met)
+SMART_INTERVAL_DAYS=30        # Days between long SMART tests per disk (based on self-test log)
 WARN_THRESHOLD_PERCENT=80     # percentage used per-disk to warn
 CRITICAL_THRESHOLD_PERCENT=90 # percentage used per-disk to critical-alert
+THRESHOLD=90                  # Byte-accurate group threshold for array/pools
+NEAR_THRESHOLD_DELTA=5        # Near-threshold window in percent
+POOL_EXCLUDES=("ramtmp" "user0") # Pool names to exclude from byte summary
+EMAIL_ENABLED=0               # 1 to send consolidated summary by email
+EMAIL_TO=""                   # Set recipient address when EMAIL_ENABLED=1
+SHORT_TEST_POLL=1             # Poll short tests until completion within script (Option 2)
+SHORT_TEST_MAX_WAIT=180       # Max seconds to wait for short test completion
+SHORT_TEST_POLL_INTERVAL=10   # Interval seconds between polls
+
+# Notification formatting options (added for configurability)
+STORAGE_STATUS_EMOJI_GREEN="🟢"
+STORAGE_STATUS_EMOJI_YELLOW="🟡"
+STORAGE_STATUS_EMOJI_RED="🔴"
+
+# Additional execution toggles
+ENABLE_BTRFS_SCRUB=0          # 1 run btrfs scrub (guarded), 0 only read last status
+ENABLE_XFS_CHECK=0            # 1 run xfs_repair -n (read-only check), 0 skip
+
+# Initialize storage metric globals for notifications/alerts
+ARRAY_COUNT=0 ARRAY_PERCENT="" ARRAY_USED_BYTES=0 ARRAY_TOTAL_BYTES=0 ARRAY_USED_HR="" ARRAY_TOTAL_HR=""
+POOLS_COUNT=0 POOLS_PERCENT="" POOLS_USED_BYTES=0 POOLS_TOTAL_BYTES=0 POOLS_USED_HR="" POOLS_TOTAL_HR=""
 
 # Thresholds for SMART attributes (you can tune these)
+ALERT_WARN=()
+ALERT_CRIT=()
 RELOC_WARNING=1               # Reallocated sectors >= this -> warning
 RELOC_CRITICAL=10             # >= this -> critical
 PEND_WARNING=1                # Pending sectors >= -> critical (treat as critical)
@@ -27,43 +59,88 @@ NVME_PERCENT_USED_CRIT=90
 
 # Log files (timestamped)
 TIMESTAMP=$(date +%Y-%m-%d_%H%M%S)
-LOG_DIR="/var/log/unraid_monitor"
+LOG_DIR="/boot/logs/disk-health"
 mkdir -p "$LOG_DIR"
 SMART_LOG="$LOG_DIR/unraid_smart_$TIMESTAMP.log"
 BTRFS_LOG="$LOG_DIR/unraid_btrfs_$TIMESTAMP.log"
 XFS_LOG="$LOG_DIR/unraid_xfs_$TIMESTAMP.log"
-REPORT_DIR="/var/log/unraid_reports"
-mkdir -p "$REPORT_DIR"
-REPORT_FILE="$REPORT_DIR/unraid_report_$TIMESTAMP.txt"
-SMART_LAST="/boot/config/plugins/unraid_smart_last_test.log"
+SMART_LONG_STATE_FILE="$LOG_DIR/unraid_smart_long_processed.log"
+SMART_LAST="/boot/logs/disk-health/unraid_smart_last_test.log"
 
 # Notification titles
 NOTIFY_TITLE_SMART="SMART Test Alert"
 NOTIFY_TITLE_BTRFS="Btrfs Scrub Alert"
 NOTIFY_TITLE_XFS="XFS Alert"
 
-# Optional: run XFS metadata check (set 1 to enable)
-RUN_XFS_CHECK=0
-
-# Helper: Unraid notify wrapper (type: 'warning' or 'critical')
+# ---------------- Helper Functions ----------------
+# Helper: Unraid notify wrapper (severity: ok|warning|critical)
 notify_unraid() {
-    local title="$1"
-    local body="$2"
-    local type=${3:-"warning"}
-    # Use dynamix system utilities notification plugin if available
-    if [ -x "/usr/local/emhttp/plugins/dynamix.system.utilities/scripts/notify" ]; then
-        /usr/local/emhttp/plugins/dynamix.system.utilities/scripts/notify "$body" "$title"
+    local title="$1"; shift
+    local body="$1"; shift
+    local sev="${1:-warning}"  # ok|warning|critical
+    local icon="normal"
+    case "$sev" in
+        critical|CRITICAL) icon="alert" ;;
+        warning|WARNING) icon="warning" ;;
+        *) icon="normal" ;;
+    esac
+    local BIN="/usr/local/emhttp/webGui/scripts/notify"
+    if [ -x "$BIN" ]; then
+        "$BIN" -e "Disk Health Monitor" -s "$title" -d "$body" -i "$icon"
     else
-        # Fallback to logger
-        logger -t unraid_monitor "$title: $body"
+        logger -t "Disk Health Monitor" "$title: $body"
     fi
+}
+
+# Accumulate alerts (warning/critical) for nightly consolidated summary.
+record_alert() {
+    local sev="$1"; shift
+    local title="$1"; shift
+    local body="$1"; shift
+    if [[ "$sev" =~ ^(critical|CRITICAL)$ ]]; then
+        ALERT_CRIT+=("$title: $body")
+    else
+        ALERT_WARN+=("$title: $body")
+    fi
+}
+
+# Human-readable bytes (decimal units: KB=1000)
+human_readable() {
+    local bytes=${1:-0}
+    local KB=1000
+    local MB=$((KB*KB))
+    local GB=$((MB*KB))
+    local TB=$((GB*KB))
+    if (( bytes < KB )); then printf "%d B" "$bytes"; return; fi
+    if (( bytes < MB )); then awk -v b="$bytes" -v k="$KB" 'BEGIN{printf "%.2f KB", b/k}'; return; fi
+    if (( bytes < GB )); then awk -v b="$bytes" -v m="$MB" 'BEGIN{printf "%.2f MB", b/m}'; return; fi
+    if (( bytes < TB )); then awk -v b="$bytes" -v g="$GB" 'BEGIN{printf "%.2f GB", b/g}'; return; fi
+    awk -v b="$bytes" -v t="$TB" 'BEGIN{printf "%.2f TB", b/t}'
 }
 
 # ---------------- Disk and SMART Helpers ----------------
 get_all_disks() {
-    local sata=$(ls /dev/sd? 2>/dev/null | grep -v '[0-9]$')
-    local nvme=$(ls /dev/nvme?n? 2>/dev/null)
-    echo "$sata $nvme"
+    # Retain original discovery method as per user preference; spins up disks intentionally.
+    local sata nvme out=()
+    sata=$(ls /dev/sd? 2>/dev/null | grep -v '[0-9]$' || true)
+    nvme=$(ls /dev/nvme?n? 2>/dev/null || true)
+    # Determine the root device for /boot and exclude it (handles sdX1 and nvmeXpY)
+    local boot_src boot_root=""
+    boot_src=$(findmnt -n -o SOURCE /boot 2>/dev/null || true)
+    if [[ -n "$boot_src" ]]; then
+        if [[ "$boot_src" == /dev/nvme* ]]; then
+            boot_root=$(echo "$boot_src" | sed -E 's/p[0-9]+$//')
+        else
+            boot_root=$(echo "$boot_src" | sed -E 's/[0-9]+$//')
+        fi
+    fi
+    for d in $sata $nvme; do
+        if [[ -n "$boot_root" && "$d" == "$boot_root" ]]; then
+            continue
+        fi
+        out+=("$d")
+    done
+    echo "${out[@]}"
 }
 
 # Load last SMART test dates
@@ -99,305 +176,625 @@ nvme_parse_details() {
 evaluate_smart() {
     local disk=$1
     local is_nvme=0
-    if [[ $disk == /dev/nvme* ]]; then is_nvme=1; fi
-
-    # Initialize state
+    [[ $disk == /dev/nvme* ]] && is_nvme=1
     local state="OK"
     local messages=()
-
     if [[ $is_nvme -eq 1 ]]; then
-        # NVMe specific checks
         local nvme_output
-        nvme_output=$(smartctl -A -d nvme $disk 2>/dev/null)
-        # Percentage Used
-        percent_used=$(echo "$nvme_output" | awk -F: '/Percentage Used/ {gsub(/%/,"",$2); print $2}' | tr -d ' ')
+        nvme_output=$(smartctl -a -d nvme "$disk" 2>/dev/null || true)
+        local percent_used crit_warn nvme_temp
+        percent_used=$(echo "$nvme_output" | awk -F: '/Percentage Used/ {gsub(/%| /,"",$2); print $2; exit}')
         percent_used=${percent_used:-0}
-        crit_warn=$(echo "$nvme_output" | awk -F: '/Critical Warning/ {gsub(/ /, "", $2); print $2}' | tr -d ' ')
+        crit_warn=$(echo "$nvme_output" | awk -F: '/Critical Warning/ {gsub(/ |\t/,"",$2); print $2; exit}')
         crit_warn=${crit_warn:-0}
+        # Extract numeric NVMe temperature (strip units/words like "Celsius")
+        nvme_temp=$(echo "$nvme_output" | awk -F: '/Temperature/ {print $2; exit}' | grep -oE '[0-9]+' | head -n1)
         if [[ $percent_used -ge $NVME_PERCENT_USED_CRIT ]]; then
-            state="CRITICAL"
-            messages+=("NVMe Percentage Used ${percent_used}% >= ${NVME_PERCENT_USED_CRIT}%")
+            state="CRITICAL"; messages+=("NVMe wear ${percent_used}% >= ${NVME_PERCENT_USED_CRIT}%")
         elif [[ $percent_used -ge $NVME_PERCENT_USED_WARN ]]; then
-            state="WARNING"
-            messages+=("NVMe Percentage Used ${percent_used}% >= ${NVME_PERCENT_USED_WARN}%")
+            state="WARNING"; messages+=("NVMe wear ${percent_used}% >= ${NVME_PERCENT_USED_WARN}%")
         fi
         if [[ $crit_warn -ne 0 ]]; then
-            state="CRITICAL"
-            messages+=("NVMe Critical Warning flags: $crit_warn")
+            state="CRITICAL"; messages+=("NVMe Critical Warning flags: $crit_warn")
         fi
-    else
-        # SATA/SAS/SSD checks
-        local attr
-        attr=$(smartctl -A $disk 2>/dev/null)
-        # Reallocated sectors
-        realloc=$(echo "$attr" | awk '/Reallocated_Sector_Ct/ {print $10}' | head -n1)
-        realloc=${realloc:-0}
-        if [[ $realloc -ge $RELOC_CRITICAL ]]; then
-            state="CRITICAL"
-            messages+=("Reallocated sectors = $realloc (>= $RELOC_CRITICAL)")
-        elif [[ $realloc -ge $RELOC_WARNING ]]; then
-            state="WARNING"
-            messages+=("Reallocated sectors = $realloc (>= $RELOC_WARNING)")
-        fi
-        pending=$(echo "$attr" | awk '/Current_Pending_Sector/ {print $10}' | head -n1)
-        pending=${pending:-0}
-        if [[ $pending -ge $PEND_WARNING ]]; then
-            state="CRITICAL"
-            messages+=("Current Pending Sectors = $pending")
-        fi
-        offunc=$(echo "$attr" | awk '/Offline_Uncorrectable/ {print $10}' | head -n1)
-        offunc=${offunc:-0}
-        if [[ $offunc -gt 0 ]]; then
-            state="CRITICAL"
-            messages+=("Offline Uncorrectable = $offunc")
-        fi
-        temp=$(echo "$attr" | awk '/Temperature_Celsius/ {print $10; exit}' )
-        temp=${temp:-0}
-        if [[ $temp -ge $TEMP_CRITICAL ]]; then
-            state="CRITICAL"
-            messages+=("Temperature = ${temp}C >= ${TEMP_CRITICAL}C")
-        elif [[ $temp -ge $TEMP_WARNING ]]; then
-            if [[ "$state" != "CRITICAL" ]]; then state="WARNING"; fi
-            messages+=("Temperature = ${temp}C >= ${TEMP_WARNING}C")
-        fi
-        udma=$(echo "$attr" | awk '/UDMA_CRC_Error_Count/ {print $10; exit}' )
-        udma=${udma:-0}
-        if [[ $udma -gt 0 ]]; then
-            if [[ "$state" != "CRITICAL" ]]; then state="WARNING"; fi
-            messages+=("UDMA CRC Errors = $udma")
-        fi
-    fi
-
-    # Output: state and messages
-    echo "$state"
-    for m in "${messages[@]}"; do echo "$m"; done
-}
-
-# Get per-disk usage (human readable and percentage)
-get_disk_usage() {
-    local disk=$1
-    # find matching DF line; try matching full device name or basename
-    local bname=$(basename $disk)
-    local line
-    line=$(df -h | awk -v d="$disk" -v b="$bname" '$1==d || $1=="/dev/"b {print $0}')
-    if [ -z "$line" ]; then
-        # fallback: look for any df line containing basename
-        line=$(df -h | grep $bname | head -n1)
-    fi
-    if [ -z "$line" ]; then
-        echo "NO_MOUNT 0 0 0"
-        return
-    fi
-    # parse: Filesystem Size Used Avail Use% Mounted on
-    local fs size used avail usep mp
-    read -r fs size used avail usep mp <<<$(echo $line | awk '{print $1" " $2" " $3" " $4" " $5" " $6}')
-    echo "$mp $size $used $avail $usep"
-}
-
-# Get total storage used/available for arrays and pools
-get_total_usage() {
-    # Array (user share) total
-    local arr_line
-    arr_line=$(df -h | awk '$6=="/mnt/user" {print $2" "$3" "$4" "$5}')
-    echo "$arr_line"
-}
-
-# ---------------- SMART test runner ----------------
-run_smart_test() {
-    local disk=$1
-    local now=$(date +%s)
-    if [[ -n "${LAST_TEST[$disk]}" ]]; then
-        local last_sec
-        last_sec=$(date -d "${LAST_TEST[$disk]}" +%s 2>/dev/null || date -j -f "%Y-%m-%d" "${LAST_TEST[$disk]}" +%s 2>/dev/null)
-        if [[ -n "$last_sec" ]]; then
-            local diff_days=$(( (now - last_sec) / 86400 ))
-            if [[ $diff_days -lt $SMART_INTERVAL_DAYS ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Skipping $disk, last SMART test $diff_days days ago" | tee -a "$SMART_LOG"
-                return
+        if [[ -n "$nvme_temp" ]]; then
+            if [[ $nvme_temp -ge $TEMP_CRITICAL ]]; then
+                state="CRITICAL"; messages+=("NVMe Temp ${nvme_temp}C >= ${TEMP_CRITICAL}C")
+            elif [[ $nvme_temp -ge $TEMP_WARNING && $state != CRITICAL ]]; then
+                [[ $state == OK ]] && state="WARNING"; messages+=("NVMe Temp ${nvme_temp}C >= ${TEMP_WARNING}C")
             fi
         fi
-    fi
-
-    [[ $disk == /dev/sd* ]] && hdparm -I $disk >/dev/null 2>&1
-    local flag="-t long"
-    [[ "$SMART_TEST_TYPE" == "short" ]] && flag="-t short"
-
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting $SMART_TEST_TYPE test on $disk" | tee -a "$SMART_LOG"
-
-    if [[ $disk == /dev/nvme* ]]; then
-        smartctl $flag -d nvme $disk >/dev/null 2>&1
     else
-        smartctl $flag $disk >/dev/null 2>&1
+        local attr realloc pending offunc temp udma
+        attr=$(smartctl -A "$disk" 2>/dev/null || true)
+        realloc=$(echo "$attr" | awk '/Reallocated_Sector_Ct/ {print $10; exit}')
+        realloc=${realloc:-0}
+        if [[ $realloc -ge $RELOC_CRITICAL ]]; then
+            state="CRITICAL"; messages+=("Reallocated = $realloc (>= $RELOC_CRITICAL)")
+        elif [[ $realloc -ge $RELOC_WARNING ]]; then
+            state="WARNING"; messages+=("Reallocated = $realloc (>= $RELOC_WARNING)")
+        fi
+        pending=$(echo "$attr" | awk '/Current_Pending_Sector/ {print $10; exit}')
+        pending=${pending:-0}
+        if [[ $pending -ge $PEND_WARNING ]]; then
+            state="CRITICAL"; messages+=("Pending sectors = $pending")
+        fi
+        offunc=$(echo "$attr" | awk '/Offline_Uncorrectable/ {print $10; exit}')
+        offunc=${offunc:-0}
+        if [[ $offunc -gt 0 ]]; then
+            state="CRITICAL"; messages+=("Offline Uncorrectable = $offunc")
+        fi
+        temp=$(echo "$attr" | awk '/Temperature_Celsius|Airflow_Temperature_Cel/ {print $10; exit}')
+        temp=${temp:-0}
+        if [[ $temp -ge $TEMP_CRITICAL ]]; then
+            state="CRITICAL"; messages+=("Temp ${temp}C >= ${TEMP_CRITICAL}C")
+        elif [[ $temp -ge $TEMP_WARNING && $state != CRITICAL ]]; then
+            [[ $state == OK ]] && state="WARNING"; messages+=("Temp ${temp}C >= ${TEMP_WARNING}C")
+        fi
+        udma=$(echo "$attr" | awk '/UDMA_CRC_Error_Count/ {print $10; exit}')
+        udma=${udma:-0}
+        if [[ $udma -gt 0 && $state != CRITICAL ]]; then
+            [[ $state == OK ]] && state="WARNING"; messages+=("UDMA CRC Errors = $udma")
+        fi
     fi
+    echo "$state"; for m in "${messages[@]}"; do echo "$m"; done
+}
 
-    sleep 5
-    # Evaluate immediate SMART attributes
-    state_and_msgs=$(evaluate_smart $disk)
+# -------- SMART self-test helpers --------
+get_latest_selftest_info() {
+    # Returns: test_num|test_type|status_phrase|lifetime_hours|remaining_pct
+    local disk=$1
+    local out
+    if [[ $disk == /dev/nvme* ]]; then
+        out=$(smartctl -l selftest -d nvme "$disk" 2>/dev/null || true)
+    else
+        out=$(smartctl -l selftest "$disk" 2>/dev/null || true)
+    fi
+    # SATA style: lines starting with number; NVMe similar or may be limited
+    local line
+    line=$(echo "$out" | awk 'NR>5 && $1 ~ /^[0-9]+$/ {print; exit}')
+    if [[ -z "$line" ]]; then
+        echo "|||"; return
+    fi
+    local num type status lifetime remaining
+    num=$(echo "$line" | awk '{print $1}')
+    type=$(echo "$line" | awk '{print $2" "$3}')
+    # Status may span multiple fields; detect Remaining and Lifetime to split
+    remaining=$(echo "$line" | grep -o '[0-9]\+%\?' | head -n1)
+    lifetime=$(echo "$line" | awk '{for(i=1;i<=NF;i++){if($i ~ /hours/){print $(i-1); break}}}')
+    # Extract status phrase between type fields and Remaining
+    status=$(echo "$line" | sed -E 's/^\s*[0-9]+\s+[^ ]+\s+[^ ]+\s+//' | sed -E 's/\s+[0-9]+%.*//' )
+    echo "${num}|${type}|${status}|${lifetime}|${remaining}"
+}
+
+classify_selftest_status() {
+    local status="$1"
+    local sev="OK"
+    local msg="$status"
+    if echo "$status" | grep -qi "in progress"; then
+        sev="INPROGRESS"
+    elif echo "$status" | grep -qiE "Completed without error|without error|no error|passed"; then
+        sev="OK"
+    elif echo "$status" | grep -qiE "read failure|uncorrectable|failed"; then
+        sev="CRITICAL"; msg="Self-test critical: $status"
+    elif echo "$status" | grep -qiE "aborted|interrupted"; then
+        sev="WARNING"; msg="Self-test did not complete cleanly: $status"
+    elif echo "$status" | grep -qi "Completed"; then
+        sev="WARNING"; msg="Self-test completed with issues: $status"
+    else
+        sev="WARNING"; msg="Self-test ambiguous status: $status"
+    fi
+    echo "$sev|$msg"
+}
+
+poll_short_test_completion() {
+    local disk=$1
+    local waited=0
+    local info status sev msg
+    while (( waited < SHORT_TEST_MAX_WAIT )); do
+        info=$(get_latest_selftest_info "$disk")
+        if [[ "$info" == "|||" ]]; then
+            # Unsupported / empty self-test log; treat as OK and skip polling
+            echo "OK|Self-test log unavailable; skipping polling"
+            return 0
+        fi
+        status=$(echo "$info" | awk -F'|' '{print $3}')
+        local class
+        class=$(classify_selftest_status "$status")
+        sev=$(echo "$class" | awk -F'|' '{print $1}')
+        msg=$(echo "$class" | awk -F'|' '{print $2}')
+        if [[ $sev != INPROGRESS ]]; then
+            echo "$sev|$msg"
+            return 0
+        fi
+        sleep $SHORT_TEST_POLL_INTERVAL
+        waited=$(( waited + SHORT_TEST_POLL_INTERVAL ))
+    done
+    echo "INPROGRESS|Short test still running after ${SHORT_TEST_MAX_WAIT}s"
+    return 0
+}
+
+# Run SMART test (short or long based on SMART_TEST_TYPE & interval)
+run_smart_test() {
+    local disk=$1
+    [[ $disk == /dev/sd* ]] && hdparm -I "$disk" >/dev/null 2>&1 || true
+    local flag="-t short"
+    if [[ "$SMART_TEST_TYPE" == "long" ]]; then
+        # Determine interval using lifetime hours vs last long test lifetime hours
+        local selftest poh_attr poh current_poh last_long_hours_diff="" threshold_hours last_long_poh
+        if [[ $disk == /dev/nvme* ]]; then
+            selftest=$(smartctl -l selftest -d nvme "$disk" 2>/dev/null || true)
+            poh_attr=$(smartctl -a -d nvme "$disk" 2>/dev/null | awk -F: '/Power On Hours/ {gsub(/ /,"",$2); print $2; exit}')
+        else
+            selftest=$(smartctl -l selftest "$disk" 2>/dev/null || true)
+            poh_attr=$(smartctl -A "$disk" 2>/dev/null | awk '/Power_On_Hours/ {print $10; exit}')
+        fi
+        current_poh=${poh_attr:-0}
+        # Extract lifetime hours from latest Extended/Long entry
+        last_long_poh=$(echo "$selftest" | awk 'NR>5 && /Extended offline|Extended self-test|Long/ && $1 ~ /^[0-9]+$/ {for(i=1;i<=NF;i++){if($i ~ /^[0-9]+$/ && $(i+1) ~ /^-/){print $i; break}}}' | head -n1)
+        # Fallback: if above pattern fails, attempt second method (field before trailing '-')
+        if [[ -z "$last_long_poh" ]]; then
+            last_long_poh=$(echo "$selftest" | awk 'NR>5 && /Extended offline|Long/ && $1 ~ /^[0-9]+$/ {for(i=NF;i>=1;i--){if($i ~ /^[0-9]+$/){print $i; break}}}' | head -n1)
+        fi
+        if [[ -n "$last_long_poh" && $current_poh -gt 0 ]]; then
+            last_long_hours_diff=$(( current_poh - last_long_poh ))
+        fi
+        threshold_hours=$(( SMART_INTERVAL_DAYS * 24 ))
+        if [[ -z "$last_long_hours_diff" || "$last_long_hours_diff" -ge $threshold_hours ]]; then
+            flag="-t long"
+        else
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Skip long on $disk (interval ${last_long_hours_diff}h < ${threshold_hours}h)" | tee -a "$SMART_LOG"
+        fi
+    fi
+    # Detect existing self-test in progress to avoid attempting a new one
+    local exec_status existing_in_progress=0
+    if [[ $disk == /dev/nvme* ]]; then
+        exec_status=$(smartctl -c -d nvme "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
+    else
+        exec_status=$(smartctl -c "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
+    fi
+    if echo "$exec_status" | grep -qi 'in progress'; then
+        existing_in_progress=1
+    fi
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting SMART ${flag/-t /} test on $disk" | tee -a "$SMART_LOG"
+    if [[ $existing_in_progress -eq 1 ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - Self-test already in progress on $disk; skipping new start (status: ${exec_status})" | tee -a "$SMART_LOG"
+    else
+        if [[ $disk == /dev/nvme* ]]; then
+            smartctl $flag -d nvme "$disk" >/dev/null 2>&1 || true
+        else
+            smartctl $flag "$disk" >/dev/null 2>&1 || true
+        fi
+    fi
+    local test_kind=${flag/-t /}
+    if [[ $test_kind == short && $SHORT_TEST_POLL -eq 1 && $existing_in_progress -eq 0 ]]; then
+        local result
+        result=$(poll_short_test_completion "$disk")
+        local s sev msg
+        sev=$(echo "$result" | awk -F'|' '{print $1}')
+        msg=$(echo "$result" | awk -F'|' '{print $2}')
+        if [[ $sev != INPROGRESS ]]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - $disk short self-test status: $msg" | tee -a "$SMART_LOG"
+            if [[ $sev == WARNING ]]; then
+                record_alert warning "$NOTIFY_TITLE_SMART" "Disk $disk short self-test warning: $msg"
+            fi
+        else
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - $disk short self-test still in progress after wait window" | tee -a "$SMART_LOG"
+        fi
+    else
+        if [[ $existing_in_progress -eq 1 ]]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Skipping poll (different test still running)" | tee -a "$SMART_LOG"
+        else
+            # Allow initial attribute update; long test result will be evaluated next run
+            sleep 5
+        fi
+    fi
+    local state_and_msgs state msgs
+    state_and_msgs=$(evaluate_smart "$disk")
     state=$(echo "$state_and_msgs" | head -n1)
     msgs=$(echo "$state_and_msgs" | tail -n +2)
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $disk SMART state: $state" | tee -a "$SMART_LOG"
-    if [ -n "$msgs" ]; then
-        echo "$msgs" | tee -a "$SMART_LOG"
+    [[ -n "$msgs" ]] && echo "$msgs" | tee -a "$SMART_LOG"
+    if [[ $state == WARNING || $state == CRITICAL ]]; then
+        record_alert "$state" "$NOTIFY_TITLE_SMART" "Disk $disk SMART $state: $(echo "$msgs" | tr '\n' ' ')"
     fi
-
-    if [[ "$state" == "WARNING" || "$state" == "CRITICAL" ]]; then
-        if [[ $ENABLE_NOTIFY -eq 1 ]]; then
-            notify_unraid "$NOTIFY_TITLE_SMART" "Disk $disk SMART $state: $(echo $msgs | tr '
-' ' ' )"
-        fi
-    fi
-
     LAST_TEST[$disk]=$(date '+%Y-%m-%d')
+}
+
+# Check completed long SMART tests since last processing
+check_completed_long_tests() {
+    # State file keeps disk|test_num processed entries
+    declare -A PROCESSED
+    if [[ -f "$SMART_LONG_STATE_FILE" ]]; then
+        while read -r d id; do PROCESSED[$d]="$id"; done < "$SMART_LONG_STATE_FILE"
+    fi
+    local disks; disks=$(get_all_disks)
+    for disk in $disks; do
+        local out
+        if [[ $disk == /dev/nvme* ]]; then
+            out=$(smartctl -l selftest -d nvme "$disk" 2>/dev/null || true)
+        else
+            out=$(smartctl -l selftest "$disk" 2>/dev/null || true)
+        fi
+        # Find latest extended/long style line
+        local line
+        line=$(echo "$out" | awk 'NR>5 && /Extended offline|Extended self-test|Long/ && $1 ~ /^[0-9]+$/ {print; exit}')
+        [[ -z "$line" ]] && continue
+        local id type status
+        id=$(echo "$line" | awk '{print $1}')
+        type=$(echo "$line" | awk '{for(i=2;i<=NF;i++){if($i ~ /Extended|Long/){print $i; break}}}')
+        # Extract status (strip leading fields and remaining percent if present)
+        status=$(echo "$line" | sed -E 's/^\s*[0-9]+\s+[^ ]+\s+[^ ]+\s+//' | sed -E 's/\s+[0-9]+%.*//' )
+        # Skip if already processed or still in progress
+        if [[ ${PROCESSED[$disk]:-} == "$id" ]]; then
+            continue
+        fi
+        if echo "$status" | grep -qi 'in progress'; then
+            continue
+        fi
+        local class msg sev
+        class=$(classify_selftest_status "$status")
+        sev=$(echo "$class" | awk -F'|' '{print $1}')
+        msg=$(echo "$class" | awk -F'|' '{print $2}')
+        # Alert if severity WARNING or CRITICAL
+        if [[ $sev == WARNING ]]; then
+            record_alert warning "$NOTIFY_TITLE_SMART" "Disk $disk long self-test warning: $msg"
+        elif [[ $sev == CRITICAL ]]; then
+            record_alert critical "$NOTIFY_TITLE_SMART" "Disk $disk long self-test CRITICAL: $msg"
+        fi
+        # Record processed test id
+        echo "$disk $id" >> "$SMART_LONG_STATE_FILE.tmp"
+    done
+    # Merge old processed with new, keeping latest id per disk
+    if [[ -f "$SMART_LONG_STATE_FILE.tmp" ]]; then
+        awk '{a[$1]=$2} END {for(k in a) print k, a[k]}' "$SMART_LONG_STATE_FILE.tmp" > "$SMART_LONG_STATE_FILE"
+        rm -f "$SMART_LONG_STATE_FILE.tmp"
+    fi
 }
 
 # ---------------- Btrfs monitoring ----------------
 monitor_btrfs() {
+    # Start banner depends on scrub enable flag
+    if [[ $ENABLE_BTRFS_SCRUB -eq 1 ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - BTRFS scrubbing starting" | tee -a "$BTRFS_LOG"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - BTRFS scrubbing disabled" | tee -a "$BTRFS_LOG"
+    fi
     local mountpoints
-    mountpoints=$(mount | grep btrfs | awk '{print $3}')
+    mountpoints=$(mount | awk '$5=="btrfs" {print $3}')
     for mp in $mountpoints; do
-        raid_type=$(btrfs filesystem df $mp | grep "Data," | awk '{print $2}')
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting Btrfs scrub on $mp (RAID type: $raid_type)" | tee -a "$BTRFS_LOG"
-        scrub_out=$(btrfs scrub start -B $mp 2>&1)
-        echo "$scrub_out" | tee -a "$BTRFS_LOG"
-        stats=$(btrfs device stats $mp 2>/dev/null)
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - Btrfs device stats for $mp:" | tee -a "$BTRFS_LOG"
-        echo "$stats" | tee -a "$BTRFS_LOG"
-
-        # parse for corrected/uncorrectable
-        corrected=$(echo "$scrub_out" | awk -F: '/errors corrected/{gsub(/ /,"",$2); print $2}' )
-        uncorrectable=$(echo "$scrub_out" | awk -F: '/errors uncorrectable/{gsub(/ /,"",$2); print $2}' )
-        corrected=${corrected:-0}
-        uncorrectable=${uncorrectable:-0}
-
-        if [[ $uncorrectable -gt 0 ]]; then
-            if [[ "$raid_type" == "RAID0" ]]; then
-                msg="CRITICAL: RAID0 pool $mp has $uncorrectable uncorrectable errors — data cannot be auto-repaired"
+        local raid_type
+        raid_type=$(btrfs filesystem df -p "$mp" 2>/dev/null | awk -F',' '/Data/ {gsub(/ /,"",$2); print $2; exit}') || true
+        raid_type=${raid_type:-UNKNOWN}
+        local status_pre
+        status_pre=$(btrfs scrub status -d "$mp" 2>/dev/null || true)
+        if [[ $ENABLE_BTRFS_SCRUB -eq 1 ]]; then
+            if echo "$status_pre" | grep -qi 'running'; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Btrfs scrub already running on $mp; will parse current running status" | tee -a "$BTRFS_LOG"
             else
-                msg="CRITICAL: Btrfs pool $mp has $uncorrectable uncorrectable errors"
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Initiating asynchronous Btrfs scrub on $mp (RAID: $raid_type)" | tee -a "$BTRFS_LOG"
+                btrfs scrub start "$mp" >>"$BTRFS_LOG" 2>&1 || true
+            fi
+        else
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Btrfs scrub disabled; parsing last recorded status only for $mp" | tee -a "$BTRFS_LOG"
+        fi
+        local status corrected uncorrectable msg
+        status=$(btrfs scrub status -d "$mp" 2>/dev/null)
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - Btrfs scrub status for $mp:" | tee -a "$BTRFS_LOG"
+        echo "$status" | tee -a "$BTRFS_LOG"
+        corrected=$(echo "$status" | awk -F'[: ]+' '/corrected errors/ {print $NF; exit}'); corrected=${corrected:-0}
+        uncorrectable=$(echo "$status" | awk -F'[: ]+' '/unrecoverable errors/ {print $NF; exit}'); uncorrectable=${uncorrectable:-0}
+        if [[ $uncorrectable -gt 0 ]]; then
+            if [[ "$raid_type" =~ RAID0 ]]; then
+                msg="CRITICAL: $mp RAID0 unrecoverable errors=$uncorrectable"
+            else
+                msg="CRITICAL: $mp unrecoverable errors=$uncorrectable"
             fi
             echo "$(date '+%Y-%m-%d %H:%M:%S') - $msg" | tee -a "$BTRFS_LOG"
-            [[ $ENABLE_NOTIFY -eq 1 ]] && notify_unraid "$NOTIFY_TITLE_BTRFS" "$msg"
+            record_alert critical "$NOTIFY_TITLE_BTRFS" "$msg"
         elif [[ $corrected -gt 0 ]]; then
-            msg="WARNING: Btrfs pool $mp scrub corrected $corrected errors"
+            msg="WARNING: $mp scrub corrected=$corrected"
             echo "$(date '+%Y-%m-%d %H:%M:%S') - $msg" | tee -a "$BTRFS_LOG"
-            [[ $ENABLE_NOTIFY -eq 1 ]] && notify_unraid "$NOTIFY_TITLE_BTRFS" "$msg"
+            record_alert warning "$NOTIFY_TITLE_BTRFS" "$msg"
         fi
     done
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - Btrfs scrubbing completed" | tee -a "$BTRFS_LOG"
 }
 
 # ---------------- XFS monitoring ----------------
 monitor_xfs() {
+    # Start banner depends on metadata check enable flag
+    if [[ $ENABLE_XFS_CHECK -eq 1 ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - XFS checks starting" | tee -a "$XFS_LOG"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - XFS checks disabled" | tee -a "$XFS_LOG"
+    fi
     local mountpoints
-    mountpoints=$(mount | grep xfs | awk '{print $3}')
+    mountpoints=$(mount | awk '$5=="xfs" {print $3}')
     for mp in $mountpoints; do
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - Checking XFS pool $mp" | tee -a "$XFS_LOG"
-        if [[ $RUN_XFS_CHECK -eq 1 ]]; then
-            # xfs_repair requires device node; user must stop array/umount or use -n for no modify
-            xfs_out=$(xfs_repair -n $mp 2>&1)
-            echo "$xfs_out" | tee -a "$XFS_LOG"
-            if echo "$xfs_out" | grep -qi "error\|corrupt"; then
-                msg="CRITICAL: XFS metadata issues detected on $mp (see logs)"
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - $msg" | tee -a "$XFS_LOG"
-                [[ $ENABLE_NOTIFY -eq 1 ]] && notify_unraid "$NOTIFY_TITLE_XFS" "$msg"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - XFS check $mp" | tee -a "$XFS_LOG"
+        if [[ $ENABLE_XFS_CHECK -eq 1 ]]; then
+            local dev xfs_out msg
+            dev=$(findmnt -n -o SOURCE --target "$mp")
+            if [[ -n "$dev" ]]; then
+                xfs_out=$(xfs_repair -n "$dev" 2>&1)
+                echo "$xfs_out" | tee -a "$XFS_LOG"
+                if echo "$xfs_out" | grep -qiE "error|corrupt|fatal"; then
+                    msg="CRITICAL: XFS metadata issue on $mp ($dev)"
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - $msg" | tee -a "$XFS_LOG"
+                    record_alert critical "$NOTIFY_TITLE_XFS" "$msg"
+                fi
             fi
         fi
-        # scan kernel logs for XFS/I/O errors relating to mountpoint
-        if dmesg | tail -n 2000 | grep -qi "$(basename $mp).*XFS\|I/O error\|xfs"; then
-            msg="WARNING: Recent kernel/XFS or I/O messages for $mp — check system logs"
+        if dmesg | tail -n 3000 | grep -qiE "$(basename "$mp").*(XFS|I/O error)|XFS ERROR|xfs_repair"; then
+            msg="WARNING: Kernel/XFS I/O messages for $mp"
             echo "$(date '+%Y-%m-%d %H:%M:%S') - $msg" | tee -a "$XFS_LOG"
-            [[ $ENABLE_NOTIFY -eq 1 ]] && notify_unraid "$NOTIFY_TITLE_XFS" "$msg"
+            record_alert warning "$NOTIFY_TITLE_XFS" "$msg"
         fi
     done
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - XFS checks completed" | tee -a "$XFS_LOG"
 }
 
-# ---------------- Reporting helpers ----------------
-append_report_header() {
-    echo "===================================" >> "$REPORT_FILE"
-    echo "Unraid Health Report - Generated: $(date '+%Y-%m-%d %H:%M:%S')" >> "$REPORT_FILE"
-    echo "===================================" >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
-}
+# ---------------- Storage Metrics ----------------
+compute_storage_metrics() {
+    # Reset metrics
+    ARRAY_COUNT=0; ARRAY_PERCENT=""; ARRAY_USED_BYTES=0; ARRAY_TOTAL_BYTES=0; ARRAY_USED_HR=""; ARRAY_TOTAL_HR=""
+    POOLS_COUNT=0; POOLS_PERCENT=""; POOLS_USED_BYTES=0; POOLS_TOTAL_BYTES=0; POOLS_USED_HR=""; POOLS_TOTAL_HR=""
 
-generate_report() {
-    append_report_header
-
-    echo "SMART Summary (recent):" >> "$REPORT_FILE"
-    echo "----------------------" >> "$REPORT_FILE"
-    tail -n 200 "$SMART_LOG" >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
-
-    echo "Btrfs Summary (recent):" >> "$REPORT_FILE"
-    echo "-----------------------" >> "$REPORT_FILE"
-    tail -n 200 "$BTRFS_LOG" >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
-
-    echo "XFS Summary (recent):" >> "$REPORT_FILE"
-    echo "---------------------" >> "$REPORT_FILE"
-    tail -n 200 "$XFS_LOG" >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
-
-    echo "Per-disk usage and thresholds:" >> "$REPORT_FILE"
-    echo "-----------------------------" >> "$REPORT_FILE"
-    for disk in $(get_all_disks); do
-        echo "Disk: $disk" >> "$REPORT_FILE"
-        usage=$(get_disk_usage $disk)
-        echo "Usage: $usage" >> "$REPORT_FILE"
-        # check threshold
-        usep=$(echo "$usage" | awk '{print $4}' | tr -d '%')
-        if [[ "$usep" != "" && "$usep" != "0" ]]; then
-            if [[ $usep -ge $CRITICAL_THRESHOLD_PERCENT ]]; then
-                echo "!! CRITICAL: Disk $disk usage ${usep}% >= ${CRITICAL_THRESHOLD_PERCENT}%" >> "$REPORT_FILE"
-                [[ $ENABLE_NOTIFY -eq 1 ]] && notify_unraid "Storage Critical" "Disk $disk usage ${usep}% >= ${CRITICAL_THRESHOLD_PERCENT}%"
-            elif [[ $usep -ge $WARN_THRESHOLD_PERCENT ]]; then
-                echo "! WARNING: Disk $disk usage ${usep}% >= ${WARN_THRESHOLD_PERCENT}%" >> "$REPORT_FILE"
-                [[ $ENABLE_NOTIFY -eq 1 ]] && notify_unraid "Storage Warning" "Disk $disk usage ${usep}% >= ${WARN_THRESHOLD_PERCENT}%"
-            fi
+    # Array: /mnt/disk*
+    local array_mounts=()
+    for d in /mnt/disk*; do
+        [[ -d $d ]] || continue
+        mountpoint -q "$d" || continue
+        array_mounts+=("$d")
+    done
+    if (( ${#array_mounts[@]} > 0 )); then
+        ARRAY_COUNT=${#array_mounts[@]}
+        local used=0 size=0 free=0
+        for d in "${array_mounts[@]}"; do
+            local line sz u a
+            line=$(df -B1 "$d" 2>/dev/null | awk 'NR==2') || continue
+            sz=$(echo "$line" | awk '{print $2}'); u=$(echo "$line" | awk '{print $3}'); a=$(echo "$line" | awk '{print $4}')
+            sz=${sz:-0}; u=${u:-0}; a=${a:-0}
+            used=$((used + u)); size=$((size + sz)); free=$((free + a))
+        done
+        if (( size > 0 )); then
+            ARRAY_USED_BYTES=$used; ARRAY_TOTAL_BYTES=$size
+            ARRAY_USED_HR=$(human_readable "$used"); ARRAY_TOTAL_HR=$(human_readable "$size")
+            ARRAY_PERCENT=$(awk "BEGIN{printf \"%.1f\", ($used/$size)*100}")
         fi
-        echo "" >> "$REPORT_FILE"
+    fi
+
+    # Pools: /mnt/* excluding disk* and user and POOL_EXCLUDES
+    local pool_mounts=()
+    for m in /mnt/*; do
+        [[ -d $m ]] || continue
+        mountpoint -q "$m" || continue
+        local name; name=$(basename "$m")
+        case "$name" in
+            disk*|user) continue;;
+        esac
+        local skip=0
+        for ex in "${POOL_EXCLUDES[@]}"; do
+            if [[ "$name" == "$ex" || "$m" == "$ex" ]]; then skip=1; break; fi
+        done
+        (( skip == 1 )) && continue
+        pool_mounts+=("$m")
     done
+    if (( ${#pool_mounts[@]} > 0 )); then
+        POOLS_COUNT=${#pool_mounts[@]}
+        local used=0 size=0 free=0
+        for p in "${pool_mounts[@]}"; do
+            local line sz u a
+            line=$(df -B1 "$p" 2>/dev/null | awk 'NR==2') || continue
+            sz=$(echo "$line" | awk '{print $2}'); u=$(echo "$line" | awk '{print $3}'); a=$(echo "$line" | awk '{print $4}')
+            sz=${sz:-0}; u=${u:-0}; a=${a:-0}
+            used=$((used + u)); size=$((size + sz)); free=$((free + a))
+        done
+        if (( size > 0 )); then
+            POOLS_USED_BYTES=$used; POOLS_TOTAL_BYTES=$size
+            POOLS_USED_HR=$(human_readable "$used"); POOLS_TOTAL_HR=$(human_readable "$size")
+            POOLS_PERCENT=$(awk "BEGIN{printf \"%.1f\", ($used/$size)*100}")
+        fi
+    fi
+}
 
-    echo "Total array (user share) usage:" >> "$REPORT_FILE"
-    echo "--------------------------------" >> "$REPORT_FILE"
-    df -h /mnt/user >> "$REPORT_FILE" 2>/dev/null || echo "/mnt/user not mounted" >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
 
-    echo "Pool mountpoints usage:" >> "$REPORT_FILE"
-    echo "-----------------------" >> "$REPORT_FILE"
-    # all btrfs and xfs mounts
-    mount | egrep "btrfs|xfs" | awk '{print $3}' | while read -r mp; do
-        echo "Mount: $mp" >> "$REPORT_FILE"
-        df -h $mp >> "$REPORT_FILE" 2>/dev/null
-        echo "" >> "$REPORT_FILE"
+# Capacity alert evaluation
+evaluate_capacity_alerts() {
+    if [[ -n "$ARRAY_PERCENT" ]]; then
+        if awk -v p="$ARRAY_PERCENT" -v t="$THRESHOLD" 'BEGIN{exit (p>t)?0:1}'; then
+            record_alert critical "Array Capacity" "Array usage ${ARRAY_PERCENT}% > ${THRESHOLD}%"
+        elif awk -v p="$ARRAY_PERCENT" -v t="$THRESHOLD" -v d="$NEAR_THRESHOLD_DELTA" 'BEGIN{exit (p + d >= t)?0:1}'; then
+            record_alert warning "Array Capacity" "Array usage ${ARRAY_PERCENT}% near ${THRESHOLD}%"
+        fi
+    fi
+    if [[ -n "$POOLS_PERCENT" ]]; then
+        if awk -v p="$POOLS_PERCENT" -v t="$THRESHOLD" 'BEGIN{exit (p>t)?0:1}'; then
+            record_alert critical "Pools Capacity" "Pools usage ${POOLS_PERCENT}% > ${THRESHOLD}%"
+        elif awk -v p="$POOLS_PERCENT" -v t="$THRESHOLD" -v d="$NEAR_THRESHOLD_DELTA" 'BEGIN{exit (p + d >= t)?0:1}'; then
+            record_alert warning "Pools Capacity" "Pools usage ${POOLS_PERCENT}% near ${THRESHOLD}%"
+        fi
+    fi
+}
+
+# Per-mount threshold alert evaluation
+evaluate_per_mount_thresholds() {
+    for mp in /mnt/disk* /mnt/cache /mnt/*; do
+        [[ -e "$mp" ]] || continue
+        mountpoint -q "$mp" || continue
+        local df_line usep
+        df_line=$(df -h "$mp" | awk 'NR==2') || continue
+        usep=$(echo "$df_line" | awk '{print $5}' | tr -d '%')
+        [[ -n "$usep" ]] || continue
+        if [[ $usep -ge $CRITICAL_THRESHOLD_PERCENT ]]; then
+            record_alert critical "Storage Critical" "$mp usage ${usep}% >= ${CRITICAL_THRESHOLD_PERCENT}%"
+        elif [[ $usep -ge $WARN_THRESHOLD_PERCENT ]]; then
+            record_alert warning "Storage Warning" "$mp usage ${usep}% >= ${WARN_THRESHOLD_PERCENT}%"
+        fi
     done
-
-    echo "Report saved to: $REPORT_FILE"
 }
 
 # ---------------- Main ----------------
-# 1) Run SMART tests with evaluation
-echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting SMART tests" | tee -a "$SMART_LOG"
+echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting SMART tests (type=$SMART_TEST_TYPE)" | tee -a "$SMART_LOG"
+check_completed_long_tests
 for disk in $(get_all_disks); do
-    run_smart_test $disk
+    run_smart_test "$disk"
 done
 save_last_test
 echo "$(date '+%Y-%m-%d %H:%M:%S') - SMART tests completed" | tee -a "$SMART_LOG"
 
-# 2) Btrfs monitoring
-echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting Btrfs monitoring" | tee -a "$BTRFS_LOG"
 monitor_btrfs
-echo "$(date '+%Y-%m-%d %H:%M:%S') - Btrfs monitoring completed" | tee -a "$BTRFS_LOG"
-
-# 3) XFS monitoring
-echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting XFS monitoring" | tee -a "$XFS_LOG"
 monitor_xfs
-echo "$(date '+%Y-%m-%d %H:%M:%S') - XFS monitoring completed" | tee -a "$XFS_LOG"
 
-# 4) Generate report
-generate_report
+compute_storage_metrics
+evaluate_per_mount_thresholds
+evaluate_capacity_alerts
 
-# 5) Email option: user must configure 'mail' or msmtp/postfix on Unraid. This is a placeholder.
-# Example (uncomment and configure):
-# EMAIL_TO="you@example.com"
-# mail -s "Unraid Health Report $(date '+%Y-%m-%d')" "$EMAIL_TO" < "$REPORT_FILE"
+# ---------------- Notification Builder (Storage style + Health & Recommendations) ----------------
+classify_pct() { awk -v a="$1" -v p="$THRESHOLD" -v d="$NEAR_THRESHOLD_DELTA" 'BEGIN{if(a>p) print 2; else if(a + d >= p) print 1; else print 0}'; }
+map_emoji() { case "$1" in 2) printf "%s" "$STORAGE_STATUS_EMOJI_RED" ;; 1) printf "%s" "$STORAGE_STATUS_EMOJI_YELLOW" ;; *) printf "%s" "$STORAGE_STATUS_EMOJI_GREEN" ;; esac; }
+
+build_storage_detail_reports() {
+    local array_used_b=0 array_tot_b=0 array_cnt=0 arr_details=""
+    local pool_used_b=0 pool_tot_b=0 pool_cnt=0 pool_details=""
+    local line sz u percent
+    local arr_mounts=()
+    for d in /mnt/disk*; do [[ -d "$d" ]] || continue; mountpoint -q "$d" || continue; arr_mounts+=("$d"); done
+    array_cnt=${#arr_mounts[@]}
+    if (( array_cnt > 0 )); then
+        for d in "${arr_mounts[@]}"; do
+            line=$(df -B1 "$d" 2>/dev/null | awk 'NR==2') || continue
+            sz=$(echo "$line" | awk '{print $2}'); u=$(echo "$line" | awk '{print $3}')
+            sz=${sz:-0}; u=${u:-0}
+            array_tot_b=$((array_tot_b + sz)); array_used_b=$((array_used_b + u))
+            percent=$(awk "BEGIN { if($sz>0) printf \"%.1f\", ($u/$sz)*100; else print 0 }")
+            arr_details+=$(printf "%-10s %10s / %-10s  used (%5s%%)\n" "$(basename "$d")" "$(human_readable "$u")" "$(human_readable "$sz")" "$percent")
+        done
+    fi
+    local array_pct="0.0"; [[ $array_tot_b -gt 0 ]] && array_pct=$(awk "BEGIN {printf \"%.1f\", ($array_used_b/$array_tot_b)*100}")
+    local pool_mounts=()
+    for m in /mnt/*; do
+        [[ -d $m ]] || continue; mountpoint -q "$m" || continue
+        local name; name=$(basename "$m")
+        case "$name" in disk*|user) continue;; esac
+        local skip=0; for ex in "${POOL_EXCLUDES[@]}"; do [[ "$name" == "$ex" || "$m" == "$ex" ]] && { skip=1; break; }; done
+        (( skip==1 )) && continue
+        pool_mounts+=("$m")
+    done
+    pool_cnt=${#pool_mounts[@]}
+    if (( pool_cnt > 0 )); then
+        for p in "${pool_mounts[@]}"; do
+            line=$(df -B1 "$p" 2>/dev/null | awk 'NR==2') || continue
+            sz=$(echo "$line" | awk '{print $2}'); u=$(echo "$line" | awk '{print $3}')
+            sz=${sz:-0}; u=${u:-0}
+            pool_tot_b=$((pool_tot_b + sz)); pool_used_b=$((pool_used_b + u))
+            percent=$(awk "BEGIN { if($sz>0) printf \"%.1f\", ($u/$sz)*100; else print 0 }")
+            pool_details+=$(printf "%-10s %10s / %-10s  used (%5s%%)\n" "$(basename "$p")" "$(human_readable "$u")" "$(human_readable "$sz")" "$percent")
+        done
+    fi
+    local pool_pct="0.0"; [[ $pool_tot_b -gt 0 ]] && pool_pct=$(awk "BEGIN {printf \"%.1f\", ($pool_used_b/$pool_tot_b)*100}")
+    local a_code p_code a_emoji p_emoji
+    a_code=$(classify_pct "$array_pct"); p_code=$(classify_pct "$pool_pct")
+    a_emoji=$(map_emoji "$a_code"); p_emoji=$(map_emoji "$p_code")
+    STORAGE_SUBJECT=$(printf "%s Array: %s%% | %s Pools: %s%%" "$a_emoji" "$array_pct" "$p_emoji" "$pool_pct")
+    local array_used_h pool_used_h array_tot_h pool_tot_h
+    array_used_h=$(human_readable "$array_used_b"); array_tot_h=$(human_readable "$array_tot_b")
+    pool_used_h=$(human_readable "$pool_used_b"); pool_tot_h=$(human_readable "$pool_tot_b")
+    local array_block pool_block
+    array_block=$(printf "🗄️ [Array Summary]\nTotal: %s\nUsed: %s (%s%%)\nFree: %s\n\n%s" "$array_tot_h" "$array_used_h" "$array_pct" "$(human_readable $((array_tot_b - array_used_b)))" "$arr_details")
+    pool_block=$(printf "⚡ [Pools Summary]\nTotal: %s\nUsed: %s (%s%%)\nFree: %s\n\n%s" "$pool_tot_h" "$pool_used_h" "$pool_pct" "$(human_readable $((pool_tot_b - pool_used_b)))" "$pool_details")
+    STORAGE_BODY_BASE=$(printf "%s Array (%d): %s%% — %s used of %s\n%s Pools (%d): %s%% — %s used of %s\n\n--------------------------------------------------\n%s\n--------------------------------------------------\n%s" \
+        "$a_emoji" "$array_cnt" "$array_pct" "$array_used_h" "$array_tot_h" \
+        "$p_emoji" "$pool_cnt" "$pool_pct" "$pool_used_h" "$pool_tot_h" \
+        "$array_block" "$pool_block")
+}
+
+build_health_sections() {
+    local sm_warn=() sm_crit=() bt_warn=() bt_crit=() xfs_warn=() xfs_crit=() cap_warn=() cap_crit=() pm_warn=() pm_crit=()
+    local i
+    for i in "${ALERT_CRIT[@]}"; do
+        case "$i" in
+            "$NOTIFY_TITLE_SMART"*) sm_crit+=("${i#*: }") ;;
+            "$NOTIFY_TITLE_BTRFS"*) bt_crit+=("${i#*: }") ;;
+            "$NOTIFY_TITLE_XFS"*) xfs_crit+=("${i#*: }") ;;
+            *Capacity*) cap_crit+=("${i#*: }") ;;
+            *Storage\ Critical*) pm_crit+=("${i#*: }") ;;
+        esac
+    done
+    for i in "${ALERT_WARN[@]}"; do
+        case "$i" in
+            "$NOTIFY_TITLE_SMART"*) sm_warn+=("${i#*: }") ;;
+            "$NOTIFY_TITLE_BTRFS"*) bt_warn+=("${i#*: }") ;;
+            "$NOTIFY_TITLE_XFS"*) xfs_warn+=("${i#*: }") ;;
+            *Capacity*) cap_warn+=("${i#*: }") ;;
+            *Storage\ Warning*) pm_warn+=("${i#*: }") ;;
+        esac
+    done
+    local out=""
+    if (( ${#sm_warn[@]} + ${#sm_crit[@]} > 0 )); then
+        out+=$'SMART Health:\n'
+        for x in "${sm_crit[@]}"; do out+=" - CRITICAL: $x\n"; done
+        for x in "${sm_warn[@]}"; do out+=" - WARNING:  $x\n"; done
+    else
+        out+=$'SMART Health: OK\n'
+    fi
+    if [[ $ENABLE_BTRFS_SCRUB -eq 1 ]]; then
+        if (( ${#bt_warn[@]} + ${#bt_crit[@]} > 0 )); then
+            out+=$'Btrfs Scrub:\n'
+            for x in "${bt_crit[@]}"; do out+=" - CRITICAL: $x\n"; done
+            for x in "${bt_warn[@]}"; do out+=" - WARNING:  $x\n"; done
+        else
+            out+=$'Btrfs Scrub: OK\n'
+        fi
+    fi
+    if [[ $ENABLE_XFS_CHECK -eq 1 ]]; then
+        if (( ${#xfs_warn[@]} + ${#xfs_crit[@]} > 0 )); then
+            out+=$'XFS Checks:\n'
+            for x in "${xfs_crit[@]}"; do out+=" - CRITICAL: $x\n"; done
+            for x in "${xfs_warn[@]}"; do out+=" - WARNING:  $x\n"; done
+        else
+            out+=$'XFS Checks: OK\n'
+        fi
+    fi
+    if (( ${#pm_warn[@]} + ${#pm_crit[@]} > 0 )); then
+        out+=$'Per-Mount Usage:\n'
+        for x in "${pm_crit[@]}"; do out+=" - CRITICAL: $x\n"; done
+        for x in "${pm_warn[@]}"; do out+=" - WARNING:  $x\n"; done
+    fi
+    if (( ${#cap_warn[@]} + ${#cap_crit[@]} > 0 )); then
+        out+=$'Group Capacity:\n'
+        for x in "${cap_crit[@]}"; do out+=" - CRITICAL: $x\n"; done
+        for x in "${cap_warn[@]}"; do out+=" - WARNING:  $x\n"; done
+    fi
+    local rec=""
+    if (( ${#ALERT_WARN[@]} + ${#ALERT_CRIT[@]} > 0 )); then
+        rec+=$'\nRecommended actions:\n'
+        for x in "${ALERT_WARN[@]}" "${ALERT_CRIT[@]}"; do
+            case "$x" in
+                *"Pending sectors"*) rec+=" - Pending sectors: back up; schedule long test; consider replacement if persists.\n" ;;
+                *"Reallocated"*)     rec+=" - Reallocated sectors: monitor trend; replace disk if count grows.\n" ;;
+                *"UDMA CRC"*)        rec+=" - UDMA CRC errors: reseat/replace SATA cable; check power.\n" ;;
+                *"Temp"*|*"Temp"*)  rec+=" - High temperature: improve airflow or reduce load.\n" ;;
+                *"NVMe wear"*)       rec+=" - NVMe wear high: plan replacement lifecycle.\n" ;;
+                *"unrecoverable errors"*) rec+=" - Btrfs unrecoverable: back up; inspect hardware; rerun scrub; consider replace.\n" ;;
+                *"XFS metadata issue"*)  rec+=" - XFS metadata issue: schedule maintenance; run xfs_repair offline.\n" ;;
+                *"Capacity"*)        rec+=" - Capacity near/exceeded: expand storage or clean unused data.\n" ;;
+            esac
+        done
+    fi
+    HEALTH_SECTIONS="$out$rec"
+}
+
+# Build and send nightly notification
+total_warn=${#ALERT_WARN[@]}; total_crit=${#ALERT_CRIT[@]}
+build_storage_detail_reports
+build_health_sections
+icon="normal"; (( total_crit > 0 )) && icon="alert" || { (( total_warn > 0 )) && icon="warning"; }
+body="${STORAGE_BODY_BASE}\n${HEALTH_SECTIONS}"
+notify_unraid "$STORAGE_SUBJECT" "$body" "$icon"
+if [[ $EMAIL_ENABLED -eq 1 && -n "$EMAIL_TO" ]]; then
+    printf "%s" "$body" | mail -s "$STORAGE_SUBJECT" "$EMAIL_TO" || logger -t unraid_monitor "Email send failed"
+fi
 
 exit 0
