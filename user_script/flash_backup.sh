@@ -22,6 +22,12 @@ max_backups=3
 # Unraid notify helper
 notify_bin="/usr/local/emhttp/webGui/scripts/notify"
 
+# Optional free-space fallback settings
+# When true, attempt stat(2)-based fallback if df reports 0/invalid
+FLASH_ENABLE_STAT_FALLBACK=${FLASH_ENABLE_STAT_FALLBACK:-true}
+# Filesystem types that commonly report 0 with df; treat zero as unknown
+FLASH_IGNORE_ZERO_FS_TYPES=${FLASH_IGNORE_ZERO_FS_TYPES:-"fuse.rclone fuse.mergerfs fuse.unionfs"}
+
 # --------------------------------------------------------------------------------
 
 # Record start time
@@ -130,7 +136,7 @@ else
   done <"$helper_out"
   syslog err "Flash backup helper failed with exit $rc"
   excerpt=$(tail -n 40 "$helper_out" 2>/dev/null || true)
-  notify_send alert "🔴 Flash Backup - FAIL" "💾 Flash backup failed" "Exit code: ${rc}\n\nExcerpt:\n${excerpt}\n\nRuntime: $(format_runtime)"
+  notify_send alert "Flash Backup - FAIL" "💾 Flash backup failed" "Exit code: ${rc}\n\nExcerpt:\n${excerpt}\n\nRuntime: $(format_runtime)"
   log "Flash backup failed; see job log"
   rm -f -- "$helper_out" 2>/dev/null || true
   exit $rc
@@ -209,15 +215,51 @@ log "Search result for flash zip: ${latest_zip:-<none>}"
 if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
   src_bytes=$(stat -c%s "$latest_zip" 2>/dev/null || stat -f%z "$latest_zip" 2>/dev/null || echo 0)
   dest_avail=$(df --output=avail -B1 "$backup_dir" 2>/dev/null | tail -n1 || echo 0)
+  dest_total=$(df --output=size -B1 "$backup_dir" 2>/dev/null | tail -n1 || echo 0)
   src_bytes=${src_bytes:-0}
   dest_avail=${dest_avail:-0}
+  dest_total=${dest_total:-0}
+
+  # Normalize non-numeric df results
+  if ! [[ "$dest_avail" =~ ^[0-9]+$ ]]; then dest_avail=0; fi
+  if ! [[ "$dest_total" =~ ^[0-9]+$ ]]; then dest_total=0; fi
+
+  # If df reports 0 available and fallback is enabled, try stat(2)-based free calculation
+  if [ "$dest_avail" -eq 0 ] && [ "$FLASH_ENABLE_STAT_FALLBACK" = "true" ]; then
+    stat_vals=$(stat -f --format '%a %s' "$backup_dir" 2>/dev/null || echo "")
+    if [[ "$stat_vals" =~ ^[0-9]+\ [0-9]+$ ]]; then
+      stat_free=$(awk '{print $1 * $2}' <<< "$stat_vals")
+      if [[ "$stat_free" =~ ^[0-9]+$ ]] && [ "$stat_free" -gt 0 ]; then
+        dest_avail=$stat_free
+      fi
+    fi
+  fi
+
+  # If still zero, and fs type matches ignore list, treat free as unknown (do not gate move)
+  dest_free_unknown=0
+  if [ "$dest_avail" -eq 0 ]; then
+    fs_type=$(stat -f -c %T "$backup_dir" 2>/dev/null || echo "")
+    for _fst in $FLASH_IGNORE_ZERO_FS_TYPES; do
+      if [ "$fs_type" = "$_fst" ]; then
+        dest_free_unknown=1
+        break
+      fi
+    done
+  fi
   human_src_size=$(bytes_human "$src_bytes")
   need_bytes=$(( src_bytes + 1024 * 1024 )) # 1MB safety buffer
-    if [ "$dest_avail" -lt "$need_bytes" ]; then
+    if [ "${dest_free_unknown}" -eq 0 ] && [ "$dest_avail" -lt "$need_bytes" ]; then
     human_need=$(bytes_human "$need_bytes")
     human_avail=$(bytes_human "$dest_avail")
     syslog err "Insufficient space to move flash zip: need ${human_need}, available ${human_avail}"
-  notify_send alert "🔴 Flash Backup - NO SPACE" "🔵 Insufficient space" "Need ${human_need}, available ${human_avail}"
+    # Build body with space metrics and percent required vs free
+    if [[ "$dest_avail" =~ ^[0-9]+$ ]] && [ "$dest_avail" -gt 0 ]; then
+      req_pct_of_free=$(awk -v r="$need_bytes" -v f="$dest_avail" 'BEGIN{printf "%d", (r*100)/f}')
+      no_space_body="Space: Free=${human_avail} Required=${human_need}\nRequired vs Free: ${req_pct_of_free}%"
+    else
+      no_space_body="Space: Free=${human_avail} Required=${human_need}\nRequired vs Free: Unknown"
+    fi
+  notify_send alert "Flash Backup - NO SPACE" "🔵 Insufficient space" "$no_space_body"
     log "Insufficient space for moving $latest_zip: need ${human_need} available ${human_avail}"
   else
     target="$latest_zip"
@@ -286,7 +328,23 @@ prune_old_files "$backup_dir" "$max_backups" "*flash-backup-*.zip"
   syslog info "Flash Backup: Unraid OS backed up on $(date) (Runtime: ${runtime_now})"
   notify_body="Flash backup moved to ${backup_dir}\nRuntime: ${runtime_now}"
   notify_body+="\nMoved: $(basename "${moved_file}") (${human_moved_size})"
-  notify_send normal "🟢 Flash Backup - OK" "💾 Flash backup successful" "$notify_body"
+  # Append space metrics if available from pre-check
+  if [ -n "${need_bytes:-}" ]; then
+    req_human=$(bytes_human "$need_bytes")
+    if [ "${dest_free_unknown:-0}" -eq 1 ]; then
+      free_human="Unknown"
+    else
+      free_human=$(bytes_human "${dest_avail:-0}")
+    fi
+    notify_body+=$'\n'"Space: Free=${free_human} Required=${req_human}"
+    if [[ "${dest_avail:-0}" =~ ^[0-9]+$ ]] && [ "${dest_avail:-0}" -gt 0 ]; then
+      req_pct_of_free=$(awk -v r="$need_bytes" -v f="${dest_avail:-0}" 'BEGIN{printf "%d", (r*100)/f}')
+      notify_body+=$'\n'"Required vs Free: ${req_pct_of_free}%"
+    else
+      notify_body+=$'\n'"Required vs Free: Unknown"
+    fi
+  fi
+  notify_send normal "Flash Backup - OK" "🟢 Flash backup successful" "$notify_body"
 else
   syslog err "Flash Backup: No backup moved on $(date) (Runtime: ${runtime_now})"
   notify_body="Flash backup did NOT move to ${backup_dir}\nRuntime: ${runtime_now}"
@@ -295,7 +353,7 @@ else
   else
     notify_body+="\nNo flash backup zip found in /usr/local/emhttp"
   fi
-  notify_send alert "🔴 Flash Backup - FAIL" "💾 Flash backup not moved" "$notify_body"
+  notify_send alert "Flash Backup - FAIL" "🔴 Flash backup not moved" "$notify_body"
   exit 1
 fi
 
