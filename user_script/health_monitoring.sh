@@ -48,6 +48,9 @@ LIFECYCLE_ENABLED=1           # 1: show lifecycle buckets (replace/monitor/healt
 AGE_AWARE_ENABLED=1           # 1: annotate near-endurance devices
 SHARE_BREAKDOWN_ENABLED=0     # 1: compute per-share usage (uses du; can be heavy)
 SHARE_TOP_N=5                 # Show top N shares by size/growth
+LOG_PRUNE_ENABLED=1           # 1: prune old timestamped run logs in LOG_DIR
+LOG_MAX_DAYS=3                # Remove run logs older than this many days (0 disables age pruning)
+LOG_MAX_COUNT=0               # After age pruning, keep at most this many run logs per pattern (0 disables count pruning)
 
 # --- SMART Thresholds (SATA/NVMe) ---
 RELOC_WARNING=1               # Reallocated sectors >= triggers warning
@@ -105,21 +108,21 @@ declare -A MOUNT_TO_DEV       # Map /mnt/diskX -> /dev/sdX|nvme
 LOG_DIR="/boot/logs/disk-health"   # Base directory for logs files
 mkdir -p "$LOG_DIR"
 TIMESTAMP=$(date +%Y-%m-%d_%H%M%S)   # Timestamp used for rotating log filenames
-SMART_LOG="$LOG_DIR/unraid_smart_$TIMESTAMP.log"   # Per-run SMART log
-BTRFS_LOG="$LOG_DIR/unraid_btrfs_$TIMESTAMP.log"   # Per-run btrfs log
-XFS_LOG="$LOG_DIR/unraid_xfs_$TIMESTAMP.log"       # Per-run XFS log
+SMART_LOG="$LOG_DIR/smart_$TIMESTAMP.log"   # Per-run SMART log
+BTRFS_LOG="$LOG_DIR/btrfs_$TIMESTAMP.log"   # Per-run btrfs log
+XFS_LOG="$LOG_DIR/xfs_$TIMESTAMP.log"       # Per-run XFS log
 
 # Persistent state files
 STATE_DIR="/boot/logs/disk-health/state"   # Base directory for state files
 mkdir -p "$STATE_DIR"
-SMART_LONG_STATE_FILE="$STATE_DIR/unraid_smart_long_processed.log" # Tracks processed long self-tests
-SMART_LAST="$STATE_DIR/unraid_smart_last_test.log"                 # Last SMART test per disk
-NVME_STATE_FILE="$STATE_DIR/unraid_nvme_counters_last.log"         # Last NVMe unsafe shutdown counters
-PREV_ATTR_FILE="$STATE_DIR/unraid_smart_prev_attrs.log"            # Previous SMART attrs for delta tagging
-CAPACITY_HISTORY_FILE="$STATE_DIR/unraid_capacity_history.log"     # Historical array/pools percent used
-DISK_CAP_HISTORY_FILE="$STATE_DIR/unraid_disk_cap_history.log"     # Historical per-disk used/size
-SHARE_USAGE_HISTORY_FILE="$STATE_DIR/unraid_share_usage_history.log" # Historical per-share size
-ALERT_NEW_SEEN_FILE="$STATE_DIR/unraid_new_alerts_seen.log"        # Cache of NEW alerts already announced
+SMART_LONG_STATE_FILE="$STATE_DIR/smart_long_processed.log" # Tracks processed long self-tests
+SMART_LAST="$STATE_DIR/smart_last_test.log"                 # Last SMART test per disk
+NVME_STATE_FILE="$STATE_DIR/counters_last.log"              # Last NVMe unsafe shutdown counters
+PREV_ATTR_FILE="$STATE_DIR/smart_prev_attrs.log"            # Previous SMART attrs for delta tagging
+CAPACITY_HISTORY_FILE="$STATE_DIR/capacity_history.log"     # Historical array/pools percent used
+DISK_CAP_HISTORY_FILE="$STATE_DIR/disk_cap_history.log"     # Historical per-disk used/size
+SHARE_USAGE_HISTORY_FILE="$STATE_DIR/share_usage_history.log" # Historical per-share size
+ALERT_NEW_SEEN_FILE="$STATE_DIR/new_alerts_seen.log"        # Cache of NEW alerts already announced
 
 # JSON export path
 JSON_EXPORT_DIR="/boot/logs/disk-health/json"                   # Directory to write JSON summary
@@ -131,6 +134,35 @@ NOTIFY_TITLE_SMART="SMART Test Alert"
 NOTIFY_TITLE_BTRFS="Btrfs Scrub Alert"
 NOTIFY_TITLE_XFS="XFS Alert"
 NOTIFY_TITLE_DISKIO="Disk I/O Alert"
+
+# Prune old run logs (only timestamped SMART/Btrfs/XFS logs; keep state + JSON)
+prune_old_run_logs() {
+    (( LOG_PRUNE_ENABLED == 1 )) || return 0
+    local patterns=("smart_*.log" "btrfs_*.log" "xfs_*.log")
+    local removed=0
+    for pat in "${patterns[@]}"; do
+        # Age-based pruning
+        if (( LOG_MAX_DAYS > 0 )); then
+            while IFS= read -r f; do
+                [[ -f "$f" ]] || continue
+                rm -f -- "$f" && ((removed++)) || true
+            done < <(find "$LOG_DIR" -maxdepth 1 -type f -name "$pat" -mtime +$LOG_MAX_DAYS 2>/dev/null)
+        fi
+        # Count-based pruning
+        if (( LOG_MAX_COUNT > 0 )); then
+            mapfile -t files < <(find "$LOG_DIR" -maxdepth 1 -type f -name "$pat" -printf '%T@\t%p\n' 2>/dev/null | sort -n | awk -F'\t' '{print $2}')
+            while (( ${#files[@]} > LOG_MAX_COUNT )); do
+                local oldest="${files[0]}"
+                rm -f -- "$oldest" && ((removed++)) || true
+                files=("${files[@]:1}")
+            done
+        fi
+    done
+    if (( removed > 0 )); then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - Pruned $removed old run log(s)" >> "$SMART_LOG"
+    fi
+}
+prune_old_run_logs
 
 # ---------------- Helper Functions ----------------
 # Helper: Unraid notify wrapper (severity: ok|warning|critical)
