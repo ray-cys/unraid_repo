@@ -15,7 +15,7 @@ clearLog=false
 
 # Directory containing container appdata directories
 src_dir="/mnt/cache/appdata"
-dest_dir="/mnt/vault/node/cache"
+dest_dir="/mnt/user/node/cache"
 
 # Containers to skip from stopping and/or archiving.
 #   skip_containers=()                    # do not skip any containers
@@ -72,6 +72,17 @@ LOW_SPACE_MARGIN=${LOW_SPACE_MARGIN:-0}
 # If df/du cannot determine size, fail when true, otherwise proceed with a warning
 LOW_SPACE_FAIL_IF_UNDETERMINED=${LOW_SPACE_FAIL_IF_UNDETERMINED:-false}
 
+# Filesystem types whose zero-free-space df output should be treated as unknown/unlimited.
+# Space-separated list. Adjust if your mount reports a different type.
+LOW_SPACE_IGNORE_ZERO_FS_TYPES=${LOW_SPACE_IGNORE_ZERO_FS_TYPES:-"fuse.rclone fuse.mergerfs fuse.unionfs"}
+
+# When true, attempt a stat(2)-based fallback if df reports 0 bytes free.
+LOW_SPACE_ENABLE_STAT_FALLBACK=${LOW_SPACE_ENABLE_STAT_FALLBACK:-true}
+
+# Percent free space thresholds (integer percent). If free% < alert -> alert notification; if < warn -> warning note.
+UTIL_WARN_THRESHOLD=${UTIL_WARN_THRESHOLD:-15}
+UTIL_ALERT_THRESHOLD=${UTIL_ALERT_THRESHOLD:-5}
+
 # Pigz thread control (0 lets pigz auto-detect). Set to 1..N to limit per-job threads
 PIGZ_THREADS=${PIGZ_THREADS:-0}
 
@@ -119,6 +130,19 @@ log_error() {
   local msg="$1"
   logger -p err "ERROR: $msg"
   log "ERROR: $msg"
+}
+
+# Immediate notification for early abort scenarios
+notify_abort() {
+  local reason="$1"
+  local detail="${2:-}"
+  local subj="${NOTIFY_TITLE} - FAILED"
+  local short="🔴 Backup aborted"
+  local body="Reason: ${reason}"
+  if [ -n "$detail" ]; then
+    body+=$'\n'"$detail"
+  fi
+  /usr/local/emhttp/webGui/scripts/notify -i alert -b -s "$subj" -d "$short" -m "$body" || true
 }
 
 # Convert bytes to human-readable form using KB/MB/GB/TB labels (1024 base)
@@ -250,18 +274,59 @@ while IFS= read -r -d '' d; do
   fi
 done < <(find "$src_dir" -mindepth 1 -maxdepth 1 -type d -print0)
 
+# Ensure destination directory exists before assessing free space; notify if missing and cannot be created
+dest_dir_was_missing=0
+if [ ! -d "$dest_dir" ]; then
+  if mkdir -p "$dest_dir" 2>/dev/null; then
+    dest_dir_was_missing=1
+    log "Destination directory was missing; created: $dest_dir"
+  else
+    log_error "destination directory missing and cannot be created: $dest_dir"
+    notify_abort "Destination directory missing" "Path: $dest_dir (mkdir failed)"
+    exit 1
+  fi
+fi
+
 dest_dir_free_bytes=$(df -B1 "$dest_dir" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
+dest_dir_total_bytes=$(df -B1 "$dest_dir" 2>/dev/null | awk 'NR==2 {print $2}' || echo 0)
+dest_dir_used_bytes=$(df -B1 "$dest_dir" 2>/dev/null | awk 'NR==2 {print $3}' || echo 0)
+df_device=$(df -P "$dest_dir" 2>/dev/null | awk 'NR==2 {print $1}' || echo "")
+fs_type=$(stat -f -c %T "$dest_dir" 2>/dev/null || echo "")
+
 if ! [[ "$dest_dir_free_bytes" =~ ^[0-9]+$ ]]; then
   log "WARN: could not determine free space on destination ($dest_dir); value='$dest_dir_free_bytes'"
   dest_unknown=1
 else
   dest_unknown=0
+  # Fallback: if reported free space is 0, try stat-based calculation
+  if [ "$dest_dir_free_bytes" -eq 0 ] && [ "$LOW_SPACE_ENABLE_STAT_FALLBACK" = "true" ]; then
+    stat_vals=$(stat -f --format '%a %s' "$dest_dir" 2>/dev/null || echo "")
+    stat_free=""
+    if [[ "$stat_vals" =~ ^[0-9]+\ [0-9]+$ ]]; then
+      stat_free=$(awk '{print $1 * $2}' <<< "$stat_vals")
+    fi
+    if [[ "$stat_free" =~ ^[0-9]+$ ]] && [ "$stat_free" -gt 0 ]; then
+      log "INFO: df reported 0 free; stat fallback detected ${stat_free} bytes free on $dest_dir"
+      dest_dir_free_bytes="$stat_free"
+    fi
+  fi
+  # If still zero, and filesystem type matches ignore list, treat as unknown/unlimited
+  if [ "$dest_dir_free_bytes" -eq 0 ]; then
+    for _fst in $LOW_SPACE_IGNORE_ZERO_FS_TYPES; do
+      if [ "$fs_type" = "$_fst" ]; then
+        log "INFO: filesystem type '$fs_type' reports 0 free; treating as unknown/unlimited (skip strict low-space abort)"
+        dest_unknown=1
+        break
+      fi
+    done
+  fi
 fi
 
 required=$((subtotal + LOW_SPACE_MARGIN))
 if [ $subtotal_unknown -eq 1 ] || [ $dest_unknown -eq 1 ]; then
   if [ "${LOW_SPACE_FAIL_IF_UNDETERMINED}" = "true" ]; then
     log_error "unable to determine required/available sizes and LOW_SPACE_FAIL_IF_UNDETERMINED=true; aborting"
+    notify_abort "Size determination failure" "Cannot determine required or free space (LOW_SPACE_FAIL_IF_UNDETERMINED=true)."
     exit 1
   else
     log "Proceeding despite unknown sizes (LOW_SPACE_FAIL_IF_UNDETERMINED=false)"
@@ -271,17 +336,27 @@ fi
 if [ $dest_unknown -eq 0 ] && [ "$dest_dir_free_bytes" -lt "$required" ]; then
   case "$LOW_SPACE_ACTION" in
     abort)
+      free_human=$(bytes_to_human "$dest_dir_free_bytes")
+      req_human=$(bytes_to_human "$required")
       log_error "not enough free space on $dest_dir: available=${dest_dir_free_bytes} bytes, required=${required} bytes; aborting as LOW_SPACE_ACTION=abort"
+      notify_abort "Low disk space" "Free: ${free_human}\nRequired: ${req_human}\nAction: abort"
       exit 1
       ;;
     warn)
+      free_human=$(bytes_to_human "$dest_dir_free_bytes")
+      req_human=$(bytes_to_human "$required")
       log "WARNING: not enough free space on $dest_dir: available=${dest_dir_free_bytes} bytes, required=${required} bytes; continuing because LOW_SPACE_ACTION=warn"
+      low_space_note="Low space warning: Free=${free_human}, Required=${req_human}, continuing (warn)"
       ;;
     partial)
+      free_human=$(bytes_to_human "$dest_dir_free_bytes")
+      req_human=$(bytes_to_human "$required")
       log "NOTICE: insufficient free space on $dest_dir (available=${dest_dir_free_bytes}, required=${required}); proceeding in partial mode"
+      low_space_note="Partial mode (space constrained): Free=${free_human}, Required=${req_human}"
       ;;
     *)
       log_error "unknown LOW_SPACE_ACTION='${LOW_SPACE_ACTION}' - aborting"
+      notify_abort "Unknown LOW_SPACE_ACTION" "Value: ${LOW_SPACE_ACTION}"
       exit 1
       ;;
   esac
@@ -289,6 +364,20 @@ else
   free_human=$(bytes_to_human "$dest_dir_free_bytes")
   req_human=$(bytes_to_human "$required")
   log "Destination free space: ${free_human} (${dest_dir_free_bytes} bytes) (required: ${req_human} (${required} bytes))"
+fi
+
+# Compute utilization percentages and apply threshold notifications
+pct_free_int=-1
+if [[ "$dest_dir_total_bytes" =~ ^[0-9]+$ ]] && [ "$dest_dir_total_bytes" -gt 0 ] && [[ "$dest_dir_free_bytes" =~ ^[0-9]+$ ]]; then
+  pct_free_int=$(awk -v f="$dest_dir_free_bytes" -v t="$dest_dir_total_bytes" 'BEGIN{printf "%d", (f*100)/t}')
+fi
+if [ "$pct_free_int" -ge 0 ]; then
+  if [ "$pct_free_int" -lt "$UTIL_ALERT_THRESHOLD" ]; then
+    util_alert_note="ALERT: Free space critically low (${pct_free_int}% < ${UTIL_ALERT_THRESHOLD}%)"
+    /usr/local/emhttp/webGui/scripts/notify -i alert -b -s "${NOTIFY_TITLE} - Low Space" -d "🔴 Critical free space" -m "$util_alert_note\nPath: $dest_dir" || true
+  elif [ "$pct_free_int" -lt "$UTIL_WARN_THRESHOLD" ]; then
+    util_warn_note="Warning: Free space low (${pct_free_int}% < ${UTIL_WARN_THRESHOLD}%)"
+  fi
 fi
 
 # Set directory for backup
@@ -337,6 +426,7 @@ log "Compressing Docker $src_dir_name for backup"
 # Sanity checks before starting
 if [ ! -d "$src_dir" ]; then
   log_error "source directory does not exist: $src_dir"
+  notify_abort "Source directory missing" "Path: $src_dir"
   exit 1
 fi
 child_count=$(find "$src_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l || true)
@@ -359,8 +449,8 @@ while IFS= read -r -d '' file; do
   rm -f -- "$err_file" "$status_file"
 
   if is_skipped "$dir_name"; then
-    log "Skipping backup for $dir_name (in skip list)"
-    printf "%s: SKIPPED|0\n" "$dir_name" >"$status_file"
+    log "Skipping backup for $dir_name (user specified)"
+    printf "%s: SKIPPED(User specified)|0\n" "$dir_name" >"$status_file"
     continue
   fi
 
@@ -384,7 +474,7 @@ else
     need_human=$(bytes_to_human "$need")
     avail_human=$(bytes_to_human "$dest_free_now")
     log "Insufficient free space for ${dir_name}: need=${need_human} (${need}), available=${avail_human} (${dest_free_now}); skipping"
-    printf "%s: SKIPPED|0\n" "$dir_name" >"$status_file"
+    printf "%s: SKIPPED(Disk space low)|0\n" "$dir_name" >"$status_file"
     continue
   fi
 fi
@@ -445,9 +535,14 @@ if [[ -n "$backup_report" ]]; then
     rest=$(printf "%s" "$_line" | cut -d: -f2- | sed 's/^ //')
     label=$(printf "%s" "$rest" | cut -d'|' -f1)
     bytes_field=$(printf "%s" "$rest" | cut -d'|' -f2)
-    if [[ "$label" == "SKIPPED" ]]; then
+    if [[ "$label" == SKIPPED* ]]; then
       skipped_count=$((skipped_count+1))
-      lines_formatted+="[${name}] Backup SKIPPED"$'\n'
+      if [[ "$label" =~ ^SKIPPED\((.*)\)$ ]]; then
+        skip_reason="${BASH_REMATCH[1]}"
+        lines_formatted+="[${name}] Backup SKIPPED: ${skip_reason}"$'\n'
+      else
+        lines_formatted+="[${name}] Backup SKIPPED"$'\n'
+      fi
     elif [[ "$label" == "FAILED" ]]; then
       failed_count=$((failed_count+1))
       lines_formatted+="[${name}] Backup FAILED"$'\n'
@@ -576,7 +671,7 @@ if [[ -n "${lines_formatted:-}" ]]; then
   done <<< "${lines_formatted}"
 fi
 
-# Emoji-prefixed subject and short detail
+# Emoji-prefixed short detail
 if [ "${backup_status:-0}" -eq 0 ]; then
   status_text="OK"
 else
@@ -587,7 +682,7 @@ if [[ -n "${ok_count:-}" && -n "${total_count:-}" ]]; then
 else
   counts=""
 fi
-emoji_subject="${overall_emoji} ${NOTIFY_TITLE} - ${status_text} ${counts}"
+notify_subject="${NOTIFY_TITLE} - ${status_text} ${counts}"
 emoji_short="${overall_emoji} ${notify_short}"
 
 final_body="Runtime: ${runtime_converted}"$'\n\n'
@@ -597,12 +692,55 @@ if [[ -n "${notify_body:-}" ]]; then
 else
   final_body+="${backup_report}"$'\n'
 fi
+# Append space metrics and optional low-space note
+if [[ -z "${free_human:-}" ]]; then
+  if [[ "$dest_dir_free_bytes" =~ ^[0-9]+$ ]]; then
+    free_human=$(bytes_to_human "$dest_dir_free_bytes")
+  else
+    free_human="Unknown"
+  fi
+fi
+if [[ -z "${req_human:-}" ]]; then
+  if [[ "$required" =~ ^[0-9]+$ ]]; then
+    req_human=$(bytes_to_human "$required")
+  else
+    req_human="Unknown"
+  fi
+fi
+space_line="Space: Free=${free_human} Required=${req_human}"
+final_body+=$'\n'"${space_line}"
+if [ "$pct_free_int" -ge 0 ]; then
+  util_line="Utilization: Total=$(bytes_to_human $dest_dir_total_bytes) Used=$(bytes_to_human $dest_dir_used_bytes) Free=$(bytes_to_human $dest_dir_free_bytes) Free%=${pct_free_int}%"
+  final_body+=$'\n'"${util_line}"
+fi
+# Percent required vs free
+req_pct_of_free=-1
+if [[ "$required" =~ ^[0-9]+$ ]] && [[ "$dest_dir_free_bytes" =~ ^[0-9]+$ ]] && [ "$dest_dir_free_bytes" -gt 0 ]; then
+  req_pct_of_free=$(awk -v r="$required" -v f="$dest_dir_free_bytes" 'BEGIN{printf "%d", (r*100)/f}')
+fi
+if [ "$req_pct_of_free" -ge 0 ]; then
+  final_body+=$'\n'"Required vs Free: ${req_pct_of_free}%"
+else
+  final_body+=$'\n'"Required vs Free: Unknown"
+fi
+if [[ -n "${low_space_note:-}" ]]; then
+  final_body+=$'\n'"${low_space_note}"
+fi
+if [[ -n "${util_alert_note:-}" ]]; then
+  final_body+=$'\n'"${util_alert_note}"
+fi
+if [[ -n "${util_warn_note:-}" ]]; then
+  final_body+=$'\n'"${util_warn_note}"
+fi
+if [ "${dest_dir_was_missing}" -eq 1 ]; then
+  final_body+=$'\n'"Destination directory was missing and created: $dest_dir"
+fi
 if [ $backup_status -ne 0 ]; then
   final_body+=$'\n'"${error_summary}"
 fi
 
 # Send notify with emoji-prefixed title and short message
-/usr/local/emhttp/webGui/scripts/notify -i "$notify_level" -b -s "$emoji_subject" \
+/usr/local/emhttp/webGui/scripts/notify -i "$notify_level" -b -s "$notify_subject" \
   -d "$emoji_short" -m "$final_body"
 notify_exit=$?
 if [ $notify_exit -ne 0 ]; then
