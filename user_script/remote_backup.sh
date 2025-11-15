@@ -37,6 +37,12 @@ remote="root@192.168.50.3"
 remote_mac="9C:6B:00:4B:BB:EE"    # Wake-on-LAN MAC for the remote
 ssh_port=22                        # SSH port used to contact remote
 
+# --- Remote free-space fallback settings ---
+# When true, attempt stat(2)-based fallback on remote if df reports 0/invalid
+REMOTE_ENABLE_STAT_FALLBACK=${REMOTE_ENABLE_STAT_FALLBACK:-true}
+# Remote filesystem types that commonly report 0 with df; treat zero as unknown
+REMOTE_IGNORE_ZERO_FS_TYPES=${REMOTE_IGNORE_ZERO_FS_TYPES:-"fuse.rclone fuse.mergerfs fuse.unionfs"}
+
 # --- Rsync defaults & excludes ---
 # Default rsync arguments.
 rsync_default_args=("-ah" "-p" "--times" "--cvs-exclude" "--delete-during" "--partial" "--protect-args" "--itemize-changes" "--stats")
@@ -183,7 +189,7 @@ notify_send() {
   "$notify_bin" -i "$level" -b -s "$subject" -d "$detail" -m "$body"
   local nrc=$?
   if [ $nrc -ne 0 ]; then
-    log_error "Notification command failed with exit code $nrc for subject: $subject"
+    log "Notification command failed with exit code $nrc for subject: $subject"
   fi
   return $nrc
 }
@@ -220,10 +226,35 @@ preflight_disk_check() {
     :
   else
     local dest_avail_kb
-  dest_avail_kb=$(ssh -p "$ssh_port" "$remote" df -k "$remote_dest" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
+    dest_avail_kb=$(ssh -p "$ssh_port" "$remote" df -k "$remote_dest" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
     dest_avail=$((dest_avail_kb * 1024))
   fi
   dest_avail=${dest_avail:-0}
+  if ! [[ "$dest_avail" =~ ^[0-9]+$ ]]; then dest_avail=0; fi
+
+  # Remote stat(2) fallback and fs-type ignore for zero/invalid free space
+  local avail_unknown=0
+  if [ "$dest_avail" -eq 0 ] && [ "$REMOTE_ENABLE_STAT_FALLBACK" = "true" ]; then
+    local stat_vals
+    stat_vals=$(ssh -p "$ssh_port" "$remote" stat -f --format '%a %s' "$remote_dest" 2>/dev/null || echo "")
+    if [[ "$stat_vals" =~ ^[0-9]+\ [0-9]+$ ]]; then
+      local stat_free
+      stat_free=$(awk '{print $1 * $2}' <<< "$stat_vals")
+      if [[ "$stat_free" =~ ^[0-9]+$ ]] && [ "$stat_free" -gt 0 ]; then
+        dest_avail=$stat_free
+      fi
+    fi
+  fi
+  if [ "$dest_avail" -eq 0 ]; then
+    local fs_type
+    fs_type=$(ssh -p "$ssh_port" "$remote" stat -f -c %T "$remote_dest" 2>/dev/null || echo "")
+    for _fst in $REMOTE_IGNORE_ZERO_FS_TYPES; do
+      if [ "$fs_type" = "$_fst" ]; then
+        avail_unknown=1
+        break
+      fi
+    done
+  fi
 
   human_src=$(bytes_human "$src_bytes")
   human_dest_avail=$(bytes_human "$dest_avail")
@@ -237,7 +268,7 @@ preflight_disk_check() {
   human_buffer=$(bytes_human "$safety_buffer")
   log "Preflight $label: source=$human_src dest_avail=$human_dest_avail buffer=$human_buffer"
 
-  if [ "$dest_avail" -lt $((src_bytes + safety_buffer)) ]; then
+  if [ "$avail_unknown" -ne 1 ] && [ "$dest_avail" -lt $((src_bytes + safety_buffer)) ]; then
     need_bytes=$((src_bytes + safety_buffer))
     human_need=$(bytes_human "$need_bytes")
     log "Insufficient space for $label: need at least $human_need but only $human_dest_avail available on $remote:$remote_dest"
@@ -250,8 +281,17 @@ preflight_disk_check() {
     human_shortfall=$(bytes_human "$shortfall")
     runtime_now=$(format_runtime)
     body="$label backup aborted: required ${human_required} (source ${human_src} + buffer ${human_buffer}); available ${human_dest_avail}; shortfall ${human_shortfall}\n\nRuntime: ${runtime_now}\nSee log: $log_file"
-  esub=$(notif_emoji nospace)
-  notify_send alert "${esub} Scheduled Remote Backup - NO SPACE" "${esub} $label backup aborted: insufficient space" "$body"
+    # Append space metrics and Required vs Free %
+    if [ "$avail_unknown" -ne 1 ] && [[ "$dest_avail" =~ ^[0-9]+$ ]] && [ "$dest_avail" -gt 0 ]; then
+      req_pct_of_free=$(awk -v r="$need_bytes" -v f="$dest_avail" 'BEGIN{printf "%d", (r*100)/f}')
+      body+=$'\n'"Space: Free=${human_dest_avail} Required=${human_need}"
+      body+=$'\n'"Required vs Free: ${req_pct_of_free}%"
+    else
+      body+=$'\n'"Space: Free=Unknown Required=${human_need}"
+      body+=$'\n'"Required vs Free: Unknown"
+    fi
+    esub=$(notif_emoji nospace)
+    notify_send alert "Scheduled Remote Backup - NO SPACE" "${esub} $label backup aborted: insufficient space" "$body"
     return 2
   fi
 
@@ -263,6 +303,7 @@ aggregate_preflight_check() {
   declare -A src_by_device
   declare -A remote_used
   declare -A remote_avail
+  declare -A remote_avail_unknown
   declare -A device_mount
   local min_buffer=$((1024 * 1024 * 1024))
 
@@ -321,23 +362,45 @@ aggregate_preflight_check() {
     local avail=$(printf '%s' "$df_out" | cut -d'|' -f3)
     local mountp=$(printf '%s' "$df_out" | cut -d'|' -f4)
 
+    # Normalize and fallback for zero/invalid avail
+    if ! [[ "$avail" =~ ^[0-9]+$ ]]; then avail=0; fi
+    local avail_unknown=0
+    if [ "$avail" -eq 0 ] && [ "$REMOTE_ENABLE_STAT_FALLBACK" = "true" ]; then
+      local stat_vals
+      stat_vals=$(ssh -o BatchMode=yes -o ConnectTimeout="$ssh_connect_timeout" -p "$ssh_port" "$remote" stat -f --format '%a %s' "$dest" 2>/dev/null || echo "")
+      if [[ "$stat_vals" =~ ^[0-9]+\ [0-9]+$ ]]; then
+        local stat_free
+        stat_free=$(awk '{print $1 * $2}' <<< "$stat_vals")
+        if [[ "$stat_free" =~ ^[0-9]+$ ]] && [ "$stat_free" -gt 0 ]; then
+          avail=$stat_free
+        fi
+      fi
+    fi
+    if [ "$avail" -eq 0 ]; then
+      local fs_type
+      fs_type=$(ssh -o BatchMode=yes -o ConnectTimeout="$ssh_connect_timeout" -p "$ssh_port" "$remote" stat -f -c %T "$dest" 2>/dev/null || echo "")
+      for _fst in $REMOTE_IGNORE_ZERO_FS_TYPES; do
+        if [ "$fs_type" = "$_fst" ]; then
+          avail_unknown=1
+          break
+        fi
+      done
+    fi
+
     device_mount["$device"]="$mountp"
     remote_used["$device"]=$(( ${remote_used["$device"]:-0} + used ))
     remote_avail["$device"]=$avail
+    remote_avail_unknown["$device"]=$avail_unknown
     src_by_device["$device"]=$(( ${src_by_device["$device"]:-0} + estimated_changed ))
   done
 
   local fail_msg=""
   for device in "${!src_by_device[@]}"; do
-    local src_sum=${src_by_device[$device]}
+    local src_sum=${src_by_device[$device]}   # this is the aggregated estimated_changed bytes
     local used=${remote_used[$device]:-0}
     local avail=${remote_avail[$device]:-0}
     local mountp=${device_mount[$device]:-/}
-
-    local needed=$(( src_sum - used ))
-    if [ "$needed" -lt 0 ]; then
-      needed=0
-    fi
+    local needed=$src_sum
 
     src_sum=${src_sum:-0}
     used=${used:-0}
@@ -356,9 +419,10 @@ aggregate_preflight_check() {
     local human_avail=$(bytes_human "$avail")
     local human_buffer=$(bytes_human "$safety_buffer")
 
-    log "Aggregate preflight for device $device mount $mountp: total_src=$human_src_sum used=$used avail=$human_avail buffer=$human_buffer"
+    log "Aggregate preflight for device $device mount $mountp: est_change=$human_src_sum avail=$human_avail buffer=$human_buffer"
 
-    if [ "$avail" -lt $(( needed + safety_buffer )) ]; then
+    local avail_unknown=${remote_avail_unknown[$device]:-0}
+    if [ "$avail_unknown" -ne 1 ] && [ "$avail" -lt $(( needed + safety_buffer )) ]; then
       fail_msg+="Device $device mounted on $mountp: need ~$human_needed + buffer $human_buffer, available $human_avail\n"
     fi
   done
@@ -587,6 +651,7 @@ run_rsync() {
   rsync_args+=("${default_excludes_local[@]:-}")
   if [ "$dry_run" = true ]; then
     rsync_args+=("--dry-run")
+
   fi
   if [ "${#opts[@]}" -ne 0 ]; then
     rsync_args+=("${opts[@]}")
@@ -783,8 +848,15 @@ start_time=$(date +%s)
 log "$src_nas --> $dest_nas start: $(date)"
 
 # Wake-on-LAN
-etherwake 9C:6B:00:4B:BB:EE
-log "Sent Wake-on-LAN to $dest_nas"
+if command -v etherwake >/dev/null 2>&1; then
+  etherwake "$remote_mac" || true
+  log "Sent Wake-on-LAN to $dest_nas (MAC: $remote_mac)"
+elif command -v wakeonlan >/dev/null 2>&1; then
+  wakeonlan "$remote_mac" || true
+  log "Sent Wake-on-LAN via wakeonlan to $dest_nas (MAC: $remote_mac)"
+else
+  log "Wake-on-LAN tool not found (etherwake/wakeonlan). Skipping WOL for $dest_nas (MAC: $remote_mac)"
+fi
 
 ## Wait loop for SSH readiness
 start_wait_ts=$(date +%s)
@@ -830,7 +902,18 @@ done
 if [ "$ssh_reachable" -eq 1 ]; then
   :
 else
-  log "Proceeding despite SSH not being reachable; Disk check may fail"
+  log "SSH not reachable on $dest_nas after ${max_ssh_wait}s; aborting backup"
+  syslog crit "Remote SSH unreachable on $dest_nas after ${max_ssh_wait}s; aborting"
+  runtime_now=$(format_runtime)
+  esub=$(notif_emoji fail)
+  body="Waited ${max_ssh_wait}s for SSH on ${dest_nas} (host: ${remote}).\n\n"
+  if [ -n "${remote_mac:-}" ]; then
+    body+="WOL MAC: ${remote_mac}\n"
+  fi
+  body+=$'Suggested checks:\n- Network connectivity and firewall\n- Remote host power state\n- SSH service status on remote\n\n'
+  body+="Runtime: ${runtime_now}\nSee log: ${log_file}"
+  notify_send alert "Scheduled Remote Backup - SSH UNREACHABLE" "${esub} Remote ${dest_nas}: SSH unreachable; backup aborted" "$body"
+  exit ${default_fail_code:-50}
 fi
 
 ## Per-label backup execution
@@ -939,7 +1022,7 @@ else
   runtime_now=$(format_runtime)
   notify_detail+="Runtime: ${runtime_now}\nSee log: $log_file"
   esub=$(notif_emoji fail)
-  notify_send alert "${esub} Scheduled Remote Backup - FAIL" "${esub} Backup FAIL: $failed_summary" "$notify_detail"
+  notify_send alert "Scheduled Remote Backup - FAIL" "${esub} Backup FAIL: $failed_summary" "$notify_detail"
 fi
 
 # Record end time
@@ -990,8 +1073,50 @@ fi
 
 if [ "${#failed_labels[@]}" -eq 0 ]; then
   body="${detailed_body}"
+  # Append per-label space metrics (Free/Required and Required vs Free %)
+  for idx in "${!labels_array[@]}"; do
+    lbl=${labels_array[$idx]}
+    dest=${dests_array[$idx]}
+    req_bytes=${rsync_transferred_bytes[$lbl]:-0}
+    req_human=$(bytes_human "$req_bytes")
+    # Query remote free space with fallback/ignore
+    df_avail=$(ssh -o BatchMode=yes -o ConnectTimeout="$ssh_connect_timeout" -p "$ssh_port" "$remote" df -P -B1 "$dest" 2>/dev/null | awk 'NR==2{print $4}' || true)
+    if [[ ! "$df_avail" =~ ^[0-9]+$ ]]; then df_avail=0; fi
+    free_bytes=$df_avail
+    if [ "$free_bytes" -eq 0 ] && [ "$REMOTE_ENABLE_STAT_FALLBACK" = "true" ]; then
+      stat_vals=$(ssh -o BatchMode=yes -o ConnectTimeout="$ssh_connect_timeout" -p "$ssh_port" "$remote" stat -f --format '%a %s' "$dest" 2>/dev/null || echo "")
+      if [[ "$stat_vals" =~ ^[0-9]+\ [0-9]+$ ]]; then
+        stat_free=$(awk '{print $1 * $2}' <<< "$stat_vals")
+        if [[ "$stat_free" =~ ^[0-9]+$ ]] && [ "$stat_free" -gt 0 ]; then
+          free_bytes=$stat_free
+        fi
+      fi
+    fi
+    free_unknown=0
+    if [ "$free_bytes" -eq 0 ]; then
+      fs_type=$(ssh -o BatchMode=yes -o ConnectTimeout="$ssh_connect_timeout" -p "$ssh_port" "$remote" stat -f -c %T "$dest" 2>/dev/null || echo "")
+      for _fst in $REMOTE_IGNORE_ZERO_FS_TYPES; do
+        if [ "$fs_type" = "$_fst" ]; then
+          free_unknown=1
+          break
+        fi
+      done
+    fi
+    if [ "$free_unknown" -eq 1 ]; then
+      body+=$'\n''Space ('"$lbl"'): Free=Unknown Required='"$req_human"''
+      body+=$'\n''Required vs Free ('"$lbl"'): Unknown'
+    else
+      free_human=$(bytes_human "$free_bytes")
+      req_pct_of_free=0
+      if [ "$free_bytes" -gt 0 ] && [ "$req_bytes" -gt 0 ]; then
+        req_pct_of_free=$(awk -v r="$req_bytes" -v f="$free_bytes" 'BEGIN{printf "%d", (r*100)/f}')
+      fi
+      body+=$'\n''Space ('"$lbl"'): Free='"$free_human"' Required='"$req_human"''
+      body+=$'\n''Required vs Free ('"$lbl"'): '"$req_pct_of_free"'%'
+    fi
+  done
   esub=$(notif_emoji ok)
-  notify_send normal "${esub} Scheduled Remote Backup - OK" "${esub} Backup. OK: $condensed_line" "$body"
+  notify_send normal "Scheduled Remote Backup - OK" "${esub} Backup. OK: $condensed_line" "$body"
   if [ "$dry_run" = false ]; then
     log "Shutting down remote after successful backup"
     if ! ssh -p "$ssh_port" "$remote" "df --type=xfs -h && powerdown" 2>/dev/null; then
