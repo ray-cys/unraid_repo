@@ -11,7 +11,8 @@ noParity=true
 clearLog=false
 
 # --------------------------------------------------------------------------------
-# SETTINGS
+# Configuration section
+# Adjust the settings below to configure the remote backup behavior.
 
 POOLS=(/mnt/cache)                    # List of BTRFS pools to snapshot, enter directory with spaces for multiple
 SHARES=("appdata" "domains" "system") # List of shares (subvolumes) to snapshot per pool
