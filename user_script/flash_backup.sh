@@ -11,16 +11,14 @@ noParity=true
 clearLog=false
 
 # --------------------------------------------------------------------------------
-# SETTINGS
+# Configuration section
+# Adjust the settings below to configure the backup behavior.
 
 # Set source directories
-backup_dir="/mnt/user/node/flash"
+BACKUP_DIR="/mnt/user/node/flash"
 
 # Set maximum number of backups to keep
-max_backups=3
-
-# Unraid notify helper
-notify_bin="/usr/local/emhttp/webGui/scripts/notify"
+MAX_BACKUP=3
 
 # Optional free-space fallback settings
 # When true, attempt stat(2)-based fallback if df reports 0/invalid
@@ -91,7 +89,7 @@ notify_send() {
   local subject="$1"; shift
   local detail="$1"; shift
   local body="$1"; shift || true
-  "$notify_bin" -i "$level" -b -s "$subject" -d "$detail" -m "$body"
+  /usr/local/emhttp/webGui/scripts/notify -i "$level" -b -s "$subject" -d "$detail" -m "$body"
   local nrc=$?
   if [ $nrc -ne 0 ]; then
     log "Notification command failed with exit code $nrc for subject: $subject"
@@ -143,23 +141,23 @@ else
 fi
 
 # Creating flash backup directory and ensure correct permissions
-if [ ! -d "$backup_dir" ] ; then
+if [ ! -d "$BACKUP_DIR" ] ; then
   log "Create backup directory as it does not exist"
-  if mkdir -p "$backup_dir" 2>/dev/null; then
+  if mkdir -p "$BACKUP_DIR" 2>/dev/null; then
     # Set conservative permissions and ownership
-    chmod 0755 "$backup_dir" 2>/dev/null || syslog warning "chmod failed for $backup_dir"
-    chown -R nobody:users "$backup_dir" 2>/dev/null || syslog warning "chown failed for $backup_dir"
-    log "Created $backup_dir backup directory with mode 0755 and owner nobody:users"
+    chmod 0755 "$BACKUP_DIR" 2>/dev/null || syslog warning "chmod failed for $BACKUP_DIR"
+    chown -R nobody:users "$BACKUP_DIR" 2>/dev/null || syslog warning "chown failed for $BACKUP_DIR"
+    log "Created $BACKUP_DIR backup directory with mode 0755 and owner nobody:users"
   else
-    syslog err "Failed to create backup directory $backup_dir"
-    log "Failed to create $backup_dir"
+    syslog err "Failed to create backup directory $BACKUP_DIR"
+    log "Failed to create $BACKUP_DIR"
     exit 2
   fi
 else
   # Ensure correct permissions/ownership on existing directory
-  chmod 0775 "$backup_dir" 2>/dev/null || syslog warning "chmod failed for $backup_dir"
-  chown -R nobody:users "$backup_dir" 2>/dev/null || syslog warning "chown failed for $backup_dir"
-  log "Directory $backup_dir exists; ensured mode 0775 and owner nobody:users"
+  chmod 0775 "$BACKUP_DIR" 2>/dev/null || syslog warning "chmod failed for $BACKUP_DIR"
+  chown -R nobody:users "$BACKUP_DIR" 2>/dev/null || syslog warning "chown failed for $BACKUP_DIR"
+  log "Directory $BACKUP_DIR exists; ensured mode 0775 and owner nobody:users"
 fi
 
 # Find the latest flash backup zip file in /usr/local/emhttp
@@ -214,8 +212,8 @@ done
 log "Search result for flash zip: ${latest_zip:-<none>}"
 if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
   src_bytes=$(stat -c%s "$latest_zip" 2>/dev/null || stat -f%z "$latest_zip" 2>/dev/null || echo 0)
-  dest_avail=$(df --output=avail -B1 "$backup_dir" 2>/dev/null | tail -n1 || echo 0)
-  dest_total=$(df --output=size -B1 "$backup_dir" 2>/dev/null | tail -n1 || echo 0)
+  dest_avail=$(df --output=avail -B1 "$BACKUP_DIR" 2>/dev/null | tail -n1 || echo 0)
+  dest_total=$(df --output=size -B1 "$BACKUP_DIR" 2>/dev/null | tail -n1 || echo 0)
   src_bytes=${src_bytes:-0}
   dest_avail=${dest_avail:-0}
   dest_total=${dest_total:-0}
@@ -226,7 +224,7 @@ if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
 
   # If df reports 0 available and fallback is enabled, try stat(2)-based free calculation
   if [ "$dest_avail" -eq 0 ] && [ "$FLASH_ENABLE_STAT_FALLBACK" = "true" ]; then
-    stat_vals=$(stat -f --format '%a %s' "$backup_dir" 2>/dev/null || echo "")
+    stat_vals=$(stat -f --format '%a %s' "$BACKUP_DIR" 2>/dev/null || echo "")
     if [[ "$stat_vals" =~ ^[0-9]+\ [0-9]+$ ]]; then
       stat_free=$(awk '{print $1 * $2}' <<< "$stat_vals")
       if [[ "$stat_free" =~ ^[0-9]+$ ]] && [ "$stat_free" -gt 0 ]; then
@@ -238,7 +236,7 @@ if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
   # If still zero, and fs type matches ignore list, treat free as unknown (do not gate move)
   dest_free_unknown=0
   if [ "$dest_avail" -eq 0 ]; then
-    fs_type=$(stat -f -c %T "$backup_dir" 2>/dev/null || echo "")
+    fs_type=$(stat -f -c %T "$BACKUP_DIR" 2>/dev/null || echo "")
     for _fst in $FLASH_IGNORE_ZERO_FS_TYPES; do
       if [ "$fs_type" = "$_fst" ]; then
         dest_free_unknown=1
@@ -263,11 +261,11 @@ if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
     log "Insufficient space for moving $latest_zip: need ${human_need} available ${human_avail}"
   else
     target="$latest_zip"
-    if mv -- "$target" "$backup_dir/"; then
-      moved_file="$backup_dir/$(basename "$target")"
+    if mv -- "$target" "$BACKUP_DIR/"; then
+      moved_file="$BACKUP_DIR/$(basename "$target")"
       moved_size=$(stat -c%s "$moved_file" 2>/dev/null || stat -f%z "$moved_file" 2>/dev/null || echo 0)
       human_moved_size=$(bytes_human "$moved_size")
-      log "Moved $target to $backup_dir"
+      log "Moved $target to $BACKUP_DIR"
       log "Moved file: $moved_file size: ${human_moved_size}"
 
       if [ -d "/usr/local/emhttp" ]; then
@@ -288,8 +286,8 @@ if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
     else
       rc=$?
       syslog warning "mv failed with exit $rc; attempting copy+remove fallback for $target"
-      if cp --preserve=mode,timestamps -- "$target" "$backup_dir/" 2>/dev/null && rm -f -- "$target" 2>/dev/null; then
-        moved_file="$backup_dir/$(basename "$target")"
+      if cp --preserve=mode,timestamps -- "$target" "$BACKUP_DIR/" 2>/dev/null && rm -f -- "$target" 2>/dev/null; then
+        moved_file="$BACKUP_DIR/$(basename "$target")"
         moved_size=$(stat -c%s "$moved_file" 2>/dev/null || stat -f%z "$moved_file" 2>/dev/null || echo 0)
         human_moved_size=$(bytes_human "$moved_size")
         log "Copied and removed original: $target -> $moved_file"
@@ -310,7 +308,7 @@ if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
         fi
 
       else
-        syslog err "Failed to move or copy $target to $backup_dir"
+        syslog err "Failed to move or copy $target to $BACKUP_DIR"
         log "mv/copy failed for $target"
       fi
     fi
@@ -320,13 +318,13 @@ else
 fi
 
 # Remove old backups
-prune_old_files "$backup_dir" "$max_backups" "*flash-backup-*.zip"
+prune_old_files "$BACKUP_DIR" "$MAX_BACKUP" "*flash-backup-*.zip"
 
  # Syslog and notification
  runtime_now=$(format_runtime)
  if [ -n "${moved_file:-}" ]; then
   syslog info "Flash Backup: Unraid OS backed up on $(date) (Runtime: ${runtime_now})"
-  notify_body="Flash backup moved to ${backup_dir}\nRuntime: ${runtime_now}"
+  notify_body="Flash backup moved to ${BACKUP_DIR}\nRuntime: ${runtime_now}"
   notify_body+="\nMoved: $(basename "${moved_file}") (${human_moved_size})"
   # Append space metrics if available from pre-check
   if [ -n "${need_bytes:-}" ]; then
@@ -347,7 +345,7 @@ prune_old_files "$backup_dir" "$max_backups" "*flash-backup-*.zip"
   notify_send normal "Flash Backup - OK" "🟢 Flash backup successful" "$notify_body"
 else
   syslog err "Flash Backup: No backup moved on $(date) (Runtime: ${runtime_now})"
-  notify_body="Flash backup did NOT move to ${backup_dir}\nRuntime: ${runtime_now}"
+  notify_body="Flash backup did NOT move to ${BACKUP_DIR}\nRuntime: ${runtime_now}"
   if [ -n "${latest_zip:-}" ] && [ -f "${latest_zip}" ]; then
     notify_body+="\nFound source zip: ${latest_zip} (${human_src_size})"
   else
