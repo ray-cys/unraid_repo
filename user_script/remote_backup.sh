@@ -898,7 +898,7 @@ while :; do
       arr_now=$(date +%s)
       arr_elapsed=$(( arr_now - arr_start_ts ))
       # Check that /mnt/user exists and at least one expected share directory is present (media or secure)
-      if ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$ssh_port" "$remote" '[ -d /mnt/user ] && { [ -d /mnt/user/media ] || [ -d /mnt/user/secure ]; }'; then
+      if ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" '[ -d /mnt/user ] && { [ -d /mnt/user/media ] || [ -d /mnt/user/secure ]; }'; then
         log "Remote array appears online after ${arr_elapsed}s; proceeding to backup operations."
         break
       fi
