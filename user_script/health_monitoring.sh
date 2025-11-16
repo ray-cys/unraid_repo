@@ -29,22 +29,22 @@ NEAR_THRESHOLD_DELTA=5        # Consider "near full" within this percent of THRE
 POOL_EXCLUDES=("ramtmp" "user0") # Pool names to exclude from pool totals
 
 # --- Feature Toggles ---
-ENABLE_BTRFS_SCRUB=0          # 1: start btrfs scrub; 0: only parse last status
-ENABLE_XFS_CHECK=0            # 1: run xfs_repair -n; 0: skip XFS metadata check
-ENABLE_POOL_DEVICE_SMART=1    # 1: include per-device SMART lines for pools
-VERBOSE_OK=0                  # 1: show OK lines; 0: suppress OK lines
-JSON_EXPORT=1                 # 1: write JSON summary to disk
-JSON_INCLUDE_DISKS=1          # 1: include per-disk details in JSON (poh/endurance)
+ENABLE_BTRFS_SCRUB=0          # 1: Start btrfs scrub; 0: only parse last status
+ENABLE_XFS_CHECK=0            # 1: Run xfs_repair -n; 0: skip XFS metadata check
+ENABLE_POOL_DEVICE_SMART=1    # 1: Include per-device SMART lines for pools
+VERBOSE_OK=0                  # 1: Show OK lines; 0: suppress OK lines
+JSON_EXPORT=1                 # 1: Write JSON summary to disk
+JSON_INCLUDE_DISKS=1          # 1: Include per-disk details in JSON (poh/endurance)
 HISTORY_WINDOW_DAYS=7         # Window (days) for growth averages and trends
-RISK_SCORING_ENABLED=1        # 1: show risk scores section
-LIFECYCLE_ENABLED=1           # 1: show lifecycle buckets (replace/monitor/healthy)
-AGE_AWARE_ENABLED=1           # 1: annotate near-endurance devices
-SHARE_BREAKDOWN_ENABLED=0     # 1: compute per-share usage (uses du; can be heavy)
+RISK_SCORING_ENABLED=1        # 1: Show risk scores section
+LIFECYCLE_ENABLED=1           # 1: Show lifecycle buckets (replace/monitor/healthy)
+AGE_AWARE_ENABLED=1           # 1: Annotate near-endurance devices
+SHARE_BREAKDOWN_ENABLED=0     # 1: Compute per-share usage (uses du; can be heavy)
 SHARE_TOP_N=5                 # Show top N shares by size/growth
-LOG_PRUNE_ENABLED=1           # 1: prune old timestamped run logs in LOG_DIR
+LOG_PRUNE_ENABLED=1           # 1: Prune old timestamped run logs in LOG_DIR
 LOG_MAX_DAYS=3                # Remove run logs older than this many days (0 disables age pruning)
 LOG_MAX_COUNT=0               # After age pruning, keep at most this many run logs per pattern (0 disables count pruning)
-ADAPTIVE_LONG_TEST_ENABLED=1  # 1: enable adaptive long test scheduling
+ADAPTIVE_LONG_TEST_ENABLED=1  # 1: Enable adaptive long test scheduling
 LONG_TEST_RISK_THRESHOLD=50   # Risk score >= triggers long test escalation
 LONG_TEST_CRITICAL_MIN_DAYS=7 # If SMART critical and last long test older than this days -> force long
 LONG_TEST_RISK_MIN_DAYS=0     # Minimum days since last long test for risk-based escalation (0=ignore)
@@ -52,8 +52,8 @@ TBW_DAYS_WARN=30              # Remaining TBW forecast days < triggers WARNING
 TBW_DAYS_CRIT=7               # Remaining TBW forecast days < triggers CRITICAL
 ADAPTIVE_ALERTS_ENABLED=1     # 1: emit alert entries for adaptive escalations (warning/critical)
 POH_RESET_CRIT_THRESHOLD=500  # If POH drops by > this many hours classify as critical reset
-NVME_WEAR_REGRESSION_WARN=1   # Flag any drop in NVMe Percentage Used (wear regression)
-LOG_MIRROR_STDOUT=1           # 1: also echo log lines to stdout; 0: silent (only log files)
+NVME_WEAR_REGRESSION_WARN=1   # 1: Flag any drop in NVMe Percentage Used (wear regression)
+LOG_MIRROR_STDOUT=1           # 1: Echo log lines to stdout; 0: silent (only log files)
 
 # --- SMART Thresholds (SATA/NVMe) ---
 RELOC_WARNING=1               # Reallocated sectors >= triggers warning
@@ -82,10 +82,10 @@ SNAPSHOT_CRIT=500             # btrfs snapshot count >= triggers critical
 
 # --- SMART Trend / Parity Suggestion ---
 PARITY_SUGGEST_ENABLED=1      # 1: evaluate SMART deltas to suggest parity check / extended test
-PARITY_PENDING_MIN_DELTA=1    # Pending sectors increase >= triggers suggestion
-PARITY_REALLOC_MIN_DELTA=1    # Reallocated sectors increase >= triggers suggestion
-PARITY_REALLOC_EVT_MIN_DELTA=1 # Reallocation event count increase >= triggers suggestion
-PARITY_UNC_MIN_DELTA=1        # Offline or reported uncorrectable increase >= triggers suggestion
+PARITY_PENDING_MIN_DELTA=1    # 1: Pending sectors increase >= triggers suggestion
+PARITY_REALLOC_MIN_DELTA=1    # 1: Reallocated sectors increase >= triggers suggestion
+PARITY_REALLOC_EVT_MIN_DELTA=1 # 1: Reallocation event count increase >= triggers suggestion
+PARITY_UNC_MIN_DELTA=1        # 1: Offline or reported uncorrectable increase >= triggers suggestion
 SMART_TREND_ALERTS_ENABLED=1  # 1: emit warning alerts for SMART trend increases
 
 # --- Disk I/O Error Frequency ---
