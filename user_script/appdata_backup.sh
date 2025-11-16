@@ -11,22 +11,21 @@ noParity=true
 clearLog=false
 
 # --------------------------------------------------------------------------------
-# SETTINGS
+# Configuration section
+# Adjust the settings below to configure the backup behavior.
 
 # Directory containing container appdata directories
-src_dir="/mnt/cache/appdata"
-dest_dir="/mnt/user/node/cache"
+SRC_DIR="/mnt/cache/appdata"
+DEST_DIR="/mnt/user/node/cache"
 
 # Containers to skip from stopping and/or archiving.
-#   skip_containers=()                    # do not skip any containers
-#   skip_containers=("plex-media-server") # skip plex
-skip_containers=()
+#   SKIP_CONTAINERS=()                    # do not skip any containers
+#   SKIP_CONTAINERS=("plex-media-server") # skip plex
+SKIP_CONTAINERS=()
 
-# How many backups to keep (oldest removed when exceeded)
-max_backups=3
-
-# Number of recent log files to keep
-max_logs=3
+# How many backups and logs to keep (oldest removed when exceeded)
+MAX_BACKUPS=3
+MAX_LOGS=3
 
 # Number of parallel compression jobs. Defaults to CPU cores. Lower to reduce IO.
 PARALLEL_JOBS=${PARALLEL_JOBS-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)}
@@ -36,7 +35,6 @@ if command -v pigz >/dev/null 2>&1; then
 else
   USE_PIGZ=0
 fi
-
 if command -v pv >/dev/null 2>&1; then
   PV_AVAILABLE=1
 else
@@ -44,69 +42,57 @@ else
 fi
 
 # Directory settings
-src_dir_name="$(basename "$src_dir")"
-datetime="$(date +%Y%m%d_%H%M%S)"
-log_file_subdir="/boot/logs/$src_dir_name-logs"
-log_file="$log_file_subdir/$src_dir_name-$datetime.log"
+SRC_DIR_NAME="$(basename "$SRC_DIR")"           # Name of source dir for logging
+DATETIME="$(date +%Y%m%d_%H%M%S)"               # Timestamp for this run
+LOG_FILE_SUBDIR="/boot/logs/$SRC_DIR_NAME-logs" # Log file directory
+LOG_FILE="$LOG_FILE_SUBDIR/$SRC_DIR_NAME-$DATETIME.log" # Log file path
+ERR_EXCERPT_LINES=${ERR_EXCERPT_LINES:-20}      # Number of stderr lines to include in notification on failure
 
 # Keep partial artifacts (on failure): "true" or "false"
 KEEP_PARTIAL=${KEEP_PARTIAL:-true}
 
 # Retry behaviour for tar/compress: how many attempts and delay between attempts (seconds)
-RETRIES=${RETRIES:-3}
-RETRY_DELAY=${RETRY_DELAY:-5}
-
-# How many lines of stderr to include in the Unraid notification for failed items
-ERR_EXCERPT_LINES=${ERR_EXCERPT_LINES:-20}
+RETRIES=${RETRIES:-3}                           # Number of attempts
+RETRY_DELAY=${RETRY_DELAY:-5}                   # Delay between attempts (seconds)
 
 # Append tar/pv progress to the main logfile (true/false)
 TARBALL_PROGRESS_TO_LOG=${TARBALL_PROGRESS_TO_LOG:-true}
 
 # Low-space / disk-check policy
-# LOW_SPACE_ACTION: abort|warn|partial  (default: abort)
-LOW_SPACE_ACTION=${LOW_SPACE_ACTION:-abort}
-
-# Extra margin in bytes to reserve in destination (default: 0)
-LOW_SPACE_MARGIN=${LOW_SPACE_MARGIN:-0}
-
-# If df/du cannot determine size, fail when true, otherwise proceed with a warning
-LOW_SPACE_FAIL_IF_UNDETERMINED=${LOW_SPACE_FAIL_IF_UNDETERMINED:-false}
-
-# Filesystem types whose zero-free-space df output should be treated as unknown/unlimited.
-# Space-separated list. Adjust if your mount reports a different type.
-LOW_SPACE_IGNORE_ZERO_FS_TYPES=${LOW_SPACE_IGNORE_ZERO_FS_TYPES:-"fuse.rclone fuse.mergerfs fuse.unionfs"}
-
-# When true, attempt a stat(2)-based fallback if df reports 0 bytes free.
-LOW_SPACE_ENABLE_STAT_FALLBACK=${LOW_SPACE_ENABLE_STAT_FALLBACK:-true}
+LOW_SPACE_ACTION=${LOW_SPACE_ACTION:-abort}     # LOW_SPACE_ACTION: abort|warn|partial  (default: abort)
+LOW_SPACE_MARGIN=${LOW_SPACE_MARGIN:-0}         # Extra margin (bytes) to add to required space calculation
+LOW_SPACE_FAIL_IF_UNDETERMINED=${LOW_SPACE_FAIL_IF_UNDETERMINED:-false} # If df/du cannot determine size, fail when true, otherwise proceed with a warning
+LOW_SPACE_IGNORE_ZERO_FS_TYPES=${LOW_SPACE_IGNORE_ZERO_FS_TYPES:-"fuse.rclone fuse.mergerfs fuse.unionfs"} # Filesystem types whose zero-free-space df output should be treated as unknown/unlimited.
+LOW_SPACE_ENABLE_STAT_FALLBACK=${LOW_SPACE_ENABLE_STAT_FALLBACK:-true} # When true, attempt a stat(2)-based fallback if df reports 0 bytes free.
 
 # Percent free space thresholds (integer percent). If free% < alert -> alert notification; if < warn -> warning note.
-UTIL_WARN_THRESHOLD=${UTIL_WARN_THRESHOLD:-15}
-UTIL_ALERT_THRESHOLD=${UTIL_ALERT_THRESHOLD:-5}
+UTIL_WARN_THRESHOLD=${UTIL_WARN_THRESHOLD:-15}  # Warning threshold (percent)
+UTIL_ALERT_THRESHOLD=${UTIL_ALERT_THRESHOLD:-5} # Alert threshold (percent)
 
-# Pigz thread control (0 lets pigz auto-detect). Set to 1..N to limit per-job threads
-PIGZ_THREADS=${PIGZ_THREADS:-0}
+# Pigz thread control
+PIGZ_THREADS=${PIGZ_THREADS:-0}.                # Pigz threads per compression job (0 lets pigz auto-detect). Set to 1..N to limit per-job threads
 
-# Extra tar options (array), e.g. TAR_OPTIONS=("--no-same-owner")
-TAR_OPTIONS=()
+# Extra tar options
+TAR_OPTIONS=()                                 # Extra tar options (array)
 
 # Notification customization
-NOTIFY_TITLE="Scheduled Docker Backup"
-NOTIFY_LEVEL_ON_SUCCESS="normal"
-NOTIFY_LEVEL_ON_FAILURE="alert"
+NOTIFY_TITLE="Scheduled Docker Backup"         # Notification title prefix
+NOTIFY_LEVEL_ON_SUCCESS="normal"               # Notification level on success: normal|warning|alert
+NOTIFY_LEVEL_ON_FAILURE="alert"                # Notification level on failure: normal|warning|alert
 
-# Intermediate files location (default: inside the run backup dir if TMP_DIR empty)
-TMP_DIR=""
+# Intermediate files location 
+TMP_DIR=""                                     # e.g., /tmp/docker_backup_tmp (default: inside the run backup dir if TMP_DIR empty)
 
 # Keep per-container .err files after a successful run
-KEEP_TEMP_ERR=${KEEP_TEMP_ERR:-false}
+KEEP_TEMP_ERR=${KEEP_TEMP_ERR:-false}         # Keep temporary error files
 # --------------------------------------------------------------------------------
 
 # Check if a container/dir is in the skip list (exact match). Empty skip list -> skip none.
 is_skipped() {
   local target="$1"
   local item
-  [ "${#skip_containers[@]}" -eq 0 ] && return 1
-  for item in "${skip_containers[@]}"; do
+  [ "${#SKIP_CONTAINERS[@]}" -eq 0 ] && return 1
+  for item in "${SKIP_CONTAINERS[@]}"; do
     [[ "$item" == "$target" ]] && return 0
   done
   return 1
@@ -118,11 +104,11 @@ backup_report=""
 # Log messages to logfile and stdout
 log() {
   local msg="$1"
-  if [ ! -d "${log_file_subdir}" ]; then
-    mkdir -p "${log_file_subdir}" || true
-    chown -R nobody:users "${log_file_subdir}" 2>/dev/null || true
+  if [ ! -d "${LOG_FILE_SUBDIR}" ]; then
+    mkdir -p "${LOG_FILE_SUBDIR}" || true
+    chown -R nobody:users "${LOG_FILE_SUBDIR}" 2>/dev/null || true
   fi
-  echo "$(date "+%Y/%m/%d %T") : $msg" | tee -a "$log_file"
+  echo "$(date "+%Y/%m/%d %T") : $msg" | tee -a "$LOG_FILE"
 }
 
 # Log error messages to syslog (logger), logfile and stdout
@@ -158,7 +144,7 @@ bytes_to_human() {
 
 # Record start time and announce start
 start_time=$(date +%s)
-log_msg="Docker $src_dir_name backup start: $(date)"
+log_msg="Docker $SRC_DIR_NAME backup start: $(date)"
 log "$log_msg"
 
 # Compression function (runs in background). Streams tar -> pv -> pigz/gzip -> out
@@ -170,14 +156,14 @@ compress_job() {
   local attempt=1
   local ok=0
   local dir_size=0
-  dir_size=$(du -sb "${src_dir}/${dname}" 2>/dev/null | awk '{print $1}' || echo 0)
+  dir_size=$(du -sb "${SRC_DIR}/${dname}" 2>/dev/null | awk '{print $1}' || echo 0)
   while [ $attempt -le $RETRIES ]; do
     log "[${dname}] compress attempt $attempt"
     if [ "$PV_AVAILABLE" -eq 1 ] && [ "$dir_size" -gt 0 ]; then
       if [ "$TARBALL_PROGRESS_TO_LOG" = "true" ]; then
         if ( set -o pipefail; \
-             tar cPf - -C "${src_dir}" "${dname}" "${TAR_OPTIONS[@]}" "${exclude_opts[@]}" 2>>"$efile" | \
-             pv -s "$dir_size" 2> >(tee -a "$log_file" >>"$efile") | \
+             tar cPf - -C "${SRC_DIR}" "${dname}" "${TAR_OPTIONS[@]}" "${exclude_opts[@]}" 2>>"$efile" | \
+             pv -s "$dir_size" 2> >(tee -a "$LOG_FILE" >>"$efile") | \
              ( if [ "$USE_PIGZ" -eq 1 ]; then \
                  if [ "$PIGZ_THREADS" -gt 0 ]; then pigz -p "$PIGZ_THREADS" -c; else pigz -p 0 -c; fi; \
                else \
@@ -190,7 +176,7 @@ compress_job() {
         fi
       else
           if ( set -o pipefail; \
-               tar cPf - -C "${src_dir}" "${dname}" "${TAR_OPTIONS[@]}" "${exclude_opts[@]}" 2>>"$efile" | \
+               tar cPf - -C "${SRC_DIR}" "${dname}" "${TAR_OPTIONS[@]}" "${exclude_opts[@]}" 2>>"$efile" | \
                pv -s "$dir_size" 2>>"$efile" | \
                ( if [ "$USE_PIGZ" -eq 1 ]; then \
                    if [ "$PIGZ_THREADS" -gt 0 ]; then pigz -p "$PIGZ_THREADS" -c; else pigz -p 0 -c; fi; \
@@ -205,7 +191,7 @@ compress_job() {
       fi
     else
         if ( set -o pipefail; \
-             tar cPf - -C "${src_dir}" "${dname}" "${TAR_OPTIONS[@]}" "${exclude_opts[@]}" 2>>"$efile" | \
+             tar cPf - -C "${SRC_DIR}" "${dname}" "${TAR_OPTIONS[@]}" "${exclude_opts[@]}" 2>>"$efile" | \
              ( if [ "$USE_PIGZ" -eq 1 ]; then \
                  if [ "$PIGZ_THREADS" -gt 0 ]; then pigz -p "$PIGZ_THREADS" -c; else pigz -p 0 -c; fi; \
                else \
@@ -272,41 +258,41 @@ while IFS= read -r -d '' d; do
   else
     subtotal=$((subtotal + bytes))
   fi
-done < <(find "$src_dir" -mindepth 1 -maxdepth 1 -type d -print0)
+done < <(find "$SRC_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
 
 # Ensure destination directory exists before assessing free space; notify if missing and cannot be created
 dest_dir_was_missing=0
-if [ ! -d "$dest_dir" ]; then
-  if mkdir -p "$dest_dir" 2>/dev/null; then
+if [ ! -d "$DEST_DIR" ]; then
+  if mkdir -p "$DEST_DIR" 2>/dev/null; then
     dest_dir_was_missing=1
-    log "Destination directory was missing; created: $dest_dir"
+    log "Destination directory was missing; created: $DEST_DIR"
   else
-    log_error "destination directory missing and cannot be created: $dest_dir"
-    notify_abort "Destination directory missing" "Path: $dest_dir (mkdir failed)"
+    log_error "destination directory missing and cannot be created: $DEST_DIR"
+    notify_abort "Destination directory missing" "Path: $DEST_DIR (mkdir failed)"
     exit 1
   fi
 fi
 
-dest_dir_free_bytes=$(df -B1 "$dest_dir" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
-dest_dir_total_bytes=$(df -B1 "$dest_dir" 2>/dev/null | awk 'NR==2 {print $2}' || echo 0)
-dest_dir_used_bytes=$(df -B1 "$dest_dir" 2>/dev/null | awk 'NR==2 {print $3}' || echo 0)
-df_device=$(df -P "$dest_dir" 2>/dev/null | awk 'NR==2 {print $1}' || echo "")
-fs_type=$(stat -f -c %T "$dest_dir" 2>/dev/null || echo "")
+dest_dir_free_bytes=$(df -B1 "$DEST_DIR" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
+dest_dir_total_bytes=$(df -B1 "$DEST_DIR" 2>/dev/null | awk 'NR==2 {print $2}' || echo 0)
+dest_dir_used_bytes=$(df -B1 "$DEST_DIR" 2>/dev/null | awk 'NR==2 {print $3}' || echo 0)
+df_device=$(df -P "$DEST_DIR" 2>/dev/null | awk 'NR==2 {print $1}' || echo "")
+fs_type=$(stat -f -c %T "$DEST_DIR" 2>/dev/null || echo "")
 
 if ! [[ "$dest_dir_free_bytes" =~ ^[0-9]+$ ]]; then
-  log "WARN: could not determine free space on destination ($dest_dir); value='$dest_dir_free_bytes'"
+  log "WARN: could not determine free space on destination ($DEST_DIR); value='$dest_dir_free_bytes'"
   dest_unknown=1
 else
   dest_unknown=0
   # Fallback: if reported free space is 0, try stat-based calculation
   if [ "$dest_dir_free_bytes" -eq 0 ] && [ "$LOW_SPACE_ENABLE_STAT_FALLBACK" = "true" ]; then
-    stat_vals=$(stat -f --format '%a %s' "$dest_dir" 2>/dev/null || echo "")
+    stat_vals=$(stat -f --format '%a %s' "$DEST_DIR" 2>/dev/null || echo "")
     stat_free=""
     if [[ "$stat_vals" =~ ^[0-9]+\ [0-9]+$ ]]; then
       stat_free=$(awk '{print $1 * $2}' <<< "$stat_vals")
     fi
     if [[ "$stat_free" =~ ^[0-9]+$ ]] && [ "$stat_free" -gt 0 ]; then
-      log "INFO: df reported 0 free; stat fallback detected ${stat_free} bytes free on $dest_dir"
+      log "INFO: df reported 0 free; stat fallback detected ${stat_free} bytes free on $DEST_DIR"
       dest_dir_free_bytes="$stat_free"
     fi
   fi
@@ -338,20 +324,20 @@ if [ $dest_unknown -eq 0 ] && [ "$dest_dir_free_bytes" -lt "$required" ]; then
     abort)
       free_human=$(bytes_to_human "$dest_dir_free_bytes")
       req_human=$(bytes_to_human "$required")
-      log_error "not enough free space on $dest_dir: available=${dest_dir_free_bytes} bytes, required=${required} bytes; aborting as LOW_SPACE_ACTION=abort"
+      log_error "not enough free space on $DEST_DIR: available=${dest_dir_free_bytes} bytes, required=${required} bytes; aborting as LOW_SPACE_ACTION=abort"
       notify_abort "Low disk space" "Free: ${free_human}\nRequired: ${req_human}\nAction: abort"
       exit 1
       ;;
     warn)
       free_human=$(bytes_to_human "$dest_dir_free_bytes")
       req_human=$(bytes_to_human "$required")
-      log "WARNING: not enough free space on $dest_dir: available=${dest_dir_free_bytes} bytes, required=${required} bytes; continuing because LOW_SPACE_ACTION=warn"
+      log "WARNING: not enough free space on $DEST_DIR: available=${dest_dir_free_bytes} bytes, required=${required} bytes; continuing because LOW_SPACE_ACTION=warn"
       low_space_note="Low space warning: Free=${free_human}, Required=${req_human}, continuing (warn)"
       ;;
     partial)
       free_human=$(bytes_to_human "$dest_dir_free_bytes")
       req_human=$(bytes_to_human "$required")
-      log "NOTICE: insufficient free space on $dest_dir (available=${dest_dir_free_bytes}, required=${required}); proceeding in partial mode"
+      log "NOTICE: insufficient free space on $DEST_DIR (available=${dest_dir_free_bytes}, required=${required}); proceeding in partial mode"
       low_space_note="Partial mode (space constrained): Free=${free_human}, Required=${req_human}"
       ;;
     *)
@@ -374,14 +360,14 @@ fi
 if [ "$pct_free_int" -ge 0 ]; then
   if [ "$pct_free_int" -lt "$UTIL_ALERT_THRESHOLD" ]; then
     util_alert_note="ALERT: Free space critically low (${pct_free_int}% < ${UTIL_ALERT_THRESHOLD}%)"
-    /usr/local/emhttp/webGui/scripts/notify -i alert -b -s "${NOTIFY_TITLE} - Low Space" -d "🔴 Critical free space" -m "$util_alert_note\nPath: $dest_dir" || true
+    /usr/local/emhttp/webGui/scripts/notify -i alert -b -s "${NOTIFY_TITLE} - Low Space" -d "🔴 Critical free space" -m "$util_alert_note\nPath: $DEST_DIR" || true
   elif [ "$pct_free_int" -lt "$UTIL_WARN_THRESHOLD" ]; then
     util_warn_note="Warning: Free space low (${pct_free_int}% < ${UTIL_WARN_THRESHOLD}%)"
   fi
 fi
 
 # Set directory for backup
-backup_dir="${dest_dir}/backup_${datetime}"
+backup_dir="${DEST_DIR}/backup_${DATETIME}"
 if [ ! -d "$backup_dir" ]; then
   mkdir -p "$backup_dir"
   chown -R nobody:users "$backup_dir"
@@ -389,7 +375,7 @@ if [ ! -d "$backup_dir" ]; then
 fi
 
 # Stop containers except those in skip list
-log "Docker $src_dir_name backup, stopping containers"
+log "Docker $SRC_DIR_NAME backup, stopping containers"
 
 container_ids=$(docker ps -q --no-trunc 2>/dev/null || true)
 if [[ -n "$container_ids" ]]; then
@@ -414,25 +400,25 @@ fi
 
 # Build exclude options for tar (only if skip list set)
 exclude_opts=()
-if [ "${#skip_containers[@]}" -gt 0 ]; then
-  for item in "${skip_containers[@]}"; do
+if [ "${#SKIP_CONTAINERS[@]}" -gt 0 ]; then
+  for item in "${SKIP_CONTAINERS[@]}"; do
     exclude_opts+=( --exclude="$item" )
   done
 fi
 
 # Create tar.gz directly in backup_dir
-log "Compressing Docker $src_dir_name for backup"
+log "Compressing Docker $SRC_DIR_NAME for backup"
 
 # Sanity checks before starting
-if [ ! -d "$src_dir" ]; then
-  log_error "source directory does not exist: $src_dir"
-  notify_abort "Source directory missing" "Path: $src_dir"
+if [ ! -d "$SRC_DIR" ]; then
+  log_error "source directory does not exist: $SRC_DIR"
+  notify_abort "Source directory missing" "Path: $SRC_DIR"
   exit 1
 fi
-child_count=$(find "$src_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l || true)
-log "Found $child_count subdirectories in $src_dir"
+child_count=$(find "$SRC_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l || true)
+log "Found $child_count subdirectories in $SRC_DIR"
 if [ "$child_count" -eq 0 ]; then
-  log "No containers/subdirectories found in $src_dir; nothing to back up"
+  log "No containers/subdirectories found in $SRC_DIR; nothing to back up"
   exit 0
 fi
 
@@ -464,8 +450,8 @@ while [ "$(jobs -rp | wc -l)" -ge "$PARALLEL_JOBS" ]; do
 done
 
 # Per-container free-space pre-check
-dir_size_bytes=$(du -sb "${src_dir}/${dir_name}" 2>/dev/null | awk '{print $1}' || echo 0)
-dest_free_now=$(df -B1 "$dest_dir" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
+dir_size_bytes=$(du -sb "${SRC_DIR}/${dir_name}" 2>/dev/null | awk '{print $1}' || echo 0)
+dest_free_now=$(df -B1 "$DEST_DIR" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
 if ! [[ "$dir_size_bytes" =~ ^[0-9]+$ ]] || ! [[ "$dest_free_now" =~ ^[0-9]+$ ]]; then
   log "WARN: could not determine size/free-space for ${dir_name}; proceeding (may fail)"
 else
@@ -481,7 +467,7 @@ fi
 
 # Run compress_job in background
 compress_job "$dir_name" "$archive_path" "$err_file" "$status_file" &
-done < <(find "${src_dir}" -type d -maxdepth 1 -mindepth 1 -print0)
+done < <(find "${SRC_DIR}" -type d -maxdepth 1 -mindepth 1 -print0)
 
 # Wait for background compression jobs to finish
 wait
@@ -571,10 +557,10 @@ if [[ -n "$backup_report" ]]; then
 fi
 
 if [ "$backup_status" -eq 0 ]; then
-  log_msg="Docker $src_dir_name backup OK, starting containers"
+  log_msg="Docker $SRC_DIR_NAME backup OK, starting containers"
   log "$log_msg"
 else
-  log_error "Docker $src_dir_name backup FAILED! == Error: $backup_status"
+  log_error "Docker $SRC_DIR_NAME backup FAILED! == Error: $backup_status"
   error_summary=""
   while IFS= read -r line; do
     name=$(printf "%s" "$line" | cut -d: -f1)
@@ -614,18 +600,18 @@ log "$log_msg"
 cleanup_old_artifacts() {
   local removed_backups=0 removed_logs=0
 
-  if [ -d "${dest_dir}" ]; then
-    mapfile -t bks < <(find "${dest_dir}/" -mindepth 1 -maxdepth 1 -type d -printf '%T+\t%p\n' 2>/dev/null | sort | cut -f2)
-    while [ "${#bks[@]}" -gt "${max_backups}" ]; do
+  if [ -d "${DEST_DIR}" ]; then
+    mapfile -t bks < <(find "${DEST_DIR}/" -mindepth 1 -maxdepth 1 -type d -printf '%T+\t%p\n' 2>/dev/null | sort | cut -f2)
+    while [ "${#bks[@]}" -gt "${MAX_BACKUPS}" ]; do
       rm -rf -- "${bks[0]}"
       removed_backups=$((removed_backups+1))
       bks=("${bks[@]:1}")
     done
   fi
 
-  if [ -d "${log_file_subdir}" ]; then
-    mapfile -t lgs < <(find "${log_file_subdir}/" -mindepth 1 -maxdepth 1 -type f -printf '%T+\t%p\n' 2>/dev/null | sort | cut -f2)
-    while [ "${#lgs[@]}" -gt "${max_logs}" ]; do
+  if [ -d "${LOG_FILE_SUBDIR}" ]; then
+    mapfile -t lgs < <(find "${LOG_FILE_SUBDIR}/" -mindepth 1 -maxdepth 1 -type f -printf '%T+\t%p\n' 2>/dev/null | sort | cut -f2)
+    while [ "${#lgs[@]}" -gt "${MAX_LOGS}" ]; do
       rm -rf -- "${lgs[0]}"
       removed_logs=$((removed_logs+1))
       lgs=("${lgs[@]:1}")
@@ -639,14 +625,14 @@ cleanup_old_artifacts
 # Record end time and log runtime
 runtime=$(($(date +%s) - start_time))
 runtime_converted=$(printf '%dh:%dm:%ds' $((runtime / 3600)) $((runtime % 3600 / 60)) $((runtime % 60)))
-log_msg="Docker $src_dir_name backup end == Runtime: ${runtime_converted}"
+log_msg="Docker $SRC_DIR_NAME backup end == Runtime: ${runtime_converted}"
 log "$log_msg"
 if [ $backup_status -eq 0 ]; then
   notify_level="$NOTIFY_LEVEL_ON_SUCCESS"
-  notify_short="Docker $src_dir_name backup OK!"
+  notify_short="Docker $SRC_DIR_NAME backup OK!"
 else
   notify_level="$NOTIFY_LEVEL_ON_FAILURE"
-  notify_short="Docker $src_dir_name backup FAILED!"
+  notify_short="Docker $SRC_DIR_NAME backup FAILED!"
 fi
 
 # Build final notify message: runtime + summary (emoji-prefixed)
@@ -733,7 +719,7 @@ if [[ -n "${util_warn_note:-}" ]]; then
   final_body+=$'\n'"${util_warn_note}"
 fi
 if [ "${dest_dir_was_missing}" -eq 1 ]; then
-  final_body+=$'\n'"Destination directory was missing and created: $dest_dir"
+  final_body+=$'\n'"Destination directory was missing and created: $DEST_DIR"
 fi
 if [ $backup_status -ne 0 ]; then
   final_body+=$'\n'"${error_summary}"
