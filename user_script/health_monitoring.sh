@@ -139,6 +139,8 @@ SCRIPT_START_EPOCH=$(date +%s)
 # -- Adaptive Escalation Tracking ---
 ADAPTIVE_DECISIONS=""
 declare -A PREV_RISK
+: "${STATE_DIR:=/boot/logs/disk-health/state}"
+RISK_PREV_FILE="${RISK_PREV_FILE:-$STATE_DIR/risk_prev.log}"
 if [ -f "$RISK_PREV_FILE" ]; then
     while read -r dev score; do
         [[ -z "$dev" || -z "$score" ]] && continue
@@ -226,20 +228,18 @@ NOTIFY_TITLE_DISKIO="Disk I/O Alert"                        # Disk I/O notificat
 
 # -----------------------------------------------
 
-prune_old_run_logs() {
 # Prune old timestamped run logs based on age and count limits.
+prune_old_run_logs() {
     (( LOG_PRUNE_ENABLED == 1 )) || return 0
     local patterns=("disk_health_*.log" "smart_*.log" "btrfs_*.log" "xfs_*.log")
     local removed=0
     for pat in "${patterns[@]}"; do
-        # Age-based pruning
         if (( LOG_MAX_DAYS > 0 )); then
             while IFS= read -r f; do
                 [[ -f "$f" ]] || continue
                 rm -f -- "$f" && ((removed++)) || true
             done < <(find "$LOG_DIR" -maxdepth 1 -type f -name "$pat" -mtime +$LOG_MAX_DAYS 2>/dev/null)
         fi
-        # Count-based pruning
         if (( LOG_MAX_COUNT > 0 )); then
             mapfile -t files < <(find "$LOG_DIR" -maxdepth 1 -type f -name "$pat" -printf '%T@\t%p\n' 2>/dev/null | sort -n | awk -F'\t' '{print $2}')
             while (( ${#files[@]} > LOG_MAX_COUNT )); do
@@ -255,8 +255,8 @@ prune_old_run_logs() {
 }
 prune_old_run_logs
 
-notify_unraid() {
 # Send notification via Unraid notify utility with aggregated subsystem summary.
+notify_unraid() {
     local title="$1"; shift
     local body="$1"; shift
     local sev="${1:-warning}"
@@ -266,8 +266,8 @@ notify_unraid() {
         warning|WARNING) icon="warning" ;;
         *) icon="normal" ;;
     esac
-    local crit_count=${#ALERT_CRIT[@]:-0}
-    local warn_count=${#ALERT_WARN[@]:-0}
+        local crit_count=${#ALERT_CRIT[@]}
+    local warn_count=${#ALERT_WARN[@]}
     local sev_word
     case "$sev" in
         critical|CRITICAL) sev_word="CRITICAL";;
@@ -296,8 +296,8 @@ notify_unraid() {
     fi
 }
 
-record_alert() {
 # Accumulate an alert (warning/critical) and log with severity.
+record_alert() {
     local sev="$1"; shift
     local title="$1"; shift
     local body="$1"; shift
@@ -310,8 +310,8 @@ record_alert() {
     fi
 }
 
-human_readable() {
 # Convert bytes to human readable decimal units.
+human_readable() {
     local bytes=${1:-0}
     local KB=1000
     local MB=$((KB*KB))
@@ -324,8 +324,8 @@ human_readable() {
     awk -v b="$bytes" -v t="$TB" 'BEGIN{printf "%.2f TB", b/t}'
 }
 
-base_device() {
 # Normalize a device to its base (strip partition component).
+base_device() {
     local d="$1"
     if [[ "$d" == /dev/nvme* ]]; then
         echo "$d" | sed -E 's/p[0-9]+$//'
@@ -334,8 +334,8 @@ base_device() {
     fi
 }
 
-get_device_model() {
 # Return and cache device model string using smartctl -i.
+get_device_model() {
     local d=$(base_device "$1")
     if [[ -n "${MODEL_CACHE[$d]:-}" ]]; then
         echo "${MODEL_CACHE[$d]}"; return 0
@@ -348,8 +348,8 @@ get_device_model() {
     echo "${MODEL_CACHE[$d]}"
 }
 
-get_device_capacity_tb() {
 # Return and cache device capacity in TB (decimal, 1 TB = 10^12 bytes).
+get_device_capacity_tb() {
     local d=$(base_device "$1")
     if [[ -n "${CAPACITY_CACHE[$d]:-}" ]]; then
         echo "${CAPACITY_CACHE[$d]}"; return 0
@@ -361,8 +361,8 @@ get_device_capacity_tb() {
     echo "${CAPACITY_CACHE[$d]}"
 }
 
-get_sata_raw() {
 # Fetch and cache raw smartctl -A output for SATA.
+get_sata_raw() {
     local d=$(base_device "$1")
     if [[ -n "${SMART_RAW[$d]:-}" ]]; then
         echo "${SMART_RAW[$d]}"; return 0
@@ -371,8 +371,8 @@ get_sata_raw() {
     echo "${SMART_RAW[$d]}"
 }
 
-get_nvme_raw() {
 # Fetch and cache raw smartctl -a output for NVMe.
+get_nvme_raw() {
     local d=$(base_device "$1")
     if [[ -n "${NVME_RAW[$d]:-}" ]]; then
         echo "${NVME_RAW[$d]}"; return 0
@@ -381,8 +381,8 @@ get_nvme_raw() {
     echo "${NVME_RAW[$d]}"
 }
 
-tbw_threshold_tb_for_device() {
 # Determine TBW endurance threshold (TB) based on model heuristic.
+tbw_threshold_tb_for_device() {
     local model="$1"; shift
     local cap="$1"; shift
     local per_tb=0
@@ -393,8 +393,9 @@ tbw_threshold_tb_for_device() {
     if (( per_tb == 0 )); then echo ""; return 0; fi
     awk -v c="$cap" -v p="$per_tb" 'BEGIN{printf "%.0f", c*p}'
 }
-get_all_disks() {
+
 # Enumerate all physical disks, excluding /boot device, intentionally spinning them up.
+get_all_disks() {
     local sata nvme out=()
     sata=$(ls /dev/sd* 2>/dev/null | grep -E '^/dev/sd[a-z]+$' || true)
     nvme=$(ls /dev/nvme?n? 2>/dev/null || true)
@@ -416,9 +417,8 @@ get_all_disks() {
     echo "${out[@]}"
 }
 
+# Construct mapping of Unraid array mountpoints to physical devices
 build_mount_device_map() {
-# Construct mapping of Unraid array mountpoints to physical devices (disk.ini / by-id fallback).
-    # Clear existing map
     MOUNT_TO_DEV=()
     local ini="/var/local/emhttp/disks.ini"
     local cfg="/boot/config/disk.cfg"
@@ -457,8 +457,8 @@ build_mount_device_map() {
     ' "$src" 2>/dev/null)
 }
 
-smart_device_for_mount() {
 # Given a mountpoint, return the associated physical device (from map or findmnt).
+smart_device_for_mount() {
     local mp="$1"
     local dev="${MOUNT_TO_DEV[$mp]:-}"
     if [[ -n "$dev" && -b "$dev" ]]; then
@@ -505,6 +505,7 @@ if [ -f "$ALERT_NEW_SEEN_FILE" ]; then
     done < "$ALERT_NEW_SEEN_FILE"
 fi
 
+# Save current SMART attributes for delta tracking.
 save_last_test() {
     > "$SMART_LAST"
     for disk in "${!LAST_TEST[@]}"; do
@@ -512,6 +513,7 @@ save_last_test() {
     done
 }
 
+# Save current NVMe unsafe shutdown counters.
 save_nvme_state() {
     > "$NVME_STATE_FILE"
     for dev in "${!NVME_LAST_UNSAFE[@]}"; do
@@ -519,8 +521,8 @@ save_nvme_state() {
     done
 }
 
-evaluate_smart() {
 # Evaluate SMART attributes and status for a given disk.
+evaluate_smart() {
     local disk=$1
     local is_nvme=0
     [[ $disk == /dev/nvme* ]] && is_nvme=1
@@ -760,8 +762,8 @@ evaluate_smart() {
     echo "$state"; for m in "${messages[@]}"; do echo "$m"; done
 }
 
-get_latest_selftest_info() {
 # Fetch latest self-test entry from smartctl log.
+get_latest_selftest_info() {
     local disk=$1
     local out
     if [[ $disk == /dev/nvme* ]]; then
@@ -783,8 +785,8 @@ get_latest_selftest_info() {
     echo "${num}|${type}|${status}|${lifetime}|${remaining}"
 }
 
-classify_selftest_status() {
 # Classify self-test status string into severity + message.
+classify_selftest_status() {
     local status="$1"
     local sev="OK"
     local msg="$status"
@@ -804,8 +806,8 @@ classify_selftest_status() {
     echo "$sev|$msg"
 }
 
-poll_short_test_completion() {
 # Poll for short self-test completion up to max wait time.
+poll_short_test_completion() {
     local disk=$1
     local waited=0
     local info status sev msg
@@ -831,8 +833,8 @@ poll_short_test_completion() {
     return 0
 }
 
-risk_score_quick() {
 # Given state and messages, return risk score.
+risk_score_quick() {
     local st="$1"; shift
     local msg="$1"; shift
     local score=0
@@ -856,8 +858,8 @@ risk_score_quick() {
     echo "$score"
 }
 
-run_smart_test() {
 # Check if disk is available for testing
+run_smart_test() {
     local disk=$1
     [[ $disk == /dev/sd* ]] && hdparm -I "$disk" >/dev/null 2>&1 || true
     local flag="-t short"
@@ -971,8 +973,8 @@ run_smart_test() {
     LAST_TEST[$disk]=$(date '+%Y-%m-%d')
 }
 
-augment_messages_with_deltas() {
 # Track NEW markers to avoid duplicates
+augment_messages_with_deltas() {
     for disk in "${!SMART_STATE[@]}"; do
         local raw="${SMART_MSGS[$disk]}"
         [[ -z "$raw" ]] && continue
@@ -1017,8 +1019,8 @@ augment_messages_with_deltas() {
     done
 }
 
-check_completed_long_tests() {
 # Check completed long SMART tests since last processing
+check_completed_long_tests() {
     declare -A PROCESSED
     if [[ -f "$SMART_LONG_STATE_FILE" ]]; then
         while read -r d id; do PROCESSED[$d]="$id"; done < "$SMART_LONG_STATE_FILE"
@@ -1061,8 +1063,8 @@ check_completed_long_tests() {
     fi
 }
 
-monitor_btrfs() {
 # Monitor Btrfs filesystems for scrub status
+monitor_btrfs() {
     if [[ $ENABLE_BTRFS_SCRUB -eq 1 ]]; then
         log_btrfs "$(date '+%Y-%m-%d %H:%M:%S') - BTRFS scrubbing starting"
     else
@@ -1109,8 +1111,8 @@ monitor_btrfs() {
     log_btrfs "$(date '+%Y-%m-%d %H:%M:%S') - Btrfs scrubbing completed"
 }
 
-monitor_xfs() {
 # Monitor XFS filesystems for metadata issues
+monitor_xfs() {
     if [[ $ENABLE_XFS_CHECK -eq 1 ]]; then
         log_xfs "$(date '+%Y-%m-%d %H:%M:%S') - XFS checks starting"
     else
@@ -1142,8 +1144,8 @@ monitor_xfs() {
     log_xfs "$(date '+%Y-%m-%d %H:%M:%S') - XFS checks completed"
 }
 
-evaluate_capacity_alerts() {
 # Evaluate array and pool capacity against thresholds
+evaluate_capacity_alerts() {
     if [[ -n "$ARRAY_PERCENT" ]]; then
         if awk -v p="$ARRAY_PERCENT" -v t="$THRESHOLD" 'BEGIN{exit (p>t)?0:1}'; then
             record_alert critical "Array Capacity" "Array usage ${ARRAY_PERCENT}% > ${THRESHOLD}%"
@@ -1160,8 +1162,8 @@ evaluate_capacity_alerts() {
     fi
 }
 
-evaluate_per_mount_thresholds() {
 # Evaluate mountpoint usage against defined thresholds
+evaluate_per_mount_thresholds() {
     local candidates=(/mnt/disk* /mnt/cache /mnt/*)
     declare -A seen
     local uniq=()
@@ -1217,8 +1219,8 @@ check_btrfs_snapshots
 monitor_xfs  # XFS metadata check (if enabled earlier)
 build_mount_device_map  # Populate array mountpoint -> device map
 
-scan_syslog_disk_errors() {
 # Scan syslog/dmesg for disk I/O errors, count unique occurrences per device over time window.
+scan_syslog_disk_errors() {
     (( IO_ERROR_MONITOR_ENABLED == 1 )) || { IO_ERROR_FREQ_SECTION=""; return 0; }
     local window_sec=$(( IO_ERROR_WINDOW_MINUTES * 60 ))
     local now_epoch=$(date +%s)
@@ -1229,7 +1231,6 @@ scan_syslog_disk_errors() {
     else
         log_src=$(dmesg 2>/dev/null | tail -n 20000)
     fi
-    # Load recent history for deduplication
     declare -A HASH_SEEN
     if [[ -f "$IO_ERROR_HISTORY_FILE" ]]; then
         while read -r ts dev hash; do
@@ -1295,6 +1296,7 @@ severity_rank() { case "$1" in CRITICAL) echo 2;; WARNING) echo 1;; *) echo 0;; 
 status_word()   { case "$1" in 2) echo "CRITICAL";; 1) echo "WARNING";; *) echo "OK";; esac; }
 map_emoji()     { case "$1" in 2) printf "🔴";; 1) printf "🟡";; *) printf "🟢";; esac; }
 
+# Build storage array and pool usage lines with severity
 build_storage_and_disk_lines() {
     ARRAY_MAX_SEV=0; POOLS_MAX_SEV=0
     ARRAY_DISK_LINES=""; POOL_LINES=""; POOL_DEVICE_LINES=""
@@ -1451,8 +1453,8 @@ build_storage_and_disk_lines() {
         "$p_emoji" "$p_word" "$POOLS_COUNT" "${POOLS_PERCENT:-0.0}" "${POOLS_USED_HR:-0 B}" "${POOLS_TOTAL_HR:-0 B}")
 }
 
-validate_storage_metrics() {
 # Check for discrepancies between array usage and /mnt/user usage
+validate_storage_metrics() {
     local user_pct user_line discrepancy_section=""
     if mountpoint -q /mnt/user; then
         user_line=$(df -B1 /mnt/user 2>/dev/null | awk 'NR==2')
@@ -1470,8 +1472,8 @@ validate_storage_metrics() {
     STORAGE_VALIDATION_SECTION="$discrepancy_section"
 }
 
-build_subsystem_lines() {
 # Summarize subsystem statuses based on collected alerts
+build_subsystem_lines() {
     local sm=OK bt=OK xfs=OK cap=OK pm=OK end=OK ad=OK
     for a in "${ALERT_CRIT[@]}"; do
         [[ $a == "$NOTIFY_TITLE_SMART"* ]] && sm=CRITICAL
@@ -1500,6 +1502,7 @@ Endurance: $end
 Adaptive: $ad"
 }
 
+# Build recommended actions based on alert messages
 build_recommendations() {
     local rec=""
     if (( ${#ALERT_WARN[@]} + ${#ALERT_CRIT[@]} > 0 )); then
@@ -1674,12 +1677,13 @@ build_recommendations() {
     RECOMMEND_SECTION="$rec"
 }
 
-build_subject() {
 # Build notification subject line
+build_subject() {
     SUBJECT="Disks Health"
 }
-build_disk_health_summary() {
+
 # Summarize disk health states
+build_disk_health_summary() {
     local crit_count=0 warn_count=0 pending_count=0 uncorrect_count=0 high_temp=0 nvme_wear_warn=0 read_only=0 reliability=0 timeout_warn=0 realloc_events_warn=0 end2end_count=0 soft_read_warn=0
     for dev in "${!SMART_STATE[@]}"; do
         local st="${SMART_STATE[$dev]}" msg="${SMART_MSGS[$dev]}"
@@ -1701,8 +1705,8 @@ build_disk_health_summary() {
     DISK_HEALTH_SUMMARY="Disk Health Summary:\n Critical disks: $crit_count\n Warning disks: $warn_count\n Pending sector disks: $pending_count\n Uncorrectable error disks: $uncorrect_count\n High temp disks: $high_temp\n NVMe wear warnings: $nvme_wear_warn\n NVMe read-only: $read_only\n NVMe reliability degraded: $reliability\n Command timeout warnings: $timeout_warn\n Reallocated event warnings: $realloc_events_warn\n End-to-end error disks: $end2end_count\n Soft read error warnings: $soft_read_warn"
 }
 
-compute_risk_and_lifecycle() {
 # Compute risk scores for disks based on SMART attributes and categorize into lifecycle buckets
+compute_risk_and_lifecycle() {
     (( RISK_SCORING_ENABLED == 1 )) || return 0
     local risk_lines="" lifecycle_lines="" age_lines=""
     declare -A RISK SCORE_ATTR AGE_CLASS
@@ -1773,8 +1777,8 @@ compute_risk_and_lifecycle() {
     RISK_SECTION="$( (( RISK_SCORING_ENABLED==1 )) && echo "Risk Scores (top):\n${risk_lines}" )$( (( LIFECYCLE_ENABLED==1 )) && echo "Lifecycle Buckets:\n${lifecycle_lines}" )$( (( AGE_AWARE_ENABLED==1 )) && [[ -n "$age_lines" ]] && echo "Age Awareness:\n${age_lines}" )"
 }
 
-persist_risk_tier_history() {
 # Append today's risk tier counts to history file
+persist_risk_tier_history() {
     (( RISK_SCORING_ENABLED == 1 )) || return 0
     local today=$(date +%Y-%m-%d)
     local crit=${CRIT_DISK_COUNT:-0} warn=${WARN_DISK_COUNT:-0}
@@ -1782,8 +1786,8 @@ persist_risk_tier_history() {
     echo "$today critical=$crit warning=$warn replace=$replace monitor=$monitor healthy=$healthy" >> "$RISK_TIER_HISTORY_FILE"
 }
 
-build_risk_tier_trend_section() {
 # Analyze risk tier history and build trend summary
+build_risk_tier_trend_section() {
     (( RISK_SCORING_ENABLED == 1 )) || { RISK_TIER_TREND_SECTION=""; return 0; }
     local lines
     lines=$(tail -n 7 "$RISK_TIER_HISTORY_FILE" 2>/dev/null || true)
@@ -1828,8 +1832,8 @@ build_risk_tier_trend_section() {
     RISK_TIER_TREND_SECTION="Risk Tier Trend (last ${count_lines}d collected, max 7d):\n ${crit_line}\n ${warn_line}\n ${replace_line}\n ${monitor_line}\n ${healthy_line}"
 }
 
-compute_share_breakdown() {
 # Compute share usage breakdown and growth trends
+compute_share_breakdown() {
     (( SHARE_BREAKDOWN_ENABLED == 1 )) || { SHARE_SECTION=""; return 0; }
     local root="/mnt/user"
     [[ -d "$root" ]] || { SHARE_SECTION=""; return 0; }
@@ -1884,8 +1888,8 @@ compute_share_breakdown() {
     SHARE_SECTION="Top Shares by Size:\n${size_lines}$( [[ -n \"$growth_lines\" ]] && printf "Top Share Growth (last %sd):\n%s" "$win" "$growth_lines" )"
 }
 
-capacity_forecast_and_export() {
 # Track capacity usage history, compute growth trends, estimate days to threshold, export JSON
+capacity_forecast_and_export() {
     local now_date=$(date +%Y-%m-%d)
     local array_pct="${ARRAY_PERCENT:-0}" pools_pct="${POOLS_PERCENT:-0}"
     echo "$now_date array=$array_pct pools=$pools_pct" >> "$CAPACITY_HISTORY_FILE"
@@ -2015,8 +2019,8 @@ capacity_forecast_and_export() {
     fi
 }
 
-compute_disk_growth_top() {
 # Analyze disk usage history and compute top growth rates
+compute_disk_growth_top() {
     (( DISK_GROWTH_ENABLED == 1 )) || { DISK_GROWTH_SECTION=""; return 0; }
     local win=$HISTORY_WINDOW_DAYS
     local lines=$(tail -n 20000 "$DISK_CAP_HISTORY_FILE" 2>/dev/null || true)
@@ -2079,8 +2083,8 @@ compute_share_breakdown
 persist_risk_tier_history
 build_risk_tier_trend_section
 
-detect_counter_resets() {
 # Detect firmware/controller resets by checking for Power-On Hours (POH) drops and NVMe Percentage Used regression
+detect_counter_resets() {
     FIRMWARE_EVENT_SECTION=""
     local events=""
     for dev in "${!SMART_STATE[@]}"; do
@@ -2110,8 +2114,8 @@ detect_counter_resets() {
 
 detect_counter_resets
 
-tbw_forecast_and_heavy_writers() {
 # Analyze TBW history to estimate daily write rates and days to threshold
+tbw_forecast_and_heavy_writers() {
     (( TBW_FORECAST_ENABLED == 1 )) || { TBW_SECTION=""; return 0; }
     local today=$(date +%Y-%m-%d)
     for dev in "${!SMART_STATE[@]}"; do
@@ -2267,8 +2271,8 @@ $RECOMMEND_SECTION"
 
 notify_unraid "$SUBJECT" "$NOTIFY_BODY" "$( [[ ${#ALERT_CRIT[@]} -gt 0 ]] && echo critical || { [[ ${#ALERT_WARN[@]} -gt 0 ]] && echo warning || echo ok; } )"
 
-persist_current_attrs() {
 # Persist current SMART attributes and states
+persist_current_attrs() {
     > "$PREV_ATTR_FILE"
     for disk in "${!SMART_STATE[@]}"; do
         local line="$disk state=${SMART_STATE[$disk]}"
@@ -2284,16 +2288,18 @@ persist_current_attrs() {
     done
 }
 persist_current_attrs
-persist_new_seen() {
+
 # Persist newly seen disks for alert suppression
+persist_new_seen() {
     > "$ALERT_NEW_SEEN_FILE"
     for key in "${!NEW_SEEN[@]}"; do
         echo "$key" >> "$ALERT_NEW_SEEN_FILE"
     done
 }
 persist_new_seen
-persist_risk_scores() {
+
 # Persist current risk scores for trend analysis
+persist_risk_scores() {
     > "$RISK_PREV_FILE"
     for dev in "${!SMART_STATE[@]}"; do
         local msg="${SMART_MSGS[$dev]}"
