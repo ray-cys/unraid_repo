@@ -11,14 +11,13 @@ noParity=true
 clearLog=false
 
 # --------------------------------------------------------------------------------
-# SETTINGS
+# Configuration section
+# Adjust the settings below to configure the remote backup behavior.
 
 # Plex container names (mutliple instances)
 CONTAINERS=("plex-media-server" "plex-media")
-
 # Path (inside the container) for DBRepair
 REPAIR_PATHS=("/config/PlexDBRepair/DBRepair.sh")
-
 # Arguments to pass to DBRepair script to run non-interactively. 
 DBREPAIR_ARGS=("stop" "auto" "start" "exit")
 
