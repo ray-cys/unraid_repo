@@ -23,7 +23,7 @@ SECURE_SRC="/mnt/user/secure"         # Source path for "Secure" label
 MEDIA_DEST="/mnt/user/media"          # Destination path for "Media" label
 SECURE_DEST="/mnt/user/secure"        # Destination path for "Secure" label
 
-LOG_FILE_SUBDIR="/mnt/cache/system/logs/remote_logs"                       # Directory to store log files
+LOG_FILE_SUBDIR="/mnt/cache/system/logs/remote_logs"                  # Directory to store log files
 LOG_FILE="$LOG_FILE_SUBDIR/remote_backup_$(date +%Y%m%d_%H%M%S).log"  # Log file path
 PRESERVED_RAW_LOG_DIR="$LOG_FILE_SUBDIR/rsync_raw"                    # Directory to store preserved raw rsync logs
 
@@ -70,12 +70,11 @@ PREFLIGHT_MODE="metadata"             # Use one of: estimate|metadata|total
 SHUTDOWN_ON_FAILURE=false             # Shutdown source NAS on failure
 
 # --- Notifications & Logging ---
-NOTIF_CONDENSED_MAX_LABELS=3                           # Maximum number of labels to include in condensed notifications
-NOTIF_EXCERPT_LINES=8                                  # Number of lines to include in notification excerpts
-LOG_TAIL_LINES=100                                     # Number of lines to include in log tails
+NOTIF_CONDENSED_MAX_LABELS=3          # Maximum number of labels to include in condensed notifications
+NOTIF_EXCERPT_LINES=8                 # Number of lines to include in notification excerpts
+LOG_TAIL_LINES=100                    # Number of lines to include in log tails
 
 # --- SSH wait / Timings ---
-# Converted to uppercase variable names for clarity; adjust values as needed.
 MAX_SSH_WAIT=420                      # Total seconds to wait for SSH to become reachable
 SSH_WAIT_INTERVAL=20                  # Sleep interval between SSH reachability checks
 SSH_CONNECT_TIMEOUT=5                 # Seconds used for ssh -o ConnectTimeout per attempt
@@ -87,9 +86,8 @@ ARRAY_READY_INTERVAL=6                # Poll interval for array readiness check
 # --- Runtime Flags ---
 DRY_RUN=false                         # When true, perform a dry run without actual data transfer
 
-# --- Labels to back up (order matters; arrays must match) ---
-# Place or remove entries here to change which datasets are backed up.
-LABELS_ARRAY=("Media" "Secure")            # Labels for datasets
+# --- Labels to backup (arrays must match) ---
+LABELS_ARRAY=("Media" "Secure")            # Labels for datasets to back up
 SRCS_ARRAY=("$MEDIA_SRC" "$SECURE_SRC")    # Source paths for datasets
 DESTS_ARRAY=("$MEDIA_DEST" "$SECURE_DEST") # Destination paths for datasets
 
@@ -286,7 +284,7 @@ preflight_disk_check() {
       body+=$'\n'"Required vs Free: Unknown"
     fi
     esub=$(notif_emoji nospace)
-    notify_send alert "Scheduled Remote Backup - NO SPACE" "${esub} $label backup aborted: insufficient space" "$body"
+    notify_send alert "Remote Backup - NO SPACE" "${esub} $label backup aborted: insufficient space" "$body"
     return 2
   fi
 
@@ -936,7 +934,7 @@ else
   fi
   body+=$'Suggested checks:\n- Network connectivity and firewall\n- Remote host power state\n- SSH service status on remote\n\n'
   body+="Runtime: ${runtime_now}\nSee log: ${LOG_FILE}"
-  notify_send alert "Scheduled Remote Backup - SSH UNREACHABLE" "${esub} Remote ${DEST_NAS}: SSH unreachable; backup aborted" "$body"
+  notify_send alert "Remote Backup - SSH UNREACHABLE" "${esub} Remote ${DEST_NAS}: SSH unreachable; backup aborted" "$body"
   exit ${DEFAULT_FAIL_CODE:-50}
 fi
 
@@ -974,7 +972,7 @@ if ! agg_msg=$(aggregate_preflight_check 2>&1); then
   log "Aggregate preflight failed: $agg_msg"
   runtime_now=$(format_runtime)
   body="$agg_msg\n\nRuntime: ${runtime_now}\nSee log: $LOG_FILE"
-  notify_send alert "Scheduled Remote Backup - NO SPACE" "Aggregate preflight failed: insufficient remote space" "$body"
+  notify_send alert "Remote Backup - NO SPACE" "Aggregate preflight failed: insufficient remote space" "$body"
   for lbl in "${LABELS_ARRAY[@]}"; do
     rsync_results["$lbl"]=2
     failed_labels+=("$lbl")
@@ -1054,7 +1052,7 @@ else
   runtime_now=$(format_runtime)
   notify_detail+="Runtime: ${runtime_now}\nSee log: $LOG_FILE"
   esub=$(notif_emoji fail)
-  notify_send alert "Scheduled Remote Backup - FAIL" "${esub} Backup FAIL: $failed_summary" "$notify_detail"
+  notify_send alert "Remote Backup - FAIL" "${esub} Backup FAIL: $failed_summary" "$notify_detail"
 fi
 
 # Record end time
@@ -1070,32 +1068,27 @@ for lbl in "${!rsync_summaries[@]}"; do
   files=${rsync_files[$lbl]:-0}
   deletes=${rsync_deletes[$lbl]:-0}
   sent=${rsync_bytes_sent[$lbl]:-0}
-  est=${estimated_changed_bytes[$lbl]:-0}
   total=${rsync_total_bytes[$lbl]:-0}
+  est=${estimated_changed_bytes[$lbl]:-0}
 
   human_transferred=$(bytes_human "$transferred")
-  human_est=$(bytes_human "$est")
   human_total=$(bytes_human "$total")
+  human_est=$(bytes_human "$est")
   human_sent=$(bytes_human "$sent")
 
-  if [ "$est" -gt 0 ] && [ "$transferred" -gt 0 ]; then
-    percent=$(awk "BEGIN{ if ($est>0) printf \"%.3f\", ($transferred / $est) * 100; else print 0 }")
-  elif [ "$transferred" -gt 0 ] && [ "$est" -eq 0 ]; then
-    percent="100.000"
-  else
-    percent="0.000"
+  percent_total=0
+  if [ "$total" -gt 0 ] && [ "$transferred" -gt 0 ]; then
+    percent_total=$(awk -v t="$total" -v tr="$transferred" 'BEGIN{printf "%.1f", (tr/t)*100}')
   fi
 
-  percent_num=$(awk -v p="$percent" 'BEGIN{gsub(/[^0-9.]/,""); if(p+0>100) printf "100.000"; else printf "%s", p}')
-  percent="$percent_num"
-
+  # Extended summary (show both total and est_changed for transparency)
   if [ "$est" -gt 0 ]; then
-    detailed_body+="$lbl: total $human_total, est_changed $human_est, transferred $human_transferred (${percent}%), files $files, deleted $deletes, sent $human_sent"$'\n'
+    detailed_body+="$lbl: $human_total total, $human_est est_changed, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
   else
-    detailed_body+="$lbl: total $human_total, est_changed unknown, transferred $human_transferred (${percent}%), files $files, deleted $deletes, sent $human_sent"$'\n'
+    detailed_body+="$lbl: $human_total total, est_changed unknown, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
   fi
 
-  condensed_parts+=("$lbl: $human_transferred (${percent}%)")
+  condensed_parts+=("$lbl: $human_transferred (${percent_total}%)")
 done
 
 max_labels_in_d=${notif_condensed_max_labels:-3}
@@ -1158,8 +1151,8 @@ if [ "${#failed_labels[@]}" -eq 0 ]; then
     fi
   done
   esub=$(notif_emoji ok)
-  # Put the condensed summary on its own line in the -d detail to avoid long single-line notifications
-  notify_send normal "Scheduled Remote Backup - OK" "${esub} Backup. OK" $'\n'"${condensed_line}" "$body"
+  detail="${esub} Backup OK"$'\n'"${condensed_line}"
+  notify_send normal "Remote Backup - OK" "$detail" "$body"
   if [ "$DRY_RUN" = false ]; then
     log "Shutting down remote after successful backup"
     if ! ssh -p "$SSH_PORT" "$REMOTE" "df --type=xfs -h && powerdown" 2>/dev/null; then
