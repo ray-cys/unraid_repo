@@ -44,7 +44,7 @@ fi
 # Directory settings
 SRC_DIR_NAME="$(basename "$SRC_DIR")"           # Name of source dir for logging
 DATETIME="$(date +%Y%m%d_%H%M%S)"               # Timestamp for this run
-LOG_FILE_SUBDIR="/boot/logs/$SRC_DIR_NAME-logs" # Log file directory
+LOG_FILE_SUBDIR="/mnt/cache/system/logs/$SRC_DIR_NAME-logs" # Log file directory
 LOG_FILE="$LOG_FILE_SUBDIR/$SRC_DIR_NAME-$DATETIME.log" # Log file path
 ERR_EXCERPT_LINES=${ERR_EXCERPT_LINES:-20}      # Number of stderr lines to include in notification on failure
 
