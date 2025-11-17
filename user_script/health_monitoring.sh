@@ -1,5 +1,7 @@
 #!/bin/bash
 set -euo pipefail
+set -E
+trap 'log_crit "Script aborted at line ${LINENO} (status=$?): in ${FUNCNAME[*]:-main}"' ERR
 LOCKFILE="/tmp/health_monitoring.lock"
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
@@ -22,8 +24,8 @@ SHORT_TEST_MAX_WAIT=180       # Max seconds to wait while polling short tests
 SHORT_TEST_POLL_INTERVAL=10   # Interval between polls (seconds)
 
 # --- Capacity Thresholds ---
-WARN_THRESHOLD_PERCENT=80     # Per-disk usage percent that triggers a warning
-CRITICAL_THRESHOLD_PERCENT=90 # Per-disk usage percent that triggers a critical alert
+WARN_THRESHOLD_PERCENT=90     # Per-disk usage percent that triggers a warning
+CRITICAL_THRESHOLD_PERCENT=98 # Per-disk usage percent that triggers a critical alert
 THRESHOLD=90                  # Array/pools overall usage percent considered full
 NEAR_THRESHOLD_DELTA=5        # Consider "near full" within this percent of THRESHOLD
 POOL_EXCLUDES=("ramtmp" "user0") # Pool names to exclude from pool totals
@@ -32,7 +34,7 @@ POOL_EXCLUDES=("ramtmp" "user0") # Pool names to exclude from pool totals
 ENABLE_BTRFS_SCRUB=0          # 1: Start btrfs scrub; 0: only parse last status
 ENABLE_XFS_CHECK=0            # 1: Run xfs_repair -n; 0: skip XFS metadata check
 ENABLE_POOL_DEVICE_SMART=1    # 1: Include per-device SMART lines for pools
-VERBOSE_OK=0                  # 1: Show OK lines; 0: suppress OK lines
+VERBOSE_OK=1                  # 1: Show OK lines; 0: suppress OK lines
 JSON_EXPORT=1                 # 1: Write JSON summary to disk
 JSON_INCLUDE_DISKS=1          # 1: Include per-disk details in JSON (poh/endurance)
 HISTORY_WINDOW_DAYS=7         # Window (days) for growth averages and trends
@@ -288,12 +290,19 @@ notify_unraid() {
     local body_norm
     body_norm=$(printf "%s\n" "$body" | awk '{sub(/[ \t]+$/, "")} NF{print; blank=0; next} !blank{print ""; blank=1}')
     local BIN="/usr/local/emhttp/webGui/scripts/notify"
+    local rc=0
     if [ -x "$BIN" ]; then
-        "$BIN" -e "Disk Health Monitor" -s "$title" -d "$summary_line" -m "$body_norm" -i "$icon"
+        log_info "notify_unraid: invoking notify with icon=$icon title='$title'"
+        "$BIN" -e "Disk Health Monitor" -s "${title:-Disk Health}" -d "$summary_line" -m "$body_norm" -i "$icon" || rc=$?
+        if (( rc != 0 )); then
+            log_warn "notify_unraid: notify returned non-zero exit $rc; continuing"
+        fi
     else
-        logger -t "Disk Health Monitor" "$title: $summary_line"
+        log_warn "notify_unraid: notify binary missing, using syslog fallback"
+        logger -t "Disk Health Monitor" "${title:-Disk Health}: $summary_line"
         logger -t "Disk Health Monitor" "$body_norm"
     fi
+    return 0
 }
 
 # Accumulate an alert (warning/critical) and log with severity.
@@ -548,7 +557,7 @@ evaluate_smart() {
         avail_spare=${avail_spare:-}
         avail_spare_thr=$(echo "$nvme_output" | awk -F: '/Available Spare Threshold/ {gsub(/%| /,"",$2); print $2; exit}')
         avail_spare_thr=${avail_spare_thr:-}
-        duw=$(echo "$nvme_output" | awk -F: '/Data Units Written/ {gsub(/,| /,"",$2); print $2; exit}')
+        duw=$(echo "$nvme_output" | awk -F: '/Data Units Written/ { if (match($2, /[0-9][0-9,]*/)) { v=substr($2,RSTART,RLENGTH); gsub(/,/, "", v); print v } else { print "" } exit }')
         if [[ -n "$duw" ]]; then
             local tbw_bytes=$(( duw * 512000 ))
             local tbw_hr=$(human_readable "$tbw_bytes")
@@ -981,7 +990,7 @@ augment_messages_with_deltas() {
         IFS='; ' read -r -a parts <<< "$raw"
         local augmented=()
         for p in "${parts[@]}"; do
-            local attr value prev cur delta
+            local attr="" value="" prev="" cur="" delta=""
             if [[ $p =~ Reallocated\ =\ ([0-9]+) ]]; then attr=realloc; value=${BASH_REMATCH[1]}; fi
             if [[ $p =~ Pending\ sectors\ =\ ([0-9]+) ]]; then attr=pending; value=${BASH_REMATCH[1]}; fi
             if [[ $p =~ UDMA\ CRC\ Errors\ =\ ([0-9]+) ]]; then attr=udma; value=${BASH_REMATCH[1]}; fi
@@ -1077,7 +1086,7 @@ monitor_btrfs() {
         raid_type=$(btrfs filesystem df -p "$mp" 2>/dev/null | awk -F',' '/Data/ {gsub(/ /,"",$2); print $2; exit}') || true
         raid_type=${raid_type:-UNKNOWN}
         local status_pre
-        status_pre=$(btrfs scrub status -d "$mp" 2>/dev/null || true)
+        status_pre=$(btrfs scrub status "$mp" 2>/dev/null || true)
         if [[ $ENABLE_BTRFS_SCRUB -eq 1 ]]; then
             if echo "$status_pre" | grep -qi 'running'; then
                 log_btrfs "$(date '+%Y-%m-%d %H:%M:%S') - Btrfs scrub already running on $mp; will parse current running status"
@@ -1089,7 +1098,8 @@ monitor_btrfs() {
             log_btrfs "$(date '+%Y-%m-%d %H:%M:%S') - Btrfs scrub disabled; parsing last recorded status only for $mp"
         fi
         local status corrected uncorrectable msg
-        status=$(btrfs scrub status -d "$mp" 2>/dev/null)
+        # Prefer summary output (without -d) to ensure last scrub info is shown
+        status=$(btrfs scrub status "$mp" 2>/dev/null)
         log_btrfs "$(date '+%Y-%m-%d %H:%M:%S') - Btrfs scrub status for $mp:"
         log_btrfs "$status"
         corrected=$(echo "$status" | awk -F'[: ]+' '/corrected errors/ {print $NF; exit}'); corrected=${corrected:-0}
@@ -1199,6 +1209,7 @@ log_smart "$(date '+%Y-%m-%d %H:%M:%S') - SMART tests completed"
 augment_messages_with_deltas
 save_nvme_state
 monitor_btrfs
+log_info "Reached checkpoint: after monitor_btrfs"
 check_btrfs_snapshots() {
 # Check btrfs snapshot counts against thresholds.
     local mountpoints
@@ -1207,7 +1218,7 @@ check_btrfs_snapshots() {
         local list cnt
         list=$(btrfs subvolume list "$mp" 2>/dev/null || true)
         [[ -z "$list" ]] && continue
-        cnt=$(printf "%s\n" "$list" | grep -Eio '(^|/)[@.]?snapshots?(/|$)|(^|/)snapshot[^/]*' | wc -l)
+        cnt=$(printf "%s\n" "$list" | grep -Eio '(^|/)[@.]?snapshots?(/|$)|(^|/)snapshot[^/]*' | wc -l || true)
         if (( cnt >= SNAPSHOT_CRIT )); then
             record_alert critical "$NOTIFY_TITLE_BTRFS" "Critical: $mp snapshot count $cnt >= $SNAPSHOT_CRIT"
         elif (( cnt >= SNAPSHOT_WARN )); then
@@ -1216,8 +1227,11 @@ check_btrfs_snapshots() {
     done
 }
 check_btrfs_snapshots
+log_info "Reached checkpoint: after check_btrfs_snapshots"
 monitor_xfs  # XFS metadata check (if enabled earlier)
+log_info "Reached checkpoint: after monitor_xfs"
 build_mount_device_map  # Populate array mountpoint -> device map
+log_info "Reached checkpoint: after build_mount_device_map"
 
 # Scan syslog/dmesg for disk I/O errors, count unique occurrences per device over time window.
 scan_syslog_disk_errors() {
@@ -1245,7 +1259,9 @@ scan_syslog_disk_errors() {
         local ts="${HASH_SEEN[$key]}" dv="${key%%|*}" h="${key#*|}"; echo "$ts $dv $h" >> "$new_hist"
     done
     while read -r line; do
-        echo "$line" | grep -qiE 'I/O error|blk_update_request|end_request|failed command: (READ|WRITE)|hard resetting link|link is slow to respond|exception Emask' || continue
+        if ! grep -qiE 'I/O error|blk_update_request|end_request|failed command: (READ|WRITE)|hard resetting link|link is slow to respond|exception Emask' <<< "$line"; then
+            continue
+        fi
         local devices=()
         while read -r sd; do devices+=("/dev/$sd"); done < <(echo "$line" | grep -oE 'sd[a-z]+' | sort -u)
         while read -r nv; do devices+=("/dev/$nv"); done < <(echo "$line" | grep -oE 'nvme[0-9]+n[0-9]+' | sort -u)
@@ -1260,13 +1276,13 @@ scan_syslog_disk_errors() {
         local hash
         hash=$(echo "$line" | sha1sum | awk '{print $1}')
         for dev in "${devices[@]}"; do
-            (( IO_ERROR_RAW_MAP[$dev]++ ))
+            IO_ERROR_RAW_MAP["$dev"]=$(( ${IO_ERROR_RAW_MAP["$dev"]:-0} + 1 ))
             if (( IO_ERROR_DEDUP_ENABLED == 1 )) && [[ -n "${HASH_SEEN["$dev|$hash"]:-}" ]]; then
                 continue
             fi
             HASH_SEEN["$dev|$hash"]=$epoch
             echo "$epoch $dev $hash" >> "$new_hist"
-            (( IO_ERROR_UNIQUE_MAP[$dev]++ ))
+            IO_ERROR_UNIQUE_MAP["$dev"]=$(( ${IO_ERROR_UNIQUE_MAP["$dev"]:-0} + 1 ))
         done
     done < <(printf "%s\n" "$log_src")
     mv "$new_hist" "$IO_ERROR_HISTORY_FILE" 2>/dev/null || true
@@ -1583,9 +1599,9 @@ build_recommendations() {
         improve+=" - Pools >=80%: Rebalance data across pools / expand SSD pool.\n"
         improve+=" - Consider compression (Btrfs/ZFS if applicable) for infrequently accessed data.\n"
     fi
-    if [[ -n "$CAPACITY_FORECAST" ]] && echo "$CAPACITY_FORECAST" | grep -q 'days to' ; then
-        local soon_arr=$(echo "$CAPACITY_FORECAST" | awk -F'Array avg daily growth:' '{print $2}' | awk -F'days to' '{print $2}' | awk '{print $NF}' | tr -d ':')
-        local soon_pool=$(echo "$CAPACITY_FORECAST" | awk -F'Pools avg daily growth:' '{print $2}' | awk -F'days to' '{print $2}' | awk '{print $NF}' | tr -d ':')
+    if [[ -n "${CAPACITY_FORECAST:-}" ]] && echo "${CAPACITY_FORECAST:-}" | grep -q 'days to' ; then
+        local soon_arr=$(echo "${CAPACITY_FORECAST:-}" | awk -F'Array avg daily growth:' '{print $2}' | awk -F'days to' '{print $2}' | awk '{print $NF}' | tr -d ':')
+        local soon_pool=$(echo "${CAPACITY_FORECAST:-}" | awk -F'Pools avg daily growth:' '{print $2}' | awk -F'days to' '{print $2}' | awk '{print $NF}' | tr -d ':')
         :
     fi
     [[ -n "$improve" ]] && rec+="Storage Improvement Suggestions:\n$improve"
@@ -1686,19 +1702,19 @@ build_subject() {
 build_disk_health_summary() {
     local crit_count=0 warn_count=0 pending_count=0 uncorrect_count=0 high_temp=0 nvme_wear_warn=0 read_only=0 reliability=0 timeout_warn=0 realloc_events_warn=0 end2end_count=0 soft_read_warn=0
     for dev in "${!SMART_STATE[@]}"; do
-        local st="${SMART_STATE[$dev]}" msg="${SMART_MSGS[$dev]}"
-        [[ $st == CRITICAL ]] && ((crit_count++))
-        [[ $st == WARNING ]] && ((warn_count++))
-        [[ $msg == *"Pending sectors"* ]] && ((pending_count++))
-        [[ $msg == *"Offline Uncorrectable"* || $msg == *"Reported Uncorrectable"* ]] && ((uncorrect_count++))
-        [[ $msg == *"Temp"* ]] && ((high_temp++))
-        [[ $msg == *"NVMe wear"* ]] && ((nvme_wear_warn++))
-        [[ $msg == *"read-only mode"* ]] && ((read_only++))
-        [[ $msg == *"reliability degraded"* ]] && ((reliability++))
-        [[ $msg == *"Command Timeout"* ]] && ((timeout_warn++))
-        [[ $msg == *"Reallocated Event Count"* ]] && ((realloc_events_warn++))
-        [[ $msg == *"End-to-End Errors"* ]] && ((end2end_count++))
-        [[ $msg == *"Soft Read Error Rate"* ]] && ((soft_read_warn++))
+        local st="${SMART_STATE[$dev]:-OK}" msg="${SMART_MSGS[$dev]:-}"
+        if [[ $st == CRITICAL ]]; then ((++crit_count)); fi
+        if [[ $st == WARNING ]]; then ((++warn_count)); fi
+        if [[ $msg == *"Pending sectors"* ]]; then ((++pending_count)); fi
+        if [[ $msg == *"Offline Uncorrectable"* || $msg == *"Reported Uncorrectable"* ]]; then ((++uncorrect_count)); fi
+        if [[ $msg == *"Temp"* ]]; then ((++high_temp)); fi
+        if [[ $msg == *"NVMe wear"* ]]; then ((++nvme_wear_warn)); fi
+        if [[ $msg == *"read-only mode"* ]]; then ((++read_only)); fi
+        if [[ $msg == *"reliability degraded"* ]]; then ((++reliability)); fi
+        if [[ $msg == *"Command Timeout"* ]]; then ((++timeout_warn)); fi
+        if [[ $msg == *"Reallocated Event Count"* ]]; then ((++realloc_events_warn)); fi
+        if [[ $msg == *"End-to-End Errors"* ]]; then ((++end2end_count)); fi
+        if [[ $msg == *"Soft Read Error Rate"* ]]; then ((++soft_read_warn)); fi
     done
     CRIT_DISK_COUNT=$crit_count
     WARN_DISK_COUNT=$warn_count
@@ -1711,25 +1727,25 @@ compute_risk_and_lifecycle() {
     local risk_lines="" lifecycle_lines="" age_lines=""
     declare -A RISK SCORE_ATTR AGE_CLASS
     for dev in "${!SMART_STATE[@]}"; do
-        local st="${SMART_STATE[$dev]}" msg="${SMART_MSGS[$dev]}"
+        local st="${SMART_STATE[$dev]:-OK}" msg="${SMART_MSGS[$dev]:-}"
         local score=0
         case "$st" in
             CRITICAL) ((score += W_SEV_CRIT));;
             WARNING)  ((score += W_SEV_WARN));;
         esac
-        [[ $msg == *"Pending sectors"* ]] && ((score += W_PENDING))
-        [[ $msg == *"Offline Uncorrectable"* || $msg == *"Reported Uncorrectable"* ]] && ((score += W_UNCORR))
-        [[ $msg == *"Reallocated ="* ]] && ((score += W_REALLOC))
-        [[ $msg == *"Reallocated Event Count"* ]] && ((score += W_REALLOC_EVENTS))
-        [[ $msg == *"Command Timeout"* ]] && ((score += W_CMD_TIMEOUT))
-        [[ $msg == *"UDMA CRC Errors"* ]] && ((score += W_CRC))
-        [[ $msg == *"SSD life remaining"* ]] && ((score += W_SSD_LIFE))
-        [[ $msg == *"NVMe wear"* ]] && ((score += W_NVME_WEAR))
-        [[ $msg == *"Temp"* ]] && ((score += W_TEMP))
-        [[ $msg == *"End-to-End Errors"* ]] && ((score += W_E2E))
-        [[ $msg == *"Soft Read Error Rate"* ]] && ((score += W_SOFT_READ))
-        [[ $msg == *"read-only mode"* ]] && ((score += W_NVME_RO))
-        [[ $msg == *"reliability degraded"* ]] && ((score += W_NVME_REL))
+        if [[ $msg == *"Pending sectors"* ]]; then ((score += W_PENDING)); fi
+        if [[ $msg == *"Offline Uncorrectable"* || $msg == *"Reported Uncorrectable"* ]]; then ((score += W_UNCORR)); fi
+        if [[ $msg == *"Reallocated ="* ]]; then ((score += W_REALLOC)); fi
+        if [[ $msg == *"Reallocated Event Count"* ]]; then ((score += W_REALLOC_EVENTS)); fi
+        if [[ $msg == *"Command Timeout"* ]]; then ((score += W_CMD_TIMEOUT)); fi
+        if [[ $msg == *"UDMA CRC Errors"* ]]; then ((score += W_CRC)); fi
+        if [[ $msg == *"SSD life remaining"* ]]; then ((score += W_SSD_LIFE)); fi
+        if [[ $msg == *"NVMe wear"* ]]; then ((score += W_NVME_WEAR)); fi
+        if [[ $msg == *"Temp"* ]]; then ((score += W_TEMP)); fi
+        if [[ $msg == *"End-to-End Errors"* ]]; then ((score += W_E2E)); fi
+        if [[ $msg == *"Soft Read Error Rate"* ]]; then ((score += W_SOFT_READ)); fi
+        if [[ $msg == *"read-only mode"* ]]; then ((score += W_NVME_RO)); fi
+        if [[ $msg == *"reliability degraded"* ]]; then ((score += W_NVME_REL)); fi
         local poh=0 percent_used=0 life_remain=0
         if [[ $dev == /dev/nvme* ]]; then
             percent_used=${CUR_ATTR["$dev|nvme_percent_used"]:-0}
@@ -1757,7 +1773,7 @@ compute_risk_and_lifecycle() {
         dv=$(echo "$line" | awk '{print $2}')
         risk_lines+="$(basename "$dv") score=$sc"
         risk_lines+="\n"
-        ((idx++))
+        ((++idx))
         (( idx >= 20 )) && break
     done < <(printf "%s\n" "$sorted")
     if (( LIFECYCLE_ENABLED == 1 )); then
@@ -1774,7 +1790,10 @@ compute_risk_and_lifecycle() {
         MONITOR_COUNT=${#monitor[@]}
         HEALTHY_COUNT=${#healthy[@]}
     fi
-    RISK_SECTION="$( (( RISK_SCORING_ENABLED==1 )) && echo "Risk Scores (top):\n${risk_lines}" )$( (( LIFECYCLE_ENABLED==1 )) && echo "Lifecycle Buckets:\n${lifecycle_lines}" )$( (( AGE_AWARE_ENABLED==1 )) && [[ -n "$age_lines" ]] && echo "Age Awareness:\n${age_lines}" )"
+    RISK_SECTION=""
+    if (( RISK_SCORING_ENABLED==1 )); then RISK_SECTION+="Risk Scores (top):\n${risk_lines}"; fi
+    if (( LIFECYCLE_ENABLED==1 )); then RISK_SECTION+="Lifecycle Buckets:\n${lifecycle_lines}"; fi
+    if (( AGE_AWARE_ENABLED==1 )) && [[ -n "$age_lines" ]]; then RISK_SECTION+="Age Awareness:\n${age_lines}"; fi
 }
 
 # Append today's risk tier counts to history file
@@ -1931,9 +1950,9 @@ capacity_forecast_and_export() {
         {
             echo '{'
             echo "  \"timestamp\": \"$(date '+%Y-%m-%dT%H:%M:%S')\",";
-            echo "  \"array\": { \"percent\": $array_pct, \"used_hr\": \"${ARRAY_USED_HR}\", \"total_hr\": \"${ARRAY_TOTAL_HR}\" },";
-            echo "  \"pools\": { \"percent\": $pools_pct, \"used_hr\": \"${POOLS_USED_HR}\", \"total_hr\": \"${POOLS_TOTAL_HR}\" },";
-            echo "  \"disk_health_summary\": \"$(echo "$DISK_HEALTH_SUMMARY" | sed 's/\"/\\\"/g')\",";
+            echo "  \"array\": { \"percent\": $array_pct, \"used_hr\": \"${ARRAY_USED_HR:-0 B}\", \"total_hr\": \"${ARRAY_TOTAL_HR:-0 B}\" },";
+            echo "  \"pools\": { \"percent\": $pools_pct, \"used_hr\": \"${POOLS_USED_HR:-0 B}\", \"total_hr\": \"${POOLS_TOTAL_HR:-0 B}\" },";
+            echo "  \"disk_health_summary\": \"$(echo "${DISK_HEALTH_SUMMARY:-}" | sed 's/\"/\\\"/g')\",";
             if (( include_disks == 1 )); then
                 echo "  \"capacity_forecast\": \"$(echo "$CAPACITY_FORECAST" | sed 's/\"/\\\"/g')\",";
                 echo "  \"disks\": ["
@@ -2021,7 +2040,7 @@ capacity_forecast_and_export() {
 
 # Analyze disk usage history and compute top growth rates
 compute_disk_growth_top() {
-    (( DISK_GROWTH_ENABLED == 1 )) || { DISK_GROWTH_SECTION=""; return 0; }
+    (( ${DISK_GROWTH_ENABLED:-1} == 1 )) || { DISK_GROWTH_SECTION=""; return 0; }
     local win=$HISTORY_WINDOW_DAYS
     local lines=$(tail -n 20000 "$DISK_CAP_HISTORY_FILE" 2>/dev/null || true)
     [[ -z "$lines" ]] && { DISK_GROWTH_SECTION=""; return 0; }
@@ -2068,55 +2087,9 @@ compute_disk_growth_top() {
     fi
 }
 
-build_storage_and_disk_lines
-evaluate_capacity_alerts
-build_recommendations 
-build_subject
-build_disk_health_summary
-tbw_forecast_and_heavy_writers
-build_subsystem_lines
-capacity_forecast_and_export
-compute_risk_and_lifecycle
-validate_storage_metrics
-compute_disk_growth_top
-compute_share_breakdown
-persist_risk_tier_history
-build_risk_tier_trend_section
-
-# Detect firmware/controller resets by checking for Power-On Hours (POH) drops and NVMe Percentage Used regression
-detect_counter_resets() {
-    FIRMWARE_EVENT_SECTION=""
-    local events=""
-    for dev in "${!SMART_STATE[@]}"; do
-        local prev_poh=${PREV_ATTR["$dev|poh"]:-}
-        local curr_poh=${CUR_ATTR["$dev|poh"]:-}
-        if [[ -n "$prev_poh" && -n "$curr_poh" && "$prev_poh" =~ ^[0-9]+$ && "$curr_poh" =~ ^[0-9]+$ && $curr_poh -lt $prev_poh ]]; then
-            local drop=$(( prev_poh - curr_poh ))
-            local sev="warning"
-            if (( drop > POH_RESET_CRIT_THRESHOLD )); then sev="critical"; fi
-            events+=" - $(basename "$dev") POH regression: ${prev_poh}h -> ${curr_poh}h (drop ${drop}h)\n"
-            record_alert "$sev" "Firmware Reset" "Disk $dev Power-On Hours dropped (${prev_poh} -> ${curr_poh}) possible controller/firmware reset"
-        fi
-        if [[ "$dev" == /dev/nvme* ]]; then
-            local prev_used=${PREV_ATTR["$dev|nvme_percent_used"]:-}
-            local curr_used=${CUR_ATTR["$dev|nvme_percent_used"]:-}
-            if [[ -n "$prev_used" && -n "$curr_used" && "$prev_used" =~ ^[0-9]+$ && "$curr_used" =~ ^[0-9]+$ && $curr_used -lt $prev_used ]]; then
-                local delta=$(( prev_used - curr_used ))
-                if (( delta >= NVME_WEAR_REGRESSION_WARN )); then
-                    events+=" - $(basename "$dev") NVMe percent_used regression: ${prev_used}% -> ${curr_used}% (drop ${delta}%)\n"
-                    record_alert warning "Firmware Reset" "Disk $dev NVMe Percentage Used decreased (${prev_used}% -> ${curr_used}%); check firmware or controller resets"
-                fi
-            fi
-        fi
-    done
-    [[ -n "$events" ]] && FIRMWARE_EVENT_SECTION="Firmware Reset / Counter Regression:\n$events"
-}
-
-detect_counter_resets
-
 # Analyze TBW history to estimate daily write rates and days to threshold
 tbw_forecast_and_heavy_writers() {
-    (( TBW_FORECAST_ENABLED == 1 )) || { TBW_SECTION=""; return 0; }
+    (( ${TBW_FORECAST_ENABLED:-1} == 1 )) || { TBW_SECTION=""; return 0; }
     local today=$(date +%Y-%m-%d)
     for dev in "${!SMART_STATE[@]}"; do
         local tbw=${CUR_ATTR["$dev|tbw_bytes"]:-}
@@ -2232,6 +2205,84 @@ ${forecast_section}$( [[ -n "$heavy_section" ]] && printf "Top Heavy Writers (no
     fi
 }
 
+log_info "Checkpoint: before build_storage_and_disk_lines"
+build_storage_and_disk_lines
+log_info "Checkpoint: after build_storage_and_disk_lines"
+log_info "Checkpoint: before evaluate_capacity_alerts"
+evaluate_capacity_alerts
+log_info "Checkpoint: after evaluate_capacity_alerts"
+log_info "Checkpoint: before capacity_forecast_and_export"
+capacity_forecast_and_export
+log_info "Checkpoint: after capacity_forecast_and_export"
+log_info "Checkpoint: before build_recommendations"
+build_recommendations 
+log_info "Checkpoint: after build_recommendations"
+log_info "Checkpoint: before build_subject"
+build_subject
+log_info "Checkpoint: after build_subject"
+log_info "Checkpoint: before build_disk_health_summary"
+build_disk_health_summary
+log_info "Checkpoint: after build_disk_health_summary"
+log_info "Checkpoint: before tbw_forecast_and_heavy_writers"
+tbw_forecast_and_heavy_writers
+log_info "Checkpoint: after tbw_forecast_and_heavy_writers"
+log_info "Checkpoint: before build_subsystem_lines"
+build_subsystem_lines
+log_info "Checkpoint: after build_subsystem_lines"
+log_info "Checkpoint: before compute_risk_and_lifecycle"
+compute_risk_and_lifecycle
+log_info "Checkpoint: after compute_risk_and_lifecycle"
+log_info "Checkpoint: before validate_storage_metrics"
+validate_storage_metrics
+log_info "Checkpoint: after validate_storage_metrics"
+log_info "Checkpoint: before compute_disk_growth_top"
+compute_disk_growth_top
+log_info "Checkpoint: after compute_disk_growth_top"
+log_info "Checkpoint: before compute_share_breakdown"
+compute_share_breakdown
+log_info "Checkpoint: after compute_share_breakdown"
+log_info "Checkpoint: before scan_syslog_disk_errors"
+scan_syslog_disk_errors
+log_info "Checkpoint: after scan_syslog_disk_errors"
+log_info "Checkpoint: before persist_risk_tier_history"
+persist_risk_tier_history
+log_info "Checkpoint: after persist_risk_tier_history"
+log_info "Checkpoint: before build_risk_tier_trend_section"
+build_risk_tier_trend_section
+log_info "Checkpoint: after build_risk_tier_trend_section"
+log_info "Reached checkpoint: after trend build"
+
+# Detect firmware/controller resets by checking for Power-On Hours (POH) drops and NVMe Percentage Used regression
+detect_counter_resets() {
+    FIRMWARE_EVENT_SECTION=""
+    local events=""
+    for dev in "${!SMART_STATE[@]}"; do
+        local prev_poh=${PREV_ATTR["$dev|poh"]:-}
+        local curr_poh=${CUR_ATTR["$dev|poh"]:-}
+        if [[ -n "$prev_poh" && -n "$curr_poh" && "$prev_poh" =~ ^[0-9]+$ && "$curr_poh" =~ ^[0-9]+$ && $curr_poh -lt $prev_poh ]]; then
+            local drop=$(( prev_poh - curr_poh ))
+            local sev="warning"
+            if (( drop > POH_RESET_CRIT_THRESHOLD )); then sev="critical"; fi
+            events+=" - $(basename "$dev") POH regression: ${prev_poh}h -> ${curr_poh}h (drop ${drop}h)\n"
+            record_alert "$sev" "Firmware Reset" "Disk $dev Power-On Hours dropped (${prev_poh} -> ${curr_poh}) possible controller/firmware reset"
+        fi
+        if [[ "$dev" == /dev/nvme* ]]; then
+            local prev_used=${PREV_ATTR["$dev|nvme_percent_used"]:-}
+            local curr_used=${CUR_ATTR["$dev|nvme_percent_used"]:-}
+            if [[ -n "$prev_used" && -n "$curr_used" && "$prev_used" =~ ^[0-9]+$ && "$curr_used" =~ ^[0-9]+$ && $curr_used -lt $prev_used ]]; then
+                local delta=$(( prev_used - curr_used ))
+                if (( delta >= NVME_WEAR_REGRESSION_WARN )); then
+                    events+=" - $(basename "$dev") NVMe percent_used regression: ${prev_used}% -> ${curr_used}% (drop ${delta}%)\n"
+                    record_alert warning "Firmware Reset" "Disk $dev NVMe Percentage Used decreased (${prev_used}% -> ${curr_used}%); check firmware or controller resets"
+                fi
+            fi
+        fi
+    done
+    [[ -n "$events" ]] && FIRMWARE_EVENT_SECTION="Firmware Reset / Counter Regression:\n$events"
+}
+
+detect_counter_resets
+
 # Build and send notification
 SCRIPT_END_EPOCH=$(date +%s)
 RUNTIME_SEC=$(( SCRIPT_END_EPOCH - SCRIPT_START_EPOCH ))
@@ -2247,29 +2298,50 @@ else
     RUNTIME_STR="${runtime_s}s"
 fi
 
-NOTIFY_BODY="Runtime: ${RUNTIME_STR}
-$STORAGE_TOP_LINES
-Array Disks:
-$ARRAY_DISK_LINES
-Pools:
-$POOL_LINES
-$( [[ $ENABLE_POOL_DEVICE_SMART -eq 1 && -n "$POOL_DEVICE_LINES" ]] && printf "Pool Devices:\n%s\n" "$POOL_DEVICE_LINES" )
-${DISK_HEALTH_SUMMARY}
-${RISK_TIER_TREND_SECTION}
-${CAPACITY_FORECAST}
-${RISK_SECTION}
-${FIRMWARE_EVENT_SECTION}
-${TBW_SECTION}
-${DISK_GROWTH_SECTION}
-${SHARE_SECTION}
-${STORAGE_VALIDATION_SECTION}
-$( [[ -n "$ADAPTIVE_DECISIONS" ]] && printf "Adaptive SMART Decisions:\n%s" "$ADAPTIVE_DECISIONS" )
-${IO_ERROR_FREQ_SECTION}
-Subsystems:
-$SUBSYSTEM_LINES
-$RECOMMEND_SECTION"
+# Build optional sections safely under set -u / set -e
+POOL_DEVICE_SECTION=""
+if (( ${ENABLE_POOL_DEVICE_SMART:-0} == 1 )) && [[ -n "${POOL_DEVICE_LINES:-}" ]]; then
+    POOL_DEVICE_SECTION="Pool Devices:\n${POOL_DEVICE_LINES}\n"
+fi
+ADAPTIVE_DECISIONS_SECTION=""
+if [[ -n "${ADAPTIVE_DECISIONS:-}" ]]; then
+    ADAPTIVE_DECISIONS_SECTION="Adaptive SMART Decisions:\n${ADAPTIVE_DECISIONS}"
+fi
 
-notify_unraid "$SUBJECT" "$NOTIFY_BODY" "$( [[ ${#ALERT_CRIT[@]} -gt 0 ]] && echo critical || { [[ ${#ALERT_WARN[@]} -gt 0 ]] && echo warning || echo ok; } )"
+NOTIFY_BODY="Runtime: ${RUNTIME_STR:-}
+${STORAGE_TOP_LINES:-}
+Array Disks:
+${ARRAY_DISK_LINES:-}
+Pools:
+${POOL_LINES:-}
+${POOL_DEVICE_SECTION:-}
+${DISK_HEALTH_SUMMARY:-}
+${RISK_TIER_TREND_SECTION:-}
+${CAPACITY_FORECAST:-}
+${RISK_SECTION:-}
+${FIRMWARE_EVENT_SECTION:-}
+${TBW_SECTION:-}
+${DISK_GROWTH_SECTION:-}
+${SHARE_SECTION:-}
+${STORAGE_VALIDATION_SECTION:-}
+${ADAPTIVE_DECISIONS_SECTION:-}
+${IO_ERROR_FREQ_SECTION:-}
+Subsystems:
+${SUBSYSTEM_LINES:-}
+${RECOMMEND_SECTION:-}"
+
+log_info "Assembled NOTIFY_BODY; preparing to send"
+
+# Log severity used for the outgoing notification
+if (( ${#ALERT_CRIT[@]} > 0 )); then
+    _final_sev=critical
+elif (( ${#ALERT_WARN[@]} > 0 )); then
+    _final_sev=warning
+else
+    _final_sev=ok
+fi
+log_info "Sending notification: severity=${_final_sev} crit=${#ALERT_CRIT[@]} warn=${#ALERT_WARN[@]}"
+notify_unraid "${SUBJECT:-Disk Health Summary}" "$NOTIFY_BODY" "${_final_sev}"
 
 # Persist current SMART attributes and states
 persist_current_attrs() {
