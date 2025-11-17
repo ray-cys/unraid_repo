@@ -23,9 +23,9 @@ SECURE_SRC="/mnt/user/secure"         # Source path for "Secure" label
 MEDIA_DEST="/mnt/user/media"          # Destination path for "Media" label
 SECURE_DEST="/mnt/user/secure"        # Destination path for "Secure" label
 
-LOG_FILE_SUBDIR="/boot/logs/remote-logs"  # Directory to store log files
-LOG_FILE="$LOG_FILE_SUBDIR/remote_backup_$(date +%Y%m%d_%H%M%S).log" # Log file path
-PRESERVED_RAW_LOG_DIR="$LOG_FILE_SUBDIR/rsync_raw" # Directory to store preserved raw rsync logs
+LOG_FILE_SUBDIR="/mnt/cache/system/logs/remote_logs"                       # Directory to store log files
+LOG_FILE="$LOG_FILE_SUBDIR/remote_backup_$(date +%Y%m%d_%H%M%S).log"  # Log file path
+PRESERVED_RAW_LOG_DIR="$LOG_FILE_SUBDIR/rsync_raw"                    # Directory to store preserved raw rsync logs
 
 # --- Logs Settings ---
 MAX_LOGS=2                             # Maximum number of dated log files to keep
@@ -705,7 +705,7 @@ run_rsync() {
     fi
 
     if [ "$last_status" -eq 0 ]; then
-      if [ "$enable_snapshots" = true ]; then
+      if [ "$ENABLE_SNAPSHOTS" = true ]; then
         safe_label=${label// /_}
         now=$(date +%Y%m%d_%H%M%S)
         snap_dest="$SNAPSHOT_ROOT/$safe_label/$now"
@@ -949,6 +949,7 @@ declare -A rsync_transferred_bytes
 declare -A rsync_files
 declare -A rsync_deletes
 declare -A rsync_bytes_sent
+declare -A estimated_changed_bytes  # per-label estimated changed bytes from manifest diff
 
 # Prepare arrays for aggregated preflight (dynamic labels)
 LABELS_ARRAY=("Media" "Secure")
@@ -958,6 +959,15 @@ agg_msg=""
 
 # Ensure manifests exist for all labels
 ensure_manifests_for_labels || true
+
+# Capture estimated changed bytes per label (using manifest diff regardless of PREFLIGHT_MODE to drive percent-of-change metrics)
+for idx in "${!LABELS_ARRAY[@]}"; do
+  lbl=${LABELS_ARRAY[$idx]}
+  src=${SRCS_ARRAY[$idx]}
+  est_changed=$(manifest_diff_bytes "$lbl" "$src" 2>/dev/null || echo 0)
+  estimated_changed_bytes["$lbl"]=$est_changed
+  log "Estimated changed bytes for $lbl (manifest diff): $est_changed"
+done
 
 # Runs `aggregate_preflight_check` which sums estimated changed bytes per remote device and compares against available space
 if ! agg_msg=$(aggregate_preflight_check 2>&1); then
@@ -1052,29 +1062,41 @@ runtime_converted=$(format_runtime)
 
 # Log status and send notification
 log "$SRC_NAS --> $DEST_NAS complete == Runtime: $runtime_converted"
- condensed_parts=()
+condensed_parts=()
 detailed_body=$'Runtime: '
 detailed_body+="$runtime_converted"$'\n'
- for lbl in "${!rsync_summaries[@]}"; do
-   condensed_parts+=("${rsync_summaries[$lbl]}")
+for lbl in "${!rsync_summaries[@]}"; do
+  transferred=${rsync_transferred_bytes[$lbl]:-0}
+  files=${rsync_files[$lbl]:-0}
+  deletes=${rsync_deletes[$lbl]:-0}
+  sent=${rsync_bytes_sent[$lbl]:-0}
+  est=${estimated_changed_bytes[$lbl]:-0}
+  total=${rsync_total_bytes[$lbl]:-0}
 
-   total=${rsync_total_bytes[$lbl]:-0}
-   transferred=${rsync_transferred_bytes[$lbl]:-0}
-   files=${rsync_files[$lbl]:-0}
-   deletes=${rsync_deletes[$lbl]:-0}
-   sent=${rsync_bytes_sent[$lbl]:-0}
+  human_transferred=$(bytes_human "$transferred")
+  human_est=$(bytes_human "$est")
+  human_total=$(bytes_human "$total")
+  human_sent=$(bytes_human "$sent")
 
-   human_total=$(bytes_human "$total")
-   human_transferred=$(bytes_human "$transferred")
-   human_sent=$(bytes_human "$sent")
+  if [ "$est" -gt 0 ] && [ "$transferred" -gt 0 ]; then
+    percent=$(awk "BEGIN{ if ($est>0) printf \"%.3f\", ($transferred / $est) * 100; else print 0 }")
+  elif [ "$transferred" -gt 0 ] && [ "$est" -eq 0 ]; then
+    percent="100.000"
+  else
+    percent="0.000"
+  fi
 
-   if [ "$total" -gt 0 ] && [ "$transferred" -ge 0 ]; then
-     percent=$(awk "BEGIN{ if ($total>0) printf \"%.1f\", ($transferred / $total) * 100; else print 0 }")
-  detailed_body+="$lbl: $human_total total, transferred $human_transferred ($percent%), files $files, deleted $deletes, sent $human_sent"$'\n'
-   else
-  detailed_body+="$lbl: transferred $human_transferred, files $files, deleted $deletes, sent $human_sent"$'\n'
-   fi
- done
+  percent_num=$(awk -v p="$percent" 'BEGIN{gsub(/[^0-9.]/,""); if(p+0>100) printf "100.000"; else printf "%s", p}')
+  percent="$percent_num"
+
+  if [ "$est" -gt 0 ]; then
+    detailed_body+="$lbl: total $human_total, est_changed $human_est, transferred $human_transferred (${percent}%), files $files, deleted $deletes, sent $human_sent"$'\n'
+  else
+    detailed_body+="$lbl: total $human_total, est_changed unknown, transferred $human_transferred (${percent}%), files $files, deleted $deletes, sent $human_sent"$'\n'
+  fi
+
+  condensed_parts+=("$lbl: $human_transferred (${percent}%)")
+done
 
 max_labels_in_d=${notif_condensed_max_labels:-3}
 condensed_show=()
@@ -1088,7 +1110,7 @@ for part in "${condensed_parts[@]}"; do
 done
 extra_count=$(( ${#condensed_parts[@]} - ${#condensed_show[@]} ))
 
-condensed_line=$(IFS=' | '; printf '%s' "${condensed_show[*]}")
+condensed_line=$(IFS=$'\n'; printf '%s' "${condensed_show[*]}")
 if [ "$extra_count" -gt 0 ]; then
   condensed_line+=" | +${extra_count} more"
 fi
@@ -1136,7 +1158,8 @@ if [ "${#failed_labels[@]}" -eq 0 ]; then
     fi
   done
   esub=$(notif_emoji ok)
-  notify_send normal "Scheduled Remote Backup - OK" "${esub} Backup. OK: $condensed_line" "$body"
+  # Put the condensed summary on its own line in the -d detail to avoid long single-line notifications
+  notify_send normal "Scheduled Remote Backup - OK" "${esub} Backup. OK" $'\n'"${condensed_line}" "$body"
   if [ "$DRY_RUN" = false ]; then
     log "Shutting down remote after successful backup"
     if ! ssh -p "$SSH_PORT" "$REMOTE" "df --type=xfs -h && powerdown" 2>/dev/null; then
