@@ -1016,7 +1016,14 @@ risk_score_quick() {
 # Check if disk is available for testing
 run_smart_test() {
     local disk=$1
-    [[ $disk == /dev/sd* ]] && hdparm -I "$disk" >/dev/null 2>&1 || true
+    if [[ $disk == /dev/sd* ]]; then
+        local pstate
+        pstate=$(hdparm -C "$disk" 2>/dev/null | awk -F: '/state is/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print tolower($2)}')
+        if echo "$pstate" | grep -qi "standby"; then
+            log_info "Spinning up disk $disk (standby -> active) via hdparm -I"
+        fi
+        hdparm -I "$disk" >/dev/null 2>&1 || true
+    fi
     local flag="-t short"
     local selftest poh_attr current_poh last_long_hours_diff="" last_long_poh="" threshold_hours=$(( SMART_INTERVAL_DAYS * 24 ))
     if [[ $disk == /dev/nvme* ]]; then
@@ -1354,7 +1361,7 @@ evaluate_per_mount_thresholds() {
 }
 
 # === Main Execution: SMART tests, filesystem checks, mapping, I/O error scan ===
-log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Starting SMART tests (type=$SMART_TEST_TYPE)"
+log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Starting SMART tests ($SMART_TEST_TYPE test type)"
 check_completed_long_tests
 for disk in $(get_all_disks); do
     run_smart_test "$disk"
@@ -1527,6 +1534,8 @@ build_storage_and_disk_lines() {
     # Array
     ARRAY_MAX_SEV=0; POOLS_MAX_SEV=0
     ARRAY_DISK_LINES=""; POOL_LINES=""; POOL_DEVICE_LINES=""; ARRAY_DEVICE_LINES=""
+    local -a ARRAY_DEV_INFO=()
+    local -a POOL_DEV_INFO=()
     local arr=()
     for d in /mnt/disk*; do [[ -d "$d" ]] || continue; mountpoint -q "$d" || continue; arr+=("$d"); done
     ARRAY_COUNT=${#arr[@]}
@@ -1566,7 +1575,7 @@ build_storage_and_disk_lines() {
             ARR_INFO+=("$(basename "$d")|$cap_str|$pct_local|$sev_word|$drv_part|$reason_join")
         fi
         if (( sm_rank > 0 )); then
-            local model cap wear_info="" msg_inline msg_full=""
+            local model cap wear_info="" msg_inline msg_full="" entry
             model=$(get_device_model "$dev")
             cap=$(get_device_capacity_tb "$dev")
             if [[ "$sm_msg" == *"NVMe wear"* ]]; then wear_info=$(echo "$sm_msg" | grep -o 'NVMe wear [0-9]*%' | head -n1)
@@ -1575,8 +1584,8 @@ build_storage_and_disk_lines() {
             msg_inline=$(sanitize_smart_for_inline "$sm_msg" 1)
             msg_full=""; [[ -n "$wear_info" ]] && msg_full+="($wear_info) "; [[ -n "$msg_inline" ]] && msg_full+="SMART: $msg_inline"
             local msg_part=""; [[ -n "$msg_full" ]] && msg_part=" $msg_full"
-            printf -v ARRAY_DEVICE_LINES "%s%-8s %-10s %sTB %s%s\n" \
-                "$ARRAY_DEVICE_LINES" "$(basename "$dev")" "[$(status_word "$sm_rank")]" "$cap" "$model" "$msg_part"
+            entry="$(basename "$dev")|[$(status_word "$sm_rank")]|${cap}TB|$model|${msg_part# }"
+            ARRAY_DEV_INFO+=("$entry")
         fi
     done
     ARRAY_TOTAL_BYTES=$arr_size
@@ -1690,7 +1699,7 @@ build_storage_and_disk_lines() {
                 local st="${SMART_STATE[$rootdv]:-OK}" msg="${SMART_MSGS[$rootdv]:-}"
                 local rank=$(severity_rank "$st")
                 if (( rank > 0 )); then
-                    local model cap wear_info="" msg_inline msg_full=""
+                    local model cap wear_info="" msg_inline msg_full="" entry
                     if [[ -n "$msg" ]]; then
                         model=$(get_device_model "$rootdv")
                         cap=$(get_device_capacity_tb "$rootdv")
@@ -1705,14 +1714,14 @@ build_storage_and_disk_lines() {
                         [[ -n "$msg_inline" ]] && msg_full+="SMART: $msg_inline"
                         local msg_part=""
                         [[ -n "$msg_full" ]] && msg_part=" $msg_full"
-                        printf -v POOL_DEVICE_LINES "%s%-8s %-10s %sTB %s%s\n" \
-                            "$POOL_DEVICE_LINES" "$(basename "$rootdv")" "[$(status_word "$rank")]" "$cap" "$model" "$msg_part"
+                        entry="$(basename "$rootdv")|[$(status_word "$rank")]|${cap}TB|$model|${msg_part# }"
+                        POOL_DEV_INFO+=("$entry")
                     else
                         local model cap
                         model=$(get_device_model "$rootdv")
                         cap=$(get_device_capacity_tb "$rootdv")
-                        printf -v POOL_DEVICE_LINES "%s%-8s %-10s %sTB %s\n" \
-                            "$POOL_DEVICE_LINES" "$(basename "$rootdv")" "[$(status_word "$rank")]" "$cap" "$model"
+                        entry="$(basename "$rootdv")|[$(status_word "$rank")]|${cap}TB|$model|"
+                        POOL_DEV_INFO+=("$entry")
                     fi
                 fi
             done
