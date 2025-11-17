@@ -11,20 +11,36 @@ noParity=true
 clearLog=false
 
 # --------------------------------------------------------------------------------
-# SETTINGS
+# --- Configuration Section ---
 
-# Source and destination directories
-src_dir="/mnt/user/secure/torrent"
-dest_dir="/mnt/user/secure"
-
-# Ownership settings: Set OWNER as needed.
-# Common pattern: 'nobody', 'root', 'user'
-OWN_USER="nobody"
-
-# Permission settings: directory and file modes (octal).
-# Common pattern: CHMOD_DIR=0775, CHMOD_FILE=0664
-CHMOD_DIR=0775
-CHMOD_FILE=0775
+SRC_DIR="/mnt/user/secure/torrent"    # Source directory to process
+DEST_DIR="/mnt/user/secure"           # Destination base directory for processed data
+OWN_USER="nobody"                     # Owner user for files and directories
+CHMOD_DIR=0775                        # Directory permissions
+CHMOD_FILE=0775                       # File permissions
+RENAME_PATTERNS=(                     # Patterns to remove from filenames
+  "hhd800.com@"
+  "gg5.co@"
+  "-C_GG5"
+  "ch"
+  "uncensored"
+)
+UNWANTED_EXTS=(                       # Extensions of files to remove under "$SRC_DIR/complete"
+  "url" "html" "mht" "gif" "txt" "rar" "apk" "jpg"
+)
+UNWANTED_NAMES=(                     # Exact file names to remove under "$SRC_DIR/complete" (match by -name)
+  "18+游戏大全(996gg.cc)-七龍珠H版-三國志H版-三國群淫傳等.mp4"
+)
+PRIVATE_SUBDIRS=(                    # List of subdirectories under source to move separately
+  "Ai.Kano.叶爱"
+  "Aika.Yumeno.夢乃あいか"
+  "Akari.Niimura.新村あかり"
+  "Ena.Satsuki.沙月恵奈"
+  "Karen.Yuzuriha.楪カレン"
+  "Sora.Amakawa.天川そら"
+  "Sui.Twinkle.月野江すい"
+  "Yui.Tenma.天馬ゆい"
+)
 
 # --------------------------------------------------------------------------------
 
@@ -193,13 +209,39 @@ human_readable() {
   awk -v b="$bytes" 'function hr(x){s="B KB MB GB TB PB"; n=0; while(x>=1024 && n<5){x/=1024;n++} split(s,a," "); printf("%.1f %s", x, a[n+1])} {hr(b)}'
 }
 
+# Escape a string to be used safely in a sed search pattern (literal match)
+escape_sed_literal() {
+  printf '%s' "$1" | sed -e 's/[][\\.^$*+?(){}|]/\\&/g' -e 's,/,\\/,g'
+}
+
+# Escape a string so it can be used as a literal in a bash match
+escape_glob_literal() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\*/[\*]}
+  s=${s//\?/[?]}
+  s=${s//\[/[[]}
+  printf '%s' "$s"
+}
+
 # Function to rename patterns in files
 rename_patterns() {
   local dir="$1"
-  local patterns=("hhd800.com@" "gg5.co@" "-C_GG5" "ch")
+  local -a patterns=("${RENAME_PATTERNS[@]:-}")
+
+  if [ ${#patterns[@]} -eq 0 ]; then
+    log_info "Rename: no patterns configured; skipping rename pass"
+    return 0
+  fi
 
   for pattern in "${patterns[@]}"; do
-  mapfile -d '' dirs < <(find "$dir" -depth \( -path "$dir/incomplete" -o -path "$dir/incomplete/*" \) -prune -o -type d -name "*${pattern}*" -print0 2>/dev/null)
+    dirs=()
+    globpat=$(escape_glob_literal "$pattern")
+    while IFS= read -r -d '' p; do
+      if [[ $p == *$globpat* ]]; then
+        dirs+=("$p")
+      fi
+    done < <(find "$dir" -depth \( -path "$dir/incomplete" -o -path "$dir/incomplete/*" \) -prune -o -type d -print0 2>/dev/null)
     local dcount=${#dirs[@]}
     if [[ $dcount -gt 0 ]]; then
       local total_dbytes=0
@@ -216,7 +258,8 @@ rename_patterns() {
         local ddirpath dbase dnewbase dnewpath
         ddirpath=$(dirname -- "$d")
         dbase=$(basename -- "$d")
-        dnewbase="${dbase//${pattern}/}"
+        esc_pat=$(escape_sed_literal "$pattern")
+        dnewbase=$(printf '%s' "$dbase" | sed -e "s/${esc_pat}//g")
         if [[ "$dnewbase" == "$dbase" ]]; then
           continue
         fi
@@ -245,7 +288,13 @@ rename_patterns() {
       log_info "Rename directory: no directories match pattern '$pattern' in $dir"
     fi
 
-  mapfile -d '' files < <(find "$dir" \( -path "$dir/incomplete" -o -path "$dir/incomplete/*" \) -prune -o -type f -name "*${pattern}*" -print0 2>/dev/null)
+    # Collect files that contain the literal substring 'pattern'
+    files=()
+    while IFS= read -r -d '' p; do
+      if [[ $p == *$globpat* ]]; then
+        files+=("$p")
+      fi
+    done < <(find "$dir" \( -path "$dir/incomplete" -o -path "$dir/incomplete/*" \) -prune -o -type f -print0 2>/dev/null)
     local count=${#files[@]}
     
     if [[ $count -eq 0 ]]; then
@@ -269,7 +318,8 @@ rename_patterns() {
       local dirpath base newbase newpath
       dirpath=$(dirname -- "$f")
       base=$(basename -- "$f")
-      newbase="${base//${pattern}/}"
+      esc_pat=$(escape_sed_literal "$pattern")
+      newbase=$(printf '%s' "$base" | sed -e "s/${esc_pat}//g")
       if [[ "$newbase" == "$base" ]]; then
         continue
       fi
@@ -316,21 +366,41 @@ rename_patterns() {
 # Function to remove unwanted file extensions
 remove_unwanted_files() {
   local dir="$1"
-  local pattern_count
-  pattern_count=$(find "$dir" -not \( -path "$dir/incomplete" -prune \) -type f \
-    \( -iname "*.url" -o -iname "*.html" -o -iname "*.mht" -o -iname "*.gif" -o -iname "*.txt" -o -iname "*.rar" -o -iname "*.apk" -o -iname "*.jpg" \) -print 2>/dev/null | wc -l)
-  if [[ "$pattern_count" -gt 0 ]]; then
-    log_info "Remove unwanted files: removing $pattern_count unwanted files under $dir"
-    local total_removed_bytes=0
-    while IFS= read -r -d '' remfile; do
-      local rb=$(filesize "$remfile")
-      total_removed_bytes=$((total_removed_bytes + rb))
-      local rsize=$(human_readable "$rb")
-      log_info "Removing unwanted file '$remfile' of size $rsize"
-      rm -f -- "$remfile"
-    done < <(find "$dir" -not \( -path "$dir/incomplete" -prune \) -type f \
-      \( -iname "*.url" -o -iname "*.html" -o -iname "*.mht" -o -iname "*.gif" -o -iname "*.txt" -o -iname "*.rar" -o -iname "*.apk" -o -iname "*.jpg" \) -print0)
-    log_info "Remove unwanted files: removed $pattern_count unwanted files under $dir"
+  local -a exts=("${UNWANTED_EXTS[@]:-}")
+
+  if [ ${#exts[@]} -eq 0 ]; then
+    log_info "Remove unwanted files: no unwanted extensions configured; skipping"
+    return 0
+  fi
+
+  local total_removed_bytes=0
+  local removed_count=0
+  # Build predicate for extensions: ( -iname "*.ext1" -o -iname "*.ext2" ... )
+  local -a pred=( '(' )
+  local first=1
+  for ext in "${exts[@]}"; do
+    if [ $first -eq 1 ]; then
+      pred+=( -iname "*.${ext}" )
+      first=0
+    else
+      pred+=( -o -iname "*.${ext}" )
+    fi
+  done
+  pred+=( ')' )
+
+  while IFS= read -r -d '' remfile; do
+    local rb
+    rb=$(filesize "$remfile")
+    total_removed_bytes=$((total_removed_bytes + rb))
+    removed_count=$((removed_count + 1))
+    local rsize
+    rsize=$(human_readable "$rb")
+    log_info "Removing unwanted file '$remfile' of size $rsize"
+    rm -f -- "$remfile"
+  done < <(find "$dir" -not \( -path "$dir/incomplete" -prune \) -type f "${pred[@]}" -print0 2>/dev/null)
+
+  if [[ $removed_count -gt 0 ]]; then
+    log_info "Remove unwanted files: removed $removed_count files under $dir"
     log_info "Total size of removed files: $(human_readable "$total_removed_bytes")"
   else
     log_info "Remove unwanted files: no unwanted files found under $dir"
@@ -427,16 +497,11 @@ safe_move() {
 move_private_subdirs() {
   local src_base="$1"
   local dest_base="$2"
-  local subdirs=(
-    "Ai.Kano.叶爱"
-    "Aika.Yumeno.夢乃あいか"
-    "Akari.Niimura.新村あかり"
-    "Ena.Satsuki.沙月恵奈"
-    "Karen.Yuzuriha.楪カレン"
-    "Sora.Amakawa.天川そら"
-    "Sui.Twinkle.月野江すい"
-    "Yui.Tenma.天馬ゆい"
-  )
+  local -a subdirs=("${PRIVATE_SUBDIRS[@]:-}")
+  if [ ${#subdirs[@]} -eq 0 ]; then
+    log_info "Safe move: no PRIVATE_SUBDIRS configured; skipping"
+    return 0
+  fi
   for subdir in "${subdirs[@]}"; do
     local sub_total=0
     if [ -d "$src_base/$subdir" ]; then
@@ -455,10 +520,10 @@ move_private_subdirs() {
 
 # Record start time and announce processing start
 START_TS=$(date +%s)
-log_info "Starting data processing for source: $src_dir"
+log_info "Starting data processing for source: $SRC_DIR"
 
-if ! has_files_under "$src_dir"; then
-  log_info "Source $src_dir directory empty, script exit!"
+if ! has_files_under "$SRC_DIR"; then
+  log_info "Source $SRC_DIR directory empty, script exit!"
   end_ts=$(date +%s)
   elapsed=$((end_ts - START_TS))
   hours=$((elapsed/3600))
@@ -474,7 +539,7 @@ if ! has_files_under "$src_dir"; then
   log_info "Processing finished (Runtime: ${runtime})"
   exit 1
 else
-  if ! set_owner_and_perms "$src_dir" "$OWN_USER" "$CHMOD_DIR" "$CHMOD_FILE"; then
+  if ! set_owner_and_perms "$SRC_DIR" "$OWN_USER" "$CHMOD_DIR" "$CHMOD_FILE"; then
     end_ts=$(date +%s)
     elapsed=$((end_ts - START_TS))
     hours=$((elapsed/3600))
@@ -493,26 +558,32 @@ else
 fi
 
 # Rename files for metadata scans
-rename_patterns "$src_dir"
+rename_patterns "$SRC_DIR"
 
 # Remove unwanted files
-remove_unwanted_files "$src_dir"
-while IFS= read -r -d '' remmp4; do
-  rbs=$(filesize "$remmp4")
-  log_info "Removing unwanted file: unwanted file '$remmp4' of size $(human_readable "$rbs")"
-  rm -f -- "$remmp4"
-done < <(find "$src_dir/complete/" -iname "18+游戏大全(996gg.cc)-七龍珠H版-三國志H版-三國群淫傳等.mp4" -type f -print0)
+remove_unwanted_files "$SRC_DIR"
+
+# Remove unwanted exact file names under "$SRC_DIR/complete"
+if [ ${#UNWANTED_NAMES[@]} -gt 0 ]; then
+  for ufn in "${UNWANTED_NAMES[@]}"; do
+    while IFS= read -r -d '' rem; do
+      rbs=$(filesize "$rem")
+      log_info "Removing unwanted file: '$rem' of size $(human_readable "$rbs")"
+      rm -f -- "$rem"
+    done < <(find "$SRC_DIR/complete/" -type f -name "$ufn" -print0 2>/dev/null)
+  done
+fi
 
 # Atomic move for ポルノ
-if has_files_under "$src_dir/complete/ポルノ"; then
-  safe_move "$src_dir/complete/ポルノ" "$dest_dir/ポルノ"
+if has_files_under "$SRC_DIR/complete/ポルノ"; then
+  safe_move "$SRC_DIR/complete/ポルノ" "$DEST_DIR/ポルノ"
 else
   log_info "Safe move: ポルノ directory empty, skipping!"
 fi
 
 # Atomic move for プライベート subdirectories
-if has_files_under_excluding "$src_dir/complete" "$src_dir/complete/ポルノ"; then
-  move_private_subdirs "$src_dir/complete" "$dest_dir/プライベート"
+if has_files_under_excluding "$SRC_DIR/complete" "$SRC_DIR/complete/ポルノ"; then
+  move_private_subdirs "$SRC_DIR/complete" "$DEST_DIR/プライベート"
 else
   log_info "Safe move: プライベート directory empty, skipping!"
   exit 1
