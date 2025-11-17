@@ -74,6 +74,15 @@ NOTIF_CONDENSED_MAX_LABELS=3          # Maximum number of labels to include in c
 NOTIF_EXCERPT_LINES=8                 # Number of lines to include in notification excerpts
 LOG_TAIL_LINES=100                    # Number of lines to include in log tails
 
+# --- Log Ownership & Permissions ---
+# Ensure logs are group-writable and owned by nobody:users on Unraid
+LOG_USER="${LOG_USER:-nobody}"
+LOG_GROUP="${LOG_GROUP:-users}"
+LOG_DIR_MODE="${LOG_DIR_MODE:-0775}"
+LOG_FILE_MODE="${LOG_FILE_MODE:-0664}"
+LOG_UMASK="${LOG_UMASK:-0002}"
+umask "$LOG_UMASK"
+
 # --- SSH wait / Timings ---
 MAX_SSH_WAIT=420                      # Total seconds to wait for SSH to become reachable
 SSH_WAIT_INTERVAL=20                  # Sleep interval between SSH reachability checks
@@ -91,12 +100,19 @@ LABELS_ARRAY=("Media" "Secure")            # Labels for datasets to back up
 SRCS_ARRAY=("$MEDIA_SRC" "$SECURE_SRC")    # Source paths for datasets
 DESTS_ARRAY=("$MEDIA_DEST" "$SECURE_DEST") # Destination paths for datasets
 
+# --------------------------------------------------------------------------------
+
 # Ensure runtime directories exist
 mkdir -p "$LOG_FILE_SUBDIR" 2>/dev/null || true 
 mkdir -p "$PRESERVED_RAW_LOG_DIR" 2>/dev/null || true 
 mkdir -p "$LOG_FILE_SUBDIR/manifests" 2>/dev/null || true
-
-# --------------------------------------------------------------------------------
+# Apply ownership and permissions to log directories
+chown "$LOG_USER:$LOG_GROUP" "$LOG_FILE_SUBDIR" "$PRESERVED_RAW_LOG_DIR" "$LOG_FILE_SUBDIR/manifests" 2>/dev/null || true
+chmod "$LOG_DIR_MODE" "$LOG_FILE_SUBDIR" "$PRESERVED_RAW_LOG_DIR" "$LOG_FILE_SUBDIR/manifests" 2>/dev/null || true
+# Pre-create current run log file with correct owner and mode
+: > "$LOG_FILE"
+chown "$LOG_USER:$LOG_GROUP" "$LOG_FILE" 2>/dev/null || true
+chmod "$LOG_FILE_MODE" "$LOG_FILE" 2>/dev/null || true
 
 # Logging function
 log() {
@@ -535,9 +551,13 @@ write_manifest() {
   local src="$2"
   local dest="$LOG_FILE_SUBDIR/manifests"
   mkdir -p "$dest" 2>/dev/null || true
+  chown "$LOG_USER:$LOG_GROUP" "$dest" 2>/dev/null || true
+  chmod "$LOG_DIR_MODE" "$dest" 2>/dev/null || true
   local out="$dest/${label// /_}_manifest_$(date +%Y%m%d_%H%M%S).txt"
   (cd "$src" && find . -type f -printf '%P\t%s\t%T@\n') > "$out" 2>/dev/null || true
   if [ -f "$out" ]; then
+    chown "$LOG_USER:$LOG_GROUP" "$out" 2>/dev/null || true
+    chmod "$LOG_FILE_MODE" "$out" 2>/dev/null || true
     log "Wrote manifest for $label: $out"
   else
     log "Warning: manifest write failed for $label (attempted $out)"
@@ -697,6 +717,8 @@ run_rsync() {
         saved_copy+="_success.log"
       fi
       cp "$tmp_rslog" "$saved_copy" 2>/dev/null || true
+      chown "$LOG_USER:$LOG_GROUP" "$saved_copy" 2>/dev/null || true
+      chmod "$LOG_FILE_MODE" "$saved_copy" 2>/dev/null || true
       rm -f "$tmp_rslog"
     else
       rsync_summaries["$label"]="$label: no stats"
@@ -816,6 +838,8 @@ prune_old_logs() {
 collect_notification_artifacts() {
   local outdir="$PRESERVED_RAW_LOG_DIR/notify_artifacts"
   mkdir -p "$outdir" 2>/dev/null || true
+  chown "$LOG_USER:$LOG_GROUP" "$outdir" 2>/dev/null || true
+  chmod "$LOG_DIR_MODE" "$outdir" 2>/dev/null || true
   local ts
   ts=$(date +%Y%m%d_%H%M%S)
   notify_df_file="$outdir/remote_df_${ts}.txt"
@@ -826,6 +850,8 @@ collect_notification_artifacts() {
   else
     echo "(remote df unavailable)" > "$notify_df_file"
   fi
+  chown "$LOG_USER:$LOG_GROUP" "$notify_df_file" 2>/dev/null || true
+  chmod "$LOG_FILE_MODE" "$notify_df_file" 2>/dev/null || true
 
   : > "$notify_snap_file"
   for lbl in "${LABELS_ARRAY[@]}"; do
@@ -836,6 +862,8 @@ collect_notification_artifacts() {
       echo "${lbl}: (snapshot info unavailable)" >> "$notify_snap_file"
     fi
   done
+  chown "$LOG_USER:$LOG_GROUP" "$notify_snap_file" 2>/dev/null || true
+  chmod "$LOG_FILE_MODE" "$notify_snap_file" 2>/dev/null || true
 
   return 0
 }
@@ -1081,11 +1109,10 @@ for lbl in "${!rsync_summaries[@]}"; do
     percent_total=$(awk -v t="$total" -v tr="$transferred" 'BEGIN{printf "%.1f", (tr/t)*100}')
   fi
 
-  # Extended summary (show both total and est_changed for transparency)
   if [ "$est" -gt 0 ]; then
     detailed_body+="$lbl: $human_total total, $human_est est_changed, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
   else
-    detailed_body+="$lbl: $human_total total, est_changed unknown, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
+    detailed_body+="$lbl: $human_total total, no changes, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
   fi
 
   condensed_parts+=("$lbl: $human_transferred (${percent_total}%)")
