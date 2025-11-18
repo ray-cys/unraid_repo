@@ -34,6 +34,8 @@ POOL_EXCLUDES=("ramtmp" "user0") # Pool names to exclude from pool totals
 ENABLE_BTRFS_SCRUB=0          # 1: Start btrfs scrub; 0: only parse last status
 ENABLE_XFS_CHECK=0            # 1: Run xfs_repair -n; 0: skip XFS metadata check
 ENABLE_POOL_DEVICE_SMART=1    # 1: Include per-device SMART lines for pools
+ENABLE_BTRFS_DEVICE_STATS=1   # 1: Parse btrfs per-device stats and integrate
+ENABLE_XFS_PROC_STATS=1       # 1: Parse /proc/fs/xfs/stat counters and integrate
 JSON_EXPORT=1                 # 1: Write JSON summary to disk
 JSON_INCLUDE_DISKS=1          # 1: Include per-disk details in JSON (poh/endurance)
 HISTORY_WINDOW_DAYS=7         # Maximum distinct days considered for disk usage growth trends
@@ -81,8 +83,12 @@ LIFECYCLE_RECOMMEND_TOP_N=3    # Max devices listed in lifecycle recommendations
 RELOC_WARNING=1               # Reallocated sectors >= triggers warning
 RELOC_CRITICAL=10             # Reallocated sectors >= triggers critical
 PEND_WARNING=1                # Pending sectors >= triggers critical
-TEMP_WARNING=60               # Temperature C >= triggers warning
-TEMP_CRITICAL=70              # Temperature C >= triggers critical
+NVME_TEMP_WARNING=65          # NVMe temp C >= triggers warning
+NVME_TEMP_CRITICAL=75         # NVMe temp C >= triggers critical
+SSD_TEMP_WARNING=65           # SATA SSD temp C >= triggers warning
+SSD_TEMP_CRITICAL=70          # SATA SSD temp C >= triggers critical
+HDD_TEMP_WARNING=50           # HDD temp C >= triggers warning
+HDD_TEMP_CRITICAL=60          # HDD temp C >= triggers critical
 NVME_PERCENT_USED_WARN=80     # NVMe Percentage Used >= triggers warning
 NVME_PERCENT_USED_CRIT=90     # NVMe Percentage Used >= triggers critical
 LOAD_CYCLE_WARN=300000        # HDD Load_Cycle_Count >= triggers warning
@@ -101,6 +107,22 @@ END_TO_END_ERR_CRIT=1         # SATA attr 184: any >0 is critical
 SOFT_READ_ERR_WARN=1000       # SATA attr 201: >= triggers warning (heuristic)
 SNAPSHOT_WARN=100             # btrfs snapshot count >= triggers warning
 SNAPSHOT_CRIT=500             # btrfs snapshot count >= triggers critical
+
+# --- Btrfs / XFS Device Stats Thresholds ---
+BTRFS_DEV_ERR_WARN_DELTA=1    # Delta >= triggers warning (read/write/flush errors)
+BTRFS_DEV_ERR_CRIT_DELTA=10   # Delta >= triggers critical
+BTRFS_DEV_CORR_WARN_DELTA=1   # Delta >= triggers warning (corruption/generation)
+BTRFS_DEV_CORR_CRIT_DELTA=1   # Any corruption/gen errors triggers critical
+XFS_PROC_WARN_DELTA=1         # Delta of selected failure counters triggers warning
+XFS_PROC_CRIT_DELTA=5         # Delta of selected failure counters triggers critical
+
+# --- POH (Power-On Hours) Age Thresholds ---
+HDD_POH_WARN_HOURS=50000      # 5 years
+HDD_POH_CRIT_HOURS=70000      # 7 years
+SSD_POH_WARN_HOURS=6000       # 6,000 hours
+SSD_POH_CRIT_HOURS=10000      # 10,000 hours
+NVME_POH_WARN_HOURS=4000      # 4,000 hours
+NVME_POH_CRIT_HOURS=6000      # 6,000 hours
 
 # --- SMART Trend / Parity Suggestion ---
 PARITY_SUGGEST_ENABLED=1      # 1: evaluate SMART deltas to suggest parity check / extended test
@@ -135,6 +157,11 @@ W_SOFT_READ=10                # Weight for soft read error rate
 W_NVME_RO=80                  # Weight for NVMe read-only mode
 W_NVME_REL=60                 # Weight for NVMe reliability degraded
 W_AGE_NEAR=30                 # Extra weight for near-endurance devices
+W_POH_HDD=10                  # Weight for high HDD POH age
+W_POH_SSD=10                  # Weight for high SATA SSD POH age
+W_POH_NVME=10                 # Weight for high NVMe POH age
+W_BTRFS_DEV_ERR=15            # Weight for btrfs per-device I/O/corruption errors
+W_XFS_META_ERR=15             # Weight for xfs metadata/stat anomalies
 RISK_REPLACE=80               # Score >= goes to Replace Soon bucket
 RISK_MONITOR=50               # Score >= goes to Monitor bucket
 
@@ -433,6 +460,7 @@ get_nvme_raw() {
     if [[ -n "${NVME_RAW[$d]:-}" ]]; then
         echo "${NVME_RAW[$d]}"; return 0
     fi
+    log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART attribute read (-a) on $d"
     NVME_RAW[$d]=$(smartctl -a -d nvme "$d" 2>/dev/null || true)
     echo "${NVME_RAW[$d]}"
 }
@@ -448,6 +476,31 @@ tbw_threshold_tb_for_device() {
     if echo "$model" | grep -qiE 'P3|P300'; then per_tb=220; fi
     if (( per_tb == 0 )); then echo ""; return 0; fi
     awk -v c="$cap" -v p="$per_tb" 'BEGIN{printf "%.0f", c*p}'
+}
+
+# Determine POH warn/crit thresholds by device model/type
+poh_thresholds_for_device() {
+    local dev="$1"; shift
+    local dtype="$1"; shift # nvme|sata
+    local rota="${1:-}"    # for sata: 1=HDD, 0=SSD
+    local model
+    model=$(get_device_model "$dev")
+    local warn=0 crit=0
+    if [[ "$dtype" == "nvme" ]]; then
+        warn=$NVME_POH_WARN_HOURS; crit=$NVME_POH_CRIT_HOURS
+        if echo "$model" | grep -qiE 'Crucial.*T500|T500'; then warn=4000; crit=6000; fi
+    else
+        if [[ "$rota" == "1" ]]; then
+            # HDD
+            warn=$HDD_POH_WARN_HOURS; crit=$HDD_POH_CRIT_HOURS
+            if echo "$model" | grep -qi 'Ultrastar'; then warn=50000; crit=70000; fi
+        else
+            # SATA SSD
+            warn=$SSD_POH_WARN_HOURS; crit=$SSD_POH_CRIT_HOURS
+            if echo "$model" | grep -qiE 'SA500|WD Red SA500'; then warn=6000; crit=10000; fi
+        fi
+    fi
+    echo "$warn $crit"
 }
 
 # Enumerate all physical disks, excluding /boot device, intentionally spinning them up.
@@ -513,64 +566,123 @@ build_mount_device_map() {
     ' "$src" 2>/dev/null)
 }
 
-# Discover parity devices from disks.ini and evaluate parity validity
-superdat_clean_flag() {
-    local file="/boot/config/super.dat"
-    [[ -r "$file" ]] || { echo ""; return 1; }
-    local -a b
-    mapfile -t b < <(xxd -p -c 1 "$file" 2>/dev/null)
-    local i
-    for ((i=0; i<${#b[@]}-10; i++)); do
-        local b0=${b[i],,} b1=${b[i+1],,} b2=${b[i+2],,} b3=${b[i+3],,} b4=${b[i+4],,} b5=${b[i+5],,}
-        if [[ "$b0" == "63" && "$b1" == "6c" && "$b2" == "65" && "$b3" == "61" && "$b4" == "6e" && "$b5" == "00" ]]; then
-            local v0=${b[i+6],,} v1=${b[i+7],,} v2=${b[i+8],,} v3=${b[i+9],,}
-            if [[ "$v0$v1$v2$v3" == "00000000" ]]; then echo 0; else echo 1; fi
+# Parity state discovery sets global fields without re-parsing
+parity_state() {
+    PARITY_VALID_FLAG=""
+    PARITY_SOURCE="none"
+    PARITY_ACTION=""
+    PARITY_CORR=""
+    PARITY_POS=""
+    PARITY_SIZE=""
+    PARITY_ERRS=""
+    PARITY_SPEED_K=""
+    PARITY_REM=""
+    # Prefer var.ini sbClean
+    local ini="/var/local/emhttp/var.ini"
+    if [[ -r "$ini" ]]; then
+        local sb
+        sb=$(awk -F= 'tolower($1)=="sbclean" {gsub(/"| |\r|\n/,"",$2); print tolower($2); exit}' "$ini" 2>/dev/null)
+        case "$sb" in
+            1|yes|true) PARITY_VALID_FLAG="1"; PARITY_SOURCE="var.ini"; return 0;;
+            0|no|false) PARITY_VALID_FLAG="0"; PARITY_SOURCE="var.ini"; return 0;;
+        esac
+    fi
+    # Fallback to mdcmd status
+    local cmd="/usr/local/sbin/mdcmd" out
+    [[ -x "$cmd" ]] || cmd="mdcmd"
+    if command -v "$cmd" >/dev/null 2>&1; then
+        out=$("$cmd" status 2>/dev/null | tr -d '\r') || out=""
+        if [[ -n "$out" ]]; then
+            PARITY_SOURCE="mdcmd"
+            local sb st act corr pos size errs spk rem
+            sb=$(echo "$out" | awk -F= 'tolower($1)=="sbclean" {print tolower($2); exit}')
+            st=$(echo "$out" | awk -F= 'tolower($1)=="mdstate" {print tolower($2); exit}')
+            act=$(echo "$out" | awk -F= 'tolower($1)=="mdresyncaction" {print tolower($2); exit}')
+            corr=$(echo "$out"| awk -F= 'tolower($1)=="mdresynccorr" {print $2; exit}')
+            pos=$(echo "$out" | awk -F= 'tolower($1)=="mdresyncpos" {print $2; exit}')
+            size=$(echo "$out"| awk -F= 'tolower($1)=="mdresyncsize" {print $2; exit}')
+            errs=$(echo "$out"| awk -F= 'tolower($1)=="mdsyncerrs" {print $2; exit}')
+            spk=$(echo "$out" | awk -F= 'tolower($1)=="mdresyncspeed" {print $2; exit}')
+            rem=$(echo "$out" | awk -F= 'tolower($1)=="mdresyncrem" {print $2; exit}')
+            if [[ -n "$sb" ]]; then
+                case "$sb" in 1|yes|true) PARITY_VALID_FLAG="1";; 0|no|false) PARITY_VALID_FLAG="0";; esac
+            else
+                if [[ -n "$act" && "$act" != "idle" ]]; then PARITY_VALID_FLAG="0"
+                elif [[ "$st" == "started" ]]; then PARITY_VALID_FLAG="1"
+                else PARITY_VALID_FLAG=""; fi
+            fi
+            PARITY_ACTION="$act"
+            PARITY_CORR="$corr"
+            PARITY_POS="$pos"
+            PARITY_SIZE="$size"
+            PARITY_ERRS="$errs"
+            PARITY_SPEED_K="$spk"
+            PARITY_REM="$rem"
             return 0
         fi
-    done
+    fi
+    return 1
+}
+
+# Determine parity validity from var.ini or mdcmd
+parity_clean_flag() {
+    parity_state || true
+    if [[ -n "${PARITY_VALID_FLAG:-}" ]]; then echo "${PARITY_VALID_FLAG}"; return 0; fi
     echo ""; return 1
 }
 
 discover_parity_and_status() {
     PARITY_STATUS_LINE=""
+    PARITY_DETAILS_SECTION=""
+    PARITY_LABELS_JSON="[]"
+    PARITY_DEVICES_JSON="[]"
+    PARITY_DETAILS_JSON="null"
     local ini="/var/local/emhttp/disks.ini"
     local -a parity_labels=()
     local -a parity_devs=()
     if [[ -f "$ini" ]]; then
-        while IFS=$'\t' read -r sec dev; do
-            [[ -z "$sec" || -z "$dev" ]] && continue
+        while IFS=$'\t' read -r sec dev idv; do
+            [[ -z "$sec" ]] && continue
             case "$sec" in
-                parity|parity2) parity_labels+=("$sec"); parity_devs+=("/dev/$dev");;
+                parity|parity2|parity[0-9]*)
+                    local resolved=""
+                    if [[ -n "$dev" ]]; then
+                        resolved="/dev/$dev"
+                    elif [[ -n "$idv" ]]; then
+                        resolved=$(readlink -f "/dev/disk/by-id/$idv" 2>/dev/null || true)
+                    fi
+                    if [[ -n "$resolved" ]]; then
+                        parity_labels+=("$sec")
+                        parity_devs+=("$resolved")
+                    fi
+                    ;;
             esac
         done < <(awk -F= '
-            BEGIN{sec=""}
-            /^\[(parity|parity2)\]/ {sec=$0; gsub(/^[\[]|[\]]$/, "", sec); next}
-            tolower($1)=="device" && sec!="" {val=$2; gsub(/"/, "", val); sub(/^[ \t]+/, "", val); sub(/[ \t]+$/, "", val); printf "%s\t%s\n", sec, val}
+            BEGIN{sec=""; dev=""; idv=""}
+            /^\[(parity|parity2|parity[0-9]+)\]/ {
+                if (sec!="") { printf "%s\t%s\t%s\n", sec, dev, idv }
+                sec=$0; gsub(/^[\[]|[\]]$/, "", sec); dev=""; idv=""; next
+            }
+            tolower($1)=="device" && sec!="" {val=$2; gsub(/"/, "", val); sub(/^[ \t]+/, "", val); sub(/[ \t]+$/, "", val); dev=val; next}
+            tolower($1)=="id" && sec!="" {val=$2; gsub(/"/, "", val); sub(/^[ \t]+/, "", val); sub(/[ \t]+$/, "", val); idv=val; next}
+            END{ if (sec!="") { printf "%s\t%s\t%s\n", sec, dev, idv } }
         ' "$ini" 2>/dev/null)
-        if (( ${#parity_devs[@]} == 0 )); then
-            while IFS=$'\t' read -r sec idv; do
-                [[ -z "$sec" || -z "$idv" ]] && continue
-                case "$sec" in
-                    parity|parity2)
-                        parity_labels+=("$sec")
-                        local resolved
-                        resolved=$(readlink -f "/dev/disk/by-id/$idv" 2>/dev/null || true)
-                        [[ -b "$resolved" ]] && parity_devs+=("$resolved")
-                        ;;
-                esac
-            done < <(awk -F= '
-                BEGIN{sec=""}
-                /^\[(parity|parity2)\]/ {sec=$0; gsub(/^[\[]|[\]]$/, "", sec); next}
-                tolower($1)=="id" && sec!="" {val=$2; gsub(/"/, "", val); sub(/^[ \t]+/, "", val); sub(/[ \t]+$/, "", val); printf "%s\t%s\n", sec, val}
-            ' "$ini" 2>/dev/null)
-        fi
     fi
     local labels_join=""
     if (( ${#parity_labels[@]} > 0 )); then
         labels_join=$(IFS=","; echo "${parity_labels[*]}")
         labels_join=$(echo "$labels_join" | sed 's/,/, /g')
+        local _lj="" _dj="" i
+        for ((i=0;i<${#parity_labels[@]};i++)); do
+            local l=${parity_labels[$i]} d=${parity_devs[$i]}
+            _lj+="\"$l\""; _dj+="\"$d\""
+            if (( i<${#parity_labels[@]}-1 )); then _lj+=","; _dj+=","; fi
+        done
+        PARITY_LABELS_JSON="[${_lj}]"
+        PARITY_DEVICES_JSON="[${_dj}]"
     fi
-    local clean_flag="$(superdat_clean_flag || true)"
+    parity_state || true
+    local clean_flag="${PARITY_VALID_FLAG:-}"
     PARITY_CLEAN_FLAG="$clean_flag"
     if [[ -n "$clean_flag" ]]; then
         if [[ "$clean_flag" == "1" ]]; then
@@ -586,6 +698,69 @@ discover_parity_and_status() {
                 PARITY_STATUS_LINE="Parity: Invalid (sync required)"
             fi
             record_alert warning "Parity Status" "Parity invalid (sync required)"
+
+            local action="${PARITY_ACTION:-}" corr="${PARITY_CORR:-}" pos="${PARITY_POS:-}" size="${PARITY_SIZE:-}" errs="${PARITY_ERRS:-}" speed_k="${PARITY_SPEED_K:-}" rem="${PARITY_REM:-}"
+            local action_word="" corr_label="" pct="" eta_str=""
+            [[ -n "$action" ]] && action_word=$(printf "%s" "$action" | awk '{print tolower($1)}')
+            corr_label=$([[ "$corr" == "1" ]] && echo "correcting" || echo "non-correcting")
+            if [[ -n "$pos" && -n "$size" ]]; then
+                pct=$(awk -v p="$pos" -v s="$size" 'BEGIN{ if (s>0) printf "%.1f", (p/s)*100; }')
+            fi
+            if [[ -n "$action_word" && "$action_word" != "idle" ]]; then
+                PARITY_STATUS_LINE+=" — ${action_word} in progress (${corr_label})"
+                [[ -n "$pct" ]] && PARITY_STATUS_LINE+=", ~${pct}%"
+                PARITY_DETAILS_SECTION="Parity Details:\n"
+                PARITY_DETAILS_SECTION+=" - Action: ${action_word} (${corr_label})\n"
+                if [[ -n "$pos" && -n "$size" ]]; then
+                    PARITY_DETAILS_SECTION+=" - Progress: ${pos} / ${size}"
+                    [[ -n "$pct" ]] && PARITY_DETAILS_SECTION+=" (~${pct}%)"
+                    PARITY_DETAILS_SECTION+="\n"
+                fi
+                local progress_file="$STATE_DIR/parity_progress.state" prev_pos="" prev_ts="" curr_ts=$(date +%s)
+                if [[ -f "$progress_file" ]]; then
+                    read -r prev_pos prev_ts < "$progress_file" || true
+                fi
+                if [[ -n "$pos" && -n "$prev_pos" && -n "$prev_ts" && "$pos" =~ ^[0-9]+$ && "$prev_pos" =~ ^[0-9]+$ && "$prev_ts" =~ ^[0-9]+$ && $pos -ge $prev_pos ]]; then
+                    local dt=$(( curr_ts - prev_ts ))
+                    if (( dt > 0 )); then
+                        local delta=$(( pos - prev_pos ))
+                        local bytes=$(( delta * 512 ))
+                        local mbps=$(awk -v b="$bytes" -v d="$dt" 'BEGIN{ if(d>0) printf "%.2f", (b/1048576)/d; }')
+                        if [[ -n "$mbps" && -n "$size" && "$size" =~ ^[0-9]+$ ]]; then
+                            local remaining=$(( size - pos ))
+                            if (( remaining > 0 )); then
+                                local rem_bytes=$(( remaining * 512 ))
+                                local eta_sec=$(awk -v rb="$rem_bytes" -v mbps="$mbps" 'BEGIN{ mb=mbps*1048576; if(mb>0) printf "%d", rb/mb; }')
+                                if [[ -n "$eta_sec" && "$eta_sec" =~ ^[0-9]+$ ]]; then
+                                    local eta_h=$(( eta_sec/3600 )) eta_m=$(( (eta_sec%3600)/60 )) eta_s=$(( eta_sec%60 ))
+                                    if (( eta_h>0 )); then eta_str="${eta_h}h ${eta_m}m"; elif (( eta_m>0 )); then eta_str="${eta_m}m ${eta_s}s"; else eta_str="${eta_s}s"; fi
+                                    PARITY_DETAILS_SECTION+=" - ETA: ${eta_str} remaining\n"
+                                fi
+                            fi
+                        fi
+                        PARITY_DETAILS_SECTION+=" - Speed: ${mbps} MB/s (Δ ${delta} sectors / ${dt}s)\n"
+                    fi
+                fi
+                if [[ -n "$speed_k" && "$speed_k" =~ ^[0-9]+$ ]]; then
+                    local speed_mb=$(awk -v sp="$speed_k" 'BEGIN{printf "%.2f", sp/1024.0}')
+                    PARITY_DETAILS_SECTION+=" - Reported Speed: ${speed_mb} MB/s\n"
+                fi
+                if [[ -n "$rem" && "$rem" =~ ^[0-9]+$ ]]; then
+                    PARITY_DETAILS_SECTION+=" - Remaining Sectors: ${rem}\n"
+                fi
+                if [[ -n "$errs" ]]; then
+                    PARITY_DETAILS_SECTION+=" - Errors: ${errs}\n"
+                fi
+                if [[ -n "$pos" ]]; then echo "$pos $curr_ts" > "$progress_file" 2>/dev/null || true; fi
+
+                local corr_bool=$([[ "$corr" == "1" ]] && echo true || echo false)
+                local speed_mb_json="null"; [[ -n "$speed_k" && "$speed_k" =~ ^[0-9]+$ ]] && speed_mb_json=$(awk -v sp="$speed_k" 'BEGIN{printf "%.2f", sp/1024.0}')
+                local pct_json="null"; [[ -n "$pct" ]] && pct_json="$pct"
+                local errs_json="null"; [[ -n "$errs" ]] && errs_json="$errs"
+                local rem_json="null"; [[ -n "$rem" ]] && rem_json="$rem"
+                local eta_json="null"; [[ -n "$eta_str" ]] && eta_json="\"$eta_str\""
+                PARITY_DETAILS_JSON="{ \"action\": \"${action_word}\", \"correcting\": ${corr_bool}, \"progress_pos\": ${pos:-0}, \"progress_size\": ${size:-0}, \"progress_percent\": ${pct_json}, \"speed_mbps\": ${speed_mb_json}, \"remaining_sectors\": ${rem_json}, \"errors\": ${errs_json}, \"eta\": ${eta_json} }"
+            fi
             local idx
             for ((idx=0; idx<${#parity_devs[@]}; idx++)); do
                 local pdev="${parity_devs[$idx]}"
@@ -597,6 +772,8 @@ discover_parity_and_status() {
                     "$ARRAY_DEVICE_LINES" "$(basename "$pdev")" "[WARNING]" "$cap" "$model" "Parity invalid (sync required)"
             done
         fi
+    else
+        PARITY_STATUS_LINE="Parity: Unknown"
     fi
 }
 
@@ -759,14 +936,26 @@ evaluate_smart() {
         fi
         NVME_LAST_UNSAFE[$disk]=$unsafe_shutdowns
         if [[ -n "$nvme_temp" ]]; then
-            if [[ $nvme_temp -ge $TEMP_CRITICAL ]]; then
-                state="CRITICAL"; messages+=("NVMe Temp ${nvme_temp}C >= ${TEMP_CRITICAL}C")
-            elif [[ $nvme_temp -ge $TEMP_WARNING && $state != CRITICAL ]]; then
-                [[ $state == OK ]] && state="WARNING"; messages+=("NVMe Temp ${nvme_temp}C >= ${TEMP_WARNING}C")
+            if [[ $nvme_temp -ge $NVME_TEMP_CRITICAL ]]; then
+                state="CRITICAL"; messages+=("NVMe Temp ${nvme_temp}C >= ${NVME_TEMP_CRITICAL}C")
+            elif [[ $nvme_temp -ge $NVME_TEMP_WARNING && $state != CRITICAL ]]; then
+                [[ $state == OK ]] && state="WARNING"; messages+=("NVMe Temp ${nvme_temp}C >= ${NVME_TEMP_WARNING}C")
             fi
         fi
         CUR_ATTR["$disk|nvme_percent_used"]="$percent_used"
         CUR_ATTR["$disk|poh"]="$poh"
+        # POH age thresholds for NVMe (model-aware)
+        if [[ -n "$poh" && "$poh" =~ ^[0-9]+$ ]]; then
+            local _poh_w _poh_c
+            read -r _poh_w _poh_c < <(poh_thresholds_for_device "$disk" "nvme")
+            if [[ -n "$_poh_w" && -n "$_poh_c" ]]; then
+                if (( poh >= _poh_c )); then
+                    state="CRITICAL"; messages+=("POH age NVMe ${poh}h >= ${_poh_c}h")
+                elif (( poh >= _poh_w )) && [[ $state != CRITICAL ]]; then
+                    [[ $state == OK ]] && state="WARNING"; messages+=("POH age NVMe ${poh}h >= ${_poh_w}h")
+                fi
+            fi
+        fi
     else
         local attr realloc pending offunc temp udma reported_uncorr cmd_timeout realloc_events end2end soft_read_err lcc poh
         attr=$(get_sata_raw "$disk")
@@ -818,10 +1007,20 @@ evaluate_smart() {
         fi
         temp=$(echo "$attr" | awk '/Temperature_Celsius|Airflow_Temperature_Cel/ {print $10; exit}')
         temp=${temp:-0}
-        if [[ $temp -ge $TEMP_CRITICAL ]]; then
-            state="CRITICAL"; messages+=("Temp ${temp}C >= ${TEMP_CRITICAL}C")
-        elif [[ $temp -ge $TEMP_WARNING && $state != CRITICAL ]]; then
-            [[ $state == OK ]] && state="WARNING"; messages+=("Temp ${temp}C >= ${TEMP_WARNING}C")
+        local bdv=$(base_device "$disk")
+        local rota=$(lsblk -dn -o ROTA "$bdv" 2>/dev/null | head -n1)
+        local warn_t crit_t label
+        if [[ "$rota" == "1" ]]; then
+            warn_t=$HDD_TEMP_WARNING; crit_t=$HDD_TEMP_CRITICAL; label="HDD Temp"
+        else
+            warn_t=$SSD_TEMP_WARNING; crit_t=$SSD_TEMP_CRITICAL; label="SSD Temp"
+        fi
+        if [[ -n "$temp" && "$temp" != "0" ]]; then
+            if [[ $temp -ge $crit_t ]]; then
+                state="CRITICAL"; messages+=("${label} ${temp}C >= ${crit_t}C")
+            elif [[ $temp -ge $warn_t && $state != CRITICAL ]]; then
+                [[ $state == OK ]] && state="WARNING"; messages+=("${label} ${temp}C >= ${warn_t}C")
+            fi
         fi
         udma=$(echo "$attr" | awk '/UDMA_CRC_Error_Count/ {print $10; exit}')
         udma=${udma:-0}
@@ -852,6 +1051,20 @@ evaluate_smart() {
         fi
         poh=$(echo "$attr" | awk '/Power_On_Hours/ {print $10; exit}')
         CUR_ATTR["$disk|poh"]="${poh:-0}"
+        # POH age thresholds for SATA (HDD vs SSD determined by ROTA, model-aware)
+        if [[ -n "${poh:-}" && "$poh" =~ ^[0-9]+$ ]]; then
+            local _poh_w _poh_c
+            read -r _poh_w _poh_c < <(poh_thresholds_for_device "$disk" "sata" "$rota")
+            if [[ -n "$_poh_w" && -n "$_poh_c" ]]; then
+                if (( poh >= _poh_c )); then
+                    if [[ "$rota" == "1" ]]; then state="CRITICAL"; messages+=("POH age HDD ${poh}h >= ${_poh_c}h");
+                    else state="CRITICAL"; messages+=("POH age SSD ${poh}h >= ${_poh_c}h"); fi
+                elif (( poh >= _poh_w )) && [[ $state != CRITICAL ]]; then
+                    [[ $state == OK ]] && state="WARNING"
+                    if [[ "$rota" == "1" ]]; then messages+=("POH age HDD ${poh}h >= ${_poh_w}h"); else messages+=("POH age SSD ${poh}h >= ${_poh_w}h"); fi
+                fi
+            fi
+        fi
         [[ -n "$life_remain" ]] && CUR_ATTR["$disk|life_remain"]="$life_remain"
         local lbasw hw32mib lbasr tbw_bytes tbw_hr reads_bytes reads_hr
         lbasw=$(echo "$attr" | awk '/Total_LBAs_Written/ {print $10; exit}')
@@ -911,6 +1124,7 @@ get_latest_selftest_info() {
     local disk=$1
     local out
     if [[ $disk == /dev/nvme* ]]; then
+        log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART self-test log read (-l selftest) on $disk"
         out=$(smartctl -l selftest -d nvme "$disk" 2>/dev/null || true)
     else
         out=$(smartctl -l selftest "$disk" 2>/dev/null || true)
@@ -959,6 +1173,7 @@ poll_short_test_completion() {
         if [[ "$info" == "|||" ]]; then
             local exec_status
             if [[ $disk == /dev/nvme* ]]; then
+                log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART capability read (-c) on $disk"
                 exec_status=$(smartctl -c -d nvme "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
             else
                 exec_status=$(smartctl -c "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
@@ -1005,6 +1220,11 @@ risk_score_quick() {
     [[ $msg == *"UDMA CRC Errors"* ]] && ((score += W_CRC))
     [[ $msg == *"SSD life remaining"* ]] && ((score += W_SSD_LIFE))
     [[ $msg == *"NVMe wear"* ]] && ((score += W_NVME_WEAR))
+    [[ $msg == *"POH age HDD"* ]] && ((score += W_POH_HDD))
+    [[ $msg == *"POH age SSD"* ]] && ((score += W_POH_SSD))
+    [[ $msg == *"POH age NVMe"* ]] && ((score += W_POH_NVME))
+    [[ $msg == *"Btrfs device errors"* ]] && ((score += W_BTRFS_DEV_ERR))
+    [[ $msg == *"XFS metadata anomalies"* ]] && ((score += W_XFS_META_ERR))
     [[ $msg == *"Temp"* ]] && ((score += W_TEMP))
     [[ $msg == *"End-to-End Errors"* ]] && ((score += W_E2E))
     [[ $msg == *"Soft Read Error Rate"* ]] && ((score += W_SOFT_READ))
@@ -1027,7 +1247,9 @@ run_smart_test() {
     local flag="-t short"
     local selftest poh_attr current_poh last_long_hours_diff="" last_long_poh="" threshold_hours=$(( SMART_INTERVAL_DAYS * 24 ))
     if [[ $disk == /dev/nvme* ]]; then
+        log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART self-test log read (-l selftest) on $disk"
         selftest=$(smartctl -l selftest -d nvme "$disk" 2>/dev/null || true)
+        log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART attribute read (-a) on $disk"
         poh_attr=$(smartctl -a -d nvme "$disk" 2>/dev/null | awk -F: '/Power On Hours/ {gsub(/ /,"",$2); print $2; exit}')
     else
         selftest=$(smartctl -l selftest "$disk" 2>/dev/null || true)
@@ -1081,6 +1303,7 @@ run_smart_test() {
 
     local exec_status existing_in_progress=0
     if [[ $disk == /dev/nvme* ]]; then
+        log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART capability read (-c) on $disk"
         exec_status=$(smartctl -c -d nvme "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
     else
         exec_status=$(smartctl -c "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
@@ -1092,6 +1315,7 @@ run_smart_test() {
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Self-test already in progress on $disk; skipping new start (status: ${exec_status})"
     else
         if [[ $disk == /dev/nvme* ]]; then
+            log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Starting NVMe SMART test ($flag) on $disk"
             smartctl $flag -d nvme "$disk" >/dev/null 2>&1 || true
         else
             smartctl $flag "$disk" >/dev/null 2>&1 || true
@@ -1189,6 +1413,7 @@ check_completed_long_tests() {
     for disk in $disks; do
         local out
         if [[ $disk == /dev/nvme* ]]; then
+            log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART self-test log read (-l selftest) on $disk"
             out=$(smartctl -l selftest -d nvme "$disk" 2>/dev/null || true)
         else
             out=$(smartctl -l selftest "$disk" 2>/dev/null || true)
@@ -1559,10 +1784,6 @@ build_storage_and_disk_lines() {
         local final_sev=$usage_sev; (( sm_rank > final_sev )) && final_sev=$sm_rank
         (( final_sev > ARRAY_MAX_SEV )) && ARRAY_MAX_SEV=$final_sev
         local sev_word=$(status_word "$final_sev")
-        local driver_from=""
-        if (( sm_rank > usage_sev )); then driver_from="SMART"
-        elif (( usage_sev > sm_rank )); then driver_from="Usage"
-        elif (( final_sev > 0 )); then driver_from="Both"; else driver_from="None"; fi
         local reasons=()
         if [[ -n "$sm_msg" && "$sm_state" != OK ]]; then
             local sm_inline=$(sanitize_smart_for_inline "$sm_msg" 0)
@@ -1570,7 +1791,21 @@ build_storage_and_disk_lines() {
         fi
         local reason_join=""; if (( ${#reasons[@]} > 0 )); then reason_join=$(printf "%s; " "${reasons[@]}"); reason_join=${reason_join%%; }; fi
         local cap_str="$(human_readable "$u") / $(human_readable "$sz")"
-        local drv_part=""; [[ "$driver_from" != "None" ]] && drv_part="{driver: $driver_from}"
+        local drv_part=""
+        if (( final_sev > 0 && sm_rank > 0 )); then
+            local has_smart=0 has_tbw=0 has_wear=0
+            has_smart=1
+            if [[ "$sm_msg" == *"TBW"* ]]; then has_tbw=1; fi
+            if [[ "$sm_msg" == *"NVMe wear"* || "$sm_msg" == *"SSD life remaining"* ]]; then has_wear=1; fi
+            local parts=() sep=""
+            (( has_smart==1 )) && parts+=("SMART")
+            (( has_tbw==1 )) && parts+=("TBW")
+            (( has_wear==1 )) && parts+=("Wear")
+            if (( ${#parts[@]} > 0 )); then
+                local joined="$(IFS=,; echo "${parts[*]}")"
+                drv_part="{driver: ${joined}}"
+            fi
+        fi
         if (( VERBOSE_OK == 1 || final_sev > 0 )); then
             ARR_INFO+=("$(basename "$d")|$cap_str|$pct_local|$sev_word|$drv_part|$reason_join")
         fi
@@ -1594,6 +1829,49 @@ build_storage_and_disk_lines() {
         ARRAY_PERCENT=$(awk "BEGIN{printf \"%.1f\", ($arr_used/$arr_size)*100}")
         ARRAY_USED_HR=$(human_readable "$arr_used")
         ARRAY_TOTAL_HR=$(human_readable "$arr_size")
+    fi
+
+    # Include parity devices in [Array Disks] when parity is valid
+    local pflag="$(parity_clean_flag || true)"
+    if [[ "$pflag" == "1" ]]; then
+        local ini="/var/local/emhttp/disks.ini"
+        if [[ -f "$ini" ]]; then
+            # First try direct device mapping
+            while IFS=$'\t' read -r sec dev; do
+                [[ -z "$sec" || -z "$dev" ]] && continue
+                case "$sec" in
+                    parity|parity2)
+                        local bdev="/dev/$dev"
+                        local cap_tb="$(get_device_capacity_tb "$bdev")"
+                        local cap_str="0B / ${cap_tb}TB"
+                        ARR_INFO+=("${sec}|$cap_str|n/a|OK||")
+                        ;;
+                esac
+            done < <(awk -F= '
+                BEGIN{sec=""}
+                /^\[(parity|parity2)\]/ {sec=$0; gsub(/^[[]|[]]$/, "", sec); next}
+                tolower($1)=="device" && sec!="" {val=$2; gsub(/"/, "", val); sub(/^[ \t]+/, "", val); sub(/[ \t]+$/, "", val); printf "%s\t%s\n", sec, val}
+            ' "$ini" 2>/dev/null)
+            # Fallback: resolve by-id if needed
+            while IFS=$'\t' read -r sec idv; do
+                [[ -z "$sec" || -z "$idv" ]] && continue
+                case "$sec" in
+                    parity|parity2)
+                        local resolved
+                        resolved=$(readlink -f "/dev/disk/by-id/$idv" 2>/dev/null || true)
+                        if [[ -b "$resolved" ]]; then
+                            local cap_tb="$(get_device_capacity_tb "$resolved")"
+                            local cap_str="0B / ${cap_tb}TB"
+                            ARR_INFO+=("${sec}|$cap_str|n/a|OK||")
+                        fi
+                        ;;
+                esac
+            done < <(awk -F= '
+                BEGIN{sec=""}
+                /^\[(parity|parity2)\]/ {sec=$0; gsub(/^[[]|[]]$/, "", sec); next}
+                tolower($1)=="id" && sec!="" {val=$2; gsub(/"/, "", val); sub(/^[ \t]+/, "", val); sub(/[ \t]+$/, "", val); printf "%s\t%s\n", sec, val}
+            ' "$ini" 2>/dev/null)
+        fi
     fi
 
     # Pools
@@ -1631,16 +1909,16 @@ build_storage_and_disk_lines() {
                 local pd_up=$(echo "$prof_data" | tr '[:lower:]' '[:upper:]')
                 local pm_up=$(echo "$prof_meta" | tr '[:lower:]' '[:upper:]')
                 if [[ -n "$pd_up" && -n "$pm_up" && "$pd_up" == "$pm_up" ]]; then
-                    raid_str="(${pd_up}) "
+                    raid_str="(${pd_up})"
                 else
-                    raid_str="(${raid_parts[*]}) "
+                    raid_str="(${raid_parts[*]})"
                 fi
             fi
             devlist=$(btrfs filesystem show "$p" 2>/dev/null | awk '/devid/ && /path/ {for(i=1;i<=NF;i++){if($i=="path"){print $(i+1)}}}');
             [[ -z "$devlist" ]] && devlist=$(btrfs filesystem show "$p" 2>/dev/null | awk '/devid/ {print $NF}')
         else
             devlist=$(findmnt -n -o SOURCE "$p" 2>/dev/null || true)
-            raid_str="(SINGLE) "
+            raid_str="(SINGLE)"
         fi
 
         local pool_dev_max=0 pool_has_wear=0 pool_has_tbw=0 pool_has_smart=0
@@ -1663,22 +1941,17 @@ build_storage_and_disk_lines() {
         (( pool_dev_max > pool_final )) && pool_final=$pool_dev_max
         (( pool_final > POOLS_MAX_SEV )) && POOLS_MAX_SEV=$pool_final
 
-        local driver_from=""
-        if (( pool_dev_max > usage_sev )); then driver_from="SMART"
-        elif (( usage_sev > pool_dev_max )); then driver_from="Usage"
-        elif (( pool_final > 0 )); then driver_from="Both"; else driver_from="None"; fi
-        local tags="" sep=""
-        if (( pool_has_smart == 1 )); then tags+="SMART"; sep=", "; fi
-        if (( pool_has_wear == 1 )); then tags+="${sep}WEAR"; sep=", "; fi
-        if (( pool_has_tbw == 1 )); then tags+="${sep}TBW"; fi
+        # Build driver tags (SMART/TBW/Wear) for Pool Disks (only if severity > 0)
         local meta_part=""
-        if [[ "$driver_from" != "None" || -n "$tags" ]]; then
-            local combined=""
-            if [[ "$driver_from" != "None" ]]; then combined="$driver_from"; fi
-            if [[ -n "$tags" ]]; then
-                if [[ -n "$combined" ]]; then combined="$combined,$tags"; else combined="$tags"; fi
+        if (( pool_final > 0 )); then
+            local parts=()
+            (( pool_has_smart == 1 )) && parts+=("SMART")
+            (( pool_has_tbw   == 1 )) && parts+=("TBW")
+            (( pool_has_wear  == 1 )) && parts+=("Wear")
+            if (( ${#parts[@]} > 0 )); then
+                local joined="$(IFS=,; echo "${parts[*]}")"
+                meta_part="{driver: ${joined}}"
             fi
-            meta_part=" {driver: ${combined}}"
         fi
 
         if (( VERBOSE_OK == 1 || pool_final > 0 )); then
@@ -1782,8 +2055,8 @@ build_storage_and_disk_lines() {
     (( DRIVER_COL_WIDTH > 40 )) && DRIVER_COL_WIDTH=40
     (( REASON_COL_WIDTH > 80 )) && REASON_COL_WIDTH=80
     local fmt_array fmt_pool
-    fmt_array="%-${NAME_COL_WIDTH}s %-${USAGE_COL_WIDTH}s (%-${PCT_COL_WIDTH}s%%) [%-${STATUS_COL_WIDTH}s] %-${DRIVER_COL_WIDTH}s %s\n"
-    fmt_pool="%-${NAME_COL_WIDTH}s %-${USAGE_COL_WIDTH}s (%-${PCT_COL_WIDTH}s%%) [%-${STATUS_COL_WIDTH}s] %-${DRIVER_COL_WIDTH}s %s\n"
+    fmt_array="%-${NAME_COL_WIDTH}s %s (%s%%) [%s]%s%s\n"
+    fmt_pool="%-${NAME_COL_WIDTH}s %s (%s%%) [%s]%s%s\n"
     ARRAY_DISK_LINES=""
     for tmp_entry in "${ARR_INFO[@]}"; do
         local n u pctv sevw drv rsn
@@ -1794,7 +2067,10 @@ build_storage_and_disk_lines() {
         drv=$(echo "$tmp_entry" | awk -F'|' '{print $5}')
         rsn=$(echo "$tmp_entry" | awk -F'|' '{print $6}')
         drv=${drv# }
-        printf -v ARRAY_DISK_LINES "%s${fmt_array}" "$ARRAY_DISK_LINES" "$n" "$u" "$pctv" "$sevw" "$drv" "$rsn"
+        local drv_out="" rsn_out=""
+        [[ -n "$drv" ]] && drv_out=" $drv"
+        [[ -n "$rsn" ]] && rsn_out=" $rsn"
+        printf -v ARRAY_DISK_LINES "%s${fmt_array}" "$ARRAY_DISK_LINES" "$n" "$u" "$pctv" "$sevw" "$drv_out" "$rsn_out"
     done
     POOL_LINES=""
     for tmp_entry in "${POOL_INFO[@]}"; do
@@ -1806,7 +2082,10 @@ build_storage_and_disk_lines() {
         meta=$(echo "$tmp_entry" | awk -F'|' '{print $5}')
         rsn=$(echo "$tmp_entry" | awk -F'|' '{print $6}')
         meta=${meta# }
-        printf -v POOL_LINES "%s${fmt_pool}" "$POOL_LINES" "$n" "$u" "$pctv" "$sevw" "$meta" "$rsn"
+        local meta_out="" rsn_out=""
+        [[ -n "$meta" ]] && meta_out=" $meta"
+        [[ -n "$rsn" ]] && rsn_out=" $rsn"
+        printf -v POOL_LINES "%s${fmt_pool}" "$POOL_LINES" "$n" "$u" "$pctv" "$sevw" "$meta_out" "$rsn_out"
     done
     # Dynamic alignment for device detail sections
     if (( ${#ARRAY_DEV_INFO[@]} > 0 )); then
@@ -1824,7 +2103,9 @@ build_storage_and_disk_lines() {
             (( ${#f4} > DMW )) && DMW=${#f4}
         done
         (( DMW > 26 )) && DMW=26
-        local dev_fmt="%-${DNW}s %-${DSW}s %-${DCW}s %-${DMW}s %s\n"
+        local dev_fmt_pool dev_fmt_array
+        dev_fmt_pool="%-${DNW}s %s %s %-${DMW}s %s\n"
+        dev_fmt_array="%-${DNW}s %s %s %-${DMW}s %s\n"
         ARRAY_DEVICE_LINES=""
         for entry in "${ARRAY_DEV_INFO[@]}"; do
             local f1=$(echo "$entry" | awk -F'|' '{print $1}')
@@ -1832,7 +2113,7 @@ build_storage_and_disk_lines() {
             local f3=$(echo "$entry" | awk -F'|' '{print $3}')
             local f4=$(echo "$entry" | awk -F'|' '{print $4}')
             local f5=$(echo "$entry" | awk -F'|' '{print $5}')
-            printf -v ARRAY_DEVICE_LINES "%s${dev_fmt}" "$ARRAY_DEVICE_LINES" "$f1" "$f2" "$f3" "$f4" "$f5"
+            printf -v ARRAY_DEVICE_LINES "%s${dev_fmt_array}" "$ARRAY_DEVICE_LINES" "$f1" "$f2" "$f3" "$f4" "$f5"
         done
         POOL_DEVICE_LINES=""
         for entry in "${POOL_DEV_INFO[@]}"; do
@@ -1841,7 +2122,7 @@ build_storage_and_disk_lines() {
             local f3=$(echo "$entry" | awk -F'|' '{print $3}')
             local f4=$(echo "$entry" | awk -F'|' '{print $4}')
             local f5=$(echo "$entry" | awk -F'|' '{print $5}')
-            printf -v POOL_DEVICE_LINES "%s${dev_fmt}" "$POOL_DEVICE_LINES" "$f1" "$f2" "$f3" "$f4" "$f5"
+            printf -v POOL_DEVICE_LINES "%s${dev_fmt_pool}" "$POOL_DEVICE_LINES" "$f1" "$f2" "$f3" "$f4" "$f5"
         done
     fi
 }
@@ -1934,6 +2215,28 @@ build_recommendations() {
                 display_friendly="${left} [${right}]"
             fi
             case "$x" in
+                *"Btrfs device errors"*)
+                    [[ -n "$friendly" ]] && rec+=" - $display_friendly: Btrfs device error counters increased; run scrub, inspect cables, consider replacing device if trend continues.\n" ;; 
+                *"XFS metadata anomalies"*)
+                    [[ -n "$friendly" ]] && rec+=" - $display_friendly: XFS metadata/stat anomaly; schedule offline check (xfs_repair -n) and verify backups.\n" ;;
+                *"POH age HDD"*)
+                    if echo "$x" | grep -qi 'SMART CRITICAL'; then
+                        [[ -n "$friendly" ]] && rec+=" - $display_friendly: Critical HDD power-on hours; schedule replacement window and ensure backups are current.\n"
+                    else
+                        [[ -n "$friendly" ]] && rec+=" - $display_friendly: Elevated HDD power-on hours; monitor closely and plan refresh.\n"
+                    fi ;;
+                *"POH age SSD"*)
+                    if echo "$x" | grep -qi 'SMART CRITICAL'; then
+                        [[ -n "$friendly" ]] && rec+=" - $display_friendly: Critical SSD power-on hours; migrate workloads and replace soon.\n"
+                    else
+                        [[ -n "$friendly" ]] && rec+=" - $display_friendly: Elevated SSD power-on hours; plan maintenance window and review TBW/endurance.\n"
+                    fi ;;
+                *"POH age NVMe"*)
+                    if echo "$x" | grep -qi 'SMART CRITICAL'; then
+                        [[ -n "$friendly" ]] && rec+=" - $display_friendly: Critical NVMe power-on hours; schedule replacement and validate firmware health.\n"
+                    else
+                        [[ -n "$friendly" ]] && rec+=" - $display_friendly: Elevated NVMe power-on hours; plan refresh and monitor performance/SMART.\n"
+                    fi ;;
                 *"Reallocated"*)
                     [[ -n "$friendly" ]] && rec+=" - $display_friendly: Reallocated sectors rising; monitor; replace if trend increases.\n" ;;
                 *"Pending sectors"*)
@@ -2190,6 +2493,8 @@ build_subject() {
 # Summarize disk health states
 build_disk_health_summary() {
     local crit_count=0 warn_count=0 pending_count=0 uncorrect_count=0 high_temp=0 nvme_wear_warn=0 read_only=0 reliability=0 timeout_warn=0 realloc_events_warn=0 end2end_count=0 soft_read_warn=0
+    local poh_hdd=0 poh_ssd=0 poh_nvme=0
+    local btrfs_dev_errs=0 xfs_meta_anoms=0
     for dev in "${!SMART_STATE[@]}"; do
         local st="${SMART_STATE[$dev]:-OK}" msg="${SMART_MSGS[$dev]:-}"
         if [[ $st == CRITICAL ]]; then ((++crit_count)); fi
@@ -2204,6 +2509,11 @@ build_disk_health_summary() {
         if [[ $msg == *"Reallocated Event Count"* ]]; then ((++realloc_events_warn)); fi
         if [[ $msg == *"End-to-End Errors"* ]]; then ((++end2end_count)); fi
         if [[ $msg == *"Soft Read Error Rate"* ]]; then ((++soft_read_warn)); fi
+        if [[ $msg == *"POH age HDD"* ]]; then ((++poh_hdd)); fi
+        if [[ $msg == *"POH age SSD"* ]]; then ((++poh_ssd)); fi
+        if [[ $msg == *"POH age NVMe"* ]]; then ((++poh_nvme)); fi
+        if [[ $msg == *"Btrfs device errors"* ]]; then ((++btrfs_dev_errs)); fi
+        if [[ $msg == *"XFS metadata anomalies"* ]]; then ((++xfs_meta_anoms)); fi
     done
     CRIT_DISK_COUNT=$crit_count
     WARN_DISK_COUNT=$warn_count
@@ -2225,6 +2535,11 @@ build_disk_health_summary() {
     add_line "Reallocation events" "$realloc_events_warn"
     add_line "End-to-end errors" "$end2end_count"
     add_line "Soft read errors" "$soft_read_warn"
+    add_line "POH age HDD" "$poh_hdd"
+    add_line "POH age SSD" "$poh_ssd"
+    add_line "POH age NVMe" "$poh_nvme"
+    add_line "Btrfs device errors" "$btrfs_dev_errs"
+    add_line "XFS metadata anomalies" "$xfs_meta_anoms"
     if (( ${#lines[@]} == 1 )); then
         lines+=(" - No issues detected")
     fi
@@ -2252,6 +2567,11 @@ compute_risk_and_lifecycle() {
         if [[ $msg == *"UDMA CRC Errors"* ]]; then ((score += W_CRC)); fi
         if [[ $msg == *"SSD life remaining"* ]]; then ((score += W_SSD_LIFE)); fi
         if [[ $msg == *"NVMe wear"* ]]; then ((score += W_NVME_WEAR)); fi
+        if [[ $msg == *"POH age HDD"* ]]; then ((score += W_POH_HDD)); fi
+        if [[ $msg == *"POH age SSD"* ]]; then ((score += W_POH_SSD)); fi
+        if [[ $msg == *"POH age NVMe"* ]]; then ((score += W_POH_NVME)); fi
+        if [[ $msg == *"Btrfs device errors"* ]]; then ((score += W_BTRFS_DEV_ERR)); fi
+        if [[ $msg == *"XFS metadata anomalies"* ]]; then ((score += W_XFS_META_ERR)); fi
         if [[ $msg == *"Temp"* ]]; then ((score += W_TEMP)); fi
         if [[ $msg == *"End-to-End Errors"* ]]; then ((score += W_E2E)); fi
         if [[ $msg == *"Soft Read Error Rate"* ]]; then ((score += W_SOFT_READ)); fi
@@ -2547,6 +2867,15 @@ capacity_forecast_and_export() {
             echo "  \"array\": { \"percent\": $array_pct, \"used_hr\": \"${ARRAY_USED_HR:-0 B}\", \"total_hr\": \"${ARRAY_TOTAL_HR:-0 B}\" },";
             echo "  \"pools\": { \"percent\": $pools_pct, \"used_hr\": \"${POOLS_USED_HR:-0 B}\", \"total_hr\": \"${POOLS_TOTAL_HR:-0 B}\" },";
             echo "  \"disk_health_summary\": \"$(echo "${DISK_HEALTH_SUMMARY:-}" | sed 's/\"/\\\"/g')\",";
+            {
+                local _p_clean="null"
+                if [[ -n "${PARITY_CLEAN_FLAG:-}" ]]; then _p_clean="${PARITY_CLEAN_FLAG}"; fi
+                local _p_labels="${PARITY_LABELS_JSON:-[]}"; [[ -z "${_p_labels}" ]] && _p_labels="[]"
+                local _p_devs="${PARITY_DEVICES_JSON:-[]}"; [[ -z "${_p_devs}" ]] && _p_devs="[]"
+                local _p_status="$(printf "%s" "${PARITY_STATUS_LINE:-}" | sed 's/\\/\\\\/g; s/\"/\\\"/g')"
+                local _p_details="${PARITY_DETAILS_JSON:-null}"; [[ -z "${_p_details}" ]] && _p_details="null"
+                echo "  \"parity\": { \"clean_flag\": ${_p_clean}, \"labels\": ${_p_labels}, \"devices\": ${_p_devs}, \"status_line\": \"${_p_status}\", \"details\": ${_p_details} },"
+            }
             if (( include_disks == 1 )); then
                 echo "  \"capacity_forecast\": \"$(echo "$CAPACITY_FORECAST" | sed 's/\"/\\\"/g')\",";
                 echo "  \"disks\": ["
@@ -2588,7 +2917,22 @@ capacity_forecast_and_export() {
                     local tbw_daily=${TBW_DAILY_MAP[$dev]:-}
                     local tbw_days_left=${TBW_DAYSLEFT_MAP[$dev]:-}
                     local tbw_status=${TBW_STATUS_MAP[$dev]:-}
-                    echo -n "    { \"device\": \"$dev\", \"type\": \"$typ\", \"model\": \"$esc_model\", \"state\": \"$st\", \"poh_hours\": ${poh:-0}, \"capacity_tb\": ${cap:-0}, \"group\": \"$group\", \"array_member\": ${array_member}, \"array_slot\": \"$array_slot\", \"pool_member\": ${pool_member}, \"pool\": \"$pool_name\""
+                    local poh_status="OK"
+                    if [[ -n "$poh" && "$poh" =~ ^[0-9]+$ ]]; then
+                        if [[ "$typ" == "nvme" ]]; then
+                            local _pw _pc; read -r _pw _pc < <(poh_thresholds_for_device "$dev" "nvme")
+                            if [[ -n "$_pw" && -n "$_pc" ]]; then
+                                if (( poh >= _pc )); then poh_status="CRITICAL"; elif (( poh >= _pw )); then poh_status="WARNING"; fi
+                            fi
+                        else
+                            local bdv rota; bdv=$(base_device "$dev"); rota=$(lsblk -dn -o ROTA "$bdv" 2>/dev/null | head -n1)
+                            local _pw _pc; read -r _pw _pc < <(poh_thresholds_for_device "$dev" "sata" "$rota")
+                            if [[ -n "$_pw" && -n "$_pc" ]]; then
+                                if (( poh >= _pc )); then poh_status="CRITICAL"; elif (( poh >= _pw )); then poh_status="WARNING"; fi
+                            fi
+                        fi
+                    fi
+                    echo -n "    { \"device\": \"$dev\", \"type\": \"$typ\", \"model\": \"$esc_model\", \"state\": \"$st\", \"poh_hours\": ${poh:-0}, \"poh_status\": \"$poh_status\", \"capacity_tb\": ${cap:-0}, \"group\": \"$group\", \"array_member\": ${array_member}, \"array_slot\": \"$array_slot\", \"pool_member\": ${pool_member}, \"pool\": \"$pool_name\""
                     local io_raw=${IO_ERROR_RAW_MAP[$dev]:-0}
                     local io_unique=${IO_ERROR_UNIQUE_MAP[$dev]:-0}
                     echo -n ", \"io_errors_raw\": $io_raw, \"io_errors_unique\": $io_unique"
@@ -2807,6 +3151,15 @@ log_info "Usage summary completed"
 log_info "Checking capacity thresholds..."
 evaluate_capacity_alerts
 log_info "Capacity threshold check completed"
+log_info "Preparing parity summary..."
+discover_parity_and_status
+log_info "Parity summary completed"
+log_info "Collecting btrfs per-device stats..."
+collect_btrfs_device_stats
+log_info "Btrfs device stats collection completed"
+log_info "Collecting XFS /proc stats..."
+collect_xfs_proc_stats
+log_info "XFS /proc stats collection completed"
 log_info "Estimating capacity growth and exporting JSON..."
 capacity_forecast_and_export
 log_info "Capacity forecast/export completed"
@@ -2814,9 +3167,6 @@ log_info "Compiling recommendations..."
 build_recommendations 
 log_info "Recommendations compiled"
 build_subject
-log_info "Preparing parity summary..."
-discover_parity_and_status
-log_info "Parity summary completed"
 log_info "Building disk health summary..."
 build_disk_health_summary
 log_info "Disk health summary completed"
@@ -2881,6 +3231,108 @@ detect_counter_resets() {
 
 detect_counter_resets
 
+# Collect and integrate btrfs per-device stats
+collect_btrfs_device_stats() {
+    (( ENABLE_BTRFS_DEVICE_STATS == 1 )) || return 0
+    local prev_file="$STATE_DIR/btrfs_device_stats.prev"
+    declare -A PREV_STAT
+    if [[ -f "$prev_file" ]]; then
+        while read -r dev key val; do
+            [[ -z "$dev" || -z "$key" || -z "$val" ]] && continue
+            PREV_STAT["$dev|$key"]="$val"
+        done < "$prev_file"
+    fi
+    local mts
+    mts=$(mount | awk '/ btrfs /{print $3}')
+    [[ -z "$mts" ]] && return 0
+    local out_has=0
+    > "$prev_file.tmp"
+    for m in $mts; do
+        local stats
+        stats=$(btrfs device stats -z "$m" 2>/dev/null || true)
+        [[ -z "$stats" ]] && continue
+        while read -r line; do
+            [[ -z "$line" ]] && continue
+            if [[ "$line" =~ ^[/]dev/ ]]; then
+                local dev=$(echo "$line" | awk '{print $1}' | sed 's/://')
+                local key=$(echo "$line" | awk '{print $2}')
+                local val=$(echo "$line" | awk '{print $3}')
+                [[ -z "$dev" || -z "$key" || -z "$val" ]] && continue
+                echo "$dev $key $val" >> "$prev_file.tmp"
+                out_has=1
+                if [[ "$val" =~ ^[0-9]+$ ]]; then
+                    local prev=${PREV_STAT["$dev|$key"]:-0}
+                    local delta=$(( val - prev ))
+                    if (( delta > 0 )); then
+                        local sev="warning"
+                        case "$key" in
+                            corruption_errs|generation_errs)
+                                (( delta >= BTRFS_DEV_CORR_CRIT_DELTA )) && sev="critical" || sev="critical";;
+                            read_io_errs|write_io_errs|flush_io_errs)
+                                if (( delta >= BTRFS_DEV_ERR_CRIT_DELTA )); then sev="critical"; elif (( delta >= BTRFS_DEV_ERR_WARN_DELTA )); then sev="warning"; fi;;
+                        esac
+                        record_alert "$sev" "Btrfs Device" "Device $dev $key +$delta (now $val) on mount $m"
+                        local bdev=$(base_device "$dev")
+                        [[ -z "${SMART_STATE[$bdev]:-}" ]] && SMART_STATE[$bdev]="OK"
+                        SMART_MSGS[$bdev]="${SMART_MSGS[$bdev]:-} Btrfs device errors: $key +$delta" 
+                    fi
+                fi
+            fi
+        done < <(echo "$stats" | awk 'NF>=3')
+    done
+    if (( out_has == 1 )); then
+        mv "$prev_file.tmp" "$prev_file" 2>/dev/null || rm -f "$prev_file.tmp"
+    else
+        rm -f "$prev_file.tmp" 2>/dev/null || true
+    fi
+}
+
+# Collect and integrate xfs /proc stats (global deltas)
+collect_xfs_proc_stats() {
+    (( ENABLE_XFS_PROC_STATS == 1 )) || return 0
+    local stat_file="/proc/fs/xfs/stat"
+    [[ -r "$stat_file" ]] || return 0
+    local prev_file="$STATE_DIR/xfs_proc_stats.prev"
+    declare -A PREV_XFS
+    if [[ -f "$prev_file" ]]; then
+        while read -r key val; do
+            [[ -z "$key" || -z "$val" ]] && continue
+            PREV_XFS["$key"]="$val"
+        done < "$prev_file"
+    fi
+    > "$prev_file.tmp"
+    local anomalies=0
+    # Parse a subset of counters (extent_alloc, abtc, igio) heuristically
+    local keys=(extent_alloc dir_lookup dir_create xs_xstrat delalloc flush)
+    for k in "${keys[@]}"; do
+        local val
+        val=$(grep -E "^$k " "$stat_file" | awk '{print $2}' | head -n1)
+        [[ -z "$val" || ! "$val" =~ ^[0-9]+$ ]] && continue
+        echo "$k $val" >> "$prev_file.tmp"
+        local prev=${PREV_XFS["$k"]:-0}
+        local delta=$(( val - prev ))
+        if (( delta > 0 )); then
+            local sev="warning"
+            if (( delta >= XFS_PROC_CRIT_DELTA )); then sev="critical"; elif (( delta >= XFS_PROC_WARN_DELTA )); then sev="warning"; else continue; fi
+            anomalies=1
+            record_alert "$sev" "XFS Stat" "Counter $k +$delta (now $val)"
+        fi
+    done
+    if (( anomalies == 1 )); then
+        # Attach XFS anomalies to each xfs mounted device SMART messages for visibility
+        local xfs_mounts
+        xfs_mounts=$(mount | awk '/ xfs /{print $3}')
+        for m in $xfs_mounts; do
+            local src=$(findmnt -n -o SOURCE "$m" 2>/dev/null || true)
+            [[ -z "$src" ]] && continue
+            local bdev=$(base_device "$src")
+            [[ -z "${SMART_STATE[$bdev]:-}" ]] && SMART_STATE[$bdev]="OK"
+            SMART_MSGS[$bdev]="${SMART_MSGS[$bdev]:-} XFS metadata anomalies"
+        done
+    fi
+    mv "$prev_file.tmp" "$prev_file" 2>/dev/null || rm -f "$prev_file.tmp"
+}
+
 # Build and send notification
 SCRIPT_END_EPOCH=$(date +%s)
 RUNTIME_SEC=$(( SCRIPT_END_EPOCH - SCRIPT_START_EPOCH ))
@@ -2928,46 +3380,50 @@ case "${SHOW_SUBSYSTEMS_BLOCK:-auto}" in
         : ;;
     auto|*)
         if echo "${SUBSYSTEM_LINES:-}" | grep -Eq ': (WARNING|CRITICAL)$'; then
-            SUBSYSTEMS_BLOCK="Subsystems:\n${SUBSYSTEM_LINES}\n"
+            local _filtered
+            _filtered=$(printf "%s\n" "${SUBSYSTEM_LINES:-}" | awk '/: (WARNING|CRITICAL)$/')
+            if [[ -n "${_filtered}" ]]; then
+                SUBSYSTEMS_BLOCK="Subsystems:\n${_filtered}\n"
+            fi
         fi
         ;;
 esac
 
 NOTIFY_BODY="Runtime: ${RUNTIME_STR:-}
 ${STORAGE_TOP_LINES:-}
-
 [Array Disks]:
 ${PARITY_STATUS_LINE:-}
+${PARITY_DETAILS_SECTION:-}
 ${ARRAY_DISK_LINES:-}
 ${ARRAY_DEVICE_SECTION:-}
-
 [Pool Disks]:
 ${POOL_LINES:-}
 ${POOL_DEVICE_SECTION:-}
-
 ${DISK_HEALTH_SUMMARY:-}
-
 ${RISK_TIER_TREND_SECTION:-}
-
 ${CAPACITY_FORECAST:-}
-
 ${RISK_BLOCK:-}
-
 ${FIRMWARE_EVENT_SECTION:-}
-
 ${TBW_SECTION:-}
-
 ${DISK_GROWTH_SECTION:-}
-
 ${SHARE_SECTION:-}
-
 ${STORAGE_VALIDATION_SECTION:-}
-
 ${ADAPTIVE_DECISIONS_SECTION:-}
-
 ${IO_ERROR_FREQ_SECTION:-}
 ${SUBSYSTEMS_BLOCK:-}
 ${RECOMMEND_SECTION:-}"
+
+# Normalize spacing: collapse multiple blank lines to a single blank line
+NOTIFY_BODY=$(printf "%s\n" "$NOTIFY_BODY" | awk '
+BEGIN{empty=0}
+{
+    if ($0 ~ /^[[:space:]]*$/) {
+        if (empty==0) print ""; empty=1
+    } else {
+        print; empty=0
+    }
+}
+END{}')
 
 # Log severity used for the outgoing notification
 if (( ${#ALERT_CRIT[@]} > 0 )); then
