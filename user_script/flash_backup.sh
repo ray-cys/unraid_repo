@@ -14,17 +14,10 @@ clearLog=false
 # Configuration section
 # Adjust the settings below to configure the backup behavior.
 
-# Set source directories
-BACKUP_DIR="/mnt/user/node/flash"
-
-# Set maximum number of backups to keep
-MAX_BACKUP=3
-
-# Optional free-space fallback settings
-# When true, attempt stat(2)-based fallback if df reports 0/invalid
-FLASH_ENABLE_STAT_FALLBACK=${FLASH_ENABLE_STAT_FALLBACK:-true}
-# Filesystem types that commonly report 0 with df; treat zero as unknown
-FLASH_IGNORE_ZERO_FS_TYPES=${FLASH_IGNORE_ZERO_FS_TYPES:-"fuse.rclone fuse.mergerfs fuse.unionfs"}
+BACKUP_DIR="/mnt/user/node/flash"                                 # Destination directory for flash backups
+MAX_BACKUP=3                                                      # Number of backups to keep
+FLASH_ENABLE_STAT_FALLBACK=${FLASH_ENABLE_STAT_FALLBACK:-true}    # When true, attempt a stat(2)-based fallback if df reports 0 bytes free.
+FLASH_IGNORE_ZERO_FS_TYPES=${FLASH_IGNORE_ZERO_FS_TYPES:-"fuse.rclone fuse.mergerfs fuse.unionfs"} # Filesystem types to ignore for free space checks
 
 # --------------------------------------------------------------------------------
 
@@ -252,7 +245,7 @@ if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
     syslog err "Insufficient space to move flash zip: need ${human_need}, available ${human_avail}"
     # Build body with space metrics and percent required vs free
     if [[ "$dest_avail" =~ ^[0-9]+$ ]] && [ "$dest_avail" -gt 0 ]; then
-      req_pct_of_free=$(awk -v r="$need_bytes" -v f="$dest_avail" 'BEGIN{printf "%d", (r*100)/f}')
+      req_pct_of_free=$(awk -v r="$need_bytes" -v f="$dest_avail" 'BEGIN{printf "%.2f", (r*100)/f}')
       no_space_body="Space: Free=${human_avail} Required=${human_need}\nRequired vs Free: ${req_pct_of_free}%"
     else
       no_space_body="Space: Free=${human_avail} Required=${human_need}\nRequired vs Free: Unknown"
@@ -336,7 +329,7 @@ prune_old_files "$BACKUP_DIR" "$MAX_BACKUP" "*flash-backup-*.zip"
     fi
     notify_body+=$'\n'"Space: Free=${free_human} Required=${req_human}"
     if [[ "${dest_avail:-0}" =~ ^[0-9]+$ ]] && [ "${dest_avail:-0}" -gt 0 ]; then
-      req_pct_of_free=$(awk -v r="$need_bytes" -v f="${dest_avail:-0}" 'BEGIN{printf "%d", (r*100)/f}')
+      req_pct_of_free=$(awk -v r="$need_bytes" -v f="${dest_avail:-0}" 'BEGIN{printf "%.2f", (r*100)/f}')
       notify_body+=$'\n'"Required vs Free: ${req_pct_of_free}%"
     else
       notify_body+=$'\n'"Required vs Free: Unknown"

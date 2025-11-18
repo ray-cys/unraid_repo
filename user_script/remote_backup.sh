@@ -13,6 +13,7 @@ clearLog=false
 # --------------------------------------------------------------------------------
 # Configuration section
 # Adjust the settings below to configure the remote backup behavior.
+
 # --- General ---
 SRC_NAS="Hubble NAS"                  # Source NAS name for logging/notifications
 DEST_NAS="ISS NAS"                    # Destination NAS name for logging/notifications
@@ -106,10 +107,8 @@ DESTS_ARRAY=("$MEDIA_DEST" "$SECURE_DEST") # Destination paths for datasets
 mkdir -p "$LOG_FILE_SUBDIR" 2>/dev/null || true 
 mkdir -p "$PRESERVED_RAW_LOG_DIR" 2>/dev/null || true 
 mkdir -p "$LOG_FILE_SUBDIR/manifests" 2>/dev/null || true
-# Apply ownership and permissions to log directories
 chown "$LOG_USER:$LOG_GROUP" "$LOG_FILE_SUBDIR" "$PRESERVED_RAW_LOG_DIR" "$LOG_FILE_SUBDIR/manifests" 2>/dev/null || true
 chmod "$LOG_DIR_MODE" "$LOG_FILE_SUBDIR" "$PRESERVED_RAW_LOG_DIR" "$LOG_FILE_SUBDIR/manifests" 2>/dev/null || true
-# Pre-create current run log file with correct owner and mode
 : > "$LOG_FILE"
 chown "$LOG_USER:$LOG_GROUP" "$LOG_FILE" 2>/dev/null || true
 chmod "$LOG_FILE_MODE" "$LOG_FILE" 2>/dev/null || true
@@ -242,7 +241,6 @@ preflight_disk_check() {
   dest_avail=${dest_avail:-0}
   if ! [[ "$dest_avail" =~ ^[0-9]+$ ]]; then dest_avail=0; fi
 
-  # Remote stat(2) fallback and fs-type ignore for zero/invalid free space
   local avail_unknown=0
   if [ "$dest_avail" -eq 0 ] && [ "$REMOTE_ENABLE_STAT_FALLBACK" = "true" ]; then
     local stat_vals
@@ -868,14 +866,7 @@ collect_notification_artifacts() {
   return 0
 }
 
-# Main flow entry
-# 1) record start time
-# 2) wake remote with Wake-on-LAN
-# 3) wait for SSH to become available (with timeout)
-# 4) run aggregate preflight to determine if remote has enough space
-# 5) execute per-label rsync runs (supports optional snapshot/link-dest)
-# 6) collect results, notify (PASS/FAIL), optionally shut down remote, rotate logs
-#
+# --- Main Execution ---
 # Record script start time
 start_time=$(date +%s)
 log "$SRC_NAS --> $DEST_NAS start: $(date)"
@@ -921,7 +912,7 @@ while :; do
       sleep "$STABILIZE_INTERVAL"
     done
 
-    # Additional Unraid array readiness loop (checks /mnt/user presence & sample share)
+    # Additional array readiness loop
     arr_start_ts=$(date +%s)
     log "Waiting up to ${ARRAY_READY_WAIT}s for remote array (/mnt/user) readiness..."
     while :; do
@@ -975,7 +966,7 @@ declare -A rsync_transferred_bytes
 declare -A rsync_files
 declare -A rsync_deletes
 declare -A rsync_bytes_sent
-declare -A estimated_changed_bytes  # per-label estimated changed bytes from manifest diff
+declare -A estimated_changed_bytes 
 
 # Prepare arrays for aggregated preflight (dynamic labels)
 LABELS_ARRAY=("Media" "Secure")

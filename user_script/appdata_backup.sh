@@ -14,23 +14,13 @@ clearLog=false
 # Configuration section
 # Adjust the settings below to configure the backup behavior.
 
-# Directory containing container appdata directories
-SRC_DIR="/mnt/cache/appdata"
-DEST_DIR="/mnt/user/node/cache"
-
-# Containers to skip from stopping and/or archiving.
-#   SKIP_CONTAINERS=()                    # do not skip any containers
-#   SKIP_CONTAINERS=("plex-media-server") # skip plex
-SKIP_CONTAINERS=()
-
-# How many backups and logs to keep (oldest removed when exceeded)
-MAX_BACKUPS=3
-MAX_LOGS=3
-
-# Number of parallel compression jobs. Defaults to CPU cores. Lower to reduce IO.
-PARALLEL_JOBS=${PARALLEL_JOBS-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)}
-# Use pigz (parallel gzip) when available for faster compression
-if command -v pigz >/dev/null 2>&1; then
+SRC_DIR="/mnt/cache/appdata"                              # Source directory
+DEST_DIR="/mnt/user/node/cache"                           # Destination directory
+SKIP_CONTAINERS=()                                        # Containers to skip (e.g. SKIP_CONTAINERS=("plex-media-server"))
+MAX_BACKUPS=3                                             # Number of backups to keep   
+MAX_LOGS=3                                                # Number of logs to keep 
+PARALLEL_JOBS=${PARALLEL_JOBS-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)}            # Number of parallel compression jobs. Defaults to CPU cores. Lower to reduce IO.
+if command -v pigz >/dev/null 2>&1; then                  # Use pigz (parallel gzip) when available for faster compression
   USE_PIGZ=1
 else
   USE_PIGZ=0
@@ -40,52 +30,47 @@ if command -v pv >/dev/null 2>&1; then
 else
   PV_AVAILABLE=0
 fi
-
-# Directory settings
-SRC_DIR_NAME="$(basename "$SRC_DIR")"           # Name of source dir for logging
-DATETIME="$(date +%Y%m%d_%H%M%S)"               # Timestamp for this run
+SRC_DIR_NAME="$(basename "$SRC_DIR")"                      # Name of source dir for logging
+DATETIME="$(date +%Y%m%d_%H%M%S)"                          # Timestamp for this run
 LOG_FILE_SUBDIR="/mnt/user/node/logs/${SRC_DIR_NAME}_logs" # Log file directory
 LOG_FILE="$LOG_FILE_SUBDIR/$SRC_DIR_NAME-$DATETIME.log"    # Log file path
-ERR_EXCERPT_LINES=${ERR_EXCERPT_LINES:-20}      # Number of stderr lines to include in notification on failure
+ERR_EXCERPT_LINES=${ERR_EXCERPT_LINES:-20}                 # Number of stderr lines to include in notification on failure
+KEEP_PARTIAL=${KEEP_PARTIAL:-true}                         # Keep partial backups 
+RETRIES=${RETRIES:-3}                                      # Number of attempts
+RETRY_DELAY=${RETRY_DELAY:-5}                              # Delay between attempts (seconds)
+TARBALL_PROGRESS_TO_LOG=${TARBALL_PROGRESS_TO_LOG:-true}   # Append tar/pv progress to the main logfile
+LOW_SPACE_ACTION=${LOW_SPACE_ACTION:-abort}                # LOW_SPACE_ACTION: abort|warn|partial  (default: abort)
+LOW_SPACE_MARGIN=${LOW_SPACE_MARGIN:-0}                    # Extra margin (bytes) to add to required space calculation
+LOW_SPACE_FAIL_IF_UNDETERMINED=${LOW_SPACE_FAIL_IF_UNDETERMINED:-false}                                     # If df/du cannot determine size, fail when true, otherwise proceed with a warning
+LOW_SPACE_IGNORE_ZERO_FS_TYPES=${LOW_SPACE_IGNORE_ZERO_FS_TYPES:-"fuse.rclone fuse.mergerfs fuse.unionfs"}  # Filesystem types whose zero-free-space df output should be treated as unknown/unlimited.
+LOW_SPACE_ENABLE_STAT_FALLBACK=${LOW_SPACE_ENABLE_STAT_FALLBACK:-true}                                      # When true, attempt a stat(2)-based fallback if df reports 0 bytes free.
+UTIL_WARN_THRESHOLD=${UTIL_WARN_THRESHOLD:-15}             # Warning threshold (percent)
+UTIL_ALERT_THRESHOLD=${UTIL_ALERT_THRESHOLD:-5}            # Alert threshold (percent)
+PIGZ_THREADS=${PIGZ_THREADS:-0}.                           # Pigz threads per compression job (0 lets pigz auto-detect). Set to 1..N to limit per-job threads
+TAR_OPTIONS=()                                             # Extra tar options (array)
+NOTIFY_TITLE="Scheduled Docker Backup"                     # Notification title prefix
+NOTIFY_LEVEL_ON_SUCCESS="normal"                           # Notification level on success: normal|warning|alert
+NOTIFY_LEVEL_ON_FAILURE="alert"                            # Notification level on failure: normal|warning|alert
+TMP_DIR=""                                                 # e.g., /tmp/docker_backup_tmp (default: inside the run backup dir if TMP_DIR empty)
+KEEP_TEMP_ERR=${KEEP_TEMP_ERR:-false}                      # Keep per-container .err files after a successful run
 
-# Keep partial artifacts (on failure): "true" or "false"
-KEEP_PARTIAL=${KEEP_PARTIAL:-true}
-
-# Retry behaviour for tar/compress: how many attempts and delay between attempts (seconds)
-RETRIES=${RETRIES:-3}                           # Number of attempts
-RETRY_DELAY=${RETRY_DELAY:-5}                   # Delay between attempts (seconds)
-
-# Append tar/pv progress to the main logfile (true/false)
-TARBALL_PROGRESS_TO_LOG=${TARBALL_PROGRESS_TO_LOG:-true}
-
-# Low-space / disk-check policy
-LOW_SPACE_ACTION=${LOW_SPACE_ACTION:-abort}     # LOW_SPACE_ACTION: abort|warn|partial  (default: abort)
-LOW_SPACE_MARGIN=${LOW_SPACE_MARGIN:-0}         # Extra margin (bytes) to add to required space calculation
-LOW_SPACE_FAIL_IF_UNDETERMINED=${LOW_SPACE_FAIL_IF_UNDETERMINED:-false} # If df/du cannot determine size, fail when true, otherwise proceed with a warning
-LOW_SPACE_IGNORE_ZERO_FS_TYPES=${LOW_SPACE_IGNORE_ZERO_FS_TYPES:-"fuse.rclone fuse.mergerfs fuse.unionfs"} # Filesystem types whose zero-free-space df output should be treated as unknown/unlimited.
-LOW_SPACE_ENABLE_STAT_FALLBACK=${LOW_SPACE_ENABLE_STAT_FALLBACK:-true} # When true, attempt a stat(2)-based fallback if df reports 0 bytes free.
-
-# Percent free space thresholds (integer percent). If free% < alert -> alert notification; if < warn -> warning note.
-UTIL_WARN_THRESHOLD=${UTIL_WARN_THRESHOLD:-15}  # Warning threshold (percent)
-UTIL_ALERT_THRESHOLD=${UTIL_ALERT_THRESHOLD:-5} # Alert threshold (percent)
-
-# Pigz thread control
-PIGZ_THREADS=${PIGZ_THREADS:-0}.                # Pigz threads per compression job (0 lets pigz auto-detect). Set to 1..N to limit per-job threads
-
-# Extra tar options
-TAR_OPTIONS=()                                 # Extra tar options (array)
-
-# Notification customization
-NOTIFY_TITLE="Scheduled Docker Backup"         # Notification title prefix
-NOTIFY_LEVEL_ON_SUCCESS="normal"               # Notification level on success: normal|warning|alert
-NOTIFY_LEVEL_ON_FAILURE="alert"                # Notification level on failure: normal|warning|alert
-
-# Intermediate files location 
-TMP_DIR=""                                     # e.g., /tmp/docker_backup_tmp (default: inside the run backup dir if TMP_DIR empty)
-
-# Keep per-container .err files after a successful run
-KEEP_TEMP_ERR=${KEEP_TEMP_ERR:-false}         # Keep temporary error files
 # --------------------------------------------------------------------------------
+
+# Ensure logs are group-writable and owned by nobody:users on Unraid
+LOG_USER="${LOG_USER:-nobody}"
+LOG_GROUP="${LOG_GROUP:-users}"
+LOG_DIR_MODE="${LOG_DIR_MODE:-0775}"
+LOG_FILE_MODE="${LOG_FILE_MODE:-0664}"
+LOG_UMASK="${LOG_UMASK:-0002}"
+umask "$LOG_UMASK"
+
+# Ensure runtime log directory exists with correct ownership/permissions and pre-create log file
+mkdir -p "$LOG_FILE_SUBDIR" 2>/dev/null || true
+chown "$LOG_USER:$LOG_GROUP" "$LOG_FILE_SUBDIR" 2>/dev/null || true
+chmod "$LOG_DIR_MODE" "$LOG_FILE_SUBDIR" 2>/dev/null || true
+: > "$LOG_FILE"
+chown "$LOG_USER:$LOG_GROUP" "$LOG_FILE" 2>/dev/null || true
+chmod "$LOG_FILE_MODE" "$LOG_FILE" 2>/dev/null || true
 
 # Check if a container/dir is in the skip list (exact match). Empty skip list -> skip none.
 is_skipped() {
@@ -104,10 +89,6 @@ backup_report=""
 # Log messages to logfile and stdout
 log() {
   local msg="$1"
-  if [ ! -d "${LOG_FILE_SUBDIR}" ]; then
-    mkdir -p "${LOG_FILE_SUBDIR}" || true
-    chown -R nobody:users "${LOG_FILE_SUBDIR}" 2>/dev/null || true
-  fi
   echo "$(date "+%Y/%m/%d %T") : $msg" | tee -a "$LOG_FILE"
 }
 
