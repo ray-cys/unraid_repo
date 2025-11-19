@@ -32,7 +32,7 @@ else
 fi
 SRC_DIR_NAME="$(basename "$SRC_DIR")"                      # Name of source dir for logging
 DATETIME="$(date +%Y%m%d_%H%M%S)"                          # Timestamp for this run
-LOG_FILE_SUBDIR="/mnt/user/node/logs/${SRC_DIR_NAME}_logs" # Log file directory
+LOG_FILE_SUBDIR="/mnt/cache/system/logs/${SRC_DIR_NAME}_logs" # Log file directory
 LOG_FILE="$LOG_FILE_SUBDIR/$SRC_DIR_NAME-$DATETIME.log"    # Log file path
 ERR_EXCERPT_LINES=${ERR_EXCERPT_LINES:-20}                 # Number of stderr lines to include in notification on failure
 KEEP_PARTIAL=${KEEP_PARTIAL:-true}                         # Keep partial backups 
@@ -48,7 +48,7 @@ UTIL_WARN_THRESHOLD=${UTIL_WARN_THRESHOLD:-15}             # Warning threshold (
 UTIL_ALERT_THRESHOLD=${UTIL_ALERT_THRESHOLD:-5}            # Alert threshold (percent)
 PIGZ_THREADS=${PIGZ_THREADS:-0}.                           # Pigz threads per compression job (0 lets pigz auto-detect). Set to 1..N to limit per-job threads
 TAR_OPTIONS=()                                             # Extra tar options (array)
-NOTIFY_TITLE="Scheduled Docker Backup"                     # Notification title prefix
+NOTIFY_TITLE="Docker Backup"                               # Notification title prefix
 NOTIFY_LEVEL_ON_SUCCESS="normal"                           # Notification level on success: normal|warning|alert
 NOTIFY_LEVEL_ON_FAILURE="alert"                            # Notification level on failure: normal|warning|alert
 TMP_DIR=""                                                 # e.g., /tmp/docker_backup_tmp (default: inside the run backup dir if TMP_DIR empty)
