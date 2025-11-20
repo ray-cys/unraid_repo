@@ -1,0 +1,89 @@
+Repository Info (read-only)
+git status
+git log
+git show
+git diff
+git blame
+git branch         # listing branches
+git tag            # listing tags
+git remote -v      # shows remotes
+git config --list  # shows config
+
+View Commits / History
+git log --oneline
+git log --graph --decorate --all
+git show <commit>
+git diff <commit1> <commit2>
+
+Check files
+git ls-tree -r HEAD
+git cat-file -p <object>
+
+Safe network operations (read-only)
+git fetch --dry-run
+
+Local Edit / Staging / Reset (safe)
+git add <files>
+git restore <file>
+git restore --staged <file>
+git reset
+git reset --soft
+git reset --hard     # careful: destroys your local changes only
+
+Local Commits (safe)
+git commit
+git commit --amend    # safe if not pushed yet
+
+Local Branch Operations
+git branch <name>
+git branch -d <name>
+git checkout <branch>
+git switch <branch>
+git switch -c <branch>
+
+Local Merge & Rebase (safe locally)
+git merge <branch>
+git rebase <branch>
+git cherry-pick <commit>
+
+Clean / prune (local only)
+git clean -n       # preview
+git clean -f       # remove untracked files
+git prune
+git gc
+
+Local stash (safe)
+git stash
+git stash list
+git stash apply
+git stash pop
+
+Upload changes to GitHub
+git push
+git push origin <branch>
+git push -u origin <branch>
+
+Push destructive operations
+git push --force
+git push --force-with-lease     # safer
+
+Clone from GitHub (safe)
+git clone git@github.com:<user>/<repo>.git
+git clone https://github.com/<user>/<repo>.git
+
+Pull from GitHub (safe, but modifies local files)
+git pull
+
+History rewrite (safe until push)
+git rebase -i
+git commit --amend
+git reset --hard HEAD~1
+
+Danger when deleting remotes
+git push origin --delete <branch>
+git push origin :<branch>
+
+Danger when messing with tags
+git tag -d <tag>
+git push origin :refs/tags/<tag>
+
