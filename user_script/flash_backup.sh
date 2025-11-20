@@ -97,18 +97,20 @@ prune_old_files() {
   local pattern="${3:-*}"
   [ -d "$dir" ] || return 0
   mapfile -t files < <(find "$dir" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null | sort -n | awk '{print $2}')
-  local i=0
   local total=${#files[@]}
-  for f in "${files[@]}"; do
-    if [ $i -ge "$max" ]; then
-      log "Deleting old backup: $f (keeping last ${max} backups; total found: ${total})"
-      if rm -f -- "$f" 2>/dev/null; then
-        log "Deleted old backup: $f"
-      else
-        syslog warning "Failed to remove old flash backup $f"
-      fi
+  if [ "$total" -le "$max" ]; then
+    return 0
+  fi
+  local to_delete=$(( total - max ))
+  local i
+  for ((i=0; i<to_delete; i++)); do
+    local f="${files[i]}"
+    log "Deleting old backup: $f (keeping newest ${max}; total found: ${total})"
+    if rm -f -- "$f" 2>/dev/null; then
+      log "Deleted old backup: $f"
+    else
+      syslog warning "Failed to remove old flash backup $f"
     fi
-    i=$((i+1))
   done
 }
 
@@ -127,7 +129,7 @@ else
   done <"$helper_out"
   syslog err "Flash backup helper failed with exit $rc"
   excerpt=$(tail -n 40 "$helper_out" 2>/dev/null || true)
-  notify_send alert "Flash Backup - FAIL" "💾 Flash backup failed" "Exit code: ${rc}\n\nExcerpt:\n${excerpt}\n\nRuntime: $(format_runtime)"
+  notify_send alert "Flash Backup - FAIL" "Flash backup failed" "Exit code: ${rc}\n\nExcerpt:\n${excerpt}\n\nRuntime: $(format_runtime)"
   log "Flash backup failed; see job log"
   rm -f -- "$helper_out" 2>/dev/null || true
   exit $rc
@@ -246,44 +248,27 @@ if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
     # Build body with space metrics and percent required vs free
     if [[ "$dest_avail" =~ ^[0-9]+$ ]] && [ "$dest_avail" -gt 0 ]; then
       req_pct_of_free=$(awk -v r="$need_bytes" -v f="$dest_avail" 'BEGIN{printf "%.2f", (r*100)/f}')
-      no_space_body="Space: Free=${human_avail} Required=${human_need}\nRequired vs Free: ${req_pct_of_free}%"
+      no_space_body="🔵 Space: Free = ${human_avail} Required = ${human_need}\nRequired vs Free: ${req_pct_of_free}%"
     else
-      no_space_body="Space: Free=${human_avail} Required=${human_need}\nRequired vs Free: Unknown"
+      no_space_body="🔵 Space: Free = ${human_avail} Required = ${human_need}\nRequired vs Free: Unknown"
     fi
-  notify_send alert "Flash Backup - NO SPACE" "🔵 Insufficient space" "$no_space_body"
+  notify_send alert "Flash Backup - NO SPACE" "Insufficient space" "$no_space_body"
     log "Insufficient space for moving $latest_zip: need ${human_need} available ${human_avail}"
   else
     target="$latest_zip"
-    if mv -- "$target" "$BACKUP_DIR/"; then
-      moved_file="$BACKUP_DIR/$(basename "$target")"
-      moved_size=$(stat -c%s "$moved_file" 2>/dev/null || stat -f%z "$moved_file" 2>/dev/null || echo 0)
-      human_moved_size=$(bytes_human "$moved_size")
-      log "Moved $target to $BACKUP_DIR"
-      log "Moved file: $moved_file size: ${human_moved_size}"
+    final="$BACKUP_DIR/$(basename "$target")"
+    tmp="$BACKUP_DIR/.tmp.$(basename "$target").$$"
+    src_dev=$(stat -c %d "$target" 2>/dev/null || echo "")
+    dest_dev=$(stat -c %d "$BACKUP_DIR" 2>/dev/null || echo "")
 
-      if [ -d "/usr/local/emhttp" ]; then
-        while IFS= read -r sl; do
-          [ -L "$sl" ] || continue
-          if command -v readlink >/dev/null 2>&1; then
-            sl_target=$(readlink -f "$sl" 2>/dev/null || true)
-          else
-            sl_target=$(realpath "$sl" 2>/dev/null || true)
-          fi
-          if [ -n "$sl_target" ] && [ "$sl_target" = "$target" ]; then
-            rm -f -- "$sl" 2>/dev/null || syslog warning "Failed to remove symlink $sl"
-            log "Removed symlink $sl that pointed to moved file"
-          fi
-        done < <(find /usr/local/emhttp -maxdepth 1 -name '*flash-backup-*.zip' -print 2>/dev/null)
-      fi
-
-    else
-      rc=$?
-      syslog warning "mv failed with exit $rc; attempting copy+remove fallback for $target"
-      if cp --preserve=mode,timestamps -- "$target" "$BACKUP_DIR/" 2>/dev/null && rm -f -- "$target" 2>/dev/null; then
-        moved_file="$BACKUP_DIR/$(basename "$target")"
+    if [ -n "$src_dev" ] && [ -n "$dest_dev" ] && [ "$src_dev" = "$dest_dev" ]; then
+      # Same filesystem: atomic rename is ideal
+      if mv -- "$target" "$final"; then
+        moved_file="$final"
         moved_size=$(stat -c%s "$moved_file" 2>/dev/null || stat -f%z "$moved_file" 2>/dev/null || echo 0)
         human_moved_size=$(bytes_human "$moved_size")
-        log "Copied and removed original: $target -> $moved_file"
+        log "Moved $target to $final"
+        log "Moved file: $moved_file size: ${human_moved_size}"
 
         if [ -d "/usr/local/emhttp" ]; then
           while IFS= read -r sl; do
@@ -301,8 +286,78 @@ if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
         fi
 
       else
-        syslog err "Failed to move or copy $target to $BACKUP_DIR"
-        log "mv/copy failed for $target"
+        rc=$?
+        syslog warning "mv (same FS) failed with exit $rc; attempting copy-to-temp+rename fallback for $target"
+        if cp --reflink=auto --sparse=always --preserve=mode,timestamps -- "$target" "$tmp" 2>/dev/null \
+           && mv -f -- "$tmp" "$final" 2>/dev/null \
+           && rm -f -- "$target" 2>/dev/null; then
+          moved_file="$final"
+          moved_size=$(stat -c%s "$moved_file" 2>/dev/null || stat -f%z "$moved_file" 2>/dev/null || echo 0)
+          human_moved_size=$(bytes_human "$moved_size")
+          log "Copied via temp and removed original: $target -> $final"
+
+          if [ -d "/usr/local/emhttp" ]; then
+            while IFS= read -r sl; do
+              [ -L "$sl" ] || continue
+              if command -v readlink >/dev/null 2>&1; then
+                sl_target=$(readlink -f "$sl" 2>/dev/null || true)
+              else
+                sl_target=$(realpath "$sl" 2>/dev/null || true)
+              fi
+              if [ -n "$sl_target" ] && [ "$sl_target" = "$target" ]; then
+                rm -f -- "$sl" 2>/dev/null || syslog warning "Failed to remove symlink $sl"
+                log "Removed symlink $sl that pointed to moved file"
+              fi
+            done < <(find /usr/local/emhttp -maxdepth 1 -name '*flash-backup-*.zip' -print 2>/dev/null)
+          fi
+        else
+          rm -f -- "$tmp" 2>/dev/null || true
+          syslog err "Failed to move (same FS) $target to $final via fallback"
+          log "mv/copy fallback failed for $target"
+        fi
+      fi
+    else
+      # Cross-filesystem: copy into temp within destination (btrfs-friendly reflink), then atomic rename
+      if cp --reflink=auto --sparse=always --preserve=mode,timestamps -- "$target" "$tmp" 2>/dev/null; then
+        if mv -f -- "$tmp" "$final" 2>/dev/null; then
+          if rm -f -- "$target" 2>/dev/null; then
+            moved_file="$final"
+            moved_size=$(stat -c%s "$moved_file" 2>/dev/null || stat -f%z "$moved_file" 2>/dev/null || echo 0)
+            human_moved_size=$(bytes_human "$moved_size")
+            log "Copied to dest (reflink where possible) and finalized: $target -> $final"
+
+            if [ -d "/usr/local/emhttp" ]; then
+              while IFS= read -r sl; do
+                [ -L "$sl" ] || continue
+                if command -v readlink >/dev/null 2>&1; then
+                  sl_target=$(readlink -f "$sl" 2>/dev/null || true)
+                else
+                  sl_target=$(realpath "$sl" 2>/dev/null || true)
+                fi
+                if [ -n "$sl_target" ] && [ "$sl_target" = "$target" ]; then
+                  rm -f -- "$sl" 2>/dev/null || syslog warning "Failed to remove symlink $sl"
+                  log "Removed symlink $sl that pointed to moved file"
+                fi
+              done < <(find /usr/local/emhttp -maxdepth 1 -name '*flash-backup-*.zip' -print 2>/dev/null)
+            fi
+          else
+            moved_file="$final"
+            moved_size=$(stat -c%s "$moved_file" 2>/dev/null || stat -f%z "$moved_file" 2>/dev/null || echo 0)
+            human_moved_size=$(bytes_human "$moved_size")
+            syslog warning "Copied and finalized at destination but failed to remove source $target"
+            log "Copied and finalized at destination; please manually remove source: $target"
+          fi
+        else
+          rc=$?
+          rm -f -- "$tmp" 2>/dev/null || true
+          syslog err "Failed to finalize rename of $tmp to $final (exit $rc)"
+          log "Failed to finalize move at destination"
+        fi
+      else
+        rc=$?
+        rm -f -- "$tmp" 2>/dev/null || true
+        syslog err "Failed to copy $target to temporary file $tmp in $BACKUP_DIR (exit $rc)"
+        log "Copy to destination temp failed for $target"
       fi
     fi
   fi
@@ -317,7 +372,7 @@ prune_old_files "$BACKUP_DIR" "$MAX_BACKUP" "*flash-backup-*.zip"
  runtime_now=$(format_runtime)
  if [ -n "${moved_file:-}" ]; then
   syslog info "Flash Backup: Unraid OS backed up on $(date) (Runtime: ${runtime_now})"
-  notify_body="Flash backup moved to ${BACKUP_DIR}\nRuntime: ${runtime_now}"
+  notify_body="🟢 Flash backup moved to ${BACKUP_DIR}\nRuntime: ${runtime_now}"
   notify_body+="\nMoved: $(basename "${moved_file}") (${human_moved_size})"
   # Append space metrics if available from pre-check
   if [ -n "${need_bytes:-}" ]; then
@@ -327,7 +382,7 @@ prune_old_files "$BACKUP_DIR" "$MAX_BACKUP" "*flash-backup-*.zip"
     else
       free_human=$(bytes_human "${dest_avail:-0}")
     fi
-    notify_body+=$'\n'"Space: Free=${free_human} Required=${req_human}"
+    notify_body+=$'\n'"Space: Free = ${free_human} Required = ${req_human}"
     if [[ "${dest_avail:-0}" =~ ^[0-9]+$ ]] && [ "${dest_avail:-0}" -gt 0 ]; then
       req_pct_of_free=$(awk -v r="$need_bytes" -v f="${dest_avail:-0}" 'BEGIN{printf "%.2f", (r*100)/f}')
       notify_body+=$'\n'"Required vs Free: ${req_pct_of_free}%"
@@ -335,16 +390,16 @@ prune_old_files "$BACKUP_DIR" "$MAX_BACKUP" "*flash-backup-*.zip"
       notify_body+=$'\n'"Required vs Free: Unknown"
     fi
   fi
-  notify_send normal "Flash Backup - OK" "🟢 Flash backup successful" "$notify_body"
+  notify_send normal "Flash Backup - OK" "Backup successful" "$notify_body"
 else
   syslog err "Flash Backup: No backup moved on $(date) (Runtime: ${runtime_now})"
-  notify_body="Flash backup did NOT move to ${BACKUP_DIR}\nRuntime: ${runtime_now}"
+  notify_body="🔴 Flash backup did NOT move to ${BACKUP_DIR}\nRuntime: ${runtime_now}"
   if [ -n "${latest_zip:-}" ] && [ -f "${latest_zip}" ]; then
     notify_body+="\nFound source zip: ${latest_zip} (${human_src_size})"
   else
     notify_body+="\nNo flash backup zip found in /usr/local/emhttp"
   fi
-  notify_send alert "Flash Backup - FAIL" "🔴 Flash backup not moved" "$notify_body"
+  notify_send alert "Flash Backup - FAIL" "Backup failed" "$notify_body"
   exit 1
 fi
 
