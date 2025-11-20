@@ -14,8 +14,8 @@ clearLog=false
 # Configuration section
 # Adjust the settings below to configure the remote backup behavior.
 
-POOLS=(/mnt/cache)                    # List of BTRFS pools to snapshot, enter directory with spaces for multiple
-SHARES=("appdata" "domains" "system") # List of shares (subvolumes) to snapshot per pool
+POOLS=(/mnt/cache /mnt/vault)                         # List of BTRFS pools to snapshot, enter directory with spaces for multiple
+SHARES=("appdata" "domains" "system" "node" "cloud")  # List of shares (subvolumes) to snapshot per pool
 SNAPSHOT_USAGE_WARN_PCT=20            # Warn if snapshots exceed % of pool
 SNAPSHOT_USAGE_CRITICAL_PCT=90        # Percent threshold for CRITICAL
 SNAPSHOT_USAGE_WARNING_PCT=65         # Percent threshold for WARNING
