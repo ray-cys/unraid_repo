@@ -248,11 +248,11 @@ if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
     # Build body with space metrics and percent required vs free
     if [[ "$dest_avail" =~ ^[0-9]+$ ]] && [ "$dest_avail" -gt 0 ]; then
       req_pct_of_free=$(awk -v r="$need_bytes" -v f="$dest_avail" 'BEGIN{printf "%.2f", (r*100)/f}')
-      no_space_body="🔵 Space: Free = ${human_avail} Required = ${human_need}\nRequired vs Free: ${req_pct_of_free}%"
+      no_space_body="Space: Free = ${human_avail} Required = ${human_need}\nRequired vs Free: ${req_pct_of_free}%"
     else
-      no_space_body="🔵 Space: Free = ${human_avail} Required = ${human_need}\nRequired vs Free: Unknown"
+      no_space_body="Space: Free = ${human_avail} Required = ${human_need}\nRequired vs Free: Unknown"
     fi
-  notify_send alert "Flash Backup - NO SPACE" "Insufficient space" "$no_space_body"
+  notify_send alert "Flash Backup - NO SPACE" "🔵 Insufficient space" "$no_space_body"
     log "Insufficient space for moving $latest_zip: need ${human_need} available ${human_avail}"
   else
     target="$latest_zip"
@@ -372,7 +372,7 @@ prune_old_files "$BACKUP_DIR" "$MAX_BACKUP" "*flash-backup-*.zip"
  runtime_now=$(format_runtime)
  if [ -n "${moved_file:-}" ]; then
   syslog info "Flash Backup: Unraid OS backed up on $(date) (Runtime: ${runtime_now})"
-  notify_body="🟢 Flash backup moved to ${BACKUP_DIR}\nRuntime: ${runtime_now}"
+  notify_body="Flash backup moved to ${BACKUP_DIR}\nRuntime: ${runtime_now}"
   notify_body+="\nMoved: $(basename "${moved_file}") (${human_moved_size})"
   # Append space metrics if available from pre-check
   if [ -n "${need_bytes:-}" ]; then
@@ -390,16 +390,16 @@ prune_old_files "$BACKUP_DIR" "$MAX_BACKUP" "*flash-backup-*.zip"
       notify_body+=$'\n'"Required vs Free: Unknown"
     fi
   fi
-  notify_send normal "Flash Backup - OK" "Backup successful" "$notify_body"
+  notify_send normal "Flash Backup - OK" "🟢 Backup successful" "$notify_body"
 else
   syslog err "Flash Backup: No backup moved on $(date) (Runtime: ${runtime_now})"
-  notify_body="🔴 Flash backup did NOT move to ${BACKUP_DIR}\nRuntime: ${runtime_now}"
+  notify_body="Flash backup did NOT move to ${BACKUP_DIR}\nRuntime: ${runtime_now}"
   if [ -n "${latest_zip:-}" ] && [ -f "${latest_zip}" ]; then
     notify_body+="\nFound source zip: ${latest_zip} (${human_src_size})"
   else
     notify_body+="\nNo flash backup zip found in /usr/local/emhttp"
   fi
-  notify_send alert "Flash Backup - FAIL" "Backup failed" "$notify_body"
+  notify_send alert "Flash Backup - FAIL" "🔴 Backup failed" "$notify_body"
   exit 1
 fi
 
