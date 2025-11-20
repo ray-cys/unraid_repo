@@ -82,7 +82,7 @@ RISK_REPLACE=80               # Score >= goes to Replace Soon bucket
 RISK_MONITOR=50               # Score >= goes to Monitor bucket
 RISK_TREND_SHOW_ZERO=0        # Show zero-only lines in risk trend (0=hide)
 
-# === Forecast / Display Toggles ===
+# === Forecast / Notification Toggles ===
 FORECAST_HIDE_ZERO_GROWTH=1   # Hide lines showing ~0% growth (0=show)
 FORECAST_DECIMALS=1           # Decimals for average growth percent (0=disable)
 FORECAST_MIN_VISIBLE=0.1      # Percent below which show ~0% label
@@ -92,7 +92,7 @@ SHOW_OK_SUBSYSTEMS=0          # Hide OK subsystems if any WARN/CRIT exist (0=sho
 SHOW_DISABLED_SUBSYSTEMS=0    # Hide Disabled subsystems in description/body (0=show)
 SHOW_EMPTY_BUCKETS=0          # Hide empty lifecycle buckets (0=show)
 VERBOSE_OK=1                  # Show OK lines (0=suppress)
-SHOW_ZERO_COUNTS=0            # Hide zero-count summary lines (1=show)
+SHOW_ZERO_COUNTS=1            # Hide zero-count summary lines (1=show)
 
 # === SMART Thresholds (SATA) ===
 RELOC_WARNING=1               # Reallocated sectors >= warning
@@ -270,14 +270,6 @@ log_emit() {
 log_info()  { log_emit INFO "$*"; }
 log_warn()  { log_emit WARN "$*"; }
 log_crit()  { log_emit CRIT "$*"; }
-
-# === Logging Verbosity ===
-: "${LOG_LEVEL:=INFO}"
-log_debug() {
-    if [[ "${LOG_LEVEL}" == "DEBUG" ]]; then
-        log_emit DEBUG "$*"
-    fi
-}
 
 # === State Files ===
 STATE_DIR="/mnt/user/node/logs/disk_health/state"               # Base directory for state files
@@ -1672,6 +1664,24 @@ check_completed_long_tests() {
         elif [[ $sev == CRITICAL ]]; then
             record_alert critical "$NOTIFY_TITLE_SMART" "Disk $disk long self-test CRITICAL: $msg"
         fi
+        # Last long-test lifetime hours for interval gating
+        local lifetime poh
+        lifetime=$(echo "$line" | awk '{for(i=1;i<=NF;i++){if($i ~ /hours/){print $(i-1); break}}}')
+        if [[ -n "${lifetime:-}" && "$lifetime" =~ ^[0-9]+$ ]]; then
+            LONG_LAST_POH["$disk"]="$lifetime"
+            log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Recorded last long-test POH for $disk from self-test log: ${lifetime}h"
+        else
+            if [[ $disk == /dev/nvme* ]]; then
+                log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART attribute read (-a) for POH fallback on $disk"
+                poh=$(smartctl -a -d nvme "$disk" 2>/dev/null | awk -F: '/Power On Hours/ {gsub(/ /,"",$2); print $2; exit}')
+            else
+                poh=$(smartctl -A "$disk" 2>/dev/null | awk '/Power_On_Hours/ {print $10; exit}')
+            fi
+            if [[ -n "${poh:-}" && "$poh" =~ ^[0-9]+$ ]]; then
+                LONG_LAST_POH["$disk"]="$poh"
+                log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Recorded last long-test POH for $disk from POH fallback: ${poh}h"
+            fi
+        fi
         echo "$disk $id" >> "$SMART_LONG_STATE_FILE.tmp"
     done
     if [[ -f "$SMART_LONG_STATE_FILE.tmp" ]]; then
@@ -1984,6 +1994,7 @@ scan_syslog_disk_errors() {
     done
     if [[ -n "$lines" ]]; then
         IO_ERROR_FREQ_SECTION="I/O Error Frequency (last ${IO_ERROR_WINDOW_MINUTES}m):\n$lines"
+        IO_ERROR_FREQ_SECTION="$(printf "%s\n" "$IO_ERROR_FREQ_SECTION" | trim_outer_blank_lines)"
     else
         IO_ERROR_FREQ_SECTION=""
     fi
@@ -2045,6 +2056,16 @@ sanitize_smart_for_inline() {
     out=${out%%, }
     out=$(printf "%s" "$out" | sed -E 's/, +, /, /g; s/, ,/, /g; s/ +,/,/g; s/, +/, /g; s/^, +//; s/, +$//')
     echo "$out"
+}
+
+# === Helper Function ===
+# Trim only leading and trailing blank-only lines, preserving internal blank lines
+trim_outer_blank_lines() {
+    awk 'BEGIN{seen=0;pending=""} {
+        if ($0 ~ /^[[:space:]]*$/) { if (seen) pending = pending $0 ORS; next }
+        if (pending) { printf "%s", pending; pending="" }
+        print; seen=1
+    } END{}'
 }
 
 # === Main Function ===
@@ -2366,6 +2387,9 @@ validate_storage_metrics() {
         fi
     fi
     STORAGE_VALIDATION_SECTION="$discrepancy_section"
+    if [[ -n "${STORAGE_VALIDATION_SECTION:-}" ]]; then
+        STORAGE_VALIDATION_SECTION="$(printf "%s\n" "$STORAGE_VALIDATION_SECTION" | trim_outer_blank_lines)"
+    fi
 }
 
 # === Main Function ===
@@ -2828,6 +2852,9 @@ build_recommendations() {
         fi
     fi
     RECOMMEND_SECTION="$rec"
+    if [[ -n "${RECOMMEND_SECTION:-}" ]]; then
+        RECOMMEND_SECTION="$(printf "%s\n" "$RECOMMEND_SECTION" | trim_outer_blank_lines)"
+    fi
 }
 
 # === Helper Function ===
@@ -2906,6 +2933,7 @@ build_disk_health_summary() {
         lines+=(" - No issues detected")
     fi
     DISK_HEALTH_SUMMARY="$(printf "%s\n" "${lines[@]}")"
+    DISK_HEALTH_SUMMARY="$(printf "%s\n" "$DISK_HEALTH_SUMMARY" | trim_outer_blank_lines)"
 }
 
 # === Main Function ===
@@ -3134,7 +3162,7 @@ build_risk_tier_trend_section() {
         for ((i=1;i<${#out_lines[@]};i++)); do
             RISK_TIER_TREND_SECTION+="\n ${out_lines[$i]}"
         done
-        RISK_TIER_TREND_SECTION+="\n"
+        RISK_TIER_TREND_SECTION="$(printf "%s\n" "$RISK_TIER_TREND_SECTION" | trim_outer_blank_lines)"
     fi
 }
 
@@ -3198,6 +3226,7 @@ compute_share_breakdown() {
     fi
     # Build share section with top sizes and (optional) growth list
     SHARE_SECTION="Top Shares by Size:\n${size_lines}$( [[ -n \"$growth_lines\" ]] && printf "Top Share Growth (last %sd):\n%s" "$win" "$growth_lines" )"
+    SHARE_SECTION="$(printf "%s\n" "$SHARE_SECTION" | trim_outer_blank_lines)"
 }
 
 # === Main Function ===
@@ -3282,6 +3311,7 @@ capacity_forecast_and_export() {
         lines_cf+=(" Stable: no meaningful growth detected in the last ${HISTORY_WINDOW_DAYS} days")
     fi
     CAPACITY_FORECAST="$(printf "%s\n" "${lines_cf[@]}")"
+    CAPACITY_FORECAST="$(printf "%s\n" "$CAPACITY_FORECAST" | trim_outer_blank_lines)"
     ARR_DAYS_TO_THRESHOLD="$arr_days_str"
     POOL_DAYS_TO_THRESHOLD="$pool_days_str"
     ARR_GROWTH_STR="$arr_g_str"
@@ -3337,6 +3367,7 @@ compute_disk_growth_top() {
         done < <(printf "%s\n" "$sorted")
         # Compose section listing the top growth disks with size-normalized percent/day
         DISK_GROWTH_SECTION="Top Disk Growth (last ${win}d):\n$out"
+        DISK_GROWTH_SECTION="$(printf "%s\n" "$DISK_GROWTH_SECTION" | trim_outer_blank_lines)"
     else
         DISK_GROWTH_SECTION=""
     fi
@@ -3461,6 +3492,7 @@ tbw_forecast_and_heavy_writers() {
     if [[ -n "$forecast_section" || -n "$heavy_section" ]]; then
         TBW_SECTION="TBW Forecast:
 ${forecast_section}$( [[ -n "$heavy_section" ]] && printf "Top Heavy Writers (normalized):\n%s" "$heavy_section" )"
+        TBW_SECTION="$(printf "%s\n" "$TBW_SECTION" | trim_outer_blank_lines)"
     else
         TBW_SECTION=""
     fi
@@ -3494,6 +3526,9 @@ detect_counter_resets() {
         fi
     done
     [[ -n "$events" ]] && FIRMWARE_EVENT_SECTION="Firmware Reset / Counter Regression:\n$events"
+    if [[ -n "${FIRMWARE_EVENT_SECTION:-}" ]]; then
+        FIRMWARE_EVENT_SECTION="$(printf "%s\n" "$FIRMWARE_EVENT_SECTION" | trim_outer_blank_lines)"
+    fi
     return 0
 }
 
@@ -3761,31 +3796,32 @@ build_btrfs_device_trend_section() {
     fi
     if [[ -n "$out$key_out$mount_out" ]]; then
         BTRFS_DEV_TREND_SECTION="Btrfs Device Error Trend (last ${win}d):\n${out}${mount_out:+Per-mount Totals:\n$mount_out}${key_out:+$key_out}"
+        BTRFS_DEV_TREND_SECTION="$(printf "%s\n" "$BTRFS_DEV_TREND_SECTION" | trim_outer_blank_lines)"
     else
         BTRFS_DEV_TREND_SECTION=""
     fi
 }
 log_info "Building health report sections..."
-log_debug "Summarizing disks and pools usage..."; build_storage_and_disk_lines; log_debug "Usage summary completed"
-log_debug "Checking capacity thresholds..."; evaluate_capacity_alerts; log_debug "Capacity threshold check completed"
-log_debug "Preparing parity summary..."; discover_parity_and_status; log_debug "Parity summary completed"
-log_debug "Collecting btrfs per-device stats..."; collect_btrfs_device_stats; log_debug "Btrfs device stats collection completed"
-log_debug "Collecting XFS /proc stats..."; collect_xfs_proc_stats; log_debug "XFS /proc stats collection completed"
-log_debug "Precomputing btrfs device trend aggregates..."; build_btrfs_device_trend_section; log_debug "Btrfs trend aggregates prepared"
-log_debug "Estimating capacity growth..."; capacity_forecast_and_export; log_debug "Capacity forecast completed"
-log_debug "Compiling recommendations..."; build_recommendations; log_debug "Recommendations compiled"
+log_info "Summarizing disks and pools usage..."; build_storage_and_disk_lines; log_info "Usage summary completed"
+log_info "Checking capacity thresholds..."; evaluate_capacity_alerts; log_info "Capacity threshold check completed"
+log_info "Preparing parity summary..."; discover_parity_and_status; log_info "Parity summary completed"
+log_info "Collecting btrfs per-device stats..."; collect_btrfs_device_stats; log_info "Btrfs device stats collection completed"
+log_info "Collecting XFS /proc stats..."; collect_xfs_proc_stats; log_info "XFS /proc stats collection completed"
+log_info "Precomputing btrfs device trend aggregates..."; build_btrfs_device_trend_section; log_info "Btrfs trend aggregates prepared"
+log_info "Estimating capacity growth..."; capacity_forecast_and_export; log_info "Capacity forecast completed"
+log_info "Compiling recommendations..."; build_recommendations; log_info "Recommendations compiled"
 build_subject
-log_debug "Building disk health summary..."; build_disk_health_summary; log_debug "Disk health summary completed"
-log_debug "Analyzing write rates and TBW forecasts..."; tbw_forecast_and_heavy_writers; log_debug "TBW analysis completed"
-log_debug "Summarizing subsystem statuses..."; build_subsystem_lines; log_debug "Subsystem summary completed"
-log_debug "Scoring disk risk and lifecycle buckets..."; compute_risk_and_lifecycle; log_debug "Risk and lifecycle scoring completed"
+log_info "Building disk health summary..."; build_disk_health_summary; log_info "Disk health summary completed"
+log_info "Analyzing write rates and TBW forecasts..."; tbw_forecast_and_heavy_writers; log_info "TBW analysis completed"
+log_info "Summarizing subsystem statuses..."; build_subsystem_lines; log_info "Subsystem summary completed"
+log_info "Scoring disk risk and lifecycle buckets..."; compute_risk_and_lifecycle; log_info "Risk and lifecycle scoring completed"
 log_info "Building post-processing sections..."
-log_debug "Validating storage metrics..."; validate_storage_metrics; log_debug "Storage metrics validation completed"
-log_debug "Analyzing top disk growth..."; compute_disk_growth_top; log_debug "Disk growth analysis completed"
-log_debug "Computing share sizes and growth (if enabled)..."; compute_share_breakdown; log_debug "Share analysis completed"
-log_debug "Scanning syslog for disk I/O errors..."; scan_syslog_disk_errors; log_debug "Syslog scan completed"
-log_debug "Recording today's risk tier counts..."; persist_risk_tier_history; log_debug "Risk tier counts recorded"
-log_debug "Summarizing recent risk trends..."; build_risk_tier_trend_section; log_debug "Risk trend summary completed"
+log_info "Validating storage metrics..."; validate_storage_metrics; log_info "Storage metrics validation completed"
+log_info "Analyzing top disk growth..."; compute_disk_growth_top; log_info "Disk growth analysis completed"
+log_info "Computing share sizes and growth (if enabled)..."; compute_share_breakdown; log_info "Share analysis completed"
+log_info "Scanning syslog for disk I/O errors..."; scan_syslog_disk_errors; log_info "Syslog scan completed"
+log_info "Recording today's risk tier counts..."; persist_risk_tier_history; log_info "Risk tier counts recorded"
+log_info "Summarizing recent risk trends..."; build_risk_tier_trend_section; log_info "Risk trend summary completed"
 log_info "Section build completed"
 
 # Format runtime string
@@ -3804,7 +3840,7 @@ fi
 # Build a conditional Risk block with surrounding spacing only when content exists
 RISK_BLOCK=""
 if [[ -n "${RISK_SECTION:-}" ]]; then
-    RISK_BLOCK="$(printf "%s\n" "${RISK_SECTION}" | awk 'BEGIN{start=0}{if($0 ~ /^[[:space:]]*$/){if(start) pending++ ; next} if(pending){pending=0} print; start=1} END{}')"
+    RISK_BLOCK="$(printf "%s\n" "${RISK_SECTION}" | trim_outer_blank_lines)"
 fi
 # Build Subsystems block per policy (auto|always|never)
 SUBSYSTEMS_BLOCK=""
@@ -3825,6 +3861,10 @@ case "${SHOW_SUBSYSTEMS_BLOCK:-auto}" in
         fi
         ;;
 esac
+# Trim outer blank lines for subsystem block, if any
+if [[ -n "${SUBSYSTEMS_BLOCK:-}" ]]; then
+    SUBSYSTEMS_BLOCK="$(printf "%s\n" "$SUBSYSTEMS_BLOCK" | trim_outer_blank_lines)"
+fi
 # Compose Array section to control spacing precisely
 ARRAY_SECTION="[Array Disks]:\n${PARITY_STATUS_LINE:-}\n"
 if [[ -n "${PARITY_DETAILS_SECTION:-}" ]]; then
@@ -3857,7 +3897,7 @@ _append_section() {
     NOTIFY_SECTIONS+=("$cleaned")
 }
 
-# Build variable sections from Disk Health onward, skipping hidden ones cleanly
+# Build variable sections, skipping hidden ones cleanly
 NOTIFY_SECTIONS=()
 _append_section "${ARRAY_SECTION:-}"
 _append_section "${POOL_SECTION:-}"
