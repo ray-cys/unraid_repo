@@ -522,8 +522,10 @@ tbw_threshold_tb_for_device() {
     local per_tb=0
     if echo "$model" | grep -qi 'MX500'; then per_tb=350; fi
     if echo "$model" | grep -qi 'WD Red' | grep -qi 'SA500'; then per_tb=600; fi
-    if echo "$model" | grep -qi 'T500'; then per_tb=600; fi
-    if echo "$model" | grep -qiE 'P3|P300'; then per_tb=220; fi
+    if echo "$model" | grep -qi 'Crucial.*T500'; then per_tb=600; fi
+        if echo "$model" | grep -qiE 'Crucial.*P5P|P5P'; then
+            awk -v c="$cap" 'BEGIN{exit !(c>=0.98 && c<=1.02)}' && per_tb=600
+        fi
     if (( per_tb == 0 )); then echo ""; return 0; fi
     awk -v c="$cap" -v p="$per_tb" 'BEGIN{printf "%.0f", c*p}'
 }
@@ -540,7 +542,11 @@ poh_thresholds_for_device() {
     local warn=0 crit=0
     if [[ "$dtype" == "nvme" ]]; then
         warn=$NVME_POH_WARN_HOURS; crit=$NVME_POH_CRIT_HOURS
-        # Model-specific override
+        # Model-specific overrides
+        if echo "$model" | grep -qiE 'Crucial.*P5P|P5P'; then
+            local cap=$(get_device_capacity_tb "$dev")
+            if awk -v c="$cap" 'BEGIN{exit !(c>=0.98 && c<=1.02)}'; then warn=4000; crit=6000; fi
+        fi
         if echo "$model" | grep -qiE 'Crucial.*T500|T500'; then warn=4000; crit=6000; fi
     else
         if [[ "$rota" == "1" ]]; then
