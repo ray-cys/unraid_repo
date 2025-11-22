@@ -65,6 +65,23 @@ SMART_TREND_ALERTS_ENABLED=1  # Emit warning alerts for SMART trend increases (0
 AGE_AWARE_ENABLED=0           # Annotate near-endurance devices (0=disable)
 NVME_WEAR_REGRESSION_WARN=1   # Flag any NVMe Percentage Used regression (0=disable)
 POH_RESET_CRIT_THRESHOLD=500  # POH drop > threshold -> critical reset event
+SMART_ATTR_TREND_ENABLED=1    # Show SMART attribute growth trend section (0=disable)
+SMART_ATTR_TREND_WINDOW_DAYS=7 # Days window for SMART attribute growth trend
+SMART_ATTR_TREND_TOP_N=5      # Top N disks by summed attribute delta
+SMART_ATTR_TREND_MIN_DELTA=1  # Minimum per-attribute delta to include in output
+ENDURANCE_DAYSLEFT_TREND_ENABLED=1  # Enable dedicated Endurance Days-Left shrink/acceleration trend
+ENDURANCE_DAYSLEFT_TOP_N=5          # Top N devices by shrink rate
+ENDURANCE_DAYSLEFT_ACCEL_FACTOR_PCT=50 # Last-day shrink exceeds avg by this percent -> acceleration flag
+ENDURANCE_DAYSLEFT_ACCEL_MIN_DELTA=0.5 # Minimum single-day shrink (days) to consider acceleration
+ERROR_RATE_TREND_ENABLED=1    # Enable Btrfs/XFS error rate acceleration trend (0=disable)
+ERROR_RATE_TREND_WINDOW_DAYS=7 # Days window for error acceleration analysis
+ERROR_RATE_TREND_TOP_N=5       # Top N accelerated devices/mounts
+ERROR_RATE_ACCEL_FACTOR_PCT=100 # Last interval delta > avg previous * (1+factor/100) => ACCEL
+ERROR_RATE_ACCEL_MIN_DELTA=2   # Minimum last-interval delta to consider acceleration
+CAPACITY_RISK_ACCEL_ENABLED=1   # Enable capacity risk (replace/monitor tier) acceleration section
+CAPACITY_RISK_ACCEL_WINDOW_DAYS=14 # Days window for risk acceleration analysis (dedup days)
+CAPACITY_RISK_ACCEL_FACTOR_PCT=100 # Last increase >= avg prior * (1+factor/100) => ACCEL
+CAPACITY_RISK_ACCEL_MIN_DELTA=1   # Minimum last increase to consider acceleration
 
 # === Export / History Toggles ===
 HISTORY_WINDOW_DAYS=7         # Days considered for usage growth trends
@@ -86,6 +103,12 @@ RISK_TOP_N=5                  # Entries shown in Risk Scores (top list)
 RISK_REPLACE=80               # Score >= goes to Replace Soon bucket
 RISK_MONITOR=50               # Score >= goes to Monitor bucket
 RISK_TREND_SHOW_ZERO=0        # Show zero-only lines in risk trend (0=hide)
+POH_TREND_ENABLED=1          # Enable POH aging trend snapshot & section
+TBW_TREND_ENABLED=1          # Enable TBW days-left trend snapshot & section
+ENDURANCE_TREND_WINDOW_DAYS=7 # Window (days) for endurance & aging trend
+ENDURANCE_TREND_TOP_N=5       # Top N devices to display per trend
+ENDURANCE_TREND_MIN_POH_DELTA=24    # Min POH hour delta to include device
+ENDURANCE_TREND_MIN_DAYSLEFT_DELTA=1.0 # Minimum absolute days-left delta to include
 
 # === Forecast / Notification Toggles ===
 FORECAST_HIDE_ZERO_GROWTH=1   # Hide lines showing ~0% growth (0=show)
@@ -285,7 +308,11 @@ HEAVY_WRITER_HISTORY_FILE="$STATE_DIR/heavy_writer_history.log" # Historical hea
 RISK_TIER_HISTORY_FILE="$STATE_DIR/risk_tier_history.log"       # Historical daily risk tier & lifecycle counts
 IO_ERROR_HISTORY_FILE="$STATE_DIR/io_error_history.log"         # Recent disk I/O error message hashes (epoch device hash)
 BTRFS_DEV_HIST_FILE="$STATE_DIR/btrfs_device_stats.history"     # Btrfs per-device stats history
+XFS_PROC_HISTORY_FILE="$STATE_DIR/xfs_proc_stats.history"       # XFS global stats history (dated)
 STORAGE_DISCREPANCY_STATE_FILE="$STATE_DIR/storage_discrepancy_streak.log" # Storage discrepancy streak state
+POH_HISTORY_FILE="$STATE_DIR/poh_history.log"                   # Daily per-disk POH snapshot
+TBW_DAYSLEFT_HISTORY_FILE="$STATE_DIR/tbw_daysleft_history.log" # Daily per-disk TBW days-left snapshot
+SMART_ATTR_HISTORY_FILE="$STATE_DIR/smart_attr_history.log"     # Daily per-disk SMART attribute snapshot
 CMD_TIMEOUT_LAST_FILE="$STATE_DIR/cmd_timeout_last.log"         # Last observed Command_Timeout counts per disk
 CMD_TIMEOUT_STATE_DIR="$STATE_DIR/cmd_timeout"                  # Cooldown timestamps for delta alerts
 UNSAFE_SDWN_STATE_DIR="$STATE_DIR/unsafe_shutdown"              # Per-device last warning timestamps for cooldown
@@ -392,6 +419,10 @@ notify_unraid() {
     add_if SMART "$sm_state"; add_if Btrfs "$bt_state"; add_if XFS "$xfs_state"; add_if Capacity "$cap_state"; add_if Parity "$pr_state"; add_if Per-Mount "$pm_state"
     local subsum=""; if (( ${#parts[@]} > 0 )); then subsum=$(IFS=' | '; echo "${parts[*]}"); fi
     local summary_line="${subsum}" # may be empty
+    # Provide default OK summary when empty and severity resolves to OK
+    if [[ -z "$summary_line" && "$sev_word" == "OK" ]]; then
+        summary_line="All monitored subsystems nominal"
+    fi
     # Normalize body for cleaner presentation (collapse multiple blank lines)
     local body_norm
     body_norm=$(printf "%s\n" "$body" | awk '{sub(/[ \t]+$/, "")} NF{print; blank=0; next} !blank{print ""; blank=1}')
@@ -1095,6 +1126,10 @@ evaluate_smart() {
         # Persist parsed NVMe attributes for downstream consumers
         CUR_ATTR["$disk|nvme_percent_used"]="$percent_used"
         CUR_ATTR["$disk|poh"]="$poh"
+        CUR_ATTR["$disk|unsafe_shutdowns"]="$unsafe_shutdowns"
+        CUR_ATTR["$disk|media_errors"]="$media_errors"
+        CUR_ATTR["$disk|err_logs"]="$err_logs"
+        CUR_ATTR["$disk|avail_spare"]="$avail_spare"
         # Retrieve and classify latest self-test; persist status and message
         local st_info st_class st_sev st_msg
         st_info=$(get_latest_selftest_info "$disk")
@@ -1311,6 +1346,17 @@ evaluate_smart() {
         # Persist POH and evaluate model-aware age thresholds for SATA (ROTA-aware)
         poh=$(echo "$attr" | awk '/Power_On_Hours/ {print $10; exit}')
         CUR_ATTR["$disk|poh"]="${poh:-0}"
+        CUR_ATTR["$disk|realloc"]="${realloc:-0}"
+        CUR_ATTR["$disk|pending"]="${pending:-0}"
+        CUR_ATTR["$disk|offunc"]="${offunc:-0}"
+        CUR_ATTR["$disk|reported_uncorr"]="${reported_uncorr:-0}"
+        CUR_ATTR["$disk|cmd_timeout"]="${cmd_timeout:-0}"
+        CUR_ATTR["$disk|realloc_events"]="${realloc_events:-0}"
+        CUR_ATTR["$disk|end2end"]="${end2end:-0}"
+        CUR_ATTR["$disk|soft_read_err"]="${soft_read_err:-0}"
+        CUR_ATTR["$disk|udma"]="${udma:-0}"
+        CUR_ATTR["$disk|lcc"]="${lcc:-0}"
+        CUR_ATTR["$disk|temp"]="${temp:-0}"
         if [[ -n "${poh:-}" && "$poh" =~ ^[0-9]+$ ]]; then
             local _poh_w _poh_c
             read -r _poh_w _poh_c < <(poh_thresholds_for_device "$disk" "sata" "$rota")
@@ -2041,6 +2087,39 @@ augment_messages_with_deltas
 save_nvme_state
 save_long_last_poh
 save_cmd_timeout_last
+# Persist daily POH snapshot for aging trend (once per day)
+if (( POH_TREND_ENABLED == 1 )); then
+    today=$(date +%Y-%m-%d)
+    if [[ -f "$POH_HISTORY_FILE" ]]; then
+        tmp=$(mktemp)
+        awk -v d="$today" '$1!=d' "$POH_HISTORY_FILE" > "$tmp" 2>/dev/null || true
+        mv -f "$tmp" "$POH_HISTORY_FILE" 2>/dev/null || rm -f "$tmp" || true
+    fi
+    for disk in "${!SMART_STATE[@]}"; do
+        poh=${CUR_ATTR["$disk|poh"]:-}
+        if [[ -n "$poh" && "$poh" =~ ^[0-9]+$ ]]; then
+            echo "$today $disk poh=$poh" >> "$POH_HISTORY_FILE"
+        fi
+    done
+fi
+ # Persist daily SMART attribute snapshot (once per day)
+ if (( SMART_ATTR_TREND_ENABLED == 1 )); then
+    today=$(date +%Y-%m-%d)
+    if [[ -f "$SMART_ATTR_HISTORY_FILE" ]]; then
+        tmp=$(mktemp)
+        awk -v d="$today" '$1!=d' "$SMART_ATTR_HISTORY_FILE" > "$tmp" 2>/dev/null || true
+        mv -f "$tmp" "$SMART_ATTR_HISTORY_FILE" 2>/dev/null || rm -f "$tmp" || true
+    fi
+    for disk in "${!SMART_STATE[@]}"; do
+        # Build compact attribute line: date device attr=value ... (subset of noisy attrs)
+        line="$today $disk"
+        for key in realloc pending offunc reported_uncorr cmd_timeout realloc_events udma soft_read_err nvme_percent_used unsafe_shutdowns media_errors err_logs poh; do
+            val=${CUR_ATTR["$disk|$key"]:-}
+            [[ -n "$val" ]] && line+=" $key=$val"
+        done
+        echo "$line" >> "$SMART_ATTR_HISTORY_FILE"
+    done
+ fi
 monitor_btrfs
 log_info "Btrfs: scrub status assessed"
 
@@ -2983,6 +3062,9 @@ build_health_alerts() {
     HEALTH_ALERTS_SECTION="$rec"
     if [[ -n "${HEALTH_ALERTS_SECTION:-}" ]]; then
         HEALTH_ALERTS_SECTION="$(printf "%s\n" "$HEALTH_ALERTS_SECTION" | trim_outer_blank_lines)"
+    else
+        # Provide a default informational message when no health alerts were generated
+        HEALTH_ALERTS_SECTION="Health Alerts:\n - None detected; all monitored disks and filesystems nominal."
     fi
 }
 
@@ -3190,35 +3272,37 @@ compute_risk_and_lifecycle() {
     # Assemble Risk section text with guidance and optional lifecycle/age subsections
     RISK_SECTION=""
     if (( RISK_SCORING_ENABLED==1 )); then
-        local intro_line="Highest Risk Disks (top ${RISK_TOP_N}):"
-        RISK_SECTION+="${intro_line}\n"
-        if (( ${#replace_inline[@]} > 0 )); then
-            RISK_SECTION+="Replace-tier [${replace_inline[*]}]\n"
-        fi
-        if (( ${#monitor_inline[@]} > 0 )); then
-            RISK_SECTION+="Monitor-tier [${monitor_inline[*]}]\n"
-        fi
-        # Only show healthy tier in this top list if no replace/monitor entries populated
-        if (( ${#replace_inline[@]} == 0 && ${#monitor_inline[@]} == 0 && ${#healthy_inline[@]} > 0 )); then
-            RISK_SECTION+="Healthy-tier [${healthy_inline[*]}]\n"
-        fi
-        if (( more > 0 )); then
-            RISK_SECTION+="(+${more} more)\n"
-        fi
-        if (( total_display > 0 )); then
+        # Build Highest Risk block only if any replace/monitor disks exist
+        if (( ${#replace_inline[@]} > 0 || ${#monitor_inline[@]} > 0 )); then
+            local intro_line="Highest Risk Disks (top ${RISK_TOP_N}):"
+            RISK_SECTION+="${intro_line}\n"
+            if (( ${#replace_inline[@]} > 0 )); then
+                RISK_SECTION+="Replace-tier [${replace_inline[*]}]\n"
+            fi
+            if (( ${#monitor_inline[@]} > 0 )); then
+                RISK_SECTION+="Monitor-tier [${monitor_inline[*]}]\n"
+            fi
+            if (( more > 0 )); then
+                RISK_SECTION+="(+${more} more)\n"
+            fi
             RISK_SECTION+="Action: Replace-tier -> migrate soon; Monitor-tier -> diagnostics.\n"
-        elif (( ${#healthy_inline[@]} == 0 )); then
-            # Nothing to show (all scores zero & filtered or only md devices) -> explicit none line
-            RISK_SECTION+="None (all disk scores below monitor threshold)\n"
         fi
     fi
     if (( LIFECYCLE_ENABLED==1 )); then
-        if (( SHOW_EMPTY_BUCKETS==1 )) || [[ -n "$lifecycle_lines" ]]; then
-            if [[ -n "$RISK_SECTION" ]]; then RISK_SECTION+=$'\n'; fi
-            RISK_SECTION+="Lifecycle Buckets (disks grouped by urgency):\n${lifecycle_lines}\n"
+        # Suppress lifecycle bucket block entirely if all disks are healthy (no replace/monitor)
+        if (( ${#replace[@]} > 0 || ${#monitor[@]} > 0 )); then
+            if (( SHOW_EMPTY_BUCKETS==1 )) || [[ -n "$lifecycle_lines" ]]; then
+                if [[ -n "$RISK_SECTION" ]]; then RISK_SECTION+=$'\n'; fi
+                RISK_SECTION+="Lifecycle Buckets (disks grouped by urgency):\n${lifecycle_lines}\n"
+            fi
         fi
     fi
-    if (( AGE_AWARE_ENABLED==1 )) && [[ -n "$age_lines" ]]; then RISK_SECTION+="\nPOH Age Awareness:\n${age_lines}"; fi
+    if (( AGE_AWARE_ENABLED==1 )) && [[ -n "$age_lines" ]]; then
+        if [[ -n "$RISK_SECTION" ]]; then
+            RISK_SECTION+=$'\n'
+        fi
+        RISK_SECTION+="POH Age Awareness:\n${age_lines}"
+    fi
 }
 
 # === Helper Function ===
@@ -3292,6 +3376,81 @@ build_risk_tier_trend_section() {
         done
         RISK_TIER_TREND_SECTION="$(printf "%s\n" "$RISK_TIER_TREND_SECTION" | trim_outer_blank_lines)"
     fi
+}
+
+# === Helper Function ===
+# Build Capacity Risk Acceleration (replace/monitor tier count acceleration)
+build_capacity_risk_accel_section() {
+    CAPACITY_RISK_ACCEL_SECTION=""
+    (( CAPACITY_RISK_ACCEL_ENABLED == 1 )) || { CAPACITY_RISK_ACCEL_SECTION=""; return 0; }
+    [[ -f "$RISK_TIER_HISTORY_FILE" ]] || { CAPACITY_RISK_ACCEL_SECTION=""; return 0; }
+    local win=${CAPACITY_RISK_ACCEL_WINDOW_DAYS:-14}
+    local cutoff=$(date -d "-$win days" +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)
+    # Load unique dated lines within window in chronological order
+    local lines
+    lines=$(tac "$RISK_TIER_HISTORY_FILE" 2>/dev/null | awk '!seen[$1]++ {print}' | tac | awk -v c="$cutoff" '$1>=c')
+    [[ -z "$lines" ]] && { CAPACITY_RISK_ACCEL_SECTION=""; return 0; }
+    local dates=() replace_counts=() monitor_counts=()
+    while read -r line; do
+        [[ -z "$line" ]] && continue
+        local dt rep mon tok
+        dt=$(echo "$line" | awk '{print $1}')
+        rep=$(echo "$line" | awk '{for(i=1;i<=NF;i++){if($i ~ /^replace=/){sub(/replace=/,"",$i); print $i; break}}}')
+        mon=$(echo "$line" | awk '{for(i=1;i<=NF;i++){if($i ~ /^monitor=/){sub(/monitor=/,"",$i); print $i; break}}}')
+        rep=${rep:-0}; mon=${mon:-0}
+        dates+=("$dt"); replace_counts+=("$rep"); monitor_counts+=("$mon")
+    done < <(printf "%s
+" "$lines")
+    local n=${#dates[@]}
+    (( n < 2 )) && { CAPACITY_RISK_ACCEL_SECTION=""; return 0; }
+    # Build per-interval deltas
+    local rep_deltas=() mon_deltas=() i
+    for ((i=1;i<n;i++)); do
+        local prev_rep=${replace_counts[$((i-1))]} cur_rep=${replace_counts[$i]}
+        local prev_mon=${monitor_counts[$((i-1))]} cur_mon=${monitor_counts[$i]}
+        rep_deltas+=( $(( cur_rep - prev_rep )) )
+        mon_deltas+=( $(( cur_mon - prev_mon )) )
+    done
+    local accel_factor=${CAPACITY_RISK_ACCEL_FACTOR_PCT:-100}
+    local accel_min=${CAPACITY_RISK_ACCEL_MIN_DELTA:-1}
+    local rep_flag="" mon_flag=""
+    if (( ${#rep_deltas[@]} > 1 )); then
+        local last=${rep_deltas[-1]}
+        local sum=0 cnt=0 d
+        for d in "${rep_deltas[@]:0:${#rep_deltas[@]}-1}"; do
+            (( d>0 )) && { sum=$(( sum + d )); ((cnt++)) ; }
+        done
+        if (( cnt>0 )) && awk -v l="$last" -v s="$sum" -v c="$cnt" -v f="$accel_factor" -v m="$accel_min" 'BEGIN{avg=s/c; exit (l>=m && avg>0 && l>=avg*(1+f/100))?0:1}'; then
+            rep_flag="ACCEL"
+        fi
+    fi
+    if (( ${#mon_deltas[@]} > 1 )); then
+        local last=${mon_deltas[-1]}
+        local sum=0 cnt=0 d
+        for d in "${mon_deltas[@]:0:${#mon_deltas[@]}-1}"; do
+            (( d>0 )) && { sum=$(( sum + d )); ((cnt++)) ; }
+        done
+        if (( cnt>0 )) && awk -v l="$last" -v s="$sum" -v c="$cnt" -v f="$accel_factor" -v m="$accel_min" 'BEGIN{avg=s/c; exit (l>=m && avg>0 && l>=avg*(1+f/100))?0:1}'; then
+            mon_flag="ACCEL"
+        fi
+    fi
+    # Compute simple average growth (excluding last) for display
+    local rep_avg="0" mon_avg="0"
+    if (( ${#rep_deltas[@]} > 1 )); then
+        local sum=0 cnt=0 d
+        for d in "${rep_deltas[@]:0:${#rep_deltas[@]}-1}"; do (( d>0 )) && { sum=$(( sum + d )); ((cnt++)); }; done
+        rep_avg=$(awk -v s="$sum" -v c="$cnt" 'BEGIN{if(c>0)printf "%.2f", s/c; else print 0}')
+    fi
+    if (( ${#mon_deltas[@]} > 1 )); then
+        local sum=0 cnt=0 d
+        for d in "${mon_deltas[@]:0:${#mon_deltas[@]}-1}"; do (( d>0 )) && { sum=$(( sum + d )); ((cnt++)); }; done
+        mon_avg=$(awk -v s="$sum" -v c="$cnt" 'BEGIN{if(c>0)printf "%.2f", s/c; else print 0}')
+    fi
+    local rep_last=${rep_deltas[-1]:-0} mon_last=${mon_deltas[-1]:-0}
+    local section="Capacity Risk Acceleration (replace/monitor tiers):\n"
+    section+=" - Replace-tier last +${rep_last} (avg +${rep_avg})${rep_flag:+, $rep_flag}\n"
+    section+=" - Monitor-tier last +${mon_last} (avg +${mon_avg})${mon_flag:+, $mon_flag}"
+    CAPACITY_RISK_ACCEL_SECTION="$(printf "%s\n" "$section" | trim_outer_blank_lines)"
 }
 
 # === Main Function ===
@@ -3496,6 +3655,8 @@ compute_disk_growth_top() {
             fi
             out+="\n"
         done < <(printf "%s\n" "$sorted")
+        out="${out%$'\n'}" 
+        out="${out%\\n}" 
         # Compose section listing the top growth disks with size-normalized percent/day
         DISK_GROWTH_SECTION="Top Disk Growth (last ${win}d):\n$out"
         DISK_GROWTH_SECTION="$(printf "%s\n" "$DISK_GROWTH_SECTION" | trim_outer_blank_lines)"
@@ -3627,14 +3788,452 @@ tbw_forecast_and_heavy_writers() {
         fi
         forecast_section+=" - $(basename "$dev") ${daily_hr}/day -> ${days_left}d (${status}) to ${target_label}\n"
     done
+    forecast_section="${forecast_section%$'\n'}" 
+    forecast_section="${forecast_section%\\n}" 
     if [[ -n "$forecast_section" || -n "$heavy_section" ]]; then
+        heavy_section="${heavy_section%$'\n'}"
+        heavy_section="${heavy_section%\\n}"
         TBW_SECTION="TBW Forecast:\n${forecast_section}"
         if [[ -n "$heavy_section" ]]; then
-            TBW_SECTION+="Top Heavy Writers (normalized):\n${heavy_section}"
+            TBW_SECTION+=$'\n\n'"Top Heavy Writers (normalized):\n${heavy_section}"
         fi
         TBW_SECTION="$(printf "%s\n" "$TBW_SECTION" | trim_outer_blank_lines)"
     else
         TBW_SECTION=""
+    fi
+    # Persist TBW days-left snapshot (once daily) for trend analysis
+    if (( TBW_TREND_ENABLED == 1 )) && [[ -n "${TBW_DAYS_LEFT[@]:-}" ]]; then
+        local today=$(date +%Y-%m-%d)
+        if [[ -f "$TBW_DAYSLEFT_HISTORY_FILE" ]]; then
+            local tmp=$(mktemp)
+            awk -v d="$today" '$1!=d' "$TBW_DAYSLEFT_HISTORY_FILE" > "$tmp" 2>/dev/null || true
+            mv -f "$tmp" "$TBW_DAYSLEFT_HISTORY_FILE" 2>/dev/null || rm -f "$tmp" || true
+        fi
+        for dev in "${!TBW_DAYS_LEFT[@]}"; do
+            local dl="${TBW_DAYS_LEFT[$dev]}"
+            [[ -n "$dl" ]] && echo "$today $dev days_left=${dl}" >> "$TBW_DAYSLEFT_HISTORY_FILE"
+        done
+    fi
+}
+
+# === Helper Function ===
+# Build combined POH aging and TBW days-left change trend section
+build_endurance_trend_section() {
+    ENDURANCE_TREND_SECTION=""
+    (( POH_TREND_ENABLED == 1 || TBW_TREND_ENABLED == 1 )) || { ENDURANCE_TREND_SECTION=""; return 0; }
+    local win=${ENDURANCE_TREND_WINDOW_DAYS:-7}
+    local cutoff
+    cutoff=$(date -d "-$win days" +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)
+    local poh_lines dl_lines
+    [[ -f "$POH_HISTORY_FILE" ]] && poh_lines=$(tail -n 50000 "$POH_HISTORY_FILE" 2>/dev/null || true) || poh_lines=""
+    [[ -f "$TBW_DAYSLEFT_HISTORY_FILE" ]] && dl_lines=$(tail -n 50000 "$TBW_DAYSLEFT_HISTORY_FILE" 2>/dev/null || true) || dl_lines=""
+
+    # --- POH Aging Trend ---
+    local poh_rank=()
+    if (( POH_TREND_ENABLED == 1 )) && [[ -n "$poh_lines" ]]; then
+        local tmp=$(mktemp)
+        printf "%s\n" "$poh_lines" | awk -v c="$cutoff" '$1>=c{print}' | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="poh") v=a[2]} if(d!="" && v!=""){print $1,d,v}}' > "$tmp"
+        declare -A first_dt first_v last_dt last_v
+        while read -r dt dev v; do
+            [[ -z "$dev" || -z "$v" ]] && continue
+            if [[ -z "${first_dt[$dev]:-}" || "$dt" < "${first_dt[$dev]}" ]]; then first_dt[$dev]="$dt"; first_v[$dev]="$v"; fi
+            if [[ -z "${last_dt[$dev]:-}" || "$dt" > "${last_dt[$dev]}" ]]; then last_dt[$dev]="$dt"; last_v[$dev]="$v"; fi
+        done < "$tmp"
+        rm -f "$tmp"
+        for dev in "${!last_v[@]}"; do
+            local start=${first_v[$dev]:-0} end=${last_v[$dev]:-0}
+            if [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && $end -gt $start ]]; then
+                local delta=$(( end - start ))
+                if (( delta >= ENDURANCE_TREND_MIN_POH_DELTA )); then
+                    poh_rank+=("$delta $dev $start $end")
+                fi
+            fi
+        done
+    fi
+    local poh_section=""
+    if (( ${#poh_rank[@]} > 0 )); then
+        local sorted=$(printf "%s\n" "${poh_rank[@]}" | sort -nr -k1,1 | head -n ${ENDURANCE_TREND_TOP_N:-5})
+        while read -r delta dev start end; do
+            [[ -z "$dev" ]] && continue
+            poh_section+=" - $(basename "$dev") +${delta}h (${start}h -> ${end}h)\n"
+        done < <(printf "%s\n" "$sorted")
+        poh_section="POH Aging (last ${win}d):\n${poh_section%$'\n'}"
+    fi
+
+    # --- TBW Days-Left Trend ---
+    local dl_rank=()
+    if (( TBW_TREND_ENABLED == 1 )) && [[ -n "$dl_lines" ]]; then
+        local tmp=$(mktemp)
+        printf "%s\n" "$dl_lines" | awk -v c="$cutoff" '$1>=c{print}' | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="days_left") v=a[2]} if(d!="" && v!=""){print $1,d,v}}' > "$tmp"
+        declare -A first_dt2 first_v2 last_dt2 last_v2
+        while read -r dt dev v; do
+            [[ -z "$dev" || -z "$v" ]] && continue
+            if [[ -z "${first_dt2[$dev]:-}" || "$dt" < "${first_dt2[$dev]}" ]]; then first_dt2[$dev]="$dt"; first_v2[$dev]="$v"; fi
+            if [[ -z "${last_dt2[$dev]:-}" || "$dt" > "${last_dt2[$dev]}" ]]; then last_dt2[$dev]="$dt"; last_v2[$dev]="$v"; fi
+        done < "$tmp"
+        rm -f "$tmp"
+        for dev in "${!last_v2[@]}"; do
+            local start=${first_v2[$dev]:-0} end=${last_v2[$dev]:-0}
+            if [[ "$start" =~ ^[0-9]+(\.[0-9]+)?$ && "$end" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                local delta
+                delta=$(awk -v s="$start" -v e="$end" 'BEGIN{printf "%.2f", e-s}')
+                # Focus on decreasing days_left (consumption acceleration)
+                if awk -v d="$delta" -v thr="-$ENDURANCE_TREND_MIN_DAYSLEFT_DELTA" 'BEGIN{exit (d <= thr)?0:1}'; then
+                    # Store absolute magnitude for sort (most negative first)
+                    local absd=$(awk -v d="$delta" 'BEGIN{printf "%.2f", (d<0)? -d : d}')
+                    dl_rank+=("$absd $dev $start $end $delta")
+                fi
+            fi
+        done
+    fi
+    local dl_section=""
+    if (( ${#dl_rank[@]} > 0 )); then
+        local sorted=$(printf "%s\n" "${dl_rank[@]}" | sort -nr -k1,1 | head -n ${ENDURANCE_TREND_TOP_N:-5})
+        while read -r absd dev start end delta; do
+            [[ -z "$dev" ]] && continue
+            dl_section+=" - $(basename "$dev") ${delta}d (${start}d -> ${end}d)\n"
+        done < <(printf "%s\n" "$sorted")
+        dl_section="TBW Days-Left Change (last ${win}d):\n${dl_section%$'\n'}"
+    fi
+
+    if [[ -n "$poh_section" || -n "$dl_section" ]]; then
+        ENDURANCE_TREND_SECTION="Endurance Aging Trend:\n${poh_section}${poh_section:+$'\n'}${dl_section}"
+        ENDURANCE_TREND_SECTION="$(printf "%s\n" "$ENDURANCE_TREND_SECTION" | trim_outer_blank_lines)"
+    else
+        ENDURANCE_TREND_SECTION=""
+    fi
+}
+
+# === Helper Function ===
+# Build SMART attribute growth trend section over window
+build_smart_attr_trend_section() {
+    SMART_ATTR_TREND_SECTION=""
+    (( SMART_ATTR_TREND_ENABLED == 1 )) || { SMART_ATTR_TREND_SECTION=""; return 0; }
+    local win=${SMART_ATTR_TREND_WINDOW_DAYS:-7}
+    local cutoff
+    cutoff=$(date -d "-$win days" +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)
+    [[ -f "$SMART_ATTR_HISTORY_FILE" ]] || { SMART_ATTR_TREND_SECTION=""; return 0; }
+    local lines
+    lines=$(tail -n 50000 "$SMART_ATTR_HISTORY_FILE" 2>/dev/null || true)
+    [[ -z "$lines" ]] && { SMART_ATTR_TREND_SECTION=""; return 0; }
+    local tmp=$(mktemp)
+    printf "%s\n" "$lines" | awk -v c="$cutoff" '$1>=c' > "$tmp"
+    declare -A first_line last_line first_dt last_dt
+    while read -r dt dev rest; do
+        [[ -z "$dt" || -z "$dev" ]] && continue
+        if [[ -z "${first_dt[$dev]:-}" || "$dt" < "${first_dt[$dev]}" ]]; then first_dt[$dev]="$dt"; first_line[$dev]="$rest"; fi
+        if [[ -z "${last_dt[$dev]:-}" || "$dt" > "${last_dt[$dev]}" ]]; then last_dt[$dev]="$dt"; last_line[$dev]="$rest"; fi
+    done < "$tmp"
+    rm -f "$tmp"
+    local min_delta=${SMART_ATTR_TREND_MIN_DELTA:-1}
+    local rank_nvme=() rank_sata=()
+    local attrs=(realloc pending reported_uncorr offunc cmd_timeout realloc_events udma soft_read_err nvme_percent_used unsafe_shutdowns media_errors err_logs)
+    for dev in "${!last_line[@]}"; do
+        local f="${first_line[$dev]}" l="${last_line[$dev]}"
+        declare -A fv lv
+        for token in $f; do k=${token%%=*}; v=${token#*=}; fv[$k]="$v"; done
+        for token in $l; do k=${token%%=*}; v=${token#*=}; lv[$k]="$v"; done
+        local deltas=() total=0 show=0
+        for a in "${attrs[@]}"; do
+            local sv=${fv[$a]:-} ev=${lv[$a]:-}
+            [[ -z "$sv" || -z "$ev" ]] && continue
+            if [[ "$sv" =~ ^[0-9]+(\.[0-9]+)?$ && "$ev" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                local delta
+                delta=$(awk -v s="$sv" -v e="$ev" 'BEGIN{printf "%.2f", e-s}')
+                # Only include positive growth
+                if awk -v d="$delta" -v m="$min_delta" 'BEGIN{exit (d>=m)?0:1}'; then
+                    show=1
+                    # Sum as integer part for ranking
+                    local dint=$(awk -v d="$delta" 'BEGIN{printf "%d", d}')
+                    total=$(( total + dint ))
+                    deltas+=("${a}:+${delta}")
+                fi
+            fi
+        done
+        if (( show == 1 )); then
+            if [[ "$dev" == /dev/nvme* ]]; then
+                rank_nvme+=("$total $dev ${deltas[*]}")
+            else
+                # Classify SATA SSD vs HDD by ROTA (0=SSD). Treat only SSD for attribute growth list.
+                local rota
+                rota=$(lsblk -dn -o ROTA "$dev" 2>/dev/null || echo 1)
+                if [[ "$rota" == "0" ]]; then
+                    rank_sata+=("$total $dev ${deltas[*]}")
+                fi
+            fi
+        fi
+    done
+    local out_all=""
+    if (( ${#rank_nvme[@]} > 0 )); then
+        local sorted_nvme=$(printf "%s\n" "${rank_nvme[@]}" | sort -nr -k1,1 | head -n ${SMART_ATTR_TREND_TOP_N:-5})
+        out_all+="NVMe:\n"
+        while read -r total dev rest; do
+            [[ -z "$dev" ]] && continue
+            out_all+=" - $(basename \"$dev\") ${rest// /, }\n"
+        done < <(printf "%s\n" "$sorted_nvme")
+    fi
+    if (( ${#rank_sata[@]} > 0 )); then
+        local sorted_sata=$(printf "%s\n" "${rank_sata[@]}" | sort -nr -k1,1 | head -n ${SMART_ATTR_TREND_TOP_N:-5})
+        out_all+=$'\n'SATA' SSD:'$'\n'
+        while read -r total dev rest; do
+            [[ -z "$dev" ]] && continue
+            out_all+=" - $(basename \"$dev\") ${rest// /, }\n"
+        done < <(printf "%s\n" "$sorted_sata")
+    fi
+    out_all=$(printf "%s\n" "$out_all" | sed '/^$/N;/^\n$/D')
+    out_all="${out_all%$'\n'}"
+    if printf "%s" "$out_all" | grep -q '[^[:space:]]'; then
+        SMART_ATTR_TREND_SECTION="SMART Attribute Growth (last ${win}d):\n$out_all"
+        SMART_ATTR_TREND_SECTION="$(printf "%s\n" "$SMART_ATTR_TREND_SECTION" | trim_outer_blank_lines)"
+    else
+        SMART_ATTR_TREND_SECTION=""
+    fi
+}
+
+# === Helper Function ===
+# Build dedicated Endurance Days-Left shrink & acceleration trend (SSD/NVMe only)
+build_endurance_daysleft_trend_section() {
+    ENDURANCE_DAYSLEFT_TREND_SECTION=""
+    (( ENDURANCE_DAYSLEFT_TREND_ENABLED == 1 )) || { ENDURANCE_DAYSLEFT_TREND_SECTION=""; return 0; }
+    [[ -f "$TBW_DAYSLEFT_HISTORY_FILE" ]] || { ENDURANCE_DAYSLEFT_TREND_SECTION=""; return 0; }
+    local win=${ENDURANCE_TREND_WINDOW_DAYS:-7}
+    local cutoff
+    cutoff=$(date -d "-$win days" +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)
+    local lines
+    lines=$(tail -n 50000 "$TBW_DAYSLEFT_HISTORY_FILE" 2>/dev/null || true)
+    [[ -z "$lines" ]] && { ENDURANCE_DAYSLEFT_TREND_SECTION=""; return 0; }
+    local tmp=$(mktemp)
+    printf "%s\n" "$lines" | awk -v c="$cutoff" '$1>=c' > "$tmp"
+    declare -A seq_map
+    while read -r dt dev rest; do
+        [[ -z "$dt" || -z "$dev" ]] && continue
+        local v=""
+        v=$(echo "$rest" | awk -F'[ =]' '/days_left/ {for(i=1;i<=NF;i++){if($i ~ /^days_left=/){sub(/days_left=/,"",$i); print $i; break}}}')
+        [[ -z "$v" ]] && continue
+        seq_map["$dev"]+="${dt}:${v} "
+    done < "$tmp"
+    rm -f "$tmp"
+    local accel_factor=${ENDURANCE_DAYSLEFT_ACCEL_FACTOR_PCT:-50}
+    local accel_min_delta=${ENDURANCE_DAYSLEFT_ACCEL_MIN_DELTA:-0.5}
+    local rank=()
+    for dev in "${!seq_map[@]}"; do
+        # Filter for NVMe or SATA SSD (ROTA=0)
+        if [[ "$dev" != /dev/nvme* ]]; then
+            local rota
+            rota=$(lsblk -dn -o ROTA "$dev" 2>/dev/null || echo 1)
+            [[ "$rota" != "0" ]] && continue
+        fi
+        local entries=( ${seq_map[$dev]} )
+        (( ${#entries[@]} < 2 )) && continue
+        # Sort by date
+        local sorted=$(printf "%s\n" "${entries[@]}" | awk -F: '{print $1,$2}' | sort -k1,1)
+        local first_dt first_v last_dt last_v prev_dt prev_v
+        local daily_deltas=()
+        while read -r dt v; do
+            [[ -z "$dt" || -z "$v" ]] && continue
+            if [[ -z "$first_dt" ]]; then first_dt="$dt"; first_v="$v"; fi
+            if [[ -n "$prev_dt" ]]; then
+                if [[ "$prev_v" =~ ^[0-9]+(\.[0-9]+)?$ && "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                    local dlt
+                    dlt=$(awk -v p="$prev_v" -v c="$v" 'BEGIN{printf "%.3f", c-p}')
+                    daily_deltas+=("$dlt")
+                fi
+            fi
+            prev_dt="$dt"; prev_v="$v"; last_dt="$dt"; last_v="$v"
+        done < <(printf "%s\n" "$sorted")
+        [[ -z "$first_v" || -z "$last_v" ]] && continue
+        if [[ "$first_v" =~ ^[0-9]+(\.[0-9]+)?$ && "$last_v" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            # Shrink is negative change (last - first)
+            local shrink
+            shrink=$(awk -v s="$first_v" -v e="$last_v" 'BEGIN{printf "%.3f", e-s}')
+            # We focus only if shrinking (negative value)
+            awk -v sh="$shrink" 'BEGIN{exit (sh<0)?0:1}' || continue
+            local days_interval=$(( ( $(date -d "$last_dt" +%s 2>/dev/null || date +%s) - $(date -d "$first_dt" +%s 2>/dev/null || date +%s) ) / 86400 ))
+            (( days_interval<=0 )) && days_interval=1
+            local rate
+            rate=$(awk -v sh="$shrink" -v d="$days_interval" 'BEGIN{printf "%.3f", sh/d}')
+            # Acceleration: compare last delta (should be negative) magnitude vs average previous negative deltas
+            local accel_flag=""
+            if (( ${#daily_deltas[@]} > 1 )); then
+                local last_delta=${daily_deltas[-1]}
+                # Average excluding last
+                local sum=0 cnt=0 d
+                for d in "${daily_deltas[@]:0:${#daily_deltas[@]}-1}"; do
+                    if awk -v x="$d" 'BEGIN{exit (x<0)?0:1}'; then
+                        sum=$(awk -v s="$sum" -v x="$d" 'BEGIN{printf "%.3f", s + x}')
+                        ((cnt++))
+                    fi
+                done
+                if (( cnt > 0 )) && awk -v ld="$last_delta" -v mn="$accel_min_delta" 'BEGIN{exit (ld<=-mn)?0:1}'; then
+                    local avg=$(awk -v s="$sum" -v c="$cnt" 'BEGIN{printf "%.3f", s/c}')
+                    # ld more negative than avg by factor
+                    if awk -v ld="$last_delta" -v avg="$avg" -v pct="$accel_factor" 'BEGIN{exit (avg!=0 && ( (ld/avg) <= ( -1 - pct/100 ) ))?0:1}'; then
+                        accel_flag="ACCEL"
+                    fi
+                fi
+            fi
+            # Ranking by absolute shrink rate (per day magnitude)
+            local abs_rate=$(awk -v r="$rate" 'BEGIN{printf "%.3f", (r<0)? -r : r}')
+            rank+=("$abs_rate $dev $first_v $last_v $shrink $rate $accel_flag")
+        fi
+    done
+    if (( ${#rank[@]} > 0 )); then
+        local sorted=$(printf "%s\n" "${rank[@]}" | sort -nr -k1,1 | head -n ${ENDURANCE_DAYSLEFT_TOP_N:-5})
+        local out=""
+        while read -r abs_rate dev start end shrink rate accel; do
+            [[ -z "$dev" ]] && continue
+            out+=" - $(basename \"$dev\") shrink ${shrink}d (${start}d -> ${end}d) rate ${rate}d/day${accel:+, $accel}\n"
+        done < <(printf "%s\n" "$sorted")
+        out=${out%$'\n'}
+        ENDURANCE_DAYSLEFT_TREND_SECTION="Endurance Days-Left Trend (last ${win}d):\n$out"
+        ENDURANCE_DAYSLEFT_TREND_SECTION="$(printf "%s\n" "$ENDURANCE_DAYSLEFT_TREND_SECTION" | trim_outer_blank_lines)"
+    else
+        ENDURANCE_DAYSLEFT_TREND_SECTION=""
+    fi
+}
+
+# === Helper Function ===
+# Build Btrfs/XFS Error Rate Acceleration Trend Section
+build_error_rate_accel_section() {
+    ERROR_RATE_ACCEL_SECTION=""
+    (( ERROR_RATE_TREND_ENABLED == 1 )) || { ERROR_RATE_ACCEL_SECTION=""; return 0; }
+    local win=${ERROR_RATE_TREND_WINDOW_DAYS:-7}
+    local cutoff
+    cutoff=$(date -d "-$win days" +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)
+    local accel_factor=${ERROR_RATE_ACCEL_FACTOR_PCT:-100}
+    local accel_min=${ERROR_RATE_ACCEL_MIN_DELTA:-2}
+    local top=${ERROR_RATE_TREND_TOP_N:-5}
+
+    # --- Btrfs Device Acceleration ---
+    local btrfs_lines=""; [[ -f "$BTRFS_DEV_HIST_FILE" ]] && btrfs_lines=$(tail -n 50000 "$BTRFS_DEV_HIST_FILE" 2>/dev/null || true)
+    declare -A BSEQ MSEQ
+    if [[ -n "$btrfs_lines" ]]; then
+        while read -r dt rest; do
+            [[ -z "$dt" || "$dt" < "$cutoff" ]] && continue
+            local key mount delta dev
+            key=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^key=/){sub(/key=/,"",$i); print $i; break}}}')
+            mount=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^mount=/){sub(/mount=/,"",$i); print $i; break}}}')
+            delta=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^delta=/){sub(/delta=/,"",$i); print $i; break}}}')
+            dev=$(echo "$rest" | awk '{print $NF}')
+            [[ -z "$dev" || -z "$delta" || -z "$key" ]] && continue
+            [[ "$delta" =~ ^[0-9]+$ ]] || continue
+            # Sequence per dev|key
+            BSEQ["$dev|$key"]+="${dt}:${delta} "
+            if [[ -n "$mount" ]]; then
+                MSEQ["$mount|$key"]+="${dt}:${delta} "
+            fi
+        done < <(printf "%s\n" "$btrfs_lines")
+    fi
+    local b_rank=()
+    local m_rank=()
+    for dk in "${!BSEQ[@]}"; do
+        local seq=( ${BSEQ[$dk]} )
+        (( ${#seq[@]} < 2 )) && continue
+        local sorted=$(printf "%s\n" "${seq[@]}" | awk -F: '{print $1,$2}' | sort -k1,1)
+        local prev_dt prev_d deltas=() last_dt last_delta total=0 count=0
+        while read -r dt d; do
+            [[ -z "$dt" || -z "$d" ]] && continue
+            if [[ -n "$prev_dt" ]]; then
+                deltas+=("$d")
+            fi
+            prev_dt="$dt"; last_dt="$dt"; last_delta="$d"
+        done < <(printf "%s\n" "$sorted")
+        (( ${#deltas[@]} < 2 )) && continue
+        local sum=0 i
+        for i in "${deltas[@]:0:${#deltas[@]}-1}"; do sum=$(( sum + i )); done
+        local avg=$(awk -v s="$sum" -v c="$(( ${#deltas[@]} - 1 ))" 'BEGIN{if(c>0)printf "%.3f", s/c; else print 0}')
+        if awk -v l="$last_delta" -v a="$avg" -v f="$accel_factor" -v m="$accel_min" 'BEGIN{exit (l>=m && a>0 && l>=a*(1+f/100))?0:1}'; then
+            local dev=${dk%%|*} key=${dk##*|}
+            local ratio=$(awk -v l="$last_delta" -v a="$avg" 'BEGIN{printf "%.2f", l/a}')
+            b_rank+=("$last_delta $dev $key $last_delta $avg $ratio")
+        fi
+    done
+    # Mount-level acceleration ranking
+    for mk in "${!MSEQ[@]}"; do
+        local seq=( ${MSEQ[$mk]} )
+        (( ${#seq[@]} < 2 )) && continue
+        local sorted=$(printf "%s\n" "${seq[@]}" | awk -F: '{print $1,$2}' | sort -k1,1)
+        local prev_dt prev_d deltas=() last_dt last_delta
+        while read -r dt d; do
+            [[ -z "$dt" || -z "$d" ]] && continue
+            if [[ -n "$prev_dt" ]]; then deltas+=("$d"); fi
+            prev_dt="$dt"; last_dt="$dt"; last_delta="$d"
+        done < <(printf "%s\n" "$sorted")
+        (( ${#deltas[@]} < 2 )) && continue
+        local sum=0 i
+        for i in "${deltas[@]:0:${#deltas[@]}-1}"; do sum=$(( sum + i )); done
+        local avg=$(awk -v s="$sum" -v c="$(( ${#deltas[@]} - 1 ))" 'BEGIN{if(c>0)printf "%.3f", s/c; else print 0}')
+        if awk -v l="$last_delta" -v a="$avg" -v f="$accel_factor" -v m="$accel_min" 'BEGIN{exit (l>=m && a>0 && l>=a*(1+f/100))?0:1}'; then
+            local mount=${mk%%|*} key=${mk##*|}
+            local ratio=$(awk -v l="$last_delta" -v a="$avg" 'BEGIN{printf "%.2f", l/a}')
+            m_rank+=("$last_delta $mount $key $last_delta $avg $ratio")
+        fi
+    done
+
+    # --- XFS Global Acceleration ---
+    local xfs_lines=""; [[ -f "$XFS_PROC_HISTORY_FILE" ]] && xfs_lines=$(tail -n 20000 "$XFS_PROC_HISTORY_FILE" 2>/dev/null || true)
+    declare -A XSEQ
+    if [[ -n "$xfs_lines" ]]; then
+        while read -r dt rest; do
+            [[ -z "$dt" || "$dt" < "$cutoff" ]] && continue
+            local key delta
+            key=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^key=/){sub(/key=/,"",$i); print $i; break}}}')
+            delta=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^delta=/){sub(/delta=/,"",$i); print $i; break}}}')
+            [[ -z "$key" || -z "$delta" ]] && continue
+            [[ "$delta" =~ ^[0-9]+$ ]] || continue
+            XSEQ["$key"]+="${dt}:${delta} "
+        done < <(printf "%s\n" "$xfs_lines")
+    fi
+    local x_rank=()
+    for key in "${!XSEQ[@]}"; do
+        local seq=( ${XSEQ[$key]} )
+        (( ${#seq[@]} < 2 )) && continue
+        local sorted=$(printf "%s\n" "${seq[@]}" | awk -F: '{print $1,$2}' | sort -k1,1)
+        local prev_dt prev_d deltas=() last_dt last_delta
+        while read -r dt d; do
+            [[ -z "$dt" || -z "$d" ]] && continue
+            if [[ -n "$prev_dt" ]]; then deltas+=("$d"); fi
+            prev_dt="$dt"; last_dt="$dt"; last_delta="$d"
+        done < <(printf "%s\n" "$sorted")
+        (( ${#deltas[@]} < 2 )) && continue
+        local sum=0 i
+        for i in "${deltas[@]:0:${#deltas[@]}-1}"; do sum=$(( sum + i )); done
+        local avg=$(awk -v s="$sum" -v c="$(( ${#deltas[@]} - 1 ))" 'BEGIN{if(c>0)printf "%.3f", s/c; else print 0}')
+        if awk -v l="$last_delta" -v a="$avg" -v f="$accel_factor" -v m="$accel_min" 'BEGIN{exit (l>=m && a>0 && l>=a*(1+f/100))?0:1}'; then
+            local ratio=$(awk -v l="$last_delta" -v a="$avg" 'BEGIN{printf "%.2f", l/a}')
+            x_rank+=("$last_delta $key $last_delta $avg $ratio")
+        fi
+    done
+
+    local section=""
+    if (( ${#b_rank[@]} > 0 )); then
+        local sorted=$(printf "%s\n" "${b_rank[@]}" | sort -nr -k1,1 | head -n $top)
+        section+="Btrfs Device Error Acceleration:\n"
+        while read -r last dev key ldelta avg ratio; do
+            section+=" - $(basename \"$dev\") $key +$ldelta vs avg +$(printf '%.0f' $avg) (x$ratio)\n"
+        done < <(printf "%s\n" "$sorted")
+    fi
+    if (( ${#m_rank[@]} > 0 )); then
+        local sorted=$(printf "%s\n" "${m_rank[@]}" | sort -nr -k1,1 | head -n $top)
+        section+=$'\n'"Btrfs Mount Error Acceleration:\n"
+        while read -r last mount key ldelta avg ratio; do
+            section+=" - $mount $key +$ldelta vs avg +$(printf '%.0f' $avg) (x$ratio)\n"
+        done < <(printf "%s\n" "$sorted")
+    fi
+    if (( ${#x_rank[@]} > 0 )); then
+        local sorted=$(printf "%s\n" "${x_rank[@]}" | sort -nr -k1,1 | head -n $top)
+        section+=$'\n'"XFS Global Error Acceleration:\n"
+        while read -r last key ldelta avg ratio; do
+            section+=" - $key +$ldelta vs avg +$(printf '%.0f' $avg) (x$ratio)\n"
+        done < <(printf "%s\n" "$sorted")
+    fi
+    section=$(printf "%s\n" "$section" | awk 'NF')
+    section="${section%$'\n'}"
+    if printf "%s" "$section" | grep -q '[^[:space:]]'; then
+        ERROR_RATE_ACCEL_SECTION="Error Rate Acceleration (last ${win}d):\n$section"
+        ERROR_RATE_ACCEL_SECTION="$(printf "%s\n" "$ERROR_RATE_ACCEL_SECTION" | trim_outer_blank_lines)"
+    else
+        ERROR_RATE_ACCEL_SECTION=""
     fi
 }
 
@@ -3958,6 +4557,7 @@ log_info "Compiling health alerts..."; build_health_alerts; log_info "Health ale
 build_subject
 log_info "Building disk health summary..."; build_disk_health_summary; log_info "Disk health summary completed"
 log_info "Analyzing write rates and TBW forecasts..."; tbw_forecast_and_heavy_writers; log_info "TBW analysis completed"
+log_info "Building endurance aging trend..."; build_endurance_trend_section; log_info "Endurance trend section completed"
 log_info "Summarizing subsystem statuses..."; build_subsystem_lines; log_info "Subsystem summary completed"
 log_info "Scoring disk risk and lifecycle buckets..."; compute_risk_and_lifecycle; log_info "Risk and lifecycle scoring completed"
 log_info "Building post-processing sections..."
@@ -3967,6 +4567,10 @@ log_info "Computing share sizes and growth (if enabled)..."; compute_share_break
 log_info "Scanning syslog for disk I/O errors..."; scan_syslog_disk_errors; log_info "Syslog scan completed"
 log_info "Recording today's risk tier counts..."; persist_risk_tier_history; log_info "Risk tier counts recorded"
 log_info "Summarizing recent risk trends..."; build_risk_tier_trend_section; log_info "Risk trend summary completed"
+log_info "Computing SMART attribute growth trends..."; build_smart_attr_trend_section; log_info "SMART attribute trend summary completed"
+log_info "Analyzing error rate acceleration..."; build_error_rate_accel_section; log_info "Error rate acceleration summary completed"
+log_info "Computing endurance days-left shrink trends..."; build_endurance_daysleft_trend_section; log_info "Endurance days-left trend summary completed"
+log_info "Evaluating capacity risk acceleration..."; build_capacity_risk_accel_section; log_info "Capacity risk acceleration summary completed"
 log_info "Section build completed"
 
 # Build a conditional Risk block with surrounding spacing only when content exists
@@ -3991,6 +4595,10 @@ case "${SHOW_SUBSYSTEMS_BLOCK:-auto}" in
                 SUBSYSTEMS_BLOCK="Subsystems:\n${_filtered}\n"
             fi
         fi
+            # All subsystems OK and user wants an informational line instead of blank.
+            if [[ -n "${SUBSYSTEM_LINES:-}" ]]; then
+                SUBSYSTEMS_BLOCK="Subsystems:\nAll monitored subsystems nominal (SMART, Btrfs, XFS, Capacity, Parity, Per-Mount)."
+            fi
         ;;
 esac
 # Trim outer blank lines for subsystem block, if any
@@ -4015,6 +4623,8 @@ _append_section() {
     local s="$1"
     # Fast skip if empty or whitespace-only
     if ! printf "%s" "$s" | grep -q '[^[:space:]]'; then return 0; fi
+    # Convert literal \n sequences to real newlines before further cleanup
+    s="$(printf '%s' "$s" | sed -E 's/\\n/\n/g')"
     # Remove leading blank lines, collapse internal runs of >1 blank lines to a single
     local cleaned
     cleaned=$(printf "%s\n" "$s" | awk 'BEGIN{out=0;blank=0} {
@@ -4038,12 +4648,17 @@ _append_section "${CAPACITY_FORECAST:-}"
 _append_section "${DISK_GROWTH_SECTION:-}"
 _append_section "${SHARE_SECTION:-}"
 _append_section "${FIRMWARE_EVENT_SECTION:-}"
+_append_section "${SMART_ATTR_TREND_SECTION:-}"
+_append_section "${ERROR_RATE_ACCEL_SECTION:-}"
+_append_section "${ENDURANCE_DAYSLEFT_TREND_SECTION:-}"
+_append_section "${ENDURANCE_TREND_SECTION:-}"
 _append_section "${TBW_SECTION:-}"
 _append_section "${BTRFS_DEV_TREND_SECTION:-}"
 _append_section "${STORAGE_VALIDATION_SECTION:-}"
 _append_section "${IO_ERROR_FREQ_SECTION:-}"
 _append_section "${SUBSYSTEMS_BLOCK:-}"
 _append_section "${RISK_TIER_TREND_SECTION:-}"
+_append_section "${CAPACITY_RISK_ACCEL_SECTION:-}"
 _append_section "${RISK_BLOCK:-}"
 _append_section "${HEALTH_ALERTS_SECTION:-}"
 
@@ -4065,9 +4680,13 @@ ${TAIL_SECTIONS}"
 if (( ${#ALERT_CRIT[@]} > 0 )); then
     _final_sev=critical
 elif (( ${#ALERT_WARN[@]} > 0 )); then
-    _final_sev=warning
+    if [[ -z "${HEALTH_ALERTS_SECTION}" ]] && [[ -z "${RISK_SECTION}" ]]; then
+        _final_sev=notice
+    else
+        _final_sev=warning
+    fi
 else
-    _final_sev=ok
+    _final_sev=notice
 fi
 log_info "Preparing notification severity level= ${_final_sev}, critical count= ${#ALERT_CRIT[@]}, warning count= ${#ALERT_WARN[@]}"
 notify_unraid "${SUBJECT:-Disk Health Summary}" "$NOTIFY_BODY" "${_final_sev}"
