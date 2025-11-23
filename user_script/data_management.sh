@@ -6,12 +6,10 @@ if ! flock -n 9; then
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "Another data_management.sh run is active, exiting (lock: $LOCKFILE)"
   exit 1
 fi
-
-noParity=true
-clearLog=false
-
-# --------------------------------------------------------------------------------
-# --- Configuration Section ---
+################################################################################
+# ---------------- Configuration ----------------
+# Data Management Script Configuration
+################################################################################
 
 SRC_DIR="/mnt/user/secure/torrent"    # Source directory to process
 DEST_DIR="/mnt/user/secure"           # Destination base directory for processed data
@@ -42,26 +40,26 @@ PRIVATE_SUBDIRS=(                    # List of subdirectories under source to mo
   "Yui.Tenma.天馬ゆい"
 )
 
-# --------------------------------------------------------------------------------
+################################################################################
 
-# Helper logging functions
-log_info() {
-  local ts
+# Unified logging function (replaces log_info, log_warn, log_err)
+log() {
+  local level="$1"; shift || true
+  local ts msg
   ts=$(date '+%Y-%m-%d %H:%M:%S')
-  printf '%s %s\n' "$ts" "$*"
+  msg="$*"
+  case "$level" in
+    info|INFO)   printf '%s %s\n' "$ts" "$msg" ;;
+    warn|WARNING|WARN)  printf '%s WARN: %s\n' "$ts" "$msg" ;;
+    err|error|ERROR)    printf '%s ERROR: %s\n' "$ts" "$msg" >&2 ;;
+    *)          printf '%s %s\n' "$ts" "$level $msg" ;;
+  esac
 }
 
-log_warn() {
-  local ts
-  ts=$(date '+%Y-%m-%d %H:%M:%S')
-  printf '%s WARN: %s\n' "$ts" "$*"
-}
-
-log_err() {
-  local ts
-  ts=$(date '+%Y-%m-%d %H:%M:%S')
-  printf '%s ERROR: %s\n' "$ts" "$*" >&2
-}
+# Backward compatible wrappers (can be removed after migration)
+log_info() { log info "$*"; }
+log_warn() { log warn "$*"; }
+log_err()  { log error "$*"; }
 
 # Warn if not running as root
 if [ "$(id -u)" -ne 0 ]; then
@@ -79,12 +77,6 @@ run_with_timestamp() {
       printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$line"
     done
   fi
-}
-
-# Helper return success if directory has any entry (file or dir)
-has_any_entry() {
-  local d="$1"
-  [ -d "$d" ] && find "$d" -mindepth 1 -print -quit >/dev/null 2>&1
 }
 
 # Helper return success if directory has any regular file under it
@@ -110,7 +102,11 @@ filesize() {
   local s
   s=$(stat -c%s "$f" 2>/dev/null) && { echo "$s"; return 0; } || true
   s=$(stat -f%z "$f" 2>/dev/null) && { echo "$s"; return 0; } || true
-  s=$(ls -nl "$f" 2>/dev/null | awk '{print $5}')
+  if command -v find >/dev/null 2>&1; then
+    s=$(find "$f" -maxdepth 0 -type f -printf '%s\n' 2>/dev/null)
+  else
+    s="$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || wc -c <"$f" 2>/dev/null || echo 0)"
+  fi
   if [ -n "$s" ] && printf '%s' "$s" | grep -Eq '^[0-9]+$'; then
     echo "$s"; return 0
   fi
@@ -151,9 +147,7 @@ set_owner_and_perms() {
     return 1
   fi
 
-  if chown -R "$owner" "$target"; then
-    :
-  else
+  if ! chown -R "$owner" "$target"; then
     log_warn "Chown $owner failed on $target — running without privilege?"
   fi
 
@@ -228,6 +222,8 @@ escape_glob_literal() {
 rename_patterns() {
   local dir="$1"
   local -a patterns=("${RENAME_PATTERNS[@]:-}")
+  local -a dirs files
+  local globpat dcount total_dbytes ed ff pattern d ddirpath dbase esc_pat dnewbase dnewpath i candidate count total_bytes ef human_total f dirpath base newbase newpath rsize fsize
 
   if [ ${#patterns[@]} -eq 0 ]; then
     log_info "Rename: no patterns configured; skipping rename pass"
@@ -242,9 +238,9 @@ rename_patterns() {
         dirs+=("$p")
       fi
     done < <(find "$dir" -depth \( -path "$dir/incomplete" -o -path "$dir/incomplete/*" \) -prune -o -type d -print0 2>/dev/null)
-    local dcount=${#dirs[@]}
+    dcount=${#dirs[@]}
     if [[ $dcount -gt 0 ]]; then
-      local total_dbytes=0
+      total_dbytes=0
       for ed in "${dirs[@]}"; do
         ed="${ed%$'\0'}"
         while IFS= read -r -d '' ff; do
@@ -255,7 +251,6 @@ rename_patterns() {
 
       for d in "${dirs[@]}"; do
         d="${d%$'\0'}"
-        local ddirpath dbase dnewbase dnewpath
         ddirpath=$(dirname -- "$d")
         dbase=$(basename -- "$d")
         esc_pat=$(escape_sed_literal "$pattern")
@@ -266,7 +261,7 @@ rename_patterns() {
         dnewpath="$ddirpath/$dnewbase"
 
         if [[ -e "$dnewpath" ]]; then
-          local i=1 candidate
+          i=1; candidate=""
           while :; do
             candidate="${dnewpath}.dup${i}"
             if [[ ! -e "$candidate" ]]; then
@@ -295,7 +290,7 @@ rename_patterns() {
         files+=("$p")
       fi
     done < <(find "$dir" \( -path "$dir/incomplete" -o -path "$dir/incomplete/*" \) -prune -o -type f -print0 2>/dev/null)
-    local count=${#files[@]}
+    count=${#files[@]}
     
     if [[ $count -eq 0 ]]; then
       log_info "Rename files: no files match pattern '$pattern' in $dir"
@@ -303,19 +298,17 @@ rename_patterns() {
     fi
 
     # Compute total size of matched files
-    local total_bytes=0
+    total_bytes=0
     for ef in "${files[@]}"; do
       ef="${ef%$'\0'}"
       total_bytes=$((total_bytes + $(filesize "$ef")))
     done
-    local human_total
     human_total=$(human_readable "$total_bytes")
 
     log_info "Rename files: removing literal pattern '$pattern' from $count files in $dir (total size: $human_total)"
 
     for f in "${files[@]}"; do
       f="${f%$'\0'}"
-      local dirpath base newbase newpath
       dirpath=$(dirname -- "$f")
       base=$(basename -- "$f")
       esc_pat=$(escape_sed_literal "$pattern")
@@ -329,15 +322,14 @@ rename_patterns() {
         if [[ $(filesize "$f") -eq $(filesize "$newpath") ]]; then
           if command -v shasum >/dev/null 2>&1; then
             if [[ "$(shasum -a 256 "$f" | awk '{print $1}')" == "$(shasum -a 256 "$newpath" | awk '{print $1}')" ]]; then
-              local size
-              size=$(human_readable "$(filesize "$f")")
-              log_info "Rename files: '$f' identical to '$newpath' -> removing source (size: $size)"
+              rsize=$(human_readable "$(filesize "$f")")
+              log_info "Rename files: '$f' identical to '$newpath' -> removing source (size: $rsize)"
               rm -f -- "$f"
               continue
             fi
           fi
         fi
-        local i=1 candidate
+        i=1; candidate=""
         while :; do
           candidate="${newpath}.dup${i}"
           if [[ ! -e "$candidate" ]]; then
@@ -349,11 +341,9 @@ rename_patterns() {
       fi
 
       if mv -n -- "$f" "$newpath"; then
-        local rsize
         rsize=$(human_readable "$(filesize "$newpath")")
         log_info "Rename files: renamed '$f' -> '$newpath' (size: $rsize)"
       else
-        local fsize
         fsize=$(human_readable "$(filesize "$f")")
         log_warn "Rename files: failed to rename '$f' -> '$newpath' (size: $fsize)"
       fi
@@ -439,7 +429,7 @@ safe_move() {
   fi
 
   find "$src" -type f -print0 | while IFS= read -r -d '' srcfile; do
-    relpath="${srcfile#$src/}"
+    relpath="${srcfile#"$src"/}"
     destfile="$dest/$relpath"
 
     if [[ -f "$destfile" ]]; then
@@ -460,7 +450,7 @@ safe_move() {
   osize=$(human_readable "$(filesize "$srcfile")")
   log_info "Overwriting: '$destfile' with '$srcfile' (size: $osize)"
         if rsync --version >/dev/null 2>&1 && rsync --help 2>&1 | grep -q -- --chown; then
-          run_with_timestamp rsync -a $rsync_chown_arg --checksum --inplace --partial --progress --remove-source-files -- "$srcfile" "${destfile%/*}/"
+          run_with_timestamp rsync -a "$rsync_chown_arg" --checksum --inplace --partial --progress --remove-source-files -- "$srcfile" "${destfile%/*}/"
           destdir="${destfile%/*}"
           ensure_dest_owner_perms "$destdir"
         else
@@ -476,7 +466,7 @@ safe_move() {
     size=$(human_readable "$(filesize "$srcfile")")
     log_info "Safe move: moving '$srcfile' -> '$destfile' (size: $size)"
       if rsync --version >/dev/null 2>&1 && rsync --help 2>&1 | grep -q -- --chown; then
-        run_with_timestamp rsync -a $rsync_chown_arg --inplace --partial --progress --remove-source-files -- "$srcfile" "${destfile%/*}/"
+        run_with_timestamp rsync -a "$rsync_chown_arg" --inplace --partial --progress --remove-source-files -- "$srcfile" "${destfile%/*}/"
         destdir="${destfile%/*}"
         ensure_dest_owner_perms "$destdir"
       else
@@ -594,7 +584,7 @@ log_info "Updating qBittorrent webui with VueTorrent "
 if cd /mnt/user/appdata/qbittorrent/webui 2>/dev/null; then
   rm -rf VueTorrent
   log_info "Cloning VueTorrent latest-release branch from GitHub"
-  GIT_TERMINAL_PROMPT=0
+  export GIT_TERMINAL_PROMPT=0
   if command -v timeout >/dev/null 2>&1; then
     if timeout 300 git clone --quiet --depth 1 --single-branch --branch latest-release https://github.com/VueTorrent/VueTorrent.git; then
       log_info "qBittorrent webui VueTorrent updated"
