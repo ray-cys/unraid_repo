@@ -39,6 +39,7 @@ IGNORE_LINES=(
   'kernel: CIFS: VFS: \\*\* error -9 on ioctl to get interface list'        # Unsolvable message from UD plugin
   'sshd[*]: Read error from remote host * port *: Connection reset by peer' # Interrupted ssh connection
   'sshd[*]: Read error from remote host * port *: Connection timed out'     # Interrupted ssh connection
+  'nginx[*]: /usr/local/emhttp/webGui/javascript/ace/mode-log.js'           # Ngnix false positive
 )
 
 ################################################################################
