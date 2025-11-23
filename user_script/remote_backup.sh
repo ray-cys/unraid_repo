@@ -35,7 +35,7 @@ SSH_PORT=22                                                           # SSH port
 
 # === Rsync defaults & excludes ===
 # Default rsync arguments.
-RSYNC_DEFAULT_ARGS=("-ah" "-p" "--times" "--cvs-exclude" "--delete-during" "--partial" "--protect-args" "--stats")  # Add or remove default rsync args as needed
+RSYNC_DEFAULT_ARGS=("-ah" "-p" "--times" "--cvs-exclude" "--delete-during" "--partial" "--protect-args" "--itemize-changes" "--stats")  # Add or remove default rsync args as needed
 RSYNC_PARTIAL_DIR=".rsync-partial"                                                                                  # Partial directory name
 DEFAULT_EXCLUDES=(--exclude='*.sock' --exclude='/dev/*' --exclude='/proc/*' --exclude='/sys/*' --exclude='*/.cache/*') # Default excludes for all labels
 RSYNC_EXTRA_EXCLUDES=("net/" "torrent/")                                                                            # Per-label additional excludes matching LABELS_ARRAY order
