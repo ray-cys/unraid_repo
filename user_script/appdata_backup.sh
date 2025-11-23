@@ -127,7 +127,7 @@ notify_abort() {
   local reason="$1"
   local detail="${2:-}"
   local subj="${NOTIFY_TITLE} - FAILED"
-  local short="🔴 Backup aborted"
+  local short="Backup aborted"
   local body="Reason: ${reason}"
   if [ -n "$detail" ]; then
     body+=$'\n'"$detail"
