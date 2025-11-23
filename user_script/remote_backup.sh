@@ -1,115 +1,112 @@
 #!/bin/bash
-set -euo pipefail
 LOCKFILE="/tmp/remote_backup.lock"
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "Another remote_backup.sh run is active, exiting (lock: $LOCKFILE)"
   exit 1
 fi
-noParity=true
-clearLog=false
+################################################################################
+# ---------------- Configuration ----------------
+# Remote Shares Backup Settings
+################################################################################
 
-# --------------------------------------------------------------------------------
-# Configuration section
-# Adjust the settings below to configure the remote backup behavior.
+# === General ===
+SRC_NAS="Hubble NAS"                                                  # Source NAS name for logging/notifications
+DEST_NAS="ISS NAS"                                                    # Destination NAS name for logging/notifications
 
-# --- General ---
-SRC_NAS="Hubble NAS"                  # Source NAS name for logging/notifications
-DEST_NAS="ISS NAS"                    # Destination NAS name for logging/notifications
-
-# --- Paths ---
-MEDIA_SRC="/mnt/user/media"           # Source path for "Media" label
-SECURE_SRC="/mnt/user/secure"         # Source path for "Secure" label
-MEDIA_DEST="/mnt/user/media"          # Destination path for "Media" label
-SECURE_DEST="/mnt/user/secure"        # Destination path for "Secure" label
-
+# === Paths ===
+MEDIA_SRC="/mnt/user/media"                                           # Source path for "Media" label
+SECURE_SRC="/mnt/user/secure"                                         # Source path for "Secure" label
+MEDIA_DEST="/mnt/user/media"                                          # Destination path for "Media" label
+SECURE_DEST="/mnt/user/secure"                                        # Destination path for "Secure" label
 LOG_FILE_SUBDIR="/mnt/cache/system/logs/remote_logs"                  # Directory to store log files
 LOG_FILE="$LOG_FILE_SUBDIR/remote_backup_$(date +%Y%m%d_%H%M%S).log"  # Log file path
 PRESERVED_RAW_LOG_DIR="$LOG_FILE_SUBDIR/rsync_raw"                    # Directory to store preserved raw rsync logs
 
-# --- Logs Settings ---
-MAX_LOGS=2                             # Maximum number of dated log files to keep
-MAX_MANIFEST=1                         # Maximum number of manifest files to keep (set 1 to keep only latest)
+# === Logs Settings ===
+MAX_LOGS=2                                                            # Maximum number of dated log files to keep
+MAX_MANIFEST=1                                                        # Maximum number of manifest files to keep (set 1 to keep only latest)
 
-# --- Remote & SSH ---
-REMOTE="root@192.168.50.3"             # SSH user and hostname/IP of the remote
-REMOTE_MAC="9C:6B:00:4B:BB:EE"         # Wake-on-LAN MAC for the remote
-SSH_PORT=22                            # SSH port used to contact remote
+# === Remote & SSH ===
+REMOTE="root@192.168.50.3"                                            # SSH user and hostname/IP of the remote
+REMOTE_MAC="9C:6B:00:4B:BB:EE"                                        # Wake-on-LAN MAC for the remote
+SSH_PORT=22                                                           # SSH port used to contact remote
 
-# --- Remote free-space fallback settings ---
-# When true, attempt stat(2)-based fallback on remote if df reports 0/invalid
-REMOTE_ENABLE_STAT_FALLBACK=${REMOTE_ENABLE_STAT_FALLBACK:-true}
-# Remote filesystem types to ignore for zero/invalid free space
-REMOTE_IGNORE_ZERO_FS_TYPES=${REMOTE_IGNORE_ZERO_FS_TYPES:-"fuse.rclone fuse.mergerfs fuse.unionfs"}
 
-# --- Rsync defaults & excludes ---
+# === Rsync defaults & excludes ===
 # Default rsync arguments.
-RSYNC_DEFAULT_ARGS=("-ah" "-p" "--times" "--cvs-exclude" "--delete-during" "--partial" "--protect-args" "--itemize-changes" "--stats") 
-RSYNC_PARTIAL_DIR=".rsync-partial"
-DEFAULT_EXCLUDES=(--exclude='*.sock' --exclude='/dev/*' --exclude='/proc/*' --exclude='/sys/*' --exclude='*/.cache/*')
+RSYNC_DEFAULT_ARGS=("-ah" "-p" "--times" "--cvs-exclude" "--delete-during" "--partial" "--protect-args" "--stats")  # Add or remove default rsync args as needed
+RSYNC_PARTIAL_DIR=".rsync-partial"                                                                                  # Partial directory name
+DEFAULT_EXCLUDES=(--exclude='*.sock' --exclude='/dev/*' --exclude='/proc/*' --exclude='/sys/*' --exclude='*/.cache/*') # Default excludes for all labels
+RSYNC_EXTRA_EXCLUDES=("net/" "torrent/")                                                                            # Per-label additional excludes matching LABELS_ARRAY order
+RSYNC_STREAM_TIMESTAMPED_LOG=${RSYNC_STREAM_TIMESTAMPED_LOG:-true}                                                  # true -> timestamp each rsync output line, false -> raw output only
 
-# --- Snapshots ---
-ENABLE_SNAPSHOTS=false                     # Enable snapshot creation on source after successful backup
-SNAPSHOT_ROOT="/mnt/user/backup/snapshots" # Snapshot root directory
-SNAPSHOT_KEEP=7                            # Number of snapshots to keep
+# === Snapshots ===
+ENABLE_SNAPSHOTS=false                                                                                              # Enable snapshot creation on source after successful backup
+SNAPSHOT_ROOT="/mnt/user/backup/snapshots"                                                                          # Snapshot root directory
+SNAPSHOT_KEEP=7                                                                                                     # Number of snapshots to keep
 
-# --- Retry / Backoff / IO niceness ---
-MAX_RETRIES=3                         # Maximum number of rsync retries
-RETRY_BACKOFF=30                      # Base backoff time in seconds
-RETRY_ON_CODES="23 24 10 11 12 20 30" # Rsync exit codes that trigger a retry
-ENABLE_EXPONENTIAL_BACKOFF=true       # Enable exponential backoff for retries
-MAX_BACKOFF=600                       # Maximum backoff time in seconds
-ENABLE_PER_ATTEMPT_NOTIFY=false       # Enable per-attempt notifications
-USE_IONICE=true                       # Use ionice with rsync
-DEFAULT_FAIL_CODE=50                  # Default failure exit code
-DF_RETRY_COUNT=20                     # Number of df retries
-DF_RETRY_SLEEP=6                      # Sleep time between df retries
+# === Retry / Backoff / IO niceness ===
+MAX_RETRIES=3                                                          # Maximum number of rsync retries
+RETRY_BACKOFF=30                                                       # Base backoff time in seconds
+RETRY_ON_CODES="23 24 10 11 12 20 30"                                  # Rsync exit codes that trigger a retry
+ENABLE_EXPONENTIAL_BACKOFF=true                                        # Enable exponential backoff for retries
+MAX_BACKOFF=600                                                        # Maximum backoff time in seconds
+ENABLE_PER_ATTEMPT_NOTIFY=false                                        # Enable per-attempt notifications
+USE_IONICE=true                                                        # Use ionice with rsync
+DEFAULT_FAIL_CODE=50                                                   # Default failure exit code
+DF_RETRY_COUNT=20                                                      # Number of df retries
+DF_RETRY_SLEEP=6                                                       # Sleep time between df retries
 
-# --- Preflight / Safety / Behavior ---
-PREFLIGHT_MODE="metadata"             # Use one of: estimate|metadata|total
-SHUTDOWN_ON_FAILURE=false             # Shutdown source NAS on failure
+# === Preflight / Safety / Behavior ===
+PREFLIGHT_MODE="metadata"                                              # Use one of: estimate|metadata|total
+SHUTDOWN_ON_FAILURE=false                                              # Shutdown source NAS on failure
 
-# --- Notifications & Logging ---
-NOTIF_CONDENSED_MAX_LABELS=3          # Maximum number of labels to include in condensed notifications
-NOTIF_EXCERPT_LINES=8                 # Number of lines to include in notification excerpts
+# === Notifications & Logging ===
+NOTIF_CONDENSED_MAX_LABELS=3                                           # Maximum number of labels to include in condensed notifications
+NOTIF_EXCERPT_LINES=8                                                  # Number of lines to include in notification excerpts
 
-# --- Log Ownership & Permissions ---
-# Ensure logs are group-writable and owned by nobody:users on Unraid
-LOG_USER="${LOG_USER:-nobody}"
-LOG_GROUP="${LOG_GROUP:-users}"
-LOG_DIR_MODE="${LOG_DIR_MODE:-0775}"
-LOG_FILE_MODE="${LOG_FILE_MODE:-0664}"
-LOG_UMASK="${LOG_UMASK:-0002}"
-umask "$LOG_UMASK"
+# === Log Ownership & Permissions ===
+LOG_USER="${LOG_USER:-nobody}"                                         # Log file owner user
+LOG_DIR_MODE="${LOG_DIR_MODE:-0775}"                                   # Log directory mode
+LOG_FILE_MODE="${LOG_FILE_MODE:-0664}"                                 # Log file mode
 
-# --- SSH wait / Timings ---
-MAX_SSH_WAIT=420                      # Total seconds to wait for SSH to become reachable
-SSH_WAIT_INTERVAL=20                  # Sleep interval between SSH reachability checks
-SSH_CONNECT_TIMEOUT=5                 # Seconds used for ssh -o ConnectTimeout per attempt
-STABILIZE_WAIT=90                     # Seconds to wait after SSH is reachable for remote services/filesystems to stabilize
-STABILIZE_INTERVAL=3                  # Poll interval during stabilization
-ARRAY_READY_WAIT=180                  # Additional wait for Unraid array (/mnt/user) readiness
-ARRAY_READY_INTERVAL=6                # Poll interval for array readiness check
+# === SSH wait / Timings ===
+MAX_SSH_WAIT=420                                                       # Total seconds to wait for SSH to become reachable
+SSH_WAIT_INTERVAL=20                                                   # Sleep interval between SSH reachability checks
+SSH_CONNECT_TIMEOUT=5                                                  # Seconds used for ssh -o ConnectTimeout per attempt
+STABILIZE_WAIT=90                                                      # Seconds to wait after SSH is reachable for remote services/filesystems to stabilize
+STABILIZE_INTERVAL=3                                                   # Poll interval during stabilization
+ARRAY_READY_WAIT=180                                                   # Additional wait for Unraid array (/mnt/user) readiness
+ARRAY_READY_INTERVAL=6                                                 # Poll interval for array readiness check
 
-# --- Runtime Flags ---
-DRY_RUN=false                         # When true, perform a dry run without actual data transfer
+# === Runtime Flags ===
+DRY_RUN=false                                                          # When true, perform a dry run without actual data transfer
 
-# --- Labels to backup (arrays must match) ---
-LABELS_ARRAY=("Media" "Secure")            # Labels for datasets to back up
-SRCS_ARRAY=("$MEDIA_SRC" "$SECURE_SRC")    # Source paths for datasets
-DESTS_ARRAY=("$MEDIA_DEST" "$SECURE_DEST") # Destination paths for datasets
+# === Labels to backup (arrays must match) ===
+LABELS_ARRAY=("Media" "Secure")                                        # Labels for datasets to back up
+SRCS_ARRAY=("$MEDIA_SRC" "$SECURE_SRC")                                # Source paths for datasets
+DESTS_ARRAY=("$MEDIA_DEST" "$SECURE_DEST")                             # Destination paths for datasets
 
-# -- Directory Setup --
-mkdir -p "$LOG_FILE_SUBDIR" 2>/dev/null || true 
-mkdir -p "$PRESERVED_RAW_LOG_DIR" 2>/dev/null || true 
-mkdir -p "$LOG_FILE_SUBDIR/manifests" 2>/dev/null || true
-chown "$LOG_USER:$LOG_GROUP" "$LOG_FILE_SUBDIR" "$PRESERVED_RAW_LOG_DIR" "$LOG_FILE_SUBDIR/manifests" 2>/dev/null || true
-chmod "$LOG_DIR_MODE" "$LOG_FILE_SUBDIR" "$PRESERVED_RAW_LOG_DIR" "$LOG_FILE_SUBDIR/manifests" 2>/dev/null || true
-: > "$LOG_FILE"
-chown "$LOG_USER:$LOG_GROUP" "$LOG_FILE" 2>/dev/null || true
-chmod "$LOG_FILE_MODE" "$LOG_FILE" 2>/dev/null || true
+# === Directory setup ===
+ensure_dir() { # path mode user
+  local p="$1" m="${2:-$LOG_DIR_MODE}" u="${3:-$LOG_USER}"
+  mkdir -p "$p" 2>/dev/null || true
+  chown "$u" "$p" 2>/dev/null || true
+  chmod "$m" "$p" 2>/dev/null || true
+}
+ensure_file() { # file mode user
+  local f="$1" m="${2:-$LOG_FILE_MODE}" u="${3:-$LOG_USER}"
+  : > "$f"
+  chown "$u" "$f" 2>/dev/null || true
+  chmod "$m" "$f" 2>/dev/null || true
+}
+ensure_dir "$LOG_FILE_SUBDIR"
+ensure_dir "$PRESERVED_RAW_LOG_DIR"
+ensure_dir "$LOG_FILE_SUBDIR/manifests"
+ensure_file "$LOG_FILE"
 
-# -- Logging function --
+# === Logging ===
 log() {
   local msg="$1"
   echo "$(date "+%Y/%m/%d %T") : $msg" | tee -a "$LOG_FILE"
@@ -117,6 +114,9 @@ log() {
 syslog() {
   local level="$1"; shift || true
   local msg="$*"
+  ssh_run() { # ssh with batch + ConnectTimeout handling
+    ssh -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}" -p "$SSH_PORT" "$REMOTE" "$@"
+  }
   local prio
   case "$level" in
     debug) prio="user.debug" ;;
@@ -130,7 +130,7 @@ syslog() {
   logger -i -t "Remote Backup" -p "$prio" "$msg"
 }
 
-# --------------------------------------------------------------------------------
+################################################################################
 
 # --- Helpers Functions ---
 # Convert a bytes integer into a human-readable string using binary units
@@ -224,10 +224,10 @@ aggregate_preflight_check() {
   declare -A src_by_device
   declare -A remote_used
   declare -A remote_avail
-  declare -A remote_avail_unknown
   declare -A device_mount
   local min_buffer=$((1024 * 1024 * 1024))
-
+  # Ensure manifests if metadata mode
+  ensure_manifests_for_labels || true
   for i in "${!LABELS_ARRAY[@]}"; do
     local label=${LABELS_ARRAY[i]}
     local src=${SRCS_ARRAY[i]}
@@ -243,8 +243,11 @@ aggregate_preflight_check() {
     fi
 
     local estimated_changed=0
-    if [ "$PREFLIGHT_MODE" = "estimate" ]; then
-      local tmp_est=$(mktemp /tmp/rsync_est.XXXXXX)
+    if [ "$PREFLIGHT_MODE" = "metadata" ]; then
+      estimated_changed=$(manifest_diff_bytes "$label" "$src" 2>/dev/null || echo 0)
+    elif [ "$PREFLIGHT_MODE" = "estimate" ]; then
+      local tmp_est
+      tmp_est=$(mktemp /tmp/rsync_est.XXXXXX)
       if command -v stdbuf >/dev/null 2>&1; then
         est_cmd=(stdbuf -oL rsync "${RSYNC_DEFAULT_ARGS[@]:-}" --itemize-changes --stats --dry-run --delete "${src}/" "$REMOTE:$dest")
       else
@@ -256,10 +259,8 @@ aggregate_preflight_check() {
     else
       estimated_changed=$src_bytes
     fi
-
-    if [ "$PREFLIGHT_MODE" = "metadata" ]; then
-      estimated_changed=$(manifest_diff_bytes "$label" "$src" 2>/dev/null || echo 0)
-    fi
+    # Populate per-label changed bytes array
+    estimated_changed_bytes["$label"]=$estimated_changed
 
     local df_out
     df_out=""
@@ -278,39 +279,17 @@ aggregate_preflight_check() {
       echo "Failed to query remote disk usage for $dest" >&2
       return "${default_fail_code:-2}"
     fi
-    local device=$(printf '%s' "$df_out" | cut -d'|' -f1)
-    local used=$(printf '%s' "$df_out" | cut -d'|' -f2)
-    local avail=$(printf '%s' "$df_out" | cut -d'|' -f3)
-    local mountp=$(printf '%s' "$df_out" | cut -d'|' -f4)
+    local device used avail mountp
+    device=$(printf '%s' "$df_out" | cut -d'|' -f1)
+    used=$(printf '%s' "$df_out" | cut -d'|' -f2)
+    avail=$(printf '%s' "$df_out" | cut -d'|' -f3)
+    mountp=$(printf '%s' "$df_out" | cut -d'|' -f4)
 
     if ! [[ "$avail" =~ ^[0-9]+$ ]]; then avail=0; fi
-    local avail_unknown=0
-    if [ "$avail" -eq 0 ] && [ "$REMOTE_ENABLE_STAT_FALLBACK" = "true" ]; then
-      local stat_vals
-      stat_vals=$(ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" stat -f --format '%a %s' "$dest" 2>/dev/null || echo "")
-      if [[ "$stat_vals" =~ ^[0-9]+\ [0-9]+$ ]]; then
-        local stat_free
-        stat_free=$(awk '{print $1 * $2}' <<< "$stat_vals")
-        if [[ "$stat_free" =~ ^[0-9]+$ ]] && [ "$stat_free" -gt 0 ]; then
-          avail=$stat_free
-        fi
-      fi
-    fi
-    if [ "$avail" -eq 0 ]; then
-      local fs_type
-      fs_type=$(ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" stat -f -c %T "$dest" 2>/dev/null || echo "")
-      for _fst in $REMOTE_IGNORE_ZERO_FS_TYPES; do
-        if [ "$fs_type" = "$_fst" ]; then
-          avail_unknown=1
-          break
-        fi
-      done
-    fi
 
     device_mount["$device"]="$mountp"
     remote_used["$device"]=$(( ${remote_used["$device"]:-0} + used ))
     remote_avail["$device"]=$avail
-    remote_avail_unknown["$device"]=$avail_unknown
     src_by_device["$device"]=$(( ${src_by_device["$device"]:-0} + estimated_changed ))
   done
 
@@ -334,15 +313,14 @@ aggregate_preflight_check() {
       safety_buffer=$pct_buffer
     fi
 
-    local human_src_sum=$(bytes_human "$src_sum")
-    local human_needed=$(bytes_human "$needed")
-    local human_avail=$(bytes_human "$avail")
-    local human_buffer=$(bytes_human "$safety_buffer")
-
+    local human_src_sum human_needed human_avail human_buffer
+    human_src_sum=$(bytes_human "$src_sum")
+    human_needed=$(bytes_human "$needed")
+    human_avail=$(bytes_human "$avail")
+    human_buffer=$(bytes_human "$safety_buffer")
     log "Aggregate preflight for device $device mount $mountp: est_change=$human_src_sum avail=$human_avail buffer=$human_buffer"
 
-    local avail_unknown=${remote_avail_unknown[$device]:-0}
-    if [ "$avail_unknown" -ne 1 ] && [ "$avail" -lt $(( needed + safety_buffer )) ]; then
+    if [ "$avail" -lt $(( needed + safety_buffer )) ]; then
       fail_msg+="Device $device mounted on $mountp: need ~$human_needed + buffer $human_buffer, available $human_avail\n"
     fi
   done
@@ -351,7 +329,6 @@ aggregate_preflight_check() {
     printf '%b' "$fail_msg"
     return 2
   fi
-
   return 0
 }
 
@@ -387,7 +364,7 @@ parse_rsync_stats() {
 
   deletes=$(grep -i 'Number of deleted files' "$file" | tail -n1 | sed -E 's/^[^:]*:[[:space:]]*([0-9,]+).*/\1/' | tr -d ',' )
   if [ -z "$deletes" ]; then
-    deletes=$(grep -E '^[[:space:]]*deleting ' "$file" | wc -l || echo 0)
+    deletes=$(grep -c -E '^[[:space:]]*deleting ' "$file" 2>/dev/null || echo 0)
   fi
 
   num_files_transferred=${num_files_transferred:-0}
@@ -396,9 +373,10 @@ parse_rsync_stats() {
   total_bytes_sent=${total_bytes_sent:-0}
   deletes=${deletes:-0}
 
-  local human_total=$(bytes_human "$total_file_size")
-  local human_transferred=$(bytes_human "$total_transferred_size")
-  local human_sent=$(bytes_human "$total_bytes_sent")
+  local human_total human_transferred human_sent
+  human_total=$(bytes_human "$total_file_size")
+  human_transferred=$(bytes_human "$total_transferred_size")
+  human_sent=$(bytes_human "$total_bytes_sent")
 
   rsync_total_bytes["$label"]="$total_file_size"
   rsync_transferred_bytes["$label"]="$total_transferred_size"
@@ -467,13 +445,13 @@ write_manifest() {
   local src="$2"
   local dest="$LOG_FILE_SUBDIR/manifests"
   mkdir -p "$dest" 2>/dev/null || true
-  chown "$LOG_USER:$LOG_GROUP" "$dest" 2>/dev/null || true
+  chown "$LOG_USER" "$dest" 2>/dev/null || true
   chmod "$LOG_DIR_MODE" "$dest" 2>/dev/null || true
   local out
   out="$dest/${label// /_}_manifest_$(date +%Y%m%d_%H%M%S).txt"
   (cd "$src" && find . -type f -printf '%P\t%s\t%T@\n') > "$out" 2>/dev/null || true
   if [ -f "$out" ]; then
-    chown "$LOG_USER:$LOG_GROUP" "$out" 2>/dev/null || true
+    chown "$LOG_USER" "$out" 2>/dev/null || true
     chmod "$LOG_FILE_MODE" "$out" 2>/dev/null || true
     log "Wrote manifest for $label: $out"
   else
@@ -598,19 +576,19 @@ run_rsync() {
     # Log the exact command for debugging
     log "Running: $(printf '%q ' "${exec_cmd[@]}")"
 
-    ( "${exec_cmd[@]}" 2>&1 | tee "$tmp_rslog" ) | while IFS= read -r line; do
+    if [ "$RSYNC_STREAM_TIMESTAMPED_LOG" = true ]; then
+      ( "${exec_cmd[@]}" 2>&1 | tee "$tmp_rslog" ) | while IFS= read -r line; do
         printf '%s : %s\n' "$(date '+%Y/%m/%d %T')" "$line"
       done | tee -a "$LOG_FILE"
-    last_status=${PIPESTATUS[0]}
+      last_status=${PIPESTATUS[0]}
+    else
+      ( "${exec_cmd[@]}" 2>&1 | tee "$tmp_rslog" ) >> "$LOG_FILE"
+      last_status=${PIPESTATUS[0]}
+    fi
 
     if [ -f "$tmp_rslog" ]; then
-      tmp_summary_file=$(mktemp /tmp/rsync_summary.XXXXXX)
-      if parse_rsync_stats "$tmp_rslog" "$label" > "$tmp_summary_file" 2>/dev/null; then
-        rsync_summaries["$label"]="$(cat "$tmp_summary_file")"
-      else
-        rsync_summaries["$label"]="$label: no stats"
-      fi
-      rm -f "$tmp_summary_file" 2>/dev/null || true
+      # Parse stats to populate arrays
+      parse_rsync_stats "$tmp_rslog" "$label" >/dev/null 2>&1 || true
       ts=$(date +%Y%m%d_%H%M%S)
       safe_label=${label// /_}
       saved_copy="$PRESERVED_RAW_LOG_DIR/rsync_raw_${safe_label}_${ts}"
@@ -621,11 +599,11 @@ run_rsync() {
         saved_copy+="_success.log"
       fi
       cp "$tmp_rslog" "$saved_copy" 2>/dev/null || true
-      chown "$LOG_USER:$LOG_GROUP" "$saved_copy" 2>/dev/null || true
+      chown "$LOG_USER" "$saved_copy" 2>/dev/null || true
       chmod "$LOG_FILE_MODE" "$saved_copy" 2>/dev/null || true
       rm -f "$tmp_rslog"
     else
-      rsync_summaries["$label"]="$label: no stats"
+      :
     fi
 
     if [ "$last_status" -eq 0 ]; then
@@ -700,6 +678,143 @@ run_rsync() {
 }
 
 # --- Main Functions ---
+# Unified label backup (snapshot optional) with extra exclude
+run_label_backup() {
+  local label="$1" src="$2" dest="$3" extra_exclude="$4"
+  local exclude_arg=()
+  if [ -n "$extra_exclude" ]; then
+    exclude_arg=("--exclude=$extra_exclude")
+  fi
+  if [ "$ENABLE_SNAPSHOTS" = true ]; then
+    local now
+    now=$(date '+%Y%m%d_%H%M%S')
+    local safe_label=${label// /_}
+    local snapdir="$SNAPSHOT_ROOT/$safe_label/$now"
+    if [ "$DRY_RUN" = false ]; then
+      ssh_run "mkdir -p '$snapdir'" 2>/dev/null || true
+    else
+      log "Dry-run: would create remote snapshot dir $snapdir"
+    fi
+    run_rsync "$src" "$snapdir" "${exclude_arg[@]}" "$label"
+    rsync_results[$label]=$?
+    log "Result: $label rsync exit=${rsync_results[$label]}"
+    if [ "${rsync_results[$label]}" -eq 0 ] && [ "$DRY_RUN" = false ]; then
+      ssh_run "ln -snf '$snapdir' '$SNAPSHOT_ROOT/$safe_label/latest'"
+      ssh_run "ls -1dt '$SNAPSHOT_ROOT/$safe_label'/*/ 2>/dev/null | tail -n +$((SNAPSHOT_KEEP+1)) | xargs -r rm -rf --" || true
+    fi
+  else
+    run_rsync "$src" "$dest" "${exclude_arg[@]}" "$label"
+    rsync_results[$label]=$?
+    log "Result: $label rsync exit=${rsync_results[$label]}"
+  fi
+  if [ "${rsync_results[$label]}" -ne 0 ]; then
+    failed_labels+=("$label")
+  fi
+}
+
+# --- Main Functions ---
+# Compose final notification (success or failure) and set COMPOSE_* variables
+compose_notification() {
+  local status="$1" # 0 success, 1 failure
+  local runtime_now
+  runtime_now=$(format_runtime)
+  local esub level detail body
+
+  if [ "$status" -ne 0 ]; then
+    esub=$(notif_emoji fail)
+    level=alert
+    local failed_summary="" notify_detail=""
+    for lbl in "${failed_labels[@]}"; do
+      local code desc transferred total human_trans human_total raw
+      code=${rsync_results[$lbl]:-${DEFAULT_FAIL_CODE:-50}}
+      desc=$(rsync_exit_description "$code")
+      transferred=${rsync_transferred_bytes[$lbl]:-0}
+      total=${rsync_total_bytes[$lbl]:-0}
+      human_trans=$(bytes_human "$transferred")
+      human_total=$(bytes_human "$total")
+      failed_summary+="$lbl: exit=${code} (${desc}); transferred ${human_trans} of ${human_total}; "
+      notify_detail+="$lbl: exit=${code} -> ${desc}\nTransferred: ${human_trans} of ${human_total}\n"
+      raw=${rsync_raw_failed[$lbl]:-}
+      if [ -n "$raw" ] && [ -f "$raw" ]; then
+        notify_detail+=$'--- recent rsync output ---\n'
+        notify_detail+="$(extract_rsync_errors "$raw" ${NOTIF_EXCERPT_LINES:-8})"$'\n\n'
+      fi
+    done
+    notify_detail+="Runtime: ${runtime_now}\nSee log: $LOG_FILE"
+    detail="${esub} Backup FAIL: $failed_summary"
+    body="$notify_detail"
+  else
+    esub=$(notif_emoji ok)
+    level=normal
+    local condensed_parts=() detailed_body
+    detailed_body=$'Runtime: '"${runtime_now}"$'\n'
+    for lbl in "${LABELS_ARRAY[@]}"; do
+      local transferred files deletes sent total est human_transferred human_total human_est human_sent percent_total
+      transferred=${rsync_transferred_bytes[$lbl]:-0}
+      files=${rsync_files[$lbl]:-0}
+      deletes=${rsync_deletes[$lbl]:-0}
+      sent=${rsync_bytes_sent[$lbl]:-0}
+      total=${rsync_total_bytes[$lbl]:-0}
+      est=${estimated_changed_bytes[$lbl]:-0}
+      human_transferred=$(bytes_human "$transferred")
+      human_total=$(bytes_human "$total")
+      human_est=$(bytes_human "$est")
+      human_sent=$(bytes_human "$sent")
+      percent_total=0
+      if [ "$total" -gt 0 ] && [ "$transferred" -gt 0 ]; then
+        percent_total=$(awk -v t="$total" -v tr="$transferred" 'BEGIN{printf "%.1f", (tr/t)*100}')
+      fi
+      if [ "$est" -gt 0 ]; then
+        detailed_body+="$lbl: $human_total total, $human_est est_changed, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
+      else
+        detailed_body+="$lbl: $human_total total, no changes, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
+      fi
+      condensed_parts+=("$lbl: $human_transferred (${percent_total}%)")
+    done
+    local max_labels_in_d condensed_show extra_count condensed_line idx
+    max_labels_in_d=${NOTIF_CONDENSED_MAX_LABELS:-3}
+    condensed_show=()
+    idx=0
+    for part in "${condensed_parts[@]}"; do
+      if [ "$idx" -ge "$max_labels_in_d" ]; then
+        break
+      fi
+      condensed_show+=("$part")
+      idx=$((idx+1))
+    done
+    extra_count=$(( ${#condensed_parts[@]} - ${#condensed_show[@]} ))
+    condensed_line=$(IFS=$'\n'; printf '%s' "${condensed_show[*]}")
+    if [ "$extra_count" -gt 0 ]; then
+      condensed_line+=" | +${extra_count} more"
+    fi
+
+    # Space summary per label (simplified)
+    for idx in "${!LABELS_ARRAY[@]}"; do
+      local lbl=${LABELS_ARRAY[$idx]} dest=${DESTS_ARRAY[$idx]} req_bytes req_human df_avail free_bytes free_human req_pct_of_free
+      req_bytes=${rsync_transferred_bytes[$lbl]:-0}
+      req_human=$(bytes_human "$req_bytes")
+      df_avail=$(ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" df -P -B1 "$dest" 2>/dev/null | awk 'NR==2{print $4}' || true)
+      [[ ! "$df_avail" =~ ^[0-9]+$ ]] && df_avail=0
+      free_bytes=$df_avail
+      free_human=$(bytes_human "$free_bytes")
+      req_pct_of_free=0
+      if [ "$free_bytes" -gt 0 ] && [ "$req_bytes" -gt 0 ]; then
+        req_pct_of_free=$(awk -v r="$req_bytes" -v f="$free_bytes" 'BEGIN{printf "%d", (r*100)/f}')
+      fi
+      detailed_body+="Space ($lbl): Free = $free_human Required = $req_human"$'\n'
+      detailed_body+="Required vs Free ($lbl): $req_pct_of_free%"$'\n'
+    done
+    detail="${esub} Backup OK"$'\n'"${condensed_line}"
+    body="$detailed_body"
+  fi
+
+  COMPOSE_LEVEL="$level"
+  COMPOSE_DETAIL="$detail"
+  COMPOSE_BODY="$body"
+  return 0
+}
+
+# --- Main Functions ---
 # Prune old log files to retention aligned with MAX_LOGS
 prune_old_logs() {
   local keep="$MAX_LOGS"
@@ -744,7 +859,7 @@ prune_old_logs() {
 collect_notification_artifacts() {
   local outdir="$PRESERVED_RAW_LOG_DIR/notify_artifacts"
   mkdir -p "$outdir" 2>/dev/null || true
-  chown "$LOG_USER:$LOG_GROUP" "$outdir" 2>/dev/null || true
+  chown "$LOG_USER" "$outdir" 2>/dev/null || true
   chmod "$LOG_DIR_MODE" "$outdir" 2>/dev/null || true
   local ts
   ts=$(date +%Y%m%d_%H%M%S)
@@ -756,7 +871,7 @@ collect_notification_artifacts() {
   else
     echo "(remote df unavailable)" > "$notify_df_file"
   fi
-  chown "$LOG_USER:$LOG_GROUP" "$notify_df_file" 2>/dev/null || true
+  chown "$LOG_USER" "$notify_df_file" 2>/dev/null || true
   chmod "$LOG_FILE_MODE" "$notify_df_file" 2>/dev/null || true
 
   : > "$notify_snap_file"
@@ -768,16 +883,18 @@ collect_notification_artifacts() {
       echo "${lbl}: (snapshot info unavailable)" >> "$notify_snap_file"
     fi
   done
-  chown "$LOG_USER:$LOG_GROUP" "$notify_snap_file" 2>/dev/null || true
+  chown "$LOG_USER" "$notify_snap_file" 2>/dev/null || true
   chmod "$LOG_FILE_MODE" "$notify_snap_file" 2>/dev/null || true
 
   return 0
 }
 
-# --- Main Execution ---
-# Record script start time
-start_time=$(date +%s)
-log "$SRC_NAS --> $DEST_NAS start: $(date)"
+# --- Main Entry Point ---
+# Main script logic
+main() {
+  # Record script start time
+  start_time=$(date +%s)
+  log "$SRC_NAS --> $DEST_NAS start: $(date)"
 
 # Wake-on-LAN
 if command -v etherwake >/dev/null 2>&1; then
@@ -859,7 +976,6 @@ fi
 ## Per-label backup execution
 declare -A rsync_results
 failed_labels=()
-declare -A rsync_summaries
 declare -A rsync_total_bytes
 declare -A rsync_transferred_bytes
 declare -A rsync_files
@@ -867,25 +983,11 @@ declare -A rsync_deletes
 declare -A rsync_bytes_sent
 declare -A estimated_changed_bytes 
 
-# Prepare arrays for aggregated preflight (dynamic labels)
-LABELS_ARRAY=("Media" "Secure")
-SRCS_ARRAY=("$MEDIA_SRC" "$SECURE_SRC")
-DESTS_ARRAY=("$MEDIA_DEST" "$SECURE_DEST")
 agg_msg=""
 
 # Ensure manifests exist for all labels
 ensure_manifests_for_labels || true
 
-# Capture estimated changed bytes per label (using manifest diff regardless of PREFLIGHT_MODE to drive percent-of-change metrics)
-for idx in "${!LABELS_ARRAY[@]}"; do
-  lbl=${LABELS_ARRAY[$idx]}
-  src=${SRCS_ARRAY[$idx]}
-  est_changed=$(manifest_diff_bytes "$lbl" "$src" 2>/dev/null || echo 0)
-  estimated_changed_bytes["$lbl"]=$est_changed
-  log "Estimated changed bytes for $lbl (manifest diff): $est_changed"
-done
-
-# Runs `aggregate_preflight_check` which sums estimated changed bytes per remote device and compares against available space
 if ! agg_msg=$(aggregate_preflight_check 2>&1); then
   log "Aggregate preflight failed: $agg_msg"
   runtime_now=$(format_runtime)
@@ -897,42 +999,13 @@ if ! agg_msg=$(aggregate_preflight_check 2>&1); then
   done
 else
   log "Aggregate preflight passed: proceeding with per-label rsyncs"
-
-  if [ "$ENABLE_SNAPSHOTS" = true ]; then
-    now=$(date +%Y%m%d_%H%M%S)
-    snapdir="$SNAPSHOT_ROOT/Media/$now"
-  ssh -p "$SSH_PORT" "$REMOTE" "mkdir -p '$snapdir'" 2>/dev/null || true
-    run_rsync "$MEDIA_SRC" "$snapdir" --exclude=net/ "Media"
-  else
-    run_rsync "$MEDIA_SRC" "$MEDIA_DEST" --exclude=net/ "Media"
-  fi
-  rsync_results[Media]=$?
-  log "Result: Media rsync exit=${rsync_results[Media]}"
-  if [ "$ENABLE_SNAPSHOTS" = true ] && [ "${rsync_results[Media]:-1}" -eq 0 ] && [ "$DRY_RUN" = false ]; then
-  ssh -p "$SSH_PORT" "$REMOTE" "ln -snf '$snapdir' '$SNAPSHOT_ROOT/Media/latest'"
-  ssh -p "$SSH_PORT" "$REMOTE" "ls -1dt '$SNAPSHOT_ROOT/Media'/*/ 2>/dev/null | tail -n +$((SNAPSHOT_KEEP+1)) | xargs -r rm -rf --" || true
-  fi
-  if [ "${rsync_results[Media]}" -ne 0 ]; then
-    failed_labels+=("Media")
-  fi
-
-  if [ "$ENABLE_SNAPSHOTS" = true ]; then
-    now=$(date +%Y%m%d_%H%M%S)
-    snapdir="$SNAPSHOT_ROOT/Secure/$now"
-  ssh -p "$SSH_PORT" "$REMOTE" "mkdir -p '$snapdir'" 2>/dev/null || true
-    run_rsync "$SECURE_SRC" "$snapdir" --exclude=torrent/ "Secure"
-  else
-    run_rsync "$SECURE_SRC" "$SECURE_DEST" --exclude=torrent/ "Secure"
-  fi
-  rsync_results[Secure]=$?
-  log "Result: Secure rsync exit=${rsync_results[Secure]}"
-  if [ "$ENABLE_SNAPSHOTS" = true ] && [ "${rsync_results[Secure]:-1}" -eq 0 ] && [ "$DRY_RUN" = false ]; then
-  ssh -p "$SSH_PORT" "$REMOTE" "ln -snf '$snapdir' '$SNAPSHOT_ROOT/Secure/latest'"
-  ssh -p "$SSH_PORT" "$REMOTE" "ls -1dt '$SNAPSHOT_ROOT/Secure'/*/ 2>/dev/null | tail -n +$((SNAPSHOT_KEEP+1)) | xargs -r rm -rf --" || true
-  fi
-  if [ "${rsync_results[Secure]}" -ne 0 ]; then
-    failed_labels+=("Secure")
-  fi
+  for idx in "${!LABELS_ARRAY[@]}"; do
+    lbl=${LABELS_ARRAY[$idx]}
+    src=${SRCS_ARRAY[$idx]}
+    dest=${DESTS_ARRAY[$idx]}
+    extra_excl=${RSYNC_EXTRA_EXCLUDES[$idx]:-}
+    run_label_backup "$lbl" "$src" "$dest" "$extra_excl"
+  done
 fi
 
 # Aggregate overall status: 0 OK, 1 failure
@@ -944,131 +1017,10 @@ fi
 
 ## Verification, notification and (optional) shutdown
 collect_notification_artifacts || true
+compose_notification "$backup_status"
+log "$SRC_NAS --> $DEST_NAS complete == $(format_runtime)"
+notify_send "$COMPOSE_LEVEL" "Remote Backup - $( [ "$backup_status" -eq 0 ] && echo OK || echo FAIL)" "$COMPOSE_DETAIL" "$COMPOSE_BODY"
 if [ "$backup_status" -eq 0 ]; then
-  log "$SRC_NAS backup complete: Status $backup_status"
-else
-  failed_summary=""
-  notify_detail=""
-  for lbl in "${failed_labels[@]}"; do
-    code=${rsync_results[$lbl]:-${default_fail_code:-2}}
-    desc=$(rsync_exit_description "$code")
-    transferred=${rsync_transferred_bytes[$lbl]:-0}
-    total_bytes=${rsync_total_bytes[$lbl]:-0}
-    human_trans=$(bytes_human "$transferred")
-    human_total=$(bytes_human "$total_bytes")
-    failed_summary+="$lbl: exit=${code} (${desc}); transferred ${human_trans} of ${human_total}; "
-    notify_detail+="$lbl: exit=${code} -> ${desc}\nTransferred: ${human_trans} of ${human_total}\n"
-    raw=${rsync_raw_failed[$lbl]:-}
-    if [ -n "$raw" ] && [ -f "$raw" ]; then
-      notify_detail+=$'--- recent rsync output ---\n'
-      notify_detail+="$(extract_rsync_errors "$raw" ${NOTIF_EXCERPT_LINES:-8})"$'\n\n'
-    fi
-  done
-  logger -p crit "$SRC_NAS backup failed: Errors: $failed_summary"
-  log "$SRC_NAS backup failed: Errors: $failed_summary"
-  runtime_now=$(format_runtime)
-  notify_detail+="Runtime: ${runtime_now}\nSee log: $LOG_FILE"
-  esub=$(notif_emoji fail)
-  notify_send alert "Remote Backup - FAIL" "${esub} Backup FAIL: $failed_summary" "$notify_detail"
-fi
-
-# Record end time
-runtime_converted=$(format_runtime)
-
-# Log status and send notification
-log "$SRC_NAS --> $DEST_NAS complete == Runtime: $runtime_converted"
-condensed_parts=()
-detailed_body=$'Runtime: '
-detailed_body+="$runtime_converted"$'\n'
-for lbl in "${!rsync_summaries[@]}"; do
-  transferred=${rsync_transferred_bytes[$lbl]:-0}
-  files=${rsync_files[$lbl]:-0}
-  deletes=${rsync_deletes[$lbl]:-0}
-  sent=${rsync_bytes_sent[$lbl]:-0}
-  total=${rsync_total_bytes[$lbl]:-0}
-  est=${estimated_changed_bytes[$lbl]:-0}
-
-  human_transferred=$(bytes_human "$transferred")
-  human_total=$(bytes_human "$total")
-  human_est=$(bytes_human "$est")
-  human_sent=$(bytes_human "$sent")
-
-  percent_total=0
-  if [ "$total" -gt 0 ] && [ "$transferred" -gt 0 ]; then
-    percent_total=$(awk -v t="$total" -v tr="$transferred" 'BEGIN{printf "%.1f", (tr/t)*100}')
-  fi
-
-  if [ "$est" -gt 0 ]; then
-    detailed_body+="$lbl: $human_total total, $human_est est_changed, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
-  else
-    detailed_body+="$lbl: $human_total total, no changes, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
-  fi
-
-  condensed_parts+=("$lbl: $human_transferred (${percent_total}%)")
-done
-
-max_labels_in_d=${NOTIF_CONDENSED_MAX_LABELS:-3}
-condensed_show=()
-idx=0
-for part in "${condensed_parts[@]}"; do
-  if [ "$idx" -ge "$max_labels_in_d" ]; then
-    break
-  fi
-  condensed_show+=("$part")
-  idx=$((idx + 1))
-done
-extra_count=$(( ${#condensed_parts[@]} - ${#condensed_show[@]} ))
-
-condensed_line=$(IFS=$'\n'; printf '%s' "${condensed_show[*]}")
-if [ "$extra_count" -gt 0 ]; then
-  condensed_line+=" | +${extra_count} more"
-fi
-
-if [ "${#failed_labels[@]}" -eq 0 ]; then
-  body="${detailed_body}"
-  for idx in "${!LABELS_ARRAY[@]}"; do
-    lbl=${LABELS_ARRAY[$idx]}
-    dest=${DESTS_ARRAY[$idx]}
-    req_bytes=${rsync_transferred_bytes[$lbl]:-0}
-    req_human=$(bytes_human "$req_bytes")
-    df_avail=$(ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" df -P -B1 "$dest" 2>/dev/null | awk 'NR==2{print $4}' || true)
-    if [[ ! "$df_avail" =~ ^[0-9]+$ ]]; then df_avail=0; fi
-    free_bytes=$df_avail
-    if [ "$free_bytes" -eq 0 ] && [ "$REMOTE_ENABLE_STAT_FALLBACK" = "true" ]; then
-      stat_vals=$(ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" stat -f --format '%a %s' "$dest" 2>/dev/null || echo "")
-      if [[ "$stat_vals" =~ ^[0-9]+\ [0-9]+$ ]]; then
-        stat_free=$(awk '{print $1 * $2}' <<< "$stat_vals")
-        if [[ "$stat_free" =~ ^[0-9]+$ ]] && [ "$stat_free" -gt 0 ]; then
-          free_bytes=$stat_free
-        fi
-      fi
-    fi
-    free_unknown=0
-    if [ "$free_bytes" -eq 0 ]; then
-      fs_type=$(ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" stat -f -c %T "$dest" 2>/dev/null || echo "")
-      for _fst in $REMOTE_IGNORE_ZERO_FS_TYPES; do
-        if [ "$fs_type" = "$_fst" ]; then
-          free_unknown=1
-          break
-        fi
-      done
-    fi
-    if [ "$free_unknown" -eq 1 ]; then
-      body+=$'\n''Space ('"$lbl"'): Free = Unknown Required='"$req_human"''
-      body+=$'\n''Required vs Free ('"$lbl"'): Unknown'
-    else
-      free_human=$(bytes_human "$free_bytes")
-      req_pct_of_free=0
-      if [ "$free_bytes" -gt 0 ] && [ "$req_bytes" -gt 0 ]; then
-        req_pct_of_free=$(awk -v r="$req_bytes" -v f="$free_bytes" 'BEGIN{printf "%d", (r*100)/f}')
-      fi
-      body+=$'\n''Space ('"$lbl"'): Free = '"$free_human"' Required = '"$req_human"''
-      body+=$'\n''Required vs Free ('"$lbl"'): '"$req_pct_of_free"'%'
-    fi
-  done
-  esub=$(notif_emoji ok)
-  detail="${esub} Backup OK"$'\n'"${condensed_line}"
-  notify_send normal "Remote Backup - OK" "$detail" "$body"
   if [ "$DRY_RUN" = false ]; then
     log "Shutting down remote after successful backup"
     if ! ssh -p "$SSH_PORT" "$REMOTE" "df --type=xfs -h && powerdown" 2>/dev/null; then
@@ -1090,7 +1042,9 @@ else
     log "Not shutting down remote because SHUTDOWN_ON_FAILURE=false"
   fi
 fi
-
-# Remove old logs and artifacts
 prune_old_logs || true
 exit 0
+}
+
+# Entry Point
+main "$@"
