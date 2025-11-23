@@ -6,7 +6,6 @@ if ! flock -n 9; then
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "Another remote_backup.sh run is active, exiting (lock: $LOCKFILE)"
   exit 1
 fi
-
 noParity=true
 clearLog=false
 
@@ -73,7 +72,6 @@ SHUTDOWN_ON_FAILURE=false             # Shutdown source NAS on failure
 # --- Notifications & Logging ---
 NOTIF_CONDENSED_MAX_LABELS=3          # Maximum number of labels to include in condensed notifications
 NOTIF_EXCERPT_LINES=8                 # Number of lines to include in notification excerpts
-LOG_TAIL_LINES=100                    # Number of lines to include in log tails
 
 # --- Log Ownership & Permissions ---
 # Ensure logs are group-writable and owned by nobody:users on Unraid
@@ -101,9 +99,7 @@ LABELS_ARRAY=("Media" "Secure")            # Labels for datasets to back up
 SRCS_ARRAY=("$MEDIA_SRC" "$SECURE_SRC")    # Source paths for datasets
 DESTS_ARRAY=("$MEDIA_DEST" "$SECURE_DEST") # Destination paths for datasets
 
-# --------------------------------------------------------------------------------
-
-# Ensure runtime directories exist
+# -- Directory Setup --
 mkdir -p "$LOG_FILE_SUBDIR" 2>/dev/null || true 
 mkdir -p "$PRESERVED_RAW_LOG_DIR" 2>/dev/null || true 
 mkdir -p "$LOG_FILE_SUBDIR/manifests" 2>/dev/null || true
@@ -113,12 +109,11 @@ chmod "$LOG_DIR_MODE" "$LOG_FILE_SUBDIR" "$PRESERVED_RAW_LOG_DIR" "$LOG_FILE_SUB
 chown "$LOG_USER:$LOG_GROUP" "$LOG_FILE" 2>/dev/null || true
 chmod "$LOG_FILE_MODE" "$LOG_FILE" 2>/dev/null || true
 
-# Logging function
+# -- Logging function --
 log() {
   local msg="$1"
   echo "$(date "+%Y/%m/%d %T") : $msg" | tee -a "$LOG_FILE"
 }
-
 syslog() {
   local level="$1"; shift || true
   local msg="$*"
@@ -135,6 +130,9 @@ syslog() {
   logger -i -t "Remote Backup" -p "$prio" "$msg"
 }
 
+# --------------------------------------------------------------------------------
+
+# --- Helpers Functions ---
 # Convert a bytes integer into a human-readable string using binary units
 bytes_human() {
   local bytes=${1:-0}
@@ -155,6 +153,7 @@ bytes_human() {
   fi
 }
 
+# --- Helpers Functions ---
 # Convert a human-readable size like "54.34T" or "18.74G bytes" -> integer bytes
 human_to_bytes() {
   local s="$1"
@@ -179,16 +178,21 @@ human_to_bytes() {
   }' <<<"$s"
 }
 
+# --- Helpers Functions ---
 # Returns human runtime string computed from start time
 format_runtime() {
   if [ -z "${start_time:-}" ]; then
     echo "0h:0m:0s"
     return
   fi
-  local secs=$(( $(date +%s) - start_time ))
+  local secs
+  secs=$(( $(date +%s) - start_time ))
   printf '%dh:%dm:%ds' $((secs/3600)) $((secs%3600/60)) $((secs%60))
 }
+now_s() { date +%s; }
+elapsed_since() { local _s="$1"; echo $(( $(now_s) - _s )); }
 
+# --- Helpers Functions ---
 # Centralized wrapper around the Unraid notify command to ensure consistent
 notify_send() {
   local level="$1"; shift
@@ -203,6 +207,7 @@ notify_send() {
   return $nrc
 }
 
+# --- Helpers Functions ---
 # Map notification semantic to chosen emoji buttons
 notif_emoji() {
   case "${1:-ok}" in
@@ -213,99 +218,8 @@ notif_emoji() {
   esac
 }
 
-# Conservative per-label preflight: compute source size and check available
-preflight_disk_check() {
-  local src="$1"
-  local remote_dest="$2"
-  local label="$3"
-  local min_buffer=$((1024 * 1024 * 1024))
-
-  local src_bytes
-  if src_bytes=$(du -sb "$src" 2>/dev/null | cut -f1); then
-    :
-  else
-    local src_kb
-    src_kb=$(du -s "$src" 2>/dev/null | cut -f1 || echo 0)
-    src_bytes=$((src_kb * 1024))
-  fi
-  src_bytes=${src_bytes:-0}
-
-  local dest_avail
-  if dest_avail=$(ssh -p "$SSH_PORT" "$REMOTE" df --output=avail -B1 "$remote_dest" 2>/dev/null | tail -n1); then
-    :
-  else
-    local dest_avail_kb
-    dest_avail_kb=$(ssh -p "$SSH_PORT" "$REMOTE" df -k "$remote_dest" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
-    dest_avail=$((dest_avail_kb * 1024))
-  fi
-  dest_avail=${dest_avail:-0}
-  if ! [[ "$dest_avail" =~ ^[0-9]+$ ]]; then dest_avail=0; fi
-
-  local avail_unknown=0
-  if [ "$dest_avail" -eq 0 ] && [ "$REMOTE_ENABLE_STAT_FALLBACK" = "true" ]; then
-    local stat_vals
-    stat_vals=$(ssh -p "$SSH_PORT" "$REMOTE" stat -f --format '%a %s' "$remote_dest" 2>/dev/null || echo "")
-    if [[ "$stat_vals" =~ ^[0-9]+\ [0-9]+$ ]]; then
-      local stat_free
-      stat_free=$(awk '{print $1 * $2}' <<< "$stat_vals")
-      if [[ "$stat_free" =~ ^[0-9]+$ ]] && [ "$stat_free" -gt 0 ]; then
-        dest_avail=$stat_free
-      fi
-    fi
-  fi
-  if [ "$dest_avail" -eq 0 ]; then
-    local fs_type
-    fs_type=$(ssh -p "$SSH_PORT" "$REMOTE" stat -f -c %T "$remote_dest" 2>/dev/null || echo "")
-    for _fst in $REMOTE_IGNORE_ZERO_FS_TYPES; do
-      if [ "$fs_type" = "$_fst" ]; then
-        avail_unknown=1
-        break
-      fi
-    done
-  fi
-
-  human_src=$(bytes_human "$src_bytes")
-  human_dest_avail=$(bytes_human "$dest_avail")
-
-  local pct_buffer=$(( (src_bytes * 5) / 100 ))
-  if [ "$pct_buffer" -lt "$min_buffer" ]; then
-    safety_buffer=$min_buffer
-  else
-    safety_buffer=$pct_buffer
-  fi
-  human_buffer=$(bytes_human "$safety_buffer")
-  log "Preflight $label: source=$human_src dest_avail=$human_dest_avail buffer=$human_buffer"
-
-  if [ "$avail_unknown" -ne 1 ] && [ "$dest_avail" -lt $((src_bytes + safety_buffer)) ]; then
-    need_bytes=$((src_bytes + safety_buffer))
-    human_need=$(bytes_human "$need_bytes")
-    log "Insufficient space for $label: need at least $human_need but only $human_dest_avail available on $REMOTE:$remote_dest"
-    total_required=$(( src_bytes + safety_buffer ))
-    shortfall=0
-    if [ "$total_required" -gt "$dest_avail" ]; then
-      shortfall=$(( total_required - dest_avail ))
-    fi
-    human_required=$(bytes_human "$total_required")
-    human_shortfall=$(bytes_human "$shortfall")
-    runtime_now=$(format_runtime)
-    body="$label backup aborted: required ${human_required} (source ${human_src} + buffer ${human_buffer}); available ${human_dest_avail}; shortfall ${human_shortfall}\n\nRuntime: ${runtime_now}\nSee log: $LOG_FILE"
-    if [ "$avail_unknown" -ne 1 ] && [[ "$dest_avail" =~ ^[0-9]+$ ]] && [ "$dest_avail" -gt 0 ]; then
-      req_pct_of_free=$(awk -v r="$need_bytes" -v f="$dest_avail" 'BEGIN{printf "%d", (r*100)/f}')
-      body+=$'\n'"Space: Free=${human_dest_avail} Required=${human_need}"
-      body+=$'\n'"Required vs Free: ${req_pct_of_free}%"
-    else
-      body+=$'\n'"Space: Free=Unknown Required=${human_need}"
-      body+=$'\n'"Required vs Free: Unknown"
-    fi
-    esub=$(notif_emoji nospace)
-    notify_send alert "Remote Backup - NO SPACE" "${esub} $label backup aborted: insufficient space" "$body"
-    return 2
-  fi
-
-  return 0
-}
-
-# Aggregates space requirements for multiple labels that may target the
+# --- Main Functions ---
+# Aggregates space requirements for multiple labels that may target the same remote destination
 aggregate_preflight_check() {
   declare -A src_by_device
   declare -A remote_used
@@ -362,7 +276,7 @@ aggregate_preflight_check() {
       log "Aggregate preflight: failed to query remote df for $dest after ${df_try} tries"
       syslog err "Aggregate preflight failed: could not query remote df for $dest"
       echo "Failed to query remote disk usage for $dest" >&2
-      return ${default_fail_code:-2}
+      return "${default_fail_code:-2}"
     fi
     local device=$(printf '%s' "$df_out" | cut -d'|' -f1)
     local used=$(printf '%s' "$df_out" | cut -d'|' -f2)
@@ -441,6 +355,7 @@ aggregate_preflight_check() {
   return 0
 }
 
+# --- Main Functions ---
 # Parse an rsync --stats block captured in a raw rsync log file
 parse_rsync_stats() {
   local file="$1"
@@ -498,6 +413,7 @@ parse_rsync_stats() {
   fi
 }
 
+# --- Helpers Functions ---
 # Map a numeric rsync exit code to a short, human-friendly description used
 rsync_exit_description() {
   local code=${1:-0}
@@ -525,6 +441,7 @@ a file/directory etc that is not supported by rsync" ;;
   esac
 }
 
+# --- Helpers Functions ---
 # Returns a concise excerpt from a preserved raw rsync log
 extract_rsync_errors() {
   local file="$1"
@@ -543,6 +460,7 @@ extract_rsync_errors() {
   tail -n "$max_lines" "$file" 2>/dev/null || echo "(no rsync output)"
 }
 
+# --- Main Functions ---
 # Create a compact manifest for `src` containing lines of the form:
 write_manifest() {
   local label="$1"
@@ -551,7 +469,8 @@ write_manifest() {
   mkdir -p "$dest" 2>/dev/null || true
   chown "$LOG_USER:$LOG_GROUP" "$dest" 2>/dev/null || true
   chmod "$LOG_DIR_MODE" "$dest" 2>/dev/null || true
-  local out="$dest/${label// /_}_manifest_$(date +%Y%m%d_%H%M%S).txt"
+  local out
+  out="$dest/${label// /_}_manifest_$(date +%Y%m%d_%H%M%S).txt"
   (cd "$src" && find . -type f -printf '%P\t%s\t%T@\n') > "$out" 2>/dev/null || true
   if [ -f "$out" ]; then
     chown "$LOG_USER:$LOG_GROUP" "$out" 2>/dev/null || true
@@ -560,7 +479,7 @@ write_manifest() {
   else
     log "Warning: manifest write failed for $label (attempted $out)"
   fi
-  mapfile -t mlist < <(ls -1t "$dest/${label// /_}_manifest_"*.txt 2>/dev/null || true)
+  mapfile -t mlist < <(find "$dest" -maxdepth 1 -type f -name "${label// /_}_manifest_*.txt" -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk '{print $2}' || true)
   if [ "${#mlist[@]}" -gt "$MAX_MANIFEST" ]; then
     for ((i=MAX_MANIFEST;i<${#mlist[@]};i++)); do
       rm -f "${mlist[$i]}" 2>/dev/null || true
@@ -568,33 +487,21 @@ write_manifest() {
   fi
 }
 
-# Print the content of the latest manifest for `label` (if any) to stdout.
-load_latest_manifest() {
-  local label="$1"
-  local dest="$LOG_FILE_SUBDIR/manifests"
-  local latest
-  latest=$(ls -1t "$dest/${label// /_}_manifest_"*.txt 2>/dev/null | head -n1 || true)
-  if [ -n "$latest" ] && [ -f "$latest" ]; then
-    cat "$latest"
-    return 0
-  fi
-  return 1
-}
-
+# --- Main Functions ---
 # Compare the current set of files under `src` to the latest stored manifest
 manifest_diff_bytes() {
   local label="$1"
   local src="$2"
   local manifest_file
-  manifest_file=$(ls -1t "$LOG_FILE_SUBDIR/manifests/${label// /_}_manifest_"*.txt 2>/dev/null | head -n1 || true)
+  manifest_file=$(find "$LOG_FILE_SUBDIR/manifests" -maxdepth 1 -type f -name "${label// /_}_manifest_*.txt" -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1{print $2}' || true)
   if [ -z "$manifest_file" ] || [ ! -f "$manifest_file" ]; then
     du -sb "$src" 2>/dev/null | cut -f1 || echo 0
     return 0
   fi
   declare -A man
-  while IFS=$'\t' read -r path size mtime; do
+  while IFS=$'\t' read -r path size; do
     man["$path"]=$size
-  done < "$manifest_file"
+  done < <(awk -F'\t' '{print $1"\t"$2}' "$manifest_file")
 
   local sum=0
   while IFS= read -r -d '' f; do
@@ -614,6 +521,7 @@ manifest_diff_bytes() {
   echo "$sum"
 }
 
+# --- Main Functions ---
 # For metadata preflight mode, ensure at least one manifest exists for each configured label
 ensure_manifests_for_labels() {
   if [ "${PREFLIGHT_MODE:-}" != "metadata" ]; then
@@ -624,7 +532,7 @@ ensure_manifests_for_labels() {
   for idx in "${!LABELS_ARRAY[@]}"; do
     label=${LABELS_ARRAY[$idx]}
     safe_label=${label// /_}
-    latest=$(ls -1t "$dest/${safe_label}_manifest_"*.txt 2>/dev/null | head -n1 || true)
+    latest=$(find "$dest" -maxdepth 1 -type f -name "${safe_label}_manifest_*.txt" -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1{print $2}' || true)
     if [ -z "$latest" ] || [ ! -f "$latest" ]; then
       log "No manifest found for $label; creating baseline manifest"
       write_manifest "$label" "${SRCS_ARRAY[$idx]}"
@@ -634,6 +542,7 @@ ensure_manifests_for_labels() {
   done
 }
 
+# --- Main Functions ---
 # Rsync wrapper to captures raw output for diagnostics, parses --stats, and retry logic
 run_rsync() {
   local src="$1"
@@ -646,14 +555,10 @@ run_rsync() {
   fi
 
   log "Initialize backup ($label --> $DEST_NAS) == $(date)"
-  local -a default_excludes_local=("${DEFAULT_EXCLUDES[@]:-}")
-
-  local -a rsync_args=("${RSYNC_DEFAULT_ARGS[@]:-}")
-  rsync_args+=("--partial-dir=${RSYNC_PARTIAL_DIR}")
-  rsync_args+=("${default_excludes_local[@]:-}")
+  local -a rsync_args=("${RSYNC_DEFAULT_ARGS[@]:-}" "--partial-dir=${RSYNC_PARTIAL_DIR}")
+  rsync_args+=("${DEFAULT_EXCLUDES[@]:-}")
   if [ "$DRY_RUN" = true ]; then
     rsync_args+=("--dry-run")
-
   fi
   if [ "${#opts[@]}" -ne 0 ]; then
     rsync_args+=("${opts[@]}")
@@ -662,7 +567,8 @@ run_rsync() {
   set +e
     local attempt=1
     local last_status=0
-    local tmp_rslog=$(mktemp /tmp/rsync_raw.XXXXXX)
+    local tmp_rslog
+    tmp_rslog=$(mktemp /tmp/rsync_raw.XXXXXX)
 
     while :; do
       log "RSYNC attempt $attempt/$MAX_RETRIES for $label"
@@ -743,10 +649,10 @@ run_rsync() {
     fi
 
     local should_retry=0
-    if [ -z "$retry_on_codes" ]; then
+    if [ -z "${RETRY_ON_CODES:-}" ]; then
       should_retry=1
     else
-      for code in $retry_on_codes; do
+      for code in $RETRY_ON_CODES; do
         if [ "$last_status" -eq "$code" ]; then
           should_retry=1
           break
@@ -754,50 +660,51 @@ run_rsync() {
       done
     fi
 
-    if [ "$should_retry" -eq 0 ] || [ "$attempt" -ge "$max_retries" ]; then
+    if [ "$should_retry" -eq 0 ] || [ "$attempt" -ge "${MAX_RETRIES}" ]; then
       log "rsync final failure for $label with exit=$last_status after attempt $attempt"
       syslog err "rsync final failure: $label exit=$last_status after attempt $attempt"
-      log "Recent rsync output (last 100 lines):"
+      log "Recent rsync output (tail excerpt):"
       tail -n 100 "$LOG_FILE" | sed -n '1,200p' | tee -a "$LOG_FILE"
       set -e
-      return $last_status
+      return "$last_status"
     fi
 
-    if [ "$enable_exponential_backoff" = true ]; then
-      backoff=$(( retry_backoff * (2 ** (attempt - 1)) ))
-      if [ "$backoff" -gt "$max_backoff" ]; then
-        backoff=$max_backoff
+    if [ "$ENABLE_EXPONENTIAL_BACKOFF" = true ]; then
+      backoff=$(( RETRY_BACKOFF * (2 ** (attempt - 1)) ))
+      if [ "$backoff" -gt "$MAX_BACKOFF" ]; then
+        backoff=$MAX_BACKOFF
       fi
       jitter=$(( RANDOM % ( (backoff / 2) + 1 ) ))
       sleep_sec=$(( backoff + jitter ))
     else
-      sleep_sec=$retry_backoff
+      sleep_sec=$RETRY_BACKOFF
     fi
 
-    log "rsync returned $last_status for $label; will retry in ${sleep_sec}s (attempt $attempt/$max_retries)"
-    if [ "$enable_per_attempt_notify" = true ]; then
+    log "rsync returned $last_status for $label; will retry in ${sleep_sec}s (attempt $attempt/$MAX_RETRIES)"
+    if [ "$ENABLE_PER_ATTEMPT_NOTIFY" = true ]; then
       desc=$(rsync_exit_description "$last_status")
       excerpt=""
       if [ -f "$tmp_rslog" ]; then
-        excerpt=$(extract_rsync_errors "$tmp_rslog" ${notif_excerpt_lines:-8} 2>/dev/null || true)
+        excerpt=$(extract_rsync_errors "$tmp_rslog" ${NOTIF_EXCERPT_LINES:-8} 2>/dev/null || true)
       fi
       runtime_now=$(format_runtime)
       body="Label: $label\nAttempt: ${attempt}/${MAX_RETRIES}\nLast exit: ${last_status} -> ${desc}\nBackoff: ${sleep_sec}s\n\nExcerpt:\n${excerpt}\n\nRuntime: ${runtime_now}\nSee log: $LOG_FILE"
-      notify_send warning "Remote Backup - RETRY" "$label: retrying (attempt $((attempt+1))/$max_retries) in ${sleep_sec}s" "$body"
+      notify_send warning "Remote Backup - RETRY" "$label: retrying (attempt $((attempt+1))/$MAX_RETRIES) in ${sleep_sec}s" "$body"
     fi
 
     sleep "$sleep_sec"
     attempt=$((attempt + 1))
   done
   set -e
-  return $last_status
+  return "$last_status"
 }
 
+# --- Main Functions ---
 # Prune old log files to retention aligned with MAX_LOGS
 prune_old_logs() {
   local keep="$MAX_LOGS"
   local base_dir="$LOG_FILE_SUBDIR"
-  mapfile -t logs < <(ls -1t "$base_dir"/remote_backup_*.log 2>/dev/null || true)
+  mapfile -t logs < <(find "$base_dir" -maxdepth 1 -type f -name 'remote_backup_*.log' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk '{print $2}' || true)
   if [ "${#logs[@]}" -gt "$keep" ]; then
     for ((i=keep;i<${#logs[@]};i++)); do
       rm -f "${logs[$i]}" 2>/dev/null || true
@@ -808,7 +715,7 @@ prune_old_logs() {
   local raw_dir="$PRESERVED_RAW_LOG_DIR"
   for lbl in "${LABELS_ARRAY[@]}"; do
     local safe_label=${lbl// /_}
-    mapfile -t rlist < <(ls -1t "$raw_dir"/rsync_raw_${safe_label}_*.log 2>/dev/null || true)
+    mapfile -t rlist < <(find "$raw_dir" -maxdepth 1 -type f -name "rsync_raw_${safe_label}_*.log" -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk '{print $2}' || true)
     if [ "${#rlist[@]}" -gt "$keep" ]; then
       for ((i=keep;i<${#rlist[@]};i++)); do
         rm -f "${rlist[$i]}" 2>/dev/null || true
@@ -818,13 +725,13 @@ prune_old_logs() {
   done
 
   local nadir="$PRESERVED_RAW_LOG_DIR/notify_artifacts"
-  mapfile -t df_files < <(ls -1t "$nadir"/remote_df_*.txt 2>/dev/null || true)
+  mapfile -t df_files < <(find "$nadir" -maxdepth 1 -type f -name 'remote_df_*.txt' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk '{print $2}' || true)
   if [ "${#df_files[@]}" -gt "$keep" ]; then
     for ((i=keep;i<${#df_files[@]};i++)); do
       rm -f "${df_files[$i]}" 2>/dev/null || true
     done
   fi
-  mapfile -t snap_files < <(ls -1t "$nadir"/snapshots_*.txt 2>/dev/null || true)
+  mapfile -t snap_files < <(find "$nadir" -maxdepth 1 -type f -name 'snapshots_*.txt' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk '{print $2}' || true)
   if [ "${#snap_files[@]}" -gt "$keep" ]; then
     for ((i=keep;i<${#snap_files[@]};i++)); do
       rm -f "${snap_files[$i]}" 2>/dev/null || true
@@ -832,6 +739,7 @@ prune_old_logs() {
   fi
 }
 
+# --- Main Functions ---
 # Gather small read-only remote artifacts (df, snapshot listings) used by notifications. 
 collect_notification_artifacts() {
   local outdir="$PRESERVED_RAW_LOG_DIR/notify_artifacts"
@@ -883,56 +791,49 @@ else
 fi
 
 ## Wait loop for SSH readiness
-start_wait_ts=$(date +%s)
+start_wait_ts=$(now_s)
 log "Waiting up to ${MAX_SSH_WAIT}s for $DEST_NAS SSH to become available..."
 ssh_reachable=0
 while :; do
-  now=$(date +%s)
-  elapsed=$(( now - start_wait_ts ))
+  elapsed=$(elapsed_since "$start_wait_ts")
   if ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" true >/dev/null 2>&1; then
     remaining=$(( MAX_SSH_WAIT - elapsed ))
-    if [ "$remaining" -lt 0 ]; then remaining=0; fi
+    (( remaining < 0 )) && remaining=0
     log "$DEST_NAS SSH is reachable after ${elapsed}s (timeout in ${remaining}s)"
 
-    stab_start_ts=$(date +%s)
+    stab_start_ts=$(now_s)
     log "Waiting up to ${STABILIZE_WAIT}s for remote filesystem readiness..."
-    stabilized=0
     while :; do
-      stab_now=$(date +%s)
-      stab_elapsed=$(( stab_now - stab_start_ts ))
+      stab_elapsed=$(elapsed_since "$stab_start_ts")
       if ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" df -P -B1 / >/dev/null 2>&1; then
         log "Remote filesystem responded to df after ${stab_elapsed}s; proceeding"
-        stabilized=1
         break
       fi
-      if [ "$stab_elapsed" -ge "$STABILIZE_WAIT" ]; then
+      if (( stab_elapsed >= STABILIZE_WAIT )); then
         log "Remote filesystem did not stabilize within ${STABILIZE_WAIT}s; proceeding anyway (df may fail)"
         break
       fi
       sleep "$STABILIZE_INTERVAL"
     done
 
-    # Additional array readiness loop
-    arr_start_ts=$(date +%s)
+    arr_start_ts=$(now_s)
     log "Waiting up to ${ARRAY_READY_WAIT}s for remote array (/mnt/user) readiness..."
     while :; do
-      arr_now=$(date +%s)
-      arr_elapsed=$(( arr_now - arr_start_ts ))
+      arr_elapsed=$(elapsed_since "$arr_start_ts")
       if ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" '[ -d /mnt/user ] && { [ -d /mnt/user/media ] || [ -d /mnt/user/secure ]; }'; then
         log "Remote array appears online after ${arr_elapsed}s; proceeding to backup operations."
         break
       fi
-      if [ "$arr_elapsed" -ge "$ARRAY_READY_WAIT" ]; then
+      if (( arr_elapsed >= ARRAY_READY_WAIT )); then
         log "Remote array not confirmed online within ${ARRAY_READY_WAIT}s; proceeding anyway (rsync may encounter missing shares)."
         break
       fi
       sleep "$ARRAY_READY_INTERVAL"
     done
-
     ssh_reachable=1
     break
   fi
-  if [ "$elapsed" -ge "$MAX_SSH_WAIT" ]; then
+  if (( elapsed >= MAX_SSH_WAIT )); then
     log "Timeout waiting for SSH on $DEST_NAS after ${elapsed}s"
     break
   fi
@@ -940,9 +841,7 @@ while :; do
   log "$DEST_NAS SSH not available yet; sleeping ${SSH_WAIT_INTERVAL}s (remaining ${remaining}s)"
   sleep "$SSH_WAIT_INTERVAL"
 done
-if [ "$ssh_reachable" -eq 1 ]; then
-  :
-else
+if [ "$ssh_reachable" -eq 0 ]; then
   log "SSH not reachable on $DEST_NAS after ${MAX_SSH_WAIT}s; aborting backup"
   syslog crit "Remote SSH unreachable on $DEST_NAS after ${MAX_SSH_WAIT}s; aborting"
   runtime_now=$(format_runtime)
@@ -1029,7 +928,7 @@ else
   log "Result: Secure rsync exit=${rsync_results[Secure]}"
   if [ "$ENABLE_SNAPSHOTS" = true ] && [ "${rsync_results[Secure]:-1}" -eq 0 ] && [ "$DRY_RUN" = false ]; then
   ssh -p "$SSH_PORT" "$REMOTE" "ln -snf '$snapdir' '$SNAPSHOT_ROOT/Secure/latest'"
-  ssh -p "$ssh_port" "$remote" "ls -1dt '$snapshot_root/Secure'/*/ 2>/dev/null | tail -n +$((snapshot_keep+1)) | xargs -r rm -rf --" || true
+  ssh -p "$SSH_PORT" "$REMOTE" "ls -1dt '$SNAPSHOT_ROOT/Secure'/*/ 2>/dev/null | tail -n +$((SNAPSHOT_KEEP+1)) | xargs -r rm -rf --" || true
   fi
   if [ "${rsync_results[Secure]}" -ne 0 ]; then
     failed_labels+=("Secure")
@@ -1045,7 +944,6 @@ fi
 
 ## Verification, notification and (optional) shutdown
 collect_notification_artifacts || true
-
 if [ "$backup_status" -eq 0 ]; then
   log "$SRC_NAS backup complete: Status $backup_status"
 else
@@ -1063,7 +961,7 @@ else
     raw=${rsync_raw_failed[$lbl]:-}
     if [ -n "$raw" ] && [ -f "$raw" ]; then
       notify_detail+=$'--- recent rsync output ---\n'
-      notify_detail+="$(extract_rsync_errors "$raw" ${notif_excerpt_lines:-8})"$'\n\n'
+      notify_detail+="$(extract_rsync_errors "$raw" ${NOTIF_EXCERPT_LINES:-8})"$'\n\n'
     fi
   done
   logger -p crit "$SRC_NAS backup failed: Errors: $failed_summary"
@@ -1109,11 +1007,11 @@ for lbl in "${!rsync_summaries[@]}"; do
   condensed_parts+=("$lbl: $human_transferred (${percent_total}%)")
 done
 
-max_labels_in_d=${notif_condensed_max_labels:-3}
+max_labels_in_d=${NOTIF_CONDENSED_MAX_LABELS:-3}
 condensed_show=()
 idx=0
 for part in "${condensed_parts[@]}"; do
-  if [ $idx -ge $max_labels_in_d ]; then
+  if [ "$idx" -ge "$max_labels_in_d" ]; then
     break
   fi
   condensed_show+=("$part")
@@ -1156,7 +1054,7 @@ if [ "${#failed_labels[@]}" -eq 0 ]; then
       done
     fi
     if [ "$free_unknown" -eq 1 ]; then
-      body+=$'\n''Space ('"$lbl"'): Free=Unknown Required='"$req_human"''
+      body+=$'\n''Space ('"$lbl"'): Free = Unknown Required='"$req_human"''
       body+=$'\n''Required vs Free ('"$lbl"'): Unknown'
     else
       free_human=$(bytes_human "$free_bytes")
@@ -1164,7 +1062,7 @@ if [ "${#failed_labels[@]}" -eq 0 ]; then
       if [ "$free_bytes" -gt 0 ] && [ "$req_bytes" -gt 0 ]; then
         req_pct_of_free=$(awk -v r="$req_bytes" -v f="$free_bytes" 'BEGIN{printf "%d", (r*100)/f}')
       fi
-      body+=$'\n''Space ('"$lbl"'): Free='"$free_human"' Required='"$req_human"''
+      body+=$'\n''Space ('"$lbl"'): Free = '"$free_human"' Required = '"$req_human"''
       body+=$'\n''Required vs Free ('"$lbl"'): '"$req_pct_of_free"'%'
     fi
   done
@@ -1184,16 +1082,15 @@ if [ "${#failed_labels[@]}" -eq 0 ]; then
 else
   if [ "$SHUTDOWN_ON_FAILURE" = true ]; then
     log "Shutdown_on_failure=true; requesting remote powerdown despite failures"
-  if ! ssh -p "$SSH_PORT" "$REMOTE" "df --type=xfs -h && powerdown" 2>/dev/null; then
-    log "Remote shutdown command failed"
-    syslog err "Remote shutdown command failed on $REMOTE"
-  fi
+    if ! ssh -p "$SSH_PORT" "$REMOTE" "df --type=xfs -h && powerdown" 2>/dev/null; then
+      log "Remote shutdown command failed"
+      syslog err "Remote shutdown command failed on $REMOTE"
+    fi
   else
-    log "Not shutting down remote because shutdown_on_failure=false"
+    log "Not shutting down remote because SHUTDOWN_ON_FAILURE=false"
   fi
 fi
 
 # Remove old logs and artifacts
 prune_old_logs || true
-
 exit 0
