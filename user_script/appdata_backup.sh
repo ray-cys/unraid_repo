@@ -5,8 +5,6 @@ if ! flock -n 9; then
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "Another appdata_backup.sh run is active, exiting (lock: $LOCKFILE)"
   exit 1
 fi
-noParity=true
-clearLog=false
 ################################################################################
 # ---------------- Configuration ----------------
 # Docker Appdata Backup & Additional Shares Settings
