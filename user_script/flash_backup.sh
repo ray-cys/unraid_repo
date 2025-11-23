@@ -1,35 +1,33 @@
 #!/bin/bash
-set -euo pipefail
 LOCKFILE="/tmp/flash_backup.lock"
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "Another flash_backup.sh run is active, exiting (lock: $LOCKFILE)"
   exit 1
 fi
-
-noParity=true
-clearLog=false
-
-# --------------------------------------------------------------------------------
-# Configuration section
-# Adjust the settings below to configure the backup behavior.
+################################################################################
+# ---------------- Configuration ----------------
+# Flash Backup Settings
+################################################################################
 
 BACKUP_DIR="/mnt/user/node/flash"                                 # Destination directory for flash backups
 MAX_BACKUP=3                                                      # Number of backups to keep
 FLASH_ENABLE_STAT_FALLBACK=${FLASH_ENABLE_STAT_FALLBACK:-true}    # When true, attempt a stat(2)-based fallback if df reports 0 bytes free.
 FLASH_IGNORE_ZERO_FS_TYPES=${FLASH_IGNORE_ZERO_FS_TYPES:-"fuse.rclone fuse.mergerfs fuse.unionfs"} # Filesystem types to ignore for free space checks
 
-# --------------------------------------------------------------------------------
+################################################################################
 
 # Record start time
 start_time=$(date +%s)
 
-# Logging function
+# === Helpers Functions ===
+# Logging
 log() {
   local msg="$*"
   echo "$(date '+%Y/%m/%d %T') : $msg"
 }
-
+# === Helpers Functions ===
+# Centralized syslog function
 syslog() {
   local level="$1"; shift || true
   local msg="$*"
@@ -45,7 +43,7 @@ syslog() {
   esac
   logger -i -t flash_backup -p "$prio" "$msg"
 }
-
+# === Helpers Functions ===
 # Convert a bytes integer into a human-readable string using binary units
 bytes_human() {
   local bytes=${1:-0}
@@ -65,7 +63,7 @@ bytes_human() {
     printf "%d B" "$bytes"
   fi
 }
-
+# === Helpers Functions ===
 # Returns human runtime string computed from start time
 format_runtime() {
   if [ -z "${start_time:-}" ]; then
@@ -75,7 +73,7 @@ format_runtime() {
   local secs=$(( $(date +%s) - start_time ))
   printf '%dh:%dm:%ds' $((secs/3600)) $((secs%3600/60)) $((secs%60))
 }
-
+# === Helpers Functions ===
 # Centralized wrapper around the Unraid notify command to ensure consistent
 notify_send() {
   local level="$1"; shift
@@ -89,7 +87,7 @@ notify_send() {
   fi
   return $nrc
 }
-
+# === Helpers Functions ===
 # Function to prune old files in a directory
 prune_old_files() {
   local dir="$1"
@@ -113,7 +111,7 @@ prune_old_files() {
     fi
   done
 }
-
+# === Main Script Execution ===
 # Start flash backup
 log 'Initialize Unraid flash backup'
 helper_out=$(mktemp -t flash_backup_helper.XXXXXX) || helper_out="/tmp/flash_backup_helper.$$"
@@ -134,7 +132,6 @@ else
   rm -f -- "$helper_out" 2>/dev/null || true
   exit $rc
 fi
-
 # Creating flash backup directory and ensure correct permissions
 if [ ! -d "$BACKUP_DIR" ] ; then
   log "Create backup directory as it does not exist"
@@ -154,7 +151,6 @@ else
   chown -R nobody:users "$BACKUP_DIR" 2>/dev/null || syslog warning "chown failed for $BACKUP_DIR"
   log "Directory $BACKUP_DIR exists; ensured mode 0775 and owner nobody:users"
 fi
-
 # Find the latest flash backup zip file in /usr/local/emhttp
 find_latest_flash_zip() {
   local d="/usr/local/emhttp"
@@ -191,7 +187,6 @@ find_latest_flash_zip() {
 
   printf '%s' "$best"
 }
-
 # Retry a few times in case the file appears slightly later.
 retries=6
 latest_zip=''
@@ -202,7 +197,6 @@ for i in $(seq 1 $retries); do
   fi
   sleep 1
 done
-
 # Move the latest flash backup zip to the backup directory
 log "Search result for flash zip: ${latest_zip:-<none>}"
 if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
@@ -212,11 +206,9 @@ if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
   src_bytes=${src_bytes:-0}
   dest_avail=${dest_avail:-0}
   dest_total=${dest_total:-0}
-
   # Normalize non-numeric df results
   if ! [[ "$dest_avail" =~ ^[0-9]+$ ]]; then dest_avail=0; fi
   if ! [[ "$dest_total" =~ ^[0-9]+$ ]]; then dest_total=0; fi
-
   # If df reports 0 available and fallback is enabled, try stat(2)-based free calculation
   if [ "$dest_avail" -eq 0 ] && [ "$FLASH_ENABLE_STAT_FALLBACK" = "true" ]; then
     stat_vals=$(stat -f --format '%a %s' "$BACKUP_DIR" 2>/dev/null || echo "")
@@ -227,7 +219,6 @@ if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
       fi
     fi
   fi
-
   # If still zero, and fs type matches ignore list, treat free as unknown (do not gate move)
   dest_free_unknown=0
   if [ "$dest_avail" -eq 0 ]; then
@@ -260,7 +251,6 @@ if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
     tmp="$BACKUP_DIR/.tmp.$(basename "$target").$$"
     src_dev=$(stat -c %d "$target" 2>/dev/null || echo "")
     dest_dev=$(stat -c %d "$BACKUP_DIR" 2>/dev/null || echo "")
-
     if [ -n "$src_dev" ] && [ -n "$dest_dev" ] && [ "$src_dev" = "$dest_dev" ]; then
       # Same filesystem: atomic rename is ideal
       if mv -- "$target" "$final"; then
@@ -284,7 +274,6 @@ if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
             fi
           done < <(find /usr/local/emhttp -maxdepth 1 -name '*flash-backup-*.zip' -print 2>/dev/null)
         fi
-
       else
         rc=$?
         syslog warning "mv (same FS) failed with exit $rc; attempting copy-to-temp+rename fallback for $target"
@@ -364,10 +353,8 @@ if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
 else
   log "No flash backup zip found in /usr/local/emhttp to move"
 fi
-
 # Remove old backups
 prune_old_files "$BACKUP_DIR" "$MAX_BACKUP" "*flash-backup-*.zip"
-
  # Syslog and notification
  runtime_now=$(format_runtime)
  if [ -n "${moved_file:-}" ]; then
@@ -390,7 +377,7 @@ prune_old_files "$BACKUP_DIR" "$MAX_BACKUP" "*flash-backup-*.zip"
       notify_body+=$'\n'"Required vs Free: Unknown"
     fi
   fi
-  notify_send normal "Flash Backup - OK" "🟢 Backup successful" "$notify_body"
+  notify_send normal "Flash Backup - OK" "Backup successful" "$notify_body"
 else
   syslog err "Flash Backup: No backup moved on $(date) (Runtime: ${runtime_now})"
   notify_body="Flash backup did NOT move to ${BACKUP_DIR}\nRuntime: ${runtime_now}"
@@ -399,11 +386,9 @@ else
   else
     notify_body+="\nNo flash backup zip found in /usr/local/emhttp"
   fi
-  notify_send alert "Flash Backup - FAIL" "🔴 Backup failed" "$notify_body"
+  notify_send alert "Flash Backup - FAIL" "Backup failed" "$notify_body"
   exit 1
 fi
-
 # Cleanup helper output temporary file
 rm -f -- "${helper_out:-/tmp/flash_backup_helper.$$}" 2>/dev/null || true
-
 exit 0
