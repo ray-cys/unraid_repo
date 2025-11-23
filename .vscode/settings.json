@@ -1,0 +1,5 @@
+{
+    "shellcheck.enable": true,
+    "shellcheck.executablePath": "${workspaceFolder}/tools/shellcheck",
+    "shellcheck.run": "onSave"
+}
