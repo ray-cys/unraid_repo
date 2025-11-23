@@ -7,20 +7,34 @@ if ! flock -n 9; then
   exit 1
 fi
 
+# shellcheck disable=SC2034
 clearLog=true
 
 # --------------------------------------------------------------------------------
-# SETTINGS
+# Configuration
 
-# Get most recent syslog file
-syslog_file=$(ls -t /var/log/syslog{.[0-9],} 2>/dev/null | head -n 1)
-
+# Get most recent syslog file (handle multi-digit + compressed rotations gracefully) without ls|grep
+latest=""
+for f in /var/log/syslog*; do
+  [[ -f "$f" ]] || continue
+  if [[ "$f" =~ ^/var/log/syslog(\.[0-9]+(\.gz)?)?$ ]]; then
+    if [[ -z "$latest" || "$f" -nt "$latest" ]]; then
+      latest="$f"
+    fi
+  fi
+done
+syslog_file="$latest"
+if [[ -z "${syslog_file:-}" || ! -f "$syslog_file" ]]; then
+  syslog_file="/var/log/syslog"
+fi
+if [[ ! -r "$syslog_file" ]]; then
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "Syslog file '$syslog_file' not readable, exiting." >&2
+  exit 1
+fi
 # Words that would cause a notification
 words="corrupt|error|fail|tainted"
-
 # Store line number of last found error in this file
 log_file="/tmp/syslog-notify-last-error-line-number.log"
-
 # Ignore these phrases (you can't use more than 4 wildcards per line!)
 ignore_lines=(
   'kernel: CIFS: VFS: \\*\* error -9 on ioctl to get interface list' # Unsolvable message from UD plugin
@@ -46,6 +60,7 @@ if [[ -f "$log_file" ]]; then
 else
   line_number_start=$(grep -c ^ "$syslog_file")
   line_number_start=$((line_number_start-100))
+  if (( line_number_start < 0 )); then line_number_start=0; fi
   echo "$line_number_start" > "$log_file"
 fi
 
@@ -66,14 +81,14 @@ while read -r line; do
   fi
   last_line="$line"
   errors="$errors$EOL$line"
-done < <(tail -n +"$((line_number_start+1))" "$syslog_file" | grep -iP "($words)")
+done < <(tail -n +"$((line_number_start+1))" "$syslog_file" | grep -Ei "($words)")
 
 # Create notification for new errors
 if [[ $errors ]]; then
   line_number_start=$(grep -nFx "$last_line" "$syslog_file" | cut -f 1 -d ":")
   echo "$line_number_start" > "$log_file"
   /usr/local/emhttp/webGui/scripts/notify -i "alert" -s "Syslog $(echo "$errors" \
-  | grep -ioP "($words)" | tr '[:upper:]' '[:lower:]' | sort -u | xargs)" -d "${errors:1}"
+  | grep -Eio "($words)" | tr '[:upper:]' '[:lower:]' | sort -u | xargs)" -d "${errors:1}"
   exit
 else
   line_number_start=$(grep -c ^ "$syslog_file")
@@ -81,7 +96,7 @@ else
 fi
 
 # Create notificaton if log exceeds usage of 90%
-log_size=$(df | grep -oP "[0-9]+(?=% /var/log)")
+log_size=$(df /var/log | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
 if [[ ! -f /tmp/syslog-notify.size ]] && [[ $log_size -gt 90 ]]; then
   touch /tmp/syslog-notify.size
   /usr/local/emhttp/webGui/scripts/notify -i "alert" \
