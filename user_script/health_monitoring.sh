@@ -12,7 +12,7 @@ fi
 # Disk Health Monitor for Unraid
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
-# notifications + JSON summary for automation.
+# notifications.
 
 ################################################################################
 # ---------------- Configuration ----------------
@@ -317,39 +317,39 @@ log_warn()  { log_emit WARN "$*"; }
 log_crit()  { log_emit CRIT "$*"; }
 
 # === State Files (consolidated) ===
-STATE_DIR="/mnt/cache/system/logs/disk_health/state"               # Base directory for state files
+STATE_DIR="/mnt/cache/system/logs/disk_health/state"                # Base directory for state files
 mkdir -p "$STATE_DIR"
 
-SMART_LONG_STATE_FILE="$STATE_DIR/smart_long_processed.log"
-SMART_LONG_LAST_POH_FILE="$STATE_DIR/smart_long_last.log"
-SMART_LAST="$STATE_DIR/smart_last_test.log"
-SMART_SELFTEST_DIR="$STATE_DIR/smart_selftest"
-NVME_STATE_FILE="$STATE_DIR/counters_last.log"
-PREV_ATTR_FILE="$STATE_DIR/smart_prev_attrs.log"
-CAPACITY_HISTORY_FILE="$STATE_DIR/capacity_history.log"
-DISK_CAP_HISTORY_FILE="$STATE_DIR/disk_cap_history.log"
-SHARE_USAGE_HISTORY_FILE="$STATE_DIR/share_usage_history.log"
-ALERT_NEW_SEEN_FILE="$STATE_DIR/new_alerts_seen.log"
-RISK_PREV_FILE="$STATE_DIR/risk_prev.log"
-TBW_HISTORY_FILE="$STATE_DIR/tbw_history.log"
-HEAVY_WRITER_HISTORY_FILE="$STATE_DIR/heavy_writer_history.log"
-RISK_TIER_HISTORY_FILE="$STATE_DIR/risk_tier_history.log"
-IO_ERROR_HISTORY_FILE="$STATE_DIR/io_error_history.log"
-BTRFS_DEV_HIST_FILE="$STATE_DIR/btrfs_device_stats.history"
-XFS_PROC_HISTORY_FILE="$STATE_DIR/xfs_proc_stats.history"
-STORAGE_DISCREPANCY_STATE_FILE="$STATE_DIR/storage_discrepancy_streak.log"
-POH_HISTORY_FILE="$STATE_DIR/poh_history.log"
-TBW_DAYSLEFT_HISTORY_FILE="$STATE_DIR/tbw_daysleft_history.log"
-SMART_ATTR_HISTORY_FILE="$STATE_DIR/smart_attr_history.log"
-CMD_TIMEOUT_LAST_FILE="$STATE_DIR/cmd_timeout_last.log"
-CMD_TIMEOUT_STATE_DIR="$STATE_DIR/cmd_timeout"
-UNSAFE_SDWN_STATE_DIR="$STATE_DIR/unsafe_shutdown"
-BTRFS_SCRUB_STATE_DIR="$STATE_DIR/btrfs_scrub_status"
-SATA_LINK_HISTORY_FILE="$STATE_DIR/sata_link_downshift.history"
-RISK_SCORES_HISTORY_FILE="$STATE_DIR/risk_scores_history.log"
-SELFTEST_HISTORY_FILE="$STATE_DIR/smart_selftest_history.log"
-TEMP_HISTORY_FILE="$STATE_DIR/temp_history.log"
-REPLACEMENT_EVENTS_FILE="$STATE_DIR/replacement_events.log"
+SMART_LONG_STATE_FILE="$STATE_DIR/smart_long_processed.log"         # Tracks last long test time per disk
+SMART_LONG_LAST_POH_FILE="$STATE_DIR/smart_long_last.log"           # Tracks last long test POH per disk    
+SMART_LAST="$STATE_DIR/smart_last_test.log"                         # Tracks last test type & time per disk
+SMART_SELFTEST_DIR="$STATE_DIR/smart_selftest"                      # Per-disk SMART self-test logs
+NVME_STATE_FILE="$STATE_DIR/counters_last.log"                      # NVMe counters last run snapshot
+PREV_ATTR_FILE="$STATE_DIR/smart_prev_attrs.log"                    # Previous SMART/NVMe attribute raw values
+CAPACITY_HISTORY_FILE="$STATE_DIR/capacity_history.log"             # Capacity history samples
+DISK_CAP_HISTORY_FILE="$STATE_DIR/disk_cap_history.log"             # Per-disk capacity history samples
+SHARE_USAGE_HISTORY_FILE="$STATE_DIR/share_usage_history.log"       # Per-share usage history samples
+ALERT_NEW_SEEN_FILE="$STATE_DIR/new_alerts_seen.log"                # Tracks newly seen alerts/disks
+RISK_PREV_FILE="$STATE_DIR/risk_prev.log"                           # Previous risk scores per disk   
+TBW_HISTORY_FILE="$STATE_DIR/tbw_history.log"                       # TBW history samples
+HEAVY_WRITER_HISTORY_FILE="$STATE_DIR/heavy_writer_history.log"     # Heavy writer history samples
+RISK_TIER_HISTORY_FILE="$STATE_DIR/risk_tier_history.log"           # Risk tier history samples
+IO_ERROR_HISTORY_FILE="$STATE_DIR/io_error_history.log"             # I/O error frequency history samples
+BTRFS_DEV_HIST_FILE="$STATE_DIR/btrfs_device_stats.history"         # Btrfs per-device stats history
+XFS_PROC_HISTORY_FILE="$STATE_DIR/xfs_proc_stats.history"           # XFS /proc/fs/xfs/stat history samples
+STORAGE_DISCREPANCY_STATE_FILE="$STATE_DIR/storage_discrepancy_streak.log"  # Storage discrepancy streak state
+POH_HISTORY_FILE="$STATE_DIR/poh_history.log"                       # POH history samples
+TBW_DAYSLEFT_HISTORY_FILE="$STATE_DIR/tbw_daysleft_history.log"     # TBW days-left history samples
+SMART_ATTR_HISTORY_FILE="$STATE_DIR/smart_attr_history.log"         # SMART attribute history samples
+CMD_TIMEOUT_LAST_FILE="$STATE_DIR/cmd_timeout_last.log"             # Previous command timeout counts
+CMD_TIMEOUT_STATE_DIR="$STATE_DIR/cmd_timeout"                      # Per-disk cmd timeout alert cooldown state
+UNSAFE_SDWN_STATE_DIR="$STATE_DIR/unsafe_shutdown"                  # Per-NVMe unsafe shutdown alert cooldown state
+BTRFS_SCRUB_STATE_DIR="$STATE_DIR/btrfs_scrub_status"               # Per-Btrfs pool scrub state files
+SATA_LINK_HISTORY_FILE="$STATE_DIR/sata_link_downshift.history"     # SATA link instability history samples
+RISK_SCORES_HISTORY_FILE="$STATE_DIR/risk_scores_history.log"       # Risk scores history samples
+SELFTEST_HISTORY_FILE="$STATE_DIR/smart_selftest_history.log"       # SMART self-test history samples
+TEMP_HISTORY_FILE="$STATE_DIR/temp_history.log"                     # Temperature history samples
+REPLACEMENT_EVENTS_FILE="$STATE_DIR/replacement_events.log"         # Drive replacement events history samples
 mkdir -p "$SMART_SELFTEST_DIR" "$UNSAFE_SDWN_STATE_DIR" "$BTRFS_SCRUB_STATE_DIR" "$(dirname "$BTRFS_DEV_HIST_FILE")"
 STATE_FILES=(
   "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$NVME_STATE_FILE" "$PREV_ATTR_FILE" "$CAPACITY_HISTORY_FILE" "$DISK_CAP_HISTORY_FILE" "$SHARE_USAGE_HISTORY_FILE" "$ALERT_NEW_SEEN_FILE" "$RISK_PREV_FILE" "$TBW_HISTORY_FILE" "$HEAVY_WRITER_HISTORY_FILE" "$RISK_TIER_HISTORY_FILE" "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE" "$XFS_PROC_HISTORY_FILE" "$STORAGE_DISCREPANCY_STATE_FILE" "$POH_HISTORY_FILE" "$TBW_DAYSLEFT_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$CMD_TIMEOUT_LAST_FILE" "$RISK_SCORES_HISTORY_FILE" "$SELFTEST_HISTORY_FILE" "$TEMP_HISTORY_FILE" "$REPLACEMENT_EVENTS_FILE" "$SATA_LINK_HISTORY_FILE"
@@ -2728,7 +2728,7 @@ build_storage_and_disk_lines() {
     for d in "${arr[@]}"; do
         local line=$(df -B1 "$d" 2>/dev/null | awk 'NR==2') || continue
         local sz=$(echo "$line" | awk '{print $2}') u=$(echo "$line" | awk '{print $3}')
-        echo "$today $(basename \"$d\") used=$u size=$sz" >> "$DISK_CAP_HISTORY_FILE"
+        echo "$today $(basename \""$d"\") used=$u size=$sz" >> "$DISK_CAP_HISTORY_FILE"
     done
 
     # Bump group severities based on capacity thresholds (array/pools)
@@ -4735,21 +4735,21 @@ build_error_rate_accel_section() {
         local sorted=$(printf "%s\n" "${b_rank[@]}" | sort -nr -k1,1 | head -n $top)
         section+="Btrfs Device Error Acceleration:\n"
         while read -r last dev key ldelta avg ratio; do
-            section+=" - $(basename \"$dev\") $key +$ldelta vs avg +$(printf '%.0f' $avg) (x$ratio)\n"
+            section+=" - $(basename \""$dev"\") $key +$ldelta vs avg +$(printf '%.0f' "$avg") (x$ratio)\n"
         done < <(printf "%s\n" "$sorted")
     fi
     if (( ${#m_rank[@]} > 0 )); then
         local sorted=$(printf "%s\n" "${m_rank[@]}" | sort -nr -k1,1 | head -n $top)
         section+=$'\n'"Btrfs Mount Error Acceleration:\n"
         while read -r last mount key ldelta avg ratio; do
-            section+=" - $mount $key +$ldelta vs avg +$(printf '%.0f' $avg) (x$ratio)\n"
+            section+=" - $mount $key +$ldelta vs avg +$(printf '%.0f' "$avg") (x$ratio)\n"
         done < <(printf "%s\n" "$sorted")
     fi
     if (( ${#x_rank[@]} > 0 )); then
         local sorted=$(printf "%s\n" "${x_rank[@]}" | sort -nr -k1,1 | head -n $top)
         section+=$'\n'"XFS Global Error Acceleration:\n"
         while read -r last key ldelta avg ratio; do
-            section+=" - $key +$ldelta vs avg +$(printf '%.0f' $avg) (x$ratio)\n"
+            section+=" - $key +$ldelta vs avg +$(printf '%.0f' "$avg") (x$ratio)\n"
         done < <(printf "%s\n" "$sorted")
     fi
     section=$(printf "%s\n" "$section" | awk 'NF')
