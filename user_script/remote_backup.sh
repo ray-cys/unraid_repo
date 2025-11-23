@@ -218,6 +218,38 @@ notif_emoji() {
   esac
 }
 
+# --- Helpers Functions ---
+# Classify SSH stderr into a concise reason for failure (password/host key/etc)
+classify_ssh_error() {
+  local stderr="$1"
+  # Normalize line endings and lowercase copy for pattern matching while preserving original for detail
+  local lower
+  lower=$(printf '%s' "$stderr" | tr '[:upper:]' '[:lower:]')
+  if printf '%s' "$lower" | grep -q 'permission denied'; then
+    echo 'Permission denied (auth failed)'
+  elif printf '%s' "$lower" | grep -q 'host key verification failed'; then
+    echo 'Host key verification failed'
+  elif printf '%s' "$lower" | grep -q 'authenticity of host'; then
+    echo 'Host key unknown (needs trust confirmation)'
+  elif printf '%s' "$lower" | grep -q 'remote host identification has changed'; then
+    echo 'Host key changed (possible MITM)'
+  elif printf '%s' "$lower" | grep -q 'connection refused'; then
+    echo 'Connection refused (SSH service down)'
+  elif printf '%s' "$lower" | grep -q 'no route to host'; then
+    echo 'No route to host (network unreachable)'
+  elif printf '%s' "$lower" | grep -q 'connection timed out'; then
+    echo 'Connection timed out'
+  elif printf '%s' "$lower" | grep -q 'could not resolve hostname'; then
+    echo 'Hostname resolution failed'
+  elif printf '%s' "$lower" | grep -q 'too many authentication failures'; then
+    echo 'Too many authentication failures'
+  elif printf '%s' "$lower" | grep -q 'handshake failed'; then
+    echo 'SSH handshake failed'
+  else
+    echo 'SSH connection/auth failure'
+  fi
+}
+
 # --- Main Functions ---
 # Aggregates space requirements for multiple labels that may target the same remote destination
 aggregate_preflight_check() {
@@ -415,6 +447,7 @@ a file/directory etc that is not supported by rsync" ;;
     23) echo "Partial transfer due to error (files/attrs not transferred)" ;;
     24) echo "Partial transfer due to vanished source files" ;;
     30) echo "Timeout in data send/receive" ;;
+    255) echo "SSH connection/auth failure" ;;
     *) echo "Unknown rsync exit code $code" ;;
   esac
 }
@@ -625,6 +658,14 @@ run_rsync() {
       set -e
       return 0
     fi
+    # Capture SSH/auth style failures distinctly (rsync commonly returns 255)
+    if [ "$last_status" -eq 255 ]; then
+      # Extract a probable reason line
+      local reason
+      reason=$(grep -Ei 'ssh:|permission denied|host key|connection refused|no route to host|timeout' "$tmp_rslog" | tail -n1 || true)
+      rsync_ssh_fail["$label"]=1
+      rsync_ssh_fail_reason["$label"]=${reason:-"SSH failure"}
+    fi
 
     local should_retry=0
     if [ -z "${RETRY_ON_CODES:-}" ]; then
@@ -724,6 +765,9 @@ compose_notification() {
     esub=$(notif_emoji fail)
     level=alert
     local failed_summary="" notify_detail=""
+    local ssh_fail_section=""
+    local ssh_reason_summary=""
+    declare -A ssh_reason_counts
     for lbl in "${failed_labels[@]}"; do
       local code desc transferred total human_trans human_total raw
       code=${rsync_results[$lbl]:-${DEFAULT_FAIL_CODE:-50}}
@@ -739,7 +783,24 @@ compose_notification() {
         notify_detail+=$'--- recent rsync output ---\n'
         notify_detail+="$(extract_rsync_errors "$raw" ${NOTIF_EXCERPT_LINES:-8})"$'\n\n'
       fi
+      if [ "${rsync_ssh_fail[$lbl]:-0}" -eq 1 ]; then
+        ssh_fail_section+="$lbl: ${rsync_ssh_fail_reason[$lbl]:-SSH failure}\n"
+        # Increment aggregated reason count
+        rkey="${rsync_ssh_fail_reason[$lbl]:-SSH failure}"
+        ssh_reason_counts["$rkey"]=$(( ${ssh_reason_counts["$rkey"]:-0} + 1 ))
+      fi
     done
+    if [ -n "$ssh_fail_section" ]; then
+      # Build summary line of counts per distinct reason
+      for rkey in "${!ssh_reason_counts[@]}"; do
+        ssh_reason_summary+="$rkey=${ssh_reason_counts[$rkey]} "
+      done
+      ssh_reason_summary=${ssh_reason_summary%% }
+      notify_detail+=$'--- SSH Failure Summary ---\n'
+      notify_detail+="$ssh_reason_summary"$'\n\n'
+      notify_detail+=$'--- SSH Failures Detected ---\n'
+      notify_detail+="$ssh_fail_section"$'\n'
+    fi
     notify_detail+="Runtime: ${runtime_now}\nSee log: $LOG_FILE"
     detail="${esub} Backup FAIL: $failed_summary"
     body="$notify_detail"
@@ -913,7 +974,7 @@ log "Waiting up to ${MAX_SSH_WAIT}s for $DEST_NAS SSH to become available..."
 ssh_reachable=0
 while :; do
   elapsed=$(elapsed_since "$start_wait_ts")
-  if ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" true >/dev/null 2>&1; then
+  if ssh_stderr=$(ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" true 2>&1 >/dev/null); then
     remaining=$(( MAX_SSH_WAIT - elapsed ))
     (( remaining < 0 )) && remaining=0
     log "$DEST_NAS SSH is reachable after ${elapsed}s (timeout in ${remaining}s)"
@@ -963,7 +1024,16 @@ if [ "$ssh_reachable" -eq 0 ]; then
   syslog crit "Remote SSH unreachable on $DEST_NAS after ${MAX_SSH_WAIT}s; aborting"
   runtime_now=$(format_runtime)
   esub=$(notif_emoji fail)
-  body="Waited ${MAX_SSH_WAIT}s for SSH on ${DEST_NAS} (host: ${REMOTE}).\n\n"
+  local reason=""
+  if [ -n "${ssh_stderr:-}" ]; then
+    reason=$(classify_ssh_error "$ssh_stderr")
+  fi
+  body="Waited ${MAX_SSH_WAIT}s for SSH on ${DEST_NAS} (host: ${REMOTE}).\n"
+  if [ -n "$reason" ]; then
+    body+="Reason: ${reason}\n\n"
+  else
+    body+=$'Reason: (generic unreachable)\n\n'
+  fi
   if [ -n "${REMOTE_MAC:-}" ]; then
     body+="WOL MAC: ${REMOTE_MAC}\n"
   fi
@@ -982,6 +1052,8 @@ declare -A rsync_files
 declare -A rsync_deletes
 declare -A rsync_bytes_sent
 declare -A estimated_changed_bytes 
+declare -A rsync_ssh_fail
+declare -A rsync_ssh_fail_reason
 
 agg_msg=""
 
@@ -1004,6 +1076,18 @@ else
     src=${SRCS_ARRAY[$idx]}
     dest=${DESTS_ARRAY[$idx]}
     extra_excl=${RSYNC_EXTRA_EXCLUDES[$idx]:-}
+    # Preflight SSH accessibility (auth/path) for this destination to catch auth issues early
+    preflight_stderr=""
+    if ! preflight_stderr=$(ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" "mkdir -p '$dest' && test -d '$dest'" 2>&1 >/dev/null); then
+      local p_reason
+      p_reason=$(classify_ssh_error "$preflight_stderr")
+      log "Preflight SSH/path check failed for $lbl dest $dest (${p_reason})"
+      failed_labels+=("$lbl")
+      rsync_results["$lbl"]=255
+      rsync_ssh_fail["$lbl"]=1
+      rsync_ssh_fail_reason["$lbl"]="$p_reason"
+      continue
+    fi
     run_label_backup "$lbl" "$src" "$dest" "$extra_excl"
   done
 fi
