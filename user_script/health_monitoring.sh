@@ -28,6 +28,12 @@ LONG_TEST_CRITICAL_MIN_DAYS=7 # Critical SMART & last long age >= days -> force 
 LONG_TEST_RISK_MIN_DAYS=0     # Min days since last long before risk-based scheduling applies
 LONG_TEST_DECISION=""         # Accumulator for long test scheduling decisions 
 LONG_TEST_NEAR_WINDOW_DAYS=7  # Show health alert when long test is due within N days
+LONG_TEST_INITIAL_FORCE=0     # When no prior long test record, force an immediate long (1=enable, 0=skip)
+REPLACEMENT_AUTO_RESET=1      # Automatically detect drive replacement via POH drop and reset state
+REPLACEMENT_POH_DROP_THRESHOLD_HOURS=24   # Default fallback drop threshold (hours) if type unknown
+REPLACEMENT_POH_DROP_THRESHOLD_HOURS_HDD=24   # HDD: POH drop >= threshold => replacement
+REPLACEMENT_POH_DROP_THRESHOLD_HOURS_SSD=12   # SATA SSD: smaller drop threshold
+REPLACEMENT_POH_DROP_THRESHOLD_HOURS_NVME=6   # NVMe: smallest drop threshold
 
 # === Capacity Thresholds ===
 WARN_THRESHOLD_PERCENT=96     # Per-disk usage percent -> warning
@@ -232,7 +238,6 @@ ALERT_WARN=()                 # Accumulator for warning messages
 ALERT_CRIT=()                 # Accumulator for critical messages
 declare -A SMART_STATE        # Map device -> OK/WARNING/CRITICAL
 declare -A SMART_MSGS         # Map device -> aggregated SMART message string
-declare -A PREV_RISK          # Map device -> previous risk score
 declare -A MOUNT_TO_DEV       # Map /mnt/diskX -> /dev/sdX|nvme
 declare -A POOL_MEMBER_MAP    # Map base device (/dev/sdX|nvme0n1) -> pool name
 declare -A MODEL_CACHE        # Base device -> model string
@@ -240,8 +245,6 @@ declare -A CAPACITY_CACHE     # Base device -> capacity TB (formatted numeric st
 declare -A SMART_RAW          # Base device -> cached SATA smartctl -A output
 declare -A NVME_RAW           # Base device -> cached NVMe smartctl -a output
 declare -A SMART_INFO         # Base device -> cached SATA smartctl -i output
-declare -A TBW_DAILY_MAP      # Map device -> daily TBW bytes
-declare -A TBW_DAYSLEFT_MAP   # Map device -> forecast days remaining
 declare -A TBW_STATUS_MAP     # Map device -> TBW status (OK/WARNING/CRITICAL)
 declare -A IO_ERROR_RAW_MAP   # Map device -> raw I/O error line count (duplicates included)
 declare -A IO_ERROR_UNIQUE_MAP # Map device -> unique I/O error event count (dedup within window)
@@ -253,6 +256,8 @@ declare -A NEW_SEEN           # Newly seen alerts/disks set
 declare -A LONG_LAST_POH      # Map device -> last long self-test lifetime hours
 declare -A LONG_TEST_DUE_SOON # Map device -> days until next long test when near
 declare -A CMD_TIMEOUT_LAST   # Map device -> previous command timeout count
+declare -A SELFTEST_WARN_SEEN # Map normalized self-test warning/critical messages (dedup within run)
+declare -A LONG_TEST_RUNNING_LONG # Map device -> 1 if a long/extended self-test is currently in progress
 
 # === Logs Paths ===
 LOG_DIR="/mnt/cache/system/logs/disk_health"      # Base directory for logs files
@@ -265,7 +270,7 @@ HEALTH_FILE_MODE="${HEALTH_FILE_MODE:-0664}"      # Log file permissions
 mkdir -p "$LOG_DIR"
 chmod "$HEALTH_DIR_MODE" "$LOG_DIR" 2>/dev/null || true
 chown "$HEALTH_LOG_USER" "$LOG_DIR" 2>/dev/null || true
-: > "$MASTER_LOG" 2>/dev/null || true
+true > "$MASTER_LOG" 2>/dev/null || true
 chmod "$HEALTH_FILE_MODE" "$MASTER_LOG" 2>/dev/null || true
 chown "$HEALTH_LOG_USER" "$MASTER_LOG" 2>/dev/null || true
 
@@ -276,7 +281,8 @@ _subsys_emit() {
     if [[ "$raw" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
         raw="$(echo "$raw" | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} - //')"
     fi
-    local ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
     local line="[$tag] $ts - $raw"
     if (( LOG_MIRROR_STDOUT == 1 )); then echo "$line"; fi
     echo "$line" >> "$MASTER_LOG"
@@ -289,7 +295,8 @@ log_xfs()   { _subsys_emit XFS   "$*"; }
 log_emit() {
     local sev="$1"; shift
     local msg="$*"
-    local ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
     if [[ "$msg" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
         msg="$(echo "$msg" | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} - //')"
     fi
@@ -304,8 +311,8 @@ log_crit()  { log_emit CRIT "$*"; }
 # === State Files ===
 STATE_DIR="/mnt/cache/system/logs/disk_health/state"               # Base directory for state files
 mkdir -p "$STATE_DIR"
-chmod "$HEALTH_DIR_MODE" "$STATE_DIR" 2>/dev/null || true
-chown "$HEALTH_LOG_USER" "$STATE_DIR" 2>/dev/null || true
+chmod "$STATE_DIR" 2>/dev/null || true
+chown "$STATE_DIR" 2>/dev/null || true
 SMART_LONG_STATE_FILE="$STATE_DIR/smart_long_processed.log"     # Tracks processed long self-tests
 SMART_LONG_LAST_POH_FILE="$STATE_DIR/smart_long_last.log"       # Last observed long-test lifetime hours per disk
 SMART_LAST="$STATE_DIR/smart_last_test.log"                     # Last SMART test per disk
@@ -336,7 +343,7 @@ mkdir -p "$BTRFS_SCRUB_STATE_DIR" "$SMART_SELFTEST_DIR" "$UNSAFE_SDWN_STATE_DIR"
 chmod "$HEALTH_DIR_MODE" "$BTRFS_SCRUB_STATE_DIR" "$SMART_SELFTEST_DIR" "$UNSAFE_SDWN_STATE_DIR" "$(dirname "$BTRFS_DEV_HIST_FILE")" 2>/dev/null || true
 chown "$HEALTH_LOG_USER" "$BTRFS_SCRUB_STATE_DIR" "$SMART_SELFTEST_DIR" "$UNSAFE_SDWN_STATE_DIR" "$(dirname "$BTRFS_DEV_HIST_FILE")" 2>/dev/null || true
 if [[ ! -f "$BTRFS_DEV_HIST_FILE" ]]; then                      # Initialize btrfs device trend history file
-    : > "$BTRFS_DEV_HIST_FILE" 2>/dev/null || true
+    true > "$BTRFS_DEV_HIST_FILE" 2>/dev/null || true
     chmod "$HEALTH_FILE_MODE" "$BTRFS_DEV_HIST_FILE" 2>/dev/null || true
     chown "$HEALTH_LOG_USER" "$BTRFS_DEV_HIST_FILE" 2>/dev/null || true
 fi
@@ -344,15 +351,9 @@ if [[ ! -f "$STORAGE_DISCREPANCY_STATE_FILE" ]]; then           # Initialize dis
     printf '0 0\n' > "$STORAGE_DISCREPANCY_STATE_FILE" 2>/dev/null || true
 fi
 if [[ ! -f "$BTRFS_DEV_HIST_FILE" ]]; then                      # Initialize btrfs device trend history file
-    : > "$BTRFS_DEV_HIST_FILE" 2>/dev/null || true
+    true > "$BTRFS_DEV_HIST_FILE" 2>/dev/null || true
     chmod "$HEALTH_FILE_MODE" "$BTRFS_DEV_HIST_FILE" 2>/dev/null || true
     chown "$HEALTH_LOG_USER" "$BTRFS_DEV_HIST_FILE" 2>/dev/null || true
-fi
-if [ -f "$RISK_PREV_FILE" ]; then                               # Load previous risk scores
-    while read -r dev score; do
-        [[ -z "$dev" || -z "$score" ]] && continue
-        PREV_RISK["$dev"]="$score"
-    done < "$RISK_PREV_FILE"
 fi
 
 # === Notification Titles ===
@@ -502,7 +503,8 @@ base_device() {
 # Return device model string using smartctl (cached when possible)
 get_device_model() {
     # Retrieve and cache disk model (NVMe vs SATA attribute differences)
-    local d=$(base_device "$1")
+    local d
+    d=$(base_device "$1")
     if [[ -n "${MODEL_CACHE[$d]:-}" ]]; then
         echo "${MODEL_CACHE[$d]}"; return 0
     fi
@@ -531,7 +533,8 @@ model_suffix_for() {
 # Return device capacity in TB (decimal TB)
 get_device_capacity_tb() {
     # Size lookup via lsblk (decimal TB), cached per base device
-    local d=$(base_device "$1")
+    local d
+    d=$(base_device "$1")
     if [[ -n "${CAPACITY_CACHE[$d]:-}" ]]; then
         echo "${CAPACITY_CACHE[$d]}"; return 0
     fi
@@ -546,7 +549,8 @@ get_device_capacity_tb() {
 # Read a SATA SMART raw attribute value by ID
 get_sata_raw() {
     # Fetch and cache SMART attribute table (-A) for SATA device
-    local d=$(base_device "$1")
+    local d
+    d=$(base_device "$1")
     if [[ -n "${SMART_RAW[$d]:-}" ]]; then
         echo "${SMART_RAW[$d]}"; return 0
     fi
@@ -558,7 +562,8 @@ get_sata_raw() {
 # Parse SATA device basic info from smartctl --info
 get_sata_info() {
     # Fetch and cache SMART identity block (-i) for SATA device
-    local d=$(base_device "$1")
+    local d
+    d=$(base_device "$1")
     if [[ -n "${SMART_INFO[$d]:-}" ]]; then
         echo "${SMART_INFO[$d]}"; return 0
     fi
@@ -570,7 +575,8 @@ get_sata_info() {
 # Read an NVMe SMART/health value by key
 get_nvme_raw() {
     # Fetch and cache full NVMe smartctl output (-a -d nvme) with logging
-    local d=$(base_device "$1")
+    local d
+    d=$(base_device "$1")
     if [[ -n "${NVME_RAW[$d]:-}" ]]; then
         echo "${NVME_RAW[$d]}"; return 0
     fi
@@ -654,7 +660,8 @@ poh_thresholds_for_device() {
         warn=$NVME_POH_WARN_HOURS; crit=$NVME_POH_CRIT_HOURS
         # Model-specific overrides
         if echo "$model" | grep -qiE 'Crucial.*P5P|P5P'; then
-            local cap=$(get_device_capacity_tb "$dev")
+            local cap
+            cap=$(get_device_capacity_tb "$dev")
             if awk -v c="$cap" 'BEGIN{exit !(c>=0.98 && c<=1.02)}'; then warn=4000; crit=6000; fi
         fi
         if echo "$model" | grep -qiE 'Crucial.*T500|T500'; then warn=4000; crit=6000; fi
@@ -725,7 +732,6 @@ build_mount_device_map() {
 parity_state() {
     # Populate global parity progress/validity variables from var.ini or mdcmd status output
     PARITY_VALID_FLAG=""
-    PARITY_SOURCE="none"
     PARITY_ACTION=""
     PARITY_CORR=""
     PARITY_POS=""
@@ -739,8 +745,8 @@ parity_state() {
         local sb
         sb=$(awk -F= 'tolower($1)=="sbclean" {gsub(/"| |\r|\n/,"",$2); print tolower($2); exit}' "$ini" 2>/dev/null)
         case "$sb" in
-            1|yes|true) PARITY_VALID_FLAG="1"; PARITY_SOURCE="var.ini"; return 0;;
-            0|no|false) PARITY_VALID_FLAG="0"; PARITY_SOURCE="var.ini"; return 0;;
+            1|yes|true) PARITY_VALID_FLAG="1"; return 0;;
+            0|no|false) PARITY_VALID_FLAG="0"; return 0;;
         esac
     fi
     # Fallback to mdcmd status
@@ -749,7 +755,6 @@ parity_state() {
     if command -v "$cmd" >/dev/null 2>&1; then
         out=$("$cmd" status 2>/dev/null | tr -d '\r') || out=""
         if [[ -n "$out" ]]; then
-            PARITY_SOURCE="mdcmd"
             local sb st act corr pos size errs spk rem
             sb=$(echo "$out" | awk -F= 'tolower($1)=="sbclean" {print tolower($2); exit}')
             st=$(echo "$out" | awk -F= 'tolower($1)=="mdstate" {print tolower($2); exit}')
@@ -979,7 +984,7 @@ fi
 # Persist last-run SMART test metadata for a device
 save_last_test() {
     # Persist SMART test completion timestamps for disks to state file
-    > "$SMART_LAST"
+    true > "$SMART_LAST"
     for disk in "${!LAST_TEST[@]}"; do
         echo "$disk ${LAST_TEST[$disk]}" >> "$SMART_LAST"
     done
@@ -989,7 +994,7 @@ save_last_test() {
 # Persist last-run NVMe health snapshot for a device
 save_nvme_state() {
     # Persist last observed unsafe shutdown count per NVMe device
-    > "$NVME_STATE_FILE"
+    true > "$NVME_STATE_FILE"
     for dev in "${!NVME_LAST_UNSAFE[@]}"; do
         echo "$dev ${NVME_LAST_UNSAFE[$dev]}" >> "$NVME_STATE_FILE"
     done
@@ -998,7 +1003,7 @@ save_nvme_state() {
 # === Helper Function ===
 # Persist last observed long self-test lifetime hours per disk
 save_long_last_poh() {
-    > "$SMART_LONG_LAST_POH_FILE"
+    true > "$SMART_LONG_LAST_POH_FILE"
     for disk in "${!LONG_LAST_POH[@]}"; do
         echo "$disk ${LONG_LAST_POH[$disk]}" >> "$SMART_LONG_LAST_POH_FILE"
     done
@@ -1007,7 +1012,7 @@ save_long_last_poh() {
 # === Helper Function ===
 # Persist last observed Command_Timeout counts per disk
 save_cmd_timeout_last() {
-    > "$CMD_TIMEOUT_LAST_FILE"
+    true > "$CMD_TIMEOUT_LAST_FILE"
     for disk in "${!CMD_TIMEOUT_LAST[@]}"; do
         echo "$disk ${CMD_TIMEOUT_LAST[$disk]}" >> "$CMD_TIMEOUT_LAST_FILE"
     done
@@ -1290,10 +1295,9 @@ evaluate_smart() {
             fi
         fi
         # Evaluate SSD wear indicators (MWI/Wear Leveling) with heuristics and vendor overrides
-        local wear_norm mwi_norm mwi_raw life_remain=""
+        local wear_norm mwi_norm life_remain=""
         wear_norm=$(echo "$attr" | awk '/Wear_Leveling_Count/ {print $4; exit}')
         mwi_norm=$(echo "$attr" | awk '/Media_Wearout_Indicator/ {print $4; exit}')
-        mwi_raw=$(echo "$attr" | awk '/Media_Wearout_Indicator/ {print $10; exit}')
         # Compute a local TBW estimate from available SMART fields for heuristic decisions
         # Prefer Total_LBAs_Written (or attribute 241 mapped as LBAs) else convert Host_Writes_GiB or NAND_GB_Written
         local _lbasw _lbaw_241 _hw32mib _host_gib _nand_tlc_gb _nand_slc_gb _tbw_bytes=""
@@ -1337,7 +1341,7 @@ evaluate_smart() {
                 # Generic heuristic for new or quirky devices
                 if [[ -n "$_tbw_bytes" && $_tbw_bytes -lt $((10*1024*1024*1024)) && $mwi_norm -le 10 ]]; then
                     # Tiny TBW (<10GB) and small normalized value (<=10) -> treat as new drive, assume full life
-                    life_remain=100; messages+=("(heuristic: inverted initial wear value $mwi_norm)")
+                    life_remain=100; messages+=("(info: inverted initial wear value $mwi_norm)")
                 elif [[ $mwi_norm -le 100 ]]; then
                     # Treat low normalized as percent used when overall writes are still modest
                     if [[ -n "$_tbw_bytes" && $_tbw_bytes -lt $((50*1024*1024*1024)) && $mwi_norm -lt 20 ]]; then
@@ -1508,7 +1512,8 @@ get_latest_selftest_info() {
         out=$(smartctl -l selftest "$disk" 2>/dev/null || true)
     fi
     local line
-    line=$(echo "$out" | awk 'NR>5 && $1 ~ /^[0-9]+$/ {print; exit}')
+    # Most recent entry is first after header; support lines starting with '#' token then numeric ID
+    line=$(echo "$out" | awk 'NR>5 && (($1=="#" && $2 ~ /^[0-9]+$/) || $1 ~ /^[0-9]+$/) {print; exit}')
     if [[ -z "$line" ]]; then
         # No entries in self-test log; fall back to execution status from capabilities page
         local exec_status
@@ -1523,36 +1528,51 @@ get_latest_selftest_info() {
         echo "0|unknown|${exec_status}| |"; return
     fi
     local num type status lifetime remaining
-    num=$(echo "$line" | awk '{print $1}')
-    type=$(echo "$line" | awk '{print $2" "$3}')
+    num=$(echo "$line" | awk '{if($1=="#"){print $2}else{print $1}}')
+    type=$(echo "$line" | awk '{if($1=="#"){print $3" "$4}else{print $2" "$3}}')
     remaining=$(echo "$line" | grep -o '[0-9]\+%\?' | head -n1)
-    lifetime=$(echo "$line" | awk '{for(i=1;i<=NF;i++){if($i ~ /hours/){print $(i-1); break}}}')
-    status=$(echo "$line" | sed -E 's/^\s*[0-9]+\s+[^ ]+\s+[^ ]+\s+//' | sed -E 's/\s+[0-9]+%.*//' )
+    lifetime=$(echo "$line" | awk '{for(i=1;i<=NF;i++){if($i ~ /hours/){print $(i-1); exit}}}')
+    if [[ -z "$lifetime" ]]; then
+        # Fallback for NVMe rows lacking the word 'hours': choose largest numeric excluding test id and percentage tokens
+        lifetime=$(echo "$line" | awk -v tid="$num" '{maxv=0; for(i=1;i<=NF;i++){if($i ~ /^[0-9]+$/ && $i!=tid && $i!~/^[0-9]+%$/){if($i>maxv) maxv=$i}} if(maxv>0) print maxv}')
+    fi
+    status=$(echo "$line" | sed -E 's/^\s*#?\s*[0-9]+\s+[^ ]+\s+[^ ]+\s+//' | sed -E 's/\s+[0-9]+%.*//' )
     echo "${num}|${type}|${status}|${lifetime}|${remaining}"
 }
 
 # === Helper Function ===
-# Map SMART self-test entries to WARNING/CRITICAL/OK
+# Map SMART self-test entries to severity
 classify_selftest_status() {
-    local status="$1"
-    local sev="OK"
-    local msg="$status"
-    # Treat missing/empty self-test logs as OK to avoid noisy warnings
-    if [[ -z "${status//[[:space:]]/}" ]] || echo "$status" | grep -qiE "not yet populated|no self-tests|no entries|self[- ]?test log (is )?empty"; then
+    local raw="$1"
+    local status norm code sev msg
+    status="$raw"
+    norm=$(echo "$status" | tr -s ' ' ' ' | sed 's/^ //; s/ $//')
+    if [[ -z "${norm//[[:space:]]/}" ]] || echo "$norm" | grep -qiE "not yet populated|no self-tests|no entries|self[- ]?test log (is )?empty"; then
         echo "OK|Self-test log not yet populated"; return 0
     fi
-    if echo "$status" | grep -qi "in progress"; then
-        sev="INPROGRESS"
-    elif echo "$status" | grep -qiE "Completed without error|without error|no error|passed"; then
-        sev="OK"
-    elif echo "$status" | grep -qiE "read failure|uncorrectable|failed"; then
-        sev="CRITICAL"; msg="Self-test critical: $status"
-    elif echo "$status" | grep -qiE "aborted|interrupted"; then
-        sev="WARNING"; msg="Self-test did not complete cleanly: $status"
-    elif echo "$status" | grep -qi "Completed"; then
-        sev="WARNING"; msg="Self-test completed with issues: $status"
+    code=$(echo "$norm" | grep -Eo '0x[0-9a-fA-F]+' | head -n1 || true)
+    [[ -z "$code" ]] && code=$(echo "$norm" | grep -Eo '\b[0-9]{1,3}\b' | head -n1 || true)
+    sev="OK"; msg="$norm"
+    if echo "$norm" | grep -qiE "in progress|progress"; then
+        sev="INPROGRESS"; msg="Self-test in progress: $norm"
+    elif echo "$norm" | grep -qiE "Completed without error|without error|completed successfully|no error|passed"; then
+        sev="OK"; msg="Self-test passed${code:+ (code $code)}"
+    elif echo "$norm" | grep -qiE "(read|write|uncorrectable|unrecoverable|fatal|electrical|servo|seek|verify) (error|failure)|failed"; then
+        sev="CRITICAL"; msg="Self-test critical${code:+ (code $code)}: $norm"
+    elif echo "$norm" | grep -qiE "aborted|interrupted|cancelled"; then
+        sev="WARNING"; msg="Self-test did not complete: $norm"
+    elif echo "$norm" | grep -qi "Completed"; then
+        sev="OK"; msg="Self-test completed${code:+ (code $code)}"
     else
-        sev="WARNING"; msg="Self-test ambiguous status: $status"
+        sev="WARNING"; msg="Self-test ambiguous status: $norm"
+    fi
+    if [[ $sev == WARNING || $sev == CRITICAL ]]; then
+        local key
+        key=$(echo "$msg" | tr 'A-Z' 'a-z')
+        if [[ -n "${SELFTEST_WARN_SEEN[$key]:-}" ]]; then
+            echo "SUPPRESS|Duplicate self-test $sev suppressed"; return 0
+        fi
+        SELFTEST_WARN_SEEN[$key]=1
     fi
     echo "$sev|$msg"
 }
@@ -1679,13 +1699,102 @@ run_smart_test() {
         poh_attr=$(smartctl -A "$disk" 2>/dev/null | awk '/Power_On_Hours/ {print $10; exit}')
     fi
     current_poh=${poh_attr:-0}
-    last_long_poh=$(echo "$selftest" | awk 'NR>5 && /Extended offline|Extended self-test|Long/ && $1 ~ /^[0-9]+$/ {for(i=1;i<=NF;i++){if($i ~ /^[0-9]+$/ && $(i+1) ~ /^-/){print $i; break}}}' | head -n1)
+    # Automatic replacement detection/reset: if current POH is much lower than persisted last-long POH
+    if (( REPLACEMENT_AUTO_RESET == 1 )); then
+        local persisted_ll=${LONG_LAST_POH["$disk"]:-}
+        # Determine device-type-aware threshold
+        local drop_threshold=$REPLACEMENT_POH_DROP_THRESHOLD_HOURS
+        if [[ $disk == /dev/nvme* ]]; then
+            drop_threshold=$REPLACEMENT_POH_DROP_THRESHOLD_HOURS_NVME
+        else
+            # Distinguish SATA SSD vs HDD via ROTA
+            local bdv=$(base_device "$disk") rota
+            rota=$(lsblk -dn -o ROTA "$bdv" 2>/dev/null | head -n1 || true)
+            if [[ "$rota" == "0" ]]; then
+                drop_threshold=$REPLACEMENT_POH_DROP_THRESHOLD_HOURS_SSD
+            else
+                drop_threshold=$REPLACEMENT_POH_DROP_THRESHOLD_HOURS_HDD
+            fi
+        fi
+        if [[ -n "$persisted_ll" && "$persisted_ll" =~ ^[0-9]+$ && "$current_poh" =~ ^[0-9]+$ ]]; then
+            if (( persisted_ll - current_poh >= drop_threshold )); then
+                log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Possible replacement detected on $disk: current POH ${current_poh}h << last-long POH ${persisted_ll}h (≥${drop_threshold}h drop). Resetting state and forcing initial long test."
+                record_alert warning "Drive Replacement" "Detected possible drive replacement on $disk (POH drop ${persisted_ll}->${current_poh} ≥ ${drop_threshold}h). Baseline reset and long test forced."
+                unset 'LONG_LAST_POH["$disk"]'
+                # Prune processed long-test id for this disk to avoid stale suppression
+                if [[ -f "$SMART_LONG_STATE_FILE" ]]; then
+                    grep -v "^$disk " "$SMART_LONG_STATE_FILE" > "$SMART_LONG_STATE_FILE.tmp" 2>/dev/null || true
+                    mv -f "$SMART_LONG_STATE_FILE.tmp" "$SMART_LONG_STATE_FILE" 2>/dev/null || true
+                fi
+                # Mark a hint variable for later scheduling block
+                local __replacement_forced=1
+            fi
+        fi
+    fi
+    # Determine model/vendor and apply hardcoded pattern expansion
+    local model_raw=""
+    if [[ $disk == /dev/nvme* ]]; then
+        model_raw=$(smartctl -i -d nvme "$disk" 2>/dev/null | awk -F: '/^Model Number/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
+    else
+        model_raw=$(smartctl -i "$disk" 2>/dev/null | awk -F: '/Device Model/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
+        [[ -z "$model_raw" ]] && model_raw=$(smartctl -i "$disk" 2>/dev/null | awk -F: '/Model Family/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
+    fi
+    # Include generic "Extended" to cover NVMe long tests as well as SATA variants
+    local patterns=("Extended" "Extended offline" "Extended self-test" "Long")
+    if echo "$model_raw" | grep -qi 'ultrastar' && echo "$model_raw" | grep -qi 'wd\|western'; then
+        patterns+=("Extended offline" "Extended" "Long offline" "Offline" "Extended-Offline" "Long_test")
+    fi
+    declare -A _seen_pat
+    local p uniq_patterns=()
+    for p in "${patterns[@]}"; do
+        [[ -z "$p" ]] && continue
+        if [[ -z "${_seen_pat[$p]:-}" ]]; then _seen_pat[$p]=1; uniq_patterns+=("$p"); fi
+    done
+    local combined_regex="$(printf '%s|' "${uniq_patterns[@]}" | sed 's/|$//')"
+    # Support smartctl rows that begin with '#' then numeric ID; robust lifetime extraction
+    last_long_poh=$(echo "$selftest" | awk -v rgx="$combined_regex" '
+        NR>5 && $0 ~ rgx && (($1=="#" && $2 ~ /^[0-9]+$/) || $1 ~ /^[0-9]+$/) {
+            id_field = ($1=="#" ? $2 : $1)
+            lifetime=""
+            # Preferred: numeric immediately preceding a dash (LBA error placeholder)
+            for(i=1;i<=NF;i++){
+                if($i ~ /^[0-9]+$/ && $(i+1) ~ /^-$/){lifetime=$i; break}
+            }
+            if(lifetime==""){
+                maxv=0
+                for(i=1;i<=NF;i++){
+                    if($i ~ /^[0-9]+$/ && $i!=id_field && $i!~/^[0-9]+%$/){ if($i>maxv) maxv=$i }
+                }
+                if(maxv>0) lifetime=maxv
+            }
+            if(lifetime!=""){print lifetime; exit}
+        }
+    ' | head -n1)
     if [[ -z "$last_long_poh" ]]; then
-        last_long_poh=$(echo "$selftest" | awk 'NR>5 && /Extended offline|Long/ && $1 ~ /^[0-9]+$/ {for(i=NF;i>=1;i--){if($i ~ /^[0-9]+$/){print $i; break}}}' | head -n1)
+        last_long_poh=$(echo "$selftest" | awk '
+            NR>5 && /Extended offline|Long/ && (($1=="#" && $2 ~ /^[0-9]+$/) || $1 ~ /^[0-9]+$/) {
+                id_field = ($1=="#" ? $2 : $1); maxv=0
+                for(i=1;i<=NF;i++){
+                    if($i ~ /^[0-9]+$/ && $i!=id_field && $i!~/^[0-9]+%$/){ if($i>maxv) maxv=$i }
+                }
+                if(maxv>0){print maxv; exit}
+            }
+        ' | head -n1)
     fi
     if [[ -n "$last_long_poh" && $current_poh -gt 0 ]]; then
-        last_long_hours_diff=$(( current_poh - last_long_poh ))
-        LONG_LAST_POH["$disk"]="$last_long_poh"
+        # Monotonic guard: ignore regressed lifetime unless drive replacement (current_poh also regressed)
+        local prev_ll=${LONG_LAST_POH["$disk"]:-}
+        if [[ -n "$prev_ll" && "$prev_ll" =~ ^[0-9]+$ && "$last_long_poh" =~ ^[0-9]+$ ]]; then
+            if (( last_long_poh < prev_ll )) && (( current_poh >= prev_ll )) && (( prev_ll - last_long_poh > 1 )); then
+                log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Ignoring regressed last long-test lifetime $last_long_poh < $prev_ll on $disk (monotonic guard)"
+            else
+                LONG_LAST_POH["$disk"]="$last_long_poh"
+            fi
+        else
+            LONG_LAST_POH["$disk"]="$last_long_poh"
+        fi
+        local eff_ll=${LONG_LAST_POH["$disk"]:-$last_long_poh}
+        last_long_hours_diff=$(( current_poh - eff_ll ))
     elif [[ -z "$last_long_poh" && -n "${LONG_LAST_POH[$disk]:-}" && $current_poh -gt 0 ]]; then
         # Fallback to persisted last long POH when self-test log has no entries
         local persisted=${LONG_LAST_POH[$disk]}
@@ -1695,18 +1804,29 @@ run_smart_test() {
     fi
 
     # SMART scheduling: evaluate SMART state & risk once, then decide if long test needed.
-    local state_pre msgs_pre risk_pre prev_risk="" schedule_long=0 reasons=()
+    local state_pre msgs_pre risk_pre schedule_long=0 reasons=()
     evaluate_smart "$disk"
     state_pre="${SMART_STATE[$disk]:-OK}"
     msgs_pre="${SMART_MSGS[$disk]:-}"
     risk_pre=$(risk_score_quick "$state_pre" "$msgs_pre")
-    prev_risk=${PREV_RISK["$disk"]:-}
     local crit_age_hours=$(( LONG_TEST_CRITICAL_MIN_DAYS * 24 ))
     local risk_age_hours=$(( LONG_TEST_RISK_MIN_DAYS * 24 ))
-    # No previous long test record
-    if [[ -z "${last_long_hours_diff:-}" ]]; then schedule_long=1; reasons+=("no record"); fi
+    # No previous long test record: optionally force initial long only if LONG_TEST_INITIAL_FORCE=1
+    # If disabled, we simply skip auto-scheduling and rely on interval/risk/critical triggers later.
+    if [[ -z "${last_long_hours_diff:-}" ]]; then
+        if (( LONG_TEST_INITIAL_FORCE == 1 )); then
+            schedule_long=1; reasons+=("no record")
+        else
+            # Re-attempt extraction with combined vendor patterns already performed; if still empty we just skip forcing
+            if [[ -n "$last_long_poh" && $current_poh -gt 0 ]]; then
+                last_long_hours_diff=$(( current_poh - last_long_poh ))
+            fi
+        fi
+    fi
     # Interval elapsed
     if [[ -n "${last_long_hours_diff:-}" && ${last_long_hours_diff} -ge $threshold_hours ]]; then schedule_long=1; reasons+=("interval ${last_long_hours_diff}h >= ${threshold_hours}h"); fi
+    # Force long test on detected replacement regardless of LONG_TEST_INITIAL_FORCE
+    if [[ -n "${__replacement_forced:-}" ]]; then schedule_long=1; reasons+=("replacement detected"); fi
     # Critical SMART state with sufficient age
     if [[ "$state_pre" == CRITICAL && ( -z "${last_long_hours_diff:-}" || ${last_long_hours_diff} -ge $crit_age_hours ) ]]; then schedule_long=1; reasons+=("critical state"); fi
     # Risk threshold (ignore rising requirement for simplicity)
@@ -1750,6 +1870,15 @@ run_smart_test() {
     fi
     if echo "$exec_status" | grep -qi 'in progress'; then
         existing_in_progress=1
+        # Attempt to classify running test type via latest self-test log entry
+        local latest
+        latest=$(get_latest_selftest_info "$disk")
+        local latest_type latest_status
+        latest_type=$(echo "$latest" | awk -F'|' '{print $2}' )
+        latest_status=$(echo "$latest" | awk -F'|' '{print $3}' )
+        if echo "$latest_status" | grep -qi 'in progress' && echo "$latest_type" | grep -qiE 'extended|long'; then
+            LONG_TEST_RUNNING_LONG["$disk"]=1
+        fi
     fi
     if [[ $existing_in_progress -eq 1 ]]; then
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Self-test already in progress on $disk; skipping new start (status: ${exec_status})"
@@ -1759,6 +1888,10 @@ run_smart_test() {
             smartctl $flag -d nvme "$disk" >/dev/null 2>&1 || true
         else
             smartctl $flag "$disk" >/dev/null 2>&1 || true
+        fi
+        local test_kind_started=${flag/-t /}
+        if [[ $test_kind_started == long || $test_kind_started == extended ]]; then
+            LONG_TEST_RUNNING_LONG["$disk"]=1
         fi
     fi
     local test_kind=${flag/-t /}
@@ -1850,26 +1983,37 @@ check_completed_long_tests() {
     fi
     local disks; disks=$(get_all_disks)
     for disk in $disks; do
-        local out
+        local out model_raw
         if [[ $disk == /dev/nvme* ]]; then
             log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART self-test log read (-l selftest) on $disk"
             out=$(smartctl -l selftest -d nvme "$disk" 2>/dev/null || true)
+            model_raw=$(smartctl -i -d nvme "$disk" 2>/dev/null | awk -F: '/^Model Number/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
         else
             out=$(smartctl -l selftest "$disk" 2>/dev/null || true)
+            model_raw=$(smartctl -i "$disk" 2>/dev/null | awk -F: '/Device Model/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
+            [[ -z "$model_raw" ]] && model_raw=$(smartctl -i "$disk" 2>/dev/null | awk -F: '/Model Family/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
         fi
+        # Build unified long-test pattern list (include generic "Extended" for NVMe devices)
+        local patterns=("Extended" "Extended offline" "Extended self-test" "Long" "Extended-Offline" "Long offline" "Offline")
+        if echo "$model_raw" | grep -qi 'ultrastar' && echo "$model_raw" | grep -qi 'wd\|western'; then
+            patterns+=("Extended" "Long_test")
+        fi
+        declare -A _seen_lp; local p uniq_lp=()
+        for p in "${patterns[@]}"; do
+            [[ -z "$p" ]] && continue
+            if [[ -z "${_seen_lp[$p]:-}" ]]; then _seen_lp[$p]=1; uniq_lp+=("$p"); fi
+        done
+        local rgx
+        rgx=$(printf '%s|' "${uniq_lp[@]}" | sed 's/|$//')
         local line
-        line=$(echo "$out" | awk 'NR>5 && /Extended offline|Extended self-test|Long/ && $1 ~ /^[0-9]+$/ {print; exit}')
+        line=$(echo "$out" | awk -v rgx="$rgx" 'NR>5 && $0 ~ rgx && (($1=="#" && $2 ~ /^[0-9]+$/) || $1 ~ /^[0-9]+$/) {print; exit}')
         [[ -z "$line" ]] && continue
         local id type status
-        id=$(echo "$line" | awk '{print $1}')
-        type=$(echo "$line" | awk '{for(i=2;i<=NF;i++){if($i ~ /Extended|Long/){print $i; break}}}')
-        status=$(echo "$line" | sed -E 's/^\s*[0-9]+\s+[^ ]+\s+[^ ]+\s+//' | sed -E 's/\s+[0-9]+%.*//' )
-        if [[ ${PROCESSED[$disk]:-} == "$id" ]]; then
-            continue
-        fi
-        if echo "$status" | grep -qi 'in progress'; then
-            continue
-        fi
+        id=$(echo "$line" | awk '{for(i=1;i<=NF;i++){if($i ~ /^[0-9]+$/){print $i; break}}}')
+        type=$(echo "$line" | awk -v rgx="$rgx" '{for(i=2;i<=NF;i++){if($i ~ /Extended|Long/){print $i; break}}}')
+        status=$(echo "$line" | sed -E 's/^\s*#?\s*[0-9]+\s+[^ ]+\s+[^ ]+\s+//' | sed -E 's/\s+[0-9]+%.*//' )
+        if [[ ${PROCESSED[$disk]:-} == "$id" ]]; then continue; fi
+        if echo "$status" | grep -qi 'in progress'; then continue; fi
         local class msg sev
         class=$(classify_selftest_status "$status")
         sev=$(echo "$class" | awk -F'|' '{print $1}')
@@ -1879,12 +2023,40 @@ check_completed_long_tests() {
         elif [[ $sev == CRITICAL ]]; then
             record_alert critical "$NOTIFY_TITLE_SMART" "Disk $disk long self-test CRITICAL: $msg"
         fi
-        # Last long-test lifetime hours for interval gating
-        local lifetime poh
-        lifetime=$(echo "$line" | awk '{for(i=1;i<=NF;i++){if($i ~ /hours/){print $(i-1); break}}}')
+        local lifetime poh current_poh
+        # Broaden lifetime extraction: first try token before 'hours'; else choose largest numeric token after id
+        lifetime=$(echo "$line" | awk '{for(i=1;i<=NF;i++){if($i ~ /hours/){print $(i-1); exit}}}')
+        if [[ -z "$lifetime" ]]; then
+            # Collect numeric tokens excluding the first column (self-test entry index) and percentages
+            local largest=0 tok 
+            while read -r tok; do
+                [[ "$tok" =~ ^[0-9]+$ ]] || continue
+                # Skip numeric test id token
+                [[ "$tok" == "$id" ]] && continue
+                if (( tok > largest )); then largest=$tok; fi
+            done < <(echo "$line" | grep -Eo '[0-9]+' )
+            [[ $largest -gt 0 ]] && lifetime=$largest
+        fi
         if [[ -n "${lifetime:-}" && "$lifetime" =~ ^[0-9]+$ ]]; then
-            LONG_LAST_POH["$disk"]="$lifetime"
-            log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Recorded last long-test POH for $disk from self-test log: ${lifetime}h"
+            local prev_ll=${LONG_LAST_POH["$disk"]:-}
+            if [[ -n "$prev_ll" && "$prev_ll" =~ ^[0-9]+$ && $lifetime -lt $prev_ll ]]; then
+                # Need current POH to decide replacement vs regression
+                local cur_poh
+                if [[ $disk == /dev/nvme* ]]; then
+                    cur_poh=$(smartctl -a -d nvme "$disk" 2>/dev/null | awk -F: '/Power On Hours/ {gsub(/ /,"",$2); print $2; exit}')
+                else
+                    cur_poh=$(smartctl -A "$disk" 2>/dev/null | awk '/Power_On_Hours/ {print $10; exit}')
+                fi
+                if [[ "$cur_poh" =~ ^[0-9]+$ && $cur_poh -ge $prev_ll && $(( prev_ll - lifetime )) -gt 1 ]]; then
+                    log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Ignoring regressed long-test POH $lifetime < $prev_ll on $disk (monotonic guard)"
+                else
+                    LONG_LAST_POH["$disk"]="$lifetime"
+                    log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Recorded last long-test POH for $disk from self-test log: ${lifetime}h"
+                fi
+            else
+                LONG_LAST_POH["$disk"]="$lifetime"
+                log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Recorded last long-test POH for $disk from self-test log: ${lifetime}h"
+            fi
         else
             if [[ $disk == /dev/nvme* ]]; then
                 log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART attribute read (-a) for POH fallback on $disk"
@@ -2235,15 +2407,18 @@ scan_syslog_disk_errors() {
     mv "$new_hist" "$IO_ERROR_HISTORY_FILE" 2>/dev/null || true
     local lines="" dev
     for dev in "${!IO_ERROR_RAW_MAP[@]}"; do
-        local raw=${IO_ERROR_RAW_MAP[$dev]:-0} uniq=${IO_ERROR_UNIQUE_MAP[$dev]:-0} mark="" sev_msg=""
-        if (( uniq >= IO_ERROR_CRIT_THRESHOLD )); then
-            record_alert critical "$NOTIFY_TITLE_DISKIO" "Disk $dev I/O errors unique $uniq >= $IO_ERROR_CRIT_THRESHOLD (last ${IO_ERROR_WINDOW_MINUTES}m)"
+        local raw_count uniq_count mark
+        raw_count=${IO_ERROR_RAW_MAP[$dev]:-0}
+        uniq_count=${IO_ERROR_UNIQUE_MAP[$dev]:-0}
+        mark=""
+        if (( uniq_count >= IO_ERROR_CRIT_THRESHOLD )); then
+            record_alert critical "$NOTIFY_TITLE_DISKIO" "Disk $dev I/O errors unique $uniq_count >= $IO_ERROR_CRIT_THRESHOLD (last ${IO_ERROR_WINDOW_MINUTES}m)"
             mark="CRIT"
-        elif (( uniq >= IO_ERROR_WARN_THRESHOLD )); then
-            record_alert warning "$NOTIFY_TITLE_DISKIO" "Disk $dev I/O errors unique $uniq >= $IO_ERROR_WARN_THRESHOLD (last ${IO_ERROR_WINDOW_MINUTES}m)"
+        elif (( uniq_count >= IO_ERROR_WARN_THRESHOLD )); then
+            record_alert warning "$NOTIFY_TITLE_DISKIO" "Disk $dev I/O errors unique $uniq_count >= $IO_ERROR_WARN_THRESHOLD (last ${IO_ERROR_WINDOW_MINUTES}m)"
             mark="WARN"
         fi
-        lines+=" - $(basename "$dev") raw=$raw unique=$uniq${mark:+ ($mark)}\n"
+        lines+=" - $(basename \"$dev\") raw=$raw_count unique=$uniq_count${mark:+ ($mark)}\n"
     done
     if [[ -n "$lines" ]]; then
         IO_ERROR_FREQ_SECTION="I/O Error Frequency (last ${IO_ERROR_WINDOW_MINUTES}m):\n$lines"
@@ -2332,7 +2507,7 @@ build_storage_and_disk_lines() {
     ARRAY_COUNT=${#arr[@]}
     local arr_used=0 arr_size=0
     declare -a ARR_INFO POOL_INFO
-    local name usage pct sev driver_part reason_str
+    local name
     # For each array disk: parse df usage, compute percent and capacity, combine with SMART severity, and collect reasons
     for d in "${arr[@]}"; do
         local line=$(df -B1 "$d" 2>/dev/null | awk 'NR==2') || continue
@@ -2364,7 +2539,7 @@ build_storage_and_disk_lines() {
             has_smart=1
             if [[ "$sm_msg" == *"TBW"* ]]; then has_tbw=1; fi
             if [[ "$sm_msg" == *"NVMe wear"* || "$sm_msg" == *"SSD life remaining"* ]]; then has_wear=1; fi
-            local parts=() sep=""
+            local parts=()
             (( has_smart==1 )) && parts+=("SMART")
             (( has_tbw==1 )) && parts+=("TBW")
             (( has_wear==1 )) && parts+=("Wear")
@@ -2621,7 +2796,7 @@ build_storage_and_disk_lines() {
 # === Helper Function ===
 # Check for discrepancies between array usage and /mnt/user usage
 validate_storage_metrics() {
-    local user_pct user_line discrepancy_section=""
+    local user_line discrepancy_section=""
     if mountpoint -q /mnt/user; then
         user_line=$(df -B1 /mnt/user 2>/dev/null | awk 'NR==2')
         local user_sz=$(echo "$user_line" | awk '{print $2}') user_used=$(echo "$user_line" | awk '{print $3}')
@@ -2633,9 +2808,9 @@ validate_storage_metrics() {
                 if (( $(awk -v d="$diff" -v t="$threshold" 'BEGIN{print (d>=t)}') )); then
                     discrepancy_section+="Storage Discrepancy: Aggregated array ${ARRAY_PERCENT:-0}% vs /mnt/user ${user_pct_calc}% (diff ${diff}%). Possible share caching, pending deletions, mover activity, or share include/exclude settings.\n"
                     if (( ${STORAGE_DISCREPANCY_ALERT_ENABLED:-1} == 1 )); then
-                        local streak=0 last_diff=0
+                        local streak=0
                         if [[ -f "$STORAGE_DISCREPANCY_STATE_FILE" ]]; then
-                            read -r streak last_diff < "$STORAGE_DISCREPANCY_STATE_FILE" || true
+                            read -r streak _ < "$STORAGE_DISCREPANCY_STATE_FILE" || true
                             [[ ! "$streak" =~ ^[0-9]+$ ]] && streak=0
                         fi
                         streak=$(( streak + 1 ))
@@ -2758,7 +2933,9 @@ build_health_alerts() {
                     else
                         [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Elevated NVMe power-on hours; plan refresh and monitor performance/SMART.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
                     fi ;;
-                *"Reallocated"*)
+                *"Reallocated Event Count"*)
+                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Reallocation events logged; monitor trend; consider replacement if increasing.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
+                *"Reallocated ="*)
                     [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Reallocated sectors rising; monitor; replace if trend increases.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
                 *"Pending sectors"*)
                     [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Pending sectors; backup; run long test; plan replacement.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
@@ -2786,8 +2963,6 @@ build_health_alerts() {
                     [[ -n "$mnt_ref" ]] && rec+="- $mnt_ref: High usage; cleanup or plan expansion.\n" ;;
                 *"Storage Critical "*)
                     [[ -n "$mnt_ref" ]] && rec+="- $mnt_ref: Critical usage; expand immediately or purge data.\n" ;;
-                *"Reallocated Event Count"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Reallocation events logged; monitor trend; consider replacement if increasing.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
                 *"Reported Uncorrectable"*)
                     [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Uncorrectable errors; backup immediately; plan replacement.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
                 *"Command Timeout events"*)
@@ -2872,12 +3047,15 @@ build_health_alerts() {
                 if [[ -n "$arr_slot" ]]; then tag="$arr_slot [$(basename "$base")]"; elif [[ -n "$pool_name" ]]; then tag="$pool_name [$(basename "$base")]"; else tag="$(basename "$base")"; fi
                 local raw_msg="${SMART_MSGS[$dev]:-}"
                 local inline_msg="$(sanitize_smart_for_inline "$raw_msg" 1)"
+                local model_suffix="$(model_suffix_for "$base")"
                 if [[ "$st" == CRITICAL ]]; then
-                    local model_suffix="$(model_suffix_for "$base")"
                     rec+=" - $tag$model_suffix: SMART CRITICAL — ${inline_msg:-review SMART details}; backup immediately and replace.\n"
                 else
-                    local model_suffix="$(model_suffix_for "$base")"
-                    rec+=" - $tag$model_suffix: SMART WARNING — ${inline_msg:-review SMART details}; run a long SMART test, monitor, and plan replacement if it worsens.\n"
+                    if [[ -n "${LONG_TEST_RUNNING_LONG[$dev]:-}" ]]; then
+                        rec+=" - $tag$model_suffix: SMART WARNING — ${inline_msg:-review SMART details}; long SMART test currently in progress; monitor results before planning replacement.\n"
+                    else
+                        rec+=" - $tag$model_suffix: SMART WARNING — ${inline_msg:-review SMART details}; run a long SMART test, monitor, and plan replacement if it worsens.\n"
+                    fi
                 fi
                 SEEN_REC_DEVICES["$base"]=1
             fi
@@ -2893,11 +3071,6 @@ build_health_alerts() {
     if [[ -n "$POOLS_PERCENT" ]] && (( $(awk -v p="$POOLS_PERCENT" 'BEGIN{print (p>=80)}') )); then
         improve+=" - Pools >=80%: Rebalance data across pools / expand SSD pool.\n"
         improve+=" - Consider compression (Btrfs/ZFS if applicable) for infrequently accessed data.\n"
-    fi
-    if [[ -n "${CAPACITY_FORECAST:-}" ]] && echo "${CAPACITY_FORECAST:-}" | grep -q 'days to' ; then
-        local soon_arr=$(echo "${CAPACITY_FORECAST:-}" | awk -F'Array avg daily growth:' '{print $2}' | awk -F'days to' '{print $2}' | awk '{print $NF}' | tr -d ':')
-        local soon_pool=$(echo "${CAPACITY_FORECAST:-}" | awk -F'Pools avg daily growth:' '{print $2}' | awk -F'days to' '{print $2}' | awk '{print $NF}' | tr -d ':')
-        :
     fi
     [[ -n "$improve" ]] && rec+="Storage Improvement Suggestions:\n$improve"
 
@@ -3071,7 +3244,8 @@ build_health_alerts() {
     fi
     # Summarize lifecycle buckets (replace/monitor) concisely
     if declare -p REPLACE_LIST &>/dev/null; then
-        local rcnt=${#REPLACE_LIST[@]}
+        local rcnt
+        rcnt=${#REPLACE_LIST[@]}
         if (( rcnt > 0 )); then
             local list_show=("${REPLACE_LIST[@]:0:LIFECYCLE_ALERT_TOP_N}")
             rec+=" - Lifecycle: Replace Soon (${rcnt}) -> ${list_show[*]}\n"
@@ -3138,7 +3312,6 @@ build_disk_health_summary() {
     CRIT_DISK_COUNT=$crit_count
     WARN_DISK_COUNT=$warn_count
     local lines=("Disk Health Summary:")
-    local add_line
     add_line() { local k="$1"; local v="$2"; if (( SHOW_ZERO_COUNTS==1 )) || (( v>0 )); then lines+=(" - $k: $v"); fi; }
     add_line "Critical" "$crit_count"
     add_line "Warning" "$warn_count"
@@ -3177,7 +3350,7 @@ build_disk_health_summary() {
 compute_risk_and_lifecycle() {
     (( RISK_SCORING_ENABLED == 1 )) || return 0
     # Derive per-disk risk scores from SMART-derived messages and attributes
-    local risk_lines="" lifecycle_lines="" age_lines=""
+    local lifecycle_lines="" age_lines=""
     declare -g -A RISK_MAP RISK_BUCKET_MAP AGE_CLASS
     declare -A RISK
     # Compute per-device risk scores
@@ -3239,7 +3412,9 @@ compute_risk_and_lifecycle() {
     done
 
     # Build top-N list of highest non-zero risk scores for display
-    local scored_list filtered idx=0 total_count=0
+    local scored_list filtered total_count idx
+    idx=0
+    total_count=0
     scored_list=$(for d in "${!RISK[@]}"; do echo "${RISK[$d]} $d"; done | sort -nr -k1,1)
     filtered=$(printf "%s\n" "$scored_list" | awk '$1+0>0')
     total_count=$(printf "%s\n" "$filtered" | grep -c . || true)
@@ -3259,7 +3434,6 @@ compute_risk_and_lifecycle() {
         fi
         (( ++idx >= RISK_TOP_N )) && break
     done < <(printf "%s\n" "$filtered")
-    local total_display=$(( ${#replace_inline[@]} + ${#monitor_inline[@]} + ${#healthy_inline[@]} ))
     local more=$(( total_count - idx ))
 
     # Bucket disks into replace/monitor/healthy based on score thresholds
@@ -3288,10 +3462,9 @@ compute_risk_and_lifecycle() {
         REPLACE_COUNT=${#replace[@]}
         MONITOR_COUNT=${#monitor[@]}
         HEALTHY_COUNT=${#healthy[@]}
-        declare -g REPLACE_LIST MONITOR_LIST HEALTHY_LIST
+        declare -g REPLACE_LIST MONITOR_LIST
         REPLACE_LIST=("${replace[@]}")
         MONITOR_LIST=("${monitor[@]}")
-        HEALTHY_LIST=("${healthy[@]}")
     fi
 
     # Assemble Risk section text with guidance and optional lifecycle/age subsections
@@ -3334,14 +3507,24 @@ compute_risk_and_lifecycle() {
 # Append today's risk tier counts to history file
 persist_risk_tier_history() {
     (( RISK_SCORING_ENABLED == 1 )) || return 0
-    local today=$(date +%Y-%m-%d)
-    local crit=${CRIT_DISK_COUNT:-0} warn=${WARN_DISK_COUNT:-0}
-    local replace=${REPLACE_COUNT:-0} monitor=${MONITOR_COUNT:-0} healthy=${HEALTHY_COUNT:-0}
-    local tmp=$(mktemp)
+    local today
+    today=$(date +%Y-%m-%d)
+    local crit
+    crit=${CRIT_DISK_COUNT:-0}
+    local warn
+    warn=${WARN_DISK_COUNT:-0}
+    local replace_cnt
+    replace_cnt=${REPLACE_COUNT:-0}
+    local monitor_cnt
+    monitor_cnt=${MONITOR_COUNT:-0}
+    local healthy_cnt
+    healthy_cnt=${HEALTHY_COUNT:-0}
+    local tmp
+    tmp=$(mktemp)
     if [[ -f "$RISK_TIER_HISTORY_FILE" ]]; then
         awk -v d="$today" '$1!=d{print}' "$RISK_TIER_HISTORY_FILE" > "$tmp" || true
     fi
-    echo "$today critical=$crit warning=$warn replace=$replace monitor=$monitor healthy=$healthy" >> "$tmp"
+    echo "$today critical=$crit warning=$warn replace=$replace_cnt monitor=$monitor_cnt healthy=$healthy_cnt" >> "$tmp"
     mv -f "$tmp" "$RISK_TIER_HISTORY_FILE"
 }
 
@@ -3586,7 +3769,8 @@ build_sata_link_instability_section() {
     local out="" any=0
     for dev in "${!DEV_DATES[@]}"; do
         # Unique dates for device
-        local dates=( $(printf "%s" "${DEV_DATES[$dev]}" | tr ' ' '\n' | awk 'NF' | sort -u) )
+        local dates
+        mapfile -t dates < <(printf "%s" "${DEV_DATES[$dev]}" | tr ' ' '\n' | awk 'NF' | sort -u)
         local count=${#dates[@]}
         (( count==0 )) && continue
         # Compute consecutive streak from latest backwards
@@ -3852,7 +4036,7 @@ tbw_forecast_and_heavy_writers() {
         hw_lines=$(tail -n 2000 "$HEAVY_WRITER_HISTORY_FILE" 2>/dev/null || true)
         while read -r line; do
             [[ -z "$line" ]] && continue
-            local dt dv npct dbytes
+            local dt dv npct
             dt=$(echo "$line" | awk '{print $1}')
             dv=$(echo "$line" | awk '{print $2}')
             npct=$(echo "$line" | awk '{for(i=3;i<=NF;i++){if($i ~ /^norm=/){sub(/norm=/,"",$i); print $i; break}}}')
@@ -3875,7 +4059,6 @@ tbw_forecast_and_heavy_writers() {
     done < "$tmp"
     rm -f "$tmp"
     declare -A TBW_DAILY TBW_DAYS_LEFT TBW_THRESHOLD_TB
-    local heavy_rank=()
     for dev in "${!last_v[@]}"; do
         local start=${first_v[$dev]:-0} end=${last_v[$dev]:-0}
         local days=$(( ( $(date -d "${last_dt[$dev]}" +%s 2>/dev/null || date +%s) - $(date -d "${first_dt[$dev]}" +%s 2>/dev/null || date +%s) ) / 86400 ))
@@ -3883,7 +4066,6 @@ tbw_forecast_and_heavy_writers() {
         if (( end>start )); then
             local daily=$(( (end - start) / days ))
             TBW_DAILY[$dev]=$daily
-            TBW_DAILY_MAP[$dev]=$daily
             local model cap tbw_thresh
             model=$(get_device_model "$dev")
             cap=$(get_device_capacity_tb "$dev")
@@ -3902,7 +4084,6 @@ tbw_forecast_and_heavy_writers() {
                 remaining_bytes=$(( total_bytes - end ))
                 days_left=$(awk -v r="$remaining_bytes" -v d="$daily" 'BEGIN{printf "%.1f", r/d}')
                 TBW_DAYS_LEFT[$dev]=$days_left
-                TBW_DAYSLEFT_MAP[$dev]=$days_left
                 local status="OK"
                 if [[ -n "$days_left" ]]; then
                     if (( $(awk -v dl="$days_left" -v c="$TBW_DAYS_CRIT" 'BEGIN{print (dl < c)}') )); then
@@ -3972,7 +4153,7 @@ tbw_forecast_and_heavy_writers() {
         TBW_SECTION=""
     fi
     # Persist TBW days-left snapshot (once daily) for trend analysis
-    if (( TBW_TREND_ENABLED == 1 )) && [[ -n "${TBW_DAYS_LEFT[@]:-}" ]]; then
+    if (( TBW_TREND_ENABLED == 1 )) && (( ${#TBW_DAYS_LEFT[@]} > 0 )); then
         local today=$(date +%Y-%m-%d)
         if [[ -f "$TBW_DAYSLEFT_HISTORY_FILE" ]]; then
             local tmp=$(mktemp)
@@ -4193,7 +4374,10 @@ build_endurance_daysleft_trend_section() {
             rota=$(lsblk -dn -o ROTA "$dev" 2>/dev/null || echo 1)
             [[ "$rota" != "0" ]] && continue
         fi
-        local entries=( ${seq_map[$dev]} )
+        local entries=()
+        if [[ -n "${seq_map[$dev]:-}" ]]; then
+            read -r -a entries <<< "${seq_map[$dev]}"
+        fi
         (( ${#entries[@]} < 2 )) && continue
         # Sort by date
         local sorted=$(printf "%s\n" "${entries[@]}" | awk -F: '{print $1,$2}' | sort -k1,1)
@@ -4297,7 +4481,8 @@ build_error_rate_accel_section() {
     local b_rank=()
     local m_rank=()
     for dk in "${!BSEQ[@]}"; do
-        local seq=( ${BSEQ[$dk]} )
+        local seq=()
+        if [[ -n "${BSEQ[$dk]:-}" ]]; then read -r -a seq <<< "${BSEQ[$dk]}"; fi
         (( ${#seq[@]} < 2 )) && continue
         local sorted=$(printf "%s\n" "${seq[@]}" | awk -F: '{print $1,$2}' | sort -k1,1)
         local prev_dt prev_d deltas=() last_dt last_delta total=0 count=0
@@ -4332,7 +4517,8 @@ build_error_rate_accel_section() {
     done
     # Mount-level acceleration ranking
     for mk in "${!MSEQ[@]}"; do
-        local seq=( ${MSEQ[$mk]} )
+        local seq=()
+        if [[ -n "${MSEQ[$mk]:-}" ]]; then read -r -a seq <<< "${MSEQ[$mk]}"; fi
         (( ${#seq[@]} < 2 )) && continue
         local sorted=$(printf "%s\n" "${seq[@]}" | awk -F: '{print $1,$2}' | sort -k1,1)
         local prev_dt prev_d deltas=() last_dt last_delta
@@ -4379,10 +4565,11 @@ build_error_rate_accel_section() {
     fi
     local x_rank=()
     for key in "${!XSEQ[@]}"; do
-        local seq=( ${XSEQ[$key]} )
+        local seq=()
+        if [[ -n "${XSEQ[$key]:-}" ]]; then read -r -a seq <<< "${XSEQ[$key]}"; fi
         (( ${#seq[@]} < 2 )) && continue
         local sorted=$(printf "%s\n" "${seq[@]}" | awk -F: '{print $1,$2}' | sort -k1,1)
-        local prev_dt prev_d deltas=() last_dt last_delta
+        local prev_dt deltas=() last_dt last_delta
         while read -r dt d; do
             [[ -z "$dt" || -z "$d" ]] && continue
             if [[ -n "$prev_dt" ]]; then deltas+=("$d"); fi
@@ -4485,7 +4672,7 @@ collect_btrfs_device_stats() {
     mts=$(mount | awk '/ btrfs /{print $3}')
     [[ -z "$mts" ]] && return 0
     local out_has=0
-    > "$prev_file.tmp"
+    true > "$prev_file.tmp"
     for m in $mts; do
         local stats
         stats=$(btrfs device stats -z "$m" 2>/dev/null || true)
@@ -4556,7 +4743,7 @@ collect_xfs_proc_stats() {
             PREV_XFS["$key"]="$val"
         done < "$prev_file"
     fi
-    > "$prev_file.tmp"
+    true > "$prev_file.tmp"
     local anomalies=0
     # Focused subset of counters relevant to allocation / directory / flushing behavior
     local keys=(extent_alloc dir_lookup dir_create xs_xstrat delalloc flush)
@@ -4605,7 +4792,7 @@ build_btrfs_device_trend_section() {
     lines=$(tail -n 50000 "$hist_file" 2>/dev/null || true)
     [[ -z "$lines" ]] && { BTRFS_DEV_TREND_SECTION=""; return 0; }
     # Accumulators for device/mount/key totals and breakdowns
-    declare -A SUM_DEV SUM_KEY DEV_SUM SUM_MOUNT SUM_MOUNT_KEY KEY_SUM MOUNT_SUM
+    declare -A SUM_KEY DEV_SUM SUM_MOUNT_KEY KEY_SUM MOUNT_SUM
     while read -r dt rest; do
         [[ -z "$dt" || "$dt" < "$cutoff" ]] && continue
         local dev mount key delta val
@@ -4686,7 +4873,10 @@ build_btrfs_device_trend_section() {
                 fi
             done
             if (( ${#parts[@]} > 0 )); then
-                mount_out+=" - $mnt: ${parts[*]}\n"
+                local parts_join
+                parts_join=$(printf '%s ' "${parts[@]}")
+                parts_join=${parts_join% }
+                mount_out+=" - $mnt: $parts_join\n"
                 local r=${SUM_MOUNT_KEY["$mnt|read_io_errs"]:-0}
                 local w=${SUM_MOUNT_KEY["$mnt|write_io_errs"]:-0}
                 local f=${SUM_MOUNT_KEY["$mnt|flush_io_errs"]:-0}
@@ -4717,19 +4907,11 @@ build_btrfs_device_trend_section() {
             fi
         done
         if (( ${#parts[@]} > 0 )); then
-            key_out="Top Keys (all devices): ${parts[*]}\n"
+            local parts_join
+            parts_join=$(printf '%s ' "${parts[@]}")
+            parts_join=${parts_join% }
+            key_out="Top Keys (all devices): $parts_join\n"
         fi
-        local lbl v k
-        for k in ${klist[*]}; do
-            v=${KEY_SUM[$k]:-0}
-            case "$k" in
-                read_io_errs) lbl="read";;
-                write_io_errs) lbl="write";;
-                flush_io_errs) lbl="flush";;
-                corruption_errs) lbl="corruption";;
-                generation_errs) lbl="generation";;
-            esac
-        done
     fi
     if [[ -n "$out$key_out$mount_out" ]]; then
         BTRFS_DEV_TREND_SECTION="Btrfs Device Error Trend (last ${win}d):\n${out}${mount_out:+Per-mount Totals:\n$mount_out}${key_out:+$key_out}"
@@ -4889,7 +5071,7 @@ notify_unraid "${SUBJECT:-Disk Health Summary}" "$NOTIFY_BODY" "${_final_sev}"
 # === Helper Function ===
 # Persist current SMART attributes and states
 persist_current_attrs() {
-    > "$PREV_ATTR_FILE"
+    true > "$PREV_ATTR_FILE"
     for disk in "${!SMART_STATE[@]}"; do
         local line="$disk state=${SMART_STATE[$disk]}"
         for key in realloc pending offunc reported_uncorr cmd_timeout realloc_events udma lcc end2end soft_read_err temp; do
@@ -4908,7 +5090,7 @@ persist_current_attrs
 # === Helper Function ===
 # Persist newly seen disks for alert suppression
 persist_new_seen() {
-    > "$ALERT_NEW_SEEN_FILE"
+    true > "$ALERT_NEW_SEEN_FILE"
     for key in "${!NEW_SEEN[@]}"; do
         echo "$key" >> "$ALERT_NEW_SEEN_FILE"
     done
@@ -4918,11 +5100,26 @@ persist_new_seen
 # === Helper Function ===
 # Persist current risk scores for trend analysis
 persist_risk_scores() {
-    > "$RISK_PREV_FILE"
+    # Load previous risk scores locally for delta computation
+    declare -A PREV_RISK
+    if [ -f "$RISK_PREV_FILE" ]; then
+        while read -r dev score; do
+            [[ -z "$dev" || -z "$score" ]] && continue
+            PREV_RISK["$dev"]="$score"
+        done < "$RISK_PREV_FILE"
+    fi
+     true > "$RISK_PREV_FILE"
     for dev in "${!SMART_STATE[@]}"; do
         local msg="${SMART_MSGS[$dev]}"
-        local score
+        local score prev delta
         score=$(risk_score_quick "${SMART_STATE[$dev]}" "$msg")
+        prev=${PREV_RISK["$dev"]:-}
+        if [[ -n "$prev" && "$prev" =~ ^[0-9]+$ && "$score" =~ ^[0-9]+$ ]]; then
+            delta=$((score - prev))
+            if (( delta != 0 )); then
+                log_info "Risk score change for $dev: ${prev} -> ${score} (Δ=${delta})"
+            fi
+        fi
         echo "$dev $score" >> "$RISK_PREV_FILE"
     done
 }
