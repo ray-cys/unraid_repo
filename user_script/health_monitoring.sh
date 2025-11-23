@@ -78,6 +78,14 @@ ERROR_RATE_TREND_WINDOW_DAYS=7 # Days window for error acceleration analysis
 ERROR_RATE_TREND_TOP_N=5       # Top N accelerated devices/mounts
 ERROR_RATE_ACCEL_FACTOR_PCT=100 # Last interval delta > avg previous * (1+factor/100) => ACCEL
 ERROR_RATE_ACCEL_MIN_DELTA=2   # Minimum last-interval delta to consider acceleration
+ERROR_RATE_ACCEL_FACTOR_CORRUPTION=50   # Override acceleration factor pct for corruption_errs key
+ERROR_RATE_ACCEL_MIN_DELTA_CORRUPTION=1 # Override min delta for corruption_errs key
+ERROR_RATE_ACCEL_FACTOR_GENERATION=75   # Override acceleration factor pct for generation_errs key
+ERROR_RATE_ACCEL_MIN_DELTA_GENERATION=1 # Override min delta for generation_errs key
+SATA_LINK_INSTABILITY_ENABLED=1   # Enable SATA link instability frequency tracking (0=disable)
+SATA_LINK_INSTABILITY_WINDOW_DAYS=14 # Days window for link instability analysis
+SATA_LINK_INSTABILITY_STREAK_WARN=2  # Consecutive days with downshift events -> warning
+SATA_LINK_INSTABILITY_STREAK_CRIT=5  # Consecutive days with downshift events -> critical
 CAPACITY_RISK_ACCEL_ENABLED=1   # Enable capacity risk (replace/monitor tier) acceleration section
 CAPACITY_RISK_ACCEL_WINDOW_DAYS=14 # Days window for risk acceleration analysis (dedup days)
 CAPACITY_RISK_ACCEL_FACTOR_PCT=100 # Last increase >= avg prior * (1+factor/100) => ACCEL
@@ -103,6 +111,12 @@ RISK_TOP_N=5                  # Entries shown in Risk Scores (top list)
 RISK_REPLACE=80               # Score >= goes to Replace Soon bucket
 RISK_MONITOR=50               # Score >= goes to Monitor bucket
 RISK_TREND_SHOW_ZERO=0        # Show zero-only lines in risk trend (0=hide)
+RISK_TREND_WINDOW_DAYS=14     # Max samples (unique days) to include in risk tier trend
+RISK_TREND_AVG_RATE_ENABLED=1 # Show average daily change rate per tier (0=disable)
+RISK_TREND_SPARKLINE_ENABLED=1 # Show sparkline for replace/monitor tiers (0=disable)
+RISK_TREND_CHURN_ENABLED=1    # Show churn (entries/exits) counts per tier (0=disable)
+RISK_TREND_ACCEL_ENABLED=1    # Show inline acceleration factor for replace/monitor tiers (0=disable)
+RISK_TREND_MERGE_CAPACITY_ACCEL=1 # Merge capacity acceleration into risk trend (hide separate section when merged)
 POH_TREND_ENABLED=1          # Enable POH aging trend snapshot & section
 TBW_TREND_ENABLED=1          # Enable TBW days-left trend snapshot & section
 ENDURANCE_TREND_WINDOW_DAYS=7 # Window (days) for endurance & aging trend
@@ -317,6 +331,7 @@ CMD_TIMEOUT_LAST_FILE="$STATE_DIR/cmd_timeout_last.log"         # Last observed 
 CMD_TIMEOUT_STATE_DIR="$STATE_DIR/cmd_timeout"                  # Cooldown timestamps for delta alerts
 UNSAFE_SDWN_STATE_DIR="$STATE_DIR/unsafe_shutdown"              # Per-device last warning timestamps for cooldown
 BTRFS_SCRUB_STATE_DIR="$STATE_DIR/btrfs_scrub_status"           # Persist last scrub status per mount
+SATA_LINK_HISTORY_FILE="$STATE_DIR/sata_link_downshift.history" # Daily SATA link downshift events (date dev max= current=)
 mkdir -p "$BTRFS_SCRUB_STATE_DIR" "$SMART_SELFTEST_DIR" "$UNSAFE_SDWN_STATE_DIR" "$(dirname "$BTRFS_DEV_HIST_FILE")"
 chmod "$HEALTH_DIR_MODE" "$BTRFS_SCRUB_STATE_DIR" "$SMART_SELFTEST_DIR" "$UNSAFE_SDWN_STATE_DIR" "$(dirname "$BTRFS_DEV_HIST_FILE")" 2>/dev/null || true
 chown "$HEALTH_LOG_USER" "$BTRFS_SCRUB_STATE_DIR" "$SMART_SELFTEST_DIR" "$UNSAFE_SDWN_STATE_DIR" "$(dirname "$BTRFS_DEV_HIST_FILE")" 2>/dev/null || true
@@ -1392,6 +1407,16 @@ evaluate_smart() {
                         state="CRITICAL"; messages+=("SATA link downshift: max ${max_speed} current ${current_speed} Gb/s")
                     else
                         [[ $state == OK ]] && state="WARNING"; messages+=("SATA link downshift: max ${max_speed} current ${current_speed} Gb/s")
+                    fi
+                    # Persist daily link downshift event (dedup per-date per-device)
+                    if (( SATA_LINK_INSTABILITY_ENABLED == 1 )); then
+                        local today=$(date +%Y-%m-%d)
+                        if [[ -f "$SATA_LINK_HISTORY_FILE" ]]; then
+                            local tmp=$(mktemp)
+                            awk -v d="$today" -v dev="$disk" '!( $1==d && $2==dev )' "$SATA_LINK_HISTORY_FILE" > "$tmp" 2>/dev/null || true
+                            mv -f "$tmp" "$SATA_LINK_HISTORY_FILE" 2>/dev/null || rm -f "$tmp" || true
+                        fi
+                        echo "$today $disk max=$max_speed current=$current_speed" >> "$SATA_LINK_HISTORY_FILE"
                     fi
                 fi
             fi
@@ -3324,57 +3349,141 @@ persist_risk_tier_history() {
 # Analyze risk tier history and build trend summary
 build_risk_tier_trend_section() {
     (( RISK_SCORING_ENABLED == 1 )) || { RISK_TIER_TREND_SECTION=""; return 0; }
+    local win=${RISK_TREND_WINDOW_DAYS:-7}
     local lines
-    lines=$(tac "$RISK_TIER_HISTORY_FILE" 2>/dev/null | awk '!seen[$1]++ {print}' | head -n 7 | tac)
+    lines=$(tac "$RISK_TIER_HISTORY_FILE" 2>/dev/null | awk '!seen[$1]++ {print}' | head -n "$win" | tac)
     [[ -z "$lines" ]] && { RISK_TIER_TREND_SECTION=""; return 0; }
-    local count_lines=$(printf "%s\n" "$lines" | grep -c . || true)
-    local first last
-    first=$(printf "%s\n" "$lines" | head -n1)
-    last=$(printf "%s\n" "$lines" | tail -n1)
-    local fcrit fwarn freplace fmonitor fhealthy lcrit lwarn lreplace lmonitor lhealthy
-    fcrit=$(echo "$first" | awk '{for(i=1;i<=NF;i++){if($i ~ /^critical=/){sub(/critical=/,"",$i);print $i}}}')
-    fwarn=$(echo "$first" | awk '{for(i=1;i<=NF;i++){if($i ~ /^warning=/){sub(/warning=/,"",$i);print $i}}}')
-    freplace=$(echo "$first" | awk '{for(i=1;i<=NF;i++){if($i ~ /^replace=/){sub(/replace=/,"",$i);print $i}}}')
-    fmonitor=$(echo "$first" | awk '{for(i=1;i<=NF;i++){if($i ~ /^monitor=/){sub(/monitor=/,"",$i);print $i}}}')
-    fhealthy=$(echo "$first" | awk '{for(i=1;i<=NF;i++){if($i ~ /^healthy=/){sub(/healthy=/,"",$i);print $i}}}')
-    lcrit=$(echo "$last" | awk '{for(i=1;i<=NF;i++){if($i ~ /^critical=/){sub(/critical=/,"",$i);print $i}}}')
-    lwarn=$(echo "$last" | awk '{for(i=1;i<=NF;i++){if($i ~ /^warning=/){sub(/warning=/,"",$i);print $i}}}')
-    lreplace=$(echo "$last" | awk '{for(i=1;i<=NF;i++){if($i ~ /^replace=/){sub(/replace=/,"",$i);print $i}}}')
-    lmonitor=$(echo "$last" | awk '{for(i=1;i<=NF;i++){if($i ~ /^monitor=/){sub(/monitor=/,"",$i);print $i}}}')
-    lhealthy=$(echo "$last" | awk '{for(i=1;i<=NF;i++){if($i ~ /^healthy=/){sub(/healthy=/,"",$i);print $i}}}')
-    for v in fcrit fwarn freplace fmonitor fhealthy lcrit lwarn lreplace lmonitor lhealthy; do
-        [[ -n "${!v}" ]] || eval "$v=0"
+    local dates=() crit=() warn=() replace=() monitor=() healthy=()
+    while read -r ln; do
+        [[ -z "$ln" ]] && continue
+        local dt c w r m h tok
+        dt=$(echo "$ln" | awk '{print $1}')
+        for tok in $ln; do
+            case "$tok" in
+                critical=*) c=${tok#critical=} ;;
+                warning=*) w=${tok#warning=} ;;
+                replace=*) r=${tok#replace=} ;;
+                monitor=*) m=${tok#monitor=} ;;
+                healthy=*) h=${tok#healthy=} ;;
+            esac
+        done
+        dates+=("$dt")
+        crit+=("${c:-0}") warn+=("${w:-0}") replace+=("${r:-0}") monitor+=("${m:-0}") healthy+=("${h:-0}")
+    done < <(printf "%s\n" "$lines")
+    local n=${#dates[@]}
+    (( n==0 )) && { RISK_TIER_TREND_SECTION=""; return 0; }
+    local first_idx=0 last_idx=$(( n-1 ))
+    local fcrit=${crit[$first_idx]} fwarn=${warn[$first_idx]} freplace=${replace[$first_idx]} fmonitor=${monitor[$first_idx]} fhealthy=${healthy[$first_idx]}
+    local lcrit=${crit[$last_idx]} lwarn=${warn[$last_idx]} lreplace=${replace[$last_idx]} lmonitor=${monitor[$last_idx]} lhealthy=${healthy[$last_idx]}
+    local dcrit=$(( lcrit - fcrit )) dwarn=$(( lwarn - fwarn )) dreplace=$(( lreplace - freplace )) dmonitor=$(( lmonitor - fmonitor )) dhealthy=$(( lhealthy - fhealthy ))
+    # Churn & avg rate
+    local entries_crit=0 exits_crit=0 entries_warn=0 exits_warn=0 entries_replace=0 exits_replace=0 entries_monitor=0 exits_monitor=0 entries_healthy=0 exits_healthy=0
+    local i
+    local last_delta_replace=0 last_delta_monitor=0 avg_replace_pos=0 avg_monitor_pos=0 pos_count_replace=0 pos_count_monitor=0
+    for ((i=1;i<n;i++)); do
+        local dc=$(( crit[$i] - crit[$((i-1))] ))
+        local dw=$(( warn[$i] - warn[$((i-1))] ))
+        local dr=$(( replace[$i] - replace[$((i-1))] ))
+        local dm=$(( monitor[$i] - monitor[$((i-1))] ))
+        local dh=$(( healthy[$i] - healthy[$((i-1))] ))
+        (( dc>0 )) && entries_crit=$(( entries_crit + dc ))
+        (( dc<0 )) && exits_crit=$(( exits_crit - dc ))
+        (( dw>0 )) && entries_warn=$(( entries_warn + dw ))
+        (( dw<0 )) && exits_warn=$(( exits_warn - dw ))
+        (( dr>0 )) && { entries_replace=$(( entries_replace + dr )); avg_replace_pos=$(( avg_replace_pos + dr )); pos_count_replace=$(( pos_count_replace + 1 )); }
+        (( dr<0 )) && exits_replace=$(( exits_replace - dr ))
+        (( dm>0 )) && { entries_monitor=$(( entries_monitor + dm )); avg_monitor_pos=$(( avg_monitor_pos + dm )); pos_count_monitor=$(( pos_count_monitor + 1 )); }
+        (( dm<0 )) && exits_monitor=$(( exits_monitor - dm ))
+        (( dh>0 )) && entries_healthy=$(( entries_healthy + dh ))
+        (( dh<0 )) && exits_healthy=$(( exits_healthy - dh ))
+        if (( i == n-1 )); then
+            last_delta_replace=$dr
+            last_delta_monitor=$dm
+        fi
     done
-    local dcrit=$(( lcrit - fcrit ))
-    local dwarn=$(( lwarn - fwarn ))
-    local dreplace=$(( lreplace - freplace ))
-    local dmonitor=$(( lmonitor - fmonitor ))
-    local dhealthy=$(( lhealthy - fhealthy ))
+    local avg_rate_crit=0 avg_rate_warn=0 avg_rate_replace=0 avg_rate_monitor=0 avg_rate_healthy=0
+    if (( n>1 )); then
+        avg_rate_crit=$(printf '%.2f' "$(awk -v d="$dcrit" -v k="$((n-1))" 'BEGIN{if(k>0)print d/k; else print 0}')")
+        avg_rate_warn=$(printf '%.2f' "$(awk -v d="$dwarn" -v k="$((n-1))" 'BEGIN{if(k>0)print d/k; else print 0}')")
+        avg_rate_replace=$(printf '%.2f' "$(awk -v d="$dreplace" -v k="$((n-1))" 'BEGIN{if(k>0)print d/k; else print 0}')")
+        avg_rate_monitor=$(printf '%.2f' "$(awk -v d="$dmonitor" -v k="$((n-1))" 'BEGIN{if(k>0)print d/k; else print 0}')")
+        avg_rate_healthy=$(printf '%.2f' "$(awk -v d="$dhealthy" -v k="$((n-1))" 'BEGIN{if(k>0)print d/k; else print 0}')")
+    fi
+    local accel_replace="" accel_monitor=""
+    if (( RISK_TREND_ACCEL_ENABLED==1 )); then
+        if (( pos_count_replace>1 )); then
+            local avg_prev=$(( avg_replace_pos - ( last_delta_replace>0 ? last_delta_replace : 0 ) ))
+            local prev_count=$(( pos_count_replace - ( last_delta_replace>0 ? 1 : 0 ) ))
+            if (( prev_count>0 )); then
+                local prev_avg=$(awk -v a="$avg_prev" -v c="$prev_count" 'BEGIN{print a/c}')
+                if (( last_delta_replace>0 )) && awk -v l="$last_delta_replace" -v p="$prev_avg" 'BEGIN{exit !(p>0 && l/p>=1.2)}'; then
+                    local ratio=$(awk -v l="$last_delta_replace" -v p="$prev_avg" 'BEGIN{printf "%.2f", l/p}')
+                    accel_replace=" accel x$ratio"
+                fi
+            fi
+        fi
+        if (( pos_count_monitor>1 )); then
+            local avg_prev=$(( avg_monitor_pos - ( last_delta_monitor>0 ? last_delta_monitor : 0 ) ))
+            local prev_count=$(( pos_count_monitor - ( last_delta_monitor>0 ? 1 : 0 ) ))
+            if (( prev_count>0 )); then
+                local prev_avg=$(awk -v a="$avg_prev" -v c="$prev_count" 'BEGIN{print a/c}')
+                if (( last_delta_monitor>0 )) && awk -v l="$last_delta_monitor" -v p="$prev_avg" 'BEGIN{exit !(p>0 && l/p>=1.2)}'; then
+                    local ratio=$(awk -v l="$last_delta_monitor" -v p="$prev_avg" 'BEGIN{printf "%.2f", l/p}')
+                    accel_monitor=" accel x$ratio"
+                fi
+            fi
+        fi
+    fi
+    # Sparkline builder for replace & monitor
+    local spark_replace="" spark_monitor=""
+    if (( RISK_TREND_SPARKLINE_ENABLED==1 )) && (( n>1 )); then
+        local chars=("▁" "▂" "▃" "▄" "▅" "▆" "▇" "█")
+        local min_r=${replace[0]} max_r=${replace[0]} min_m=${monitor[0]} max_m=${monitor[0]}
+        for ((i=1;i<n;i++)); do
+            (( replace[i] < min_r )) && min_r=${replace[i]}
+            (( replace[i] > max_r )) && max_r=${replace[i]}
+            (( monitor[i] < min_m )) && min_m=${monitor[i]}
+            (( monitor[i] > max_m )) && max_m=${monitor[i]}
+        done
+        local range_r=$(( max_r - min_r )) range_m=$(( max_m - min_m ))
+        local sb=""; for ((i=0;i<n;i++)); do
+            if (( range_r==0 )); then sb+="${chars[4]}"; else
+                local idx=$(( ( ( replace[i] - min_r ) * 7 ) / range_r ))
+                (( idx<0 )) && idx=0; (( idx>7 )) && idx=7
+                sb+="${chars[$idx]}"
+            fi
+        done; spark_replace=$sb
+        sb=""; for ((i=0;i<n;i++)); do
+            if (( range_m==0 )); then sb+="${chars[4]}"; else
+                local idx=$(( ( ( monitor[i] - min_m ) * 7 ) / range_m ))
+                (( idx<0 )) && idx=0; (( idx>7 )) && idx=7
+                sb+="${chars[$idx]}"
+            fi
+        done; spark_monitor=$sb
+    fi
     local -a out_lines
-    if (( count_lines > 1 )); then
-        # Include if toggled to show zeros, or either endpoint is non-zero
-        if (( RISK_TREND_SHOW_ZERO==1 )) || (( fcrit>0 || lcrit>0 )); then out_lines+=("Critical disks (SMART severe): ${fcrit} -> ${lcrit} ($(printf "%+d" $dcrit))"); fi
-        if (( RISK_TREND_SHOW_ZERO==1 )) || (( fwarn>0 || lwarn>0 )); then out_lines+=("Warning disks (SMART warnings): ${fwarn} -> ${lwarn} ($(printf "%+d" $dwarn))"); fi
-        if (( RISK_TREND_SHOW_ZERO==1 )) || (( freplace>0 || lreplace>0 )); then out_lines+=("Replace-tier (high risk): ${freplace} -> ${lreplace} ($(printf "%+d" $dreplace))"); fi
-        if (( RISK_TREND_SHOW_ZERO==1 )) || (( fmonitor>0 || lmonitor>0 )); then out_lines+=("Monitor-tier (elevated risk): ${fmonitor} -> ${lmonitor} ($(printf "%+d" $dmonitor))"); fi
-        if (( RISK_TREND_SHOW_ZERO==1 )) || (( fhealthy>0 || lhealthy>0 )); then out_lines+=("Healthy-tier (low risk): ${fhealthy} -> ${lhealthy} ($(printf "%+d" $dhealthy))"); fi
+    if (( n>1 )); then
+        if (( RISK_TREND_SHOW_ZERO==1 )) || (( fcrit>0 || lcrit>0 )); then out_lines+=("Critical disks: ${fcrit} -> ${lcrit} ($(printf "%+d" $dcrit)${RISK_TREND_AVG_RATE_ENABLED==1?", avg $(printf '%+0.2f/d' $avg_rate_crit)":""}${RISK_TREND_CHURN_ENABLED==1?", churn in:${entries_crit} out:${exits_crit}" :""})"); fi
+        if (( RISK_TREND_SHOW_ZERO==1 )) || (( fwarn>0 || lwarn>0 )); then out_lines+=("Warning disks: ${fwarn} -> ${lwarn} ($(printf "%+d" $dwarn)${RISK_TREND_AVG_RATE_ENABLED==1?", avg $(printf '%+0.2f/d' $avg_rate_warn)":""}${RISK_TREND_CHURN_ENABLED==1?", churn in:${entries_warn} out:${exits_warn}" :""})"); fi
+        if (( RISK_TREND_SHOW_ZERO==1 )) || (( freplace>0 || lreplace>0 )); then out_lines+=("Replace-tier: ${freplace} -> ${lreplace} ($(printf "%+d" $dreplace)${RISK_TREND_AVG_RATE_ENABLED==1?", avg $(printf '%+0.2f/d' $avg_rate_replace)":""}${RISK_TREND_CHURN_ENABLED==1?", churn in:${entries_replace} out:${exits_replace}" :""}${accel_replace:+,$accel_replace}${spark_replace:+, spark $spark_replace})"); fi
+        if (( RISK_TREND_SHOW_ZERO==1 )) || (( fmonitor>0 || lmonitor>0 )); then out_lines+=("Monitor-tier: ${fmonitor} -> ${lmonitor} ($(printf "%+d" $dmonitor)${RISK_TREND_AVG_RATE_ENABLED==1?", avg $(printf '%+0.2f/d' $avg_rate_monitor)":""}${RISK_TREND_CHURN_ENABLED==1?", churn in:${entries_monitor} out:${exits_monitor}" :""}${accel_monitor:+,$accel_monitor}${spark_monitor:+, spark $spark_monitor})"); fi
+        if (( RISK_TREND_SHOW_ZERO==1 )) || (( fhealthy>0 || lhealthy>0 )); then out_lines+=("Healthy-tier: ${fhealthy} -> ${lhealthy} ($(printf "%+d" $dhealthy)${RISK_TREND_AVG_RATE_ENABLED==1?", avg $(printf '%+0.2f/d' $avg_rate_healthy)":""}${RISK_TREND_CHURN_ENABLED==1?", churn in:${entries_healthy} out:${exits_healthy}" :""})"); fi
     else
-        # Single-sample case: include only when last value non-zero unless toggle says otherwise
-        if (( RISK_TREND_SHOW_ZERO==1 )) || (( lcrit>0 )); then out_lines+=("Critical disks (SMART severe): ${lcrit} (no prior data)"); fi
-        if (( RISK_TREND_SHOW_ZERO==1 )) || (( lwarn>0 )); then out_lines+=("Warning disks (SMART warnings): ${lwarn} (no prior data)"); fi
-        if (( RISK_TREND_SHOW_ZERO==1 )) || (( lreplace>0 )); then out_lines+=("Replace-tier (high risk): ${lreplace} (no prior data)"); fi
-        if (( RISK_TREND_SHOW_ZERO==1 )) || (( lmonitor>0 )); then out_lines+=("Monitor-tier (elevated risk): ${lmonitor} (no prior data)"); fi
-        if (( RISK_TREND_SHOW_ZERO==1 )) || (( lhealthy>0 )); then out_lines+=("Healthy-tier (low risk): ${lhealthy} (no prior data)"); fi
+        if (( RISK_TREND_SHOW_ZERO==1 )) || (( lcrit>0 )); then out_lines+=("Critical disks: ${lcrit} (no prior data)"); fi
+        if (( RISK_TREND_SHOW_ZERO==1 )) || (( lwarn>0 )); then out_lines+=("Warning disks: ${lwarn} (no prior data)"); fi
+        if (( RISK_TREND_SHOW_ZERO==1 )) || (( lreplace>0 )); then out_lines+=("Replace-tier: ${lreplace} (no prior data)"); fi
+        if (( RISK_TREND_SHOW_ZERO==1 )) || (( lmonitor>0 )); then out_lines+=("Monitor-tier: ${lmonitor} (no prior data)"); fi
+        if (( RISK_TREND_SHOW_ZERO==1 )) || (( lhealthy>0 )); then out_lines+=("Healthy-tier: ${lhealthy} (no prior data)"); fi
     fi
     if (( ${#out_lines[@]} == 0 )); then
         RISK_TIER_TREND_SECTION=""
     else
-        RISK_TIER_TREND_SECTION="Risk Tier Trend (last ${count_lines} samples, max 7):"
-        local i
-        for ((i=0;i<${#out_lines[@]};i++)); do
-            RISK_TIER_TREND_SECTION+="\n${out_lines[$i]}"
-        done
+        RISK_TIER_TREND_SECTION="Risk Tier Trend (last ${n} samples, max ${win}):"
+        for ((i=0;i<${#out_lines[@]};i++)); do RISK_TIER_TREND_SECTION+=$'\n'"${out_lines[$i]}"; done
         RISK_TIER_TREND_SECTION="$(printf "%s\n" "$RISK_TIER_TREND_SECTION" | trim_outer_blank_lines)"
+    fi
+    if (( RISK_TREND_MERGE_CAPACITY_ACCEL==1 )); then
+        CAPACITY_RISK_ACCEL_SECTION=""  # suppress separate section when merged
     fi
 }
 
@@ -3451,6 +3560,67 @@ build_capacity_risk_accel_section() {
     section+=" - Replace-tier last +${rep_last} (avg +${rep_avg})${rep_flag:+, $rep_flag}\n"
     section+=" - Monitor-tier last +${mon_last} (avg +${mon_avg})${mon_flag:+, $mon_flag}"
     CAPACITY_RISK_ACCEL_SECTION="$(printf "%s\n" "$section" | trim_outer_blank_lines)"
+}
+
+# === Helper Function ===
+# Build SATA Link Instability Section (frequency & streak)
+build_sata_link_instability_section() {
+    SATA_LINK_INSTABILITY_SECTION=""
+    (( SATA_LINK_INSTABILITY_ENABLED == 1 )) || { SATA_LINK_INSTABILITY_SECTION=""; return 0; }
+    [[ -f "$SATA_LINK_HISTORY_FILE" ]] || { SATA_LINK_INSTABILITY_SECTION=""; return 0; }
+    local win=${SATA_LINK_INSTABILITY_WINDOW_DAYS:-14}
+    local cutoff=$(date -d "-$win days" +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)
+    local lines
+    lines=$(tail -n 20000 "$SATA_LINK_HISTORY_FILE" 2>/dev/null || true)
+    [[ -z "$lines" ]] && { SATA_LINK_INSTABILITY_SECTION=""; return 0; }
+    declare -A DEV_DATES DEV_LAST_MAX DEV_LAST_CURR
+    while read -r dt dev rest; do
+        [[ -z "$dt" || -z "$dev" || "$dt" < "$cutoff" ]] && continue
+        DEV_DATES["$dev"]+="$dt "
+        local mx cur
+        mx=$(echo "$rest" | awk -F'[ =]' '{for(i=1;i<=NF;i++){if($i ~ /^max=/){print $(i+1); break}}}')
+        cur=$(echo "$rest" | awk -F'[ =]' '{for(i=1;i<=NF;i++){if($i ~ /^current=/){print $(i+1); break}}}')
+        [[ -n "$mx" ]] && DEV_LAST_MAX["$dev"]="$mx"
+        [[ -n "$cur" ]] && DEV_LAST_CURR["$dev"]="$cur"
+    done < <(printf "%s\n" "$lines")
+    local out="" any=0
+    for dev in "${!DEV_DATES[@]}"; do
+        # Unique dates for device
+        local dates=( $(printf "%s" "${DEV_DATES[$dev]}" | tr ' ' '\n' | awk 'NF' | sort -u) )
+        local count=${#dates[@]}
+        (( count==0 )) && continue
+        # Compute consecutive streak from latest backwards
+        local streak=1
+        if (( count > 1 )); then
+            local i
+            for ((i=count-1;i>0;i--)); do
+                local curr=${dates[$i]} prev=${dates[$((i-1))]}
+                local prev_plus
+                prev_plus=$(date -d "$prev +1 day" +%Y-%m-%d 2>/dev/null || echo "$prev")
+                if [[ "$curr" == "$prev_plus" ]]; then
+                    ((streak++))
+                else
+                    break
+                fi
+            done
+        fi
+        local mx=${DEV_LAST_MAX[$dev]:-?} cur=${DEV_LAST_CURR[$dev]:-?}
+        local sev=""; local warn_thr=${SATA_LINK_INSTABILITY_STREAK_WARN:-2}; local crit_thr=${SATA_LINK_INSTABILITY_STREAK_CRIT:-5}
+        if (( streak >= crit_thr )); then sev="CRITICAL"; elif (( streak >= warn_thr )); then sev="WARNING"; fi
+        out+=" - $(basename \"$dev\") events=${count} streak=${streak} last ${mx}->${cur}Gb/s${sev:+ (${sev})}\n"
+        any=1
+        if [[ -n "$sev" ]]; then
+            local sev_lc=$(echo "$sev" | tr 'A-Z' 'a-z')
+            record_alert "$sev_lc" "SATA Link Instability" "Disk $dev link downshift streak ${streak}d (events ${count}) ${mx}->${cur}Gb/s"
+        fi
+    done
+    if (( any==1 )); then
+        out=${out%$'\n'}
+        SATA_LINK_INSTABILITY_SECTION="SATA Link Instability (last ${win}d):\n$out"
+        SATA_LINK_INSTABILITY_SECTION="$(printf "%s\n" "$SATA_LINK_INSTABILITY_SECTION" | trim_outer_blank_lines)"
+    else
+        SATA_LINK_INSTABILITY_SECTION=""
+    fi
 }
 
 # === Main Function ===
@@ -4142,7 +4312,19 @@ build_error_rate_accel_section() {
         local sum=0 i
         for i in "${deltas[@]:0:${#deltas[@]}-1}"; do sum=$(( sum + i )); done
         local avg=$(awk -v s="$sum" -v c="$(( ${#deltas[@]} - 1 ))" 'BEGIN{if(c>0)printf "%.3f", s/c; else print 0}')
-        if awk -v l="$last_delta" -v a="$avg" -v f="$accel_factor" -v m="$accel_min" 'BEGIN{exit (l>=m && a>0 && l>=a*(1+f/100))?0:1}'; then
+        # Per-key overrides for acceleration factor / min delta
+        local f_key="$accel_factor" m_key="$accel_min"
+        case "$key" in
+            corruption_errs)
+                f_key=${ERROR_RATE_ACCEL_FACTOR_CORRUPTION:-$accel_factor}
+                m_key=${ERROR_RATE_ACCEL_MIN_DELTA_CORRUPTION:-$accel_min}
+                ;;
+            generation_errs)
+                f_key=${ERROR_RATE_ACCEL_FACTOR_GENERATION:-$accel_factor}
+                m_key=${ERROR_RATE_ACCEL_MIN_DELTA_GENERATION:-$accel_min}
+                ;;
+        esac
+        if awk -v l="$last_delta" -v a="$avg" -v f="$f_key" -v m="$m_key" 'BEGIN{exit (l>=m && a>0 && l>=a*(1+f/100))?0:1}'; then
             local dev=${dk%%|*} key=${dk##*|}
             local ratio=$(awk -v l="$last_delta" -v a="$avg" 'BEGIN{printf "%.2f", l/a}')
             b_rank+=("$last_delta $dev $key $last_delta $avg $ratio")
@@ -4163,7 +4345,18 @@ build_error_rate_accel_section() {
         local sum=0 i
         for i in "${deltas[@]:0:${#deltas[@]}-1}"; do sum=$(( sum + i )); done
         local avg=$(awk -v s="$sum" -v c="$(( ${#deltas[@]} - 1 ))" 'BEGIN{if(c>0)printf "%.3f", s/c; else print 0}')
-        if awk -v l="$last_delta" -v a="$avg" -v f="$accel_factor" -v m="$accel_min" 'BEGIN{exit (l>=m && a>0 && l>=a*(1+f/100))?0:1}'; then
+        local f_key="$accel_factor" m_key="$accel_min"
+        case "$key" in
+            corruption_errs)
+                f_key=${ERROR_RATE_ACCEL_FACTOR_CORRUPTION:-$accel_factor}
+                m_key=${ERROR_RATE_ACCEL_MIN_DELTA_CORRUPTION:-$accel_min}
+                ;;
+            generation_errs)
+                f_key=${ERROR_RATE_ACCEL_FACTOR_GENERATION:-$accel_factor}
+                m_key=${ERROR_RATE_ACCEL_MIN_DELTA_GENERATION:-$accel_min}
+                ;;
+        esac
+        if awk -v l="$last_delta" -v a="$avg" -v f="$f_key" -v m="$m_key" 'BEGIN{exit (l>=m && a>0 && l>=a*(1+f/100))?0:1}'; then
             local mount=${mk%%|*} key=${mk##*|}
             local ratio=$(awk -v l="$last_delta" -v a="$avg" 'BEGIN{printf "%.2f", l/a}')
             m_rank+=("$last_delta $mount $key $last_delta $avg $ratio")
@@ -4571,6 +4764,7 @@ log_info "Computing SMART attribute growth trends..."; build_smart_attr_trend_se
 log_info "Analyzing error rate acceleration..."; build_error_rate_accel_section; log_info "Error rate acceleration summary completed"
 log_info "Computing endurance days-left shrink trends..."; build_endurance_daysleft_trend_section; log_info "Endurance days-left trend summary completed"
 log_info "Evaluating capacity risk acceleration..."; build_capacity_risk_accel_section; log_info "Capacity risk acceleration summary completed"
+log_info "Assessing SATA link instability..."; build_sata_link_instability_section; log_info "SATA link instability summary completed"
 log_info "Section build completed"
 
 # Build a conditional Risk block with surrounding spacing only when content exists
@@ -4647,18 +4841,19 @@ _append_section "${DISK_HEALTH_SUMMARY:-}"
 _append_section "${CAPACITY_FORECAST:-}"
 _append_section "${DISK_GROWTH_SECTION:-}"
 _append_section "${SHARE_SECTION:-}"
+_append_section "${STORAGE_VALIDATION_SECTION:-}"
+_append_section "${CAPACITY_RISK_ACCEL_SECTION:-}"
 _append_section "${FIRMWARE_EVENT_SECTION:-}"
+_append_section "${SATA_LINK_INSTABILITY_SECTION:-}"
 _append_section "${SMART_ATTR_TREND_SECTION:-}"
 _append_section "${ERROR_RATE_ACCEL_SECTION:-}"
 _append_section "${ENDURANCE_DAYSLEFT_TREND_SECTION:-}"
 _append_section "${ENDURANCE_TREND_SECTION:-}"
 _append_section "${TBW_SECTION:-}"
 _append_section "${BTRFS_DEV_TREND_SECTION:-}"
-_append_section "${STORAGE_VALIDATION_SECTION:-}"
 _append_section "${IO_ERROR_FREQ_SECTION:-}"
 _append_section "${SUBSYSTEMS_BLOCK:-}"
 _append_section "${RISK_TIER_TREND_SECTION:-}"
-_append_section "${CAPACITY_RISK_ACCEL_SECTION:-}"
 _append_section "${RISK_BLOCK:-}"
 _append_section "${HEALTH_ALERTS_SECTION:-}"
 
