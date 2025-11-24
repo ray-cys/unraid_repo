@@ -12,8 +12,6 @@ fi
 
 BACKUP_DIR="/mnt/user/node/flash"                                 # Destination directory for flash backups
 MAX_BACKUP=3                                                      # Number of backups to keep
-FLASH_ENABLE_STAT_FALLBACK=${FLASH_ENABLE_STAT_FALLBACK:-true}    # When true, attempt a stat(2)-based fallback if df reports 0 bytes free.
-FLASH_IGNORE_ZERO_FS_TYPES=${FLASH_IGNORE_ZERO_FS_TYPES:-"fuse.rclone fuse.mergerfs fuse.unionfs"} # Filesystem types to ignore for free space checks
 
 ################################################################################
 
@@ -209,30 +207,9 @@ if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
   # Normalize non-numeric df results
   if ! [[ "$dest_avail" =~ ^[0-9]+$ ]]; then dest_avail=0; fi
   if ! [[ "$dest_total" =~ ^[0-9]+$ ]]; then dest_total=0; fi
-  # If df reports 0 available and fallback is enabled, try stat(2)-based free calculation
-  if [ "$dest_avail" -eq 0 ] && [ "$FLASH_ENABLE_STAT_FALLBACK" = "true" ]; then
-    stat_vals=$(stat -f --format '%a %s' "$BACKUP_DIR" 2>/dev/null || echo "")
-    if [[ "$stat_vals" =~ ^[0-9]+\ [0-9]+$ ]]; then
-      stat_free=$(awk '{print $1 * $2}' <<< "$stat_vals")
-      if [[ "$stat_free" =~ ^[0-9]+$ ]] && [ "$stat_free" -gt 0 ]; then
-        dest_avail=$stat_free
-      fi
-    fi
-  fi
-  # If still zero, and fs type matches ignore list, treat free as unknown (do not gate move)
-  dest_free_unknown=0
-  if [ "$dest_avail" -eq 0 ]; then
-    fs_type=$(stat -f -c %T "$BACKUP_DIR" 2>/dev/null || echo "")
-    for _fst in $FLASH_IGNORE_ZERO_FS_TYPES; do
-      if [ "$fs_type" = "$_fst" ]; then
-        dest_free_unknown=1
-        break
-      fi
-    done
-  fi
   human_src_size=$(bytes_human "$src_bytes")
   need_bytes=$(( src_bytes + 1024 * 1024 )) # 1MB safety buffer
-    if [ "${dest_free_unknown}" -eq 0 ] && [ "$dest_avail" -lt "$need_bytes" ]; then
+  if [ "$dest_avail" -lt "$need_bytes" ]; then
     human_need=$(bytes_human "$need_bytes")
     human_avail=$(bytes_human "$dest_avail")
     syslog err "Insufficient space to move flash zip: need ${human_need}, available ${human_avail}"
@@ -364,11 +341,7 @@ prune_old_files "$BACKUP_DIR" "$MAX_BACKUP" "*flash-backup-*.zip"
   # Append space metrics if available from pre-check
   if [ -n "${need_bytes:-}" ]; then
     req_human=$(bytes_human "$need_bytes")
-    if [ "${dest_free_unknown:-0}" -eq 1 ]; then
-      free_human="Unknown"
-    else
-      free_human=$(bytes_human "${dest_avail:-0}")
-    fi
+    free_human=$(bytes_human "${dest_avail:-0}")
     notify_body+=$'\n'"Space: Free = ${free_human} Required = ${req_human}"
     if [[ "${dest_avail:-0}" =~ ^[0-9]+$ ]] && [ "${dest_avail:-0}" -gt 0 ]; then
       req_pct_of_free=$(awk -v r="$need_bytes" -v f="${dest_avail:-0}" 'BEGIN{printf "%.2f", (r*100)/f}')
