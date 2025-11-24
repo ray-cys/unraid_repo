@@ -50,7 +50,7 @@ UTIL_ALERT_THRESHOLD=${UTIL_ALERT_THRESHOLD:-5}                # Percent free be
 
 # === Notifications ===
 NOTIFY_TITLE="Docker Backup"                                  # Notification title prefix
-NOTIFY_LEVEL_ON_SUCCESS="notice"                              # Level for overall success
+NOTIFY_LEVEL_ON_SUCCESS="normal"                              # Level for overall success
 NOTIFY_LEVEL_ON_FAILURE="alert"                               # Level for overall failure
 
 # === Shares Backup (Rsync) ===
