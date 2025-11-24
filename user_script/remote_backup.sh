@@ -80,9 +80,6 @@ STABILIZE_INTERVAL=3                                                   # Poll in
 ARRAY_READY_WAIT=180                                                   # Additional wait for Unraid array (/mnt/user) readiness
 ARRAY_READY_INTERVAL=6                                                 # Poll interval for array readiness check
 
-# === Runtime Flags ===
-DRY_RUN=false                                                          # When true, perform a dry run without actual data transfer
-
 # === Labels to backup (arrays must match) ===
 LABELS_ARRAY=("Media" "Secure")                                        # Labels for datasets to back up
 SRCS_ARRAY=("$MEDIA_SRC" "$SECURE_SRC")                                # Source paths for datasets
@@ -568,9 +565,6 @@ run_rsync() {
   log "Initialize backup ($label --> $DEST_NAS) == $(date)"
   local -a rsync_args=("${RSYNC_DEFAULT_ARGS[@]:-}" "--partial-dir=${RSYNC_PARTIAL_DIR}")
   rsync_args+=("${DEFAULT_EXCLUDES[@]:-}")
-  if [ "$DRY_RUN" = true ]; then
-    rsync_args+=("--dry-run")
-  fi
   if [ "${#opts[@]}" -ne 0 ]; then
     rsync_args+=("${opts[@]}")
   fi
@@ -644,16 +638,8 @@ run_rsync() {
         safe_label=${label// /_}
         now=$(date +%Y%m%d_%H%M%S)
         snap_dest="$SNAPSHOT_ROOT/$safe_label/$now"
-        if [ "$DRY_RUN" = false ]; then
-          ssh -p "$SSH_PORT" "$REMOTE" "mkdir -p '$snap_dest'" 2>/dev/null || true
-        else
-          log "Dry-run: would create remote snapshot dir $snap_dest"
-        fi
-        if [ "$DRY_RUN" = false ]; then
-          write_manifest "$label" "$src"
-        else
-          log "Dry-run: skipping manifest write for $label"
-        fi
+        ssh -p "$SSH_PORT" "$REMOTE" "mkdir -p '$snap_dest'" 2>/dev/null || true
+        write_manifest "$label" "$src"
       fi
       set -e
       return 0
@@ -731,15 +717,11 @@ run_label_backup() {
     now=$(date '+%Y%m%d_%H%M%S')
     local safe_label=${label// /_}
     local snapdir="$SNAPSHOT_ROOT/$safe_label/$now"
-    if [ "$DRY_RUN" = false ]; then
-      ssh_run "mkdir -p '$snapdir'" 2>/dev/null || true
-    else
-      log "Dry-run: would create remote snapshot dir $snapdir"
-    fi
+    ssh_run "mkdir -p '$snapdir'" 2>/dev/null || true
     run_rsync "$src" "$snapdir" "${exclude_arg[@]}" "$label"
     rsync_results[$label]=$?
     log "Result: $label rsync exit=${rsync_results[$label]}"
-    if [ "${rsync_results[$label]}" -eq 0 ] && [ "$DRY_RUN" = false ]; then
+    if [ "${rsync_results[$label]}" -eq 0 ]; then
       ssh_run "ln -snf '$snapdir' '$SNAPSHOT_ROOT/$safe_label/latest'"
       ssh_run "ls -1dt '$SNAPSHOT_ROOT/$safe_label'/*/ 2>/dev/null | tail -n +$((SNAPSHOT_KEEP+1)) | xargs -r rm -rf --" || true
     fi
@@ -1105,16 +1087,12 @@ compose_notification "$backup_status"
 log "$SRC_NAS --> $DEST_NAS complete == $(format_runtime)"
 notify_send "$COMPOSE_LEVEL" "Remote Backup - $( [ "$backup_status" -eq 0 ] && echo OK || echo FAIL)" "$COMPOSE_DETAIL" "$COMPOSE_BODY"
 if [ "$backup_status" -eq 0 ]; then
-  if [ "$DRY_RUN" = false ]; then
-    log "Shutting down remote after successful backup"
-    if ! ssh -p "$SSH_PORT" "$REMOTE" "df --type=xfs -h && powerdown" 2>/dev/null; then
-      log "Remote shutdown command failed"
-      syslog err "Remote shutdown command failed on $REMOTE"
-    fi
-    sleep 5s
-  else
-    log "Dry-run: skipping remote powerdown after success"
+  log "Shutting down remote after successful backup"
+  if ! ssh -p "$SSH_PORT" "$REMOTE" "df --type=xfs -h && powerdown" 2>/dev/null; then
+    log "Remote shutdown command failed"
+    syslog err "Remote shutdown command failed on $REMOTE"
   fi
+  sleep 5s
 else
   if [ "$SHUTDOWN_ON_FAILURE" = true ]; then
     log "Shutdown_on_failure=true; requesting remote powerdown despite failures"
