@@ -79,10 +79,7 @@ dest_dir_free_bytes=0                                          # Free bytes (pos
 dest_dir_total_bytes=0                                         # Total bytes of destination filesystem
 dest_dir_used_bytes=0                                          # Used bytes of destination filesystem
 declare -A DIR_SIZES=()                                        # Per-container size cache (bytes)
-STOP_CONTAINERS=()                                             # Containers selected to stop (global for traps)
-containers_stopped=0                                           # Flag when containers have been stopped
-containers_restarted=0                                         # Flag when containers have been restarted
-aborted=0                                                      # Set by signal handler to suppress final notify
+STOP_CONTAINERS=()                                             # Containers selected to stop
 raw_uncompressed_total=0                                       # Raw summed bytes of all directories
 estimated_compressed_total=0                                   # Estimated compressed bytes using REQUIRED_RATIO
 
@@ -107,7 +104,10 @@ for _skip in "${SKIP_CONTAINERS[@]}"; do
   SKIP_MAP["$_skip"]=1
   exclude_opts+=( --exclude="$_skip" )
 done
-is_skipped() { [[ -n "${SKIP_MAP[$1]:-}" ]]; }
+is_skipped() {
+  local k="$1"
+  [[ -n "$k" && -n "${SKIP_MAP[$k]:-}" ]]
+}
 # Report of backups (populated later)
 backup_report=""
 # Log messages to logfile and stdout
@@ -125,71 +125,6 @@ log() {
     body="$msg"
   fi
   echo "$(date "+%Y/%m/%d %T") : [${category}][${level}] ${body}" | tee -a "$LOG_FILE"
-}
-# Trap interrupts/termination/errors to attempt container restart and graceful abort.
-# shellcheck disable=SC2329 # handle_signal invoked via trap handlers
-handle_signal() {
-  local sig="$1"
-  # Prevent re-entrancy
-  if [ "$aborted" -eq 1 ]; then return; fi
-  aborted=1
-  log "BACKUP|ERROR|Interrupted by signal ${sig}; initiating abort sequence"
-  # Attempt container restart if they were stopped and not yet restarted
-  if [ "$containers_stopped" -eq 1 ] && [ "$containers_restarted" -eq 0 ] && [ "${#STOP_CONTAINERS[@]}" -gt 0 ]; then
-    log "DOCKER|INFO|Restarting ${#STOP_CONTAINERS[@]} containers after ${sig}"
-    docker start "${STOP_CONTAINERS[@]}" >/dev/null 2>&1 || true
-    for c in "${STOP_CONTAINERS[@]}"; do
-      running=$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null || echo false)
-      if [[ "$running" != "true" ]]; then
-        log "DOCKER|WARN|Container failed to restart after interrupt: $c"
-      else
-        log "DOCKER|INFO|Restarted $c"
-      fi
-    done
-    containers_restarted=1
-  fi
-  # If backup_dir exists and KEEP_PARTIAL is false, remove partial artifacts
-  if [ -n "${backup_dir:-}" ] && [ -d "${backup_dir:-}" ]; then
-    if [ "${KEEP_PARTIAL}" != "true" ]; then
-      log "BACKUP|INFO|Removing partial backup directory (KEEP_PARTIAL=false): $backup_dir"
-      rm -rf -- "$backup_dir" 2>/dev/null || true
-    else
-      log "BACKUP|INFO|Keeping partial backup directory (KEEP_PARTIAL=true): $backup_dir"
-    fi
-  fi
-  # Notify abort
-  send_notify abort "Interrupted (${sig})" "Script aborted prior to completion"
-  log "BACKUP|ERROR|Aborted by signal ${sig}; exit 1"
-  exit 1
-}
-# Register traps for INT TERM ERR
-trap 'handle_signal INT' INT
-trap 'handle_signal TERM' TERM
-trap 'handle_signal ERR' ERR
-# Resolve path (portable realpath/readlink fallback)
-resolve_path() {
-  local p="$1"
-  if command -v realpath >/dev/null 2>&1; then
-    realpath "$p"
-  else
-    readlink -f "$p" 2>/dev/null || echo "$p"
-  fi
-}
-# Determine if a container mounts any host path under SRC_DIR
-container_uses_src_dir() {
-  local cname="$1"
-  local mounts src_real m m_real
-  src_real="$(resolve_path "$SRC_DIR")"
-  mounts=$(docker inspect --format '{{range .Mounts}}{{println .Source}}{{end}}' "$cname" 2>/dev/null || true)
-  [[ -z "$mounts" ]] && return 1
-  while IFS= read -r m; do
-    [[ -z "$m" ]] && continue
-    m_real="$(resolve_path "$m")"
-    if [[ "$m_real" == "$src_real" ]] || [[ "$m_real" == "$src_real"/* ]]; then
-      return 0
-    fi
-  done <<< "$mounts"
-  return 1
 }
 # Notification helper
 send_notify() {
@@ -500,32 +435,26 @@ main() {
   STATUS_DIR="${TMP_DIR:-$backup_dir}"
 # Stop containers except those in skip list
   log "DOCKER|INFO|Docker $SRC_DIR_NAME backup, stopping containers"
-# Get list of running containers and filter
-  container_ids=$(docker ps -q --no-trunc 2>/dev/null || true)
-  if [[ -n "$container_ids" ]]; then
-    mapfile -t CONTAINERS < <(docker inspect --format='{{.Name}}' "$container_ids" | cut -c2- | sort)
-  else
+# Get list of running container names directly
+  mapfile -t CONTAINERS < <(docker ps --format '{{.Names}}' 2>/dev/null | sort || true)
+  if [ ${#CONTAINERS[@]} -eq 0 ]; then
     CONTAINERS=()
   fi
   STOP_CONTAINERS=()
   for container in "${CONTAINERS[@]}"; do
+    [[ -z "$container" ]] && continue
     if is_skipped "$container"; then
       log "DOCKER|INFO|Skip ${container} (user skip list)"
       continue
     fi
-    if container_uses_src_dir "$container"; then
-      log "DOCKER|INFO|Queue stop ${container} (mount under $SRC_DIR)"
-      STOP_CONTAINERS+=("$container")
-    else
-      log "DOCKER|INFO|Skip ${container} (no mounts under $SRC_DIR)"
-    fi
+    log "DOCKER|INFO|Queue stop ${container}"
+    STOP_CONTAINERS+=("$container")
   done
-  log "DOCKER|INFO|Containers to stop: ${#STOP_CONTAINERS[@]} / ${#CONTAINERS[@]} running"
+  log "DOCKER|INFO|Containers to stop: ${#STOP_CONTAINERS[@]} (of ${#CONTAINERS[@]} running)"
 # Stop all target containers
   if [ "${#STOP_CONTAINERS[@]}" -gt 0 ]; then
     docker stop "${STOP_CONTAINERS[@]}" >/dev/null 2>&1 || true
   fi
-  if [ "${#STOP_CONTAINERS[@]}" -gt 0 ]; then containers_stopped=1; fi
     log "DOCKER|INFO|Compressing Docker $SRC_DIR_NAME for backup"
 # Directories checks before starting
   if [ ! -d "$SRC_DIR" ]; then
@@ -700,7 +629,6 @@ if [ "${#STOP_CONTAINERS[@]}" -gt 0 ]; then
     fi
   done
 fi
-  containers_restarted=1
   log "DOCKER|INFO|Docker backup files are in $backup_dir"
 
 # == Shares Backup Rsync ===
@@ -848,9 +776,7 @@ fi
     fi
   fi
 # Send consolidated final notification
-  if [ "$aborted" -eq 0 ]; then
-    send_notify final "$failed_count" "${additional_fail:-0}" "$docker_counts" "${shares_counts:-}" "$final_body"
-  fi
+  send_notify final "$failed_count" "${additional_fail:-0}" "$docker_counts" "${shares_counts:-}" "$final_body"
 # Remove backup_dir if failed and KEEP_PARTIAL is false, otherwise keep as before
   if [ "$failed_count" -gt 0 ]; then
     if [ "${KEEP_PARTIAL}" != "true" ]; then
