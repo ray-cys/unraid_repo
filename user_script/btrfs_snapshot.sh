@@ -282,7 +282,7 @@ for POOL in "${POOLS[@]}"; do
   p_pool_bytes=$(df -B1 "$POOL" 2>/dev/null | awk 'NR==2 {gsub(/,/,""); print $2}' || echo 0)
   p_pool_avail=$(df -B1 "$POOL" 2>/dev/null | awk 'NR==2 {gsub(/,/,"" ); print $4}' || echo 0)
   p_snap_phys_bytes=0
-  matched_count=0; du_count=0; matched_phys_bytes=0; matched_du_bytes=0n
+  matched_count=0; du_count=0; matched_phys_bytes=0; matched_du_bytes=0
   allow_estimate=true
   # Process snapshots per-share so parent-based estimates are computed within the same share
   for SHARE in "${SHARES[@]}"; do
