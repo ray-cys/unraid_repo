@@ -538,9 +538,11 @@ main() {
       printf "%s: FAILED|0\n" "$name" >"$sf"
       continue
     fi
-    # Tar readability sanity check (list first entry)
-    if ! ( set -o pipefail; tar -tzf "$archive_path" 2>>"$err_file" | head -n 1 >/dev/null ); then
-      log "VERIFY|ERROR|Integrity check failed (tar list): ${name}"
+    # Tar readability integrity test
+    tar -tzf "$archive_path" >/dev/null 2>>"$err_file"
+    tstat=$?
+    if [ $tstat -ne 0 ] && [ $tstat -ne 141 ]; then
+      log "VERIFY|ERROR|Integrity check failed (tar list exit=$tstat): ${name}"
       printf "%s: FAILED|0\n" "$name" >"$sf"
       continue
     fi
@@ -685,7 +687,6 @@ fi
           log "SHARES|WARN|[share: $share_name] excludes_file missing: $share_excludes_file (ignored)"
         fi
       fi
-      rsync_cmd=(rsync "${ADD_RSYNC_BASE_ARGS[@]}" "${rsync_excludes[@]}" "$share_src/" "$share_dest/")
       RSYNC_IO_PREFIX=""
       if [ "$ADD_USE_IONICE" = true ]; then
         if command -v ionice >/dev/null 2>&1; then
@@ -695,16 +696,20 @@ fi
         fi
       fi
       if [ -n "$RSYNC_IO_PREFIX" ]; then
-        rsync_cmd=(bash -c "$RSYNC_IO_PREFIX $(printf '%q ' rsync) $(printf '%q ' "${ADD_RSYNC_BASE_ARGS[@]}") $(printf '%q ' "${rsync_excludes[@]}") $(printf '%q' "$share_src/") $(printf '%q' "$share_dest/")")
+        read -r -a PREFIX_ARR <<<"$RSYNC_IO_PREFIX"
+        rsync_cmd=("${PREFIX_ARR[@]}" rsync "${ADD_RSYNC_BASE_ARGS[@]}" "${rsync_excludes[@]}" "$share_src/" "$share_dest/")
+      else
+        rsync_cmd=(rsync "${ADD_RSYNC_BASE_ARGS[@]}" "${rsync_excludes[@]}" "$share_src/" "$share_dest/")
       fi
-      log "SHARES|INFO|[share: $share_name] Running (io_prefix='${RSYNC_IO_PREFIX:-none}'): $(printf '%q ' "${rsync_cmd[@]}")"
-      set +e
+      local rsync_cmd_str
+      rsync_cmd_str=$(printf '%q ' "${rsync_cmd[@]}")
+      log "SHARES|INFO|[share: $share_name] Running (io_prefix='${RSYNC_IO_PREFIX:-none}'): ${rsync_cmd_str}"
       set -o pipefail
-      "${rsync_cmd[@]}" 2>&1 | tee "$tmp_rsync_log" | while IFS= read -r line; do
+      "${rsync_cmd[@]}" >"$tmp_rsync_log" 2>&1
+      rstat=$?
+      while IFS= read -r line; do
         [ -n "$line" ] && log "SHARES|INFO|[rsync: $share_name] $line"
-      done
-      rstat=${PIPESTATUS[0]}
-      set -e
+      done <"$tmp_rsync_log"
       if [ "$rstat" -ne 0 ]; then
         case $rstat in
           23) rdesc="Partial transfer";;
