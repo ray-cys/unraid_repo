@@ -36,6 +36,7 @@ PIGZ_THREADS=${PIGZ_THREADS:-0}                                                 
 TARBALL_PROGRESS_TO_LOG=${TARBALL_PROGRESS_TO_LOG:-true}                                        # Append live progress to log when pv used
 TAR_OPTIONS=()                                                                                  # Extra tar options array (e.g., ("--exclude=foo"))
 DF_REFRESH_INTERVAL=${DF_REFRESH_INTERVAL:-3}                                                   # Refresh cadence for df free-space checks
+COMP_USE_IONICE=${COMP_USE_IONICE:-true}                                                        # Ionice/nice wrapper for compression pipeline
 
 # === Reliability / Retry ===
 RETRIES=${RETRIES:-3}                                          # Compression retry attempts per directory
@@ -47,21 +48,18 @@ LOW_SPACE_ACTION=${LOW_SPACE_ACTION:-abort}                    # Behavior when s
 LOW_SPACE_MARGIN=${LOW_SPACE_MARGIN:-0}                        # Extra bytes added to required size estimate
 UTIL_WARN_THRESHOLD=${UTIL_WARN_THRESHOLD:-15}                 # Percent free below -> warning note
 UTIL_ALERT_THRESHOLD=${UTIL_ALERT_THRESHOLD:-5}                # Percent free below -> alert notification
-
-# === Notifications ===
-NOTIFY_TITLE="Docker Backup"                                  # Notification title prefix
-NOTIFY_LEVEL_ON_SUCCESS="normal"                              # Level for overall success
-NOTIFY_LEVEL_ON_FAILURE="alert"                               # Level for overall failure
+REQUIRED_RATIO=${REQUIRED_RATIO:-0.6}                          # Estimated compression ratio (0<r<=1)
 
 # === Shares Backup (Rsync) ===
-# Extend arrays to add more non-appdata shares. Each mirrors src -> dest via rsync.
-ADD_NAMES=("cloud" "system")                                                  # Names for each additional share
-ADD_SRCS=("/mnt/user/cloud" "/mnt/cache/system")                              # Mirror source directories
-ADD_DESTS=("/mnt/user/node/shares/cloud" "/mnt/user/node/shares/system")      # Mirror destination directories
-ADD_EXCLUDES=("" "")                                                          # Space-separated patterns per position (empty => none)
-ADD_RSYNC_BASE_ARGS=("-aH" "--delete" "--stats" "--protect-args" "--partial") # Base rsync args
+# Descriptor-based: "name=<n> src=<path> dest=<path> excludes=<p1,p2> excludes_file=/path/to/file"
+ADD_SHARES=(
+  "name=system src=/mnt/cache/system dest=/mnt/user/node/shares/system excludes="
+)
+ADD_RSYNC_BASE_ARGS=("-aH" "--delete-delay" "--stats" "--protect-args" "--partial") # Base rsync args
 ADD_USE_IONICE=true                                                           # Ionice/nice wrappers for rsync if available
-ADD_SECTION_HEADER="Shares Backup"                                            # Heading used in final notification
+RSYNC_IONICE_CLASS=${RSYNC_IONICE_CLASS:-2}                                   # ionice class (2=best-effort)
+RSYNC_IONICE_PRIO=${RSYNC_IONICE_PRIO:-7}                                     # ionice priority (0-7 lower is higher priority)
+RSYNC_NICE=${RSYNC_NICE:-10}                                                  # nice adjustment for rsync
 
 # === Ownership / Permissions ===
 LOG_OWNER="${LOG_OWNER:-nobody}"                               # Owner user for log directory and files
@@ -81,13 +79,17 @@ dest_dir_free_bytes=0                                          # Free bytes (pos
 dest_dir_total_bytes=0                                         # Total bytes of destination filesystem
 dest_dir_used_bytes=0                                          # Used bytes of destination filesystem
 declare -A DIR_SIZES=()                                        # Per-container size cache (bytes)
+STOP_CONTAINERS=()                                             # Containers selected to stop (global for traps)
+containers_stopped=0                                           # Flag when containers have been stopped
+containers_restarted=0                                         # Flag when containers have been restarted
+aborted=0                                                      # Set by signal handler to suppress final notify
+raw_uncompressed_total=0                                       # Raw summed bytes of all directories
+estimated_compressed_total=0                                   # Estimated compressed bytes using REQUIRED_RATIO
 
 ################################################################################
-# Helper Functions
-################################################################################
 
-# Helper: ensure_dir - create directory if missing; apply owner & perms
-# Ensure runtime log directory exists
+# === Helper Functions ===
+# Create directory and log file if missing; apply owner & perms
 ensure_dir() {
   local path="$1" perm="${2:-$LOG_DIR_PERMS}" owner="${3:-$LOG_OWNER}"
   if [ ! -d "$path" ]; then mkdir -p "$path" 2>/dev/null || return 1; fi
@@ -108,34 +110,133 @@ done
 is_skipped() { [[ -n "${SKIP_MAP[$1]:-}" ]]; }
 # Report of backups (populated later)
 backup_report=""
-
-# Helper: log - messages to logfile and stdout
+# Log messages to logfile and stdout
 log() {
   local msg="$1"
-  echo "$(date "+%Y/%m/%d %T") : $msg" | tee -a "$LOG_FILE"
-}
-
-# Helper: log_error - errors to syslog + logfile
-log_error() {
-  local msg="$1"
-  logger -p err "ERROR: $msg"
-  log "ERROR: $msg"
-}
-
-# Helper: notify_abort - early failure notification
-notify_abort() {
-  local reason="$1"
-  local detail="${2:-}"
-  local subj="${NOTIFY_TITLE} - FAILED"
-  local short="Backup aborted"
-  local body="Reason: ${reason}"
-  if [ -n "$detail" ]; then
-    body+=$'\n'"$detail"
+  local category level body
+  if [[ "$msg" =~ ^([A-Z]+)\|([A-Z]+)\|[[:space:]]?(.*)$ ]]; then
+    category="${BASH_REMATCH[1]}"
+    level="${BASH_REMATCH[2]}"
+    body="${BASH_REMATCH[3]}"
+  else
+    # Fallback: treat unprefixed messages as BACKUP|INFO
+    category="BACKUP"
+    level="INFO"
+    body="$msg"
   fi
-  /usr/local/emhttp/webGui/scripts/notify -i "$NOTIFY_LEVEL_ON_FAILURE" -b -s "$subj" -d "$short" -m "$body" || true
+  echo "$(date "+%Y/%m/%d %T") : [${category}][${level}] ${body}" | tee -a "$LOG_FILE"
 }
-
-# Helper: bytes_to_human - format byte counts
+# Trap interrupts/termination/errors to attempt container restart and graceful abort.
+# shellcheck disable=SC2329 # handle_signal invoked via trap handlers
+handle_signal() {
+  local sig="$1"
+  # Prevent re-entrancy
+  if [ "$aborted" -eq 1 ]; then return; fi
+  aborted=1
+  log "BACKUP|ERROR|Interrupted by signal ${sig}; initiating abort sequence"
+  # Attempt container restart if they were stopped and not yet restarted
+  if [ "$containers_stopped" -eq 1 ] && [ "$containers_restarted" -eq 0 ] && [ "${#STOP_CONTAINERS[@]}" -gt 0 ]; then
+    log "DOCKER|INFO|Restarting ${#STOP_CONTAINERS[@]} containers after ${sig}"
+    docker start "${STOP_CONTAINERS[@]}" >/dev/null 2>&1 || true
+    for c in "${STOP_CONTAINERS[@]}"; do
+      running=$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null || echo false)
+      if [[ "$running" != "true" ]]; then
+        log "DOCKER|WARN|Container failed to restart after interrupt: $c"
+      else
+        log "DOCKER|INFO|Restarted $c"
+      fi
+    done
+    containers_restarted=1
+  fi
+  # If backup_dir exists and KEEP_PARTIAL is false, remove partial artifacts
+  if [ -n "${backup_dir:-}" ] && [ -d "${backup_dir:-}" ]; then
+    if [ "${KEEP_PARTIAL}" != "true" ]; then
+      log "BACKUP|INFO|Removing partial backup directory (KEEP_PARTIAL=false): $backup_dir"
+      rm -rf -- "$backup_dir" 2>/dev/null || true
+    else
+      log "BACKUP|INFO|Keeping partial backup directory (KEEP_PARTIAL=true): $backup_dir"
+    fi
+  fi
+  # Notify abort
+  send_notify abort "Interrupted (${sig})" "Script aborted prior to completion"
+  log "BACKUP|ERROR|Aborted by signal ${sig}; exit 1"
+  exit 1
+}
+# Register traps for INT TERM ERR
+trap 'handle_signal INT' INT
+trap 'handle_signal TERM' TERM
+trap 'handle_signal ERR' ERR
+# Resolve path (portable realpath/readlink fallback)
+resolve_path() {
+  local p="$1"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$p"
+  else
+    readlink -f "$p" 2>/dev/null || echo "$p"
+  fi
+}
+# Determine if a container mounts any host path under SRC_DIR
+container_uses_src_dir() {
+  local cname="$1"
+  local mounts src_real m m_real
+  src_real="$(resolve_path "$SRC_DIR")"
+  mounts=$(docker inspect --format '{{range .Mounts}}{{println .Source}}{{end}}' "$cname" 2>/dev/null || true)
+  [[ -z "$mounts" ]] && return 1
+  while IFS= read -r m; do
+    [[ -z "$m" ]] && continue
+    m_real="$(resolve_path "$m")"
+    if [[ "$m_real" == "$src_real" ]] || [[ "$m_real" == "$src_real"/* ]]; then
+      return 0
+    fi
+  done <<< "$mounts"
+  return 1
+}
+# Notification helper
+send_notify() {
+  local mode="$1"; shift
+  local subj="Scheduled Backup"
+  case "$mode" in
+    final)
+      local failed_count="$1" additional_fail="$2" docker_counts="$3" shares_counts="$4" body="$5"
+      local level desc status_text counts
+      if [ "${failed_count:-0}" -eq 0 ] && [ "${additional_fail:-0}" -eq 0 ]; then
+        level="normal"; status_text="OK"
+      else
+        level="alert"
+        if [ "${failed_count:-0}" -gt 0 ] && [ "${additional_fail:-0}" -gt 0 ]; then
+          status_text="FAILED (Docker & Shares)"
+        elif [ "${failed_count:-0}" -gt 0 ]; then
+          status_text="FAILED (Docker)"
+        else
+          status_text="FAILED (Shares)"
+        fi
+      fi
+      if [ -n "$shares_counts" ]; then
+        counts="D ${docker_counts}; S ${shares_counts}"
+      else
+        counts="D ${docker_counts}"
+      fi
+      desc="Docker Appdata & Shares - ${status_text} ${counts}"
+      /usr/local/emhttp/webGui/scripts/notify -i "$level" -b -s "$subj" -d "$desc" -m "$body" || true
+      ;;
+    abort)
+      local reason="$1" detail="${2:-}"
+      local short="🔴 Backup FAILED"
+      local body="Reason: ${reason}"
+      local level="alert"
+      if [ -n "$detail" ]; then body+=$'\n'"$detail"; fi
+      /usr/local/emhttp/webGui/scripts/notify -i "$level" -b -s "$subj" -d "$short" -m "$body" || true
+      ;;
+    lowspace)
+      local alert_msg="$1"
+      local level="alert"
+      local short="🔴 Low Disk Space"
+      /usr/local/emhttp/webGui/scripts/notify -i "$level" -b -s "$subj" -d "$short" -m "$alert_msg" || true
+      ;;
+    *)
+  esac
+}
+# Human readable byte formatting
 bytes_to_human() {
   local bytes=${1:-0}
   awk -v b="$bytes" 'BEGIN{
@@ -145,8 +246,12 @@ bytes_to_human() {
     if(b>=100) printf("%.0f%s", b, u[i]); else printf("%.1f%s", b, u[i]);
   }'
 }
-
-# Helper: safe_size_bytes - robust size retrieval
+# Format seconds to H:M:S (e.g. 1h:02m:09s)
+format_duration() {
+  local secs=${1:-0}
+  printf '%dh:%dm:%ds' $((secs / 3600)) $((secs % 3600 / 60)) $((secs % 60))
+}
+# Robust size retrieval
 safe_size_bytes() {
   local path="$1"
   local size
@@ -162,8 +267,7 @@ safe_size_bytes() {
   fi
   echo "$size"
 }
-
-# Helper: write_status - standardized status line
+# Standardized status line
 write_status() {
   local name="$1" label="$2" bytes="$3" sfile="${4:-}"
   if [ -n "$sfile" ]; then
@@ -172,8 +276,24 @@ write_status() {
     printf "%s: %s|%s\n" "$name" "$label" "$bytes"
   fi
 }
-
-# Helper: compress_job - Streams tar -> (optional pv) -> pigz/gzip with retries
+# Disk and concurrency helpers
+disk_refresh_state() {
+  dest_dir_free_bytes=$(df -B1 "$DEST_DIR" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
+  dest_dir_total_bytes=$(df -B1 "$DEST_DIR" 2>/dev/null | awk 'NR==2 {print $2}' || echo 0)
+  dest_dir_used_bytes=$(df -B1 "$DEST_DIR" 2>/dev/null | awk 'NR==2 {print $3}' || echo 0)
+  if [[ "$dest_dir_total_bytes" =~ ^[0-9]+$ ]] && [ "$dest_dir_total_bytes" -gt 0 ] && [[ "$dest_dir_free_bytes" =~ ^[0-9]+$ ]]; then
+    pct_free_int=$(awk -v f="$dest_dir_free_bytes" -v t="$dest_dir_total_bytes" 'BEGIN{printf "%d", (f*100)/t}')
+  else
+    pct_free_int=-1
+  fi
+}
+# Wait for a free job slot
+wait_for_slot() {
+  while [ "$(jobs -rp | wc -l)" -ge "$PARALLEL_JOBS" ]; do
+    sleep 0.5
+  done
+}
+# Compress directory with retries
 compress_job() {
   local dname="$1"; shift
   local out="$1"; shift
@@ -183,61 +303,70 @@ compress_job() {
   local dir_size
   dir_size=$(safe_size_bytes "${SRC_DIR}/${dname}")
 
-  local comp_cmd
+  local comp_cmd base_comp
   if [ "$USE_PIGZ" -eq 1 ]; then
     if [ "$PIGZ_THREADS" -gt 0 ]; then
-      comp_cmd="pigz -p $PIGZ_THREADS -c"
+      base_comp="pigz -p $PIGZ_THREADS -c"
     else
-      comp_cmd="pigz -p 0 -c"
+      base_comp="pigz -p 0 -c"
     fi
   else
-    comp_cmd="gzip -c"
+    base_comp="gzip -c"
+  fi
+  local IO_PREFIX=""
+  if [ "$COMP_USE_IONICE" = true ] && command -v ionice >/dev/null 2>&1; then
+    IO_PREFIX="ionice -c2 -n7 nice -n 10"
+  fi
+  if [ -n "$IO_PREFIX" ]; then
+    comp_cmd="$IO_PREFIX $base_comp"
+  else
+    comp_cmd="$base_comp"
   fi
 
   while [ $attempt -le "$RETRIES" ]; do
-    log "[${dname}] compress attempt $attempt"
+    log "DOCKER|INFO|[${dname}] compress attempt $attempt (ionice=${COMP_USE_IONICE} prefix='${IO_PREFIX}')"
     if [ "$PV_AVAILABLE" -eq 1 ] && [ "$dir_size" -gt 0 ]; then
       if [ "$TARBALL_PROGRESS_TO_LOG" = "true" ]; then
-        if ( set -o pipefail; tar cPf - -C "${SRC_DIR}" "${dname}" "${TAR_OPTIONS[@]}" "${exclude_opts[@]}" 2>>"$efile" | pv -s "$dir_size" 2> >(tee -a "$LOG_FILE" >>"$efile") | eval "$comp_cmd" >"$out" ); then
+        if ( set -o pipefail; ${IO_PREFIX:+$IO_PREFIX }tar cPf - -C "${SRC_DIR}" "${dname}" "${TAR_OPTIONS[@]}" "${exclude_opts[@]}" 2>>"$efile" | pv -s "$dir_size" 2> >(tee -a "$LOG_FILE" >>"$efile") | eval "$comp_cmd" >"$out" ); then
           ok=1; break
         else
-          log "[${dname}] pv+progress pipeline failed (attempt $attempt)"
+          log "DOCKER|ERROR|[${dname}] pv+progress pipeline failed (attempt $attempt)"
         fi
       else
-        if ( set -o pipefail; tar cPf - -C "${SRC_DIR}" "${dname}" "${TAR_OPTIONS[@]}" "${exclude_opts[@]}" 2>>"$efile" | pv -s "$dir_size" 2>>"$efile" | eval "$comp_cmd" >"$out" ); then
+        if ( set -o pipefail; ${IO_PREFIX:+$IO_PREFIX }tar cPf - -C "${SRC_DIR}" "${dname}" "${TAR_OPTIONS[@]}" "${exclude_opts[@]}" 2>>"$efile" | pv -s "$dir_size" 2>>"$efile" | eval "$comp_cmd" >"$out" ); then
           ok=1; break
         else
-          log "[${dname}] pv pipeline failed (attempt $attempt)"
+          log "DOCKER|ERROR|[${dname}] pv pipeline failed (attempt $attempt)"
         fi
       fi
     else
-      if ( set -o pipefail; tar cPf - -C "${SRC_DIR}" "${dname}" "${TAR_OPTIONS[@]}" "${exclude_opts[@]}" 2>>"$efile" | eval "$comp_cmd" >"$out" ); then
+      if ( set -o pipefail; ${IO_PREFIX:+$IO_PREFIX }tar cPf - -C "${SRC_DIR}" "${dname}" "${TAR_OPTIONS[@]}" "${exclude_opts[@]}" 2>>"$efile" | eval "$comp_cmd" >"$out" ); then
         ok=1; break
       else
-        log "[${dname}] basic pipeline failed (attempt $attempt)"
+        log "DOCKER|ERROR|[${dname}] basic pipeline failed (attempt $attempt)"
       fi
     fi
     attempt=$((attempt+1))
     sleep "$RETRY_DELAY"
   done
-
+  # Finalize status
   if [ $ok -eq 1 ]; then
     local size_bytes size_human
     size_bytes=$(safe_size_bytes "$out")
     if [[ "$size_bytes" =~ ^[0-9]+$ ]] && [ "$size_bytes" -gt 0 ]; then
       size_human=$(bytes_to_human "$size_bytes")
-      log "[${dname}] compressed -> ${size_human} (${size_bytes} bytes)"
+      log "DOCKER|INFO|[${dname}] compressed -> ${size_human} (${size_bytes} bytes)"
     else
       size_human="0B"
-      log "[${dname}] compressed size unknown (0B)"
+      log "DOCKER|WARN|[${dname}] compressed size unknown (0B)"
     fi
     write_status "$dname" "$size_human" "$size_bytes" "$sfile"
   else
     write_status "$dname" FAILED 0 "$sfile"
-    log_error "${dname} compression failed after ${RETRIES} attempts (see ${efile})"
+    log "DOCKER|ERROR|${dname} compression failed after ${RETRIES} attempts (see ${efile})"
   fi
 }
-
+# Evaluate required & free space
 assess_space() {
   local _subtotal=0 _subtotal_unknown=0 _dest_unknown=0
   while IFS= read -r -d '' d; do
@@ -250,7 +379,7 @@ assess_space() {
       _subtotal=$((_subtotal + bytes))
       DIR_SIZES["$name"]="$bytes"
     else
-      log "WARN: size unknown for $d"
+      log "SPACE|WARN|Size unknown for $d"
       _subtotal_unknown=1
       DIR_SIZES["$name"]=0
     fi
@@ -259,60 +388,58 @@ assess_space() {
   if [ ! -d "$DEST_DIR" ]; then
     if mkdir -p "$DEST_DIR" 2>/dev/null; then
       dest_dir_was_missing=1
-      log "Created destination: $DEST_DIR"
+      log "SPACE|INFO|Created destination: $DEST_DIR"
     else
-      log_error "Cannot create destination: $DEST_DIR"
-      notify_abort "Destination directory missing" "Path: $DEST_DIR (mkdir failed)"
+      log "SPACE|ERROR|Cannot create destination: $DEST_DIR"
+      send_notify abort "Destination directory missing" "Path: $DEST_DIR (failed)"
       exit 1
     fi
   fi
-
-  dest_dir_free_bytes=$(df -B1 "$DEST_DIR" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
-  dest_dir_total_bytes=$(df -B1 "$DEST_DIR" 2>/dev/null | awk 'NR==2 {print $2}' || echo 0)
-  dest_dir_used_bytes=$(df -B1 "$DEST_DIR" 2>/dev/null | awk 'NR==2 {print $3}' || echo 0)
+# Refresh disk space information
+disk_refresh_state
   if ! [[ "$dest_dir_free_bytes" =~ ^[0-9]+$ ]]; then
-    log "WARN: free space unknown on $DEST_DIR"
+    log "SPACE|WARN|Free space unknown on $DEST_DIR"
     _dest_unknown=1
   fi
 
-  required=$((_subtotal + LOW_SPACE_MARGIN))
+  raw_uncompressed_total=$_subtotal
+  # Validate REQUIRED_RATIO numeric
+  if ! [[ "$REQUIRED_RATIO" =~ ^[0-9]*\.?[0-9]+$ ]]; then
+    log "SPACE|WARN|REQUIRED_RATIO '$REQUIRED_RATIO' invalid; falling back to 1.0"
+    REQUIRED_RATIO=1.0
+  fi
+  # Clamp ratio bounds
+  awk_ratio_clamped=$(awk -v r="$REQUIRED_RATIO" 'BEGIN{ if(r<=0) r=1; if(r>1) r=1; printf "%f", r }')
+  REQUIRED_RATIO="$awk_ratio_clamped"
+  estimated_compressed_total=$(awk -v s="$_subtotal" -v r="$REQUIRED_RATIO" 'BEGIN{printf "%d", s*r}')
+  required=$((estimated_compressed_total + LOW_SPACE_MARGIN))
   if [ $_subtotal_unknown -eq 1 ] || [ $_dest_unknown -eq 1 ]; then
-    log "Proceeding despite undetermined required or free space (local destination)"
+    log "SPACE|WARN|Proceeding despite undetermined required or free space (local destination)"
   fi
 
+  log "SPACE|INFO|Estimation: raw=$_subtotal bytes ratio=${REQUIRED_RATIO} -> estimated=${estimated_compressed_total} required=${required} (margin=${LOW_SPACE_MARGIN})"
   if [ $_dest_unknown -eq 0 ] && [ "$dest_dir_free_bytes" -lt "$required" ]; then
     case "$LOW_SPACE_ACTION" in
       abort)
         free_human=$(bytes_to_human "$dest_dir_free_bytes"); req_human=$(bytes_to_human "$required")
-        log_error "Insufficient free space (need=$required have=$dest_dir_free_bytes)"
-        notify_abort "Low disk space" "Free = ${free_human}\nRequired = ${req_human}\nAction = abort"; exit 1 ;;
+        log "SPACE|ERROR|Insufficient free space (need=$required have=$dest_dir_free_bytes)"
+        send_notify lowspace "Free = ${free_human}\nRequired = ${req_human}\nAction = abort\nPath: $DEST_DIR"; exit 1 ;;
       warn)
         free_human=$(bytes_to_human "$dest_dir_free_bytes"); req_human=$(bytes_to_human "$required")
-        low_space_note="Low space warning: Free = ${free_human} Required = ${req_human}" ;;
+        low_space_note="Low space warning: Free = ${free_human}, Required = ${req_human}" ;;
       partial)
         free_human=$(bytes_to_human "$dest_dir_free_bytes"); req_human=$(bytes_to_human "$required")
-        low_space_note="Partial mode: Free = ${free_human} Required = ${req_human}" ;;
+        low_space_note="Partial mode: Free = ${free_human}, Required = ${req_human}" ;;
       *)
-        log_error "Unknown LOW_SPACE_ACTION='$LOW_SPACE_ACTION'"; notify_abort "Unknown LOW_SPACE_ACTION" "$LOW_SPACE_ACTION"; exit 1 ;;
+        log "SPACE|ERROR|Unknown LOW_SPACE_ACTION='$LOW_SPACE_ACTION'"; send_notify lowspace "Unknown LOW_SPACE_ACTION" "$LOW_SPACE_ACTION"; exit 1 ;;
     esac
   else
     free_human=$(bytes_to_human "$dest_dir_free_bytes")
     req_human=$(bytes_to_human "$required")
-    log "Free space OK: Free = ${free_human} Required = ${req_human}"
-  fi
-
-  if [[ "$dest_dir_total_bytes" =~ ^[0-9]+$ ]] && [ "$dest_dir_total_bytes" -gt 0 ] && [[ "$dest_dir_free_bytes" =~ ^[0-9]+$ ]]; then
-    pct_free_int=$(awk -v f="$dest_dir_free_bytes" -v t="$dest_dir_total_bytes" 'BEGIN{printf "%d", (f*100)/t}')
-    if [ "$pct_free_int" -lt "$UTIL_ALERT_THRESHOLD" ]; then
-      util_alert_note="ALERT: Free space critically low (${pct_free_int}% < ${UTIL_ALERT_THRESHOLD}%)"
-      /usr/local/emhttp/webGui/scripts/notify -i "$NOTIFY_LEVEL_ON_FAILURE" -b -s "${NOTIFY_TITLE} - Low Space" -d "🔴 Critical free space" -m "$util_alert_note\nPath: $DEST_DIR" || true
-    elif [ "$pct_free_int" -lt "$UTIL_WARN_THRESHOLD" ]; then
-      util_warn_note="Warning: Free space low (${pct_free_int}% < ${UTIL_WARN_THRESHOLD}%)"
-    fi
+    log "SPACE|INFO|Free space OK: Free = ${free_human}, Required = ${req_human}"
   fi
 }
-
-# Helper: cleanup_old_artifacts - prune old backups & logs
+# Prune old backups & logs
 cleanup_old_artifacts() {
   local removed_backups=0 removed_logs=0
   if [ -d "${DEST_DIR}" ]; then
@@ -331,16 +458,18 @@ cleanup_old_artifacts() {
       lgs=("${lgs[@]:1}")
     done
   fi
-  log "Cleanup removed ${removed_backups} old backups and ${removed_logs} old logs"
+  log "CLEANUP|INFO|Cleanup removed ${removed_backups} old backups and ${removed_logs} old logs"
 }
-
-# Helper: build_space_block - assemble space/utilization summary
+# Assemble space/utilization summary
 build_space_block() {
   [[ -z "${free_human:-}" ]] && free_human=$( [[ "$dest_dir_free_bytes" =~ ^[0-9]+$ ]] && bytes_to_human "$dest_dir_free_bytes" || echo "Unknown" )
   [[ -z "${req_human:-}" ]] && req_human=$( [[ "$required" =~ ^[0-9]+$ ]] && bytes_to_human "$required" || echo "Unknown" )
-  local out="Space: Free = ${free_human} Required = ${req_human}"$'\n'
+  local out="Space: Free = ${free_human}, Required = ${req_human}"$'\n'
+  if [[ "$raw_uncompressed_total" =~ ^[0-9]+$ ]] && [[ "$estimated_compressed_total" =~ ^[0-9]+$ ]]; then
+    out+="Compression Estimation: Raw = $(bytes_to_human "$raw_uncompressed_total"), Ratio = ${REQUIRED_RATIO}, Estimated = $(bytes_to_human "$estimated_compressed_total")"$'\n'
+  fi
   if [ "$pct_free_int" -ge 0 ]; then
-    out+="Utilization: Total = $(bytes_to_human "$dest_dir_total_bytes") Used = $(bytes_to_human "$dest_dir_used_bytes") Free = $(bytes_to_human "$dest_dir_free_bytes") Free% = ${pct_free_int}%"$'\n'
+    out+="Utilization: Total = $(bytes_to_human "$dest_dir_total_bytes"), Used = $(bytes_to_human "$dest_dir_used_bytes"), Free = $(bytes_to_human "$dest_dir_free_bytes"), Free % = ${pct_free_int}%"$'\n'
   fi
   local req_pct_of_free=-1
   if [[ "$required" =~ ^[0-9]+$ ]] && [[ "$dest_dir_free_bytes" =~ ^[0-9]+$ ]] && [ "$dest_dir_free_bytes" -gt 0 ]; then
@@ -354,91 +483,81 @@ build_space_block() {
   printf '%s' "$out"
 }
 
-# =============================
-# Main Execution
-# =============================
+# == Main Execution ===
 main() {
   # Record start time and announce start
   start_time=$(date +%s)
-  log_msg="Docker $SRC_DIR_NAME backup start: $(date)"
-  log "$log_msg"
+  log "BACKUP|INFO|Scheduled $SRC_DIR_NAME backup start: $(date)"
+  # Pruning of old backups/logs
+  cleanup_old_artifacts
   assess_space
-
 # Set directory for appdata backup
   backup_dir="${DEST_DIR}/backup_${DATETIME}"
   if [ ! -d "$backup_dir" ]; then
     ensure_dir "$backup_dir" 775 "$LOG_OWNER"
   fi
-
+  # Location for transient status/error artifacts
+  STATUS_DIR="${TMP_DIR:-$backup_dir}"
 # Stop containers except those in skip list
-  log "Docker $SRC_DIR_NAME backup, stopping containers"
-
-container_ids=$(docker ps -q --no-trunc 2>/dev/null || true)
-if [[ -n "$container_ids" ]]; then
-  mapfile -t CONTAINERS < <(docker inspect --format='{{.Name}}' "$container_ids" | cut -c2- | sort)
-else
-  CONTAINERS=()
-fi
-STOP_CONTAINERS=()
-for container in "${CONTAINERS[@]}"; do
-  if is_skipped "$container"; then
-  log "Skip ${container} for backup"
+  log "DOCKER|INFO|Docker $SRC_DIR_NAME backup, stopping containers"
+# Get list of running containers and filter
+  container_ids=$(docker ps -q --no-trunc 2>/dev/null || true)
+  if [[ -n "$container_ids" ]]; then
+    mapfile -t CONTAINERS < <(docker inspect --format='{{.Name}}' "$container_ids" | cut -c2- | sort)
   else
-  log "Stopping ${container} for backup"
-    STOP_CONTAINERS+=("$container")
+    CONTAINERS=()
   fi
-done
-
+  STOP_CONTAINERS=()
+  for container in "${CONTAINERS[@]}"; do
+    if is_skipped "$container"; then
+      log "DOCKER|INFO|Skip ${container} (user skip list)"
+      continue
+    fi
+    if container_uses_src_dir "$container"; then
+      log "DOCKER|INFO|Queue stop ${container} (mount under $SRC_DIR)"
+      STOP_CONTAINERS+=("$container")
+    else
+      log "DOCKER|INFO|Skip ${container} (no mounts under $SRC_DIR)"
+    fi
+  done
+  log "DOCKER|INFO|Containers to stop: ${#STOP_CONTAINERS[@]} / ${#CONTAINERS[@]} running"
 # Stop all target containers
-if [ "${#STOP_CONTAINERS[@]}" -gt 0 ]; then
-  docker stop "${STOP_CONTAINERS[@]}" >/dev/null 2>&1 || true
-fi
-
-
-# Create tar.gz directly in backup_dir
-  log "Compressing Docker $SRC_DIR_NAME for backup"
-
-# Sanity checks before starting
-if [ ! -d "$SRC_DIR" ]; then
-  log_error "source directory does not exist: $SRC_DIR"
-  notify_abort "Source directory missing" "Path: $SRC_DIR"
-  exit 1
-fi
-child_count=$(find "$SRC_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l || true)
-  log "Found $child_count subdirectories in $SRC_DIR"
-if [ "$child_count" -eq 0 ]; then
-  log "No containers/subdirectories found in $SRC_DIR; nothing to back up"
-  exit 0
-fi
-
-while IFS= read -r -d '' file; do
-  dir_name="$(basename "$file")"
-  log "Processing directory: $dir_name"
-  if [[ -n "$TMP_DIR" ]]; then
-    err_file="${TMP_DIR}/${dir_name}.err"
-    status_file="${TMP_DIR}/${dir_name}.status"
-  else
-    err_file="${backup_dir}/${dir_name}.err"
-    status_file="${backup_dir}/${dir_name}.status"
+  if [ "${#STOP_CONTAINERS[@]}" -gt 0 ]; then
+    docker stop "${STOP_CONTAINERS[@]}" >/dev/null 2>&1 || true
   fi
-  rm -f -- "$err_file" "$status_file"
-
-  if is_skipped "$dir_name"; then
-    log "Skipping backup for $dir_name (user specified)"
-    printf "%s: SKIPPED(User specified)|0\n" "$dir_name" >"$status_file"
-    continue
+  if [ "${#STOP_CONTAINERS[@]}" -gt 0 ]; then containers_stopped=1; fi
+    log "DOCKER|INFO|Compressing Docker $SRC_DIR_NAME for backup"
+# Directories checks before starting
+  if [ ! -d "$SRC_DIR" ]; then
+    log "DOCKER|ERROR|Source directory does not exist: $SRC_DIR"
+    send_notify abort "Source directory missing" "Path: $SRC_DIR"
+    exit 1
   fi
-
-  archive_name="${dir_name}.tar.gz"
-  archive_path="${backup_dir}/${archive_name}"
-  log "Compress $file to $archive_path..."
-
-# Job concurrency control: wait when too many jobs
-while [ "$(jobs -rp | wc -l)" -ge "$PARALLEL_JOBS" ]; do
-  sleep 0.5
-done
-
-  # Per-container free-space check using precomputed size (fallback to runtime du if missing)
+  child_count=$(find "$SRC_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l || true)
+    log "DOCKER|INFO|Found $child_count subdirectories in $SRC_DIR"
+  if [ "$child_count" -eq 0 ]; then
+    log "DOCKER|WARN|No containers/subdirectories found in $SRC_DIR; nothing to back up"
+    exit 0
+  fi
+# Processing backups
+  while IFS= read -r -d '' file; do
+    dir_name="$(basename "$file")"
+    log "DOCKER|INFO|Processing directory: $dir_name"
+    err_file="${STATUS_DIR}/${dir_name}.err"
+    status_file="${STATUS_DIR}/${dir_name}.status"
+    rm -f -- "$err_file" "$status_file"
+    # Check skip list
+    if is_skipped "$dir_name"; then
+      log "DOCKER|INFO|Skipping backup for $dir_name (user specified)"
+      printf "%s: SKIPPED(User specified)|0\n" "$dir_name" >"$status_file"
+      continue
+    fi
+    archive_name="${dir_name}.tar.gz"
+    archive_path="${backup_dir}/${archive_name}"
+    log "DOCKER|INFO|Compress $file to $archive_path..."
+# Job concurrency control
+  wait_for_slot
+  # Per-container free-space check using precomputed size
   dir_size_bytes="${DIR_SIZES[$dir_name]:-0}"
   if ! [[ "$dir_size_bytes" =~ ^[0-9]+$ ]] || [ "$dir_size_bytes" -eq 0 ]; then
     dir_size_bytes=$(safe_size_bytes "${SRC_DIR}/${dir_name}")
@@ -446,250 +565,305 @@ done
   # Refresh free space only every N containers to reduce df calls
   container_index=${container_index:-0}
   if (( container_index % DF_REFRESH_INTERVAL == 0 )) || [ -z "${cached_dest_free:-}" ]; then
-    cached_dest_free=$(df -B1 "$DEST_DIR" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
+    disk_refresh_state
+    cached_dest_free="$dest_dir_free_bytes"
   fi
   dest_free_now="$cached_dest_free"
   container_index=$((container_index+1))
   if [[ "$dir_size_bytes" =~ ^[0-9]+$ ]] && [[ "$dest_free_now" =~ ^[0-9]+$ ]]; then
-    need=$((dir_size_bytes + LOW_SPACE_MARGIN))
+    need=$(awk -v s="$dir_size_bytes" -v r="$REQUIRED_RATIO" -v m="$LOW_SPACE_MARGIN" 'BEGIN{printf "%d", s*r + m}')
     if [ "$dest_free_now" -lt "$need" ]; then
       need_human=$(bytes_to_human "$need")
       avail_human=$(bytes_to_human "$dest_free_now")
-      log "Insufficient free space for ${dir_name}: need=${need_human} (${need}), available=${avail_human} (${dest_free_now}); skipping"
+      log "SPACE|WARN|Insufficient free space (ratio ${REQUIRED_RATIO}) for ${dir_name}: need=${need_human} (${need}), available=${avail_human} (${dest_free_now}); skipping"
       printf "%s: SKIPPED(Disk space low)|0\n" "$dir_name" >"$status_file"
       continue
     fi
   else
-    log "WARN: could not determine size/free-space for ${dir_name}; proceeding (may fail)"
+    log "SPACE|ERROR|could not determine size/free-space for ${dir_name}; proceeding (may fail)"
   fi
-
 # Run compress_job in background
   compress_job "$dir_name" "$archive_path" "$err_file" "$status_file" &
-done < <(find "${SRC_DIR}" -type d -maxdepth 1 -mindepth 1 -print0)
-
+  done < <(find "${SRC_DIR}" -type d -maxdepth 1 -mindepth 1 -print0)
 # Wait for background compression jobs to finish
   wait
-
-#############################################
-# Aggregate per-job status -> report + emojis
-#############################################
-backup_report=""
-shopt -s nullglob
-status_files=()
-for f in "${backup_dir}"/*.status; do [ -e "$f" ] && status_files+=("$f"); done
-if [[ -n "$TMP_DIR" ]]; then for f in "${TMP_DIR}"/*.status; do [ -e "$f" ] && status_files+=("$f"); done; fi
-
-ok_count=0 failed_count=0 skipped_count=0 total_bytes=0
-if [ ${#status_files[@]} -gt 0 ]; then
-  for sf in "${status_files[@]}"; do
+  # Post-compression integrity checks to catch silent corruption
+  shopt -s nullglob
+  for sf in "${STATUS_DIR}"/*.status; do
     [ -s "$sf" ] || continue
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      [[ "$line" =~ ^[^[:space:]]+:[[:space:]].* ]] || continue
-      name=$(printf "%s" "$line" | cut -d: -f1)
-      rest=$(printf "%s" "$line" | cut -d: -f2- | sed 's/^ //')
-      label=$(printf "%s" "$rest" | cut -d'|' -f1)
-      bytes_field=$(printf "%s" "$rest" | cut -d'|' -f2)
-      emoji=""
-      if [[ "$label" == SKIPPED* ]]; then
-        skipped_count=$((skipped_count+1))
-        emoji="🔵"
-        if [[ "$label" =~ ^SKIPPED\((.*)\)$ ]]; then
-          skip_reason="${BASH_REMATCH[1]}"
-          backup_report+="${emoji} [${name}] SKIPPED: ${skip_reason}"$'\n'
-        else
-          backup_report+="${emoji} [${name}] SKIPPED"$'\n'
-        fi
-      elif [[ "$label" == FAILED ]]; then
-        failed_count=$((failed_count+1))
-        emoji="🔴"
-        err_file="${backup_dir}/${name}.err"
-        if [[ -f "$err_file" ]]; then
-          excerpt=$(tail -n "$ERR_EXCERPT_LINES" "$err_file" | sed ':a;N;$!ba;s/\r$//')
-          backup_report+="${emoji} [${name}] FAILED"$'\n'"---- excerpt ----"$'\n'"${excerpt}"$'\n'"-----------------"$'\n'
-        else
-          backup_report+="${emoji} [${name}] FAILED (no stderr)"$'\n'
-        fi
-      else
-        ok_count=$((ok_count+1))
-        emoji="🟢"
-        size_str="$label"
-        size_str=$(sed -E 's/([0-9.]+)M$/\\1MB/; s/([0-9.]+)G$/\\1GB/; s/([0-9.]+)T$/\\1TB/; s/([0-9.]+)K$/\\1KB/' <<< "$size_str")
-        backup_report+="${emoji} [${name}] OK: ${size_str}"$'\n'
-        if [[ "$bytes_field" =~ ^[0-9]+$ ]]; then total_bytes=$((total_bytes + bytes_field)); fi
-      fi
-    done < "$sf"
+    line=$(head -n1 "$sf")
+    name=$(printf "%s" "$line" | cut -d: -f1)
+    rest=$(printf "%s" "$line" | cut -d: -f2- | sed 's/^ //')
+    label=$(printf "%s" "$rest" | cut -d'|' -f1)
+    # Skip verification for already FAILED or SKIPPED entries
+    if [[ "$label" == FAILED ]] || [[ "$label" == SKIPPED* ]]; then
+      continue
+    fi
+    archive_path="${backup_dir}/${name}.tar.gz"
+    err_file="${STATUS_DIR}/${name}.err"
+    # gzip/pigz integrity test
+    verifier="gzip -t"
+    if command -v pigz >/dev/null 2>&1; then verifier="pigz -t"; fi
+    if ! $verifier "$archive_path" >/dev/null 2>>"$err_file"; then
+      log "VERIFY|ERROR|Integrity check failed (gzip test): ${name}"
+      printf "%s: FAILED|0\n" "$name" >"$sf"
+      continue
+    fi
+    # Tar readability sanity check (list first entry)
+    if ! ( set -o pipefail; tar -tzf "$archive_path" 2>>"$err_file" | head -n 1 >/dev/null ); then
+      log "VERIFY|ERROR|Integrity check failed (tar list): ${name}"
+      printf "%s: FAILED|0\n" "$name" >"$sf"
+      continue
+    fi
   done
-  for f in "${status_files[@]}"; do rm -f -- "$f" 2>/dev/null || true; done
-fi
-shopt -u nullglob
-
-total_count=$((ok_count + failed_count + skipped_count))
-total_human=$(bytes_to_human "$total_bytes")
-backup_status=0; [[ $failed_count -gt 0 ]] && backup_status=1
-summary_header="Docker: Total ${total_count} Backups, OK ${ok_count}, FAILED ${failed_count}, SKIPPED ${skipped_count} — Size: ${total_human}"
-  log "Backup report: ${summary_header}"
-while IFS= read -r _l; do [[ -z "$_l" ]] && continue; log "$_l"; done <<< "$backup_report"
-
-if [ "$backup_status" -eq 0 ]; then
-  log "Docker $SRC_DIR_NAME backup OK, starting containers"
-else
-  log_error "Docker $SRC_DIR_NAME backup FAILED"
-fi
-
+  shopt -u nullglob
+# == Aggregate per-job status -> report ===
+  backup_report=""
+  shopt -s nullglob
+  status_files=()
+  for f in "${STATUS_DIR}"/*.status; do [ -e "$f" ] && status_files+=("$f"); done
+# Initialize counts
+  ok_count=0 failed_count=0 skipped_count=0 total_bytes=0
+  if [ ${#status_files[@]} -gt 0 ]; then
+    for sf in "${status_files[@]}"; do
+      [ -s "$sf" ] || continue
+      while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        [[ "$line" =~ ^[^[:space:]]+:[[:space:]].* ]] || continue
+        name=$(printf "%s" "$line" | cut -d: -f1)
+        rest=$(printf "%s" "$line" | cut -d: -f2- | sed 's/^ //')
+        label=$(printf "%s" "$rest" | cut -d'|' -f1)
+        bytes_field=$(printf "%s" "$rest" | cut -d'|' -f2)
+        emoji=""
+        if [[ "$label" == SKIPPED* ]]; then
+          skipped_count=$((skipped_count+1))
+          emoji="🔵"
+          if [[ "$label" =~ ^SKIPPED\((.*)\)$ ]]; then
+            skip_reason="${BASH_REMATCH[1]}"
+            backup_report+="${emoji} [${name}] SKIPPED: ${skip_reason}"$'\n'
+          else
+            backup_report+="${emoji} [${name}] SKIPPED"$'\n'
+          fi
+        elif [[ "$label" == FAILED ]]; then
+          failed_count=$((failed_count+1))
+          emoji="🔴"
+          err_file="${STATUS_DIR}/${name}.err"
+          if [[ -f "$err_file" ]]; then
+            excerpt=$(tail -n "$ERR_EXCERPT_LINES" "$err_file" | sed ':a;N;$!ba;s/\r$//')
+            backup_report+="${emoji} [${name}] FAILED"$'\n'"---- excerpt ----"$'\n'"${excerpt}"$'\n'"-----------------"$'\n'
+          else
+            backup_report+="${emoji} [${name}] FAILED (no stderr)"$'\n'
+          fi
+        else
+          ok_count=$((ok_count+1))
+          emoji="🟢"
+          size_str="$label"
+          size_str=$(sed -E 's/([0-9.]+)M$/\\1MB/; s/([0-9.]+)G$/\\1GB/; s/([0-9.]+)T$/\\1TB/; s/([0-9.]+)K$/\\1KB/' <<< "$size_str")
+          backup_report+="${emoji} [${name}] OK: ${size_str}"$'\n'
+          if [[ "$bytes_field" =~ ^[0-9]+$ ]]; then total_bytes=$((total_bytes + bytes_field)); fi
+        fi
+      done < "$sf"
+    done
+    for f in "${status_files[@]}"; do rm -f -- "$f" 2>/dev/null || true; done
+  fi
+  shopt -u nullglob
+# Summarize results
+  total_count=$((ok_count + failed_count + skipped_count))
+  total_human=$(bytes_to_human "$total_bytes")
+  summary_header="Docker: Total ${total_count}, OK ${ok_count}, FAILED ${failed_count}, SKIPPED ${skipped_count} — Size: ${total_human}"
+    log "DOCKER|INFO|Backup report: ${summary_header}"
+  while IFS= read -r _l; do 
+    [[ -z "$_l" ]] && continue
+    if [[ "$_l" =~ FAILED ]]; then
+      log "DOCKER|ERROR|$_l"
+    elif [[ "$_l" =~ SKIPPED ]]; then
+      log "DOCKER|WARN|$_l"
+    else
+      log "DOCKER|INFO|$_l"
+    fi
+  done <<< "$backup_report"
+# Start containers again
+  if [ "$failed_count" -eq 0 ]; then
+    log "DOCKER|INFO|Docker $SRC_DIR_NAME backup OK, restarting containers"
+  else
+    log "DOCKER|ERROR|Docker $SRC_DIR_NAME backup FAILED"
+  fi
 # Start containers in batch then verify
 if [ "${#STOP_CONTAINERS[@]}" -gt 0 ]; then
   docker start "${STOP_CONTAINERS[@]}" >/dev/null 2>&1 || true
   for container in "${STOP_CONTAINERS[@]}"; do
     running=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || echo false)
     if [[ "$running" != "true" ]]; then
-      log_msg="Start container fail: ${container}"
-      log_error "$log_msg"
+      log "DOCKER|ERROR|Start container fail: ${container}"
     else
-      log_msg="Started ${container}"
-  log "$log_msg"
+      log "DOCKER|INFO|Started ${container}"
     fi
   done
 fi
+  containers_restarted=1
+  log "DOCKER|INFO|Docker backup files are in $backup_dir"
 
-  # Consolidated cleanup of old backups and logs
-  log_msg="Docker backup files are in $backup_dir"
-  log "$log_msg"
-  cleanup_old_artifacts
-
-# Record end time and log runtime
-  runtime=$(($(date +%s) - start_time))
-  runtime_converted=$(printf '%dh:%dm:%ds' $((runtime / 3600)) $((runtime % 3600 / 60)) $((runtime % 60)))
-  log_msg="Docker $SRC_DIR_NAME backup end == Runtime: ${runtime_converted}"
-  log "$log_msg"
-if [ $backup_status -eq 0 ]; then
-  notify_level="$NOTIFY_LEVEL_ON_SUCCESS"
-  notify_short="Docker $SRC_DIR_NAME backup OK!"
-else
-  notify_level="$NOTIFY_LEVEL_ON_FAILURE"
-  notify_short="Docker $SRC_DIR_NAME backup FAILED!"
-fi
-
-if [ "${backup_status:-0}" -eq 0 ]; then status_text="OK"; else status_text="FAILED"; fi
-counts="(${ok_count}/${total_count})"
-notify_subject="${NOTIFY_TITLE} - ${status_text} ${counts}"
-notify_short="Docker $SRC_DIR_NAME backup ${status_text}!"
-
-  final_body="Runtime: ${runtime_converted}"$'\n\n'
-
-#############################################
-# Additional Shares Backup Rsync Phase
-#############################################
-additional_lines=""
-additional_ok=0
-additional_fail=0
-additional_total=0
-if [ ${#ADD_NAMES[@]} -gt 0 ]; then
-  for idx in "${!ADD_NAMES[@]}"; do
-    name="${ADD_NAMES[$idx]}"
-    src="${ADD_SRCS[$idx]}"
-    dest="${ADD_DESTS[$idx]}"
-    excl_raw="${ADD_EXCLUDES[$idx]}"
-    additional_total=$((additional_total+1))
-    if [ ! -d "$src" ]; then
-      log "[share:$name] source missing: $src (skipping)"
-      additional_lines+="🔵 $name: SKIPPED (missing source)"$'\n'
-      continue
-    fi
-    if [ ! -d "$dest" ]; then
-      if ensure_dir "$dest" 775 "$LOG_OWNER"; then
-        log "[share:$name] created destination: $dest"
-      else
-        log "[share:$name] cannot create destination: $dest"
-        additional_lines+="🔴 $name: FAILED (dest create)"$'\n'
-        additional_fail=$((additional_fail+1))
+# == Shares Backup Rsync ===
+  additional_lines=""
+  additional_ok=0
+  additional_fail=0
+  additional_skip=0
+  additional_total=0
+  shares_total_bytes=0
+# Rsync shares backup
+  log "SHARES|INFO|Starting Shares backup phase with ${#ADD_SHARES[@]} shares defined"
+  if [ ${#ADD_SHARES[@]} -gt 0 ]; then
+    for desc in "${ADD_SHARES[@]}"; do
+      share_name=""; share_src=""; share_dest=""; share_excludes=""; share_excludes_file=""
+      for kv in $desc; do
+        key="${kv%%=*}"; val="${kv#*=}"
+        case "$key" in
+          name) share_name="$val";;
+          src) share_src="$val";;
+          dest) share_dest="$val";;
+          excludes) share_excludes="$val";;
+          excludes_file) share_excludes_file="$val";;
+        esac
+      done
+      [ -z "$share_name" ] && share_name="share_$additional_total"
+      additional_total=$((additional_total+1))
+      if [ ! -d "$share_src" ]; then
+        log "SHARES|WARN|[share: $share_name] source missing: $share_src (skipping)"
+        additional_lines+="🔵 $share_name: SKIPPED (missing source)"$'\n'
+        additional_skip=$((additional_skip+1))
         continue
       fi
-    fi
-    tmp_rsync_log=$(mktemp /tmp/add_rsync_"${name}".XXXXXX)
-    rsync_excludes=()
-    if [ -n "$excl_raw" ]; then
-      # Split on spaces; expansion already handled when reading config
-      for pat in $excl_raw; do
-        rsync_excludes+=("--exclude=$pat")
+      if [ ! -d "$share_dest" ]; then
+        if ensure_dir "$share_dest" 775 "$LOG_OWNER"; then
+          log "SHARES|INFO|[share: $share_name] created destination: $share_dest"
+        else
+          log "SHARES|ERROR|[share: $share_name] cannot create destination: $share_dest"
+          additional_lines+="🔴 $share_name: FAILED (dest create)"$'\n'
+          additional_fail=$((additional_fail+1))
+          continue
+        fi
+      fi
+      tmp_rsync_log=$(mktemp /tmp/add_rsync_"${share_name}".XXXXXX)
+      rsync_excludes=()
+      if [ -n "$share_excludes" ]; then
+        IFS=', ' read -r -a _exarr <<< "$share_excludes"
+        for pat in "${_exarr[@]}"; do [ -n "$pat" ] && rsync_excludes+=("--exclude=$pat"); done
+      fi
+      if [ -n "$share_excludes_file" ]; then
+        if [ -f "$share_excludes_file" ]; then
+          rsync_excludes+=("--exclude-from=$share_excludes_file")
+          log "SHARES|INFO|[share: $share_name] using excludes_file: $share_excludes_file"
+        else
+          log "SHARES|WARN|[share: $share_name] excludes_file missing: $share_excludes_file (ignored)"
+        fi
+      fi
+      rsync_cmd=(rsync "${ADD_RSYNC_BASE_ARGS[@]}" "${rsync_excludes[@]}" "$share_src/" "$share_dest/")
+      RSYNC_IO_PREFIX=""
+      if [ "$ADD_USE_IONICE" = true ]; then
+        if command -v ionice >/dev/null 2>&1; then
+          RSYNC_IO_PREFIX="ionice -c${RSYNC_IONICE_CLASS} -n${RSYNC_IONICE_PRIO} nice -n ${RSYNC_NICE}"
+        else
+          RSYNC_IO_PREFIX="nice -n ${RSYNC_NICE}"
+        fi
+      fi
+      if [ -n "$RSYNC_IO_PREFIX" ]; then
+        rsync_cmd=(bash -c "$RSYNC_IO_PREFIX $(printf '%q ' rsync) $(printf '%q ' "${ADD_RSYNC_BASE_ARGS[@]}") $(printf '%q ' "${rsync_excludes[@]}") $(printf '%q' "$share_src/") $(printf '%q' "$share_dest/")")
+      fi
+      log "SHARES|INFO|[share: $share_name] Running (io_prefix='${RSYNC_IO_PREFIX:-none}'): $(printf '%q ' "${rsync_cmd[@]}")"
+      set +e
+      set -o pipefail
+      "${rsync_cmd[@]}" 2>&1 | tee "$tmp_rsync_log" | while IFS= read -r line; do
+        [ -n "$line" ] && log "SHARES|INFO|[rsync: $share_name] $line"
       done
-    fi
-    rsync_cmd=(rsync "${ADD_RSYNC_BASE_ARGS[@]}" "${rsync_excludes[@]}" "$src/" "$dest/")
-    if [ "$ADD_USE_IONICE" = true ] && command -v ionice >/dev/null 2>&1; then
-      rsync_cmd=(ionice -c2 -n7 nice -n 10 "${rsync_cmd[@]}")
-    fi
-    log "[share:$name] Running: $(printf '%q ' "${rsync_cmd[@]}")"
-    set +e
-    ("${rsync_cmd[@]}" 2>&1 | tee "$tmp_rsync_log") >> "$LOG_FILE" 2>&1
-    rstat=${PIPESTATUS[0]}
-    set -e
-    if [ "$rstat" -ne 0 ]; then
-      # Map rsync code to brief description
-      case $rstat in
-        23) rdesc="Partial transfer";;
-        24) rdesc="Source vanished";;
-        10) rdesc="Socket I/O";;
-        11) rdesc="File I/O";;
-        12) rdesc="Protocol stream";;
-        30) rdesc="Timeout";;
-        *) rdesc="Exit $rstat";;
-      esac
-      additional_lines+="🔴 $name: FAILED ($rdesc)"$'\n'
-      additional_fail=$((additional_fail+1))
-      log "[share:$name] rsync failed code=$rstat desc=$rdesc (see $tmp_rsync_log)"
-      continue
-    fi
-    declare -A RSYNC_PATTERNS=(
-      ["Total transferred file size"]="total_tx_bytes"
-      ["Number of regular files transferred"]="files_tx"
-      ["Number of deleted files"]="del_count"
-      ["Total bytes sent"]="bytes_sent"
-    )
-    total_tx_bytes=0 files_tx=0 del_count=0 bytes_sent=0
-    for pat in "${!RSYNC_PATTERNS[@]}"; do
-      raw=$(grep -i "$pat" "$tmp_rsync_log" | tail -n1 | sed -E 's/^[^:]*:[[:space:]]*([0-9,]+).*/\1/' | tr -d ',' || echo 0)
-      [[ "$raw" =~ ^[0-9]+$ ]] || raw=0
-      var_name="${RSYNC_PATTERNS[$pat]}"
-      printf -v "$var_name" '%s' "$raw"
+      rstat=${PIPESTATUS[0]}
+      set -e
+      if [ "$rstat" -ne 0 ]; then
+        case $rstat in
+          23) rdesc="Partial transfer";;
+          24) rdesc="Source vanished";;
+          10) rdesc="Socket I/O";;
+          11) rdesc="File I/O";;
+          12) rdesc="Protocol stream";;
+          30) rdesc="Timeout";;
+          *) rdesc="Exit $rstat";;
+        esac
+        additional_lines+="🔴 $share_name: FAILED ($rdesc)"$'\n'
+        additional_fail=$((additional_fail+1))
+        log "SHARES|ERROR|[share: $share_name] rsync failed code=$rstat desc=$rdesc (see $tmp_rsync_log)"
+        continue
+      fi
+      declare -A RSYNC_PATTERNS=(
+        ["Total transferred file size"]=total_tx_bytes
+        ["Number of regular files transferred"]=files_tx
+        ["Number of deleted files"]=del_count
+        ["Total bytes sent"]=bytes_sent
+      )
+      total_tx_bytes=0 files_tx=0 del_count=0 bytes_sent=0
+      for pat in "${!RSYNC_PATTERNS[@]}"; do
+        raw=$(grep -i "$pat" "$tmp_rsync_log" | tail -n1 | sed -E 's/^[^:]*:[[:space:]]*([0-9,]+).*/\1/' | tr -d ',' || echo 0)
+        [[ "$raw" =~ ^[0-9]+$ ]] || raw=0
+        var_name="${RSYNC_PATTERNS[$pat]}"
+        printf -v "$var_name" '%s' "$raw"
+      done
+      shares_total_bytes=$((shares_total_bytes + total_tx_bytes))
+      human_tx=$(bytes_to_human "${total_tx_bytes:-0}")
+      human_sent=$(bytes_to_human "${bytes_sent:-0}")
+      additional_lines+="🟢 $share_name: transferred ${human_tx}, files ${files_tx}, deleted ${del_count}, sent ${human_sent}"$'\n'
+      additional_ok=$((additional_ok+1))
+      rm -f "$tmp_rsync_log" 2>/dev/null || true
     done
-    human_tx=$(bytes_to_human "${total_tx_bytes:-0}")
-    human_sent=$(bytes_to_human "${bytes_sent:-0}")
-    additional_lines+="🟢 $name: transferred ${human_tx}, files ${files_tx}, deleted ${del_count}, sent ${human_sent}"$'\n'
-    additional_ok=$((additional_ok+1))
-    rm -f "$tmp_rsync_log" 2>/dev/null || true
-  done
-fi
-
+  fi
+# Record runtime AFTER both Docker compression and Shares rsync phases
+  full_runtime_secs=$(($(date +%s) - start_time))
+  full_runtime_hms=$(format_duration "$full_runtime_secs")
+  log "BACKUP|INFO|Scheduled backup end runtime: ${full_runtime_hms}"
+# Build notification body
+  final_body="Runtime: ${full_runtime_hms}"$'\n\n'
+  final_body+="${summary_header}"$'\n'"${backup_report}"$'\n'
   if [ ${additional_total} -gt 0 ]; then
-    final_body+="${ADD_SECTION_HEADER}: Total ${additional_total} OK ${additional_ok} FAILED ${additional_fail}"$'\n'
+    shares_total_human=$(bytes_to_human "${shares_total_bytes:-0}")
+    shares_summary_header="Shares: Total ${additional_total}, OK ${additional_ok}, FAILED ${additional_fail}, SKIPPED ${additional_skip} — Size: ${shares_total_human}"
+    final_body+="${shares_summary_header}"$'\n'
     final_body+="${additional_lines}"$'\n'
   fi
-  final_body+="${summary_header}"$'\n'"${backup_report}"$'\n'
   final_body+=$(build_space_block)
-
-# Send notify with emoji-prefixed title and short message
-  /usr/local/emhttp/webGui/scripts/notify -i "$notify_level" -b -s "$notify_subject" \
-    -d "$notify_short" -m "$final_body"
-  notify_exit=$?
-  if [ $notify_exit -ne 0 ]; then
-    log_error "Notification command failed with exit code $notify_exit"
+# Compute combined counts (Docker + Shares) and overall status
+  docker_counts="${ok_count}/${total_count}"
+  if [ ${additional_total} -gt 0 ]; then
+    shares_counts="${additional_ok}/${additional_total}"
+    counts="D ${docker_counts}; S ${shares_counts}"
+  else
+    counts="D ${docker_counts}"
   fi
-
+# Compute overall status for both Docker and Shares failures
+  if [ "$failed_count" -eq 0 ] && [ "${additional_fail:-0}" -eq 0 ]; then
+    status_text="OK"
+  else
+    if [ "$failed_count" -gt 0 ] && [ "${additional_fail:-0}" -gt 0 ]; then
+      status_text="FAILED (Docker & Shares)"
+    elif [ "$failed_count" -gt 0 ]; then
+      status_text="FAILED (Docker)"
+    else
+      status_text="FAILED (Shares)"
+    fi
+  fi
+# Send consolidated final notification
+  if [ "$aborted" -eq 0 ]; then
+    send_notify final "$failed_count" "${additional_fail:-0}" "$docker_counts" "${shares_counts:-}" "$final_body"
+  fi
 # Remove backup_dir if failed and KEEP_PARTIAL is false, otherwise keep as before
-  if [ $backup_status -ne 0 ]; then
+  if [ "$failed_count" -gt 0 ]; then
     if [ "${KEEP_PARTIAL}" != "true" ]; then
       rm -r "$backup_dir"
     else
-      log "Keeping partial backup artifacts in $backup_dir for inspection"
+      log "DOCKER|INFO|Keeping partial backup artifacts in $backup_dir for inspection"
     fi
   fi
-
-# Cleanup temporary .err files if requested and run was successful
+# Cleanup temporary .err files
   if [ "$KEEP_TEMP_ERR" != "true" ]; then
     find "${backup_dir}" -type f -name '*.err' -delete 2>/dev/null || true
   fi
   exit 0
 }
-
 # Main Entry Point
 main "$@"
