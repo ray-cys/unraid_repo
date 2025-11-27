@@ -448,7 +448,7 @@ parse_rsync_stats() {
   local total_bytes_sent_raw=""
   local num_files_transferred="0"
   local deletes_count="0"
-  read -r total_file_size_raw total_transferred_raw total_bytes_sent_raw num_files_transferred deletes_count < <(
+  IFS=$'\t' read -r total_file_size_raw total_transferred_raw total_bytes_sent_raw num_files_transferred deletes_count < <(
     awk '
       BEGIN{tfs=""; ttx=""; tbs=""; nft="0"; del=0;}
       /Total file size/ { sub(/^.*:[[:space:]]*/,"",$0); tfs=$0; next }
