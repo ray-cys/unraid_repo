@@ -1,5 +1,4 @@
 #!/bin/bash
-set -euo pipefail
 LOCKFILE="/tmp/plex_dbrepair.lock"
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
@@ -12,12 +11,9 @@ fi
 # Automates running the Plex DBRepair script inside specified Plex Docker containers.
 ################################################################################
 
-# Plex container names (mutliple instances)
-CONTAINERS=("plex-media-server" "plex-media")
-# Path (inside the container) for DBRepair
-REPAIR_PATHS=("/config/PlexDBRepair/DBRepair.sh")
-# Arguments to pass to DBRepair script to run non-interactively. 
-DBREPAIR_ARGS=("stop" "auto" "start" "exit")
+CONTAINERS=("plex-media-server" "plex-media")         # Plex container names here (multiple instances)
+REPAIR_PATHS=("/config/PlexDBRepair/DBRepair.sh")     # Common path for Plex DBRepair script inside container
+DBREPAIR_ARGS=("stop" "auto" "start" "exit")          # DBRepair non-interactive run: ("stop" "auto" "start" "exit")
 
 ################################################################################
 
