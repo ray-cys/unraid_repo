@@ -728,21 +728,31 @@ run_parallel_backups() {
     done
     local tmpf
     tmpf=$(mktemp /tmp/remote_backup_result.XXXXXX)
-    (
+        (
       preflight_stderr=""
       if ! preflight_stderr=$(ssh_run "mkdir -p '$dest' && test -d '$dest'" 2>&1 >/dev/null); then
         local p_reason
         p_reason=$(classify_ssh_error "$preflight_stderr")
         log "Preflight SSH/path check failed for $lbl dest $dest (${p_reason})"
-        printf 'label=%s\nexit=%s\nssh_fail=%s\nssh_reason=%s\n' \
-               "$lbl" "255" "1" "$p_reason" >"$tmpf"
+       printf 'label=%s\nexit=%s\nssh_fail=%s\nssh_reason=%s\n' \
+         "$lbl" "255" "1" "$p_reason" >"$tmpf"
+       printf 'total_bytes=%s\ntransferred_bytes=%s\nfiles=%s\ndeletes=%s\nbytes_sent=%s\nraw_failed=%s\n' \
+         "0" "0" "0" "0" "0" "" >>"$tmpf"
       else
         rsync_label "$lbl" "$src" "$dest" "$extra_excl" "$bwl"
         local rc=${rsync_results[$lbl]:-${DEFAULT_FAIL_CODE:-50}}
         local ssh_f=${rsync_ssh_fail[$lbl]:-0}
         local ssh_r=${rsync_ssh_fail_reason[$lbl]:-}
-        printf 'label=%s\nexit=%s\nssh_fail=%s\nssh_reason=%s\n' \
-               "$lbl" "$rc" "$ssh_f" "$ssh_r" >"$tmpf"
+       local tb=${rsync_total_bytes[$lbl]:-0}
+       local tr=${rsync_transferred_bytes[$lbl]:-0}
+       local nf=${rsync_files[$lbl]:-0}
+       local del=${rsync_deletes[$lbl]:-0}
+       local bs=${rsync_bytes_sent[$lbl]:-0}
+       local rawf=${rsync_raw_failed[$lbl]:-}
+       printf 'label=%s\nexit=%s\nssh_fail=%s\nssh_reason=%s\n' \
+         "$lbl" "$rc" "$ssh_f" "$ssh_r" >"$tmpf"
+       printf 'total_bytes=%s\ntransferred_bytes=%s\nfiles=%s\ndeletes=%s\nbytes_sent=%s\nraw_failed=%s\n' \
+         "$tb" "$tr" "$nf" "$del" "$bs" "$rawf" >>"$tmpf"
       fi
     ) &
     local pid=$!
@@ -756,14 +766,20 @@ run_parallel_backups() {
     local tf
     tf=${pid_to_tmp[$pid]:-}
     if [ -n "$tf" ] && [ -f "$tf" ]; then
-      local _label _exit _ssh_fail _ssh_reason
-      _label=""; _exit=""; _ssh_fail="0"; _ssh_reason=""
+      local _label _exit _ssh_fail _ssh_reason _total _trans _files _deletes _sent _rawf
+      _label=""; _exit=""; _ssh_fail="0"; _ssh_reason=""; _total="0"; _trans="0"; _files="0"; _deletes="0"; _sent="0"; _rawf=""
       while IFS='=' read -r k v; do
         case "$k" in
           label) _label="$v" ;;
           exit) _exit="$v" ;;
           ssh_fail) _ssh_fail="$v" ;;
           ssh_reason) _ssh_reason="$v" ;;
+          total_bytes) _total="$v" ;;
+          transferred_bytes) _trans="$v" ;;
+          files) _files="$v" ;;
+          deletes) _deletes="$v" ;;
+          bytes_sent) _sent="$v" ;;
+          raw_failed) _rawf="$v" ;;
         esac
       done <"$tf"
       if [ -n "$_label" ]; then
@@ -773,6 +789,14 @@ run_parallel_backups() {
         fi
         rsync_ssh_fail["$_label"]="${_ssh_fail:-0}"
         rsync_ssh_fail_reason["$_label"]="${_ssh_reason:-}"
+        rsync_total_bytes["$_label"]="${_total:-0}"
+        rsync_transferred_bytes["$_label"]="${_trans:-0}"
+        rsync_files["$_label"]="${_files:-0}"
+        rsync_deletes["$_label"]="${_deletes:-0}"
+        rsync_bytes_sent["$_label"]="${_sent:-0}"
+        if [ -n "$_rawf" ]; then
+          rsync_raw_failed["$_label"]="$_rawf"
+        fi
       fi
       rm -f "$tf" 2>/dev/null || true
     fi
