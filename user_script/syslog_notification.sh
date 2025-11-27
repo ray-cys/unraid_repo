@@ -36,11 +36,9 @@ LAST_ERROR_LINE_FILE="/tmp/syslog-notify-last-error-line-number.log"
 # Ignore these phrases (no more than 4 wildcards per line)
 IGNORE_LINES=(
   'kernel: CIFS: VFS: \\*\* error -9 on ioctl to get interface list'        # Unsolvable message from UD plugin
-  'sshd*: Read error from remote host * port *: Connection reset by peer'   # Interrupted ssh connection
-  'sshd*: Read error from remote host * port *: Connection timed out'       # Interrupted ssh connection
-  'sshd*: Read error from remote host * port *: No route to host'           # Interrupted ssh connection
-  'nginx*: /usr/local/emhttp/webGui/javascript/ace/mode-log.js'             # Ngnix false positive
-  'smbd*: sys_path_to_bdev() failed for path'                               # Unsolvable message from SMB plugin
+  'sshd*: Read error from remote host * port *: *'                          # Interrupted ssh connection
+  'nginx*: /ace/mode-log.js failed * while sending to client'               # Ngnix false positive
+  'smbd*: sys_path_to_bdev() failed for path [*]!'                          # Unsolvable message from SMB plugin
 )
 
 ################################################################################
