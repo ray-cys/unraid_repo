@@ -151,7 +151,7 @@ send_notify() {
       else
         counts="D ${docker_counts}"
       fi
-      desc="Docker Appdata & Shares - ${status_text} ${counts}"
+      desc="Docker & Shares - ${status_text} ${counts}"
       /usr/local/emhttp/webGui/scripts/notify -i "$level" -b -s "$subj" -d "$desc" -m "$body" || true
       ;;
     abort)
@@ -404,7 +404,7 @@ build_space_block() {
     out+="Compression Estimation: Raw = $(bytes_to_human "$raw_uncompressed_total"), Ratio = ${REQUIRED_RATIO}, Estimated = $(bytes_to_human "$estimated_compressed_total")"$'\n'
   fi
   if [ "$pct_free_int" -ge 0 ]; then
-    out+="Utilization: Total = $(bytes_to_human "$dest_dir_total_bytes"), Used = $(bytes_to_human "$dest_dir_used_bytes"), Free = $(bytes_to_human "$dest_dir_free_bytes"), Free % = ${pct_free_int}%"$'\n'
+    out+="Utilization: Total = $(bytes_to_human "$dest_dir_total_bytes"), Used = $(bytes_to_human "$dest_dir_used_bytes"), Free = $(bytes_to_human "$dest_dir_free_bytes"), Free% = ${pct_free_int}%"$'\n'
   fi
   local req_pct_of_free=-1
   if [[ "$required" =~ ^[0-9]+$ ]] && [[ "$dest_dir_free_bytes" =~ ^[0-9]+$ ]] && [ "$dest_dir_free_bytes" -gt 0 ]; then
