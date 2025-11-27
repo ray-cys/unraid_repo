@@ -25,7 +25,7 @@ MIN_NOTIFY_INTERVAL=60   # seconds between identical grouped notifications
 IGNORE_REGEX=(
   '^.*kernel: CIFS: VFS: .* error -9 on ioctl to get interface list$'
   '^.*sshd[^:]*: Read error from remote host .* port .*: .*$'
-  '^.*nginx[^:]*: /ace/mode-log\.js failed .* while sending to client$'
+  '^.*nginx[^:]*: */ace/mode-log\.js failed .* while sending to client$'
   '^.*smbd[^:]*: sys_path_to_bdev\(\) failed for path \[.*\]!$'
 )
 
