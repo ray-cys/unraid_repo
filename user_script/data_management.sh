@@ -15,7 +15,7 @@ SRC_DIR="/mnt/user/secure/torrent"    # Source directory to process
 DEST_DIR="/mnt/user/secure"           # Destination base directory for processed data
 CHMOD_DIR=0775                        # Directory permissions
 CHMOD_FILE=0775                       # File permissions
-OWN_USER="nobody"                    # Owner user for files and directories
+OWN_USER="nobody"                     # Owner user for files and directories
 # ---------------- Arrays (patterns / filters / subdirectories) ----------------
 RENAME_PATTERNS=("hhd800.com@" "gg5.co@" "-C_GG5" "ch" "uncensored")
 UNWANTED_EXTS=("url" "html" "mht" "gif" "txt" "rar" "apk" "jpg")
