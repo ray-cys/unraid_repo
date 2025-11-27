@@ -1,5 +1,4 @@
 #!/bin/bash
-set -euo pipefail
 LOCKFILE="/tmp/data_management.lock"
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
@@ -8,65 +7,140 @@ if ! flock -n 9; then
 fi
 ################################################################################
 # ---------------- Configuration ----------------
-# Data Management Script Configuration
+# Data Management Settings
 ################################################################################
 
+# ---------------- General Settings ----------------
 SRC_DIR="/mnt/user/secure/torrent"    # Source directory to process
 DEST_DIR="/mnt/user/secure"           # Destination base directory for processed data
-OWN_USER="nobody"                     # Owner user for files and directories
 CHMOD_DIR=0775                        # Directory permissions
 CHMOD_FILE=0775                       # File permissions
-RENAME_PATTERNS=(                     # Patterns to remove from filenames
-  "hhd800.com@"
-  "gg5.co@"
-  "-C_GG5"
-  "ch"
-  "uncensored"
+OWN_USER="nobody"                    # Owner user for files and directories
+# ---------------- Arrays (patterns / filters / subdirectories) ----------------
+RENAME_PATTERNS=("hhd800.com@" "gg5.co@" "-C_GG5" "ch" "uncensored")
+UNWANTED_EXTS=("url" "html" "mht" "gif" "txt" "rar" "apk" "jpg")
+UNWANTED_NAMES=("18+游戏大全(996gg.cc)-七龍珠H版-三國志H版-三國群淫傳等.mp4")
+PRIVATE_SUBDIRS=(
+  "Ai.Kano.叶爱" "Aika.Yumeno.夢乃あいか" "Akari.Niimura.新村あかり" "Ena.Satsuki.沙月恵奈"
+  "Karen.Yuzuriha.楪カレン" "Sora.Amakawa.天川そら" "Sui.Twinkle.月野江すい" "Yui.Tenma.天馬ゆい"
 )
-UNWANTED_EXTS=(                       # Extensions of files to remove under "$SRC_DIR/complete"
-  "url" "html" "mht" "gif" "txt" "rar" "apk" "jpg"
-)
-UNWANTED_NAMES=(                     # Exact file names to remove under "$SRC_DIR/complete" (match by -name)
-  "18+游戏大全(996gg.cc)-七龍珠H版-三國志H版-三國群淫傳等.mp4"
-)
-PRIVATE_SUBDIRS=(                    # List of subdirectories under source to move separately
-  "Ai.Kano.叶爱"
-  "Aika.Yumeno.夢乃あいか"
-  "Akari.Niimura.新村あかり"
-  "Ena.Satsuki.沙月恵奈"
-  "Karen.Yuzuriha.楪カレン"
-  "Sora.Amakawa.天川そら"
-  "Sui.Twinkle.月野江すい"
-  "Yui.Tenma.天馬ゆい"
-)
-
 ################################################################################
 
-# Unified logging function (replaces log_info, log_warn, log_err)
+# ---------------- Script Helpers Functions ----------------
+# Dynamic logging
 log() {
-  local level="$1"; shift || true
-  local ts msg
-  ts=$(date '+%Y-%m-%d %H:%M:%S')
-  msg="$*"
+  local level="${1:-info}"; shift || true
+  local ts msg min="${LOG_MIN_LEVEL:-debug}"; ts=$(date '+%Y-%m-%d %H:%M:%S'); msg="$*"
+  # Rank levels for filtering
+  local rank_level rank_min
   case "$level" in
-    info|INFO)   printf '%s %s\n' "$ts" "$msg" ;;
-    warn|WARNING|WARN)  printf '%s WARN: %s\n' "$ts" "$msg" ;;
-    err|error|ERROR)    printf '%s ERROR: %s\n' "$ts" "$msg" >&2 ;;
-    *)          printf '%s %s\n' "$ts" "$level $msg" ;;
+    debug) rank_level=10 ;;
+    info)  rank_level=20 ;;
+    warn|warning) rank_level=30 ; level=warn ;;
+    err|error) rank_level=40 ; level=error ;;
+    crit|critical) rank_level=50 ; level=crit ;;
+    *) rank_level=20 ; level=info ;;
   esac
+  case "$min" in
+    debug) rank_min=10 ;;
+    info)  rank_min=20 ;;
+    warn|warning) rank_min=30 ;;
+    err|error) rank_min=40 ;;
+    crit|critical) rank_min=50 ;;
+    *) rank_min=10 ;;
+  esac
+  [ "$rank_level" -lt "$rank_min" ] && return 0
+  if [ "$level" = debug ]; then
+    printf '%s DEBUG: %s\n' "$ts" "$msg"
+  elif [ "$level" = info ]; then
+    printf '%s %s\n' "$ts" "$msg"
+  elif [ "$level" = warn ]; then
+    printf '%s WARN: %s\n' "$ts" "$msg" >&2
+  elif [ "$level" = error ]; then
+    printf '%s ERROR: %s\n' "$ts" "$msg" >&2
+  elif [ "$level" = crit ]; then
+    printf '%s CRIT: %s\n' "$ts" "$msg" >&2
+  else
+    printf '%s %s %s\n' "$ts" "$level" "$msg"
+  fi
 }
-
-# Backward compatible wrappers (can be removed after migration)
-log_info() { log info "$*"; }
-log_warn() { log warn "$*"; }
-log_err()  { log error "$*"; }
-
-# Warn if not running as root
-if [ "$(id -u)" -ne 0 ]; then
-  log_warn "This script is not running as root (uid=$(id -u)). Chown operations may fail unless you run as root or adjust permissions."
-fi
-
-# Helper run rsync with timestamp
+# Elapsed seconds since start timestamp
+elapsed() {
+  local start="$1"
+  echo $(( $(date +%s) - start ))
+}
+# Format runtime from elapsed seconds
+format_runtime() {
+  local secs="$1"
+  printf '%dh %dm %ds' $((secs/3600)) $(((secs%3600)/60)) $((secs%60))
+}
+# Script finish handler
+finish() {
+  local code=${1:-0}
+  shift || true
+  local msg="$*"
+  local rt_secs rt
+  rt_secs=$(elapsed "$START_TS")
+  rt=$(format_runtime "$rt_secs")
+  log info "$msg (Runtime: $rt)"
+  exit "$code"
+}
+# Generic has_files with optional exclude path: has_files <dir> [exclude]
+has_files() {
+  local d="$1"
+  local ex="${2:-}"
+  [ -d "$d" ] || return 1
+  if [ -n "$ex" ]; then
+    find "$d" -not \( -path "$ex" -prune \) -type f -print -quit >/dev/null 2>&1
+  else
+    find "$d" -type f -print -quit >/dev/null 2>&1
+  fi
+}
+# Resolve collision by appending .dupN
+resolve_collision() {
+  local base="$1"
+  local i=1
+  local candidate="$base"
+  while [ -e "$candidate" ]; do
+    candidate="${base}.dup${i}"
+    i=$((i+1))
+  done
+  printf '%s' "$candidate"
+}
+# Determine if two files are identical (size + sha256 if available)
+is_same_file() {
+  local a="$1" b="$2"
+  [ -f "$a" ] || return 1
+  [ -f "$b" ] || return 1
+  local sa sb
+  sa=$(stat -c%s "$a" 2>/dev/null || echo 0)
+  sb=$(stat -c%s "$b" 2>/dev/null || echo 0)
+  [ "$sa" = "$sb" ] || return 1
+  if command -v shasum >/dev/null 2>&1; then
+    local ha hb
+    ha=$(shasum -a 256 "$a" | awk '{print $1}')
+    hb=$(shasum -a 256 "$b" | awk '{print $1}')
+    [ "$ha" = "$hb" ] || return 1
+  fi
+  return 0
+}
+# Rsync copy wrapper handling 
+rsync_copy() {
+  local src="$1" destdir="$2" overwrite="$3"
+  local owner_group chown_flag
+  owner_group=$(id -gn "$OWN_USER" 2>/dev/null || true)
+  chown_flag=""
+  if rsync --help 2>&1 | grep -q -- --chown; then
+    chown_flag="--chown=${OWN_USER}${owner_group:+:$owner_group}"
+  fi
+  local base_args=( -a --inplace --partial --progress --remove-source-files )
+  local extra=()
+  if [ "$overwrite" = "yes" ]; then
+    extra+=( --checksum )
+  fi
+  run_with_timestamp rsync "${base_args[@]}" ${chown_flag:+$chown_flag} "${extra[@]}" -- "$src" "$destdir/"
+}
+# Run rsync with timestamp
 run_with_timestamp() {
   if command -v stdbuf >/dev/null 2>&1; then
     stdbuf -oL -eL "$@" 2>&1 | while IFS= read -r line; do
@@ -78,117 +152,28 @@ run_with_timestamp() {
     done
   fi
 }
-
-# Helper return success if directory has any regular file under it
-has_files_under() {
-  local d="$1"
-  [ -d "$d" ] && find "$d" -type f -print -quit >/dev/null 2>&1
-}
-
-# Helper same as has_files_under but excluding a path pattern
-has_files_under_excluding() {
-  local base="$1"; shift
-  local exclude_path="$1"; shift
-  [ -d "$base" ] && find "$base" -not \( -path "$exclude_path" -prune \) -type f -print -quit >/dev/null 2>&1
-}
-
-# Helper returns file size in bytes (works on GNU and BSD stat)
-filesize() {
-  local f="$1"
-  if [ ! -e "$f" ]; then
-    echo 0
-    return 0
-  fi
-  local s
-  s=$(stat -c%s "$f" 2>/dev/null) && { echo "$s"; return 0; } || true
-  s=$(stat -f%z "$f" 2>/dev/null) && { echo "$s"; return 0; } || true
-  if command -v find >/dev/null 2>&1; then
-    s=$(find "$f" -maxdepth 0 -type f -printf '%s\n' 2>/dev/null)
-  else
-    s="$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || wc -c <"$f" 2>/dev/null || echo 0)"
-  fi
-  if [ -n "$s" ] && printf '%s' "$s" | grep -Eq '^[0-9]+$'; then
-    echo "$s"; return 0
-  fi
-  s=$(wc -c <"$f" 2>/dev/null) && { echo "$s"; return 0; } || true
-  echo 0
-}
-
-# Validate an octal mode like 0755 or 644 (allow 3- or 4-digit octal)
-validate_mode() {
-  case "$1" in
-    [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-# Check whether the owner user exists on the system
-owner_exists() {
-  id -u "$1" >/dev/null 2>&1
-}
-
-# Helper set owner and permissions on a directory tree.
-set_owner_and_perms() {
-  local target="$1"
-  local owner="${2:-$OWN_USER}"
-  local dir_mode="${3:-$CHMOD_DIR}"
-  local file_mode="${4:-$CHMOD_FILE}"
-
-  if ! owner_exists "$owner"; then
-    log_warn "Directory owner '$owner' does not exist on this system; chown will likely fail"
-  fi
-
-  if ! validate_mode "$dir_mode"; then
-    log_err "Directory mode value '$dir_mode' is not a valid octal mode"
-    return 1
-  fi
-  if ! validate_mode "$file_mode"; then
-    log_err "File mode value '$file_mode' is not a valid octal mode"
-    return 1
-  fi
-
-  if ! chown -R "$owner" "$target"; then
-    log_warn "Chown $owner failed on $target — running without privilege?"
-  fi
-
-  if ! chmod -R "$dir_mode" "$target"; then
-    log_err "Chmod $dir_mode failed on $target — check permissions"
-    return 1
-  fi
-
-  find "$target" -type f -exec chmod "$file_mode" {} \; >/dev/null 2>&1 || true
-  find "$target" -type d -exec chmod g+s {} \; >/dev/null 2>&1 || true
-  log_info "Directory ownership and permissions set on $target"
-  return 0
-}
-
-# Ensure ownership and permissions on a destination directory after move/rsync
-ensure_dest_owner_perms() {
-  local destdir="$1"
-  local owner="${2:-$OWN_USER}"
-  local dir_mode="${3:-$CHMOD_DIR}"
-  local file_mode="${4:-$CHMOD_FILE}"
-
-  local owner_group
+# Returns file size in bytes
+filesize() { local f="$1"; [ -e "$f" ] || { echo 0; return 0; }; local s; s=$(stat -c%s "$f" 2>/dev/null) || s=$(wc -c <"$f" 2>/dev/null || echo 0); echo "${s:-0}"; }
+# Final permission normalization helper (targeted; defaults to DEST_DIR)
+apply_final_perms() {
+  local owner="$OWN_USER" owner_group target
+  local -a targets=("$@")
+  [ ${#targets[@]} -eq 0 ] && targets=("$DEST_DIR")
   owner_group=$(id -gn "$owner" 2>/dev/null || true)
-  if [[ -n "$owner_group" ]]; then
-    if ! chown -R "${owner}:${owner_group}" "$destdir" 2>/dev/null; then
-      log_warn "Failed to chown $destdir to ${owner}:${owner_group} — you may need root privileges"
+  for target in "${targets[@]}"; do
+    [ -d "$target" ] || { log debug "PERM: skip non-dir $target"; continue; }
+    log info "PERM: normalizing $target"
+    if [ -n "$owner_group" ]; then
+      chown -R "$owner:$owner_group" "$target" 2>/dev/null || log warn "PERM: chown ${owner}:${owner_group} failed on $target"
+    else
+      chown -R "$owner" "$target" 2>/dev/null || log warn "PERM: chown $owner failed on $target"
     fi
-  else
-    if ! chown -R "$owner" "$destdir" 2>/dev/null; then
-      log_warn "Failed to chown $destdir to $owner — you may need root privileges"
-    fi
-  fi
-  log_info "Permission: owner and permission modified to ${owner}${owner_group:+:${owner_group}} on $destdir"
-
-  if ! chmod -R "$dir_mode" "$destdir" 2>/dev/null; then
-    log_warn "Failed to chmod -R $dir_mode on $destdir"
-  fi
-  find "$destdir" -type f -exec chmod "$file_mode" {} \; >/dev/null 2>&1 || true
-  find "$destdir" -type d -exec chmod g+s {} \; >/dev/null 2>&1 || true
+    chmod -R "$CHMOD_DIR" "$target" 2>/dev/null || log warn "PERM: chmod -R $CHMOD_DIR failed on $target"
+    find "$target" -type f -exec chmod "$CHMOD_FILE" {} \; >/dev/null 2>&1 || true
+    find "$target" -type d -exec chmod g+s {} \; >/dev/null 2>&1 || true
+  done
+  log debug "PERM: applied to ${#targets[@]} target(s)"
 }
-
 # Convert bytes to human-readable units (B KB MB GB TB PB)
 human_readable() {
   local bytes="$1"
@@ -202,170 +187,98 @@ human_readable() {
   fi
   awk -v b="$bytes" 'function hr(x){s="B KB MB GB TB PB"; n=0; while(x>=1024 && n<5){x/=1024;n++} split(s,a," "); printf("%.1f %s", x, a[n+1])} {hr(b)}'
 }
-
-# Escape a string to be used safely in a sed search pattern (literal match)
-escape_sed_literal() {
-  printf '%s' "$1" | sed -e 's/[][\\.^$*+?(){}|]/\\&/g' -e 's,/,\\/,g'
+# Escape helper:
+escape_literal() {
+  local mode="$1" s="$2"
+  case "$mode" in
+    sed)
+      printf '%s' "$s" | sed -e 's/[][\\.^$*+?(){}|]/\\&/g' -e 's,/,\\/,g'
+      ;;
+    glob)
+      s=${s//\\/\\\\}
+      s=${s//\*/[\*]}
+      s=${s//\?/[?]}
+      s=${s//\[/[[]}
+      printf '%s' "$s"
+      ;;
+    *) printf '%s' "$s" ;;
+  esac
 }
-
-# Escape a string so it can be used as a literal in a bash match
-escape_glob_literal() {
-  local s="$1"
-  s=${s//\\/\\\\}
-  s=${s//\*/[\*]}
-  s=${s//\?/[?]}
-  s=${s//\[/[[]}
-  printf '%s' "$s"
-}
-
 # Function to rename patterns in files
 rename_patterns() {
   local dir="$1"
   local -a patterns=("${RENAME_PATTERNS[@]:-}")
-  local -a dirs files
-  local globpat dcount total_dbytes ed ff pattern d ddirpath dbase esc_pat dnewbase dnewpath i candidate count total_bytes ef human_total f dirpath base newbase newpath rsize fsize
-
-  if [ ${#patterns[@]} -eq 0 ]; then
-    log_info "Rename: no patterns configured; skipping rename pass"
-    return 0
-  fi
-
+  [ ${#patterns[@]} -eq 0 ] && { log info "Rename: no patterns configured; skipping"; return 0; }
   for pattern in "${patterns[@]}"; do
-    dirs=()
-    globpat=$(escape_glob_literal "$pattern")
-    while IFS= read -r -d '' p; do
-      if [[ $p == *$globpat* ]]; then
-        dirs+=("$p")
-      fi
-    done < <(find "$dir" -depth \( -path "$dir/incomplete" -o -path "$dir/incomplete/*" \) -prune -o -type d -print0 2>/dev/null)
-    dcount=${#dirs[@]}
-    if [[ $dcount -gt 0 ]]; then
-      total_dbytes=0
-      for ed in "${dirs[@]}"; do
-        ed="${ed%$'\0'}"
-        while IFS= read -r -d '' ff; do
-          total_dbytes=$((total_dbytes + $(filesize "$ff")))
-        done < <(find "$ed" -type f -print0 2>/dev/null)
-      done
-      log_info "Rename directory: removing literal pattern '$pattern' from $dcount directories under $dir (total size: $(human_readable "$total_dbytes"))"
-
-      for d in "${dirs[@]}"; do
-        d="${d%$'\0'}"
-        ddirpath=$(dirname -- "$d")
-        dbase=$(basename -- "$d")
-        esc_pat=$(escape_sed_literal "$pattern")
-        dnewbase=$(printf '%s' "$dbase" | sed -e "s/${esc_pat}//g")
-        if [[ "$dnewbase" == "$dbase" ]]; then
-          continue
-        fi
-        dnewpath="$ddirpath/$dnewbase"
-
-        if [[ -e "$dnewpath" ]]; then
-          i=1; candidate=""
-          while :; do
-            candidate="${dnewpath}.dup${i}"
-            if [[ ! -e "$candidate" ]]; then
-              dnewpath="$candidate"
-              break
-            fi
-            i=$((i+1))
-          done
-        fi
-
+    local esc_pat globpat
+    esc_pat=$(escape_literal sed "$pattern")
+    globpat=$(escape_literal glob "$pattern")
+    # Directories
+    local -a match_dirs=()
+    while IFS= read -r -d '' d; do [[ $d == *$globpat* ]] && match_dirs+=("$d"); done < <(find "$dir" -depth \( -path "$dir/incomplete" -o -path "$dir/incomplete/*" \) -prune -o -type d -print0 2>/dev/null)
+    local total_dir_bytes=0
+    for md in "${match_dirs[@]}"; do while IFS= read -r -d '' f; do total_dir_bytes=$((total_dir_bytes + $(filesize "$f"))); done < <(find "$md" -type f -print0 2>/dev/null); done
+    if [ ${#match_dirs[@]} -gt 0 ]; then
+      log info "REN: dir pattern '$pattern' on ${#match_dirs[@]} dirs (size: $(human_readable "$total_dir_bytes"))"
+      for d in "${match_dirs[@]}"; do
+        local ddir dbase dnewbase dnewpath
+        ddir=$(dirname -- "$d"); dbase=$(basename -- "$d"); dnewbase=$(printf '%s' "$dbase" | sed -e "s/${esc_pat}//g")
+        [ "$dnewbase" = "$dbase" ] && continue
+        dnewpath="$ddir/$dnewbase"
+        [ -e "$dnewpath" ] && dnewpath=$(resolve_collision "$dnewpath")
         if mv -n -- "$d" "$dnewpath"; then
-          log_info "Rename directory: renamed '$d' -> '$dnewpath'"
+          log info "REN: dir '$d' -> '$dnewpath'"
         else
-          log_warn "Rename directory: failed to rename '$d' -> '$dnewpath'"
+          log warn "REN: dir fail '$d' -> '$dnewpath'"
         fi
       done
-      log_info "Rename directory: finished pattern '$pattern'"
     else
-      log_info "Rename directory: no directories match pattern '$pattern' in $dir"
+      log debug "REN: dir none match '$pattern'"
     fi
-
-    # Collect files that contain the literal substring 'pattern'
-    files=()
-    while IFS= read -r -d '' p; do
-      if [[ $p == *$globpat* ]]; then
-        files+=("$p")
-      fi
-    done < <(find "$dir" \( -path "$dir/incomplete" -o -path "$dir/incomplete/*" \) -prune -o -type f -print0 2>/dev/null)
-    count=${#files[@]}
-    
-    if [[ $count -eq 0 ]]; then
-      log_info "Rename files: no files match pattern '$pattern' in $dir"
+    # Files
+    local -a match_files=()
+    while IFS= read -r -d '' f; do [[ $f == *$globpat* ]] && match_files+=("$f"); done < <(find "$dir" \( -path "$dir/incomplete" -o -path "$dir/incomplete/*" \) -prune -o -type f -print0 2>/dev/null)
+    local total_file_bytes=0
+    for mf in "${match_files[@]}"; do total_file_bytes=$((total_file_bytes + $(filesize "$mf"))); done
+    if [ ${#match_files[@]} -eq 0 ]; then
+      log info "REN: file none match '$pattern'"
       continue
     fi
-
-    # Compute total size of matched files
-    total_bytes=0
-    for ef in "${files[@]}"; do
-      ef="${ef%$'\0'}"
-      total_bytes=$((total_bytes + $(filesize "$ef")))
-    done
-    human_total=$(human_readable "$total_bytes")
-
-    log_info "Rename files: removing literal pattern '$pattern' from $count files in $dir (total size: $human_total)"
-
-    for f in "${files[@]}"; do
-      f="${f%$'\0'}"
-      dirpath=$(dirname -- "$f")
-      base=$(basename -- "$f")
-      esc_pat=$(escape_sed_literal "$pattern")
-      newbase=$(printf '%s' "$base" | sed -e "s/${esc_pat}//g")
-      if [[ "$newbase" == "$base" ]]; then
-        continue
-      fi
-      newpath="$dirpath/$newbase"
-
-      if [[ -e "$newpath" ]]; then
-        if [[ $(filesize "$f") -eq $(filesize "$newpath") ]]; then
-          if command -v shasum >/dev/null 2>&1; then
-            if [[ "$(shasum -a 256 "$f" | awk '{print $1}')" == "$(shasum -a 256 "$newpath" | awk '{print $1}')" ]]; then
-              rsize=$(human_readable "$(filesize "$f")")
-              log_info "Rename files: '$f' identical to '$newpath' -> removing source (size: $rsize)"
-              rm -f -- "$f"
-              continue
-            fi
-          fi
+    log info "REN: file pattern '$pattern' on ${#match_files[@]} files (size: $(human_readable "$total_file_bytes"))"
+    for f in "${match_files[@]}"; do
+      local fdir fbase fnewbase fnewpath
+      fdir=$(dirname -- "$f"); fbase=$(basename -- "$f"); fnewbase=$(printf '%s' "$fbase" | sed -e "s/${esc_pat}//g")
+      [ "$fnewbase" = "$fbase" ] && continue
+      fnewpath="$fdir/$fnewbase"
+      if [ -e "$fnewpath" ]; then
+        if is_same_file "$f" "$fnewpath"; then
+          local rsize; rsize=$(human_readable "$(filesize "$f")")
+          log info "REN: identical remove '$f' == '$fnewpath' (size: $rsize)"
+          rm -f -- "$f"
+          continue
         fi
-        i=1; candidate=""
-        while :; do
-          candidate="${newpath}.dup${i}"
-          if [[ ! -e "$candidate" ]]; then
-            newpath="$candidate"
-            break
-          fi
-          i=$((i+1))
-        done
+        fnewpath=$(resolve_collision "$fnewpath")
       fi
-
-      if mv -n -- "$f" "$newpath"; then
-        rsize=$(human_readable "$(filesize "$newpath")")
-        log_info "Rename files: renamed '$f' -> '$newpath' (size: $rsize)"
+      if mv -n -- "$f" "$fnewpath"; then
+        local nrsize; nrsize=$(human_readable "$(filesize "$fnewpath")")
+        log info "REN: file '$f' -> '$fnewpath' (size: $nrsize)"
       else
-        fsize=$(human_readable "$(filesize "$f")")
-        log_warn "Rename files: failed to rename '$f' -> '$newpath' (size: $fsize)"
+        local fsize; fsize=$(human_readable "$(filesize "$f")")
+        log warn "REN: file fail '$f' -> '$fnewpath' (size: $fsize)"
       fi
     done
-
-    log_info "Rename files: finished removing files pattern '$pattern' (total size: $human_total)"
   done
 }
-
 # Function to remove unwanted file extensions
 remove_unwanted_files() {
   local dir="$1"
   local -a exts=("${UNWANTED_EXTS[@]:-}")
-
   if [ ${#exts[@]} -eq 0 ]; then
-    log_info "Remove unwanted files: no unwanted extensions configured; skipping"
+    log info "PRUNE: no unwanted extensions configured; skipping"
     return 0
   fi
-
   local total_removed_bytes=0
   local removed_count=0
-  # Build predicate for extensions: ( -iname "*.ext1" -o -iname "*.ext2" ... )
   local -a pred=( '(' )
   local first=1
   for ext in "${exts[@]}"; do
@@ -377,7 +290,6 @@ remove_unwanted_files() {
     fi
   done
   pred+=( ')' )
-
   while IFS= read -r -d '' remfile; do
     local rb
     rb=$(filesize "$remfile")
@@ -385,235 +297,142 @@ remove_unwanted_files() {
     removed_count=$((removed_count + 1))
     local rsize
     rsize=$(human_readable "$rb")
-    log_info "Removing unwanted file '$remfile' of size $rsize"
+    log info "PRUNE: unwanted '$remfile' size=$rsize"
     rm -f -- "$remfile"
   done < <(find "$dir" -not \( -path "$dir/incomplete" -prune \) -type f "${pred[@]}" -print0 2>/dev/null)
-
   if [[ $removed_count -gt 0 ]]; then
-    log_info "Remove unwanted files: removed $removed_count files under $dir"
-    log_info "Total size of removed files: $(human_readable "$total_removed_bytes")"
+    log info "PRUNE: removed $removed_count files under $dir (bytes: $(human_readable "$total_removed_bytes"))"
   else
-    log_info "Remove unwanted files: no unwanted files found under $dir"
+    log info "PRUNE: none found under $dir"
   fi
 }
-
-# Function to safely move files from source to destination
+# Safely move files from source to destination
 safe_move() {
   local src="$1"
   local dest="$2"
-
   if [[ ! -d "$src" ]]; then
-      log_warn "Safe move: source '$src' does not exist, skipping"
+      log warn "MV: source missing '$src'"
     return 0
   fi
-
   if [[ -z "$(find "$src" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
-      log_info "Safe move: source '$src' empty, skipping"
+      log info "MV: source empty '$src'"
     return 0
   fi
   mkdir -p "$dest"
-
   if ! command -v rsync >/dev/null 2>&1; then
-      log_err "Safe move: rsync is required but not found in PATH"
+      log error "MV: rsync is required but not found in PATH"
     return 1
   fi
-
-  # Determine owner primary group for use with rsync --chown
-  local owner_group
-  owner_group=$(id -gn "$OWN_USER" 2>/dev/null || true)
-  local rsync_chown_arg
-  if [[ -n "$owner_group" ]]; then
-    rsync_chown_arg="--chown=${OWN_USER}:${owner_group}"
-  else
-    rsync_chown_arg="--chown=${OWN_USER}"
-  fi
-
+  local moved_bytes=0
   find "$src" -type f -print0 | while IFS= read -r -d '' srcfile; do
+    local relpath destfile destdir size
     relpath="${srcfile#"$src"/}"
     destfile="$dest/$relpath"
-
+    destdir="${destfile%/*}"
+    mkdir -p "$destdir"
     if [[ -f "$destfile" ]]; then
-  if [[ $(filesize "$srcfile") -eq $(filesize "$destfile") ]]; then
-        if command -v shasum >/dev/null 2>&1; then
-          if [[ "$(shasum -a 256 "$srcfile" | awk '{print $1}')" == "$(shasum -a 256 "$destfile" | awk '{print $1}')" ]]; then
-            local size
-            size=$(human_readable "$(filesize "$srcfile")")
-            log_info "Identical file: removing source '$srcfile' (size: $size)"
-            rm -f -- "$srcfile"
-            continue
-          fi
-        fi
-      fi
-
-      mkdir -p "$(dirname "$destfile")"
-  local osize
-  osize=$(human_readable "$(filesize "$srcfile")")
-  log_info "Overwriting: '$destfile' with '$srcfile' (size: $osize)"
-        if rsync --version >/dev/null 2>&1 && rsync --help 2>&1 | grep -q -- --chown; then
-          run_with_timestamp rsync -a "$rsync_chown_arg" --checksum --inplace --partial --progress --remove-source-files -- "$srcfile" "${destfile%/*}/"
-          destdir="${destfile%/*}"
-          ensure_dest_owner_perms "$destdir"
-        else
-          run_with_timestamp rsync -a --inplace --partial --progress --remove-source-files -- "$srcfile" "${destfile%/*}/"
-          destdir="${destfile%/*}"
-          ensure_dest_owner_perms "$destdir"
-        fi
-      continue
-    fi
-
-    mkdir -p "$(dirname "$destfile")"
-    local size
-    size=$(human_readable "$(filesize "$srcfile")")
-    log_info "Safe move: moving '$srcfile' -> '$destfile' (size: $size)"
-      if rsync --version >/dev/null 2>&1 && rsync --help 2>&1 | grep -q -- --chown; then
-        run_with_timestamp rsync -a "$rsync_chown_arg" --inplace --partial --progress --remove-source-files -- "$srcfile" "${destfile%/*}/"
-        destdir="${destfile%/*}"
-        ensure_dest_owner_perms "$destdir"
+      if is_same_file "$srcfile" "$destfile"; then
+        local size_bytes; size_bytes=$(filesize "$srcfile")
+        size=$(human_readable "$size_bytes")
+        log info "MV: identical remove '$srcfile' size=$size"
+        rm -f -- "$srcfile"
+        moved_bytes=$((moved_bytes + size_bytes))
+        continue
       else
-        run_with_timestamp rsync -a --inplace --partial --progress --remove-source-files -- "$srcfile" "${destfile%/*}/"
-        destdir="${destfile%/*}"
-        ensure_dest_owner_perms "$destdir"
+        local size_bytes; size_bytes=$(filesize "$srcfile")
+        size=$(human_readable "$size_bytes")
+        log info "MV: overwrite dest='$destfile' src='$srcfile' size=$size"
+        rsync_copy "$srcfile" "$destdir" yes
+        moved_bytes=$((moved_bytes + size_bytes))
       fi
-  done
-
-  find "$src" -mindepth 1 -type d -empty -delete
-
-  if [[ -d "$src" ]] && [[ -z "$(find "$src" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
-      log_info "Directory: '$src' (empty)"
-  fi
-}
-
-# Function to move プライベート subdirectories
-move_private_subdirs() {
-  local src_base="$1"
-  local dest_base="$2"
-  local -a subdirs=("${PRIVATE_SUBDIRS[@]:-}")
-  if [ ${#subdirs[@]} -eq 0 ]; then
-    log_info "Safe move: no PRIVATE_SUBDIRS configured; skipping"
-    return 0
-  fi
-  for subdir in "${subdirs[@]}"; do
-    local sub_total=0
-    if [ -d "$src_base/$subdir" ]; then
-      while IFS= read -r -d '' sf; do
-        sub_total=$((sub_total + $(filesize "$sf")))
-      done < <(find "$src_base/$subdir" -type f -print0 2>/dev/null)
-    fi
-    log_info "Safe move: processing sub-directory '$subdir' (size: $(human_readable "$sub_total"))"
-    if safe_move "$src_base/$subdir" "$dest_base/$subdir"; then
-      log_info "Safe move: finished sub-directory '$subdir' (size: $(human_readable "$sub_total"))"
     else
-      log_warn "Safe move: failure for sub-directory '$subdir'"
+      local size_bytes; size_bytes=$(filesize "$srcfile")
+      size=$(human_readable "$size_bytes")
+      log info "MV: move '$srcfile' -> '$destfile' size=$size"
+      rsync_copy "$srcfile" "$destdir" no
+      moved_bytes=$((moved_bytes + size_bytes))
+    fi
+  done
+  find "$src" -mindepth 1 -type d -empty -delete
+  if [[ -d "$src" ]] && [[ -z "$(find "$src" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+      log info "MV: directory empty '$src'"
+  fi
+  SAFE_MOVE_LAST_BYTES=$moved_bytes
+}
+# Safely move プライベート subdirectories
+move_private_subdirs() {
+  local src_base="$1" dest_base="$2"
+  local -a subdirs=("${PRIVATE_SUBDIRS[@]:-}")
+  [ ${#subdirs[@]} -eq 0 ] && { log info "MV: no PRIVATE_SUBDIRS configured; skipping"; return 0; }
+  for subdir in "${subdirs[@]}"; do
+    log info "MV: processing private '$subdir'"
+    SAFE_MOVE_LAST_BYTES=0
+    if safe_move "$src_base/$subdir" "$dest_base/$subdir"; then
+      local human_total; human_total=$(human_readable "${SAFE_MOVE_LAST_BYTES:-0}")
+      log info "MV: finished private '$subdir' bytes=$human_total"
+    else
+      log warn "MV: failed private '$subdir'"
     fi
   done
 }
 
+# ---------------- Main Processing ----------------
 # Record start time and announce processing start
 START_TS=$(date +%s)
-log_info "Starting data processing for source: $SRC_DIR"
+log info "Starting data processing for source: $SRC_DIR"
 
-if ! has_files_under "$SRC_DIR"; then
-  log_info "Source $SRC_DIR directory empty, script exit!"
-  end_ts=$(date +%s)
-  elapsed=$((end_ts - START_TS))
-  hours=$((elapsed/3600))
-  mins=$(((elapsed%3600)/60))
-  secs=$((elapsed%60))
-  if [ "$hours" -gt 0 ]; then
-    runtime="${hours}h ${mins}m ${secs}s"
-  elif [ "$mins" -gt 0 ]; then
-    runtime="${mins}m ${secs}s"
-  else
-    runtime="${secs}s"
-  fi
-  log_info "Processing finished (Runtime: ${runtime})"
-  exit 1
-else
-  if ! set_owner_and_perms "$SRC_DIR" "$OWN_USER" "$CHMOD_DIR" "$CHMOD_FILE"; then
-    end_ts=$(date +%s)
-    elapsed=$((end_ts - START_TS))
-    hours=$((elapsed/3600))
-    mins=$(((elapsed%3600)/60))
-    secs=$((elapsed%60))
-    if [ "$hours" -gt 0 ]; then
-      runtime="${hours}h ${mins}m ${secs}s"
-    elif [ "$mins" -gt 0 ]; then
-      runtime="${mins}m ${secs}s"
-    else
-      runtime="${secs}s"
-    fi
-    log_info "Processing finished (Runtime: ${runtime})"
-    exit 1
-  fi
+if ! has_files "$SRC_DIR"; then
+  finish 1 "Source $SRC_DIR directory empty"
 fi
-
 # Rename files for metadata scans
 rename_patterns "$SRC_DIR"
-
 # Remove unwanted files
 remove_unwanted_files "$SRC_DIR"
-
 # Remove unwanted exact file names under "$SRC_DIR/complete"
 if [ ${#UNWANTED_NAMES[@]} -gt 0 ]; then
   for ufn in "${UNWANTED_NAMES[@]}"; do
     while IFS= read -r -d '' rem; do
       rbs=$(filesize "$rem")
-      log_info "Removing unwanted file: '$rem' of size $(human_readable "$rbs")"
+      log info "PRUNE: unwanted-exact '$rem' size=$(human_readable "$rbs")"
       rm -f -- "$rem"
     done < <(find "$SRC_DIR/complete/" -type f -name "$ufn" -print0 2>/dev/null)
   done
 fi
-
 # Atomic move for ポルノ
-if has_files_under "$SRC_DIR/complete/ポルノ"; then
+if has_files "$SRC_DIR/complete/ポルノ"; then
   safe_move "$SRC_DIR/complete/ポルノ" "$DEST_DIR/ポルノ"
 else
-  log_info "Safe move: ポルノ directory empty, skipping!"
+  log info "MV: ポルノ directory empty, skipping"
 fi
-
 # Atomic move for プライベート subdirectories
-if has_files_under_excluding "$SRC_DIR/complete" "$SRC_DIR/complete/ポルノ"; then
+if has_files "$SRC_DIR/complete" "$SRC_DIR/complete/ポルノ"; then
   move_private_subdirs "$SRC_DIR/complete" "$DEST_DIR/プライベート"
 else
-  log_info "Safe move: プライベート directory empty, skipping!"
-  exit 1
+  finish 1 "MV: プライベート directory empty, skipping"
 fi
-
+# Final permission normalization ==
+apply_final_perms "$DEST_DIR/ポルノ" "$DEST_DIR/プライベート" || log warn "PERM: final permission application encountered issues"
 # Update qBittorrent VueTorrent webui
-log_info "Updating qBittorrent webui with VueTorrent "
+log info "Updating qBittorrent webui with VueTorrent "
 if cd /mnt/user/appdata/qbittorrent/webui 2>/dev/null; then
   rm -rf VueTorrent
-  log_info "Cloning VueTorrent latest-release branch from GitHub"
+  log info "Cloning VueTorrent latest-release branch from GitHub"
   export GIT_TERMINAL_PROMPT=0
   if command -v timeout >/dev/null 2>&1; then
     if timeout 300 git clone --quiet --depth 1 --single-branch --branch latest-release https://github.com/VueTorrent/VueTorrent.git; then
-      log_info "qBittorrent webui VueTorrent updated"
+      log info "qBittorrent webui VueTorrent updated"
     else
-      log_warn "qBittorrent webui VueTorrent git clone failed or timed out"
+      log warn "qBittorrent webui VueTorrent git clone failed or timed out"
     fi
   else
     if git clone --quiet --depth 1 --single-branch --branch latest-release https://github.com/VueTorrent/VueTorrent.git; then
-      log_info "qBittorrent webui VueTorrent updated"
+      log info "qBittorrent webui VueTorrent updated"
     else
-      log_warn "qBittorrent webui VueTorrent git clone failed"
+      log warn "qBittorrent webui VueTorrent git clone failed"
     fi
   fi
   cd ~ || true
 else
-  log_warn "Cannot cd to /mnt/user/appdata/qbittorrent/webui — skipping VueTorrent update"
+  log warn "Cannot cd to /mnt/user/appdata/qbittorrent/webui — skipping VueTorrent update"
 fi
-
-end_ts=$(date +%s)
-elapsed=$((end_ts - START_TS))
-hours=$((elapsed/3600))
-mins=$(((elapsed%3600)/60))
-secs=$((elapsed%60))
-if [ "$hours" -gt 0 ]; then
-  runtime="${hours}h ${mins}m ${secs}s"
-elif [ "$mins" -gt 0 ]; then
-  runtime="${mins}m ${secs}s"
-else
-  runtime="${secs}s"
-fi
-log_info "Processing finished successfully (Runtime: ${runtime})"
-exit 0
+finish 0 "Processing finished successfully"
