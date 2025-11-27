@@ -5714,7 +5714,7 @@ collect_xfs_proc_stats() {
                         local cur_boost=${BURST_BOOST[$bdev_burst]:-0}; cur_boost=$(( cur_boost + BURST_CRIT_BOOST )); (( cur_boost > 100 )) && cur_boost=100; BURST_BOOST[$bdev_burst]=$cur_boost
                     done
                 elif (( ratio >= XFS_ERR_BURST_WARN_RATIO )); then
-                    (( sev == "skip" )) && sev="warning"
+                    [[ "$sev" == "skip" ]] && sev="warning"
                     record_alert warning "XFS Burst" "Counter $k elevated delta $delta (x${ratio} vs last $last_delta) now $val"
                     anomalies=1
                     local xfs_mounts bdev_burst
@@ -5753,6 +5753,7 @@ collect_xfs_proc_stats() {
             bdev=$(base_device "$src")
             [[ -z "${SMART_STATE[$bdev]:-}" ]] && SMART_STATE[$bdev]="OK"
             SMART_MSGS[$bdev]="${SMART_MSGS[$bdev]:-} XFS metadata anomalies"
+            record_alert warning "$NOTIFY_TITLE_XFS" "XFS metadata anomalies detected on $(basename "$bdev") (mount: $m)"
         done
     fi
     # Persist new snapshot for next run delta computation
