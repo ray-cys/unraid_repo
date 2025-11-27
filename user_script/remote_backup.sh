@@ -9,7 +9,6 @@ fi
 # ---------------- Configuration ----------------
 # Remote Shares Backup Settings
 ################################################################################
-
 # === General ===
 SRC_NAS="Hubble NAS"                                                  # Source NAS name for logging/notifications
 DEST_NAS="ISS NAS"                                                    # Destination NAS name for logging/notifications
@@ -32,19 +31,17 @@ REMOTE="root@192.168.50.3"                                            # SSH user
 REMOTE_MAC="9C:6B:00:4B:BB:EE"                                        # Wake-on-LAN MAC for the remote
 SSH_PORT=22                                                           # SSH port used to contact remote
 
-
 # === Rsync defaults & excludes ===
 # Default rsync arguments.
 RSYNC_DEFAULT_ARGS=("-ah" "-p" "--times" "--cvs-exclude" "--delete-during" "--partial" "--protect-args" "--itemize-changes" "--stats")  # Add or remove default rsync args as needed
-RSYNC_PARTIAL_DIR=".rsync-partial"                                                                                  # Partial directory name
-DEFAULT_EXCLUDES=(--exclude='*.sock' --exclude='/dev/*' --exclude='/proc/*' --exclude='/sys/*' --exclude='*/.cache/*') # Default excludes for all labels
-RSYNC_EXTRA_EXCLUDES=("net/" "torrent/")                                                                            # Per-label additional excludes matching LABELS_ARRAY order
-RSYNC_STREAM_TIMESTAMPED_LOG=${RSYNC_STREAM_TIMESTAMPED_LOG:-true}                                                  # true -> timestamp each rsync output line, false -> raw output only
+RSYNC_PARTIAL_DIR=".rsync-partial"                                                                                      # Partial directory name
+DEFAULT_EXCLUDES=(--exclude='*.sock' --exclude='/dev/*' --exclude='/proc/*' --exclude='/sys/*' --exclude='*/.cache/*')  # Default excludes for all labels
+RSYNC_EXTRA_EXCLUDES=("net/" "torrent/")                                                                                # Per-label additional excludes matching LABELS_ARRAY order
 
 # === Snapshots ===
-ENABLE_SNAPSHOTS=false                                                                                              # Enable snapshot creation on source after successful backup
-SNAPSHOT_ROOT="/mnt/user/backup/snapshots"                                                                          # Snapshot root directory
-SNAPSHOT_KEEP=7                                                                                                     # Number of snapshots to keep
+ENABLE_SNAPSHOTS=false                                                 # Enable snapshot creation on source after successful backup
+SNAPSHOT_ROOT="/mnt/user/backup/snapshots"                             # Snapshot root directory
+SNAPSHOT_KEEP=7                                                        # Number of snapshots to keep
 
 # === Retry / Backoff / IO niceness ===
 MAX_RETRIES=3                                                          # Maximum number of rsync retries
@@ -54,12 +51,23 @@ ENABLE_EXPONENTIAL_BACKOFF=true                                        # Enable 
 MAX_BACKOFF=600                                                        # Maximum backoff time in seconds
 ENABLE_PER_ATTEMPT_NOTIFY=false                                        # Enable per-attempt notifications
 USE_IONICE=true                                                        # Use ionice with rsync
+IONICE_CLASS=2                                                         # ionice class (1=RT,2=BestEffort,3=Idle)
+IONICE_PRIORITY=7                                                      # ionice priority (0-7, lower is higher priority)
+NICE_LEVEL=10                                                          # CPU nice level for rsync
 DEFAULT_FAIL_CODE=50                                                   # Default failure exit code
 DF_RETRY_COUNT=20                                                      # Number of df retries
 DF_RETRY_SLEEP=6                                                       # Sleep time between df retries
 
+# === Parallelism & Bandwidth ===
+ENABLE_PARALLEL=true                                                  # Run label backups in parallel
+DEST_CONCURRENCY_LIMIT=1                                              # Max concurrent rsyncs per destination path
+# Per-label bandwidth limits (KB/s); align indices with LABELS_ARRAY
+RSYNC_BWLIMITS=(0 0)                                                  # 0 means unlimited; set e.g., 20480 for ~20MB/s
+
 # === Preflight / Safety / Behavior ===
 PREFLIGHT_MODE="metadata"                                              # Use one of: estimate|metadata|total
+PREFLIGHT_MIN_BUFFER_BYTES=1073741824                                   # Minimum safety buffer (bytes)
+PREFLIGHT_BUFFER_PERCENT=5                                              # Percent of estimated change used as buffer
 SHUTDOWN_ON_FAILURE=false                                              # Shutdown source NAS on failure
 
 # === Notifications & Logging ===
@@ -85,14 +93,30 @@ LABELS_ARRAY=("Media" "Secure")                                        # Labels 
 SRCS_ARRAY=("$MEDIA_SRC" "$SECURE_SRC")                                # Source paths for datasets
 DESTS_ARRAY=("$MEDIA_DEST" "$SECURE_DEST")                             # Destination paths for datasets
 
-# === Directory setup ===
-ensure_dir() { # path mode user
+# === Globals (do not modify) ===
+declare -A rsync_results                                                # Rsync exit codes by label
+failed_labels=()                                                        # Labels that failed backup
+declare -A rsync_total_bytes                                            # Total bytes processed by rsync
+declare -A rsync_transferred_bytes                                      # Bytes transferred by rsync
+declare -A rsync_files                                                  # Number of files processed by rsync
+declare -A rsync_deletes                                                # Number of deleted files by rsync
+declare -A rsync_bytes_sent                                             # Bytes sent by rsync
+declare -A estimated_changed_bytes                                      # Estimated changed bytes by label
+declare -A rsync_ssh_fail                                               # Rsync SSH failure flags by label
+declare -A rsync_ssh_fail_reason                                        # Rsync SSH failure reasons by label
+declare -A DF_AVAIL_BY_DEST                                             # Available bytes by destination path
+
+################################################################################
+
+# --- Helpers Functions ---
+# Ensure log directories and files exist with proper ownership and permissions
+ensure_dir() {
   local p="$1" m="${2:-$LOG_DIR_MODE}" u="${3:-$LOG_USER}"
   mkdir -p "$p" 2>/dev/null || true
   chown "$u" "$p" 2>/dev/null || true
   chmod "$m" "$p" 2>/dev/null || true
 }
-ensure_file() { # file mode user
+ensure_file() {
   local f="$1" m="${2:-$LOG_FILE_MODE}" u="${3:-$LOG_USER}"
   : > "$f"
   chown "$u" "$f" 2>/dev/null || true
@@ -102,18 +126,50 @@ ensure_dir "$LOG_FILE_SUBDIR"
 ensure_dir "$PRESERVED_RAW_LOG_DIR"
 ensure_dir "$LOG_FILE_SUBDIR/manifests"
 ensure_file "$LOG_FILE"
-
-# === Logging ===
 log() {
   local msg="$1"
   echo "$(date "+%Y/%m/%d %T") : $msg" | tee -a "$LOG_FILE"
 }
+# --- Helpers Functions ---
+# Centralized SSH helper
+ssh_run() {
+  ssh -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}" -p "$SSH_PORT" "$REMOTE" "$@"
+}
+# --- Helpers Functions ---
+# Retry decision helper (returns 0 to indicate retry, 1 to stop)
+rsync_should_retry() {
+  local code=${1:-0}
+  local allow=0
+  if [ -z "${RETRY_ON_CODES:-}" ]; then
+    allow=1
+  else
+    for c in $RETRY_ON_CODES; do
+      if [ "$code" -eq "$c" ]; then allow=1; break; fi
+    done
+  fi
+  [ $allow -eq 1 ]
+}
+# --- Helpers Functions ---
+# Backoff helper: echoes sleep seconds for attempt number
+compute_backoff() {
+  local attempt=${1:-1}
+  local base=${RETRY_BACKOFF:-30}
+  local max=${MAX_BACKOFF:-600}
+  local sec
+  if [ "${ENABLE_EXPONENTIAL_BACKOFF}" = true ]; then
+    sec=$(( base * (2 ** (attempt - 1)) ))
+    if [ "$sec" -gt "$max" ]; then sec=$max; fi
+    local jitter=$(( RANDOM % ( (sec / 2) + 1 ) ))
+    echo $(( sec + jitter ))
+  else
+    echo "$base"
+  fi
+}
+# --- Helpers Functions ---
+# Syslog wrapper
 syslog() {
   local level="$1"; shift || true
   local msg="$*"
-  ssh_run() { # ssh with batch + ConnectTimeout handling
-    ssh -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT}" -p "$SSH_PORT" "$REMOTE" "$@"
-  }
   local prio
   case "$level" in
     debug) prio="user.debug" ;;
@@ -126,9 +182,6 @@ syslog() {
   esac
   logger -i -t "Remote Backup" -p "$prio" "$msg"
 }
-
-################################################################################
-
 # --- Helpers Functions ---
 # Convert a bytes integer into a human-readable string using binary units
 bytes_human() {
@@ -149,7 +202,6 @@ bytes_human() {
     printf "%d B" "$bytes"
   fi
 }
-
 # --- Helpers Functions ---
 # Convert a human-readable size like "54.34T" or "18.74G bytes" -> integer bytes
 human_to_bytes() {
@@ -174,7 +226,6 @@ human_to_bytes() {
     }
   }' <<<"$s"
 }
-
 # --- Helpers Functions ---
 # Returns human runtime string computed from start time
 format_runtime() {
@@ -188,7 +239,6 @@ format_runtime() {
 }
 now_s() { date +%s; }
 elapsed_since() { local _s="$1"; echo $(( $(now_s) - _s )); }
-
 # --- Helpers Functions ---
 # Centralized wrapper around the Unraid notify command to ensure consistent
 notify_send() {
@@ -203,7 +253,6 @@ notify_send() {
   fi
   return $nrc
 }
-
 # --- Helpers Functions ---
 # Map notification semantic to chosen emoji buttons
 notif_emoji() {
@@ -214,7 +263,6 @@ notif_emoji() {
     *) printf '🔵' ;;
   esac
 }
-
 # --- Helpers Functions ---
 # Classify SSH stderr into a concise reason for failure (password/host key/etc)
 classify_ssh_error() {
@@ -246,17 +294,30 @@ classify_ssh_error() {
     echo 'SSH connection/auth failure'
   fi
 }
-
 # --- Main Functions ---
 # Aggregates space requirements for multiple labels that may target the same remote destination
-aggregate_preflight_check() {
+preflight_labels() {
   declare -A src_by_device
   declare -A remote_used
   declare -A remote_avail
   declare -A device_mount
-  local min_buffer=$((1024 * 1024 * 1024))
-  # Ensure manifests if metadata mode
-  ensure_manifests_for_labels || true
+  local min_buffer=${PREFLIGHT_MIN_BUFFER_BYTES:-1073741824}
+  if [ "${PREFLIGHT_MODE:-}" = "metadata" ]; then
+    local dest_m="$LOG_FILE_SUBDIR/manifests"
+    mkdir -p "$dest_m" 2>/dev/null || true
+    for idx in "${!LABELS_ARRAY[@]}"; do
+      local label=${LABELS_ARRAY[$idx]}
+      local safe_label=${label// /_}
+      local latest
+      latest=$(find "$dest_m" -maxdepth 1 -type f -name "${safe_label}_manifest_*.txt" -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1{print $2}' || true)
+      if [ -z "$latest" ] || [ ! -f "$latest" ]; then
+        log "No manifest found for $label; creating baseline manifest"
+        write_manifest "$label" "${SRCS_ARRAY[$idx]}"
+      else
+        log "Found existing manifest for $label: $latest"
+      fi
+    done
+  fi
   for i in "${!LABELS_ARRAY[@]}"; do
     local label=${LABELS_ARRAY[i]}
     local src=${SRCS_ARRAY[i]}
@@ -277,25 +338,41 @@ aggregate_preflight_check() {
     elif [ "$PREFLIGHT_MODE" = "estimate" ]; then
       local tmp_est
       tmp_est=$(mktemp /tmp/rsync_est.XXXXXX)
+      local -a est_args=("${RSYNC_DEFAULT_ARGS[@]:-}" "--delete" "--dry-run" "--stats")
+      est_args+=("${DEFAULT_EXCLUDES[@]:-}")
+      if [ -n "${RSYNC_EXTRA_EXCLUDES[$i]:-}" ]; then est_args+=("--exclude=${RSYNC_EXTRA_EXCLUDES[$i]}"); fi
+      local est_cmd
       if command -v stdbuf >/dev/null 2>&1; then
-        est_cmd=(stdbuf -oL rsync "${RSYNC_DEFAULT_ARGS[@]:-}" --itemize-changes --stats --dry-run --delete "${src}/" "$REMOTE:$dest")
+        est_cmd=(stdbuf -oL rsync "${est_args[@]}" "${src}/" "$REMOTE:$dest")
       else
-        est_cmd=(rsync "${RSYNC_DEFAULT_ARGS[@]:-}" --itemize-changes --stats --dry-run --delete "${src}/" "$REMOTE:$dest")
+        est_cmd=(rsync "${est_args[@]}" "${src}/" "$REMOTE:$dest")
       fi
       ( "${est_cmd[@]}" 2>&1 | tee "$tmp_est" ) >/dev/null 2>&1 || true
-      estimated_changed=$(grep -i 'Total transferred file size' "$tmp_est" | tail -n1 | awk -F: '{gsub(/[^0-9]/,"",$2); print $2}' || echo 0)
+      local raw_line
+      raw_line=$(grep -i 'Total transferred file size' "$tmp_est" | tail -n1 | awk -F: '{print $2}' | sed -E 's/^\s+//')
+      estimated_changed=$(human_to_bytes "${raw_line}")
       rm -f "$tmp_est" 2>/dev/null || true
+      local human_est human_avail human_buf safety_buffer
+      human_est=$(bytes_human "$estimated_changed")
+      human_avail=$(bytes_human "$avail")
+      local pct_buffer=$(( (estimated_changed * ${PREFLIGHT_BUFFER_PERCENT:-5}) / 100 ))
+      if [ "$pct_buffer" -lt "${PREFLIGHT_MIN_BUFFER_BYTES:-1073741824}" ]; then
+        safety_buffer=${PREFLIGHT_MIN_BUFFER_BYTES:-1073741824}
+      else
+        safety_buffer=$pct_buffer
+      fi
+      human_buf=$(bytes_human "$safety_buffer")
+      log "Estimate preflight ($label -> $dest): est_change=$human_est avail=$human_avail buffer=$human_buf"
     else
       estimated_changed=$src_bytes
     fi
-    # Populate per-label changed bytes array
     estimated_changed_bytes["$label"]=$estimated_changed
 
     local df_out
     df_out=""
     local df_try=0
     while [ $df_try -lt ${DF_RETRY_COUNT:-3} ]; do
-      df_out=$(ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" df -P -B1 "$dest" 2>/dev/null | awk 'NR==2{print $1"|"$3"|"$4"|"$6}' || true)
+      df_out=$(ssh_run df -P -B1 "$dest" 2>/dev/null | awk 'NR==2{print $1"|"$3"|"$4"|"$6}' || true)
       if [ -n "$df_out" ]; then
         break
       fi
@@ -306,7 +383,7 @@ aggregate_preflight_check() {
       log "Aggregate preflight: failed to query remote df for $dest after ${df_try} tries"
       syslog err "Aggregate preflight failed: could not query remote df for $dest"
       echo "Failed to query remote disk usage for $dest" >&2
-      return "${default_fail_code:-2}"
+      return "${DEFAULT_FAIL_CODE:-2}"
     fi
     local device used avail mountp
     device=$(printf '%s' "$df_out" | cut -d'|' -f1)
@@ -320,6 +397,7 @@ aggregate_preflight_check() {
     remote_used["$device"]=$(( ${remote_used["$device"]:-0} + used ))
     remote_avail["$device"]=$avail
     src_by_device["$device"]=$(( ${src_by_device["$device"]:-0} + estimated_changed ))
+    DF_AVAIL_BY_DEST["$dest"]="$avail"
   done
 
   local fail_msg=""
@@ -334,7 +412,7 @@ aggregate_preflight_check() {
     used=${used:-0}
     avail=${avail:-0}
 
-    local pct_buffer=$(( (src_sum * 5) / 100 ))
+    local pct_buffer=$(( (src_sum * ${PREFLIGHT_BUFFER_PERCENT:-5}) / 100 ))
     local safety_buffer
     if [ "$pct_buffer" -lt "$min_buffer" ]; then
       safety_buffer=$min_buffer
@@ -360,47 +438,38 @@ aggregate_preflight_check() {
   fi
   return 0
 }
-
 # --- Main Functions ---
 # Parse an rsync --stats block captured in a raw rsync log file
 parse_rsync_stats() {
   local file="$1"
   local label="$2"
-  local num_files_transferred=0
-  local total_file_size=0
-  local total_transferred_size=0
-  local total_bytes_sent=0
-  local deletes=0
+  local total_file_size_raw=""
+  local total_transferred_raw=""
+  local total_bytes_sent_raw=""
+  local num_files_transferred="0"
+  local deletes_count="0"
+  read -r total_file_size_raw total_transferred_raw total_bytes_sent_raw num_files_transferred deletes_count < <(
+    awk '
+      BEGIN{tfs=""; ttx=""; tbs=""; nft="0"; del=0;}
+      /Total file size/ { sub(/^.*:[[:space:]]*/,"",$0); tfs=$0; next }
+      /Total transferred file size/ { sub(/^.*:[[:space:]]*/,"",$0); ttx=$0; next }
+      /Total bytes sent/ { sub(/^.*:[[:space:]]*/,"",$0); tbs=$0; next }
+      /Number of (regular )?files transferred/ {
+        line=$0; sub(/^.*:[[:space:]]*/,"",line); gsub(",","",line); nft=line; next }
+      /^[[:space:]]*deleting[[:space:]]/ { del++ }
+      /Number of deleted files/ { line=$0; sub(/^.*:[[:space:]]*/,"",line); gsub(",","",line); del=line }
+      END{ printf("%s\t%s\t%s\t%s\t%s\n", tfs, ttx, tbs, nft, del) }
+    ' "$file")
 
-  total_file_size_raw=$(grep -i 'Total file size' "$file" | tail -n1 | sed -E 's/^[^:]*:[[:space:]]*//')
+  local total_file_size total_transferred_size total_bytes_sent deletes
   total_file_size=$(human_to_bytes "$total_file_size_raw")
-  total_transferred_raw=$(grep -i 'Total transferred file size' "$file" | tail -n1 | sed -E 's/^[^:]*:[[:space:]]*//')
   total_transferred_size=$(human_to_bytes "$total_transferred_raw")
-  total_bytes_sent_raw=$(grep -i 'Total bytes sent' "$file" | tail -n1 | sed -E 's/^[^:]*:[[:space:]]*//')
   total_bytes_sent=$(human_to_bytes "$total_bytes_sent_raw")
 
-  num_files_transferred=$(grep -i -E 'Number of (regular )?files transferred' "$file" | tail -n1 | sed -E 's/^[^:]*:[[:space:]]*([0-9,]+).*/\1/' | tr -d ',' )
-  if [ -z "$num_files_transferred" ]; then
-    line=$(grep -i '^Number of files:' "$file" | tail -n1 || true)
-    if [ -n "$line" ]; then
-      if echo "$line" | grep -qi 'reg:'; then
-        num_files_transferred=$(echo "$line" | sed -E 's/.*reg:[[:space:]]*([0-9,]+).*/\1/' | tr -d ',')
-      else
-        num_files_transferred=$(echo "$line" | sed -E 's/^[^:]*:[[:space:]]*([0-9,]+).*/\1/' | tr -d ',')
-      fi
-    fi
-  fi
-
-  deletes=$(grep -i 'Number of deleted files' "$file" | tail -n1 | sed -E 's/^[^:]*:[[:space:]]*([0-9,]+).*/\1/' | tr -d ',' )
-  if [ -z "$deletes" ]; then
-    deletes=$(grep -c -E '^[[:space:]]*deleting ' "$file" 2>/dev/null || echo 0)
-  fi
-
-  num_files_transferred=${num_files_transferred:-0}
-  total_file_size=${total_file_size:-0}
-  total_transferred_size=${total_transferred_size:-0}
-  total_bytes_sent=${total_bytes_sent:-0}
-  deletes=${deletes:-0}
+  num_files_transferred=${num_files_transferred//,/}
+  [[ "$num_files_transferred" =~ ^[0-9]+$ ]] || num_files_transferred=0
+  deletes=${deletes_count//,/}
+  [[ "$deletes" =~ ^[0-9]+$ ]] || deletes=0
 
   local human_total human_transferred human_sent
   human_total=$(bytes_human "$total_file_size")
@@ -419,7 +488,6 @@ parse_rsync_stats() {
     printf '%s: no stats' "$label"
   fi
 }
-
 # --- Helpers Functions ---
 # Map a numeric rsync exit code to a short, human-friendly description used
 rsync_exit_description() {
@@ -467,7 +535,6 @@ extract_rsync_errors() {
   fi
   tail -n "$max_lines" "$file" 2>/dev/null || echo "(no rsync output)"
 }
-
 # --- Main Functions ---
 # Create a compact manifest for `src` containing lines of the form:
 write_manifest() {
@@ -494,7 +561,6 @@ write_manifest() {
     done
   fi
 }
-
 # --- Main Functions ---
 # Compare the current set of files under `src` to the latest stored manifest
 manifest_diff_bytes() {
@@ -528,94 +594,59 @@ manifest_diff_bytes() {
 
   echo "$sum"
 }
-
 # --- Main Functions ---
-# For metadata preflight mode, ensure at least one manifest exists for each configured label
-ensure_manifests_for_labels() {
-  if [ "${PREFLIGHT_MODE:-}" != "metadata" ]; then
-    return 0
+# Unified rsync for a label (handles snapshots, retries, logging, stats)
+rsync_label() {
+  local label="$1" src="$2" dest="$3" extra_exclude="$4" bwlimit="${5:-0}"
+  local exclude_arg=()
+  if [ -n "$extra_exclude" ]; then
+    exclude_arg=("--exclude=$extra_exclude")
   fi
-  local dest="$LOG_FILE_SUBDIR/manifests"
-  mkdir -p "$dest" 2>/dev/null || true
-  for idx in "${!LABELS_ARRAY[@]}"; do
-    label=${LABELS_ARRAY[$idx]}
-    safe_label=${label// /_}
-    latest=$(find "$dest" -maxdepth 1 -type f -name "${safe_label}_manifest_*.txt" -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1{print $2}' || true)
-    if [ -z "$latest" ] || [ ! -f "$latest" ]; then
-      log "No manifest found for $label; creating baseline manifest"
-      write_manifest "$label" "${SRCS_ARRAY[$idx]}"
-    else
-      log "Found existing manifest for $label: $latest"
-    fi
-  done
-}
-
-# --- Main Functions ---
-# Rsync wrapper to captures raw output for diagnostics, parses --stats, and retry logic
-run_rsync() {
-  local src="$1"
-  local dest="$2"
-  shift 2
-  local label="${!#}"
-  local opts=()
-  if [ "$#" -gt 1 ]; then
-    opts=("${@:1:$#-1}")
-  fi
-
   log "Initialize backup ($label --> $DEST_NAS) == $(date)"
-  local -a rsync_args=("${RSYNC_DEFAULT_ARGS[@]:-}" "--partial-dir=${RSYNC_PARTIAL_DIR}")
-  rsync_args+=("${DEFAULT_EXCLUDES[@]:-}")
-  if [ "${#opts[@]}" -ne 0 ]; then
-    rsync_args+=("${opts[@]}")
+  local -a base_args=("${RSYNC_DEFAULT_ARGS[@]:-}" "--partial-dir=${RSYNC_PARTIAL_DIR}")
+  base_args+=("${DEFAULT_EXCLUDES[@]:-}")
+  base_args+=("${exclude_arg[@]}")
+  if [[ "$bwlimit" =~ ^[0-9]+$ ]] && [ "$bwlimit" -gt 0 ]; then
+    base_args+=("--bwlimit=$bwlimit")
   fi
 
-  set +e
-    local attempt=1
-    local last_status=0
-    local tmp_rslog
-    tmp_rslog=$(mktemp /tmp/rsync_raw.XXXXXX)
+  local attempt=1 last_status=0 tmp_rslog
+  tmp_rslog=$(mktemp /tmp/rsync_raw.XXXXXX)
+  while :; do
+    log "RSYNC attempt $attempt/$MAX_RETRIES for $label"
+    local rsync_bin=(rsync)
+    if command -v stdbuf >/dev/null 2>&1; then rsync_bin=(stdbuf -oL rsync); fi
 
-    while :; do
-      log "RSYNC attempt $attempt/$MAX_RETRIES for $label"
-
-    if command -v stdbuf >/dev/null 2>&1; then
-      rsync_bin=(stdbuf -oL rsync)
-    else
-      rsync_bin=(rsync)
-    fi
-
-    # Build a per-attempt copy of rsync args so retries don't accumulate
-    local cur_rsync_args=("${rsync_args[@]:-}")
+    local cur_args=("${base_args[@]}")
+    local effective_dest="$dest"
     if [ "$ENABLE_SNAPSHOTS" = true ]; then
-      safe_label=${label// /_}
-      latest_link="$SNAPSHOT_ROOT/$safe_label/latest"
-      cur_rsync_args+=("--link-dest=$latest_link")
+      local safe_label=${label// /_}
+      local latest_link="$SNAPSHOT_ROOT/$safe_label/latest"
+      cur_args+=("--link-dest=$latest_link")
+      local now
+      now=$(date +%Y%m%d_%H%M%S)
+      effective_dest="$SNAPSHOT_ROOT/$safe_label/$now"
+      ssh_run "mkdir -p '$effective_dest'" 2>/dev/null || true
     fi
 
-    rsync_cmd=("${rsync_bin[@]}" "${cur_rsync_args[@]}" "$src/" "$REMOTE:$dest")
-
+    local rsync_cmd=("${rsync_bin[@]}" "${cur_args[@]}" "$src/" "$REMOTE:$effective_dest")
+    local exec_cmd
     if [ "$USE_IONICE" = true ] && command -v ionice >/dev/null 2>&1; then
-      exec_cmd=(ionice -c2 -n7 nice -n 10 "${rsync_cmd[@]}")
+      exec_cmd=(ionice -c"$IONICE_CLASS" -n"$IONICE_PRIORITY" nice -n "$NICE_LEVEL" "${rsync_cmd[@]}")
     else
       exec_cmd=("${rsync_cmd[@]}")
     fi
-
-    # Log the exact command for debugging
     log "Running: $(printf '%q ' "${exec_cmd[@]}")"
 
-    if [ "$RSYNC_STREAM_TIMESTAMPED_LOG" = true ]; then
-      ( "${exec_cmd[@]}" 2>&1 | tee "$tmp_rslog" ) | while IFS= read -r line; do
-        printf '%s : %s\n' "$(date '+%Y/%m/%d %T')" "$line"
-      done | tee -a "$LOG_FILE"
-      last_status=${PIPESTATUS[0]}
-    else
-      ( "${exec_cmd[@]}" 2>&1 | tee "$tmp_rslog" ) >> "$LOG_FILE"
-      last_status=${PIPESTATUS[0]}
-    fi
+    "${exec_cmd[@]}" 2>&1 \
+      | tee "$tmp_rslog" \
+      | awk '{ cmd="date +%Y/%m/%d%t%T"; cmd | getline ts; close(cmd); print ts, ":", $0 }' \
+      | tee -a "$LOG_FILE" >/dev/null
+    last_status=${PIPESTATUS[0]:-0}
 
     if [ -f "$tmp_rslog" ]; then
-      # Parse stats to populate arrays
       parse_rsync_stats "$tmp_rslog" "$label" >/dev/null 2>&1 || true
+      local ts safe_label saved_copy
       ts=$(date +%Y%m%d_%H%M%S)
       safe_label=${label// /_}
       saved_copy="$PRESERVED_RAW_LOG_DIR/rsync_raw_${safe_label}_${ts}"
@@ -628,117 +659,133 @@ run_rsync() {
       cp "$tmp_rslog" "$saved_copy" 2>/dev/null || true
       chown "$LOG_USER" "$saved_copy" 2>/dev/null || true
       chmod "$LOG_FILE_MODE" "$saved_copy" 2>/dev/null || true
-      rm -f "$tmp_rslog"
-    else
-      :
     fi
 
     if [ "$last_status" -eq 0 ]; then
       if [ "$ENABLE_SNAPSHOTS" = true ]; then
-        safe_label=${label// /_}
-        now=$(date +%Y%m%d_%H%M%S)
-        snap_dest="$SNAPSHOT_ROOT/$safe_label/$now"
-        ssh -p "$SSH_PORT" "$REMOTE" "mkdir -p '$snap_dest'" 2>/dev/null || true
+        local safe_label=${label// /_}
+        ssh_run "ln -snf '$effective_dest' '$SNAPSHOT_ROOT/$safe_label/latest'" || true
+        ssh_run "ls -1dt '$SNAPSHOT_ROOT/$safe_label'/*/ 2>/dev/null | tail -n +$((SNAPSHOT_KEEP+1)) | xargs -r rm -rf --" || true
         write_manifest "$label" "$src"
       fi
-      set -e
-      return 0
+      rsync_results[$label]=0
+      break
     fi
-    # Capture SSH/auth style failures distinctly (rsync commonly returns 255)
+
     if [ "$last_status" -eq 255 ]; then
-      # Extract a probable reason line
       local reason
       reason=$(grep -Ei 'ssh:|permission denied|host key|connection refused|no route to host|timeout' "$tmp_rslog" | tail -n1 || true)
       rsync_ssh_fail["$label"]=1
       rsync_ssh_fail_reason["$label"]=${reason:-"SSH failure"}
     fi
 
-    local should_retry=0
-    if [ -z "${RETRY_ON_CODES:-}" ]; then
-      should_retry=1
-    else
-      for code in $RETRY_ON_CODES; do
-        if [ "$last_status" -eq "$code" ]; then
-          should_retry=1
-          break
-        fi
-      done
-    fi
-
-    if [ "$should_retry" -eq 0 ] || [ "$attempt" -ge "${MAX_RETRIES}" ]; then
+    if ! rsync_should_retry "$last_status" || [ "$attempt" -ge "${MAX_RETRIES}" ]; then
       log "rsync final failure for $label with exit=$last_status after attempt $attempt"
       syslog err "rsync final failure: $label exit=$last_status after attempt $attempt"
-      log "Recent rsync output (tail excerpt):"
-      tail -n 100 "$LOG_FILE" | sed -n '1,200p' | tee -a "$LOG_FILE"
-      set -e
-      return "$last_status"
+      rsync_results[$label]="$last_status"
+      break
     fi
-
-    if [ "$ENABLE_EXPONENTIAL_BACKOFF" = true ]; then
-      backoff=$(( RETRY_BACKOFF * (2 ** (attempt - 1)) ))
-      if [ "$backoff" -gt "$MAX_BACKOFF" ]; then
-        backoff=$MAX_BACKOFF
-      fi
-      jitter=$(( RANDOM % ( (backoff / 2) + 1 ) ))
-      sleep_sec=$(( backoff + jitter ))
-    else
-      sleep_sec=$RETRY_BACKOFF
-    fi
-
+    local sleep_sec
+    sleep_sec=$(compute_backoff "$attempt")
     log "rsync returned $last_status for $label; will retry in ${sleep_sec}s (attempt $attempt/$MAX_RETRIES)"
     if [ "$ENABLE_PER_ATTEMPT_NOTIFY" = true ]; then
+      local desc excerpt runtime_now
       desc=$(rsync_exit_description "$last_status")
-      excerpt=""
-      if [ -f "$tmp_rslog" ]; then
-        excerpt=$(extract_rsync_errors "$tmp_rslog" ${NOTIF_EXCERPT_LINES:-8} 2>/dev/null || true)
-      fi
+      excerpt=$(extract_rsync_errors "$tmp_rslog" ${NOTIF_EXCERPT_LINES:-8} 2>/dev/null || true)
       runtime_now=$(format_runtime)
       body="Label: $label\nAttempt: ${attempt}/${MAX_RETRIES}\nLast exit: ${last_status} -> ${desc}\nBackoff: ${sleep_sec}s\n\nExcerpt:\n${excerpt}\n\nRuntime: ${runtime_now}\nSee log: $LOG_FILE"
       notify_send warning "Remote Backup - RETRY" "$label: retrying (attempt $((attempt+1))/$MAX_RETRIES) in ${sleep_sec}s" "$body"
     fi
-
     sleep "$sleep_sec"
     attempt=$((attempt + 1))
   done
-  set -e
-  return "$last_status"
-}
-
-# --- Main Functions ---
-# Unified label backup (snapshot optional) with extra exclude
-run_label_backup() {
-  local label="$1" src="$2" dest="$3" extra_exclude="$4"
-  local exclude_arg=()
-  if [ -n "$extra_exclude" ]; then
-    exclude_arg=("--exclude=$extra_exclude")
-  fi
-  if [ "$ENABLE_SNAPSHOTS" = true ]; then
-    local now
-    now=$(date '+%Y%m%d_%H%M%S')
-    local safe_label=${label// /_}
-    local snapdir="$SNAPSHOT_ROOT/$safe_label/$now"
-    ssh_run "mkdir -p '$snapdir'" 2>/dev/null || true
-    run_rsync "$src" "$snapdir" "${exclude_arg[@]}" "$label"
-    rsync_results[$label]=$?
-    log "Result: $label rsync exit=${rsync_results[$label]}"
-    if [ "${rsync_results[$label]}" -eq 0 ]; then
-      ssh_run "ln -snf '$snapdir' '$SNAPSHOT_ROOT/$safe_label/latest'"
-      ssh_run "ls -1dt '$SNAPSHOT_ROOT/$safe_label'/*/ 2>/dev/null | tail -n +$((SNAPSHOT_KEEP+1)) | xargs -r rm -rf --" || true
-    fi
-  else
-    run_rsync "$src" "$dest" "${exclude_arg[@]}" "$label"
-    rsync_results[$label]=$?
-    log "Result: $label rsync exit=${rsync_results[$label]}"
-  fi
-  if [ "${rsync_results[$label]}" -ne 0 ]; then
+  rm -f "$tmp_rslog" 2>/dev/null || true
+  if [ "${rsync_results[$label]:-1}" -ne 0 ]; then
     failed_labels+=("$label")
   fi
 }
-
 # --- Main Functions ---
-# Compose final notification (success or failure) and set COMPOSE_* variables
+# Dispatch labels in parallel with per-destination concurrency guards
+run_parallel_backups() {
+  declare -A running_counts
+  declare -A dest_limits
+  declare -A pid_to_dest
+  declare -A pid_to_tmp
+  local -a pids=()
+  for d in "${DESTS_ARRAY[@]}"; do dest_limits["$d"]=${DEST_CONCURRENCY_LIMIT:-1}; done
+  for idx in "${!LABELS_ARRAY[@]}"; do
+    local lbl=${LABELS_ARRAY[$idx]}
+    local src=${SRCS_ARRAY[$idx]}
+    local dest=${DESTS_ARRAY[$idx]}
+    local extra_excl=${RSYNC_EXTRA_EXCLUDES[$idx]:-}
+    local bwl=${RSYNC_BWLIMITS[$idx]:-0}
+    running_counts["$dest"]=${running_counts["$dest"]:-0}
+    while [ "${running_counts[$dest]}" -ge "${dest_limits[$dest]}" ]; do
+      wait -n 2>/dev/null || true
+      for d in "${!running_counts[@]}"; do
+        if [ "${running_counts[$d]}" -gt 0 ]; then running_counts["$d"]=$(( ${running_counts["$d"]} - 1 )); fi
+      done
+    done
+    local tmpf
+    tmpf=$(mktemp /tmp/remote_backup_result.XXXXXX)
+    (
+      preflight_stderr=""
+      if ! preflight_stderr=$(ssh_run "mkdir -p '$dest' && test -d '$dest'" 2>&1 >/dev/null); then
+        local p_reason
+        p_reason=$(classify_ssh_error "$preflight_stderr")
+        log "Preflight SSH/path check failed for $lbl dest $dest (${p_reason})"
+        printf 'label=%s\nexit=%s\nssh_fail=%s\nssh_reason=%s\n' \
+               "$lbl" "255" "1" "$p_reason" >"$tmpf"
+      else
+        rsync_label "$lbl" "$src" "$dest" "$extra_excl" "$bwl"
+        local rc=${rsync_results[$lbl]:-${DEFAULT_FAIL_CODE:-50}}
+        local ssh_f=${rsync_ssh_fail[$lbl]:-0}
+        local ssh_r=${rsync_ssh_fail_reason[$lbl]:-}
+        printf 'label=%s\nexit=%s\nssh_fail=%s\nssh_reason=%s\n' \
+               "$lbl" "$rc" "$ssh_f" "$ssh_r" >"$tmpf"
+      fi
+    ) &
+    local pid=$!
+    pids+=("$pid")
+    pid_to_dest["$pid"]="$dest"
+    pid_to_tmp["$pid"]="$tmpf"
+    running_counts["$dest"]=$(( ${running_counts["$dest"]} + 1 ))
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+    local tf
+    tf=${pid_to_tmp[$pid]:-}
+    if [ -n "$tf" ] && [ -f "$tf" ]; then
+      local _label _exit _ssh_fail _ssh_reason
+      _label=""; _exit=""; _ssh_fail="0"; _ssh_reason=""
+      while IFS='=' read -r k v; do
+        case "$k" in
+          label) _label="$v" ;;
+          exit) _exit="$v" ;;
+          ssh_fail) _ssh_fail="$v" ;;
+          ssh_reason) _ssh_reason="$v" ;;
+        esac
+      done <"$tf"
+      if [ -n "$_label" ]; then
+        rsync_results["$_label"]="${_exit:-${DEFAULT_FAIL_CODE:-50}}"
+        if [[ "${_exit:-${DEFAULT_FAIL_CODE:-50}}" -ne 0 ]]; then
+          failed_labels+=("$_label")
+        fi
+        rsync_ssh_fail["$_label"]="${_ssh_fail:-0}"
+        rsync_ssh_fail_reason["$_label"]="${_ssh_reason:-}"
+      fi
+      rm -f "$tf" 2>/dev/null || true
+    fi
+    local d=${pid_to_dest[$pid]:-}
+    if [ -n "$d" ] && [ "${running_counts[$d]:-0}" -gt 0 ]; then
+      running_counts["$d"]=$(( ${running_counts["$d"]} - 1 ))
+    fi
+  done
+}
+# --- Main Functions ---
+# Compose final notification (success or failure)
 compose_notification() {
-  local status="$1" # 0 success, 1 failure
+  local status="$1"
   local runtime_now
   runtime_now=$(format_runtime)
   local esub level detail body
@@ -767,13 +814,11 @@ compose_notification() {
       fi
       if [ "${rsync_ssh_fail[$lbl]:-0}" -eq 1 ]; then
         ssh_fail_section+="$lbl: ${rsync_ssh_fail_reason[$lbl]:-SSH failure}\n"
-        # Increment aggregated reason count
         rkey="${rsync_ssh_fail_reason[$lbl]:-SSH failure}"
         ssh_reason_counts["$rkey"]=$(( ${ssh_reason_counts["$rkey"]:-0} + 1 ))
       fi
     done
     if [ -n "$ssh_fail_section" ]; then
-      # Build summary line of counts per distinct reason
       for rkey in "${!ssh_reason_counts[@]}"; do
         ssh_reason_summary+="$rkey=${ssh_reason_counts[$rkey]} "
       done
@@ -830,13 +875,15 @@ compose_notification() {
     if [ "$extra_count" -gt 0 ]; then
       condensed_line+=" | +${extra_count} more"
     fi
-
-    # Space summary per label (simplified)
     for idx in "${!LABELS_ARRAY[@]}"; do
       local lbl=${LABELS_ARRAY[$idx]} dest=${DESTS_ARRAY[$idx]} req_bytes req_human df_avail free_bytes free_human req_pct_of_free
       req_bytes=${rsync_transferred_bytes[$lbl]:-0}
       req_human=$(bytes_human "$req_bytes")
-      df_avail=$(ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" df -P -B1 "$dest" 2>/dev/null | awk 'NR==2{print $4}' || true)
+      if [ -n "${DF_AVAIL_BY_DEST[$dest]:-}" ]; then
+        df_avail=${DF_AVAIL_BY_DEST[$dest]}
+      else
+        df_avail=$(ssh_run df -P -B1 "$dest" 2>/dev/null | awk 'NR==2{print $4}' || true)
+      fi
       [[ ! "$df_avail" =~ ^[0-9]+$ ]] && df_avail=0
       free_bytes=$df_avail
       free_human=$(bytes_human "$free_bytes")
@@ -856,7 +903,6 @@ compose_notification() {
   COMPOSE_BODY="$body"
   return 0
 }
-
 # --- Main Functions ---
 # Prune old log files to retention aligned with MAX_LOGS
 prune_old_logs() {
@@ -896,7 +942,6 @@ prune_old_logs() {
     done
   fi
 }
-
 # --- Main Functions ---
 # Gather small read-only remote artifacts (df, snapshot listings) used by notifications. 
 collect_notification_artifacts() {
@@ -909,7 +954,7 @@ collect_notification_artifacts() {
   notify_df_file="$outdir/remote_df_${ts}.txt"
   notify_snap_file="$outdir/snapshots_${ts}.txt"
 
-  if ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$SSH_PORT" "$REMOTE" "df -h" > "$notify_df_file" 2>/dev/null; then
+  if ssh_run "df -h" > "$notify_df_file" 2>/dev/null; then
     :
   else
     echo "(remote df unavailable)" > "$notify_df_file"
@@ -920,7 +965,7 @@ collect_notification_artifacts() {
   : > "$notify_snap_file"
   for lbl in "${LABELS_ARRAY[@]}"; do
     safe_label=${lbl// /_}
-    if ssh -o BatchMode=yes -o ConnectTimeout=5 -p "$SSH_PORT" "$REMOTE" "readlink -f '$SNAPSHOT_ROOT/$safe_label/latest' 2>/dev/null || echo '(no latest)'" >> "$notify_snap_file" 2>/dev/null; then
+    if ssh_run "readlink -f '$SNAPSHOT_ROOT/$safe_label/latest' 2>/dev/null || echo '(no latest)'" >> "$notify_snap_file" 2>/dev/null; then
       :
     else
       echo "${lbl}: (snapshot info unavailable)" >> "$notify_snap_file"
@@ -938,175 +983,169 @@ main() {
   # Record script start time
   start_time=$(date +%s)
   log "$SRC_NAS --> $DEST_NAS start: $(date)"
-
-# Wake-on-LAN
-if command -v etherwake >/dev/null 2>&1; then
-  etherwake "$REMOTE_MAC" || true
-  log "Sent Wake-on-LAN to $DEST_NAS (MAC: $REMOTE_MAC)"
-elif command -v wakeonlan >/dev/null 2>&1; then
-  wakeonlan "$REMOTE_MAC" || true
-  log "Sent Wake-on-LAN via wakeonlan to $DEST_NAS (MAC: $REMOTE_MAC)"
-else
-  log "Wake-on-LAN tool not found (etherwake/wakeonlan). Skipping WOL for $DEST_NAS (MAC: $REMOTE_MAC)"
-fi
-
-## Wait loop for SSH readiness
-start_wait_ts=$(now_s)
-log "Waiting up to ${MAX_SSH_WAIT}s for $DEST_NAS SSH to become available..."
-ssh_reachable=0
-while :; do
-  elapsed=$(elapsed_since "$start_wait_ts")
-  if ssh_stderr=$(ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" true 2>&1 >/dev/null); then
-    remaining=$(( MAX_SSH_WAIT - elapsed ))
-    (( remaining < 0 )) && remaining=0
-    log "$DEST_NAS SSH is reachable after ${elapsed}s (timeout in ${remaining}s)"
-
-    stab_start_ts=$(now_s)
-    log "Waiting up to ${STABILIZE_WAIT}s for remote filesystem readiness..."
-    while :; do
-      stab_elapsed=$(elapsed_since "$stab_start_ts")
-      if ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" df -P -B1 / >/dev/null 2>&1; then
-        log "Remote filesystem responded to df after ${stab_elapsed}s; proceeding"
-        break
-      fi
-      if (( stab_elapsed >= STABILIZE_WAIT )); then
-        log "Remote filesystem did not stabilize within ${STABILIZE_WAIT}s; proceeding anyway (df may fail)"
-        break
-      fi
-      sleep "$STABILIZE_INTERVAL"
-    done
-
-    arr_start_ts=$(now_s)
-    log "Waiting up to ${ARRAY_READY_WAIT}s for remote array (/mnt/user) readiness..."
-    while :; do
-      arr_elapsed=$(elapsed_since "$arr_start_ts")
-      if ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" '[ -d /mnt/user ] && { [ -d /mnt/user/media ] || [ -d /mnt/user/secure ]; }'; then
-        log "Remote array appears online after ${arr_elapsed}s; proceeding to backup operations."
-        break
-      fi
-      if (( arr_elapsed >= ARRAY_READY_WAIT )); then
-        log "Remote array not confirmed online within ${ARRAY_READY_WAIT}s; proceeding anyway (rsync may encounter missing shares)."
-        break
-      fi
-      sleep "$ARRAY_READY_INTERVAL"
-    done
-    ssh_reachable=1
-    break
-  fi
-  if (( elapsed >= MAX_SSH_WAIT )); then
-    log "Timeout waiting for SSH on $DEST_NAS after ${elapsed}s"
-    break
-  fi
-  remaining=$(( MAX_SSH_WAIT - elapsed ))
-  log "$DEST_NAS SSH not available yet; sleeping ${SSH_WAIT_INTERVAL}s (remaining ${remaining}s)"
-  sleep "$SSH_WAIT_INTERVAL"
-done
-if [ "$ssh_reachable" -eq 0 ]; then
-  log "SSH not reachable on $DEST_NAS after ${MAX_SSH_WAIT}s; aborting backup"
-  syslog crit "Remote SSH unreachable on $DEST_NAS after ${MAX_SSH_WAIT}s; aborting"
-  runtime_now=$(format_runtime)
-  esub=$(notif_emoji fail)
-  local reason=""
-  if [ -n "${ssh_stderr:-}" ]; then
-    reason=$(classify_ssh_error "$ssh_stderr")
-  fi
-  body="Waited ${MAX_SSH_WAIT}s for SSH on ${DEST_NAS} (host: ${REMOTE}).\n"
-  if [ -n "$reason" ]; then
-    body+="Reason: ${reason}\n\n"
+  # Wake-on-LAN
+  if command -v etherwake >/dev/null 2>&1; then
+    etherwake "$REMOTE_MAC" || true
+    log "Sent Wake-on-LAN to $DEST_NAS (MAC: $REMOTE_MAC)"
+  elif command -v wakeonlan >/dev/null 2>&1; then
+    wakeonlan "$REMOTE_MAC" || true
+    log "Sent Wake-on-LAN via wakeonlan to $DEST_NAS (MAC: $REMOTE_MAC)"
   else
-    body+=$'Reason: (generic unreachable)\n\n'
+    log "Wake-on-LAN tool not found (etherwake/wakeonlan). Skipping WOL for $DEST_NAS (MAC: $REMOTE_MAC)"
   fi
-  if [ -n "${REMOTE_MAC:-}" ]; then
-    body+="WOL MAC: ${REMOTE_MAC}\n"
-  fi
-  body+=$'Suggested checks:\n- Network connectivity and firewall\n- Remote host power state\n- SSH service status on remote\n\n'
-  body+="Runtime: ${runtime_now}\nSee log: ${LOG_FILE}"
-  notify_send alert "Remote Backup - SSH UNREACHABLE" "${esub} Remote ${DEST_NAS}: SSH unreachable; backup aborted" "$body"
-  exit ${DEFAULT_FAIL_CODE:-50}
-fi
 
-## Per-label backup execution
-declare -A rsync_results
-failed_labels=()
-declare -A rsync_total_bytes
-declare -A rsync_transferred_bytes
-declare -A rsync_files
-declare -A rsync_deletes
-declare -A rsync_bytes_sent
-declare -A estimated_changed_bytes 
-declare -A rsync_ssh_fail
-declare -A rsync_ssh_fail_reason
-
-agg_msg=""
-
-# Ensure manifests exist for all labels
-ensure_manifests_for_labels || true
-
-if ! agg_msg=$(aggregate_preflight_check 2>&1); then
-  log "Aggregate preflight failed: $agg_msg"
-  runtime_now=$(format_runtime)
-  body="$agg_msg\n\nRuntime: ${runtime_now}\nSee log: $LOG_FILE"
-  notify_send alert "Remote Backup - NO SPACE" "Aggregate preflight failed: insufficient remote space" "$body"
-  for lbl in "${LABELS_ARRAY[@]}"; do
-    rsync_results["$lbl"]=2
-    failed_labels+=("$lbl")
-  done
-else
-  log "Aggregate preflight passed: proceeding with per-label rsyncs"
-  for idx in "${!LABELS_ARRAY[@]}"; do
-    lbl=${LABELS_ARRAY[$idx]}
-    src=${SRCS_ARRAY[$idx]}
-    dest=${DESTS_ARRAY[$idx]}
-    extra_excl=${RSYNC_EXTRA_EXCLUDES[$idx]:-}
-    # Preflight SSH accessibility (auth/path) for this destination to catch auth issues early
-    preflight_stderr=""
-    if ! preflight_stderr=$(ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -p "$SSH_PORT" "$REMOTE" "mkdir -p '$dest' && test -d '$dest'" 2>&1 >/dev/null); then
-      local p_reason
-      p_reason=$(classify_ssh_error "$preflight_stderr")
-      log "Preflight SSH/path check failed for $lbl dest $dest (${p_reason})"
-      failed_labels+=("$lbl")
-      rsync_results["$lbl"]=255
-      rsync_ssh_fail["$lbl"]=1
-      rsync_ssh_fail_reason["$lbl"]="$p_reason"
-      continue
+  ## Wait loop for SSH readiness
+  start_wait_ts=$(now_s)
+  log "Waiting up to ${MAX_SSH_WAIT}s for $DEST_NAS SSH to become available..."
+  ssh_reachable=0; fs_ready=0; array_ready=0
+  fs_deadline=0; array_deadline=0
+  while :; do
+    elapsed=$(elapsed_since "$start_wait_ts")
+    # Stage 1: SSH
+    if [ $ssh_reachable -eq 0 ]; then
+      if ssh_stderr=$(ssh_run true 2>&1 >/dev/null); then
+        ssh_reachable=1
+        remaining=$(( MAX_SSH_WAIT - elapsed )); (( remaining < 0 )) && remaining=0
+        log "$DEST_NAS SSH reachable after ${elapsed}s (timeout in ${remaining}s)"
+        fs_deadline=$(( $(now_s) + STABILIZE_WAIT ))
+        continue
+      fi
+      if (( elapsed >= MAX_SSH_WAIT )); then
+        log "Timeout waiting for SSH on $DEST_NAS after ${elapsed}s"
+        break
+      fi
+      sleep "$SSH_WAIT_INTERVAL"; continue
     fi
-    run_label_backup "$lbl" "$src" "$dest" "$extra_excl"
+    # Stage 2: Filesystem readiness (df)
+    if [ $fs_ready -eq 0 ]; then
+      if ssh_run df -P -B1 / >/dev/null 2>&1; then
+        fs_ready=1
+        log "Remote filesystem responded to df; proceeding"
+        array_deadline=$(( $(now_s) + ARRAY_READY_WAIT ))
+        continue
+      fi
+      if [ "${STABILIZE_WAIT}" -gt 0 ]; then
+        now_chk=$(now_s)
+        if [ "$now_chk" -ge "$fs_deadline" ]; then
+          log "Remote filesystem did not stabilize within ${STABILIZE_WAIT}s; proceeding anyway (df may fail)"
+          fs_ready=1
+          array_deadline=$(( $(now_s) + ARRAY_READY_WAIT ))
+          continue
+        fi
+      fi
+      sleep "$STABILIZE_INTERVAL"; continue
+    fi
+    # Stage 3: Array readiness
+    if [ $array_ready -eq 0 ]; then
+      if ssh_run '[ -d /mnt/user ] && { [ -d /mnt/user/media ] || [ -d /mnt/user/secure ]; }'; then
+        array_ready=1
+        log "Remote array appears online; proceeding to backup operations."
+        break
+      fi
+      if [ "${ARRAY_READY_WAIT}" -gt 0 ]; then
+        now_chk2=$(now_s)
+        if [ "$now_chk2" -ge "$array_deadline" ]; then
+          log "Remote array not confirmed online within ${ARRAY_READY_WAIT}s; proceeding anyway (rsync may encounter missing shares)."
+          array_ready=1
+          break
+        fi
+      fi
+      sleep "$ARRAY_READY_INTERVAL"; continue
+    fi
+    if [ $ssh_reachable -eq 1 ] && [ $fs_ready -eq 1 ] && [ $array_ready -eq 1 ]; then
+      break
+    fi
   done
-fi
-
-# Aggregate overall status: 0 OK, 1 failure
-if [ "${#failed_labels[@]}" -eq 0 ]; then
-  backup_status=0
-else
-  backup_status=1
-fi
-
-## Verification, notification and (optional) shutdown
-collect_notification_artifacts || true
-compose_notification "$backup_status"
-log "$SRC_NAS --> $DEST_NAS complete == $(format_runtime)"
-notify_send "$COMPOSE_LEVEL" "Remote Backup - $( [ "$backup_status" -eq 0 ] && echo OK || echo FAIL)" "$COMPOSE_DETAIL" "$COMPOSE_BODY"
-if [ "$backup_status" -eq 0 ]; then
-  log "Shutting down remote after successful backup"
-  if ! ssh -p "$SSH_PORT" "$REMOTE" "df --type=xfs -h && powerdown" 2>/dev/null; then
-    log "Remote shutdown command failed"
-    syslog err "Remote shutdown command failed on $REMOTE"
+  if [ "$ssh_reachable" -eq 0 ]; then
+    log "SSH not reachable on $DEST_NAS after ${MAX_SSH_WAIT}s; aborting backup"
+    syslog crit "Remote SSH unreachable on $DEST_NAS after ${MAX_SSH_WAIT}s; aborting"
+    runtime_now=$(format_runtime)
+    esub=$(notif_emoji fail)
+    local reason=""
+    if [ -n "${ssh_stderr:-}" ]; then
+      reason=$(classify_ssh_error "$ssh_stderr")
+    fi
+    body="Waited ${MAX_SSH_WAIT}s for SSH on ${DEST_NAS} (host: ${REMOTE}).\n"
+    if [ -n "$reason" ]; then
+      body+="Reason: ${reason}\n\n"
+    else
+      body+=$'Reason: (generic unreachable)\n\n'
+    fi
+    if [ -n "${REMOTE_MAC:-}" ]; then
+      body+="WOL MAC: ${REMOTE_MAC}\n"
+    fi
+    body+=$'Suggested checks:\n- Network connectivity and firewall\n- Remote host power state\n- SSH service status on remote\n\n'
+    body+="Runtime: ${runtime_now}\nSee log: ${LOG_FILE}"
+    notify_send alert "Remote Backup - SSH UNREACHABLE" "${esub} Remote ${DEST_NAS}: SSH unreachable; backup aborted" "$body"
+    exit ${DEFAULT_FAIL_CODE:-50}
   fi
-  sleep 5s
-else
-  if [ "$SHUTDOWN_ON_FAILURE" = true ]; then
-    log "Shutdown_on_failure=true; requesting remote powerdown despite failures"
-    if ! ssh -p "$SSH_PORT" "$REMOTE" "df --type=xfs -h && powerdown" 2>/dev/null; then
+
+  # Ensure manifests exist for all labels
+  agg_msg=""
+  if ! agg_msg=$(preflight_labels 2>&1); then
+    log "Aggregate preflight failed: $agg_msg"
+    runtime_now=$(format_runtime)
+    body="$agg_msg\n\nRuntime: ${runtime_now}\nSee log: $LOG_FILE"
+    notify_send alert "Remote Backup - NO SPACE" "Aggregate preflight failed: insufficient remote space" "$body"
+    for lbl in "${LABELS_ARRAY[@]}"; do
+      rsync_results["$lbl"]=2
+      failed_labels+=("$lbl")
+    done
+  else
+    log "Aggregate preflight passed: proceeding with per-label rsyncs"
+    if [ "$ENABLE_PARALLEL" = true ]; then
+      run_parallel_backups
+    else
+      for idx in "${!LABELS_ARRAY[@]}"; do
+        lbl=${LABELS_ARRAY[$idx]}
+        src=${SRCS_ARRAY[$idx]}
+        dest=${DESTS_ARRAY[$idx]}
+        extra_excl=${RSYNC_EXTRA_EXCLUDES[$idx]:-}
+        bwl=${RSYNC_BWLIMITS[$idx]:-0}
+        preflight_stderr=""
+        if ! preflight_stderr=$(ssh_run "mkdir -p '$dest' && test -d '$dest'" 2>&1 >/dev/null); then
+          local p_reason
+          p_reason=$(classify_ssh_error "$preflight_stderr")
+          log "Preflight SSH/path check failed for $lbl dest $dest (${p_reason})"
+          failed_labels+=("$lbl")
+          rsync_results["$lbl"]=255
+          rsync_ssh_fail["$lbl"]=1
+          rsync_ssh_fail_reason["$lbl"]="$p_reason"
+          continue
+        fi
+        rsync_label "$lbl" "$src" "$dest" "$extra_excl" "$bwl"
+      done
+    fi
+  fi
+
+  ## Verification, notification and (optional) shutdown
+  collect_notification_artifacts || true
+  # Derive status inline: 0=success,1=failure
+  local _status
+  [ "${#failed_labels[@]}" -eq 0 ] && _status=0 || _status=1
+  compose_notification "$_status"
+  log "$SRC_NAS --> $DEST_NAS complete == $(format_runtime)"
+  notify_send "$COMPOSE_LEVEL" "Remote Backup - $( [ "${#failed_labels[@]}" -eq 0 ] && echo OK || echo FAIL)" "$COMPOSE_DETAIL" "$COMPOSE_BODY"
+  if [ "${#failed_labels[@]}" -eq 0 ]; then
+    log "Shutting down remote after successful backup"
+    if ! ssh_run "df --type=xfs -h && powerdown" 2>/dev/null; then
       log "Remote shutdown command failed"
       syslog err "Remote shutdown command failed on $REMOTE"
     fi
+    sleep 5s
   else
-    log "Not shutting down remote because SHUTDOWN_ON_FAILURE=false"
+    if [ "$SHUTDOWN_ON_FAILURE" = true ]; then
+      log "Shutdown_on_failure=true; requesting remote powerdown despite failures"
+      if ! ssh_run "df --type=xfs -h && powerdown" 2>/dev/null; then
+        log "Remote shutdown command failed"
+        syslog err "Remote shutdown command failed on $REMOTE"
+      fi
+    else
+      log "Not shutting down remote because SHUTDOWN_ON_FAILURE=false"
+    fi
   fi
-fi
-prune_old_logs || true
-exit 0
-}
-
-# Entry Point
+  prune_old_logs || true
+  exit 0
+  }
+# Entry Point Exit
 main "$@"
