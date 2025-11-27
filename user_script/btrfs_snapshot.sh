@@ -550,11 +550,17 @@ if [ -x /usr/local/emhttp/webGui/scripts/notify ]; then
     log "DEBUG mode: Notification suppressed. Summary: $notify_subject - $notify_short"
   else
     if [ "${status_text:-OK}" != "OK" ]; then
+      notify_icon="normal"
+      case "$status_text" in
+        WARNING) notify_icon="warning" ;;
+        CRITICAL) notify_icon="alert" ;;
+        *) notify_icon="normal" ;;
+      esac
       /usr/local/emhttp/webGui/scripts/notify \
-        -e "BTRFS Snapshot" \
-        -s "$notify_subject" \
-        -d "$notify_body" \
-        -i "warning"
+        -s "BTRFS Snapshot" \
+        -d "$notify_subject" \
+        -m "$notify_body"$'\n\n'"$notify_short" \
+        -i "$notify_icon"
     else
       log "Status OK: Notification suppressed. Summary: $notify_subject - $notify_short"
     fi
