@@ -82,6 +82,8 @@ IO_ERROR_MONITOR_ENABLED=1                      # Enable syslog scanning for dis
 IO_ERROR_DEDUP_ENABLED=1                        # De-duplicate identical message hashes inside window (0=disable)
 
 # === SMART / Endurance / Trend Parameters ===
+PARITY_SYNC_ERR_WARN=1                          # Parity sync errors threshold for warning alert
+PARITY_SYNC_ERR_CRIT=10                         # Parity sync errors threshold for critical alert
 POH_RESET_CRIT_THRESHOLD=500                    # POH drop > threshold -> critical reset event
 SMART_ATTR_TREND_WINDOW_DAYS=7                  # Days window for SMART attribute growth trend
 SMART_ATTR_TREND_TOP_N=5                        # Top N disks by summed attribute delta
@@ -1085,6 +1087,15 @@ discover_parity_and_status() {
                 if [[ -n "$errs" ]]; then PARITY_DETAILS_SECTION+=" - Errors: ${errs}\n"; fi
                 # Persist current position snapshot for next run speed/ETA calculation
                 if [[ -n "$pos" ]]; then echo "$pos $curr_ts" > "$progress_file" 2>/dev/null || true; fi
+                # Parity sync error alerts (no new function). Use thresholds if defined.
+                if [[ -n "$errs" && "$errs" =~ ^[0-9]+$ && "$action_word" != "idle" ]]; then
+                    local perr_warn=${PARITY_SYNC_ERR_WARN:-1} perr_crit=${PARITY_SYNC_ERR_CRIT:-10}
+                    if (( errs >= perr_crit )); then
+                        record_alert critical "Parity Sync Errors" "Parity operation has ${errs} sync errors; investigate disks (SMART long tests), cabling, and consider corrective check."
+                    elif (( errs >= perr_warn )); then
+                        record_alert warning "Parity Sync Errors" "Parity operation reported ${errs} sync errors; monitor; if increasing run a correcting parity check and inspect recent SMART logs."
+                    fi
+                fi
             fi
         fi
     else
@@ -3180,6 +3191,28 @@ build_storage_and_disk_lines() {
             fi
             devlist=$(btrfs filesystem show "$p" 2>/dev/null | awk '/devid/ && /path/ {for(i=1;i<=NF;i++){if($i=="path"){print $(i+1)}}}');
             [[ -z "$devlist" ]] && devlist=$(btrfs filesystem show "$p" 2>/dev/null | awk '/devid/ {print $NF}')
+                    # Btrfs profile mismatch / unbalanced detection
+                    if [[ -n "$prof_data" && -n "$prof_meta" ]]; then
+                        local pd_norm pm_norm
+                        pd_norm=$(echo "$prof_data" | tr '[:lower:]' '[:upper:]')
+                        pm_norm=$(echo "$prof_meta" | tr '[:lower:]' '[:upper:]')
+                        local devcnt
+                        devcnt=$(echo "$devlist" | awk 'NF' | wc -l | awk '{print $1}')
+                        # Mismatch: one redundant, other single
+                        if [[ "$pd_norm" =~ RAID[0-9]+ && "$pm_norm" == SINGLE ]]; then
+                            record_alert warning "Btrfs Profile" "Pool $(basename "$p") metadata SINGLE but data $pd_norm; consider 'btrfs balance start -mconvert=$pd_norm'"
+                        elif [[ "$pm_norm" =~ RAID[0-9]+ && "$pd_norm" == SINGLE ]]; then
+                            record_alert warning "Btrfs Profile" "Pool $(basename "$p") data SINGLE but metadata $pm_norm; consider 'btrfs balance start -dconvert=$pm_norm'"
+                        fi
+                        # Unbalanced: multiple devices but single profile (no redundancy)
+                        if [[ "$devcnt" =~ ^[0-9]+$ && $devcnt -ge 2 && "$pd_norm" == SINGLE ]]; then
+                            record_alert warning "Btrfs Unbalanced" "Pool $(basename "$p") has $devcnt devices with data profile SINGLE; add redundancy via 'btrfs balance start -dconvert=raid1 -mconvert=raid1'"
+                        fi
+                        # RAID1 profile with only one device present
+                        if [[ "$devcnt" =~ ^[0-9]+$ && $devcnt -lt 2 && "$pd_norm" == RAID1 ]]; then
+                            record_alert warning "Btrfs Unbalanced" "Pool $(basename "$p") data profile RAID1 but only $devcnt device; convert to SINGLE or add a second device."
+                        fi
+                    fi
         else
             devlist=$(findmnt -n -o SOURCE "$p" 2>/dev/null || true)
             raid_str="(SINGLE)"
@@ -3607,6 +3640,21 @@ build_health_alerts() {
                     [[ -n "$mnt_ref" ]] && rec+="- $mnt_ref (Btrfs): Unrecoverable errors; backup; inspect device(s); rerun scrub.\n" ;;
                 *"scrub corrected="*)
                     [[ -n "$mnt_ref" ]] && rec+="- $mnt_ref (Btrfs): Corrected errors; monitor; consider more frequent scrubs.\n" ;;
+                *"Parity Sync Errors"*)
+                    if [[ -n "$friendly" ]]; then
+                        rec+="- $display_friendly$model_suffix: Parity sync reported errors; run SMART long tests, inspect cabling/backplane, consider a correcting parity check.\n"
+                        [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
+                    fi ;;
+                *"Btrfs Profile"*)
+                    if [[ -n "$friendly" ]]; then
+                        rec+="- $display_friendly$model_suffix: Btrfs data/metadata profile mismatch; align via 'btrfs balance start -dconvert=raid1 -mconvert=raid1' (use appropriate target).\n"
+                        [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
+                    fi ;;
+                *"Btrfs Unbalanced"*)
+                    if [[ -n "$friendly" ]]; then
+                        rec+="- $display_friendly$model_suffix: Btrfs pool redundancy not configured or insufficient devices; add a second device or convert profiles (e.g., raid1).\n"
+                        [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
+                    fi ;;
                 *"XFS metadata issue"*)
                     [[ -n "$mnt_ref" ]] && rec+="- $mnt_ref (XFS): Metadata issue; schedule offline xfs_repair; backup first.\n" ;;
                 *"Array usage "*|*"Pools usage "*)
@@ -4742,7 +4790,7 @@ build_trend_section() {
                         disk=${disk//\"/}
                         local rate pct
                         rate=$(format_rate_dg "$pd")
-                        if (( sz>0 )); then pct=$(awk -v pd="$pd" -v sz="$sz" 'BEGIN{printf "%.2f", (pd/sz)*100}'); _items_shrink+=("⬇️${disk} -${rate} (${pct}%)"); else _items_shrink+=("⬇️${disk} -${rate}"); fi
+                        if (( sz>0 )); then pct=$(awk -v pd="$pd" -v sz="$sz" 'BEGIN{printf "%.2f", (pd/sz)*100}'); _items_shrink+=("🔻${disk} -${rate} (${pct}%)"); else _items_shrink+=("🔻${disk} -${rate}"); fi
                     done < <(printf "%s\n" "$_sorted_s")
                 fi
                 if (( ${#_items_growth[@]} + ${#_items_shrink[@]} > 0 )); then
@@ -4804,7 +4852,7 @@ build_trend_section() {
                     while read -r pd s; do
                         [[ -z "$s" ]] && continue
                         local rate; rate=$(_share_rate_fmt "$pd")
-                        _share_shrink_items+=("⬇️${s} -${rate}")
+                        _share_shrink_items+=("🔻${s} -${rate}")
                     done < <(printf "%s\n" "$_sorted_ss")
                 fi
                 if (( ${#_share_growth_items[@]} + ${#_share_shrink_items[@]} > 0 )); then
@@ -4930,7 +4978,7 @@ build_trend_section() {
                 [[ -z "$_dpart" ]] && continue
                 if [[ "$_dpart" =~ -[0-9] ]]; then _dl_items+=("$_dpart"); else _dl_items+=("🔺$_dpart"); fi
             done
-            [[ ${#_dl_items[@]} -gt 0 ]] && _add_line "DL↓" "$(IFS=' | '; echo "${_dl_items[*]}")"
+            [[ ${#_dl_items[@]} -gt 0 ]] && _add_line "DL🔻" "$(IFS=' | '; echo "${_dl_items[*]}")"
         fi
         if [[ -n "${EARLY_ERR_LINE:-}" ]]; then
             local _err_items=() _epart
