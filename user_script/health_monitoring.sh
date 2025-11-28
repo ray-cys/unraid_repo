@@ -104,8 +104,8 @@ SATA_LINK_INSTABILITY_STREAK_WARN=2             # Consecutive days with downshif
 SATA_LINK_INSTABILITY_STREAK_CRIT=5             # Consecutive days with downshift events -> critical
 
 # === Export / History / Logging ===
-HISTORY_WINDOW_DAYS=7                           # Days considered for usage growth trends
-DYNAMIC_GROWTH=1                                # Use first vs last sample over actual elapsed days
+HISTORY_WINDOW_DAYS=14                          # Days considered for usage growth trends
+DYNAMIC_GROWTH=0                                # Use first vs last sample over actual elapsed days
 SHARE_TOP_N=5                                   # Top N shares by size/growth
 LOG_PRUNE_ENABLED=1                             # Prune old run logs in LOG_DIR
 LOG_MAX_DAYS=0                                  # Age pruning days (0=disable)
@@ -125,8 +125,7 @@ ENDURANCE_TREND_TOP_N=5                         # Top N devices to display per t
 ENDURANCE_TREND_MIN_POH_DELTA=24                # Min POH hour delta to include device
 
 # === Display / Notification Preferences ===
-FORECAST_MIN_VISIBLE=0.1                        # Percent below which show ~0% label
-FORECAST_ZERO_LABEL="~0%"                       # Label for very small growth percentages
+FORECAST_PRECISION_DECIMALS=3                   # Decimals to show for daily percent growth
 SHOW_SUBSYSTEMS_BLOCK="auto"                    # Subsystems block policy (auto|always|never)
 SHOW_OK_SUBSYSTEMS=0                            # Hide OK subsystems if any WARN/CRIT exist (0=show)
 SHOW_DISABLED_SUBSYSTEMS=0                      # Hide Disabled subsystems in description/body (0=show)
@@ -5423,14 +5422,12 @@ capacity_forecast_and_export() {
         days_to_pool_thresh="INF"
     fi
     fmt_growth() {
-        # Format daily growth (milli-percent units) with small-growth suppression
+        # Format daily growth with higher precision
         local gm="$1"
-        if (( gm <= $(convert_pct_to_milli "$FORECAST_MIN_VISIBLE") )); then
-            printf "%s" "$FORECAST_ZERO_LABEL"
-        else
-            local whole=$(( gm / 1000 )) frac=$(( gm % 1000 ))
-            printf "%s" "$(printf '%d.%03d%%' "$whole" "$frac")"
-        fi
+        if (( gm <= 0 )); then printf "0%%"; return; fi
+        # Convert milli-percent to percent float with configured decimals
+        local decs=${FORECAST_PRECISION_DECIMALS:-3}
+        awk -v m="$gm" -v d="$decs" 'BEGIN{p=m/1000.0; fmt="%0."d"f%%"; printf(fmt,p)}'
     }
     local arr_g_str pool_g_str
     arr_g_str=$(fmt_growth "$arr_growth_m")
