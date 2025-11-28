@@ -1,7 +1,5 @@
 #!/bin/bash
 set -euo pipefail
-set -E
-trap 'log_crit "Script aborted at line ${LINENO} (status=$?): in ${FUNCNAME[*]:-main}"' ERR
 LOCKFILE="/tmp/health_monitoring.lock"
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
@@ -289,19 +287,10 @@ declare -A LONG_TEST_RUNNING_LONG                 # Map device -> 1 if a long/ex
 declare -A RISK_SPIKE_TS                          # Map device -> epoch timestamp of last captured risk spike
 
 # === Logs Paths ===
-LOG_DIR="/mnt/cache/system/logs/disk_health"      # Base directory for logs files
-mkdir -p "$LOG_DIR"
+LOG_DIR="/mnt/user/cloud/logs/disk_health"        # Base directory for logs files
 TIMESTAMP=$(date '+%Y-%m-%d_%H%M%S')              # Timestamp used for rotating log filenames
+mkdir -p "$LOG_DIR" 2>/dev/null || true
 MASTER_LOG="$LOG_DIR/disk_health_$TIMESTAMP.log"  # Consolidated master log
-HEALTH_LOG_USER="${HEALTH_LOG_USER:-nobody}"      # Log file owner
-HEALTH_DIR_MODE="${HEALTH_DIR_MODE:-0775}"        # Log directory permissions
-HEALTH_FILE_MODE="${HEALTH_FILE_MODE:-0664}"      # Log file permissions
-mkdir -p "$LOG_DIR"
-chmod "$HEALTH_DIR_MODE" "$LOG_DIR" 2>/dev/null || true
-chown "$HEALTH_LOG_USER" "$LOG_DIR" 2>/dev/null || true
-true > "$MASTER_LOG" 2>/dev/null || true
-chmod "$HEALTH_FILE_MODE" "$MASTER_LOG" 2>/dev/null || true
-chown "$HEALTH_LOG_USER" "$MASTER_LOG" 2>/dev/null || true
 
 # === Unified Subsystem Logging ===
 _subsys_emit() {
@@ -338,22 +327,8 @@ log_warn()  { log_emit WARN "$*"; }
 log_crit()  { log_emit CRIT "$*"; }
 
 # === State Files ===
-STATE_DIR="/mnt/cache/system/logs/disk_health/state"                # Base directory for state files
+STATE_DIR="/mnt/user/cloud/logs/disk_health/state"                  # Base directory for state files
 mkdir -p "$STATE_DIR"
-# Ownership & permissions for state files (defaults align with log files)
-# Adjust if running under different UID/GID or want stricter modes.
-STATE_FILE_OWNER="nobody"                                           # Desired owner for created state files
-STATE_FILE_MODE="0664"                                              # Desired file mode for state files
-set_state_file_perms() {
-    local f="$1"
-    [[ -e "$f" ]] || return 0
-    if [[ -n "$STATE_FILE_OWNER" ]]; then
-        chown "$STATE_FILE_OWNER" "$f" 2>/dev/null || true
-    fi
-    if [[ -n "$STATE_FILE_MODE" ]]; then
-        chmod "$STATE_FILE_MODE" "$f" 2>/dev/null || true
-    fi
-}
 # --- Alerting & Runtime (immediate health evaluation, deltas, cooldowns, recent events) ---
 SMART_LONG_STATE_FILE="$STATE_DIR/smart_long_processed.log"         # Long SMART test last run time per disk (scheduling)
 SMART_LONG_LAST_POH_FILE="$STATE_DIR/smart_long_last.log"           # Long SMART test last POH snapshot per disk (delta vetting)
@@ -389,7 +364,7 @@ RISK_SCORES_HISTORY_FILE="$STATE_DIR/risk_scores_history.log"       # Historical
 TEMP_HISTORY_FILE="$STATE_DIR/temp_history.log"                     # Temperature samples (rate & exposure)
 SELFTEST_HISTORY_FILE="$STATE_DIR/selftest_events.log"              # SMART self-test lifecycle history (frequency/volatility)
 # State files initialization
-mkdir -p "$SMART_SELFTEST_DIR" "$UNSAFE_SDWN_STATE_DIR" "$BTRFS_SCRUB_STATE_DIR"
+mkdir -p "$SMART_SELFTEST_DIR" "$UNSAFE_SDWN_STATE_DIR" "$BTRFS_SCRUB_STATE_DIR" "$CMD_TIMEOUT_STATE_DIR"
 STATE_FILES_ALERT_RUNTIME=(
     "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$NVME_STATE_FILE" "$PREV_ATTR_FILE" "$ALERT_NEW_SEEN_FILE" "$RISK_PREV_FILE" "$CMD_TIMEOUT_LAST_FILE" "$XFS_PROC_PREV_FILE" "$STORAGE_DISCREPANCY_STATE_FILE" "$RISK_SPIKE_FILE" "$REPLACEMENT_EVENTS_FILE" "$SATA_LINK_HISTORY_FILE"
 )
@@ -400,12 +375,10 @@ for f in "${STATE_FILES_ALERT_RUNTIME[@]}" "${STATE_FILES_TREND_HISTORY[@]}"; do
     if [[ ! -f "$f" ]]; then
         true > "$f" 2>/dev/null || true
     fi
-    set_state_file_perms "$f"
 done
 if [[ ! -s "$STORAGE_DISCREPANCY_STATE_FILE" ]]; then
     printf '0 0\n' > "$STORAGE_DISCREPANCY_STATE_FILE" 2>/dev/null || true
 fi
-set_state_file_perms "$STORAGE_DISCREPANCY_STATE_FILE"
 
 # === Notification Titles ===
 NOTIFY_TITLE_SMART="SMART Test Alert"                       # SMART test notifications
@@ -486,6 +459,43 @@ prune_history_files() {
     done
 }
 prune_history_files
+
+# === Helper Function ===
+# Apply owner/permissions directly to all logs and persistent files.
+enforce_state_tree_perms() {
+    local f
+    for f in "${STATE_FILES_ALERT_RUNTIME[@]}" "${STATE_FILES_TREND_HISTORY[@]}" "$STORAGE_DISCREPANCY_STATE_FILE"; do
+        [[ -e "$f" ]] || continue
+        chmod 0664 "$f" 2>/dev/null || true
+        chown nobody "$f" 2>/dev/null || true
+    done
+    # State subdirectories contents
+    local d
+    for d in "$SMART_SELFTEST_DIR" "$UNSAFE_SDWN_STATE_DIR" "$BTRFS_SCRUB_STATE_DIR" "$CMD_TIMEOUT_STATE_DIR"; do
+        [[ -d "$d" ]] || continue
+        while IFS= read -r sf; do
+            chmod 0664 "$sf" 2>/dev/null || true
+            chown nobody "$sf" 2>/dev/null || true
+        done < <(find "$d" -type f 2>/dev/null)
+    done
+    # Logs: master log and any .log in LOG_DIR
+    if [[ -n "$LOG_DIR" ]]; then        
+        chmod 0775 "$LOG_DIR" 2>/dev/null || true
+        chown nobody "$LOG_DIR" 2>/dev/null || true
+    fi
+    if [[ -n "$MASTER_LOG" ]]; then
+        # Ensure master log exists and apply permissions
+        : > "$MASTER_LOG" 2>/dev/null || true
+        chmod 0664 "$MASTER_LOG" 2>/dev/null || true
+        chown nobody "$MASTER_LOG" 2>/dev/null || true
+    fi
+    if [[ -d "$LOG_DIR" ]]; then
+        while IFS= read -r lf; do
+            chmod 0664 "$lf" 2>/dev/null || true
+            chown nobody "$lf" 2>/dev/null || true
+        done < <(find "$LOG_DIR" -type f -name '*.log' 2>/dev/null)
+    fi
+}
 
 # === Helper Functions ===
 # Caching wrappers for external commands to minimize repeated calls
@@ -4120,13 +4130,14 @@ build_health_alerts() {
             st="${SMART_STATE[$dev]:-OK}"
             sm_raw="$(risk_score_quick "$st" "${SMART_MSGS[$dev]:-}")"; [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
             sm_norm=$(( sm_raw > 100 ? 100 : sm_raw ))
-                        # Burst boost (long test guidance)
-                        local _burst_boost=${BURST_BOOST[$dev]:-${BURST_BOOST[$base_dev]:-0}}
+            base_dev="$(base_device "$dev")"
+            # Burst boost (long test guidance)
+            local _burst_boost=${BURST_BOOST[$dev]:-${BURST_BOOST[$base_dev]:-0}}
                         if [[ "$_burst_boost" =~ ^[0-9]+$ && $_burst_boost -gt 0 ]]; then
                             sm_norm=$(( sm_norm + _burst_boost ))
                             (( sm_norm > 100 )) && sm_norm=100
                         fi
-            base_dev="$(base_device "$dev")"
+            # base_dev already set above
             uniq="${IO_ERROR_UNIQUE_MAP[$dev]:-${IO_ERROR_UNIQUE_MAP[$base_dev]:-0}}"; [[ "$uniq" =~ ^[0-9]+$ ]] || uniq=0
             if (( uniq >= ${IO_ERROR_CRIT_THRESHOLD:-20} )); then err_norm=100
             elif (( uniq >= ${IO_ERROR_WARN_THRESHOLD:-5} )); then err_norm=65
@@ -5457,6 +5468,7 @@ capacity_forecast_and_export() {
 tbw_forecast_and_heavy_writers() {
     # Forecast days-to-endurance threshold and list heavy writers (normalized by capacity)
     (( ${TBW_TREND_ENABLED:-1} == 1 )) || { return 0; }
+    declare -A TBW_DAYS_LEFT TBW_STATUS_MAP TBW_DAILY 2>/dev/null || true
     local today
     today=$(date '+%Y-%m-%d')
     for dev in "${!SMART_STATE[@]}"; do
@@ -5480,6 +5492,7 @@ tbw_forecast_and_heavy_writers() {
     done < "$tmp"
     rm -f "$tmp"
     declare -A TBW_DAILY TBW_DAYS_LEFT
+    declare -a heavy_rank=()
     for dev in "${!last_v[@]}"; do
         local start=${first_v[$dev]:-0} end=${last_v[$dev]:-0}
         local days=$(( ( $(date -d "${last_dt[$dev]}" +%s 2>/dev/null || date +%s) - $(date -d "${first_dt[$dev]}" +%s 2>/dev/null || date +%s) ) / 86400 ))
@@ -5534,7 +5547,8 @@ tbw_forecast_and_heavy_writers() {
         done < <(printf "%s\n" "$sorted")
     fi
     # Generate TBW endurance alerts
-    for dev in "${!TBW_DAYS_LEFT[@]}"; do
+    if declare -p TBW_DAYS_LEFT >/dev/null 2>&1; then
+        for dev in "${!TBW_DAYS_LEFT[@]}"; do
         local days_left=${TBW_DAYS_LEFT[$dev]}
         local status=${TBW_STATUS_MAP[$dev]:-OK}
         if [[ "$status" == "CRITICAL" ]]; then
@@ -5542,9 +5556,15 @@ tbw_forecast_and_heavy_writers() {
         elif [[ "$status" == "WARNING" ]]; then
             record_alert warning "TBW Endurance" "Disk $dev TBW forecast WARNING: ${days_left}d remaining (<${TBW_DAYS_WARN}d)"
         fi
-    done
+        done
+    fi
     # Persist TBW days-left snapshot (once daily) for trend analysis
-    if (( TBW_TREND_ENABLED == 1 )) && (( ${#TBW_DAYS_LEFT[@]} > 0 )); then
+    declare -A TBW_DAYS_LEFT TBW_STATUS_MAP 2>/dev/null || true
+    if (( TBW_TREND_ENABLED == 1 )); then
+        if declare -p TBW_DAYS_LEFT >/dev/null 2>&1; then
+            local __have_keys=0
+            for __k in "${!TBW_DAYS_LEFT[@]}"; do __have_keys=1; break; done
+            if (( __have_keys == 1 )); then
         local today tmp
         today=$(date '+%Y-%m-%d')
         if [[ -f "$TBW_DAYSLEFT_HISTORY_FILE" ]]; then
@@ -5552,11 +5572,13 @@ tbw_forecast_and_heavy_writers() {
             awk -v d="$today" '$1!=d' "$TBW_DAYSLEFT_HISTORY_FILE" > "$tmp" 2>/dev/null || true
             mv -f "$tmp" "$TBW_DAYSLEFT_HISTORY_FILE" 2>/dev/null || rm -f "$tmp" || true
         fi
-        for dev in "${!TBW_DAYS_LEFT[@]}"; do
+                for dev in "${!TBW_DAYS_LEFT[@]}"; do
             local dl
             dl="${TBW_DAYS_LEFT[$dev]}"
             [[ -n "$dl" ]] && echo "$today $dev days_left=${dl}" >> "$TBW_DAYSLEFT_HISTORY_FILE"
         done
+            fi
+        fi
     fi
 }
 
@@ -5991,4 +6013,5 @@ persist_risk_scores() {
     done
 }
 persist_risk_scores
+enforce_state_tree_perms
 exit 0
