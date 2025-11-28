@@ -485,7 +485,7 @@ enforce_state_tree_perms() {
     fi
     if [[ -n "$MASTER_LOG" ]]; then
         # Ensure master log exists and apply permissions
-        : > "$MASTER_LOG" 2>/dev/null || true
+        touch "$MASTER_LOG" 2>/dev/null || true
         chmod 0664 "$MASTER_LOG" 2>/dev/null || true
         chown nobody "$MASTER_LOG" 2>/dev/null || true
     fi
