@@ -18,7 +18,7 @@ MEDIA_SRC="/mnt/user/media"                                           # Source p
 SECURE_SRC="/mnt/user/secure"                                         # Source path for "Secure" label
 MEDIA_DEST="/mnt/user/media"                                          # Destination path for "Media" label
 SECURE_DEST="/mnt/user/secure"                                        # Destination path for "Secure" label
-LOG_FILE_SUBDIR="/mnt/user/cloud/remote_logs"                  # Directory to store log files
+LOG_FILE_SUBDIR="/mnt/user/cloud/logs/remote_logs".                   # Directory to store log files
 LOG_FILE="$LOG_FILE_SUBDIR/remote_backup_$(date +%Y%m%d_%H%M%S).log"  # Log file path
 PRESERVED_RAW_LOG_DIR="$LOG_FILE_SUBDIR/rsync_raw"                    # Directory to store preserved raw rsync logs
 
