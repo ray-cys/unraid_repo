@@ -23,10 +23,10 @@ MIN_NOTIFY_INTERVAL=60   # seconds between identical grouped notifications
 
 # == Regex patterns to ignore. Use anchored flexible patterns. ===
 IGNORE_REGEX=(
-  '^.*kernel: CIFS: VFS: .* error -9 on ioctl to get interface list$'
-  '^.*sshd[^:]*: Read error from remote host .* port .*: .*$'
-  '^.*nginx[^:]*: */ace/mode-log\.js failed .* while sending to client$'
-  '^.*smbd[^:]*: sys_path_to_bdev\(\) failed for path \[.*\]!$'
+  '^.*kernel:[[:space:]]+CIFS:[[:space:]]+VFS:[[:space:]].*error[[:space:]]+-9[[:space:]]+on[[:space:]]+ioctl[[:space:]]+to[[:space:]]+get[[:space:]]+interface[[:space:]]+list.*$'
+  '^.*sshd[^:]*:[[:space:]]+Read[[:space:]]+error[[:space:]]+from[[:space:]]+remote[[:space:]]+host[[:space:]].*[[:space:]]+port[[:space:]].*:[[:space:]].*$'
+  '^.*nginx[^:]*:.*?/ace/mode-log\.js[[:space:]]+failed[[:space:]].*[[:space:]]+while[[:space:]]+sending[[:space:]]+to[[:space:]]+client.*$'
+  '^.*smbd[^:]*:[[:space:]]+sys_path_to_bdev\(\)[[:space:]]+failed[[:space:]]+for[[:space:]]+path[[:space:]]+\[.*\]!.*$'
 )
 
 ################################################################################
