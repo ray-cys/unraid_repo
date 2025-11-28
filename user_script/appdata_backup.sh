@@ -16,7 +16,7 @@ DEST_DIR="/mnt/user/node/cache"                               # Destination dire
 SRC_DIR_NAME="$(basename "$SRC_DIR")"                         # Derived name for logging & log path prefix
 DATETIME="$(date +%Y%m%d_%H%M%S)"                             # Run timestamp
 TMP_DIR=""                                                    # Optional temp staging dir (empty -> inside backup_dir)
-LOG_FILE_SUBDIR="/mnt/cache/system/logs/${SRC_DIR_NAME}_logs" # Directory for run logs
+LOG_FILE_SUBDIR="/mnt/user/cloud/${SRC_DIR_NAME}_logs"        # Directory for run logs
 LOG_FILE="$LOG_FILE_SUBDIR/$SRC_DIR_NAME-$DATETIME.log"       # Per-run log file
 
 # === Container Selection ===
