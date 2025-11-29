@@ -302,7 +302,7 @@ _subsys_emit() {
     local ts
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
     local line="[$tag] $ts - $raw"
-    if (( LOG_MIRROR_STDOUT == 1 )); then echo "$line"; fi
+    if (( ${LOG_MIRROR_STDOUT:-0} == 1 )); then echo "$line"; fi
     echo "$line" >> "$MASTER_LOG"
 }
 log_smart() { _subsys_emit SMART "$*"; }
@@ -319,7 +319,7 @@ log_emit() {
         msg="$(echo "$msg" | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} - //')"
     fi
     local line="[${sev}] $ts - $msg"
-    if (( LOG_MIRROR_STDOUT == 1 )); then echo "$line"; fi
+    if (( ${LOG_MIRROR_STDOUT:-0} == 1 )); then echo "$line"; fi
     echo "$line" >> "$MASTER_LOG"
 }
 log_info()  { log_emit INFO "$*"; }
@@ -571,7 +571,7 @@ notify_unraid() {
     pm_state=$(echo "$SUBSYSTEM_LINES" | awk -F': ' '/^Per-Mount:/ {print $2; exit}')
     # Build filtered summary string
     local parts=()
-    add_if() { local k="$1" v="$2"; [[ -z "$v" ]] && return; if [[ "$v" == "Disabled" && $SHOW_DISABLED_SUBSYSTEMS -eq 0 ]]; then return; fi; if [[ $SHOW_OK_SUBSYSTEMS -eq 0 && "$v" == "OK" ]]; then return; fi; if [[ "$v" == "N/A" ]]; then return; fi; parts+=("$k $v"); }
+    add_if() { local k="$1" v="$2"; [[ -z "$v" ]] && return; if [[ "$v" == "Disabled" && ${SHOW_DISABLED_SUBSYSTEMS:-0} -eq 0 ]]; then return; fi; if [[ ${SHOW_OK_SUBSYSTEMS:-0} -eq 0 && "$v" == "OK" ]]; then return; fi; if [[ "$v" == "N/A" ]]; then return; fi; parts+=("$k $v"); }
     add_if SMART "$sm_state"; add_if Btrfs "$bt_state"; add_if XFS "$xfs_state"; add_if Capacity "$cap_state"; add_if Parity "$pr_state"; add_if Per-Mount "$pm_state"
     local summary_line=""
     if (( ${#parts[@]} > 0 )); then
@@ -615,7 +615,7 @@ record_alert() {
     if [[ "$sev" =~ ^(critical|CRITICAL|warning)$ ]]; then
         # Attempt to extract a device path from body (formats: 'Disk /dev/sdX', 'Disk /dev/nvme0n1')
         local dev_match
-        dev_match=$(printf '%s' "$body" | grep -Eo '/dev/[A-Za-z0-9]+' | head -n1) || true
+        dev_match=$(printf '%s' "$body" | grep -Eo '/dev/[A-Za-z0-9]+' | head -n1 || true)
         if [[ -n "$dev_match" ]]; then
             RISK_SPIKE_TS["$dev_match"]="$(date +%s)"
         fi
@@ -674,7 +674,7 @@ get_device_model() {
 model_suffix_for() {
     local dev="$1"
     local suffix=""
-    if (( ENABLE_MODEL_IN_ALERTS == 1 )) && [[ -n "$dev" ]]; then
+    if (( ${ENABLE_MODEL_IN_ALERTS:-0} == 1 )) && [[ -n "$dev" ]]; then
         local mdl
         mdl="$(get_device_model "$dev" 2>/dev/null)"
         if [[ -n "$mdl" ]]; then suffix=" (Model: $mdl)"; fi
@@ -1345,7 +1345,7 @@ evaluate_smart() {
             fi
         fi
         # Parse temperature and evaluate wear percent thresholds
-        nvme_temp=$(echo "$nvme_output" | awk -F: '/Temperature/ {print $2; exit}' | grep -oE '[0-9]+' | head -n1)
+        nvme_temp=$(echo "$nvme_output" | awk -F: '/Temperature/ {print $2; exit}' | grep -oE '[0-9]+' | head -n1 || true)
         if [[ -n "$nvme_temp" && "$nvme_temp" =~ ^[0-9]+$ ]]; then
             printf '%s %s temp=%s\n' "$(date '+%Y-%m-%d')" "$disk" "$nvme_temp" >> "$TEMP_HISTORY_FILE" 2>/dev/null || true
         fi
@@ -1946,7 +1946,7 @@ get_latest_selftest_info() {
     local num type status lifetime remaining
     num=$(echo "$line" | awk '{if($1=="#"){print $2}else{print $1}}')
     type=$(echo "$line" | awk '{if($1=="#"){print $3" "$4}else{print $2" "$3}}')
-    remaining=$(echo "$line" | grep -o '[0-9]\+%\?' | head -n1)
+    remaining=$(echo "$line" | grep -o '[0-9]\+%\?' | head -n1 || true)
     lifetime=$(echo "$line" | awk '{for(i=1;i<=NF;i++){if($i ~ /hours/){print $(i-1); exit}}}')
     if [[ -z "$lifetime" ]]; then
         # Fallback for NVMe rows lacking the word 'hours': choose largest numeric excluding test id and percentage tokens
@@ -2534,7 +2534,7 @@ monitor_btrfs() {
         done
         (( skip==0 )) && filtered+=("$m")
     done
-    if [[ $ENABLE_BTRFS_SCRUB -eq 1 ]]; then
+    if [[ ${ENABLE_BTRFS_SCRUB:-0} -eq 1 ]]; then
         log_btrfs "BTRFS scrubbing starting (${#filtered[@]} mount(s))"
     else
         log_btrfs "BTRFS scrubbing disabled; summarizing last recorded status for ${#filtered[@]} mount(s)"
@@ -2554,7 +2554,7 @@ monitor_btrfs() {
         meta_raid=${meta_raid:-UNKNOWN}
         local initial_status
         initial_status=$(btrfs scrub status "$m" 2>/dev/null || true)
-        if [[ $ENABLE_BTRFS_SCRUB -eq 1 ]]; then
+        if [[ ${ENABLE_BTRFS_SCRUB:-0} -eq 1 ]]; then
             if echo "$initial_status" | grep -qi 'running'; then
                 log_btrfs "Scrub already running on $m (Data: $data_raid Meta: $meta_raid)"
             else
@@ -2624,7 +2624,7 @@ monitor_btrfs() {
 # Monitor XFS filesystems for metadata issues
 monitor_xfs() {
     # Log start (or disabled state) then iterate XFS mountpoints performing lightweight metadata scrutiny and kernel message scan
-    if [[ $ENABLE_XFS_CHECK -eq 1 ]]; then
+    if [[ ${ENABLE_XFS_CHECK:-0} -eq 1 ]]; then
         log_xfs "$(date '+%Y-%m-%d %H:%M:%S') - XFS checks starting"
     else
         log_xfs "$(date '+%Y-%m-%d %H:%M:%S') - XFS checks disabled"
@@ -2635,11 +2635,11 @@ monitor_xfs() {
     for mp in $mountpoints; do
         log_xfs "$(date '+%Y-%m-%d %H:%M:%S') - XFS check $mp"
         # Optional offline repair (-n) metadata inspection for corruption indicators
-        if [[ $ENABLE_XFS_CHECK -eq 1 ]]; then
+        if [[ ${ENABLE_XFS_CHECK:-0} -eq 1 ]]; then
             local dev xfs_out msg
-            dev=$(findmnt -n -o SOURCE --target "$mp")
+            dev=$(findmnt -n -o SOURCE --target "$mp" 2>/dev/null || true)
             if [[ -n "$dev" ]]; then
-                xfs_out=$(xfs_repair -n "$dev" 2>&1)
+                xfs_out=$(xfs_repair -n "$dev" 2>&1 || true)
                 log_xfs "$xfs_out"
                 # Flag critical if tool output signals error/corruption/fatal conditions
                 if echo "$xfs_out" | grep -qiE "error|corrupt|fatal"; then
@@ -3471,7 +3471,7 @@ build_subsystem_lines() {
 
     # Determine XFS display state: enabled if either metadata check OR proc stats enabled
     local xfs_display
-    if [[ $ENABLE_XFS_CHECK -eq 1 || ${ENABLE_XFS_PROC_STATS:-0} -eq 1 ]]; then
+    if [[ ${ENABLE_XFS_CHECK:-0} -eq 1 || ${ENABLE_XFS_PROC_STATS:-0} -eq 1 ]]; then
         xfs_display="$xfs"
     else
         xfs_display="Disabled"
@@ -3488,7 +3488,7 @@ build_subsystem_lines() {
     fi
     # Determine Btrfs display: enabled if scrub OR anomalies present
     local btrfs_display
-    if [[ $ENABLE_BTRFS_SCRUB -eq 1 || $btrfs_anom_count -gt 0 ]]; then
+    if [[ ${ENABLE_BTRFS_SCRUB:-0} -eq 1 || $btrfs_anom_count -gt 0 ]]; then
         btrfs_display="$bt"
     else
         btrfs_display="Disabled"
@@ -4391,7 +4391,7 @@ build_trend_section() {
         fi
     fi
     # Endurance aging + TBW days-left shrink & acceleration (ranking)
-    if (( POH_TREND_ENABLED == 1 || TBW_TREND_ENABLED == 1 )); then
+    if (( ${POH_TREND_ENABLED:-0} == 1 || ${TBW_TREND_ENABLED:-0} == 1 )); then
         local win_end=${ENDURANCE_TREND_WINDOW_DAYS:-7}
         local cutoff_end
         cutoff_end=$(date -d "-${win_end} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
@@ -4426,7 +4426,7 @@ build_trend_section() {
             fi
         fi
         # --- TBW Days-Left Shrink & Acceleration ---
-        if (( TBW_TREND_ENABLED == 1 )) && [[ -f "$TBW_DAYSLEFT_HISTORY_FILE" ]]; then
+        if (( ${TBW_TREND_ENABLED:-0} == 1 )) && [[ -f "$TBW_DAYSLEFT_HISTORY_FILE" ]]; then
             local dl_lines tmp_dl accel_factor=${ENDURANCE_DAYSLEFT_ACCEL_FACTOR_PCT:-50} accel_min=${ENDURANCE_DAYSLEFT_ACCEL_MIN_DELTA:-0.5}
             dl_lines=$(tail -n 50000 "$TBW_DAYSLEFT_HISTORY_FILE" 2>/dev/null || true | awk -v c="$cutoff_end" '$1>=c')
             if [[ -n "$dl_lines" ]]; then
@@ -5126,7 +5126,7 @@ build_disk_health_summary() {
     CRIT_DISK_COUNT=$crit_count
     WARN_DISK_COUNT=$warn_count
     local lines=("Disk Health Summary:")
-    add_line() { local k="$1"; local v="$2"; if (( SHOW_ZERO_COUNTS==1 )) || (( v>0 )); then lines+=(" - $k: $v"); fi; }
+    add_line() { local k="$1"; local v="$2"; if (( ${SHOW_ZERO_COUNTS:-0}==1 )) || (( v>0 )); then lines+=(" - $k: $v"); fi; }
     add_line "Critical" "$crit_count"
     add_line "Warning" "$warn_count"
     local parity_invalid=0
@@ -5307,7 +5307,7 @@ persist_risk_tier_history() {
     local healthy_cnt
     healthy_cnt=${HEALTHY_COUNT:-0}
     local tmp
-    tmp=$(mktemp)
+    tmp=$(mktemp) || { log_warn "mktemp failed; skipping TBW forecast snapshot"; return 0; }
     if [[ -f "$RISK_TIER_HISTORY_FILE" ]]; then
         awk -v d="$today" '$1!=d{print}' "$RISK_TIER_HISTORY_FILE" > "$tmp" || true
     fi
@@ -5388,13 +5388,20 @@ capacity_forecast_and_export() {
                 local fa_m la_m
                 fa_m=$(convert_pct_to_milli "$first_arr")
                 la_m=$(convert_pct_to_milli "$last_arr")
-                if (( la_m > fa_m )); then arr_growth_m=$(( (la_m - fa_m) / days_elapsed )); fi
+                if (( la_m > fa_m )); then
+                    arr_growth_m=$(( (la_m - fa_m) / days_elapsed ))
+                    # Preserve tiny positive growth by clamping to minimum 1 milli-%%/day
+                    (( arr_growth_m == 0 )) && arr_growth_m=1
+                fi
             fi
             if [[ $first_pool =~ ^[0-9.]+$ && $last_pool =~ ^[0-9.]+$ ]]; then
                 local fp_m lp_m
                 fp_m=$(convert_pct_to_milli "$first_pool")
                 lp_m=$(convert_pct_to_milli "$last_pool")
-                if (( lp_m > fp_m )); then pool_growth_m=$(( (lp_m - fp_m) / days_elapsed_p )); fi
+                if (( lp_m > fp_m )); then
+                    pool_growth_m=$(( (lp_m - fp_m) / days_elapsed_p ))
+                    (( pool_growth_m == 0 )) && pool_growth_m=1
+                fi
             fi
         else
             local i prev_m cur_m accum_arr=0 accum_pool=0 delta_count=0
@@ -5411,7 +5418,13 @@ capacity_forecast_and_export() {
                 fi
             done
             delta_count=$(( count - 1 ))
-            (( delta_count > 0 )) && arr_growth_m=$(( accum_arr / delta_count )) && pool_growth_m=$(( accum_pool / delta_count ))
+            if (( delta_count > 0 )); then
+                arr_growth_m=$(( accum_arr / delta_count ))
+                pool_growth_m=$(( accum_pool / delta_count ))
+                # Clamp to minimum 1 milli-%%/day when there is net positive growth
+                (( arr_growth_m == 0 && accum_arr > 0 )) && arr_growth_m=1
+                (( pool_growth_m == 0 && accum_pool > 0 )) && pool_growth_m=1
+            fi
         fi
     fi
     local days_to_arr_thresh="N/A" days_to_pool_thresh="N/A"
@@ -5560,7 +5573,7 @@ tbw_forecast_and_heavy_writers() {
     fi
     # Persist TBW days-left snapshot (once daily) for trend analysis
     declare -A TBW_DAYS_LEFT TBW_STATUS_MAP 2>/dev/null || true
-    if (( TBW_TREND_ENABLED == 1 )); then
+    if (( ${TBW_TREND_ENABLED:-0} == 1 )); then
         if declare -p TBW_DAYS_LEFT >/dev/null 2>&1; then
             local __have_keys=0
             for __k in "${!TBW_DAYS_LEFT[@]}"; do __have_keys=1; break; done
@@ -5617,7 +5630,7 @@ detect_counter_resets
 # Collect and integrate btrfs per-device stats
 collect_btrfs_device_stats() {
     # Snapshot per-device btrfs error counters; compute deltas vs previous run; raise alerts and record history
-    (( ENABLE_BTRFS_DEVICE_STATS == 1 )) || return 0
+    (( ${ENABLE_BTRFS_DEVICE_STATS:-0} == 1 )) || return 0
     local prev_file="$STATE_DIR/btrfs_device_stats.prev"
     declare -A PREV_STAT
     # Load previous counters for delta computation
@@ -5676,7 +5689,7 @@ collect_btrfs_device_stats() {
                         local last_delta ratio
                         last_delta=0
                         if [[ -f "$BTRFS_DEV_HIST_FILE" ]]; then
-                            last_delta=$(grep -E " key=$key " "$BTRFS_DEV_HIST_FILE" | tail -n1 | awk '{for(i=1;i<=NF;i++){ if($i ~ /^delta=/){sub(/delta=/,"",$i); print $i; break } }}')
+                            last_delta=$(grep -E " key=$key " "$BTRFS_DEV_HIST_FILE" 2>/dev/null | tail -n1 | awk '{for(i=1;i<=NF;i++){ if($i ~ /^delta=/){sub(/delta=/,"",$i); print $i; break } }}' || true)
                             [[ -n "$last_delta" && "$last_delta" =~ ^[0-9]+$ ]] || last_delta=0
                         fi
                         if (( last_delta > 0 )); then
@@ -5725,7 +5738,7 @@ collect_btrfs_device_stats() {
 # Collect and integrate xfs /proc stats (global deltas)
 collect_xfs_proc_stats() {
     # Capture select global XFS counters; compute deltas to detect anomalous spikes signalling metadata pressure
-    (( ENABLE_XFS_PROC_STATS == 1 )) || return 0
+    (( ${ENABLE_XFS_PROC_STATS:-0} == 1 )) || return 0
     local stat_file="/proc/fs/xfs/stat"
     [[ -r "$stat_file" ]] || return 0
     local prev_file="$XFS_PROC_PREV_FILE"
