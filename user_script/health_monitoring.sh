@@ -195,8 +195,8 @@ BTRFS_DEV_CORR_WARN_DELTA=1                      # Per-device corruption/gen err
 BTRFS_DEV_CORR_CRIT_DELTA=1                      # Per-device corruption/gen err delta >= critical
 BTRFS_ERR_BURST_WARN_RATIO=5                     # Btrfs device error delta / previous delta >= warn ratio
 BTRFS_ERR_BURST_CRIT_RATIO=10                    # Btrfs device error delta / previous delta >= critical ratio
-XFS_PROC_WARN_DELTA=2000                         # xfs stat failure counter delta >= warning
-XFS_PROC_CRIT_DELTA=8000                         # xfs stat failure counter delta >= critical
+XFS_PROC_WARN_DELTA=1000                         # xfs stat failure counter delta >= warning
+XFS_PROC_CRIT_DELTA=4000                         # xfs stat failure counter delta >= critical
 XFS_ERR_BURST_WARN_RATIO=5                       # xfs counter delta / previous delta >= warn ratio
 XFS_ERR_BURST_CRIT_RATIO=10                      # xfs counter delta / previous delta >= critical ratio
 BURST_WARN_BOOST=15                              # Composite SMART boost for warning burst events
@@ -242,8 +242,8 @@ W_AGE_NEAR=30                                    # Near endurance extra weight
 W_POH_HDD=10                                     # High HDD POH age weight
 W_POH_SSD=10                                     # High SATA SSD POH age weight
 W_POH_NVME=10                                    # High NVMe POH age weight
-W_BTRFS_DEV_ERR=15                               # Btrfs per-device I/O/corruption errors weight
-W_XFS_META_ERR=15                                # XFS metadata/stat anomalies weight
+W_BTRFS_DEV_ERR=3                                # Btrfs per-device I/O/corruption errors weight
+W_XFS_META_ERR=3                                 # XFS metadata/stat anomalies weight
 W_SATA_LINK_DOWN=10                              # SATA negotiated link downshift weight
 W_SELFTEST_CRIT=40                               # SMART self-test critical result weight
 W_SELFTEST_WARN=15                               # SMART self-test warning/ambiguous result weight
@@ -398,12 +398,16 @@ prune_old_run_logs() {
     (( LOG_PRUNE_ENABLED == 1 )) || return 0
     local patterns=("disk_health_*.log")
     local removed=0
+    local removed_age=0
+    local removed_count=0
+    local examined=0
     for pat in "${patterns[@]}"; do
         # Age-based pruning (mtime exceeding LOG_MAX_DAYS)
         if (( LOG_MAX_DAYS > 0 )); then
             while IFS= read -r f; do
                 [[ -f "$f" ]] || continue
-                rm -f -- "$f" && ((removed++)) || true
+                ((examined++)) || true
+                rm -f -- "$f" && ((removed++)) && ((removed_age++)) || true
             done < <(find "$LOG_DIR" -maxdepth 1 -type f -name "$pat" -mtime +$LOG_MAX_DAYS 2>/dev/null)
         fi
         # Count-based pruning (oldest first until within limit)
@@ -411,17 +415,17 @@ prune_old_run_logs() {
             mapfile -t files < <(find "$LOG_DIR" -maxdepth 1 -type f -name "$pat" -printf '%T@\t%p\n' 2>/dev/null | sort -n | awk -F'\t' '{print $2}')
             while (( ${#files[@]} > LOG_MAX_COUNT )); do
                 local oldest="${files[0]}"
-                rm -f -- "$oldest" && ((removed++)) || true
+                rm -f -- "$oldest" && ((removed++)) && ((removed_count++)) || true
                 files=("${files[@]:1}")
             done
+            if (( LOG_MAX_COUNT > 0 )); then
+                log_info "Run log pruning: pattern=$pat retained=${#files[@]} (limit=$LOG_MAX_COUNT)"
+            fi
         fi
     done
     # Emit summary if any deletions occurred
-    if (( removed > 0 )); then
-        log_info "Pruned $removed old run log(s)"
-    fi
+    log_info "Run log pruning: removed_total=$removed age=$removed_age count=$removed_count examined=$examined"
 }
-prune_old_run_logs
 
 # === Helper Function ===
 # Prune history/state growth files by age and line count (first column date YYYY-MM-DD)
@@ -464,37 +468,47 @@ prune_history_files
 # Apply owner/permissions directly to all logs and persistent files.
 enforce_state_tree_perms() {
     local f
+    local count_files=0
+    local count_dirs=0
+    local count_logs=0
     for f in "${STATE_FILES_ALERT_RUNTIME[@]}" "${STATE_FILES_TREND_HISTORY[@]}" "$STORAGE_DISCREPANCY_STATE_FILE"; do
         [[ -e "$f" ]] || continue
         chmod 0664 "$f" 2>/dev/null || true
         chown nobody "$f" 2>/dev/null || true
+        ((count_files++)) || true
     done
     # State subdirectories contents
     local d
     for d in "$SMART_SELFTEST_DIR" "$UNSAFE_SDWN_STATE_DIR" "$BTRFS_SCRUB_STATE_DIR" "$CMD_TIMEOUT_STATE_DIR"; do
         [[ -d "$d" ]] || continue
+        ((count_dirs++)) || true
         while IFS= read -r sf; do
             chmod 0664 "$sf" 2>/dev/null || true
             chown nobody "$sf" 2>/dev/null || true
+            ((count_files++)) || true
         done < <(find "$d" -type f 2>/dev/null)
     done
     # Logs: master log and any .log in LOG_DIR
     if [[ -n "$LOG_DIR" ]]; then        
         chmod 0775 "$LOG_DIR" 2>/dev/null || true
         chown nobody "$LOG_DIR" 2>/dev/null || true
+        ((count_dirs++)) || true
     fi
     if [[ -n "$MASTER_LOG" ]]; then
         # Ensure master log exists and apply permissions
         touch "$MASTER_LOG" 2>/dev/null || true
         chmod 0664 "$MASTER_LOG" 2>/dev/null || true
         chown nobody "$MASTER_LOG" 2>/dev/null || true
+        ((count_logs++)) || true
     fi
     if [[ -d "$LOG_DIR" ]]; then
         while IFS= read -r lf; do
             chmod 0664 "$lf" 2>/dev/null || true
             chown nobody "$lf" 2>/dev/null || true
+            ((count_logs++)) || true
         done < <(find "$LOG_DIR" -type f -name '*.log' 2>/dev/null)
     fi
+    log_info "Permissions sweep: files=$count_files dirs=$count_dirs logs=$count_logs"
 }
 
 # === Helper Functions ===
@@ -4892,6 +4906,44 @@ build_trend_section() {
                 fi
             fi
         fi
+
+        # NVMe/SATA SSD wear rate (TBW-derived percent/day)
+        if declare -p TBW_DAILY >/dev/null 2>&1; then
+            local wear_items=() sep_w=" | "
+            for dev in "${!TBW_DAILY[@]}"; do
+                # Restrict to SSD/NVMe (ROTA=0 or nvme path)
+                local is_ssd=0
+                if [[ "$dev" == /dev/nvme* ]]; then is_ssd=1; else
+                    local rota; rota=$(lsblk_rota_cached "$dev" 2>/dev/null || echo 1)
+                    [[ "$rota" == "0" ]] && is_ssd=1
+                fi
+                (( is_ssd == 0 )) && continue
+                local model cap_tb tbw_thresh_tb
+                model=$(get_device_model "$dev")
+                cap_tb=$(get_device_capacity_tb "$dev")
+                tbw_thresh_tb=$(tbw_threshold_tb_for_device "$model" "$cap_tb")
+                [[ -z "$tbw_thresh_tb" || "$tbw_thresh_tb" == 0 ]] && continue
+                local daily_bytes total_bytes rate_pct_day
+                daily_bytes=${TBW_DAILY[$dev]:-0}
+                total_bytes=$(( tbw_thresh_tb * 1000 * 1000 * 1000 * 1000 ))
+                if (( daily_bytes > 0 && total_bytes > 0 )); then
+                    rate_pct_day=$(awk -v d="$daily_bytes" -v t="$total_bytes" 'BEGIN{printf "%.4f", (d/t)*100.0}')
+                    local used_pct days_left label_dev
+                    used_pct=${CUR_ATTR["$dev|nvme_percent_used"]:-}
+                    label_dev=$(basename "$dev")
+                    if [[ -n "$used_pct" && "$used_pct" =~ ^[0-9]+$ && $(awk -v r="$rate_pct_day" 'BEGIN{print (r>0)}') -eq 1 ]]; then
+                        local remaining
+                        remaining=$(awk -v u="$used_pct" -v r="$rate_pct_day" 'BEGIN{printf "%.1f", (100.0 - u)/r}')
+                        wear_items+=("${label_dev} ${remaining/.*}d r=${rate_pct_day}%/d")
+                    else
+                        wear_items+=("${label_dev} ∞ r=${rate_pct_day}%/d")
+                    fi
+                fi
+            done
+            if (( ${#wear_items[@]} > 0 )); then
+                _add_line "WEAR" "$(IFS="$sep_w"; echo "${wear_items[*]}")"
+            fi
+        fi
         # Maintenance: long SMART tests due soon
         if declare -p LONG_TEST_DUE_SOON &>/dev/null; then
             local _near=() _k _d
@@ -6051,5 +6103,6 @@ persist_risk_scores() {
     done
 }
 persist_risk_scores
+prune_old_run_logs
 enforce_state_tree_perms
 exit 0
