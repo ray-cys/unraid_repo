@@ -457,7 +457,10 @@ parse_rsync_stats() {
       /Number of (regular )?files transferred/ {
         line=$0; sub(/^.*:[[:space:]]*/,"",line); gsub(",","",line); nft=line; next }
       /^[[:space:]]*deleting[[:space:]]/ { del++ }
-      /Number of deleted files/ { line=$0; sub(/^.*:[[:space:]]*/,"",line); gsub(",","",line); del=line }
+      /Number of deleted files/ {
+        raw=$0; sub(/^.*:[[:space:]]*/,"",raw); gsub(",","",raw);
+        if (match(raw, /[0-9]+/, m)) { del=m[0]; } else { del=0; }
+        next }
       END{ printf("%s\t%s\t%s\t%s\t%s\n", tfs, ttx, tbs, nft, del) }
     ' "$file")
 
@@ -469,7 +472,10 @@ parse_rsync_stats() {
   num_files_transferred=${num_files_transferred//,/}
   [[ "$num_files_transferred" =~ ^[0-9]+$ ]] || num_files_transferred=0
   deletes=${deletes_count//,/}
-  [[ "$deletes" =~ ^[0-9]+$ ]] || deletes=0
+  if ! [[ "$deletes" =~ ^[0-9]+$ ]]; then
+    deletes=$(printf '%s\n' "$deletes_count" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/){print $i; exit}}')
+    [[ "$deletes" =~ ^[0-9]+$ ]] || deletes=0
+  fi
 
   local human_total human_transferred human_sent
   human_total=$(bytes_human "$total_file_size")
@@ -876,10 +882,10 @@ compose_notification() {
       if [ "$total" -gt 0 ] && [ "$transferred" -gt 0 ]; then
         percent_total=$(awk -v t="$total" -v tr="$transferred" 'BEGIN{printf "%.1f", (tr/t)*100}')
       fi
-      if [ "$est" -gt 0 ]; then
-        detailed_body+="$lbl: $human_total total, $human_est est_changed, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
-      else
+      if [ "$transferred" -eq 0 ] && [ "$files" -eq 0 ] && [ "$deletes" -eq 0 ]; then
         detailed_body+="$lbl: $human_total total, no changes, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
+      else
+        detailed_body+="$lbl: $human_total total, $human_est est_changed, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
       fi
       condensed_parts+=("$lbl: $human_transferred (${percent_total}%)")
     done
