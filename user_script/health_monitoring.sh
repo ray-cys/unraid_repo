@@ -1126,7 +1126,8 @@ save_risk_spikes() {
         if (( age_days > lookback_days )); then unset 'RISK_SPIKE_TS[$dev]'; fi
     done
     # Write file atomically
-    local tmp; tmp=$(mktemp)
+    local tmp
+    tmp=$(mktemp) || { log_warn "mktemp failed; skipping risk spike save"; return 0; }
     for dev in "${!RISK_SPIKE_TS[@]}"; do
         printf '%s %s\n' "$dev" "${RISK_SPIKE_TS[$dev]}" >> "$tmp"
     done
@@ -1832,9 +1833,11 @@ evaluate_smart() {
                         today=$(date '+%Y-%m-%d')
                         if [[ -f "$SATA_LINK_HISTORY_FILE" ]]; then
                             local tmp
-                            tmp=$(mktemp)
-                            awk -v d="$today" -v dev="$disk" '!( $1==d && $2==dev )' "$SATA_LINK_HISTORY_FILE" > "$tmp" 2>/dev/null || true
-                            mv -f "$tmp" "$SATA_LINK_HISTORY_FILE" 2>/dev/null || rm -f "$tmp" || true
+                            tmp=$(mktemp) || { log_warn "mktemp failed; skipping SATA link history dedup"; tmp=""; }
+                            if [[ -n "$tmp" ]]; then
+                                awk -v d="$today" -v dev="$disk" '!( $1==d && $2==dev )' "$SATA_LINK_HISTORY_FILE" > "$tmp" 2>/dev/null || true
+                                mv -f "$tmp" "$SATA_LINK_HISTORY_FILE" 2>/dev/null || rm -f "$tmp" || true
+                            fi
                         fi
                         echo "$today $disk max=$max_speed current=$current_speed" >> "$SATA_LINK_HISTORY_FILE"
                     fi
@@ -2728,9 +2731,11 @@ save_last_test
 if (( POH_TREND_ENABLED == 1 )); then
     today=$(date '+%Y-%m-%d')
     if [[ -f "$POH_HISTORY_FILE" ]]; then
-        tmp=$(mktemp)
-        awk -v d="$today" '$1!=d' "$POH_HISTORY_FILE" > "$tmp" 2>/dev/null || true
-        mv -f "$tmp" "$POH_HISTORY_FILE" 2>/dev/null || rm -f "$tmp" || true
+        tmp=$(mktemp) || { log_warn "mktemp failed; skipping POH history dedup"; tmp=""; }
+        if [[ -n "$tmp" ]]; then
+            awk -v d="$today" '$1!=d' "$POH_HISTORY_FILE" > "$tmp" 2>/dev/null || true
+            mv -f "$tmp" "$POH_HISTORY_FILE" 2>/dev/null || rm -f "$tmp" || true
+        fi
     fi
     for disk in "${!SMART_STATE[@]}"; do
         poh=${CUR_ATTR["$disk|poh"]:-}
@@ -2743,9 +2748,11 @@ fi
  if (( SMART_ATTR_TREND_ENABLED == 1 )); then
     today=$(date '+%Y-%m-%d')
     if [[ -f "$SMART_ATTR_HISTORY_FILE" ]]; then
-        tmp=$(mktemp)
-        awk -v d="$today" '$1!=d' "$SMART_ATTR_HISTORY_FILE" > "$tmp" 2>/dev/null || true
-        mv -f "$tmp" "$SMART_ATTR_HISTORY_FILE" 2>/dev/null || rm -f "$tmp" || true
+        tmp=$(mktemp) || { log_warn "mktemp failed; skipping SMART attribute history dedup"; tmp=""; }
+        if [[ -n "$tmp" ]]; then
+            awk -v d="$today" '$1!=d' "$SMART_ATTR_HISTORY_FILE" > "$tmp" 2>/dev/null || true
+            mv -f "$tmp" "$SMART_ATTR_HISTORY_FILE" 2>/dev/null || rm -f "$tmp" || true
+        fi
     fi
     for disk in "${!SMART_STATE[@]}"; do
         # Build compact attribute line: date device attr=value ... (subset of noisy attrs)
@@ -2869,9 +2876,11 @@ scan_syslog_disk_errors() {
         done < "$IO_ERROR_HISTORY_FILE"
     fi
     local new_hist
-    new_hist="$(mktemp)"
+    new_hist="$(mktemp)" || { log_warn "mktemp failed; skipping I/O error history update"; new_hist=""; }
     for key in "${!HASH_SEEN[@]}"; do
-        local ts="${HASH_SEEN[$key]}" dv="${key%%|*}" h="${key#*|}"; printf "%s %s %s\n" "$ts" "$dv" "$h" >> "$new_hist"
+        if [[ -n "$new_hist" ]]; then
+            local ts="${HASH_SEEN[$key]}" dv="${key%%|*}" h="${key#*|}"; printf "%s %s %s\n" "$ts" "$dv" "$h" >> "$new_hist"
+        fi
     done
     while read -r line; do
         [[ "$line" == *"Script aborted"* ]] && continue
@@ -2901,11 +2910,11 @@ scan_syslog_disk_errors() {
                 continue
             fi
             HASH_SEEN["$dev|$hash"]=$epoch
-            printf "%s %s %s\n" "$epoch" "$dev" "$hash" >> "$new_hist"
+            [[ -n "$new_hist" ]] && printf "%s %s %s\n" "$epoch" "$dev" "$hash" >> "$new_hist"
             IO_ERROR_UNIQUE_MAP["$dev"]=$(( ${IO_ERROR_UNIQUE_MAP["$dev"]:-0} + 1 ))
         done
     done < <(printf "%s\n" "$log_src")
-    mv "$new_hist" "$IO_ERROR_HISTORY_FILE" 2>/dev/null || true
+    if [[ -n "$new_hist" ]]; then mv "$new_hist" "$IO_ERROR_HISTORY_FILE" 2>/dev/null || true; fi
     local dev _io_rank=() lines=""
     for dev in "${!IO_ERROR_RAW_MAP[@]}"; do
         local raw_count uniq_count mark
@@ -3452,17 +3461,17 @@ build_subsystem_lines() {
     local btrfs_anom_count=0 btrfs_crit_flag=0 btrfs_warn_flag=0
     # Scan SMART_MSGS for device-level patterns
     for msg in "${SMART_MSGS[@]}"; do
-        [[ $msg == *"Btrfs device errors"* ]] && ((btrfs_anom_count++)) && btrfs_warn_flag=1
+        if [[ $msg == *"Btrfs device errors"* ]]; then btrfs_anom_count=$((btrfs_anom_count+1)); btrfs_warn_flag=1; fi
     done
     # Scan recommendation / alert arrays for additional Btrfs patterns
     for a in "${ALERT_CRIT[@]}"; do
         if [[ $a == *"scrub corrected="* || $a == *"unrecoverable errors="* || $a == *"Btrfs device errors"* ]]; then
-            ((btrfs_anom_count++)); btrfs_crit_flag=1
+            btrfs_anom_count=$((btrfs_anom_count+1)); btrfs_crit_flag=1
         fi
     done
     for a in "${ALERT_WARN[@]}"; do
         if [[ $a == *"scrub corrected="* || $a == *"unrecoverable errors="* || $a == *"Btrfs device errors"* ]]; then
-            ((btrfs_anom_count++)); btrfs_warn_flag=1
+            btrfs_anom_count=$((btrfs_anom_count+1)); btrfs_warn_flag=1
         fi
     done
     # Elevate bt severity if anomalies present even when scrub disabled
@@ -3479,9 +3488,9 @@ build_subsystem_lines() {
     # Count XFS anomalies/messages for optional inline detail
     local xfs_anom_count=0
     for a in "${ALERT_CRIT[@]}" "${ALERT_WARN[@]}"; do
-        [[ $a == *"XFS metadata anomalies"* ]] && ((xfs_anom_count++))
-        [[ $a == *"XFS metadata issue"* ]] && ((xfs_anom_count++))
-        [[ $a == *"XFS Alert"* ]] && [[ $a == *"Counter "* ]] && ((xfs_anom_count++))
+        if [[ $a == *"XFS metadata anomalies"* ]]; then xfs_anom_count=$((xfs_anom_count+1)); fi
+        if [[ $a == *"XFS metadata issue"* ]]; then xfs_anom_count=$((xfs_anom_count+1)); fi
+        if [[ $a == *"XFS Alert"* ]] && [[ $a == *"Counter "* ]]; then xfs_anom_count=$((xfs_anom_count+1)); fi
     done
     if (( xfs_anom_count > 0 )) && [[ $xfs_display != Disabled ]]; then
         xfs_display+=" (${xfs_anom_count})"
@@ -4309,8 +4318,9 @@ build_trend_section() {
             lines_attr=$(tail -n 50000 "$SMART_ATTR_HISTORY_FILE" 2>/dev/null || true)
             if [[ -n "$lines_attr" ]]; then
                 local tmp_attr
-                tmp_attr=$(mktemp)
-                printf "%s\n" "$lines_attr" | awk -v c="$cutoff_attr" '$1>=c' > "$tmp_attr"
+                tmp_attr=$(mktemp) || { log_warn "mktemp failed; skipping SMART attribute trend block"; tmp_attr=""; }
+                if [[ -n "$tmp_attr" ]]; then
+                    printf "%s\n" "$lines_attr" | awk -v c="$cutoff_attr" '$1>=c' > "$tmp_attr"
                 declare -A first_line_attr last_line_attr first_dt_attr last_dt_attr
                 while read -r dt dev rest; do
                     [[ -z "$dt" || -z "$dev" ]] && continue
@@ -4318,6 +4328,10 @@ build_trend_section() {
                     if [[ -z "${last_dt_attr[$dev]:-}" || "$dt" > "${last_dt_attr[$dev]}" ]]; then last_dt_attr[$dev]="$dt"; last_line_attr[$dev]="$rest"; fi
                 done < "$tmp_attr"
                 rm -f "$tmp_attr"
+                else
+                    # Without tmp, skip SMART attribute trend computation
+                    :
+                fi
                 local min_delta_attr=${SMART_ATTR_TREND_MIN_DELTA:-1}
                 local attrs_attr=(realloc pending reported_uncorr offunc cmd_timeout realloc_events udma soft_read_err nvme_percent_used unsafe_shutdowns media_errors err_logs pcie_corr pcie_unc therm_t1 therm_t2 warn_temp_time crit_temp_time tbw_bytes)
                 for dev in "${!last_line_attr[@]}"; do
@@ -4400,8 +4414,9 @@ build_trend_section() {
             local poh_lines tmp_poh
             poh_lines=$(tail -n 50000 "$POH_HISTORY_FILE" 2>/dev/null || true | awk -v c="$cutoff_end" '$1>=c')
             if [[ -n "$poh_lines" ]]; then
-                tmp_poh=$(mktemp)
-                printf "%s\n" "$poh_lines" | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="poh") v=a[2]} if(d!="" && v!=""){print $1,d,v}}' > "$tmp_poh"
+                tmp_poh=$(mktemp) || { log_warn "mktemp failed; skipping POH trend block"; tmp_poh=""; }
+                if [[ -n "$tmp_poh" ]]; then
+                    printf "%s\n" "$poh_lines" | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="poh") v=a[2]} if(d!="" && v!=""){print $1,d,v}}' > "$tmp_poh"
                 declare -A poh_first_dt poh_first_v poh_last_dt poh_last_v
                 while read -r dt dev v; do
                     [[ -z "$dev" || -z "$v" ]] && continue
@@ -4409,6 +4424,7 @@ build_trend_section() {
                     if [[ -z "${poh_last_dt[$dev]:-}" || "$dt" > "${poh_last_dt[$dev]}" ]]; then poh_last_dt[$dev]="$dt"; poh_last_v[$dev]="$v"; fi
                 done < "$tmp_poh"
                 rm -f "$tmp_poh"
+                fi
                 local poh_rank=()
                 for dev in "${!poh_last_v[@]}"; do
                     local start=${poh_first_v[$dev]:-0} end=${poh_last_v[$dev]:-0}
@@ -4430,8 +4446,9 @@ build_trend_section() {
             local dl_lines tmp_dl accel_factor=${ENDURANCE_DAYSLEFT_ACCEL_FACTOR_PCT:-50} accel_min=${ENDURANCE_DAYSLEFT_ACCEL_MIN_DELTA:-0.5}
             dl_lines=$(tail -n 50000 "$TBW_DAYSLEFT_HISTORY_FILE" 2>/dev/null || true | awk -v c="$cutoff_end" '$1>=c')
             if [[ -n "$dl_lines" ]]; then
-                tmp_dl=$(mktemp)
-                printf "%s\n" "$dl_lines" | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="days_left") v=a[2]} if(d!="" && v!=""){print $1,d,v}}' > "$tmp_dl"
+                tmp_dl=$(mktemp) || { log_warn "mktemp failed; skipping TBW days-left trend block"; tmp_dl=""; }
+                if [[ -n "$tmp_dl" ]]; then
+                    printf "%s\n" "$dl_lines" | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="days_left") v=a[2]} if(d!="" && v!=""){print $1,d,v}}' > "$tmp_dl"
                 declare -A dl_first_dt dl_first_v dl_last_dt dl_last_v dl_seq
                 while read -r dt dev v; do
                     [[ -z "$dev" || -z "$v" ]] && continue
@@ -4440,6 +4457,7 @@ build_trend_section() {
                     dl_seq[$dev]+="${dt}:${v} "
                 done < "$tmp_dl"
                 rm -f "$tmp_dl"
+                fi
                 local dl_rank=()
                 for dev in "${!dl_last_v[@]}"; do
                     # Restrict to SSD/NVMe (ROTA=0 or nvme path)
@@ -4749,15 +4767,17 @@ build_trend_section() {
             _lines_dg=$(tail -n 20000 "$DISK_CAP_HISTORY_FILE" 2>/dev/null || true)
             if [[ -n "$_lines_dg" ]]; then
                 _cutoff_dg=$(date -d "-${_win_dg} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
-                _tmp_dg=$(mktemp)
-                printf "%s\n" "$_lines_dg" | awk -v c="$_cutoff_dg" '$1>=c{print}' | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="used") used=a[2]; if(a[1]=="size") sz=a[2]} if(used!="" && sz!=""){print $1,d,used,sz}}' > "$_tmp_dg"
-                declare -A _DG_FDT _DG_FU _DG_LDT _DG_LU _DG_SZ
-                while read -r dt disk used sz; do
-                    _DG_SZ[$disk]="$sz"
-                    if [[ -z "${_DG_FDT[$disk]:-}" || "$dt" < "${_DG_FDT[$disk]}" ]]; then _DG_FDT[$disk]="$dt"; _DG_FU[$disk]="$used"; fi
-                    if [[ -z "${_DG_LDT[$disk]:-}" || "$dt" > "${_DG_LDT[$disk]}" ]]; then _DG_LDT[$disk]="$dt"; _DG_LU[$disk]="$used"; fi
-                done < "$_tmp_dg"
-                rm -f "$_tmp_dg"
+                _tmp_dg=$(mktemp) || { log_warn "mktemp failed; skipping disk growth block"; _tmp_dg=""; }
+                if [[ -n "$_tmp_dg" ]]; then
+                    printf "%s\n" "$_lines_dg" | awk -v c="$_cutoff_dg" '$1>=c{print}' | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="used") used=a[2]; if(a[1]=="size") sz=a[2]} if(used!="" && sz!=""){print $1,d,used,sz}}' > "$_tmp_dg"
+                    declare -A _DG_FDT _DG_FU _DG_LDT _DG_LU _DG_SZ
+                    while read -r dt disk used sz; do
+                        _DG_SZ[$disk]="$sz"
+                        if [[ -z "${_DG_FDT[$disk]:-}" || "$dt" < "${_DG_FDT[$disk]}" ]]; then _DG_FDT[$disk]="$dt"; _DG_FU[$disk]="$used"; fi
+                        if [[ -z "${_DG_LDT[$disk]:-}" || "$dt" > "${_DG_LDT[$disk]}" ]]; then _DG_LDT[$disk]="$dt"; _DG_LU[$disk]="$used"; fi
+                    done < "$_tmp_dg"
+                    rm -f "$_tmp_dg"
+                fi
                 local _rank=()
                 for disk in "${!_DG_LU[@]}"; do
                     local fu=${_DG_FU[$disk]:-0} lu=${_DG_LU[$disk]:-0} sz=${_DG_SZ[$disk]:-0}
@@ -4816,14 +4836,16 @@ build_trend_section() {
             _cut_s=$(date -d "-${_win_s} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
             _lines_s=$(tail -n 50000 "${SHARE_USAGE_HISTORY_FILE}" 2>/dev/null || true)
             if [[ -n "$_lines_s" ]]; then
-                _tmp_s=$(mktemp)
-                printf "%s\n" "$_lines_s" | awk -v c="$_cut_s" '$1>=c{print}' | awk '{s=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="bytes") b=a[2]} if(s!="" && b!=""){print $1,s,b}}' > "$_tmp_s"
+                _tmp_s=$(mktemp) || { log_warn "mktemp failed; skipping share growth block"; _tmp_s=""; }
+                if [[ -n "$_tmp_s" ]]; then
+                    printf "%s\n" "$_lines_s" | awk -v c="$_cut_s" '$1>=c{print}' | awk '{s=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="bytes") b=a[2]} if(s!="" && b!=""){print $1,s,b}}' > "$_tmp_s"
                 declare -A _SFDT _SFB _SLDT _SLB
                 while read -r dt s b; do
                     if [[ -z "${_SFDT[$s]:-}" || "$dt" < "${_SFDT[$s]}" ]]; then _SFDT[$s]="$dt"; _SFB[$s]="$b"; fi
                     if [[ -z "${_SLDT[$s]:-}" || "$dt" > "${_SLDT[$s]}" ]]; then _SLDT[$s]="$dt"; _SLB[$s]="$b"; fi
                 done < "$_tmp_s"
                 rm -f "$_tmp_s"
+                fi
                 local _gr=()
                 for s in "${!_SLB[@]}"; do
                     local fu=${_SFB[$s]:-0} lu=${_SLB[$s]:-0}
@@ -5307,25 +5329,27 @@ persist_risk_tier_history() {
     local healthy_cnt
     healthy_cnt=${HEALTHY_COUNT:-0}
     local tmp
-    tmp=$(mktemp) || { log_warn "mktemp failed; skipping TBW forecast snapshot"; return 0; }
+    tmp=$(mktemp) || { log_warn "mktemp failed; skipping risk tier snapshot"; return 0; }
     if [[ -f "$RISK_TIER_HISTORY_FILE" ]]; then
         awk -v d="$today" '$1!=d{print}' "$RISK_TIER_HISTORY_FILE" > "$tmp" || true
     fi
     echo "$today critical=$crit warning=$warn replace=$replace_cnt monitor=$monitor_cnt healthy=$healthy_cnt" >> "$tmp"
-    mv -f "$tmp" "$RISK_TIER_HISTORY_FILE"
+    mv -f "$tmp" "$RISK_TIER_HISTORY_FILE" 2>/dev/null || rm -f "$tmp" || true
     # Persist per-disk risk scores history (overwrite today's entries for each disk)
     if declare -p RISK_MAP &>/dev/null; then
         local today_r
         today_r=$(date '+%Y-%m-%d')
         local tmp_scores
-        tmp_scores=$(mktemp)
-        if [[ -f "$RISK_SCORES_HISTORY_FILE" ]]; then
-            awk -v d="$today_r" '$1!=d{print}' "$RISK_SCORES_HISTORY_FILE" > "$tmp_scores" || true
+        tmp_scores=$(mktemp) || { log_warn "mktemp failed; skipping risk scores history update"; tmp_scores=""; }
+        if [[ -n "$tmp_scores" ]]; then
+            if [[ -f "$RISK_SCORES_HISTORY_FILE" ]]; then
+                awk -v d="$today_r" '$1!=d{print}' "$RISK_SCORES_HISTORY_FILE" > "$tmp_scores" || true
+            fi
+            for d in "${!RISK_MAP[@]}"; do
+                printf '%s %s risk=%s\n' "$today_r" "$d" "${RISK_MAP[$d]}" >> "$tmp_scores"
+            done
+            mv -f "$tmp_scores" "$RISK_SCORES_HISTORY_FILE" 2>/dev/null || true
         fi
-        for d in "${!RISK_MAP[@]}"; do
-            printf '%s %s risk=%s\n' "$today_r" "$d" "${RISK_MAP[$d]}" >> "$tmp_scores"
-        done
-        mv -f "$tmp_scores" "$RISK_SCORES_HISTORY_FILE" 2>/dev/null || true
     fi
 }
 
@@ -5496,7 +5520,7 @@ tbw_forecast_and_heavy_writers() {
     lines=$(tail -n 50000 "$TBW_HISTORY_FILE" 2>/dev/null || true)
     [[ -z "$lines" ]] && { return 0; }
     local tmp
-    tmp=$(mktemp)
+    tmp=$(mktemp) || { log_warn "mktemp failed; skipping TBW window aggregation"; return 0; }
     printf "%s\n" "$lines" | awk -v c="$cutoff" '$1>=c{print}' | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="tbw") v=a[2]} if(d!="" && v!=""){print $1,d,v}}' > "$tmp"
     declare -A first_dt first_v last_dt last_v
     while read -r dt dev v; do
@@ -5581,9 +5605,11 @@ tbw_forecast_and_heavy_writers() {
         local today tmp
         today=$(date '+%Y-%m-%d')
         if [[ -f "$TBW_DAYSLEFT_HISTORY_FILE" ]]; then
-            tmp=$(mktemp)
-            awk -v d="$today" '$1!=d' "$TBW_DAYSLEFT_HISTORY_FILE" > "$tmp" 2>/dev/null || true
-            mv -f "$tmp" "$TBW_DAYSLEFT_HISTORY_FILE" 2>/dev/null || rm -f "$tmp" || true
+            tmp=$(mktemp) || { log_warn "mktemp failed; skipping TBW days-left history dedup"; tmp=""; }
+            if [[ -n "$tmp" ]]; then
+                awk -v d="$today" '$1!=d' "$TBW_DAYSLEFT_HISTORY_FILE" > "$tmp" 2>/dev/null || true
+                mv -f "$tmp" "$TBW_DAYSLEFT_HISTORY_FILE" 2>/dev/null || rm -f "$tmp" || true
+            fi
         fi
                 for dev in "${!TBW_DAYS_LEFT[@]}"; do
             local dl
