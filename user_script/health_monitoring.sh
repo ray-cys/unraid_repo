@@ -2027,37 +2027,37 @@ save_selftest_snapshot() {
 # Poll a short self-test until completion or timeout
 poll_short_test_completion() {
     local disk=$1
-    local waited=0 info status sev msg
+    local waited=0
     while (( waited < SHORT_TEST_MAX_WAIT )); do
-        info=$(get_latest_selftest_info "$disk")
-        if [[ "$info" == "|||" ]]; then
-            local exec_status
-            if [[ $disk == /dev/nvme* ]]; then
-                log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART capability read (-c) on $disk"
-                exec_status=$(smartctl -c -d nvme "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
-            else
-                exec_status=$(smartctl -c "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
-            fi
-            if echo "$exec_status" | grep -qi 'in progress'; then
-                sleep $SHORT_TEST_POLL_INTERVAL
-                waited=$(( waited + SHORT_TEST_POLL_INTERVAL ))
-                continue
-            else
-                echo "OK|Self-test log not yet populated"
-                return 0
-            fi
+        # Poll execution status directly to detect running short test
+        local exec_status
+        if [[ $disk == /dev/nvme* ]]; then
+            log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART capability read (-c) on $disk"
+            exec_status=$(smartctl -c -d nvme "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
+        else
+            exec_status=$(smartctl -c "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
         fi
-        status=$(echo "$info" | awk -F'|' '{print $3}')
-        local class
+        if echo "$exec_status" | grep -qi 'in progress'; then
+            sleep $SHORT_TEST_POLL_INTERVAL
+            waited=$(( waited + SHORT_TEST_POLL_INTERVAL ))
+            continue
+        fi
+        # Not in progress: try to read latest self-test log entry for classification
+        local info
+        info=$(get_latest_selftest_info "$disk")
+        local num type status remaining
+        IFS='|' read -r num type status remaining <<< "$info"
+        # If self-test log is not populated yet, reflect that explicitly
+        if [[ "$type" == "unknown" ]]; then
+            echo "OK|Self-test log not yet populated"
+            return 0
+        fi
+        local class sev msg
         class=$(classify_selftest_status "$status")
         sev=$(echo "$class" | awk -F'|' '{print $1}')
         msg=$(echo "$class" | awk -F'|' '{print $2}')
-        if [[ $sev != INPROGRESS ]]; then
-            echo "$sev|$msg"
-            return 0
-        fi
-        sleep $SHORT_TEST_POLL_INTERVAL
-        waited=$(( waited + SHORT_TEST_POLL_INTERVAL ))
+        echo "$sev|$msg"
+        return 0
     done
     echo "INPROGRESS|Short test still running after ${SHORT_TEST_MAX_WAIT}s"
     return 0
@@ -2113,7 +2113,7 @@ run_smart_test() {
         fi
         hdparm -I "$disk" >/dev/null 2>&1 || true
     fi
-    local flag="-t short"
+    local test_kind="short"
     local selftest poh_attr current_poh last_long_hours_diff="" last_long_poh="" threshold_hours=$(( LONG_TEST_MAX_INTERVAL_DAYS * 24 ))
     if [[ $disk == /dev/nvme* ]]; then
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART self-test log read (-l selftest) on $disk"
@@ -2264,7 +2264,7 @@ run_smart_test() {
     # Risk threshold (ignore rising requirement for simplicity)
     if (( risk_pre >= LONG_TEST_RISK_THRESHOLD )) && [[ -z "${last_long_hours_diff:-}" || ${last_long_hours_diff} -ge $risk_age_hours ]]; then schedule_long=1; reasons+=("risk ${risk_pre} >= ${LONG_TEST_RISK_THRESHOLD}"); fi    # Removed explicit SMART_TEST_TYPE override; long tests are scheduled only via risk/critical/interval logic
     if (( schedule_long == 1 )); then
-        flag="-t long"
+        test_kind="long"
         local last_note="no record"
         [[ -n "${last_long_hours_diff:-}" ]] && last_note="${last_long_hours_diff}h"
         local IFS=','
@@ -2316,19 +2316,18 @@ run_smart_test() {
         printf '%s %s in_progress status=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$disk" "$exec_status" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
     else
         if [[ $disk == /dev/nvme* ]]; then
-            log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Starting NVMe SMART test ($flag) on $disk"
-            smartctl "$flag" -d nvme "$disk" >/dev/null 2>&1 || true
-            printf '%s %s start type=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$disk" "${flag/-t /}" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
+            log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Starting NVMe SMART test (-t ${test_kind}) on $disk"
+            smartctl -t "$test_kind" -d nvme "$disk" >/dev/null 2>&1 || true
+            printf '%s %s start type=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$disk" "${test_kind}" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
         else
-            smartctl "$flag" "$disk" >/dev/null 2>&1 || true
-            printf '%s %s start type=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$disk" "${flag/-t /}" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
+            smartctl -t "$test_kind" "$disk" >/dev/null 2>&1 || true
+            printf '%s %s start type=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$disk" "${test_kind}" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
         fi
-        local test_kind_started=${flag/-t /}
+        local test_kind_started="${test_kind}"
         if [[ $test_kind_started == long || $test_kind_started == extended ]]; then
             LONG_TEST_RUNNING_LONG["$disk"]=1
         fi
     fi
-    local test_kind=${flag/-t /}
     if [[ $test_kind == short && $SHORT_TEST_POLL -eq 1 && $existing_in_progress -eq 0 ]]; then
         local result
         result=$(poll_short_test_completion "$disk")
