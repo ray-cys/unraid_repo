@@ -3923,18 +3923,15 @@ build_health_alerts() {
             done <<< "$sorted"
         fi
     fi
-    # Parity invalid is an immediate actionable condition; include if present
-    if [[ "${PARITY_CLEAN_FLAG:-1}" == "0" ]]; then
-        rec+=" - Parity: invalid; run non-correcting parity check first (investigate recent SMART pending/reallocated/uncorrectable deltas), then correcting if errors found.\n"
-    fi
-    # Parity in-progress annotate health alerts to reflect potential skew in forecasts
-    if [[ -n "${PARITY_ACTION:-}" ]]; then
-        local _act
-        _act=$(printf "%s" "${PARITY_ACTION}" | awk '{print tolower($1)}')
-        if [[ "${_act}" != "idle" ]]; then
-            local _corr_lbl
-            _corr_lbl=$([[ "${PARITY_CORR:-}" == "1" ]] && echo "correcting" || echo "non-correcting")
-            rec+=" - Parity: in progress (${_corr_lbl}); capacity forecast and write metrics may be skewed; defer interpretation and re-check after completion.\n"
+    # If parity operation is active (non-idle), prefer in-progress guidance and suppress invalid
+    local _act_lc=""
+    if [[ -n "${PARITY_ACTION:-}" ]]; then _act_lc=$(printf "%s" "${PARITY_ACTION}" | awk '{print tolower($1)}'); fi
+    if [[ -n "${_act_lc}" && "${_act_lc}" != "idle" ]]; then
+        local _corr_lbl; _corr_lbl=$([[ "${PARITY_CORR:-}" == "1" ]] && echo "correcting" || echo "non-correcting")
+        rec+=" - Parity: in progress (${_corr_lbl}); capacity forecast and write metrics may be skewed; defer interpretation and re-check after completion.\n"
+    else
+        if [[ "${PARITY_CLEAN_FLAG:-1}" == "0" ]]; then
+            rec+=" - Parity: invalid; run non-correcting parity check first (investigate recent SMART pending/reallocated/uncorrectable deltas), then correcting if errors found.\n"
         fi
     fi
     HEALTH_ALERTS_SECTION="$rec"
@@ -5051,15 +5048,34 @@ build_trend_section() {
             done
             [[ ${#_poh_items[@]} -gt 0 ]] && _add_line "POH↑" "$(IFS=' | '; echo "${_poh_items[*]}")"
         fi
-        # POH Age
+        # POH Age : show top-N highest POH with class
         if (( AGE_AWARE_ENABLED==1 )) && [[ -n "${AGE_AWARE_LINES:-}" ]]; then
-            local _age="" cnt=0
+            local _rank=()
             while IFS= read -r l; do
                 [[ -z "$l" ]] && continue
-                _age+="${l}; "
-                (( ++cnt >= 5 )) && break
+                # Expect format: dev (class) POH=XXXXh
+                local dev cls poh
+                dev=$(printf "%s" "$l" | awk '{print $1}')
+                cls=$(printf "%s" "$l" | awk -F'[()]' '{print $2}')
+                poh=$(printf "%s" "$l" | awk -F'POH=' '{print $2}' | tr -d 'h')
+                [[ -z "$dev" || -z "$poh" ]] && continue
+                [[ "$poh" =~ ^[0-9]+$ ]] || continue
+                _rank+=("$poh $dev $cls")
             done < <(printf "%s\n" "${AGE_AWARE_LINES}")
-            _age="${_age%'; '}"; _add_line "AGE" "$_age"
+            if (( ${#_rank[@]} > 0 )); then
+                local _sorted _line="" _top=${AGE_AWARE_TOP_N:-5}
+                _sorted=$(printf "%s\n" "${_rank[@]}" | sort -nr -k1,1 | head -n "$_top")
+                while read -r poh dev cls; do
+                    local suffix="${poh}h"
+                    if [[ -n "$cls" && "$cls" != "age" ]]; then
+                        _line+="$(basename "$dev") ${suffix} (${cls}); "
+                    else
+                        _line+="$(basename "$dev") ${suffix}; "
+                    fi
+                done < <(printf "%s\n" "$\_sorted")
+                _line="${_line%'; '}"
+                [[ -n "$_line" ]] && _add_line "AGE↑" "$_line"
+            fi
         fi
         # Smart growth and early warnings compact summaries
         if [[ -n "${SMART_GROWTH_LINE:-}" ]]; then
@@ -5326,7 +5342,7 @@ compute_risk_and_lifecycle() {
             local cls="${AGE_CLASS[$dev]:-}"
             local poh_num="${poh//,/}"
             if [[ -n "$cls" ]] || (( 10#${poh_num:-0} > 0 )); then
-                age_lines+="$(basename "$dev") (${cls:-age}) POH=${poh}\n"
+                age_lines+="$(basename "$dev") (${cls:-age}) POH=${poh}h\n"
             fi
         fi
     done
@@ -5629,7 +5645,7 @@ tbw_forecast_and_heavy_writers() {
     [[ -z "$lines" ]] && { return 0; }
     local tmp
     tmp=$(mktemp) || { log_warn "mktemp failed; skipping TBW window aggregation"; return 0; }
-    printf "%s\n" "$lines" | awk -v c="$cutoff" '$1>=c{print}' | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="tbw") v=a[2]} if(d!="" && v!=""){print $1,d,v}}' > "$tmp"
+    printf "%s\n" "$lines" | awk -v c="$cutoff" '$1>=c{print}' | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="tbw") v=a[2]} if(d!="" && v!="" && v ~ /^[0-9]+$/){print $1,d,v}}' > "$tmp"
     declare -A first_dt first_v last_dt last_v
     while read -r dt dev v; do
         if [[ -z "${first_dt[$dev]:-}" || "$dt" < "${first_dt[$dev]}" ]]; then first_dt[$dev]="$dt"; first_v[$dev]="$v"; fi
@@ -5642,6 +5658,7 @@ tbw_forecast_and_heavy_writers() {
     declare -a heavy_rank=()
     for dev in "${!last_v[@]}"; do
         local start=${first_v[$dev]:-0} end=${last_v[$dev]:-0}
+        [[ ! "$start" =~ ^[0-9]+$ || ! "$end" =~ ^[0-9]+$ ]] && continue
         local days=$(( ( $(date -d "${last_dt[$dev]}" +%s 2>/dev/null || date +%s) - $(date -d "${first_dt[$dev]}" +%s 2>/dev/null || date +%s) ) / 86400 ))
         (( days<=0 )) && days=1
         if (( end>start )); then
@@ -5661,6 +5678,7 @@ tbw_forecast_and_heavy_writers() {
                     total_bytes=$(( end * 100 / used_pct ))
                 fi
             fi
+            [[ ! "$total_bytes" =~ ^[0-9]+$ ]] && total_bytes=""
             if [[ -n "$total_bytes" && $total_bytes -gt end && $daily -gt 0 ]]; then
                 remaining_bytes=$(( total_bytes - end ))
                 days_left=$(awk -v r="$remaining_bytes" -v d="$daily" 'BEGIN{printf "%.1f", r/d}')
@@ -5676,7 +5694,7 @@ tbw_forecast_and_heavy_writers() {
                 TBW_STATUS_MAP[$dev]="$status"
             fi
             local cap_tb
-            cap_tb=$(printf "%s" "$cap" | awk '{print ($0+0)}')
+            cap_tb=$(printf "%s" "$cap" | awk '/^[0-9]+(\.[0-9]+)?$/{print ($0+0)}')
             if [[ -n "$cap_tb" && "$cap_tb" != 0 ]]; then
                 local norm_pct
                 norm_pct=$(awk -v daily="$daily" -v cap_tb="$cap_tb" 'BEGIN{printf "%.6f", (daily/ (cap_tb*1000000000000.0))*100}')
