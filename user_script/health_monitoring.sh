@@ -6,12 +6,10 @@ if ! flock -n 9; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') - Another run health_monitoring.sh active, exiting (lock: $LOCKFILE)" >&2
     exit 1
 fi
-
 # Disk Health Monitor for Unraid
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
-
 ################################################################################
 # ---------------- Configuration ----------------
 # Disks health script settings. Tuned for performance and reliability.
@@ -58,13 +56,19 @@ BTRFS_TREND_TOP_N=5                             # Top N devices by error delta
 BTRFS_TREND_WINDOW_DAYS=7                       # Window for btrfs device trend aggregation
 ENABLE_XFS_CHECK=0                              # Run xfs_repair -n metadata check (0=disable)
 ENABLE_XFS_PROC_STATS=1                         # Parse /proc/fs/xfs/stat counters (0=disable)
+XFS_PROC_PER_MOUNT_ALERTS=0                    # 1: emit per-mount warnings from proc spikes; 0: single global alert
+XFS_PROC_REQUIRE_RATIO_FOR_ALERT=1             # 1: only alert on burst ratio triggers; 0: also alert on absolute deltas
+XFS_PROC_KEYS=""                               # Space-separated keys to monitor; empty uses sane defaults
+XFS_PROC_KEYS_EXCLUDE="extent_alloc dir_create dir_lookup delalloc flush" # Space-separated keys to exclude (e.g., "extent_alloc dir_create")
+XFS_PROC_SMART_ANNOTATE_BURST=0                # 1: add SMART note to all XFS devices on burst; 0: do not annotate
+XFS_PROC_SUPPRESS_DURING_PARITY=1              # 1: suppress XFS proc alerts while parity is running
 IO_ERROR_LOG_FILE="/var/log/syslog"             # Syslog path fallback to dmesg
 IO_ERROR_WINDOW_MINUTES=60                      # Time window (minutes) for de-dup/frequency
 IO_ERROR_WARN_THRESHOLD=5                       # Unique error events >= warning
 IO_ERROR_CRIT_THRESHOLD=20                      # Unique error events >= critical
 
 # === Trends & Alerts: Toggles ===
-AGE_AWARE_ENABLED=0                             # Annotate near-endurance devices (0=disable)
+AGE_AWARE_ENABLED=1                             # Annotate near-endurance devices (0=disable)
 NVME_WEAR_REGRESSION_WARN=1                     # Flag any NVMe Percentage Used regression (0=disable)
 SMART_ATTR_TREND_ENABLED=1                      # Enable SMART attribute growth trend (0=disable)
 ERROR_RATE_TREND_ENABLED=1                      # Enable Btrfs/XFS error rate acceleration trend (0=disable)
@@ -195,10 +199,10 @@ BTRFS_DEV_CORR_WARN_DELTA=1                      # Per-device corruption/gen err
 BTRFS_DEV_CORR_CRIT_DELTA=1                      # Per-device corruption/gen err delta >= critical
 BTRFS_ERR_BURST_WARN_RATIO=5                     # Btrfs device error delta / previous delta >= warn ratio
 BTRFS_ERR_BURST_CRIT_RATIO=10                    # Btrfs device error delta / previous delta >= critical ratio
-XFS_PROC_WARN_DELTA=1000                         # xfs stat failure counter delta >= warning
-XFS_PROC_CRIT_DELTA=4000                         # xfs stat failure counter delta >= critical
-XFS_ERR_BURST_WARN_RATIO=5                       # xfs counter delta / previous delta >= warn ratio
-XFS_ERR_BURST_CRIT_RATIO=10                      # xfs counter delta / previous delta >= critical ratio
+XFS_PROC_WARN_DELTA=1000                         # xfs stat delta >= warning
+XFS_PROC_CRIT_DELTA=4000                         # xfs stat delta >= critical
+XFS_ERR_BURST_WARN_RATIO=8                       # xfs delta / previous-delta >= warn ratio
+XFS_ERR_BURST_CRIT_RATIO=20                      # xfs delta / previous-delta >= critical ratio
 BURST_WARN_BOOST=15                              # Composite SMART boost for warning burst events
 BURST_CRIT_BOOST=30                              # Composite SMART boost for critical burst events
 
@@ -380,13 +384,11 @@ if [[ ! -s "$STORAGE_DISCREPANCY_STATE_FILE" ]]; then
     printf '0 0\n' > "$STORAGE_DISCREPANCY_STATE_FILE" 2>/dev/null || true
 fi
 
-# === Notification Titles ===
+# === Notification Settings ===
 NOTIFY_TITLE_SMART="SMART Test Alert"                       # SMART test notifications
 NOTIFY_TITLE_BTRFS="Btrfs Scrub Alert"                      # Btrfs scrub notifications
 NOTIFY_TITLE_XFS="XFS Alert"                                # XFS filesystem notifications
 NOTIFY_TITLE_DISKIO="Disk I/O Alert"                        # Disk I/O notifications
-
-# === Health Alerts Display Toggles ===
 ENABLE_MODEL_IN_ALERTS=0                                    # If 1, append disk model to per-disk health alert lines
 
 ################################################################################
@@ -394,7 +396,6 @@ ENABLE_MODEL_IN_ALERTS=0                                    # If 1, append disk 
 # === Helper Function ===
 # Trim old run logs under STATE_DIR to keep history bounded
 prune_old_run_logs() {
-    # Enforce age and count retention policies for run logs under LOG_DIR
     (( LOG_PRUNE_ENABLED == 1 )) || return 0
     local patterns=("disk_health_*.log")
     local removed=0
@@ -556,7 +557,6 @@ btrfs_df_cached() {
 # === Helper Function ===
 # Send a notification through Unraid's notify script with severity
 notify_unraid() {
-    # Compose subsystem summary and dispatch via Unraid notify script (fallback to syslog)
     local title="$1"; shift
     local body="$1"; shift
     local sev="${1:-warning}"
@@ -614,7 +614,6 @@ notify_unraid() {
 # === Helper Function ===
 # Record structured alerts and accumulate for notification severity
 record_alert() {
-    # Store alert payload by severity for later aggregation and logging
     local sev="$1"; shift
     local title="$1"; shift
     local body="$1"; shift
@@ -639,7 +638,6 @@ record_alert() {
 # === Helper Function ===
 # Convert bytes to human readable units
 human_readable() {
-    # Convert raw byte count to decimal unit string (KB/MB/GB/TB)
     local bytes=${1:-0}
     local KB=1000; local MB=$((KB*KB)); local GB=$((MB*KB)); local TB=$((GB*KB))
     if (( bytes < KB )); then printf "%d B" "$bytes"; return; fi
@@ -649,11 +647,9 @@ human_readable() {
     awk -v b="$bytes" -v t="$TB" 'BEGIN{printf "%.2f TB", b/t}'
 }
 
-# Normalize a device to its base (strip partition component).
 # === Helper Function ===
 # Normalize partition path to its base device (e.g., /dev/sda1 -> /dev/sda)
 base_device() {
-    # Strip partition suffix to yield root block device (handles nvme pN vs sdXn)
     local d="$1"
     if [[ ! "$d" =~ ^/dev/[A-Za-z0-9]+([p0-9]+)?$ ]]; then
         echo ""; return 0
@@ -668,7 +664,6 @@ base_device() {
 # === Helper Function ===
 # Return device model string using smartctl (cached when possible)
 get_device_model() {
-    # Retrieve and cache disk model (NVMe vs SATA attribute differences)
     local d
     d=$(base_device "$1")
     [[ -z "$d" ]] && echo "" && return 0
@@ -699,7 +694,6 @@ model_suffix_for() {
 # === Helper Function ===
 # Return device capacity in TB (decimal TB)
 get_device_capacity_tb() {
-    # Size lookup via lsblk (decimal TB), cached per base device
     local d
     d=$(base_device "$1")
     [[ -z "$d" ]] && echo "0" && return 0
@@ -716,7 +710,6 @@ get_device_capacity_tb() {
 # === Helper Function ===
 # Read a SATA SMART raw attribute value by ID
 get_sata_raw() {
-    # Fetch and cache SMART attribute table (-A) for SATA device
     local d
     d=$(base_device "$1")
     [[ -z "$d" ]] && echo "" && return 0
@@ -730,7 +723,6 @@ get_sata_raw() {
 # === Helper Function ===
 # Parse SATA device basic info from smartctl --info
 get_sata_info() {
-    # Fetch and cache SMART identity block (-i) for SATA device
     local d
     d=$(base_device "$1")
     [[ -z "$d" ]] && echo "" && return 0
@@ -744,7 +736,6 @@ get_sata_info() {
 # === Helper Function ===
 # Read an NVMe SMART/health value by key
 get_nvme_raw() {
-    # Fetch and cache full NVMe smartctl output (-a -d nvme) with logging
     local d
     d=$(base_device "$1")
     [[ -z "$d" ]] && echo "" && return 0
@@ -835,9 +826,8 @@ eval_tbw_state() {
 }
 
 # === Helper Function ===
-# Provide age thresholds for HDD/SSD/NVMe by model hints
+# Derive power-on-hours warning/critical thresholds adjusted for device class & model hints
 poh_thresholds_for_device() {
-    # Derive power-on-hours warning/critical thresholds adjusted for device class & model hints
     local dev="$1"; shift
     local dtype="$1"; shift # nvme|sata
     local rota="${1:-}"    # for sata: 1=HDD, 0=SSD
@@ -866,9 +856,8 @@ poh_thresholds_for_device() {
 }
 
 # === Helper Function ===
-# Enumerate array/pool block devices for processing
+# Enumerate base SATA and NVMe devices excluding boot root device
 get_all_disks() {
-    # Enumerate base SATA and NVMe devices excluding boot root device
     local sata nvme out=()
     local sata_list=()
     for d in /dev/sd?; do
@@ -893,9 +882,8 @@ get_all_disks() {
 }
 
 # === Helper Function ===
-# Build map from /mnt mount points to underlying block devices
+# Construct mapping from /mnt/diskX mountpoints to block devices using disks.ini / disk.cfg definitions
 build_mount_device_map() {
-    # Construct mapping from /mnt/diskX mountpoints to block devices using disks.ini / disk.cfg definitions
     MOUNT_TO_DEV=()
     local ini="/var/local/emhttp/disks.ini" cfg="/boot/config/disk.cfg" src=""
     if [[ -f "$ini" ]]; then src="$ini"; elif [[ -f "$cfg" ]]; then src="$cfg"; else return 0; fi
@@ -920,9 +908,8 @@ build_mount_device_map() {
 }
 
 # === Helper Function ===
-# Read Unraid mdstat-like parity status
+# Populate global parity progress/validity variables from var.ini or mdcmd status output
 parity_state() {
-    # Populate global parity progress/validity variables from var.ini or mdcmd status output
     PARITY_VALID_FLAG=""
     PARITY_ACTION=""
     PARITY_CORR=""
@@ -937,8 +924,8 @@ parity_state() {
         local sb
         sb=$(awk -F= 'tolower($1)=="sbclean" {gsub(/"| |\r|\n/,"",$2); print tolower($2); exit}' "$ini" 2>/dev/null)
         case "$sb" in
-            1|yes|true) PARITY_VALID_FLAG="1"; return 0;;
-            0|no|false) PARITY_VALID_FLAG="0"; return 0;;
+            1|yes|true) PARITY_VALID_FLAG="1";;
+            0|no|false) PARITY_VALID_FLAG="0";;
         esac
     fi
     # Fallback to mdcmd status
@@ -978,9 +965,8 @@ parity_state() {
 }
 
 # === Helper Function ===
-# Return 0/1 indicating if parity is valid/clean
+# Return cached / resolved parity validity flag (1 clean, 0 invalid, empty unknown)
 parity_clean_flag() {
-    # Return cached / resolved parity validity flag (1 clean, 0 invalid, empty unknown)
     parity_state || true
     if [[ -n "${PARITY_VALID_FLAG:-}" ]]; then echo "${PARITY_VALID_FLAG}"; return 0; fi
     echo ""; return 1
@@ -1047,83 +1033,86 @@ discover_parity_and_status() {
         else
             PARITY_STATUS_LINE=$([[ -n "$labels_join" ]] && echo "Parity ($labels_join): Invalid (sync required)" || echo "Parity: Invalid (sync required)")
             record_alert warning "Parity Status" "Parity invalid (sync required)"
-
-            # Capture operation metrics from global parity_* variables
-            local action="${PARITY_ACTION:-}" corr="${PARITY_CORR:-}" pos="${PARITY_POS:-}" size="${PARITY_SIZE:-}" errs="${PARITY_ERRS:-}" speed_k="${PARITY_SPEED_K:-}" rem="${PARITY_REM:-}"
-            local action_word="" corr_label="" pct="" eta_str="" 
-            [[ -n "$action" ]] && action_word=$(printf "%s" "$action" | awk '{print tolower($1)}')
-            corr_label=$([[ "$corr" == "1" ]] && echo "correcting" || echo "non-correcting")
-            # Compute in-progress percentage if position/size known
-            if [[ -n "$pos" && -n "$size" ]]; then
-                pct=$(awk -v p="$pos" -v s="$size" 'BEGIN{ if (s>0) printf "%.1f", (p/s)*100; }')
-            fi
-            # Append operation summary to status line and start details section
-            if [[ -n "$action_word" && "$action_word" != "idle" ]]; then
-                PARITY_STATUS_LINE+=" — ${action_word} in progress (${corr_label})"
-                [[ -n "$pct" ]] && PARITY_STATUS_LINE+=", ~${pct}%"
-                PARITY_DETAILS_SECTION="Parity Details:\n"
-                PARITY_DETAILS_SECTION+=" - Action: ${action_word} (${corr_label})\n"
-                # Progress line with optional percent
-                if [[ -n "$pos" && -n "$size" ]]; then
-                    PARITY_DETAILS_SECTION+=" - Progress: ${pos} / ${size}"
-                    [[ -n "$pct" ]] && PARITY_DETAILS_SECTION+=" (~${pct}%)"
-                    PARITY_DETAILS_SECTION+="\n"
-                fi
-                # Load previous progress snapshot to compute delta speed/ETA
-                local progress_file prev_pos prev_ts curr_ts
-                progress_file="$STATE_DIR/parity_progress.state"
-                prev_pos=""
-                prev_ts=""
-                curr_ts=$(date +%s)
-                if [[ -f "$progress_file" ]]; then read -r prev_pos prev_ts < "$progress_file" || true; fi
-                # If previous snapshot valid, compute instantaneous MB/s and ETA
-                if [[ -n "$pos" && -n "$prev_pos" && -n "$prev_ts" && "$pos" =~ ^[0-9]+$ && "$prev_pos" =~ ^[0-9]+$ && "$prev_ts" =~ ^[0-9]+$ && $pos -ge $prev_pos ]]; then
-                    local dt=$(( curr_ts - prev_ts ))
-                    if (( dt > 0 )); then
-                        local delta=$(( pos - prev_pos ))
-                        local bytes=$(( delta * 512 ))
-                        local mbps
-                        mbps=$(awk -v b="$bytes" -v d="$dt" 'BEGIN{ if(d>0) printf "%.2f", (b/1048576)/d; }')
-                        if [[ -n "$mbps" && -n "$size" && "$size" =~ ^[0-9]+$ ]]; then
-                            local remaining=$(( size - pos ))
-                            if (( remaining > 0 )); then
-                                local rem_bytes=$(( remaining * 512 ))
-                                local eta_sec
-                                eta_sec=$(awk -v rb="$rem_bytes" -v mbps="$mbps" 'BEGIN{ mb=mbps*1048576; if(mb>0) printf "%d", rb/mb; }')
-                                if [[ -n "$eta_sec" && "$eta_sec" =~ ^[0-9]+$ ]]; then
-                                    local eta_h=$(( eta_sec/3600 )) eta_m=$(( (eta_sec%3600)/60 )) eta_s=$(( eta_sec%60 ))
-                                    if (( eta_h>0 )); then eta_str="${eta_h}h ${eta_m}m"; elif (( eta_m>0 )); then eta_str="${eta_m}m ${eta_s}s"; else eta_str="${eta_s}s"; fi
-                                    PARITY_DETAILS_SECTION+=" - ETA: ${eta_str} remaining\n"
-                                fi
-                            fi
-                        fi
-                        PARITY_DETAILS_SECTION+=" - Speed: ${mbps} MB/s (Δ ${delta} sectors / ${dt}s)\n"
-                    fi
-                fi
-                # Append reported speed / remaining sectors / errors when provided
-                if [[ -n "$speed_k" && "$speed_k" =~ ^[0-9]+$ ]]; then
-                    local speed_mb
-                    speed_mb=$(awk -v sp="$speed_k" 'BEGIN{printf "%.2f", sp/1024.0}')
-                    PARITY_DETAILS_SECTION+=" - Reported Speed: ${speed_mb} MB/s\n"
-                fi
-                if [[ -n "$rem" && "$rem" =~ ^[0-9]+$ ]]; then PARITY_DETAILS_SECTION+=" - Remaining Sectors: ${rem}\n"; fi
-                if [[ -n "$errs" ]]; then PARITY_DETAILS_SECTION+=" - Errors: ${errs}\n"; fi
-                # Persist current position snapshot for next run speed/ETA calculation
-                if [[ -n "$pos" ]]; then echo "$pos $curr_ts" > "$progress_file" 2>/dev/null || true; fi
-                # Parity sync error alerts (no new function). Use thresholds if defined.
-                if [[ -n "$errs" && "$errs" =~ ^[0-9]+$ && "$action_word" != "idle" ]]; then
-                    local perr_warn=${PARITY_SYNC_ERR_WARN:-1} perr_crit=${PARITY_SYNC_ERR_CRIT:-10}
-                    if (( errs >= perr_crit )); then
-                        record_alert critical "Parity Sync Errors" "Parity operation has ${errs} sync errors; investigate disks (SMART long tests), cabling, and consider corrective check."
-                    elif (( errs >= perr_warn )); then
-                        record_alert warning "Parity Sync Errors" "Parity operation reported ${errs} sync errors; monitor; if increasing run a correcting parity check and inspect recent SMART logs."
-                    fi
-                fi
-            fi
         fi
     else
         # Unknown parity state (no parity devices configured)
         PARITY_STATUS_LINE="Parity: Unknown"
+    fi
+
+    # Append operation details if a parity operation is active (including paused)
+    local action="${PARITY_ACTION:-}" corr="${PARITY_CORR:-}" pos="${PARITY_POS:-}" size="${PARITY_SIZE:-}" errs="${PARITY_ERRS:-}" speed_k="${PARITY_SPEED_K:-}" rem="${PARITY_REM:-}"
+    local action_word="" corr_label="" pct="" eta_str="" paused=""
+    [[ -n "$action" ]] && action_word=$(printf "%s" "$action" | awk '{print tolower($1)}')
+    corr_label=$([[ "$corr" == "1" ]] && echo "correcting" || echo "non-correcting")
+    # Compute in-progress percentage if position/size known
+    if [[ -n "$pos" && -n "$size" ]]; then
+        pct=$(awk -v p="$pos" -v s="$size" 'BEGIN{ if (s>0) printf "%.1f", (p/s)*100; }')
+    fi
+    # Consider paused if action is non-idle but reported speed is 0 and pos<size
+    if [[ -n "$action_word" && "$action_word" != "idle" ]]; then
+        if [[ -n "$speed_k" && "$speed_k" =~ ^[0-9]+$ && "$speed_k" -eq 0 && -n "$pos" && -n "$size" && "$size" =~ ^[0-9]+$ && "$pos" =~ ^[0-9]+$ && $pos -lt $size ]]; then
+            paused=" (paused)"
+        fi
+        PARITY_STATUS_LINE+=" — ${action_word} in progress${paused} (${corr_label})"
+        [[ -n "$pct" ]] && PARITY_STATUS_LINE+=", ~${pct}%"
+        PARITY_DETAILS_SECTION="Parity Details:\n"
+        PARITY_DETAILS_SECTION+=" - Action: ${action_word}${paused} (${corr_label})\n"
+        # Progress line with optional percent
+        if [[ -n "$pos" && -n "$size" ]]; then
+            PARITY_DETAILS_SECTION+=" - Progress: ${pos} / ${size}"
+            [[ -n "$pct" ]] && PARITY_DETAILS_SECTION+=" (~${pct}%)"
+            PARITY_DETAILS_SECTION+="\n"
+        fi
+        # Load previous progress snapshot to compute delta speed/ETA
+        local progress_file prev_pos prev_ts curr_ts
+        progress_file="$STATE_DIR/parity_progress.state"
+        prev_pos=""
+        prev_ts=""
+        curr_ts=$(date +%s)
+        if [[ -f "$progress_file" ]]; then read -r prev_pos prev_ts < "$progress_file" || true; fi
+        # If previous snapshot valid, compute instantaneous MB/s and ETA
+        if [[ -n "$pos" && -n "$prev_pos" && -n "$prev_ts" && "$pos" =~ ^[0-9]+$ && "$prev_pos" =~ ^[0-9]+$ && "$prev_ts" =~ ^[0-9]+$ && $pos -ge $prev_pos ]]; then
+            local dt=$(( curr_ts - prev_ts ))
+            if (( dt > 0 )); then
+                local delta=$(( pos - prev_pos ))
+                local bytes=$(( delta * 512 ))
+                local mbps
+                mbps=$(awk -v b="$bytes" -v d="$dt" 'BEGIN{ if(d>0) printf "%.2f", (b/1048576)/d; }')
+                if [[ -n "$mbps" && -n "$size" && "$size" =~ ^[0-9]+$ ]]; then
+                    local remaining=$(( size - pos ))
+                    if (( remaining > 0 )); then
+                        local rem_bytes=$(( remaining * 512 ))
+                        local eta_sec
+                        eta_sec=$(awk -v rb="$rem_bytes" -v mbps="$mbps" 'BEGIN{ mb=mbps*1048576; if(mb>0) printf "%d", rb/mb; }')
+                        if [[ -n "$eta_sec" && "$eta_sec" =~ ^[0-9]+$ ]]; then
+                            local eta_h=$(( eta_sec/3600 )) eta_m=$(( (eta_sec%3600)/60 )) eta_s=$(( eta_sec%60 ))
+                            if (( eta_h>0 )); then eta_str="${eta_h}h ${eta_m}m"; elif (( eta_m>0 )); then eta_str="${eta_m}m ${eta_s}s"; else eta_str="${eta_s}s"; fi
+                            PARITY_DETAILS_SECTION+=" - ETA: ${eta_str} remaining\n"
+                        fi
+                    fi
+                fi
+                PARITY_DETAILS_SECTION+=" - Speed: ${mbps} MB/s (Δ ${delta} sectors / ${dt}s)\n"
+            fi
+        fi
+        # Append reported speed / remaining sectors / errors when provided
+        if [[ -n "$speed_k" && "$speed_k" =~ ^[0-9]+$ ]]; then
+            local speed_mb
+            speed_mb=$(awk -v sp="$speed_k" 'BEGIN{printf "%.2f", sp/1024.0}')
+            PARITY_DETAILS_SECTION+=" - Reported Speed: ${speed_mb} MB/s\n"
+        fi
+        if [[ -n "$rem" && "$rem" =~ ^[0-9]+$ ]]; then PARITY_DETAILS_SECTION+=" - Remaining Sectors: ${rem}\n"; fi
+        if [[ -n "$errs" ]]; then PARITY_DETAILS_SECTION+=" - Errors: ${errs}\n"; fi
+        # Persist current position snapshot for next run speed/ETA calculation
+        if [[ -n "$pos" ]]; then echo "$pos $curr_ts" > "$progress_file" 2>/dev/null || true; fi
+        # Parity sync error alerts. Use thresholds if defined.
+        if [[ -n "$errs" && "$errs" =~ ^[0-9]+$ && "$action_word" != "idle" ]]; then
+            local perr_warn=${PARITY_SYNC_ERR_WARN:-1} perr_crit=${PARITY_SYNC_ERR_CRIT:-10}
+            if (( errs >= perr_crit )); then
+                record_alert critical "Parity Sync Errors" "Parity operation has ${errs} sync errors; investigate disks (SMART long tests), cabling, and consider corrective check."
+            elif (( errs >= perr_warn )); then
+                record_alert warning "Parity Sync Errors" "Parity operation reported ${errs} sync errors; monitor; if increasing run a correcting parity check and inspect recent SMART logs."
+            fi
+        fi
     fi
 }
 
@@ -1151,7 +1140,6 @@ save_risk_spikes() {
 # === Helper Function ===
 # Resolve SMART-capable device for a given /mnt path
 smart_device_for_mount() {
-    # Resolve SMART-capable block device backing a mountpoint (direct map or findmnt fallback)
     local mp="$1"
     local dev="${MOUNT_TO_DEV[$mp]:-}"
     if [[ -n "$dev" && -b "$dev" ]]; then echo "$dev"; return 0; fi
@@ -1254,7 +1242,6 @@ fi
 # === Helper Function ===
 # Persist last-run SMART test metadata for a device
 save_last_test() {
-    # Persist SMART test completion timestamps for disks to state file
     true > "$SMART_LAST"
     for disk in "${!LAST_TEST[@]}"; do
         echo "$disk ${LAST_TEST[$disk]}" >> "$SMART_LAST"
@@ -1264,7 +1251,6 @@ save_last_test() {
 # === Helper Function ===
 # Persist last-run NVMe health snapshot for a device
 save_nvme_state() {
-    # Persist last observed NVMe counters per device (key=value pairs)
     true > "$NVME_STATE_FILE"
     for dev in "${!NVME_LAST_UNSAFE[@]}"; do
         local line="$dev unsafe=${NVME_LAST_UNSAFE[$dev]:-0}"
@@ -1297,11 +1283,9 @@ save_cmd_timeout_last() {
     done
 }
 
-# Evaluate SMART attributes and status for a given disk.
 # === Main Function ===
 # Collect SMART data, classify device health, and raise alerts
 evaluate_smart() {
-    # Identify device type (NVMe vs SATA) and initialize outputs
     local disk=$1
     local is_nvme=0
     [[ $disk == /dev/nvme* ]] && is_nvme=1
@@ -1729,7 +1713,6 @@ evaluate_smart() {
             _nand_slc_gb=$(echo "$attr" | awk '/NAND_GB_Written_SLC/ {print $10; exit}')
             if [[ -n "$_nand_slc_gb" && "$_nand_slc_gb" =~ ^[0-9]+$ ]]; then _tbw_bytes=$(( _nand_slc_gb * 1024 * 1024 * 1024 )); fi
         fi
-
         # Prefer MWI normalized when present, but apply heuristics for inverted/ambiguous reports
         if [[ -n "$mwi_norm" ]]; then
             local model
@@ -1931,7 +1914,6 @@ evaluate_smart() {
     done
     return 0
 }
-
 
 # === Helper Function ===
 # Extract latest SMART self-test entry from smartctl output
@@ -2248,7 +2230,6 @@ run_smart_test() {
             last_long_hours_diff=$(( current_poh - persisted ))
         fi
     fi
-
     # SMART scheduling: evaluate SMART state & risk once, then decide if long test needed.
     local state_pre msgs_pre risk_pre schedule_long=0 reasons=()
     evaluate_smart "$disk"
@@ -2294,7 +2275,6 @@ run_smart_test() {
     else
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - SHORT test retained on $disk (risk=${risk_pre} state=${state_pre})"
     fi
-
     # If not scheduled yet but near interval, add to due-soon health alerts list
     if (( schedule_long == 0 )) && [[ -n "${last_long_hours_diff:-}" ]]; then
         local remaining=$(( threshold_hours - last_long_hours_diff ))
@@ -2305,7 +2285,7 @@ run_smart_test() {
             fi
         fi
     fi
-
+    # Check for existing in-progress test
     local exec_status existing_in_progress=0
     if [[ $disk == /dev/nvme* ]]; then
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART capability read (-c) on $disk"
@@ -2639,7 +2619,6 @@ monitor_btrfs() {
 # === Main Function ===
 # Monitor XFS filesystems for metadata issues
 monitor_xfs() {
-    # Log start (or disabled state) then iterate XFS mountpoints performing lightweight metadata scrutiny and kernel message scan
     if [[ ${ENABLE_XFS_CHECK:-0} -eq 1 ]]; then
         log_xfs "$(date '+%Y-%m-%d %H:%M:%S') - XFS checks starting"
     else
@@ -2679,7 +2658,6 @@ monitor_xfs() {
 # === Main Function ===
 # Evaluate array and pool capacity against thresholds
 evaluate_capacity_alerts() {
-    # Compare aggregate array and pool usage against hard threshold and near-threshold delta to generate alerts
     if [[ -n "${ARRAY_PERCENT:-}" ]]; then
         # Critical if usage exceeds configured threshold
         if awk -v p="${ARRAY_PERCENT:-0}" -v t="$THRESHOLD" 'BEGIN{exit (p>t)?0:1}'; then
@@ -3059,9 +3037,8 @@ trim_outer_blank_lines() {
 }
 
 # === Main Function ===
-# Build storage array and pool usage lines with severity
+# Build array disk list, compute usage per disk, merge SMART severity, and assemble lines
 build_storage_and_disk_lines() {
-    # Build array disk list, compute usage per disk, merge SMART severity, and assemble lines
     ARRAY_MAX_SEV=0; POOLS_MAX_SEV=0
     ARRAY_DISK_LINES=""; POOL_LINES=""
     local arr=()
@@ -3124,11 +3101,13 @@ build_storage_and_disk_lines() {
     done
     # Compute aggregated array stats and human-readable forms
     if (( arr_size > 0 )); then
-        ARRAY_PERCENT=$(awk "BEGIN{printf \"%.1f\", ($arr_used/$arr_size)*100}")
+        ARRAY_PERCENT=$(awk "BEGIN{printf \"%.3f\", ($arr_used/$arr_size)*100}")
         ARRAY_USED_HR=$(human_readable "$arr_used")
         ARRAY_TOTAL_HR=$(human_readable "$arr_size")
+        # Export raw bytes for higher-precision capacity history
+        ARRAY_USED_BYTES=$arr_used
+        ARRAY_TOTAL_BYTES=$arr_size
     fi
-
     # Optionally include parity devices when parity is valid (for visibility)
     local pflag
     pflag="$(parity_clean_flag || true)"
@@ -3174,7 +3153,6 @@ build_storage_and_disk_lines() {
             ' "$ini" 2>/dev/null)
         fi
     fi
-
     # Discover pools (exclude array disks and /mnt/user), honoring pool excludes
     local pools=()
     for p in /mnt/*; do
@@ -3248,7 +3226,7 @@ build_storage_and_disk_lines() {
             devlist=$(findmnt -n -o SOURCE "$p" 2>/dev/null || true)
             raid_str="(SINGLE)"
         fi
-
+        # Evaluate member device SMART statuses for pool
         local pool_dev_max=0 pool_has_wear=0 pool_has_tbw=0 pool_has_smart=0
         for dv in $devlist; do
             local rootdv="$dv"
@@ -3265,11 +3243,9 @@ build_storage_and_disk_lines() {
             if [[ "$msg" == *"NVMe wear"* || "$msg" == *"SSD life remaining"* ]]; then pool_has_wear=1; fi
             if [[ "$msg" == *"TBW exceeds"* || "$msg" == *"TBW ~"* ]]; then pool_has_tbw=1; fi
         done
-
         local pool_final=$usage_sev
         (( pool_dev_max > pool_final )) && pool_final=$pool_dev_max
         (( pool_final > POOLS_MAX_SEV )) && POOLS_MAX_SEV=$pool_final
-
         # Build driver tags (SMART/TBW/Wear) for Pool Disks (only if severity > 0)
         local meta_part=""
         if (( pool_final > 0 )); then
@@ -3283,7 +3259,6 @@ build_storage_and_disk_lines() {
                 meta_part="{driver: ${joined}}"
             fi
         fi
-
         # Append pool line if verbose or severity > OK
         if (( VERBOSE_OK == 1 || pool_final > 0 )); then
             local cap_str
@@ -3291,7 +3266,6 @@ build_storage_and_disk_lines() {
             local usage_display="$cap_str"; [[ -n "$raid_str" ]] && usage_display="$cap_str $raid_str"
             POOL_INFO+=("$name|$usage_display|$pct|$(status_word "$pool_final")|$meta_part")
         fi
-
         # Pool membership mapping for annotations
         # Map each member device back to its pool for later annotations
         for dv in $devlist; do
@@ -3306,11 +3280,13 @@ build_storage_and_disk_lines() {
     done
     # Compute aggregated pool stats and human-readable forms
     if (( pools_size > 0 )); then
-        POOLS_PERCENT=$(awk "BEGIN{printf \"%.1f\", ($pools_used/$pools_size)*100}")
+        POOLS_PERCENT=$(awk "BEGIN{printf \"%.3f\", ($pools_used/$pools_size)*100}")
         POOLS_USED_HR=$(human_readable "$pools_used")
         POOLS_TOTAL_HR=$(human_readable "$pools_size")
+        # Export raw bytes for higher-precision capacity history
+        POOLS_USED_BYTES=$pools_used
+        POOLS_TOTAL_BYTES=$pools_size
     fi
-
     # Persist per-disk usage snapshot to support disk growth analysis
     local today
     today=$(date '+%Y-%m-%d')
@@ -3319,13 +3295,11 @@ build_storage_and_disk_lines() {
         read -r sz u pct mount < <(df -B1 --output=size,used,pcent,target "$d" 2>/dev/null | tail -n1) || continue
         echo "$today $(basename \""$d"\") used=$u size=$sz" >> "$DISK_CAP_HISTORY_FILE"
     done
-
     # Bump group severities based on capacity thresholds (array/pools)
     if awk -v p="${ARRAY_PERCENT:-0}" -v t="$THRESHOLD" 'BEGIN{exit (p>t)?0:1}'; then ARRAY_MAX_SEV=2
     elif awk -v p="${ARRAY_PERCENT:-0}" -v t="$THRESHOLD" -v d="$NEAR_THRESHOLD_DELTA" 'BEGIN{exit (p + d >= t)?0:1}' && [[ $ARRAY_MAX_SEV -lt 1 ]]; then ARRAY_MAX_SEV=1; fi
     if awk -v p="${POOLS_PERCENT:-0}" -v t="$THRESHOLD" 'BEGIN{exit (p>t)?0:1}'; then POOLS_MAX_SEV=2
     elif awk -v p="${POOLS_PERCENT:-0}" -v t="$THRESHOLD" -v d="$NEAR_THRESHOLD_DELTA" 'BEGIN{exit (p + d >= t)?0:1}' && [[ $POOLS_MAX_SEV -lt 1 ]]; then POOLS_MAX_SEV=1; fi
-
     local a_emoji
     a_emoji=$(map_emoji "$ARRAY_MAX_SEV")
     local p_emoji
@@ -3334,12 +3308,10 @@ build_storage_and_disk_lines() {
     a_word=$(status_word "$ARRAY_MAX_SEV")
     local p_word
     p_word=$(status_word "$POOLS_MAX_SEV")
-
     # Build the top summary line for array and pools
     STORAGE_TOP_LINES=$(printf "%s Array %s (%d Disk): %s%% — %s used of %s\n%s Pools %s (%d Disk): %s%% — %s used of %s" \
         "$a_emoji" "$a_word" "$ARRAY_COUNT" "${ARRAY_PERCENT:-0.0}" "${ARRAY_USED_HR:-0 B}" "${ARRAY_TOTAL_HR:-0 B}" \
         "$p_emoji" "$p_word" "$POOLS_COUNT" "${POOLS_PERCENT:-0.0}" "${POOLS_USED_HR:-0 B}" "${POOLS_TOTAL_HR:-0 B}")
-
     # Dynamic alignment for [Array Disks] and [Pool Disks]
     local NAME_COL_WIDTH=6 USAGE_COL_WIDTH=22 PCT_COL_WIDTH=4 STATUS_COL_WIDTH=7 DRIVER_COL_WIDTH=0 REASON_COL_WIDTH=0
     local tmp_entry
@@ -3448,7 +3420,6 @@ validate_storage_metrics() {
 # === Main Function ===
 # Summarize subsystem statuses based on collected alerts
 build_subsystem_lines() {
-    # Aggregate alert severities across subsystems to produce a concise health summary
     local sm=OK bt=OK xfs=OK cap=OK pm=OK end=OK ad=OK pr=OK
     for a in "${ALERT_CRIT[@]}"; do
         [[ $a == "$NOTIFY_TITLE_SMART"* ]] && sm=CRITICAL
@@ -3531,7 +3502,6 @@ Parity: $pr"
 # === Main Function ===
 # Build health alerts based on alert messages
 build_health_alerts() {
-    # Translate alerts and trends into actionable next steps by device/mount
     local rec=""
     if (( ${#ALERT_WARN[@]} + ${#ALERT_CRIT[@]} > 0 )); then
         rec+="Health Alerts:\n"
@@ -3630,7 +3600,10 @@ build_health_alerts() {
                 *"Btrfs Device"*)
                     [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Btrfs per-device errors rising; run scrub, check SMART for underlying issues, inspect cabling/backplane, and plan replacement if escalation persists.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
                 *"XFS metadata anomalies"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: XFS metadata/stat anomaly; schedule offline check (xfs_repair -n) and verify backups.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
+                    if [[ -n "$friendly" ]]; then
+                        rec+="- $display_friendly$model_suffix: XFS metadata/stat anomaly, stop array/unmount volume, run 'xfs_repair -n $bdev' (read-only). If output says 'would be modified', back up then run 'xfs_repair $bdev' during maintenance. Also check dmesg and SMART for underlying faults.\n"
+                        [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
+                    fi ;;
                 *"POH age HDD"*)
                     if echo "$x" | grep -qi 'SMART CRITICAL'; then
                         [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Critical HDD power-on hours; schedule replacement window and ensure backups are current.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
@@ -3801,7 +3774,6 @@ build_health_alerts() {
                     [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: High I/O error frequency; check SATA/NVMe cabling, power stability, controller logs; consider moving data & replacing if persistent.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
             esac
         done
-
         # Emit aggregated firmware reset guidance lines (after collecting all events)
         local fr_dev
         for fr_dev in "${!FR_COUNT[@]}"; do
@@ -3814,7 +3786,6 @@ build_health_alerts() {
             rec+="- ${friendly_tag}${model_suffix}: ${agg_line}.\n"
             SEEN_REC_DEVICES["$fr_dev"]=1
         done
-
         # Compound SMART failure escalation: if multiple critical conditions detected on same device
         for dev_key in "${!CRIT_SMART_COUNT[@]}"; do
             local cnt=${CRIT_SMART_COUNT[$dev_key]:-0}
@@ -3823,7 +3794,6 @@ build_health_alerts() {
                 COMPOUND_EMITTED[dev_key]=1
             fi
         done
-
         # Inject NVMe-specific SMART message driven guidance (messages not recorded via record_alert)
         for dev in "${!SMART_STATE[@]}"; do
             local st="${SMART_STATE[$dev]:-OK}"
@@ -3870,7 +3840,6 @@ build_health_alerts() {
                 rec+=" - $tag$model_suffix: NVMe time at critical temperature; throttle workloads and replace if persistent.\n"; SEEN_REC_DEVICES[$base]=1; continue
             fi
         done
-
         # Compute composite health score per device and prioritize alert ordering
         local rank_lines=()
         local dev
@@ -3954,7 +3923,6 @@ build_health_alerts() {
             done <<< "$sorted"
         fi
     fi
-
     # Parity invalid is an immediate actionable condition; include if present
     if [[ "${PARITY_CLEAN_FLAG:-1}" == "0" ]]; then
         rec+=" - Parity: invalid; run non-correcting parity check first (investigate recent SMART pending/reallocated/uncorrectable deltas), then correcting if errors found.\n"
@@ -3976,7 +3944,6 @@ build_health_alerts() {
         # Provide a default informational message when no health alerts were generated
         HEALTH_ALERTS_SECTION="Health Alerts:\n - None detected; all monitored disks and filesystems nominal."
     fi
-
     # Integrate NVMe wear projection guidance (warn/critical only) if arrays populated
     if declare -p NVME_WEAR_DAYS_LEFT &>/dev/null && declare -p NVME_WEAR_RATE &>/dev/null; then
         local guid_added=0
@@ -4062,7 +4029,6 @@ build_health_alerts() {
             fi
         fi
     fi
-
     # Add heavy writer guidance (tiers) based on weekly percent arrays, ranked by composite priority
     if declare -p WRITER_WEEKLY_PCT &>/dev/null && declare -p WRITER_TIER &>/dev/null; then
         local dev w tier
@@ -4315,11 +4281,9 @@ build_trend_section() {
             fi
         fi
     fi
-
-
     # Trend-derived early warnings (growth acceleration, thermal exposure, heavy writers, endurance)
-    declare -g DL_SHRINK_LINE EARLY_ERR_LINE BTRFS_SUM_LINE SMART_GROWTH_LINE
-    DL_SHRINK_LINE=""; EARLY_ERR_LINE=""; BTRFS_SUM_LINE=""; SMART_GROWTH_LINE=""
+    declare -g DL_SHRINK_LINE EARLY_ERR_LINE BTRFS_SUM_LINE SMART_GROWTH_LINE POH_GROWTH_LINE
+    DL_SHRINK_LINE=""; EARLY_ERR_LINE=""; BTRFS_SUM_LINE=""; SMART_GROWTH_LINE=""; POH_GROWTH_LINE=""
     # SMART attribute growth trend computation
     if (( SMART_ATTR_TREND_ENABLED == 1 )); then
         declare -A SMARTG_CODES=() SMARTG_SCORE=()
@@ -4451,6 +4415,22 @@ build_trend_section() {
                 if (( ${#poh_rank[@]} > 0 )); then
                     local sorted
                     sorted=$(printf "%s\n" "${poh_rank[@]}" | sort -nr -k1,1 | head -n ${ENDURANCE_TREND_TOP_N:-5})
+                    # Build compact POH growth line with rate per day
+                    {
+                        local _s="" _cnt=0
+                        while read -r delta dev start end; do
+                            [[ -z "$dev" ]] && continue
+                            local days_interval=$(( ( $(date -d "${poh_last_dt[$dev]}" +%s 2>/dev/null || date +%s) - $(date -d "${poh_first_dt[$dev]}" +%s 2>/dev/null || date +%s) ) / 86400 ))
+                            (( days_interval<=0 )) && days_interval=1
+                            local rate
+                            rate=$(awk -v dlt="$delta" -v dd="$days_interval" 'BEGIN{printf "%.2f", dlt/dd}')
+                            local base tag model_suffix
+                            base="$(base_device "$dev")"; tag="$(basename "$base")"; model_suffix="$(model_suffix_for "$base")"
+                            _s+="${tag}${model_suffix} +${delta}h r=${rate}h/d; "
+                            (( ++_cnt >= ${ENDURANCE_TREND_TOP_N:-5} )) && break
+                        done < <(printf "%s\n" "$sorted")
+                        POH_GROWTH_LINE="${_s%'; '}"
+                    }
                 fi
             fi
         fi
@@ -4745,7 +4725,6 @@ build_trend_section() {
             fi
         fi
     fi
-
     # Build compact one-liner Trend output with key metrics
     {
         declare -a _TL=()
@@ -4906,7 +4885,6 @@ build_trend_section() {
                 fi
             fi
         fi
-
         # NVMe/SATA SSD wear rate (TBW-derived percent/day)
         if declare -p TBW_DAILY >/dev/null 2>&1; then
             local wear_items=() sep_w=" | "
@@ -4923,20 +4901,25 @@ build_trend_section() {
                 cap_tb=$(get_device_capacity_tb "$dev")
                 tbw_thresh_tb=$(tbw_threshold_tb_for_device "$model" "$cap_tb")
                 [[ -z "$tbw_thresh_tb" || "$tbw_thresh_tb" == 0 ]] && continue
-                local daily_bytes total_bytes rate_pct_day
+                local daily_bytes total_bytes rate_pct_day_raw rate_pct_day_disp
                 daily_bytes=${TBW_DAILY[$dev]:-0}
                 total_bytes=$(( tbw_thresh_tb * 1000 * 1000 * 1000 * 1000 ))
                 if (( daily_bytes > 0 && total_bytes > 0 )); then
-                    rate_pct_day=$(awk -v d="$daily_bytes" -v t="$total_bytes" 'BEGIN{printf "%.4f", (d/t)*100.0}')
+                    rate_pct_day_raw=$(awk -v d="$daily_bytes" -v t="$total_bytes" 'BEGIN{printf "%.8f", (d/t)*100.0}')
+                    # Display at 4 decimals; if non-zero but rounds to 0.0000, show ~0.0001
+                    rate_pct_day_disp=$(awk -v r="$rate_pct_day_raw" 'BEGIN{printf "%.4f", r}')
+                    if awk -v r="$rate_pct_day_raw" -v d="$rate_pct_day_disp" 'BEGIN{exit (r>0 && d==0)?0:1}'; then
+                        rate_pct_day_disp="~0.0001"
+                    fi
                     local used_pct days_left label_dev
                     used_pct=${CUR_ATTR["$dev|nvme_percent_used"]:-}
                     label_dev=$(basename "$dev")
-                    if [[ -n "$used_pct" && "$used_pct" =~ ^[0-9]+$ && $(awk -v r="$rate_pct_day" 'BEGIN{print (r>0)}') -eq 1 ]]; then
+                    if [[ -n "$used_pct" && "$used_pct" =~ ^[0-9]+$ ]] && awk -v r="$rate_pct_day_raw" 'BEGIN{exit (r>0)?0:1}'; then
                         local remaining
-                        remaining=$(awk -v u="$used_pct" -v r="$rate_pct_day" 'BEGIN{printf "%.1f", (100.0 - u)/r}')
-                        wear_items+=("${label_dev} ${remaining/.*}d r=${rate_pct_day}%/d")
+                        remaining=$(awk -v u="$used_pct" -v r="$rate_pct_day_raw" 'BEGIN{printf "%.1f", (100.0 - u)/r}')
+                        wear_items+=("${label_dev} ${remaining/.*}d r=${rate_pct_day_disp}%/d")
                     else
-                        wear_items+=("${label_dev} ∞ r=${rate_pct_day}%/d")
+                        wear_items+=("${label_dev} ∞ r=${rate_pct_day_disp}%/d")
                     fi
                 fi
             done
@@ -5024,13 +5007,49 @@ build_trend_section() {
             fi
         fi
         # Lifecycle
-        if declare -p REPLACE_LIST &>/dev/null || declare -p MONITOR_LIST &>/dev/null; then
-            local rcnt=0 mcnt=0; [[ -n "${REPLACE_LIST[*]:-}" ]] && rcnt=${#REPLACE_LIST[@]} ; [[ -n "${MONITOR_LIST[*]:-}" ]] && mcnt=${#MONITOR_LIST[@]}
-            local rshow="" mshow=""
-            if (( rcnt > 0 )); then rshow="Replace(${rcnt})=$(printf '%s' "${REPLACE_LIST[*]:0:LIFECYCLE_ALERT_TOP_N}")"; fi
-            if (( mcnt > 0 )); then mshow="Monitor(${mcnt})=$(printf '%s' "${MONITOR_LIST[*]:0:LIFECYCLE_ALERT_TOP_N}")"; fi
-            local life_line="${rshow}${rshow:+; }${mshow}"
+        {
+            local rcnt=0 mcnt=0 rshow="" mshow="" life_line="" top=${LIFECYCLE_ALERT_TOP_N}
+            if declare -p REPLACE_LIST &>/dev/null || declare -p MONITOR_LIST &>/dev/null; then
+                [[ -n "${REPLACE_LIST[*]:-}" ]] && rcnt=${#REPLACE_LIST[@]} ; [[ -n "${MONITOR_LIST[*]:-}" ]] && mcnt=${#MONITOR_LIST[@]}
+                if (( rcnt > 0 )); then rshow="Replace(${rcnt})=$(printf '%s' "${REPLACE_LIST[*]:0:top}")"; fi
+                if (( mcnt > 0 )); then mshow="Monitor(${mcnt})=$(printf '%s' "${MONITOR_LIST[*]:0:top}")"; fi
+            fi
+            if [[ -z "$rshow$mshow" ]] && [[ -f "$RISK_TIER_HISTORY_FILE" ]]; then
+                # Fallback to most recent history line containing device lists
+                local last
+                last=$(tail -n 200 "$RISK_TIER_HISTORY_FILE" | awk 'NF' | tail -n 1)
+                if [[ -n "$last" ]]; then
+                    local repl mon
+                    repl=$(printf "%s\n" "$last" | awk '{for(i=1;i<=NF;i++){if($i ~ /^REPLACE_DEVICES=/){sub(/REPLACE_DEVICES=/,"",$i); print $i; break}}}')
+                    mon=$(printf "%s\n" "$last" | awk '{for(i=1;i<=NF;i++){if($i ~ /^MONITOR_DEVICES=/){sub(/MONITOR_DEVICES=/,"",$i); print $i; break}}}')
+                    if [[ -n "$repl" ]]; then
+                        # split by comma, keep top N
+                        IFS=',' read -r -a _ra <<< "$repl"
+                        rcnt=${#_ra[@]}
+                        local _slice_r; _slice_r=$(printf '%s ' "${_ra[@]:0:top}" | awk 'NF')
+                        rshow="Replace(${rcnt})=${_slice_r% }"
+                    fi
+                    if [[ -n "$mon" ]]; then
+                        IFS=',' read -r -a _ma <<< "$mon"
+                        mcnt=${#_ma[@]}
+                        local _slice_m; _slice_m=$(printf '%s ' "${_ma[@]:0:top}" | awk 'NF')
+                        mshow="Monitor(${mcnt})=${_slice_m% }"
+                    fi
+                fi
+            fi
+            life_line="${rshow}${rshow:+; }${mshow}"
             [[ -n "$life_line" ]] && _add_line "LIFE" "$life_line"
+        }
+        # POH growth (aging rate)
+        if [[ -n "${POH_GROWTH_LINE:-}" ]]; then
+            local _poh_items=() _ppart
+            IFS=';' read -r -a _poh_parts <<< "${POH_GROWTH_LINE}" || true
+            for _ppart in "${_poh_parts[@]}"; do
+                _ppart=$(echo "$_ppart" | awk 'NF')
+                [[ -z "$_ppart" ]] && continue
+                if [[ "$_ppart" =~ -[0-9] ]]; then _poh_items+=("$_ppart"); else _poh_items+=("🔺$_ppart"); fi
+            done
+            [[ ${#_poh_items[@]} -gt 0 ]] && _add_line "POH↑" "$(IFS=' | '; echo "${_poh_items[*]}")"
         fi
         # POH Age
         if (( AGE_AWARE_ENABLED==1 )) && [[ -n "${AGE_AWARE_LINES:-}" ]]; then
@@ -5286,7 +5305,6 @@ compute_risk_and_lifecycle() {
         [[ $msg == *"Soft Read Error Rate"* ]] && ((score += W_SOFT_READ))
         [[ $msg == *"read-only mode"* ]] && ((score += W_NVME_RO))
         [[ $msg == *"reliability degraded"* ]] && ((score += W_NVME_REL))
-
         local poh=0 percent_used=0 life_remain=0
         if [[ $dev == /dev/nvme* ]]; then
             percent_used=${CUR_ATTR["$dev|nvme_percent_used"]:-0}
@@ -5302,7 +5320,6 @@ compute_risk_and_lifecycle() {
             if (( _tc >= TBW_CONSUMED_CRIT )); then ((score += W_TBW_CONS_CRIT))
             elif (( _tc >= TBW_CONSUMED_WARN )); then ((score += W_TBW_CONS_WARN)); fi
         fi
-
         RISK[$dev]=$score
         RISK_MAP[$dev]=$score
         if (( AGE_AWARE_ENABLED==1 )); then
@@ -5336,7 +5353,6 @@ compute_risk_and_lifecycle() {
         fi
         (( ++idx >= RISK_TOP_N )) && break
     done < <(printf "%s\n" "$filtered")
-
     # Bucket disks into replace/monitor/healthy based on score thresholds
     if (( LIFECYCLE_ENABLED == 1 )); then
         local replace=() monitor=() healthy=()
@@ -5384,7 +5400,18 @@ persist_risk_tier_history() {
     if [[ -f "$RISK_TIER_HISTORY_FILE" ]]; then
         awk -v d="$today" '$1!=d{print}' "$RISK_TIER_HISTORY_FILE" > "$tmp" || true
     fi
-    echo "$today critical=$crit warning=$warn replace=$replace_cnt monitor=$monitor_cnt healthy=$healthy_cnt" >> "$tmp"
+    local repl_csv mon_csv
+    if declare -p REPLACE_LIST &>/dev/null && (( ${#REPLACE_LIST[@]} > 0 )); then
+        local _r=() d; for d in "${REPLACE_LIST[@]}"; do _r+=("$(basename "$d")"); done; repl_csv=$(IFS=, ; echo "${_r[*]}")
+    else
+        repl_csv=""
+    fi
+    if declare -p MONITOR_LIST &>/dev/null && (( ${#MONITOR_LIST[@]} > 0 )); then
+        local _m=() d; for d in "${MONITOR_LIST[@]}"; do _m+=("$(basename "$d")"); done; mon_csv=$(IFS=, ; echo "${_m[*]}")
+    else
+        mon_csv=""
+    fi
+    echo "$today critical=$crit warning=$warn replace=$replace_cnt monitor=$monitor_cnt healthy=$healthy_cnt REPLACE_DEVICES=${repl_csv} MONITOR_DEVICES=${mon_csv}" >> "$tmp"
     mv -f "$tmp" "$RISK_TIER_HISTORY_FILE" 2>/dev/null || rm -f "$tmp" || true
     # Persist per-disk risk scores history (overwrite today's entries for each disk)
     if declare -p RISK_MAP &>/dev/null; then
@@ -5435,18 +5462,49 @@ capacity_forecast_and_export() {
     convert_pct_to_milli() { local p="$1"; if [[ $p =~ ^[0-9]+$ ]]; then echo $(( p*1000 )); elif [[ $p =~ ^([0-9]+)\.([0-9]+)$ ]]; then local whole=${BASH_REMATCH[1]}; local frac=${BASH_REMATCH[2]}; frac=${frac:0:3}; while (( ${#frac} < 3 )); do frac+="0"; done; echo $(( whole*1000 + frac )); else echo 0; fi; }
     local now_date
     now_date=$(date '+%Y-%m-%d')
+    # Prefer computing percent from bytes for maximum precision
+    local arr_bu arr_bs pool_bu pool_bs
+    arr_bu=${ARRAY_USED_BYTES:-0}
+    arr_bs=${ARRAY_TOTAL_BYTES:-0}
+    pool_bu=${POOLS_USED_BYTES:-0}
+    pool_bs=${POOLS_TOTAL_BYTES:-0}
     local array_pct pools_pct
-    array_pct="${ARRAY_PERCENT:-0}"
-    pools_pct="${POOLS_PERCENT:-0}"
-    echo "$now_date array=$array_pct pools=$pools_pct" >> "$CAPACITY_HISTORY_FILE"
+    if [[ "$arr_bs" =~ ^[0-9]+$ && $arr_bs -gt 0 ]]; then
+        array_pct=$(awk -v bu="$arr_bu" -v bs="$arr_bs" 'BEGIN{printf "%.6f", (bu/bs)*100}')
+    else
+        array_pct="${ARRAY_PERCENT:-0}"
+    fi
+    if [[ "$pool_bs" =~ ^[0-9]+$ && $pool_bs -gt 0 ]]; then
+        pools_pct=$(awk -v bu="$pool_bu" -v bs="$pool_bs" 'BEGIN{printf "%.6f", (bu/bs)*100}')
+    else
+        pools_pct="${POOLS_PERCENT:-0}"
+    fi
+    # Persist both percent and raw bytes for back-compat and better precision
+    echo "$now_date array=$array_pct pools=$pools_pct arr_bu=$arr_bu arr_bs=$arr_bs pool_bu=$pool_bu pool_bs=$pool_bs" >> "$CAPACITY_HISTORY_FILE"
     local arr_prev=() pool_prev=() dates=()
     local lines
     lines=$(tail -n $HISTORY_WINDOW_DAYS "$CAPACITY_HISTORY_FILE" 2>/dev/null || true)
     while read -r l; do
         [[ -z "$l" ]] && continue
         dates+=("$l")
-        arr_prev+=("$(echo "$l" | awk -F '[ =]' '{for(i=1;i<=NF;i++){if($i ~ /^array=/){print substr($i,7)}}}')")
-        pool_prev+=("$(echo "$l" | awk -F '[ =]' '{for(i=1;i<=NF;i++){if($i ~ /^pools=/){print substr($i,7)}}}')")
+        # Prefer computing percent from persisted bytes; fallback to stored percent fields
+        local _abu _abs _pbu _pbs _apct _ppct
+        _abu=$(awk 'match($0, /arr_bu=([0-9]+)/, m){print m[1]}' <<< "$l")
+        _abs=$(awk 'match($0, /arr_bs=([0-9]+)/, m){print m[1]}' <<< "$l")
+        _pbu=$(awk 'match($0, /pool_bu=([0-9]+)/, m){print m[1]}' <<< "$l")
+        _pbs=$(awk 'match($0, /pool_bs=([0-9]+)/, m){print m[1]}' <<< "$l")
+        if [[ -n "$_abu" && -n "$_abs" && $_abs -gt 0 ]]; then
+            _apct=$(awk -v bu="$_abu" -v bs="$_abs" 'BEGIN{printf "%.6f", (bu/bs)*100}')
+        else
+            _apct=$(awk 'match($0, /array=([0-9.]+)/, m){print m[1]}' <<< "$l")
+        fi
+        if [[ -n "$_pbu" && -n "$_pbs" && $_pbs -gt 0 ]]; then
+            _ppct=$(awk -v bu="$_pbu" -v bs="$_pbs" 'BEGIN{printf "%.6f", (bu/bs)*100}')
+        else
+            _ppct=$(awk 'match($0, /pools=([0-9.]+)/, m){print m[1]}' <<< "$l")
+        fi
+        arr_prev+=("${_apct:-0}")
+        pool_prev+=("${_ppct:-0}")
     done < <(printf "%s\n" "$lines")
     local arr_growth_m=0 pool_growth_m=0 count=${#arr_prev[@]}
     if (( count > 1 )); then
@@ -5550,7 +5608,6 @@ capacity_forecast_and_export() {
     POOL_HISTORY_COUNT="$count"
 }
 
-
 # === Main Function ===
 # Analyze TBW history to estimate daily write rates and days to threshold
 tbw_forecast_and_heavy_writers() {
@@ -5579,7 +5636,9 @@ tbw_forecast_and_heavy_writers() {
         if [[ -z "${last_dt[$dev]:-}" || "$dt" > "${last_dt[$dev]}" ]]; then last_dt[$dev]="$dt"; last_v[$dev]="$v"; fi
     done < "$tmp"
     rm -f "$tmp"
-    declare -A TBW_DAILY TBW_DAYS_LEFT
+    # Ensure global associative arrays for downstream Trend assembly
+    unset -v TBW_DAILY TBW_DAYS_LEFT TBW_STATUS_MAP 2>/dev/null || true
+    declare -gA TBW_DAILY TBW_DAYS_LEFT TBW_STATUS_MAP
     declare -a heavy_rank=()
     for dev in "${!last_v[@]}"; do
         local start=${first_v[$dev]:-0} end=${last_v[$dev]:-0}
@@ -5647,7 +5706,6 @@ tbw_forecast_and_heavy_writers() {
         done
     fi
     # Persist TBW days-left snapshot (once daily) for trend analysis
-    declare -A TBW_DAYS_LEFT TBW_STATUS_MAP 2>/dev/null || true
     if (( ${TBW_TREND_ENABLED:-0} == 1 )); then
         if declare -p TBW_DAYS_LEFT >/dev/null 2>&1; then
             local __have_keys=0
@@ -5819,6 +5877,16 @@ collect_xfs_proc_stats() {
     local stat_file="/proc/fs/xfs/stat"
     [[ -r "$stat_file" ]] || return 0
     local prev_file="$XFS_PROC_PREV_FILE"
+    # Optionally suppress alerting during parity operations (still capture history/snapshot)
+    local suppress=0
+    if (( XFS_PROC_SUPPRESS_DURING_PARITY == 1 )); then
+        # Ensure parity state is refreshed (non-fatal if unavailable)
+        parity_state || true
+        if [[ -n "${PARITY_ACTION:-}" && "${PARITY_ACTION,,}" != "idle" ]]; then
+            suppress=1
+            log_xfs "$(date '+%Y-%m-%d %H:%M:%S') - Suppressing XFS proc alerts (parity action: ${PARITY_ACTION})"
+        fi
+    fi
     declare -A PREV_XFS
     # Load previous snapshot for delta computation
     if [[ -f "$prev_file" ]]; then
@@ -5828,9 +5896,27 @@ collect_xfs_proc_stats() {
         done < "$prev_file"
     fi
     true > "$prev_file.tmp"
-    local anomalies=0
-    # Focused subset of counters relevant to allocation / directory / flushing behavior
-    local keys=(extent_alloc dir_lookup dir_create xs_xstrat delalloc flush)
+    local had_any=0 had_crit=0
+    local summary_lines=""
+    # Resolve keys to inspect: use configured list or defaults, then apply excludes
+    local keys=()
+    if [[ -n "$XFS_PROC_KEYS" ]]; then
+        read -r -a keys <<< "$XFS_PROC_KEYS"
+    else
+        keys=(extent_alloc dir_lookup dir_create xs_xstrat delalloc flush)
+    fi
+    if [[ -n "$XFS_PROC_KEYS_EXCLUDE" ]]; then
+        local filtered=() k ex
+        for k in "${keys[@]}"; do
+            local skip=0
+            for ex in $XFS_PROC_KEYS_EXCLUDE; do [[ "$k" == "$ex" ]] && { skip=1; break; }; done
+            (( skip==0 )) && filtered+=("$k")
+        done
+        keys=("${filtered[@]}")
+    fi
+    # Snapshot XFS mountpoints once for reuse
+    local -a xfs_mounts_arr=()
+    mapfile -t xfs_mounts_arr < <(mount | awk '/ xfs /{print $3}')
     for k in "${keys[@]}"; do
         local val
         val=$(awk -v key="$k" '$1==key{print $2; exit}' "$stat_file" 2>/dev/null || true)
@@ -5857,40 +5943,44 @@ collect_xfs_proc_stats() {
             if (( last_delta > 0 )); then
                 ratio=$(awk -v d="$delta" -v l="$last_delta" 'BEGIN{ if(l>0) printf "%d", int(d/l); else print 0 }')
                 if (( ratio >= XFS_ERR_BURST_CRIT_RATIO )); then
-                    sev="critical"
-                    record_alert critical "XFS Burst" "Counter $k burst delta $delta (x${ratio} vs last $last_delta) now $val"
-                    anomalies=1
-                    # Annotate SMART messages and apply boost to each XFS mount's base device
-                    local xfs_mounts bdev_burst
-                    xfs_mounts=$(mount | awk '/ xfs /{print $3}')
-                    for m in $xfs_mounts; do
-                        local src; src=$(findmnt -n -o SOURCE "$m" 2>/dev/null || true); [[ -z "$src" ]] && continue
-                        bdev_burst=$(base_device "$src")
-                        [[ -z "${SMART_STATE[$bdev_burst]:-}" ]] && SMART_STATE[$bdev_burst]="OK"
-                        SMART_MSGS[$bdev_burst]="${SMART_MSGS[$bdev_burst]:-} XFS burst: $k x${ratio}"
-                        local cur_boost=${BURST_BOOST[$bdev_burst]:-0}; cur_boost=$(( cur_boost + BURST_CRIT_BOOST )); (( cur_boost > 100 )) && cur_boost=100; BURST_BOOST[$bdev_burst]=$cur_boost
-                    done
+                    sev="critical"; had_crit=1; had_any=1
+                    summary_lines+="$k burst +$delta (x${ratio} vs $last_delta); "
+                    if (( XFS_PROC_SMART_ANNOTATE_BURST == 1 && suppress == 0 )); then
+                        local bdev_burst
+                        for m in "${xfs_mounts_arr[@]}"; do
+                            local src; src=$(findmnt -n -o SOURCE "$m" 2>/dev/null || true); [[ -z "$src" ]] && continue
+                            bdev_burst=$(base_device "$src")
+                            [[ -z "${SMART_STATE[$bdev_burst]:-}" ]] && SMART_STATE[$bdev_burst]="OK"
+                            SMART_MSGS[$bdev_burst]="${SMART_MSGS[$bdev_burst]:-} XFS burst: $k x${ratio}"
+                            local cur_boost=${BURST_BOOST[$bdev_burst]:-0}; cur_boost=$(( cur_boost + BURST_CRIT_BOOST )); (( cur_boost > 100 )) && cur_boost=100; BURST_BOOST[$bdev_burst]=$cur_boost
+                        done
+                    fi
                 elif (( ratio >= XFS_ERR_BURST_WARN_RATIO )); then
                     [[ "$sev" == "skip" ]] && sev="warning"
-                    record_alert warning "XFS Burst" "Counter $k elevated delta $delta (x${ratio} vs last $last_delta) now $val"
-                    anomalies=1
-                    local xfs_mounts bdev_burst
-                    xfs_mounts=$(mount | awk '/ xfs /{print $3}')
-                    for m in $xfs_mounts; do
-                        local src; src=$(findmnt -n -o SOURCE "$m" 2>/dev/null || true); [[ -z "$src" ]] && continue
-                        bdev_burst=$(base_device "$src")
-                        [[ -z "${SMART_STATE[$bdev_burst]:-}" ]] && SMART_STATE[$bdev_burst]="OK"
-                        SMART_MSGS[$bdev_burst]="${SMART_MSGS[$bdev_burst]:-} XFS burst: $k x${ratio}"
-                        local cur_boost=${BURST_BOOST[$bdev_burst]:-0}; cur_boost=$(( cur_boost + BURST_WARN_BOOST )); (( cur_boost > 100 )) && cur_boost=100; BURST_BOOST[$bdev_burst]=$cur_boost
-                    done
+                    had_any=1
+                    summary_lines+="$k elevated +$delta (x${ratio} vs $last_delta); "
+                    if (( XFS_PROC_SMART_ANNOTATE_BURST == 1 && suppress == 0 )); then
+                        local bdev_burst
+                        for m in "${xfs_mounts_arr[@]}"; do
+                            local src; src=$(findmnt -n -o SOURCE "$m" 2>/dev/null || true); [[ -z "$src" ]] && continue
+                            bdev_burst=$(base_device "$src")
+                            [[ -z "${SMART_STATE[$bdev_burst]:-}" ]] && SMART_STATE[$bdev_burst]="OK"
+                            SMART_MSGS[$bdev_burst]="${SMART_MSGS[$bdev_burst]:-} XFS burst: $k x${ratio}"
+                            local cur_boost=${BURST_BOOST[$bdev_burst]:-0}; cur_boost=$(( cur_boost + BURST_WARN_BOOST )); (( cur_boost > 100 )) && cur_boost=100; BURST_BOOST[$bdev_burst]=$cur_boost
+                        done
+                    fi
                 elif [[ "$sev" != "skip" ]]; then
-                    record_alert "$sev" "$NOTIFY_TITLE_XFS" "Counter $k +$delta (now $val)"
-                    anomalies=1
+                    if (( XFS_PROC_REQUIRE_RATIO_FOR_ALERT == 0 )); then
+                        had_any=1; [[ "$sev" == "critical" ]] && had_crit=1
+                        summary_lines+="$k +$delta; "
+                    fi
                 fi
             else
                 if [[ "$sev" != "skip" ]]; then
-                    record_alert "$sev" "$NOTIFY_TITLE_XFS" "Counter $k +$delta (now $val)"
-                    anomalies=1
+                    if (( XFS_PROC_REQUIRE_RATIO_FOR_ALERT == 0 )); then
+                        had_any=1; [[ "$sev" == "critical" ]] && had_crit=1
+                        summary_lines+="$k +$delta; "
+                    fi
                 fi
             fi
             # Persist delta to history with delta field for future burst comparisons
@@ -5898,20 +5988,19 @@ collect_xfs_proc_stats() {
             echo "$today key=$k delta=$delta value=$val" >> "$XFS_PROC_HISTORY_FILE"
         fi
     done
-    # If anomalies were detected, annotate each XFS mount's base device SMART messages for summary visibility
-    if (( anomalies == 1 )); then
-        local xfs_mounts
-        xfs_mounts=$(mount | awk '/ xfs /{print $3}')
-        for m in $xfs_mounts; do
-            local src
-            src=$(findmnt -n -o SOURCE "$m" 2>/dev/null || true)
-            [[ -z "$src" ]] && continue
-            local bdev
-            bdev=$(base_device "$src")
-            [[ -z "${SMART_STATE[$bdev]:-}" ]] && SMART_STATE[$bdev]="OK"
-            SMART_MSGS[$bdev]="${SMART_MSGS[$bdev]:-} XFS metadata anomalies"
-            record_alert warning "$NOTIFY_TITLE_XFS" "XFS metadata anomalies detected on $(basename "$bdev") (mount: $m)"
-        done
+    # Emit alert(s): prefer single global alert unless explicitly configured for per-mount
+    if (( had_any == 1 && suppress == 0 )); then
+        local msg="XFS metadata activity spike: ${summary_lines%%; }"
+        if (( XFS_PROC_PER_MOUNT_ALERTS == 1 )); then
+            for m in "${xfs_mounts_arr[@]}"; do
+                local src; src=$(findmnt -n -o SOURCE "$m" 2>/dev/null || true); [[ -z "$src" ]] && continue
+                local bdev; bdev=$(base_device "$src")
+                [[ -z "${SMART_STATE[$bdev]:-}" ]] && SMART_STATE[$bdev]="OK"
+                record_alert "$([[ $had_crit -eq 1 ]] && echo critical || echo warning)" "$NOTIFY_TITLE_XFS" "$msg ($bdev, mount: $m)"
+            done
+        else
+            record_alert "$([[ $had_crit -eq 1 ]] && echo critical || echo warning)" "$NOTIFY_TITLE_XFS" "$msg"
+        fi
     fi
     # Persist new snapshot for next run delta computation
     mv "$prev_file.tmp" "$prev_file" 2>/dev/null || rm -f "$prev_file.tmp" 2>/dev/null || true
@@ -5919,7 +6008,7 @@ collect_xfs_proc_stats() {
 
 # === Main Function ===
 # Build and send notification
-log_info "Building health report sections..."
+log_info "Building sections..."
 log_info "Summarizing disks and pools usage..."; build_storage_and_disk_lines; log_info "Usage summary completed"
 log_info "Checking capacity thresholds..."; evaluate_capacity_alerts; log_info "Capacity threshold check completed"
 log_info "Preparing parity summary..."; discover_parity_and_status; log_info "Parity summary completed"
@@ -5932,14 +6021,12 @@ log_info "Building disk health summary..."; build_disk_health_summary; log_info 
 log_info "Analyzing write rates and TBW forecasts..."; tbw_forecast_and_heavy_writers; log_info "TBW analysis completed"
 log_info "Summarizing subsystem statuses..."; build_subsystem_lines; log_info "Subsystem summary completed"
 log_info "Scoring disk risk and lifecycle buckets..."; compute_risk_and_lifecycle; log_info "Risk and lifecycle scoring completed"
-log_info "Building post-processing sections..."
 log_info "Validating storage metrics..."; validate_storage_metrics; log_info "Storage metrics validation completed"
 log_info "Recording share sizes to history..."; compute_share_breakdown; log_info "Share size history updated"
 log_info "Scanning syslog for disk I/O errors..."; scan_syslog_disk_errors; log_info "Syslog scan completed"
 log_info "Recording today's risk tier counts..."; persist_risk_tier_history; log_info "Risk tier counts recorded"
 log_info "Compiling trend analytics..."; build_trend_section; log_info "Trend analytics compiled"
 log_info "Section build completed"
-
 # Build subsystem subject suffix per policy (auto|always|never); no body content rendered
 if [[ -n "${SUBSYSTEM_LINES:-}" ]]; then
     case "${SHOW_SUBSYSTEMS_BLOCK:-auto}" in
@@ -5981,13 +6068,11 @@ if [[ -n "${PARITY_DETAILS_SECTION:-}" ]]; then
     ARRAY_SECTION+="${PARITY_DETAILS_SECTION}"
 fi
 ARRAY_SECTION+="${ARRAY_DISK_LINES:-}"
-
 # Compose Pool section only if there is content
 POOL_SECTION=""
 if printf "%s" "${POOL_LINES:-}" | grep -q '[^[:space:]]'; then
     POOL_SECTION="[Pool Disks]:\n${POOL_LINES}"
 fi
-
 # Append a section in notification if non-empty
 _append_section() {
     local s="$1"
@@ -6008,7 +6093,6 @@ _append_section() {
     if ! printf "%s" "$cleaned" | grep -q '[^[:space:]]'; then return 0; fi
     NOTIFY_SECTIONS+=("$cleaned")
 }
-
 # Build variable sections, skipping hidden ones cleanly
 NOTIFY_SECTIONS=()
 _append_section "${ARRAY_SECTION:-}"
@@ -6017,7 +6101,6 @@ _append_section "${DISK_HEALTH_SUMMARY:-}"
 _append_section "${STORAGE_VALIDATION_SECTION:-}"
 _append_section "${HEALTH_ALERTS_SECTION:-}"
 _append_section "${TREND_SECTION:-}"
-
 # Join non-empty sections with exactly one blank line between
 TAIL_SECTIONS=""
 if (( ${#NOTIFY_SECTIONS[@]} > 0 )); then
@@ -6026,7 +6109,6 @@ if (( ${#NOTIFY_SECTIONS[@]} > 0 )); then
         TAIL_SECTIONS+="${NOTIFY_SECTIONS[$idx]}"
     done
 fi
-
 # Assemble final notification body with symmetric spacing
 NOTIFY_BODY="${STORAGE_TOP_LINES:-}
 
