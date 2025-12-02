@@ -420,12 +420,12 @@ prune_old_run_logs() {
                 files=("${files[@]:1}")
             done
             if (( LOG_MAX_COUNT > 0 )); then
-                log_info "Run log pruning: pattern=$pat retained=${#files[@]} (limit=$LOG_MAX_COUNT)"
+                log_info "Run log pruning: pattern = $pat retained = ${#files[@]} (limit = $LOG_MAX_COUNT)"
             fi
         fi
     done
     # Emit summary if any deletions occurred
-    log_info "Run log pruning: removed_total=$removed age=$removed_age count=$removed_count examined=$examined"
+    log_info "Run log pruning: removed_total = $removed age = $removed_age count = $removed_count examined = $examined"
 }
 
 # === Helper Function ===
@@ -6144,7 +6144,7 @@ elif (( ${#ALERT_WARN[@]} > 0 )); then
 else
     _final_sev=normal
 fi
-log_info "Preparing notification severity level= ${_final_sev}, critical count= ${#ALERT_CRIT[@]}, warning count= ${#ALERT_WARN[@]}"
+log_info "Preparing notification severity level = ${_final_sev}, critical count = ${#ALERT_CRIT[@]}, warning count = ${#ALERT_WARN[@]}"
 notify_unraid "${SUBJECT:-Disk Health Summary}" "$NOTIFY_BODY" "${_final_sev}"
 
 # === Helper Function ===
