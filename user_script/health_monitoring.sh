@@ -1,4 +1,6 @@
 #!/bin/bash
+# shellcheck disable=SC2034
+noParity=true
 set -euo pipefail
 LOCKFILE="/tmp/health_monitoring.lock"
 exec 9>"$LOCKFILE"
