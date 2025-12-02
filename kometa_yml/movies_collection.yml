@@ -6,64 +6,64 @@
 ## Kometa reads this file as default directory as /config/collections.yml
 
 collections:
-  ## IMDb Watchlist
-  # IMDb Watchlist:
-  #   imdb_watchlist:
-  #     user_id: ur170668654
-  #   smart_label: release.desc
-  #   sync_mode: sync
-  #   file_poster: config/assets/collection/Must-See-Movies.jpg
-  #   summary: >-
-  #           A collection of IMDb Watchlist.
-  #   content_rating: R
-  #   sort_title: +1
-  #   radarr_add_missing: true
-  #   radarr_search: true
-  #   radarr_monitor: true
-  #   item_radarr_tag: imdb-watchlist
+  # IMDb Watchlist
+  IMDb Watchlist:
+    imdb_watchlist:
+      user_id: ur170668654
+    smart_label: release.desc
+    sync_mode: sync
+    file_poster: config/assets/collection/Must-See-Movies.jpg
+    summary: >-
+            A collection of IMDb Watchlist.
+    content_rating: R
+    sort_title: +1
+    radarr_add_missing: true
+    radarr_search: true
+    radarr_monitor: true
+    item_radarr_tag: imdb-watchlist
     
-   ## IMDb Box Office
-#   IMDb Box Office:
-#     schedule: weekly(monday)
-#     imdb_chart: box_office
-#     filters:
-#       original_language: en, ja, th, zh
-#     smart_label: release.desc
-#     sync_mode: sync
-#     file_poster: config/assets/collection/IMDb-Box-Office.jpg
-#     summary: >-
-#             A collection of IMDb weekly box office in United States
-#     content_rating: R
-#     sort_title: +
+  # IMDb Box Office
+  IMDb Box Office:
+    schedule: weekly(monday)
+    imdb_chart: box_office
+    filters:
+      original_language: en, ja, th, zh
+    smart_label: release.desc
+    sync_mode: sync
+    file_poster: config/assets/collection/IMDb-Box-Office.jpg
+    summary: >-
+            A collection of IMDb weekly box office in United States
+    content_rating: R
+    sort_title: +
     
-  ## IMDb Most Popular
-  # IMDb Most Popular Movies:
-  #   schedule: weekly(wednesday|saturday)
-  #   imdb_chart: popular_movies
-  #   filters:
-  #     original_language: en, ja, th, zh
-  #   smart_label: release.desc
-  #   sync_mode: sync
-  #   file_poster: config/assets/collection/IMDb-Popular.jpg
-  #   summary: >-
-  #           A collection of IMDb user determined popular Movies.
-  #   content_rating: R
-  #   sort_title: +
+  # IMDb Most Popular
+  IMDb Most Popular Movies:
+    schedule: weekly(wednesday|saturday)
+    imdb_chart: popular_movies
+    filters:
+      original_language: en, ja, th, zh
+    smart_label: release.desc
+    sync_mode: sync
+    file_poster: config/assets/collection/IMDb-Popular.jpg
+    summary: >-
+            A collection of IMDb user determined popular Movies.
+    content_rating: R
+    sort_title: +
       
-  ## TMDb Apple Studios
-#   Apple Studios:
-#     schedule: weekly(friday)
-#     tmdb_company: 194232
-#     filters:
-#       genre.not: Family, Animation
-#     sync_mode: sync
-#     file_poster: config/assets/collection/Apple-TV+.jpg
-#     summary: >-
-#             A collection of Apple TV movies.
-#     content_rating: R
-#     sort_title: +2
-#     radarr_add_missing: true
-#     item_radarr_tag: appletv
+  # TMDb Apple Studios
+  Apple Studios:
+    schedule: weekly(friday)
+    tmdb_company: 194232
+    filters:
+      genre.not: Family, Animation
+    sync_mode: sync
+    file_poster: config/assets/collection/Apple-TV+.jpg
+    summary: >-
+            A collection of Apple TV movies.
+    content_rating: R
+    sort_title: +2
+    radarr_add_missing: true
+    item_radarr_tag: appletv
 
 ## TMDb Franchises      
 dynamic_collections:
