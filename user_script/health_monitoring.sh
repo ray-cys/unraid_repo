@@ -5679,9 +5679,9 @@ tbw_forecast_and_heavy_writers() {
                 fi
             fi
             [[ ! "$total_bytes" =~ ^[0-9]+$ ]] && total_bytes=""
-            if [[ -n "$total_bytes" && $total_bytes -gt end && $daily -gt 0 ]]; then
-                remaining_bytes=$(( total_bytes - end ))
-                days_left=$(awk -v r="$remaining_bytes" -v d="$daily" 'BEGIN{printf "%.1f", r/d}')
+            if [[ -n "$total_bytes" ]] && awk -v t="$total_bytes" -v e="$end" -v d="$daily" 'BEGIN{exit !(t+0>e+0 && d+0>0)}'; then
+                remaining_bytes=$(awk -v t="$total_bytes" -v e="$end" 'BEGIN{printf "%d", (t+0) - (e+0)}')
+                days_left=$(awk -v r="$remaining_bytes" -v d="$daily" 'BEGIN{printf "%.1f", (r+0)/(d+0)}')
                 TBW_DAYS_LEFT[$dev]=$days_left
                 local status="OK"
                 if [[ -n "$days_left" ]]; then
@@ -5695,9 +5695,9 @@ tbw_forecast_and_heavy_writers() {
             fi
             local cap_tb
             cap_tb=$(printf "%s" "$cap" | awk '/^[0-9]+(\.[0-9]+)?$/{print ($0+0)}')
-            if [[ -n "$cap_tb" && "$cap_tb" != 0 ]]; then
+            if awk -v c="$cap_tb" 'BEGIN{exit !(c+0>0)}'; then
                 local norm_pct
-                norm_pct=$(awk -v daily="$daily" -v cap_tb="$cap_tb" 'BEGIN{printf "%.6f", (daily/ (cap_tb*1000000000000.0))*100}')
+                norm_pct=$(awk -v daily="$daily" -v cap_tb="$cap_tb" 'BEGIN{printf "%.6f", ((daily+0)/ (cap_tb*1000000000000.0))*100}')
                 heavy_rank+=("$norm_pct $dev $daily $cap_tb")
             fi
         fi
