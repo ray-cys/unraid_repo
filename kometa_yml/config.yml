@@ -7,11 +7,9 @@
 ## For default or advanced configuration, see wiki for how to use local files, folders, URLs, or files https://kometa.wiki/en/latest/
 
 libraries:
-
 #####################################
 #              Movies               #
 #####################################
-
   Movies:                            # Movies library in Plex
     ## Missing Reports
     report_path: config/reports/movie_report.yml
@@ -91,7 +89,6 @@ libraries:
 #####################################
 #              TV Shows             #
 #####################################
-
   TV Shows:                          # TV Shows library in Plex
     ## Missing Reports
     report_path: config/reports/tv_report.yml
@@ -216,7 +213,6 @@ libraries:
 #####################################
 #           Formula 1               #
 #####################################
-
   Formula 1:                          # Formula 1 library in Plex
     ## Metadata
     metadata_files:
@@ -233,7 +229,6 @@ libraries:
 #####################################
 #       Global Configuration        #
 #####################################
-
 ## Global Settings
 settings:
   run_order:
