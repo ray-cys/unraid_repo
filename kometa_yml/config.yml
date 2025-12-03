@@ -216,7 +216,8 @@ libraries:
   Formula 1:                          # Formula 1 library in Plex
     ## Metadata
     metadata_files:
-    - file: config/metadata/formula1.yml
+    - file: config/metadata/formula1_2025.yml
+    - file: config/metadata/formula1_2026.yml
       schedule: daily
     settings:
       save_report: false

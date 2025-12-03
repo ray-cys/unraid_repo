@@ -1,0 +1,1675 @@
+#####################################
+#           Metadata YAML          #
+#####################################
+
+## This file is a Kometa metadata file using builders
+## Kometa reads this file as default directory as /config/metadata.yml
+## Metadata source: https://www.imdb.com/title/tt6758316/
+## Race schedule: https://www.formula1.com
+## Event posters: https://www.eventartworks.de
+## Race information: https://en.wikipedia.org/wiki/Formula_One
+
+metadata:
+  Formula 1 (2025):
+    title: "Formula 1 (2025)"
+    sort_title: "Formula 1 (2025)"
+    original_title: "Formula Internationale"
+    originally_available: "1950-05-13"
+    content_rating: "PG-13"
+    studio: "F1TV"
+    tagline: "We race as one."
+    summary: |-
+            Formula One (also Formula 1 or F1 and officially the FIA Formula One World Championship) is the highest class of single-seat auto racing that is sanctioned by the Fédération Internationale de l'Automobile (FIA).
+            The FIA Formula One World Championship has been the premier form of racing since the inaugural season in 1950.
+            The F1 season consists of a series of races, known as Grands Prix, held worldwide on purpose-built F1 circuits and public roads.
+    genre:
+        - Sport
+        - Action
+        - Comedy
+        - Drama
+        - Thriller
+    file_poster: config/assets/formula1/poster2.jpg
+    file_background: config/assets/formula1/background6.jpg
+    visible_library: true
+    seasons:
+      ## Formula 1 Australian Grand Prix 2025
+      1:
+        title: "Round 01 - Australian Grand Prix"
+        summary: |-
+              Albert Park Circuit, Melbourne
+              Circuit Length: 5.278 km
+              Race Distance: 306.124 km, Laps: 58              
+        file_poster: config/assets/formula1/2025/season01.jpg
+        episodes:
+            1:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-03-14"
+              content_rating: "PG-13"
+              summary: |-
+                    14-16 March 2025 Australian Grand Prix
+                    Held in Albert Park Circuit, Melbourne
+            6:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-03-14"
+              content_rating: "PG-13"
+              summary: |-
+                    14-16 March 2025 Australian Grand Prix
+                    Held in Albert Park Circuit, Melbourne
+            7:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-03-15"
+              content_rating: "PG-13"
+              summary: |-
+                    14-16 March 2025 Australian Grand Prix
+                    Held in Albert Park Circuit, Melbourne
+            9:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-03-15"
+              content_rating: "PG-13"
+              summary: |-
+                    14-16 March 2025 Australian Grand Prix
+                    Held in Albert Park Circuit, Melbourne
+            12:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-03-16"
+              content_rating: "PG-13"
+              summary: |-
+                    14-16 March 2025 Australian Grand Prix
+                    Held in Albert Park Circuit, Melbourne
+      ## Formula 1 Chinese Grand Prix 2025
+      2:
+        title: "Round 02 - Chinese Grand Prix"
+        summary: |-
+              Shanghai International Circuit, Shanghai
+              Circuit Length: 5.451 km
+              Race Distance: 305.066 km, Laps: 56
+        file_poster: config/assets/formula1/2025/season02.jpg
+        episodes:
+            1:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-03-21"
+              content_rating: "PG-13"
+              summary: |-
+                    21-23 March 2025 Chinese Grand Prix 
+                    Held in Shanghai International Circuit, Shanghai
+            2:
+              title: "Sprint Qualifying Session"
+              sort_title: "Sprint Qualifying Session"
+              originally_available: "2025-03-21"
+              content_rating: "PG-13"
+              summary: |-
+                    21-23 March 2025 Chinese Grand Prix 
+                    Held in Shanghai International Circuit, Shanghai
+            4:
+              title: "Sprint Race Session"
+              sort_title: "Sprint Race Session"
+              originally_available: "2025-03-22"
+              content_rating: "PG-13"
+              summary: |-
+                    21-23 March 2025 Chinese Grand Prix 
+                    Held in Shanghai International Circuit, Shanghai
+            9:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-03-22"
+              content_rating: "PG-13"
+              summary: |-
+                    21-23 March 2025 Chinese Grand Prix 
+                    Held in Shanghai International Circuit, Shanghai
+            12:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-03-23"
+              content_rating: "PG-13"
+              summary: |-
+                    21-23 March 2025 Chinese Grand Prix 
+                    Held in Shanghai International Circuit, Shanghai
+      ## Formula 1 Japanese Grand Prix 2025
+      3:
+        title: "Round 03 - Japanese Grand Prix"
+        summary: |-
+              Suzuka International Racing Course, Suzuka
+              Circuit Length: 5.807 km
+              Race Distance: 307.471 km, Laps: 53
+        file_poster: config/assets/formula1/2025/season03.jpg
+        episodes:
+            1:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-04-04"
+              content_rating: "PG-13"
+              summary: |-
+                    4-6 April 2025 Japanese Grand Prix 
+                    Held in Suzuka International Racing Course, Suzuka
+            6:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-04-04"
+              content_rating: "PG-13"
+              summary: |-
+                    4-6 April 2025 Japanese Grand Prix 
+                    Held in Suzuka International Racing Course, Suzuka
+            7:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-04-05"
+              content_rating: "PG-13"
+              summary: |-
+                    4-6 April 2025 Japanese Grand Prix 
+                    Held in Suzuka International Racing Course, Suzuka
+            9:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-04-05"
+              content_rating: "PG-13"
+              summary: |-
+                    4-6 April 2025 Japanese Grand Prix 
+                    Held in Suzuka International Racing Course, Suzuka
+            12:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-04-06"
+              content_rating: "PG-13"
+              summary: |-
+                    4-6 April 2025 Japanese Grand Prix 
+                    Held in Suzuka International Racing Course, Suzuka
+      ## Formula 1 Bahrain Grand Prix 2025
+      4:
+        title: "Round 04 - Bahrain Grand Prix"
+        summary: |-
+              Bahrain International Circuit, Sakhir
+              Circuit Length: 5.412 km
+              Race Distance: 308.238 km, Laps: 57
+        file_poster: config/assets/formula1/2025/season04.jpg
+        episodes:
+            1:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-04-11"
+              content_rating: "PG-13"
+              summary: |-
+                    11-13 April 2025 Bahrain Grand Prix 
+                    Held in Bahrain International Circuit, Sakhir
+            6:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-04-11"
+              content_rating: "PG-13"
+              summary: |-
+                    11-13 April 2025 Bahrain Grand Prix 
+                    Held in Bahrain International Circuit, Sakhir
+            7:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-04-12"
+              content_rating: "PG-13"
+              summary: |-
+                    11-13 April 2025 Bahrain Grand Prix 
+                    Held in Bahrain International Circuit, Sakhir
+            9:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-04-13"
+              content_rating: "PG-13"
+              summary: |-
+                    11-13 April 2025 Bahrain Grand Prix 
+                    Held in Bahrain International Circuit, Sakhir
+            12:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-04-13"
+              content_rating: "PG-13"
+              summary: |-
+                    11-13 April 2025 Bahrain Grand Prix 
+                    Held in Bahrain International Circuit, Sakhir
+      ## Formula 1 Saudi Arabian Grand Prix 2025
+      5:
+        title: "Round 05 - Saudi Arabian Grand Prix"
+        summary: |-
+              Jeddah Corniche Circuit, Jeddah
+              Circuit Length: 6.174 km
+              Race Distance: 308.45 km, Laps: 50
+        file_poster: config/assets/formula1/2025/season05.jpg
+        episodes:
+            1:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-04-18"
+              content_rating: "PG-13"
+              summary: |-     
+                    18-20 April 205 Saudi Arabian Grand Prix 
+                    Held in Jeddah Corniche Circuit, Jeddah
+            6:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-04-19"
+              content_rating: "PG-13"
+              summary: |-     
+                    18-20 April 205 Saudi Arabian Grand Prix 
+                    Held in Jeddah Corniche Circuit, Jeddah
+            7:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-04-19"
+              content_rating: "PG-13"
+              summary: |-     
+                    18-20 April 205 Saudi Arabian Grand Prix 
+                    Held in Jeddah Corniche Circuit, Jeddah
+            9:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-04-20"
+              content_rating: "PG-13"
+              summary: |-     
+                    18-20 April 205 Saudi Arabian Grand Prix 
+                    Held in Jeddah Corniche Circuit, Jeddah
+            12:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-04-21"
+              content_rating: "PG-13"
+              summary: |-     
+                    18-20 April 205 Saudi Arabian Grand Prix 
+                    Held in Jeddah Corniche Circuit, Jeddah
+      ## Formula 1 Miami Grand Prix 2025
+      6:
+        title: "Round 06 - Miami Grand Prix"
+        summary: |- 
+              Miami International Autodrome, Miami Gardens, Florida
+              Circuit Length: 5.412 km
+              Race Distance: 308.326 km, Laps: 57
+        file_poster: config/assets/formula1/2025/season06.jpg
+        episodes:
+            1:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-05-03"
+              content_rating: "PG-13"
+              summary: |- 
+                    2-4 May 2025 Miami Grand Prix 
+                    Held in Miami International Autodrome, Miami Gardens, Florida
+            2:
+              title: "Sprint Qualifying Session"
+              sort_title: "Sprint Qualifying Session"
+              originally_available: "2025-05-03"
+              content_rating: "PG-13"
+              summary: |- 
+                    2-4 May 2025 Miami Grand Prix 
+                    Held in Miami International Autodrome, Miami Gardens, Florida
+            4:
+              title: "Sprint Session"
+              sort_title: "Sprint Session"
+              originally_available: "2025-05-04"
+              content_rating: "PG-13"
+              summary: |- 
+                    2-4 May 2025 Miami Grand Prix 
+                    Held in Miami International Autodrome, Miami Gardens, Florida
+            9:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-05-04"
+              content_rating: "PG-13"
+              summary: |- 
+                    2-4 May 2025 Miami Grand Prix 
+                    Held in Miami International Autodrome, Miami Gardens, Florida
+            12:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-05-05"
+              content_rating: "PG-13"
+              summary: |- 
+                    2-4 May 2025 Miami Grand Prix 
+                    Held in Miami International Autodrome, Miami Gardens, Florida
+      ## Formula 1 Emilia Romagna Grand Prix 2025
+      7:
+        title: "Round 07 - Emilia Romagna Grand Prix"
+        summary: |-
+              Imola Circuit, Imola
+              Circuit Length: 4.909 km
+              Race Distance: 309.049 km, Laps: 63
+        file_poster: config/assets/formula1/2025/season07.jpg
+        episodes:
+            1:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-05-16"
+              content_rating: "PG-13"
+              summary: |-
+                    16-18 May 2025 Emilia Romagna Grand Prix 
+                    Held in Imola Circuit, Imola
+            6:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-05-16"
+              content_rating: "PG-13"
+              summary: |-
+                    16-18 May 2025 Emilia Romagna Grand Prix 
+                    Held in Imola Circuit, Imola
+            7:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-05-17"
+              content_rating: "PG-13"
+              summary: |-
+                    16-18 May 2025 Emilia Romagna Grand Prix 
+                    Held in Imola Circuit, Imola
+            9:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-05-17"
+              content_rating: "PG-13"
+              summary: |-
+                    16-18 May 2025 Emilia Romagna Grand Prix 
+                    Held in Imola Circuit, Imola
+            12:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-05-18"
+              content_rating: "PG-13"
+              summary: |-
+                    16-18 May 2025 Emilia Romagna Grand Prix 
+                    Held in Imola Circuit, Imola
+      ## Formula 1 Monaco Grand Prix 2025
+      8:
+        title: "Round 08 - Monaco Grand Prix"
+        summary: |-
+              Circuit de Monaco, Monaco
+              Circuit Length: 3.337 km
+              Race Distance: 260.286 km, Laps: 78
+        file_poster: config/assets/formula1/2025/season08.jpg
+        episodes:
+            1:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-05-23"
+              content_rating: "PG-13"
+              summary: |-
+                    23-25 May 2025 Monaco Grand Prix
+                    Held in Circuit de Monaco, Monaco
+            6:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-05-23"
+              content_rating: "PG-13"
+              summary: |-
+                    23-25 May 2025 Monaco Grand Prix
+                    Held in Circuit de Monaco, Monaco
+            7:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-05-24"
+              content_rating: "PG-13"
+              summary: |-
+                    23-25 May 2025 Monaco Grand Prix
+                    Held in Circuit de Monaco, Monaco
+            9:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-05-24"
+              content_rating: "PG-13"
+              summary: |-
+                    23-25 May 2025 Monaco Grand Prix
+                    Held in Circuit de Monaco, Monaco
+            12:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-05-25"
+              content_rating: "PG-13"
+              summary: |-
+                    23-25 May 2025 Monaco Grand Prix
+                    Held in Circuit de Monaco, Monaco
+      ## Formula 1 Spanish Grand Prix 2025
+      9:
+        title: "Round 09 - Spanish Grand Prix"
+        summary: |-
+              Circuit de Barcelona-Catalunya, Montmeló
+              Circuit Length: 4.657 km
+              Race Distance: 307.236 km, Laps: 66
+        file_poster: config/assets/formula1/2025/season09.jpg
+        episodes:
+            1:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-05-30"
+              content_rating: "PG-13"
+              summary: |-
+                    30-1 May/June 2025 Spanish Grand Prix 
+                    Held in Circuit de Barcelona-Catalunya, Montmeló
+            6:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-05-30"
+              content_rating: "PG-13"
+              summary: |-
+                    30-1 May/June 2025 Spanish Grand Prix 
+                    Held in Circuit de Barcelona-Catalunya, Montmeló
+            7:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-05-31"
+              content_rating: "PG-13"
+              summary: |-
+                    30-1 May/June 2025 Spanish Grand Prix 
+                    Held in Circuit de Barcelona-Catalunya, Montmeló
+            9:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-05-31"
+              content_rating: "PG-13"
+              summary: |-
+                    30-1 May/June 2025 Spanish Grand Prix 
+                    Held in Circuit de Barcelona-Catalunya, Montmeló
+            12:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-06-01"
+              content_rating: "PG-13"
+              summary: |-
+                    30-1 May/June 2025 Spanish Grand Prix 
+                    Held in Circuit de Barcelona-Catalunya, Montmeló
+      ## Formula 1 Canadian Grand Prix 2025
+      10:
+        title: "Round 10 - Canadian Grand Prix"
+        summary: |-
+              Circuit Gilles Villeneuve, Montreal
+              Circuit Length: 4.361 km
+              Race Distance: 305.27 km, Laps: 70
+        file_poster: config/assets/formula1/2025/season10.jpg
+        episodes:
+            1:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-06-14"
+              content_rating: "PG-13"
+              summary: |-
+                    13-15 June 2025 Canadian Grand Prix 
+                    Held in Circuit Gilles Villeneuve, Montreal
+            6:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-06-14"
+              content_rating: "PG-13"
+              summary: |-
+                    13-15 June 2025 Canadian Grand Prix 
+                    Held in Circuit Gilles Villeneuve, Montreal
+            7:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-06-15"
+              content_rating: "PG-13"
+              summary: |-
+                    13-15 June 2025 Canadian Grand Prix 
+                    Held in Circuit Gilles Villeneuve, Montreal
+            9:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-06-15"
+              content_rating: "PG-13"
+              summary: |-
+                    13-15 June 2025 Canadian Grand Prix 
+                    Held in Circuit Gilles Villeneuve, Montreal
+            12:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-06-16"
+              content_rating: "PG-13"
+              summary: |-
+                    13-15 June 2025 Canadian Grand Prix 
+                    Held in Circuit Gilles Villeneuve, Montreal
+      ## Formula 1 Austrian Grand Prix 2025
+      11:
+        title: "Round 11 - Austrian Grand Prix"
+        summary: |-
+              Red Bull Ring, Spielberg
+              Circuit Length: 4.318 km
+              Race Distance: 306.452 km, Laps: 71
+        file_poster: config/assets/formula1/2025/season11.jpg
+        episodes:
+            1:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-06-27"
+              content_rating: "PG-13"
+              summary: |-
+                    27-29 June 2025 Austrian Grand Prix
+                    Held in Red Bull Ring, Spielberg
+            6:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-06-27"
+              content_rating: "PG-13"
+              summary: |-
+                    27-29 June 2025 Austrian Grand Prix
+                    Held in Red Bull Ring, Spielberg
+            7:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-06-28"
+              content_rating: "PG-13"
+              summary: |-
+                    27-29 June 2025 Austrian Grand Prix
+                    Held in Red Bull Ring, Spielberg
+            9:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-06-28"
+              content_rating: "PG-13"
+              summary: |-
+                    27-29 June 2025 Austrian Grand Prix
+                    Held in Red Bull Ring, Spielberg
+            12:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-06-29"
+              content_rating: "PG-13"
+              summary: |-
+                    27-29 June 2025 Austrian Grand Prix
+                    Held in Red Bull Ring, Spielberg
+      ## Formula 1 British Grand Prix 2025
+      12:
+        title: "Round 12 - British Grand Prix"
+        summary: |-
+              Silverstone Circuit, Silverstone
+              Circuit Length: 5.891 km
+              Race Distance: 306.198 km, Laps: 52
+        file_poster: config/assets/formula1/2025/season12.jpg
+        episodes:
+            1:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-07-04"
+              content_rating: "PG-13"
+              summary: |-
+                    4-6 July 2025 British Grand Prix 
+                    Held in Silverstone Circuit, Silverstone
+            6:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-07-04"
+              content_rating: "PG-13"
+              summary: |-
+                    4-6 July 2025 British Grand Prix 
+                    Held in Silverstone Circuit, Silverstone
+            7:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-07-05"
+              content_rating: "PG-13"
+              summary: |-
+                    4-6 July 2025 British Grand Prix 
+                    Held in Silverstone Circuit, Silverstone
+            9:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-07-05"
+              content_rating: "PG-13"
+              summary: |-
+                    4-6 July 2025 British Grand Prix 
+                    Held in Silverstone Circuit, Silverstone
+            12:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-07-06"
+              content_rating: "PG-13"
+              summary: |-
+                    4-6 July 2025 British Grand Prix 
+                    Held in Silverstone Circuit, Silverstone
+      ## Formula 1 Belgian Grand Prix 2025
+      13:
+        title: "Round 13 - Belgian Grand Prix"
+        summary: |-
+              Circuit de Spa-Francorchamps, Stavelot
+              Circuit Length: 7.004 km
+              Race Distance: 308.052 km, Laps: 44
+        file_poster: config/assets/formula1/2025/season13.jpg
+        episodes:
+            1:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-07-25"
+              content_rating: "PG-13"
+              summary: |-
+                    25-27 July 2025 Belgian Grand Prix
+                    Held in Circuit de Spa-Francorchamps, Stavelot
+            2:
+              title: "Sprint Qualifying Session"
+              sort_title: "Sprint Qualifying Session"
+              originally_available: "2025-07-25"
+              content_rating: "PG-13"
+              summary: |-
+                    25-27 July 2025 Belgian Grand Prix
+                    Held in Circuit de Spa-Francorchamps, Stavelot
+            4:
+              title: "Sprint Session"
+              sort_title: "Sprint Session"
+              originally_available: "2025-07-26"
+              content_rating: "PG-13"
+              summary: |-
+                    25-27 July 2025 Belgian Grand Prix
+                    Held in Circuit de Spa-Francorchamps, Stavelot
+            9:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-07-26"
+              content_rating: "PG-13"
+              summary: |-
+                    25-27 July 2025 Belgian Grand Prix
+                    Held in Circuit de Spa-Francorchamps, Stavelot
+            12:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-07-27"
+              content_rating: "PG-13"
+              summary: |-
+                    25-27 July 2025 Belgian Grand Prix
+                    Held in Circuit de Spa-Francorchamps, Stavelot
+      ## Formula 1 Hungarian Grand Prix 2025
+      14:
+        title: "Round 14 - Hungarian Grand Prix"
+        summary: |-
+              Hungaroring, Mogyoród
+              Circuit Length: 4.381 km
+              Race Distance: 306.63 km, Laps: 70
+        file_poster: config/assets/formula1/2025/season14.jpg
+        episodes:
+            1:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-08-01"
+              content_rating: "PG-13"
+              summary: |-
+                    1-3 August 2025 Hungarian Grand Prix
+                    Held in Hungaroring, Mogyoród
+            6:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-08-01"
+              content_rating: "PG-13"
+              summary: |-
+                    1-3 August 2025 Hungarian Grand Prix
+                    Held in Hungaroring, Mogyoród
+            7:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-08-02"
+              content_rating: "PG-13"
+              summary: |-
+                    1-3 August 2025 Hungarian Grand Prix
+                    Held in Hungaroring, Mogyoród
+            8:
+              title: "Pre-Qualifying Buildup"
+              sort_title: "Pre-Qualifying Buildup"
+              originally_available: "2025-08-02"
+              content_rating: "PG-13"
+              summary: |-
+                    1-3 August 2025 Hungarian Grand Prix
+                    Held in Hungaroring, Mogyoród            
+            9:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-08-02"
+              content_rating: "PG-13"
+              summary: |-
+                    1-3 August 2025 Hungarian Grand Prix
+                    Held in Hungaroring, Mogyoród
+            10:
+              title: "Post-Qualifying Analysis"
+              sort_title: "Post-Qualifying Analysis"
+              originally_available: "2025-08-02"
+              content_rating: "PG-13"
+              summary: |-
+                    1-3 August 2025 Hungarian Grand Prix
+                    Held in Hungaroring, Mogyoród
+            11:
+              title: "Pre-Race Buildup"
+              sort_title: "Pre-Race Buildup"
+              originally_available: "2025-08-02"
+              content_rating: "PG-13"
+              summary: |-
+                    1-3 August 2025 Hungarian Grand Prix
+                    Held in Hungaroring, Mogyoród  
+            12:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-08-03"
+              content_rating: "PG-13"
+              summary: |-
+                    1-3 August 2025 Hungarian Grand Prix
+                    Held in Hungaroring, Mogyoród
+            13:
+              title: "Post-Race Analysis"
+              sort_title: "Post-Race Analysis"
+              originally_available: "2025-08-02"
+              content_rating: "PG-13"
+              summary: |-
+                    1-3 August 2025 Hungarian Grand Prix
+                    Held in Hungaroring, Mogyoród  
+      ## Formula 1 Dutch Grand Prix 2025
+      15:
+        title: "Round 15 - Dutch Grand Prix"
+        summary: |-
+              Circuit Zandvoort, Zandvoort
+              Circuit Length: 4.259 km
+              Race Distance: 306.587 km, Laps: 72
+        file_poster: config/assets/formula1/2025/season15.jpg
+        episodes:
+            1:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-08-29"
+              content_rating: "PG-13"
+              summary: |-
+                    29-31 August 2025 Dutch Grand Prix
+                    Held in Circuit Zandvoort, Zandvoort
+            6:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-08-29"
+              content_rating: "PG-13"
+              summary: |-
+                    29-31 August 2025 Dutch Grand Prix
+                    Held in Circuit Zandvoort, Zandvoort
+            7:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-08-30"
+              content_rating: "PG-13"
+              summary: |-
+                    29-31 August 2025 Dutch Grand Prix
+                    Held in Circuit Zandvoort, Zandvoort
+            8:
+              title: "Pre-Qualifying Buildup"
+              sort_title: "Pre-Qualifying Buildup"
+              originally_available: "2025-08-30"
+              content_rating: "PG-13"
+              summary: |-
+                    29-31 August 2025 Dutch Grand Prix
+                    Held in Circuit Zandvoort, Zandvoort
+            9:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-08-30"
+              content_rating: "PG-13"
+              summary: |-
+                    29-31 August 2025 Dutch Grand Prix
+                    Held in Circuit Zandvoort, Zandvoort
+            10:
+              title: "Post-Qualifying Analysis"
+              sort_title: "Post-Qualifying Analysis"
+              originally_available: "2025-08-30"
+              content_rating: "PG-13"
+              summary: |-
+                    29-31 August 2025 Dutch Grand Prix
+                    Held in Circuit Zandvoort, Zandvoort
+            11:
+              title: "Pre-Race Buildup"
+              sort_title: "Pre-Race Buildup"
+              originally_available: "2025-08-30"
+              content_rating: "PG-13"
+              summary: |-
+                    29-31 August 2025 Dutch Grand Prix
+                    Held in Circuit Zandvoort, Zandvoort
+            12:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-08-31"
+              content_rating: "PG-13"
+              summary: |-
+                    29-31 August 2025 Dutch Grand Prix
+                    Held in Circuit Zandvoort, Zandvoort
+            13:
+              title: "Post-Race Analysis"
+              sort_title: "Post-Race Analysis"
+              originally_available: "2025-08-30"
+              content_rating: "PG-13"
+              summary: |-
+                    29-31 August 2025 Dutch Grand Prix
+                    Held in Circuit Zandvoort, Zandvoort
+      ## Formula 1 Italian Grand Prix 2025
+      16:
+        title: "Round 16 - Italian Grand Prix"
+        summary: |-
+              Monza Circuit, Monza
+              Circuit Length: 5.793 km
+              Race Distance: 306.72 km, Laps: 53
+        file_poster: config/assets/formula1/2025/season16.jpg
+        episodes:
+            1:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-09-05"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 September 2025 Italian Grand Prix
+                    Held in Monza Circuit, Monza
+            6:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-09-05"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 September 2025 Italian Grand Prix
+                    Held in Monza Circuit, Monza
+            7:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-09-06"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 September 2025 Italian Grand Prix
+                    Held in Monza Circuit, Monza
+            8:
+              title: "Pre-Qualifying Buildup"
+              sort_title: "Pre-Qualifying Buildup"
+              originally_available: "2025-09-06"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 September 2025 Italian Grand Prix
+                    Held in Monza Circuit, Monza
+            9:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-09-06"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 September 2025 Italian Grand Prix
+                    Held in Monza Circuit, Monza
+            10:
+              title: "Post-Qualifying Analysis"
+              sort_title: "Post-Qualifying Analysis"
+              originally_available: "2025-09-06"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 September 2025 Italian Grand Prix
+                    Held in Monza Circuit, Monza
+            11:
+              title: "Pre-Race Buildup"
+              sort_title: "Pre-Race Buildup"
+              originally_available: "2025-09-06"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 September 2025 Italian Grand Prix
+                    Held in Monza Circuit, Monza
+            12:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-09-07"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 September 2025 Italian Grand Prix
+                    Held in Monza Circuit, Monza
+            13:
+              title: "Post-Race Analysis"
+              sort_title: "Post-Race Analysis"
+              originally_available: "2025-09-06"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 September 2025 Italian Grand Prix
+                    Held in Monza Circuit, Monza
+      ## Formula 1 Azerbaijan Grand Prix 2025
+      17:
+        title: "Round 17 - Azerbaijan Grand Prix"
+        summary: |-
+              Baku City Circuit, Baku
+              Circuit Length: 6.003 km
+              Race Distance: 306.049 km, Laps: 51
+        file_poster: config/assets/formula1/2025/season17.jpg
+        episodes:
+            1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2025-09-19"
+              content_rating: "PG-13"
+              summary: |-
+                    29-21 September 2025 Azerbaijan Grand Prix
+                    Held in Baku City Circuit, Baku
+            2:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-09-19"
+              content_rating: "PG-13"
+              summary: |-
+                    29-21 September 2025 Azerbaijan Grand Prix
+                    Held in Baku City Circuit, Baku
+            7:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-09-19"
+              content_rating: "PG-13"
+              summary: |-
+                    29-21 September 2025 Azerbaijan Grand Prix
+                    Held in Baku City Circuit, Baku
+            8:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-09-20"
+              content_rating: "PG-13"
+              summary: |-
+                    29-21 September 2025 Azerbaijan Grand Prix
+                    Held in Baku City Circuit, Baku
+            9:
+              title: "Pre-Qualifying Buildup"
+              sort_title: "Pre-Qualifying Buildup"
+              originally_available: "2025-09-20"
+              content_rating: "PG-13"
+              summary: |-
+                    29-21 September 2025 Azerbaijan Grand Prix
+                    Held in Baku City Circuit, Baku
+            10:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-09-20"
+              content_rating: "PG-13"
+              summary: |-
+                    29-21 September 2025 Azerbaijan Grand Prix
+                    Held in Baku City Circuit, Baku
+            11:
+              title: "Post-Qualifying Analysis"
+              sort_title: "Post-Qualifying Analysis"
+              originally_available: "2025-09-20"
+              content_rating: "PG-13"
+              summary: |-
+                    29-21 September 2025 Azerbaijan Grand Prix
+                    Held in Baku City Circuit, Baku
+            12:
+              title: "Pre-Race Buildup"
+              sort_title: "Pre-Race Buildup"
+              originally_available: "2025-09-20"
+              content_rating: "PG-13"
+              summary: |-
+                    29-21 September 2025 Azerbaijan Grand Prix
+                    Held in Baku City Circuit, Baku
+            13:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-09-21"
+              content_rating: "PG-13"
+              summary: |-
+                    29-21 September 2025 Azerbaijan Grand Prix
+                    Held in Baku City Circuit, Baku
+            14:
+              title: "Post-Race Analysis"
+              sort_title: "Post-Race Analysis"
+              originally_available: "2025-09-20"
+              content_rating: "PG-13"
+              summary: |-
+                    29-21 September 2025 Azerbaijan Grand Prix
+                    Held in Baku City Circuit, Baku
+      ## Formula 1 Singapore Grand Prix 2025
+      18:
+        title: "Round 18 - Singapore Grand Prix"
+        summary: |-
+              Marina Bay Street Circuit, Singapore
+              Circuit Length: 4.94 km
+              Race Distance: 306.143 km, Laps: 62
+        file_poster: config/assets/formula1/2025/season18.jpg
+        episodes:
+            1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2025-10-03"
+              content_rating: "PG-13"
+              summary: |-
+                    3-5 October 2025 Singapore Grand Prix
+                    Held in Marina Bay Street Circuit, Singapore
+            2:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-10-03"
+              content_rating: "PG-13"
+              summary: |-
+                    3-5 October 2025 Singapore Grand Prix
+                    Held in Marina Bay Street Circuit, Singapore
+            7:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-10-03"
+              content_rating: "PG-13"
+              summary: |-
+                    3-5 October 2025 Singapore Grand Prix
+                    Held in Marina Bay Street Circuit, Singapore
+            8:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-10-04"
+              content_rating: "PG-13"
+              summary: |-
+                    3-5 October 2025 Singapore Grand Prix
+                    Held in Marina Bay Street Circuit, Singapore
+            9:
+              title: "Pre-Qualifying Buildup"
+              sort_title: "Pre-Qualifying Buildup"
+              originally_available: "2025-10-04"
+              content_rating: "PG-13"
+              summary: |-
+                    3-5 October 2025 Singapore Grand Prix
+                    Held in Marina Bay Street Circuit, Singapore
+            10:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-10-04"
+              content_rating: "PG-13"
+              summary: |-
+                    3-5 October 2025 Singapore Grand Prix
+                    Held in Marina Bay Street Circuit, Singapore
+            11:
+              title: "Post-Qualifying Analysis"
+              sort_title: "Post-Qualifying Analysis"
+              originally_available: "2025-10-04"
+              content_rating: "PG-13"
+              summary: |-
+                    3-5 October 2025 Singapore Grand Prix
+                    Held in Marina Bay Street Circuit, Singapore
+            12:
+              title: "Pre-Race Buildup"
+              sort_title: "Pre-Race Buildup"
+              originally_available: "2025-10-04"
+              content_rating: "PG-13"
+              summary: |-
+                    3-5 October 2025 Singapore Grand Prix
+                    Held in Marina Bay Street Circuit, Singapore
+            13:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-10-05"
+              content_rating: "PG-13"
+              summary: |-
+                    3-5 October 2025 Singapore Grand Prix
+                    Held in Marina Bay Street Circuit, Singapore
+            14:
+              title: "Post-Race Analysis"
+              sort_title: "Post-Race Analysis"
+              originally_available: "2025-10-04"
+              content_rating: "PG-13"
+              summary: |-
+                    3-5 October 2025 Singapore Grand Prix
+                    Held in Marina Bay Street Circuit, Singapore
+      ## Formula 1 United States Grand Prix 2025
+      19:
+        title: "Round 19 - United States Grand Prix"
+        summary: |-
+              Circuit of the Americas, Austin, Texas
+              Circuit Length: 5.513 km
+              Race Distance: 308.405 km, Laps: 56
+        file_poster: config/assets/formula1/2025/season19.jpg
+        episodes:
+            1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2025-10-18"
+              content_rating: "PG-13"
+              summary: |-
+                    17-19 October 2025 United States Grand Prix
+                    Held in Circuit of the Americas, Austin, Texas
+            2:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-10-18"
+              content_rating: "PG-13"
+              summary: |-
+                    17-19 October 2025 United States Grand Prix
+                    Held in Circuit of the Americas, Austin, Texas
+            3:
+              title: "Sprint Qualifying Session"
+              sort_title: "Sprint Qualifying Session"
+              originally_available: "2025-10-18"
+              content_rating: "PG-13"
+              summary: |-
+                    17-19 October 2025 United States Grand Prix
+                    Held in Circuit of the Americas, Austin, Texas
+            4:
+              title: "Pre-Sprint Buildup"
+              sort_title: "Pre-Sprint Buildup"
+              originally_available: "2025-10-18"
+              content_rating: "PG-13"
+              summary: |-
+                    17-19 October 2025 United States Grand Prix
+                    Held in Circuit of the Americas, Austin, Texas
+            5:
+              title: "Sprint Session"
+              sort_title: "Sprint Session"
+              originally_available: "2025-10-19"
+              content_rating: "PG-13"
+              summary: |-
+                    17-19 October 2025 United States Grand Prix
+                    Held in Circuit of the Americas, Austin, Texas
+            6:
+              title: "Post-Sprint Buildup"
+              sort_title: "Post-Sprint Buildup"
+              originally_available: "2025-10-18"
+              content_rating: "PG-13"
+              summary: |-
+                    17-19 October 2025 United States Grand Prix
+                    Held in Circuit of the Americas, Austin, Texas
+            9:
+              title: "Pre-Qualifying Buildup"
+              sort_title: "Pre-Qualifying Buildup"
+              originally_available: "2025-10-18"
+              content_rating: "PG-13"
+              summary: |-
+                    17-19 October 2025 United States Grand Prix
+                    Held in Circuit of the Americas, Austin, Texas
+            10:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-10-19"
+              content_rating: "PG-13"
+              summary: |-
+                    17-19 October 2025 United States Grand Prix
+                    Held in Circuit of the Americas, Austin, Texas
+            11:
+              title: "Post-Qualifying Analysis"
+              sort_title: "Post-Qualifying Analysis"
+              originally_available: "2025-10-18"
+              content_rating: "PG-13"
+              summary: |-
+                    17-19 October 2025 United States Grand Prix
+                    Held in Circuit of the Americas, Austin, Texas
+            12:
+              title: "Pre-Race Buildup"
+              sort_title: "Pre-Race Buildup"
+              originally_available: "2025-10-18"
+              content_rating: "PG-13"
+              summary: |-
+                    17-19 October 2025 United States Grand Prix
+                    Held in Circuit of the Americas, Austin, Texas
+            13:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-10-20"
+              content_rating: "PG-13"
+              summary: |-
+                    17-19 October 2025 United States Grand Prix
+                    Held in Circuit of the Americas, Austin, Texas
+            14:
+              title: "Post-Race Analysis"
+              sort_title: "Post-Race Analysis"
+              originally_available: "2025-10-18"
+              content_rating: "PG-13"
+              summary: |-
+                    17-19 October 2025 United States Grand Prix
+                    Held in Circuit of the Americas, Austin, Texas
+      ## Formula 1 Mexico City Grand Prix 2025
+      20:
+        title: "Round 20 - Mexico City Grand Prix"
+        summary: |-
+              Autódromo Hermanos Rodríguez, Mexico City
+              Circuit Length: 4.304 km
+              Race Distance: 305.354 km, Laps: 71
+        file_poster: config/assets/formula1/2025/season20.jpg
+        episodes:
+            1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2025-10-25"
+              content_rating: "PG-13"
+              summary: |-
+                    24-26 October 2025 Mexico City Grand Prix
+                    Held in Autódromo Hermanos Rodríguez, Mexico City
+            2:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-10-25"
+              content_rating: "PG-13"
+              summary: |-
+                    24-26 October 2025 Mexico City Grand Prix
+                    Held in Autódromo Hermanos Rodríguez, Mexico City
+            7:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-10-25"
+              content_rating: "PG-13"
+              summary: |-
+                    24-26 October 2025 Mexico City Grand Prix
+                    Held in Autódromo Hermanos Rodríguez, Mexico City
+            8:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-10-26"
+              content_rating: "PG-13"
+              summary: |-
+                    24-26 October 2025 Mexico City Grand Prix
+                    Held in Autódromo Hermanos Rodríguez, Mexico City
+            9:
+              title: "Pre-Qualifying Buildup"
+              sort_title: "Pre-Qualifying Buildup"
+              originally_available: "2025-10-26"
+              content_rating: "PG-13"
+              summary: |-
+                    24-26 October 2025 Mexico City Grand Prix
+                    Held in Autódromo Hermanos Rodríguez, Mexico City
+            10:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-10-26"
+              content_rating: "PG-13"
+              summary: |-
+                    24-26 October 2025 Mexico City Grand Prix
+                    Held in Autódromo Hermanos Rodríguez, Mexico City
+            11:
+              title: "Post-Qualifying Analysis"
+              sort_title: "Post-Qualifying Analysis"
+              originally_available: "2025-10-26"
+              content_rating: "PG-13"
+              summary: |-
+                    24-26 October 2025 Mexico City Grand Prix
+                    Held in Autódromo Hermanos Rodríguez, Mexico City
+            12:
+              title: "Pre-Race Buildup"
+              sort_title: "Pre-Race Buildup"
+              originally_available: "2025-10-26"
+              content_rating: "PG-13"
+              summary: |-
+                    24-26 October 2025 Mexico City Grand Prix
+                    Held in Autódromo Hermanos Rodríguez, Mexico City
+            13:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-10-27"
+              content_rating: "PG-13"
+              summary: |-
+                    24-26 October 2025 Mexico City Grand Prix
+                    Held in Autódromo Hermanos Rodríguez, Mexico City
+            14:
+              title: "Post-Race Analysis"
+              sort_title: "Post-Race Analysis"
+              originally_available: "2025-10-26"
+              content_rating: "PG-13"
+              summary: |-
+                    24-26 October 2025 Mexico City Grand Prix
+                    Held in Autódromo Hermanos Rodríguez, Mexico City
+      ## Formula 1 São Paulo Grand Prix 2025
+      21:
+        title: "Round 21 - São Paulo Grand Prix"
+        summary: |-
+              Interlagos Circuit, São Paulo
+              Circuit Length: 4.309 km
+              Race Distance: 305.879 km, Laps: 71
+        file_poster: config/assets/formula1/2025/season21.jpg
+        episodes:
+            1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2025-11-07"
+              content_rating: "PG-13"
+              summary: |-
+                    7-9 November 2025 São Paulo Grand Prix
+                    Held in Interlagos Circuit, São Paulo
+            2:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-11-07"
+              content_rating: "PG-13"
+              summary: |-
+                    7-9 November 2025 São Paulo Grand Prix
+                    Held in Interlagos Circuit, São Paulo
+            3:
+              title: "Sprint Qualifying Session"
+              sort_title: "Sprint Qualifying Session"
+              originally_available: "2025-11-08"
+              content_rating: "PG-13"
+              summary: |-
+                    7-9 November 2025 São Paulo Grand Prix
+                    Held in Interlagos Circuit, São Paulo
+            4:
+              title: "Pre-Sprint Buildup"
+              sort_title: "Pre-Sprint Buildup"
+              originally_available: "2025-11-08"
+              content_rating: "PG-13"
+              summary: |-
+                    7-9 November 2025 São Paulo Grand Prix
+                    Held in Interlagos Circuit, São Paulo
+            5:
+              title: "Sprint Session"
+              sort_title: "Sprint Session"
+              originally_available: "2025-11-08"
+              content_rating: "PG-13"
+              summary: |-
+                    7-9 November 2025 São Paulo Grand Prix
+                    Held in Interlagos Circuit, São Paulo
+            6:
+              title: "Post-Sprint Buildup"
+              sort_title: "Post-Sprint Buildup"
+              originally_available: "2025-11-08"
+              content_rating: "PG-13"
+              summary: |-
+                    7-9 November 2025 São Paulo Grand Prix
+                    Held in Interlagos Circuit, São Paulo
+            9:
+              title: "Pre-Qualifying Buildup"
+              sort_title: "Pre-Qualifying Buildup"
+              originally_available: "2025-11-08"
+              content_rating: "PG-13"
+              summary: |-
+                    7-9 November 2025 São Paulo Grand Prix
+                    Held in Interlagos Circuit, São Paulo
+            10:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-11-09"
+              content_rating: "PG-13"
+              summary: |-
+                    7-9 November 2025 São Paulo Grand Prix
+                    Held in Interlagos Circuit, São Paulo
+            11:
+              title: "Post-Qualifying Analysis"
+              sort_title: "Post-Qualifying Analysis"
+              originally_available: "2025-11-08"
+              content_rating: "PG-13"
+              summary: |-
+                    7-9 November 2025 São Paulo Grand Prix
+                    Held in Interlagos Circuit, São Paulo
+            12:
+              title: "Pre-Race Buildup"
+              sort_title: "Pre-Race Buildup"
+              originally_available: "2025-11-08"
+              content_rating: "PG-13"
+              summary: |-
+                    7-9 November 2025 São Paulo Grand Prix
+                    Held in Interlagos Circuit, São Paulo
+            13:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-11-10"
+              content_rating: "PG-13"
+              summary: |-
+                    7-9 November 2025 São Paulo Grand Prix
+                    Held in Interlagos Circuit, São Paulo
+            14:
+              title: "Post-Race Analysis"
+              sort_title: "Post-Race Analysis"
+              originally_available: "2025-11-08"
+              content_rating: "PG-13"
+              summary: |-
+                    7-9 November 2025 São Paulo Grand Prix
+                    Held in Interlagos Circuit, São Paulo
+      ## Formula 1 Las Vegas Grand Prix 2025
+      22:
+        title: "Round 22 - Las Vegas Grand Prix"
+        summary: |-
+              Las Vegas Strip Circuit, Paradise, Nevada
+              Circuit Length: 6.201 km
+              Race Distance: 309.958 km, Laps: 50
+        file_poster: config/assets/formula1/2025/season22.jpg
+        episodes:
+            1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2025-11-21"
+              content_rating: "PG-13"
+              summary: |-
+                    20-22 November 2025 Las Vegas Grand Prix
+                    Held in Las Vegas Strip Circuit, Paradise, Nevada
+            2:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-11-21"
+              content_rating: "PG-13"
+              summary: |-
+                    20-22 November 2025 Las Vegas Grand Prix
+                    Held in Las Vegas Strip Circuit, Paradise, Nevada
+            7:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-11-21"
+              content_rating: "PG-13"
+              summary: |-
+                    20-22 November 2025 Las Vegas Grand Prix
+                    Held in Las Vegas Strip Circuit, Paradise, Nevada
+            8:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-11-22"
+              content_rating: "PG-13"
+              summary: |-
+                    20-22 November 2025 Las Vegas Grand Prix
+                    Held in Las Vegas Strip Circuit, Paradise, Nevada
+            9:
+              title: "Pre-Qualifying Buildup"
+              sort_title: "Pre-Qualifying Buildup"
+              originally_available: "2025-11-22"
+              content_rating: "PG-13"
+              summary: |-
+                    20-22 November 2025 Las Vegas Grand Prix
+                    Held in Las Vegas Strip Circuit, Paradise, Nevada
+            10:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-11-22"
+              content_rating: "PG-13"
+              summary: |-
+                    20-22 November 2025 Las Vegas Grand Prix
+                    Held in Las Vegas Strip Circuit, Paradise, Nevada
+            11:
+              title: "Post-Qualifying Analysis"
+              sort_title: "Post-Qualifying Analysis"
+              originally_available: "2025-11-22"
+              content_rating: "PG-13"
+              summary: |-
+                    20-22 November 2025 Las Vegas Grand Prix
+                    Held in Las Vegas Strip Circuit, Paradise, Nevada
+            12:
+              title: "Pre-Race Buildup"
+              sort_title: "Pre-Race Buildup"
+              originally_available: "2025-11-22"
+              content_rating: "PG-13"
+              summary: |-
+                    20-22 November 2025 Las Vegas Grand Prix
+                    Held in Las Vegas Strip Circuit, Paradise, Nevada
+            13:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-11-23"
+              content_rating: "PG-13"
+              summary: |-
+                    20-22 November 2025 Las Vegas Grand Prix
+                    Held in Las Vegas Strip Circuit, Paradise, Nevada
+            14:
+              title: "Post-Race Analysis"
+              sort_title: "Post-Race Analysis"
+              originally_available: "2025-11-22"
+              content_rating: "PG-13"
+              summary: |-
+                    20-22 November 2025 Las Vegas Grand Prix
+                    Held in Las Vegas Strip Circuit, Paradise, Nevada
+      ## Formula 1 Qatar Grand Prix 2025
+      23:
+        title: "Round 23 - Qatar Grand Prix"
+        summary: |-
+              Lusail International Circuit, Lusail
+              Circuit Length: 5.419 km
+              Race Distance: 308.611 km, Laps: 57
+        file_poster: config/assets/formula1/2025/season23.jpg
+        episodes:
+            1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2025-11-28"
+              content_rating: "PG-13"
+              summary: |-
+                    28-30 November 2025 Qatar Grand Prix
+                    Held in Lusail International Circuit, Lusail
+            2:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-11-28"
+              content_rating: "PG-13"
+              summary: |-
+                    28-30 November 2025 Qatar Grand Prix
+                    Held in Lusail International Circuit, Lusail
+            3:
+              title: "Sprint Qualifying Session"
+              sort_title: "Sprint Qualifying Session"
+              originally_available: "2025-11-29"
+              content_rating: "PG-13"
+              summary: |-
+                    28-30 November 2025 Qatar Grand Prix
+                    Held in Lusail International Circuit, Lusail
+            4:
+              title: "Pre-Sprint Buildup"
+              sort_title: "Pre-Sprint Buildup"
+              originally_available: "2025-11-29"
+              content_rating: "PG-13"
+              summary: |-
+                    28-30 November 2025 Qatar Grand Prix
+                    Held in Lusail International Circuit, Lusail
+            5:
+              title: "Sprint Session"
+              sort_title: "Sprint Session"
+              originally_available: "2025-11-29"
+              content_rating: "PG-13"
+              summary: |-
+                    28-30 November 2025 Qatar Grand Prix
+                    Held in Lusail International Circuit, Lusail
+            6:
+              title: "Post-Sprint Analysis"
+              sort_title: "Post-Sprint Analysis"
+              originally_available: "2025-11-29"
+              content_rating: "PG-13"
+              summary: |-
+                    28-30 November 2025 Qatar Grand Prix
+                    Held in Lusail International Circuit, Lusail
+            9:
+              title: "Pre-Qualifying Buildup"
+              sort_title: "Pre-Qualifying Buildup"
+              originally_available: "2025-11-29"
+              content_rating: "PG-13"
+              summary: |-
+                    28-30 November 2025 Qatar Grand Prix
+                    Held in Lusail International Circuit, Lusail
+            10:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-11-30"
+              content_rating: "PG-13"
+              summary: |-
+                    28-30 November 2025 Qatar Grand Prix
+                    Held in Lusail International Circuit, Lusail
+            11:
+              title: "Post-Qualifying Analysis"
+              sort_title: "Post-Qualifying Analysis"
+              originally_available: "2025-11-29"
+              content_rating: "PG-13"
+              summary: |-
+                    28-30 November 2025 Qatar Grand Prix
+                    Held in Lusail International Circuit, Lusail
+            12:
+              title: "Pre-Race Buildup"
+              sort_title: "Pre-Race Buildup"
+              originally_available: "2025-11-29"
+              content_rating: "PG-13"
+              summary: |-
+                    28-30 November 2025 Qatar Grand Prix
+                    Held in Lusail International Circuit, Lusail
+            13:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-12-01"
+              content_rating: "PG-13"
+              summary: |-
+                    28-30 November 2025 Qatar Grand Prix
+                    Held in Lusail International Circuit, Lusail
+            14:
+              title: "Post-Race Analysis"
+              sort_title: "Post-Race Analysis"
+              originally_available: "2025-11-29"
+              content_rating: "PG-13"
+              summary: |-
+                    28-30 November 2025 Qatar Grand Prix
+                    Held in Lusail International Circuit, Lusail
+      ## Formula 1 Abu Dhabi Grand Prix 2025
+      24:
+        title: "Round 24 - Abu Dhabi Grand Prix"
+        summary: |-
+              Yas Marina Circuit, Abu Dhabi
+              Circuit Length: 5.281 km
+              Race Distance: 306.183 km, Laps: 58
+        file_poster: config/assets/formula1/2025/season24.jpg
+        episodes:
+            1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2025-12-05"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 December 2025 Abu Dhabi Grand Prix
+                    Held in Yas Marina Circuit, Abu Dhabi
+            2:
+              title: "Free Practice 1"
+              sort_title: "Free Practice 1"
+              originally_available: "2025-12-05"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 December 2025 Abu Dhabi Grand Prix
+                    Held in Yas Marina Circuit, Abu Dhabi
+            7:
+              title: "Free Practice 2"
+              sort_title: "Free Practice 2"
+              originally_available: "2025-12-05"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 December 2025 Abu Dhabi Grand Prix
+                    Held in Yas Marina Circuit, Abu Dhabi
+            8:
+              title: "Free Practice 3"
+              sort_title: "Free Practice 3"
+              originally_available: "2025-12-06"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 December 2025 Abu Dhabi Grand Prix
+                    Held in Yas Marina Circuit, Abu Dhabi
+            9:
+              title: "Pre-Qualifying Buildup"
+              sort_title: "Pre-Qualifying Buildup"
+              originally_available: "2025-12-06"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 December 2025 Abu Dhabi Grand Prix
+                    Held in Yas Marina Circuit, Abu Dhabi
+            10:
+              title: "Qualifying Session"
+              sort_title: "Qualifying Session"
+              originally_available: "2025-12-06"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 December 2025 Abu Dhabi Grand Prix
+                    Held in Yas Marina Circuit, Abu Dhabi
+            11:
+              title: "Post-Qualifying Analysis"
+              sort_title: "Post-Qualifying Analysis"
+              originally_available: "2025-12-06"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 December 2025 Abu Dhabi Grand Prix
+                    Held in Yas Marina Circuit, Abu Dhabi
+            12:
+              title: "Pre-Race Buildup"
+              sort_title: "Pre-Race Buildup"
+              originally_available: "2025-12-06"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 December 2025 Abu Dhabi Grand Prix
+                    Held in Yas Marina Circuit, Abu Dhabi
+            13:
+              title: "Race Session"
+              sort_title: "Race Session"
+              originally_available: "2025-12-07"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 December 2025 Abu Dhabi Grand Prix
+                    Held in Yas Marina Circuit, Abu Dhabi
+            14:
+              title: "Post-Race Analysis"
+              sort_title: "Post-Race Analysis"
+              originally_available: "2025-12-06"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 December 2025 Abu Dhabi Grand Prix
+                    Held in Yas Marina Circuit, Abu Dhabi
+
