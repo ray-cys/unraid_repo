@@ -220,6 +220,7 @@ NVME_POH_CRIT_HOURS=43800                        # NVMe critical
 TBW_DAYS_WARN=14                                 # Remaining TBW forecast days < warning
 TBW_DAYS_CRIT=3                                  # Remaining TBW forecast days < critical
 TBW_WARN_TB=480                                  # Fallback TBW absolute threshold (TB)
+DEFAULT_SSD_ENDURANCE_PER_TB=300                 # Fallback endurance (TB) for unknown SATA/NVMe SSD models
 TBW_CONSUMED_WARN=80                             # Consumed percent of model TBW >= warning
 TBW_CONSUMED_CRIT=95                             # Consumed percent of model TBW >= critical
 
@@ -256,6 +257,35 @@ W_SELFTEST_WARN=15                               # SMART self-test warning/ambig
 W_TBW_CONS_WARN=10                               # TBW consumed over warn threshold
 W_TBW_CONS_CRIT=25                               # TBW consumed over critical threshold
 
+# === Model-Specific Overrides ===
+# Rule format uses ';'-separated key:value pairs per line. Supported keys:
+#  - regex: POSIX ERE to match model string (case-insensitive)
+#  - cap_min / cap_max: optional decimal TB capacity window (inclusive)
+#  - per_tb: TBW endurance per TB of capacity (numeric)
+#  - type: nvme | sata-ssd | sata-hdd (for POH overrides)
+#  - warn / crit: POH hours thresholds (numeric)
+#  - action: for quirks (e.g., invert_mwi_small)
+# TBW endurance per TB overrides (model + optional capacity window)
+TBW_MODEL_RULES='\
+regex:MX500;per_tb:350
+regex:WD[[:space:]]+Red.*SA500;cap_min:0.45;cap_max:0.55;per_tb:700
+regex:WD[[:space:]]+Red.*SA500;cap_min:0.95;cap_max:1.05;per_tb:600
+regex:Crucial[[:space:]]*T500;cap_min:0.95;cap_max:1.05;per_tb:600
+regex:Crucial[[:space:]]*P5(\\+|[[:space:]]*Plus|P5P);cap_min:0.95;cap_max:1.05;per_tb:600
+'
+# POH threshold overrides by device type and model
+POH_MODEL_RULES='\
+type:nvme;regex:Crucial[[:space:]]*T500;warn:4000;crit:6000
+type:nvme;regex:Crucial.*P5P|Crucial[[:space:]]*P5[[:space:]]*Plus|P5\\+;cap_min:0.95;cap_max:1.05;warn:4000;crit:6000
+type:sata-hdd;regex:Ultrastar;warn:50000;crit:70000
+type:sata-ssd;regex:SA500|WD[[:space:]]+Red[[:space:]]+SA500;warn:6000;crit:10000
+'
+# Parsing/compatibility quirks (e.g., vendor-reported life remaining anomalies)
+QUIRK_MWI_RULES='\
+action:invert_mwi_small;regex:WD[[:space:]]+Red.*SA500;cap_min:0.48;cap_max:0.52
+'
+
+
 # === Internals (do not modify unless needed) ===
 ALERT_WARN=()                                     # Accumulator for warning messages
 ALERT_CRIT=()                                     # Accumulator for critical messages
@@ -271,6 +301,8 @@ declare -A NVME_EXT_RAW                           # Base device -> cached NVMe s
 declare -A SMART_INFO                             # Base device -> cached SATA smartctl -i output
 declare -A BURST_BOOST                            # Base device -> accumulated burst boost this run (0-100)
 declare -A TBW_STATUS_MAP                         # Map device -> TBW status (OK/WARNING/CRITICAL)
+declare -A TBW_DAILY                              # Map device -> daily TBW bytes (over window)
+declare -A TBW_DAYS_LEFT                          # Map device -> forecasted days left to endurance
 declare -A IO_ERROR_RAW_MAP                       # Map device -> raw I/O error line count (duplicates included)
 declare -A IO_ERROR_UNIQUE_MAP                    # Map device -> unique I/O error event count (dedup within window)
 declare -A LAST_TEST                              # Map device -> last SMART test timestamp
@@ -769,14 +801,33 @@ tbw_threshold_tb_for_device() {
     # Map model hints to endurance (TB written per TB capacity); return empty if unknown
     local model="$1"; shift
     local cap="$1"; shift
-    local per_tb=0
-    if echo "$model" | grep -qi 'MX500'; then per_tb=350; fi
-    if echo "$model" | grep -qi 'WD Red' | grep -qi 'SA500'; then per_tb=600; fi
-    if echo "$model" | grep -qi 'Crucial.*T500'; then per_tb=600; fi
-        if echo "$model" | grep -qiE 'Crucial.*P5P|P5P'; then
-            awk -v c="$cap" 'BEGIN{exit !(c>=0.98 && c<=1.02)}' && per_tb=600
-        fi
-    if (( per_tb == 0 )); then echo ""; return 0; fi
+    local per_tb=""
+    # Evaluate configured TBW rules first
+    if [[ -n "${TBW_MODEL_RULES:-}" ]]; then
+        while IFS= read -r __rline; do
+            [[ -z "$__rline" || "$__rline" =~ ^# ]] && continue
+            local _regex="" _per="" _min="" _max=""
+            IFS=';' read -r -a __parts <<< "$__rline"
+            for __p in "${__parts[@]}"; do
+                case "$__p" in
+                    regex:*) _regex="${__p#regex:}" ;;
+                    per_tb:*) _per="${__p#per_tb:}" ;;
+                    cap_min:*) _min="${__p#cap_min:}" ;;
+                    cap_max:*) _max="${__p#cap_max:}" ;;
+                esac
+            done
+            [[ -z "$_regex" || -z "$_per" ]] && continue
+            if echo "$model" | grep -qiE "$_regex"; then
+                local _cap_ok=1
+                if [[ -n "$_min" || -n "$_max" ]]; then
+                    _cap_ok=0
+                    if awk -v c="$cap" -v a="${_min:-0}" -v b="${_max:-9999}" 'BEGIN{exit !(c+0>=a+0 && c+0<=b+0)}'; then _cap_ok=1; fi
+                fi
+                if (( _cap_ok == 1 )); then per_tb="$_per"; break; fi
+            fi
+        done <<< "${TBW_MODEL_RULES}"
+    fi
+    [[ -z "$per_tb" ]] && { echo ""; return 0; }
     awk -v c="$cap" -v p="$per_tb" 'BEGIN{printf "%.0f", c*p}'
 }
 
@@ -838,21 +889,52 @@ poh_thresholds_for_device() {
     local warn=0 crit=0
     if [[ "$dtype" == "nvme" ]]; then
         warn=$NVME_POH_WARN_HOURS; crit=$NVME_POH_CRIT_HOURS
-        # Model-specific overrides
-        if echo "$model" | grep -qiE 'Crucial.*P5P|P5P'; then
-            local cap
-            cap=$(get_device_capacity_tb "$dev")
-            if awk -v c="$cap" 'BEGIN{exit !(c>=0.98 && c<=1.02)}'; then warn=4000; crit=6000; fi
-        fi
-        if echo "$model" | grep -qiE 'Crucial.*T500|T500'; then warn=4000; crit=6000; fi
     else
         if [[ "$rota" == "1" ]]; then
             warn=$HDD_POH_WARN_HOURS; crit=$HDD_POH_CRIT_HOURS
-            if echo "$model" | grep -qi 'Ultrastar'; then warn=50000; crit=70000; fi
         else
             warn=$SSD_POH_WARN_HOURS; crit=$SSD_POH_CRIT_HOURS
-            if echo "$model" | grep -qiE 'SA500|WD Red SA500'; then warn=6000; crit=10000; fi
         fi
+    fi
+    # Apply configuration-driven overrides
+    if [[ -n "${POH_MODEL_RULES:-}" ]]; then
+        local cap; cap=$(get_device_capacity_tb "$dev")
+        while IFS= read -r __rline; do
+            [[ -z "$__rline" || "$__rline" =~ ^# ]] && continue
+            local _type="" _regex="" _warn="" _crit="" _min="" _max=""
+            IFS=';' read -r -a __parts <<< "$__rline"
+            for __p in "${__parts[@]}"; do
+                case "$__p" in
+                    type:*) _type="${__p#type:}" ;;
+                    regex:*) _regex="${__p#regex:}" ;;
+                    warn:*) _warn="${__p#warn:}" ;;
+                    crit:*) _crit="${__p#crit:}" ;;
+                    cap_min:*) _min="${__p#cap_min:}" ;;
+                    cap_max:*) _max="${__p#cap_max:}" ;;
+                esac
+            done
+            [[ -z "$_type" || -z "$_regex" ]] && continue
+            # Match type to current device
+            local _dtype=""
+            case "${dtype}:${rota}" in
+                nvme:*) _dtype="nvme" ;;
+                *:1) _dtype="sata-hdd" ;;
+                *) _dtype="sata-ssd" ;;
+            esac
+            [[ "$_dtype" != "$_type" ]] && continue
+            if echo "$model" | grep -qiE "$_regex"; then
+                local _cap_ok=1
+                if [[ -n "$_min" || -n "$_max" ]]; then
+                    _cap_ok=0
+                    if awk -v c="$cap" -v a="${_min:-0}" -v b="${_max:-9999}" 'BEGIN{exit !(c+0>=a+0 && c+0<=b+0)}'; then _cap_ok=1; fi
+                fi
+                if (( _cap_ok == 1 )); then
+                    [[ -n "$_warn" ]] && warn="$_warn"
+                    [[ -n "$_crit" ]] && crit="$_crit"
+                    break
+                fi
+            fi
+        done <<< "${POH_MODEL_RULES}"
     fi
     echo "$warn $crit"
 }
@@ -1289,6 +1371,9 @@ save_cmd_timeout_last() {
 # Collect SMART data, classify device health, and raise alerts
 evaluate_smart() {
     local disk=$1
+    local ctx=${2:-}
+    local prev_state="${SMART_STATE[$disk]:-}"
+    local prev_msgs="${SMART_MSGS[$disk]:-}"
     local is_nvme=0
     [[ $disk == /dev/nvme* ]] && is_nvme=1
     local state="OK"
@@ -1903,17 +1988,27 @@ evaluate_smart() {
         fi
     fi
     # Persist state & aggregated messages + emit per-line logs (minimal, no single-line aggregation)
-    SMART_STATE["$disk"]="$state"
     local _joined="" _m
     for _m in "${messages[@]}"; do
         if [[ -z "$_joined" ]]; then _joined="$_m"; else _joined+="; $_m"; fi
     done
+    # Decide whether to log based on delta when in post-test context
+    SMART_STATE["$disk"]="$state"
     SMART_MSGS["$disk"]="$_joined"
-    # Log state then each message with disk prefix for clarity
-    log_smart "SMART state $disk: $state"
-    for _m in "${messages[@]}"; do
-        log_smart "SMART detail $disk: $_m"
-    done
+    if [[ "$ctx" == "post-test" && "$prev_state" == "$state" && "${prev_msgs}" == "$_joined" ]]; then
+        # No change in state or messages; suppress duplicate post-test log
+        :
+    else
+        # Log state then each message with disk prefix for clarity
+        if [[ -n "$ctx" ]]; then
+            log_smart "SMART state ($ctx) $disk: $state"
+        else
+            log_smart "SMART state $disk: $state"
+        fi
+        for _m in "${messages[@]}"; do
+            log_smart "SMART detail $disk: $_m"
+        done
+    fi
     return 0
 }
 
@@ -2113,6 +2208,8 @@ run_smart_test() {
     fi
     local test_kind="short"
     local selftest poh_attr current_poh last_long_hours_diff="" last_long_poh="" threshold_hours=$(( LONG_TEST_MAX_INTERVAL_DAYS * 24 ))
+    # Baseline SMART evaluation and log (pre-test)
+    evaluate_smart "$disk" "pre-test"
     if [[ $disk == /dev/nvme* ]]; then
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART self-test log read (-l selftest) on $disk"
         selftest=$(smartctl -l selftest -d nvme "$disk" 2>/dev/null || true)
@@ -2348,7 +2445,7 @@ run_smart_test() {
         fi
     fi
     # Re-evaluate post test (may reveal new info); keep pre-eval already used for scheduling
-    evaluate_smart "$disk"
+    evaluate_smart "$disk" "post-test"
     local state="${SMART_STATE[$disk]:-OK}" msgs="${SMART_MSGS[$disk]:-}"
     if [[ $state == WARNING || $state == CRITICAL ]]; then
         record_alert "$state" "$NOTIFY_TITLE_SMART" "Disk $disk SMART $state: $msgs"
@@ -4937,7 +5034,14 @@ build_trend_section() {
             local _tbw="" _writers=""
             for dev in "${!TBW_DAYS_LEFT[@]}"; do
                 local dl=${TBW_DAYS_LEFT[$dev]} daily=${TBW_DAILY[$dev]:-0}
-                format_rate() { local b="$1"; if (( b >= 1000000000 )); then awk -v v="$b" 'BEGIN{printf "%.1fG", v/1000000000}'; elif (( b >= 1000000 )); then awk -v v="$b" 'BEGIN{printf "%dM", int(v/1000000)}'; else awk -v v="$b" 'BEGIN{printf "%dK", int(v/1000)}'; fi; }
+                format_rate() {
+                    local b="$1"
+                    if [[ "$b" =~ ^[0-9]+$ ]]; then
+                        awk -v v="$b" 'BEGIN{ if(v>=1000000000) printf "%.1fG", v/1000000000; else if(v>=1000000) printf "%dM", int(v/1000000); else printf "%dK", int(v/1000) }'
+                    else
+                        printf "0K"
+                    fi
+                }
                 local rate; rate=$(format_rate "$daily")
                 _tbw+="🔺$(basename "$dev") ${rate} → ${dl}d | "
             done
@@ -4957,7 +5061,14 @@ build_trend_section() {
                     # Global writer classification arrays for guidance and alerts
                     declare -A WRITER_WEEKLY_PCT WRITER_TIER
                     while read -r pct dev daily cap_tb; do
-                        format_rate() { local b="$1"; if (( b >= 1000000000 )); then awk -v v="$b" 'BEGIN{printf "%.1fG", v/1000000000}'; elif (( b >= 1000000 )); then awk -v v="$b" 'BEGIN{printf "%dM", int(v/1000000)}'; else awk -v v="$b" 'BEGIN{printf "%dK", int(v/1000)}'; fi; }
+                        format_rate() {
+                            local b="$1"
+                            if [[ "$b" =~ ^[0-9]+$ ]]; then
+                                awk -v v="$b" 'BEGIN{ if(v>=1000000000) printf "%.1fG", v/1000000000; else if(v>=1000000) printf "%dM", int(v/1000000); else printf "%dK", int(v/1000) }'
+                            else
+                                printf "0K"
+                            fi
+                        }
                         local rate; rate=$(format_rate "$daily")
                         # pct is daily % of capacity; derive weekly percent
                         local weekly_pct; weekly_pct=$(awk -v d="$pct" 'BEGIN{printf "%.6f", d*7}')
@@ -5631,7 +5742,9 @@ capacity_forecast_and_export() {
 tbw_forecast_and_heavy_writers() {
     # Forecast days-to-endurance threshold and list heavy writers (normalized by capacity)
     (( ${TBW_TREND_ENABLED:-1} == 1 )) || { return 0; }
-    declare -A TBW_DAYS_LEFT TBW_STATUS_MAP TBW_DAILY 2>/dev/null || true
+    TBW_DAILY=()
+    TBW_DAYS_LEFT=()
+    TBW_STATUS_MAP=()
     local today
     today=$(date '+%Y-%m-%d')
     for dev in "${!SMART_STATE[@]}"; do
@@ -5654,15 +5767,17 @@ tbw_forecast_and_heavy_writers() {
         if [[ -z "${last_dt[$dev]:-}" || "$dt" > "${last_dt[$dev]}" ]]; then last_dt[$dev]="$dt"; last_v[$dev]="$v"; fi
     done < "$tmp"
     rm -f "$tmp"
-    # Ensure global associative arrays for downstream Trend assembly
-    unset -v TBW_DAILY TBW_DAYS_LEFT TBW_STATUS_MAP 2>/dev/null || true
-    declare -gA TBW_DAILY TBW_DAYS_LEFT TBW_STATUS_MAP
     declare -a heavy_rank=()
     for dev in "${!last_v[@]}"; do
         local start=${first_v[$dev]:-0} end=${last_v[$dev]:-0}
         [[ ! "$start" =~ ^[0-9]+$ || ! "$end" =~ ^[0-9]+$ ]] && continue
         local days
         days=$(awk -v lts="$(date -d "${last_dt[$dev]}" +%s 2>/dev/null || date +%s)" -v fts="$(date -d "${first_dt[$dev]}" +%s 2>/dev/null || date +%s)" 'BEGIN{d=int((lts-fts)/86400); if(d<=0)d=1; print d}')
+        # Debug: log values if anything is non-numeric before proceeding
+        if ! awk -v e="$end" -v s="$start" -v d="$days" 'BEGIN{exit (e ~ /^[0-9]+$/ && s ~ /^[0-9]+$/ && d ~ /^[0-9]+$/)?0:1}'; then
+            log_warn "TBW debug: skipping dev=$(basename "$dev") start='$start' end='$end' days='$days' (non-numeric)"
+            continue
+        fi
         if awk -v e="$end" -v s="$start" 'BEGIN{exit !(e+0>s+0)}'; then
             local daily
             daily=$(awk -v e="$end" -v s="$start" -v d="$days" 'BEGIN{printf "%d", int(((e+0)-(s+0))/(d+0))}')
@@ -5677,12 +5792,24 @@ tbw_forecast_and_heavy_writers() {
                 if [[ "$tbw_thresh" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
                     total_bytes=$(awk -v th="$tbw_thresh" 'BEGIN{printf "%d", int(th * 1000*1000*1000*1000)}')
                 else
+                    log_warn "TBW debug: non-numeric tbw_thresh for dev=$(basename "$dev") model='$model' cap='$cap' tbw_thresh='$tbw_thresh'"
                     total_bytes=""
                 fi
             else
                 local used_pct=${CUR_ATTR["$dev|nvme_percent_used"]:-}
                 if [[ -n "$used_pct" && "$used_pct" =~ ^[0-9]+$ ]] && awk -v u="$used_pct" 'BEGIN{exit !(u+0>0)}'; then
                     total_bytes=$(awk -v e="$end" -v u="$used_pct" 'BEGIN{printf "%d", int((e+0)*100/(u+0))}')
+                else
+                    # Fallback for SATA/NVMe SSDs with unknown model endurance: use DEFAULT_SSD_ENDURANCE_PER_TB
+                    local bd rota
+                    bd=$(base_device "$dev")
+                    rota=$(lsblk_rota_cached "$bd" 2>/dev/null || echo 1)
+                    if [[ "$rota" == "0" ]]; then
+                        # SSD: use capacity * DEFAULT_SSD_ENDURANCE_PER_TB
+                        if [[ -n "$cap" && "$cap" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                            total_bytes=$(awk -v c="$cap" -v p="$DEFAULT_SSD_ENDURANCE_PER_TB" 'BEGIN{printf "%d", int(c*p*1000*1000*1000*1000)}')
+                        fi
+                    fi
                 fi
             fi
             [[ ! "$total_bytes" =~ ^[0-9]+$ ]] && total_bytes=""
@@ -5699,6 +5826,8 @@ tbw_forecast_and_heavy_writers() {
                     fi
                 fi
                 TBW_STATUS_MAP[$dev]="$status"
+            else
+                log_warn "TBW debug: insufficient data for dev=$(basename "$dev") total_bytes='$total_bytes' end='$end' daily='$daily'"
             fi
             local cap_tb
             cap_tb=$(printf "%s" "$cap" | awk '/^[0-9]+(\.[0-9]+)?$/{print ($0+0)}')
