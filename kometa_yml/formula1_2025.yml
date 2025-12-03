@@ -28,8 +28,8 @@ metadata:
         - Comedy
         - Drama
         - Thriller
-    file_poster: config/assets/formula1/poster2.jpg
-    file_background: config/assets/formula1/background6.jpg
+    file_poster: config/assets/formula1/poster4.jpg
+    file_background: config/assets/formula1/background8.jpg
     visible_library: true
     seasons:
       ## Formula 1 Australian Grand Prix 2025

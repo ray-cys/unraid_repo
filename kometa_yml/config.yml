@@ -266,7 +266,7 @@ settings:
   show_filtered: false
   show_unfiltered: false
   show_options: false
-  show_missing: true
+  show_missing: false
   save_report: true
   playlist_report: true
   tvdb_language: eng
