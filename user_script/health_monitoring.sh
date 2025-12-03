@@ -5661,10 +5661,11 @@ tbw_forecast_and_heavy_writers() {
     for dev in "${!last_v[@]}"; do
         local start=${first_v[$dev]:-0} end=${last_v[$dev]:-0}
         [[ ! "$start" =~ ^[0-9]+$ || ! "$end" =~ ^[0-9]+$ ]] && continue
-        local days=$(( ( $(date -d "${last_dt[$dev]}" +%s 2>/dev/null || date +%s) - $(date -d "${first_dt[$dev]}" +%s 2>/dev/null || date +%s) ) / 86400 ))
-        (( days<=0 )) && days=1
-        if (( end>start )); then
-            local daily=$(( (end - start) / days ))
+        local days
+        days=$(awk -v lts="$(date -d "${last_dt[$dev]}" +%s 2>/dev/null || date +%s)" -v fts="$(date -d "${first_dt[$dev]}" +%s 2>/dev/null || date +%s)" 'BEGIN{d=int((lts-fts)/86400); if(d<=0)d=1; print d}')
+        if awk -v e="$end" -v s="$start" 'BEGIN{exit !(e+0>s+0)}'; then
+            local daily
+            daily=$(awk -v e="$end" -v s="$start" -v d="$days" 'BEGIN{printf "%d", int(((e+0)-(s+0))/(d+0))}')
             TBW_DAILY[$dev]=$daily
             local model cap tbw_thresh
             model=$(get_device_model "$dev")
@@ -5676,8 +5677,8 @@ tbw_forecast_and_heavy_writers() {
                 total_bytes=$(( tbw_thresh * TB ))
             else
                 local used_pct=${CUR_ATTR["$dev|nvme_percent_used"]:-}
-                if [[ -n "$used_pct" && "$used_pct" =~ ^[0-9]+$ && $used_pct -gt 0 ]]; then
-                    total_bytes=$(( end * 100 / used_pct ))
+                if [[ -n "$used_pct" && "$used_pct" =~ ^[0-9]+$ ]] && awk -v u="$used_pct" 'BEGIN{exit !(u+0>0)}'; then
+                    total_bytes=$(awk -v e="$end" -v u="$used_pct" 'BEGIN{printf "%d", int((e+0)*100/(u+0))}')
                 fi
             fi
             [[ ! "$total_bytes" =~ ^[0-9]+$ ]] && total_bytes=""
