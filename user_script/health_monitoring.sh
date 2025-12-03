@@ -5673,8 +5673,12 @@ tbw_forecast_and_heavy_writers() {
             tbw_thresh=$(tbw_threshold_tb_for_device "$model" "$cap")
             local total_bytes="" remaining_bytes="" days_left=""
             if [[ -n "$tbw_thresh" ]]; then
-                local TB=$((1000*1000*1000*1000))
-                total_bytes=$(( tbw_thresh * TB ))
+                # Compute total_bytes using awk to avoid arithmetic errors on non-numeric inputs
+                if [[ "$tbw_thresh" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                    total_bytes=$(awk -v th="$tbw_thresh" 'BEGIN{printf "%d", int(th * 1000*1000*1000*1000)}')
+                else
+                    total_bytes=""
+                fi
             else
                 local used_pct=${CUR_ATTR["$dev|nvme_percent_used"]:-}
                 if [[ -n "$used_pct" && "$used_pct" =~ ^[0-9]+$ ]] && awk -v u="$used_pct" 'BEGIN{exit !(u+0>0)}'; then
@@ -5688,9 +5692,9 @@ tbw_forecast_and_heavy_writers() {
                 TBW_DAYS_LEFT[$dev]=$days_left
                 local status="OK"
                 if [[ -n "$days_left" ]]; then
-                    if (( $(awk -v dl="$days_left" -v c="$TBW_DAYS_CRIT" 'BEGIN{print (dl < c)}') )); then
+                    if awk -v dl="$days_left" -v c="$TBW_DAYS_CRIT" 'BEGIN{exit !(dl+0<c+0)}'; then
                         status="CRITICAL"
-                    elif (( $(awk -v dl="$days_left" -v w="$TBW_DAYS_WARN" 'BEGIN{print (dl < w)}') )); then
+                    elif awk -v dl="$days_left" -v w="$TBW_DAYS_WARN" 'BEGIN{exit !(dl+0<w+0)}'; then
                         status="WARNING"
                     fi
                 fi
