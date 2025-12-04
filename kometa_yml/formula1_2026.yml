@@ -42,6 +42,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season01.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-03-06"
+              content_rating: "PG-13"
+              summary: |-
+                    6-8 March 2026 Australian Grand Prix
+                    Held in Albert Park Circuit, Melbourne
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-03-06"
@@ -123,6 +131,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season02.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-03-13"
+              content_rating: "PG-13"
+              summary: |-
+                    13-15 March 2026 Chinese Grand Prix 
+                    Held in Shanghai International Circuit, Shanghai
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-03-13"
@@ -130,7 +146,7 @@ metadata:
               summary: |-
                     13-15 March 2026 Chinese Grand Prix 
                     Held in Shanghai International Circuit, Shanghai
-            2:
+            3:
               title: "Sprint Qualifying Session"
               sort_title: "Sprint Qualifying Session"
               originally_available: "2026-03-13"
@@ -138,7 +154,7 @@ metadata:
               summary: |-
                     13-15 March 2026 Chinese Grand Prix 
                     Held in Shanghai International Circuit, Shanghai
-            3:
+            4:
               title: "Pre-Sprint Buildup"
               sort_title: "Pre-Sprint Buildup"
               originally_available: "2026-03-14"
@@ -146,7 +162,7 @@ metadata:
               summary: |-
                     13-15 March 2026 Chinese Grand Prix 
                     Held in Shanghai International Circuit, Shanghai
-            4:
+            5:
               title: "Sprint Session"
               sort_title: "Sprint Session"
               originally_available: "2026-03-14"
@@ -154,7 +170,7 @@ metadata:
               summary: |-
                     13-15 March 2026 Chinese Grand Prix 
                     Held in Shanghai International Circuit, Shanghai
-            5:
+            6:
               title: "Post-Sprint Analysis"
               sort_title: "Post-Sprint Analysis"
               originally_available: "2026-03-14"
@@ -162,7 +178,7 @@ metadata:
               summary: |-
                     13-15 March 2026 Chinese Grand Prix 
                     Held in Shanghai International Circuit, Shanghai
-            8:
+            9:
               title: "Pre-Qualifying Buildup"
               sort_title: "Pre-Qualifying Buildup"
               originally_available: "2026-03-14"
@@ -170,7 +186,7 @@ metadata:
               summary: |-
                     13-15 March 2026 Chinese Grand Prix 
                     Held in Shanghai International Circuit, Shanghai
-            9:
+            10:
               title: "Qualifying Session"
               sort_title: "Qualifying Session"
               originally_available: "2026-03-14"
@@ -178,7 +194,7 @@ metadata:
               summary: |-
                     13-15 March 2026 Chinese Grand Prix 
                     Held in Shanghai International Circuit, Shanghai
-            10:
+            11:
               title: "Post-Qualifying Analysis"
               sort_title: "Post-Qualifying Analysis"
               originally_available: "2026-03-14"
@@ -186,7 +202,7 @@ metadata:
               summary: |-
                     13-15 March 2026 Chinese Grand Prix 
                     Held in Shanghai International Circuit, Shanghai
-            11:
+            12:
               title: "Pre-Race Buildup"
               sort_title: "Pre-Race Buildup"
               originally_available: "2026-03-14"
@@ -194,7 +210,7 @@ metadata:
               summary: |-
                     13-15 March 2026 Chinese Grand Prix 
                     Held in Shanghai International Circuit, Shanghai
-            12:
+            13:
               title: "Race Session"
               sort_title: "Race Session"
               originally_available: "2026-03-15"
@@ -202,7 +218,7 @@ metadata:
               summary: |-
                     13-15 March 2026 Chinese Grand Prix 
                     Held in Shanghai International Circuit, Shanghai
-            13:
+            14:
               title: "Post-Race Analysis"
               sort_title: "Post-Race Analysis"
               originally_available: "2026-03-14"
@@ -220,6 +236,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season03.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-03-27"
+              content_rating: "PG-13"
+              summary: |-
+                    27-29 March 2026 Japanese Grand Prix 
+                    Held in Suzuka Circuit, Suzuka
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-03-27"
@@ -301,6 +325,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season04.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-04-10"
+              content_rating: "PG-13"
+              summary: |-
+                    10-12 April 2026 Bahrain Grand Prix 
+                    Held in Bahrain International Circuit, Sakhir
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-04-10"
@@ -382,6 +414,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season05.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-04-17"
+              content_rating: "PG-13"
+              summary: |-
+                    17-19 April 2026 Saudi Arabian Grand Prix 
+                    Held in Jeddah Corniche Circuit, Jeddah
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-04-17"
@@ -463,6 +503,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season06.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-05-01"
+              content_rating: "PG-13"
+              summary: |- 
+                    1-3 May 2026 Miami Grand Prix 
+                    Held in Miami International Autodrome, Miami Gardens, Florida
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-05-01"
@@ -470,7 +518,7 @@ metadata:
               summary: |- 
                     1-3 May 2026 Miami Grand Prix 
                     Held in Miami International Autodrome, Miami Gardens, Florida
-            2:
+            3:
               title: "Sprint Qualifying Session"
               sort_title: "Sprint Qualifying Session"
               originally_available: "2026-05-01"
@@ -478,7 +526,7 @@ metadata:
               summary: |- 
                     1-3 May 2026 Miami Grand Prix 
                     Held in Miami International Autodrome, Miami Gardens, Florida
-            3:
+            4:
               title: "Pre-Sprint Buildup"
               sort_title: "Pre-Sprint Buildup"
               originally_available: "2026-05-02"
@@ -486,7 +534,7 @@ metadata:
               summary: |- 
                     1-3 May 2026 Miami Grand Prix 
                     Held in Miami International Autodrome, Miami Gardens, Florida
-            4:
+            5:
               title: "Sprint Session"
               sort_title: "Sprint Session"
               originally_available: "2026-05-02"
@@ -494,7 +542,7 @@ metadata:
               summary: |- 
                     1-3 May 2026 Miami Grand Prix 
                     Held in Miami International Autodrome, Miami Gardens, Florida
-            5:
+            6:
               title: "Post-Sprint Analysis"
               sort_title: "Post-Sprint Analysis"
               originally_available: "2026-05-02"
@@ -502,7 +550,7 @@ metadata:
               summary: |- 
                     1-3 May 2026 Miami Grand Prix 
                     Held in Miami International Autodrome, Miami Gardens, Florida
-            8:
+            9:
               title: "Pre-Qualifying Buildup"
               sort_title: "Pre-Qualifying Buildup"
               originally_available: "2026-05-02"
@@ -510,7 +558,7 @@ metadata:
               summary: |- 
                     1-3 May 2026 Miami Grand Prix 
                     Held in Miami International Autodrome, Miami Gardens, Florida
-            9:
+            10:
               title: "Qualifying Session"
               sort_title: "Qualifying Session"
               originally_available: "2026-05-02"
@@ -518,7 +566,7 @@ metadata:
               summary: |- 
                     1-3 May 2026 Miami Grand Prix 
                     Held in Miami International Autodrome, Miami Gardens, Florida
-            10:
+            11:
               title: "Post-Qualifying Analysis"
               sort_title: "Post-Qualifying Analysis"
               originally_available: "2026-05-02"
@@ -526,7 +574,7 @@ metadata:
               summary: |- 
                     1-3 May 2026 Miami Grand Prix 
                     Held in Miami International Autodrome, Miami Gardens, Florida
-            11:
+            12:
               title: "Pre-Race Buildup"
               sort_title: "Pre-Race Buildup"
               originally_available: "2026-05-02"
@@ -534,7 +582,7 @@ metadata:
               summary: |- 
                     1-3 May 2026 Miami Grand Prix 
                     Held in Miami International Autodrome, Miami Gardens, Florida
-            12:
+            13:
               title: "Race Session"
               sort_title: "Race Session"
               originally_available: "2026-05-03"
@@ -542,7 +590,7 @@ metadata:
               summary: |- 
                     1-3 May 2026 Miami Grand Prix 
                     Held in Miami International Autodrome, Miami Gardens, Florida
-            13:
+            14:
               title: "Post-Race Analysis"
               sort_title: "Post-Race Analysis"
               originally_available: "2026-05-02"
@@ -560,6 +608,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season07.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-05-22"
+              content_rating: "PG-13"
+              summary: |-
+                    22-24 May 2026 Canadian Grand Prix 
+                    Held in Circuit Gilles Villeneuve, Montreal
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-05-22"
@@ -567,7 +623,7 @@ metadata:
               summary: |-
                     22-24 May 2026 Canadian Grand Prix 
                     Held in Circuit Gilles Villeneuve, Montreal
-            2:
+            3:
               title: "Sprint Qualifying Session"
               sort_title: "Sprint Qualifying Session"
               originally_available: "2026-05-22"
@@ -575,7 +631,7 @@ metadata:
               summary: |-
                     22-24 May 2026 Canadian Grand Prix 
                     Held in Circuit Gilles Villeneuve, Montreal
-            3:
+            4:
               title: "Pre-Sprint Buildup"
               sort_title: "Pre-Sprint Buildup"
               originally_available: "2026-05-22"
@@ -583,7 +639,7 @@ metadata:
               summary: |-
                     22-24 May 2026 Canadian Grand Prix 
                     Held in Circuit Gilles Villeneuve, Montreal
-            4:
+            5:
               title: "Sprint Session"
               sort_title: "Sprint Session"
               originally_available: "2026-05-23"
@@ -591,7 +647,7 @@ metadata:
               summary: |-
                     22-24 May 2026 Canadian Grand Prix 
                     Held in Circuit Gilles Villeneuve, Montreal
-            5:
+            6:
               title: "Post-Sprint Analysis"
               sort_title: "Post-Sprint Analysis"
               originally_available: "2026-05-23"
@@ -599,7 +655,7 @@ metadata:
               summary: |-
                     22-24 May 2026 Canadian Grand Prix 
                     Held in Circuit Gilles Villeneuve, Montreal
-            8:
+            9:
               title: "Pre-Qualifying Buildup"
               sort_title: "Pre-Qualifying Buildup"
               originally_available: "2026-05-23"
@@ -607,7 +663,7 @@ metadata:
               summary: |-
                     22-24 May 2026 Canadian Grand Prix 
                     Held in Circuit Gilles Villeneuve, Montreal
-            9:
+            10:
               title: "Qualifying Session"
               sort_title: "Qualifying Session"
               originally_available: "2026-05-23"
@@ -615,7 +671,7 @@ metadata:
               summary: |-
                     22-24 May 2026 Canadian Grand Prix 
                     Held in Circuit Gilles Villeneuve, Montreal
-            10:
+            11:
               title: "Post-Qualifying Analysis"
               sort_title: "Post-Qualifying Analysis"
               originally_available: "2026-05-23"
@@ -623,15 +679,15 @@ metadata:
               summary: |-
                     22-24 May 2026 Canadian Grand Prix
                     Held in Circuit Gilles Villeneuve, Montreal
-            11:
+            12:
               title: "Pre-Race Buildup"
               sort_title: "Pre-Race Buildup"
               originally_available: "2026-05-23"
               content_rating: "PG-13"
               summary: |-
                     22-24 May 2026 Canadian Grand Prix
-                    Held in Circuit Gilles Villeneuve, Montreal            
-            12:
+                    Held in Circuit Gilles Villeneuve, Montreal
+            13:
               title: "Race Session"
               sort_title: "Race Session"
               originally_available: "2026-05-24"
@@ -639,7 +695,7 @@ metadata:
               summary: |-
                     22-24 May 2026 Canadian Grand Prix 
                     Held in Circuit Gilles Villeneuve, Montreal
-            13:
+            14:
               title: "Post-Race Analysis"
               sort_title: "Post-Race Analysis"
               originally_available: "2026-05-23"
@@ -657,6 +713,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season08.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-06-05"
+              content_rating: "PG-13"
+              summary: |-
+                    5-7 June 2026 Monaco Grand Prix
+                    Held in Circuit de Monaco, Monaco
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-06-05"
@@ -738,6 +802,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season09.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-06-12"
+              content_rating: "PG-13"
+              summary: |-
+                    12-14 June 2026 Barcelona-Catalunya Grand Prix 
+                    Held in Circuit de Barcelona-Catalunya, Montmeló
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-06-12"
@@ -819,6 +891,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season10.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-06-26"
+              content_rating: "PG-13"
+              summary: |-
+                    26-28 June 2026 Austrian Grand Prix
+                    Held in Red Bull Ring, Spielberg
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-06-26"
@@ -900,6 +980,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season11.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-07-03"
+              content_rating: "PG-13"
+              summary: |-
+                    3-5 July 2026 British Grand Prix 
+                    Held in Silverstone Circuit, Silverstone
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-07-03"
@@ -907,7 +995,7 @@ metadata:
               summary: |-
                     3-5 July 2026 British Grand Prix 
                     Held in Silverstone Circuit, Silverstone
-            2:
+            3:
               title: "Sprint Qualifying Session"
               sort_title: "Sprint Qualifying Session"
               originally_available: "2026-07-03"
@@ -915,7 +1003,7 @@ metadata:
               summary: |-
                     3-5 July 2026 British Grand Prix 
                     Held in Silverstone Circuit, Silverstone
-            3:
+            4:
               title: "Pre-Sprint Buildup"
               sort_title: "Pre-Sprint Buildup"
               originally_available: "2026-07-03"
@@ -923,7 +1011,7 @@ metadata:
               summary: |-
                     3-5 July 2026 British Grand Prix 
                     Held in Silverstone Circuit, Silverstone           
-            4:
+            5:
               title: "Sprint Session"
               sort_title: "Sprint Session"
               originally_available: "2026-07-04"
@@ -931,7 +1019,7 @@ metadata:
               summary: |-
                     3-5 July 2026 British Grand Prix 
                     Held in Silverstone Circuit, Silverstone
-            5:
+            6:
               title: "Post-Sprint Analysis"
               sort_title: "Post-Sprint Analysis"
               originally_available: "2026-07-04"
@@ -939,7 +1027,7 @@ metadata:
               summary: |-
                     3-5 July 2026 British Grand Prix 
                     Held in Silverstone Circuit, Silverstone
-            8:
+            9:
               title: "Pre-Qualifying Buildup"
               sort_title: "Pre-Qualifying Buildup"
               originally_available: "2026-07-04"
@@ -947,7 +1035,7 @@ metadata:
               summary: |-
                     3-5 July 2026 British Grand Prix 
                     Held in Silverstone Circuit, Silverstone
-            9:
+            10:
               title: "Qualifying Session"
               sort_title: "Qualifying Session"
               originally_available: "2026-07-04"
@@ -955,7 +1043,7 @@ metadata:
               summary: |-
                     3-5 July 2026 British Grand Prix 
                     Held in Silverstone Circuit, Silverstone
-            10:
+            11:
               title: "Post-Qualifying Analysis"
               sort_title: "Post-Qualifying Analysis"
               originally_available: "2026-07-04"
@@ -963,7 +1051,7 @@ metadata:
               summary: |-
                     3-5 July 2026 British Grand Prix 
                     Held in Silverstone Circuit, Silverstone
-            11:
+            12:
               title: "Pre-Race Buildup"
               sort_title: "Pre-Race Buildup"
               originally_available: "2026-07-04"
@@ -971,7 +1059,7 @@ metadata:
               summary: |-
                     3-5 July 2026 British Grand Prix 
                     Held in Silverstone Circuit, Silverstone
-            12:
+            13:
               title: "Race Session"
               sort_title: "Race Session"
               originally_available: "2026-07-05"
@@ -979,7 +1067,7 @@ metadata:
               summary: |-
                     3-5 July 2026 British Grand Prix 
                     Held in Silverstone Circuit, Silverstone
-            13:
+            14:
               title: "Post-Race Analysis"
               sort_title: "Post-Race Analysis"
               originally_available: "2026-07-04"
@@ -997,11 +1085,21 @@ metadata:
         file_poster: config/assets/formula1/2026/season12.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-07-17"
+              content_rating: "PG-13"
+              summary: |-
+                    17-19 July 2026 Belgian Grand Prix
+                    Held in Circuit de Spa-Francorchamps, Stavelot
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-07-17"
               content_rating: "PG-13"
               summary: |-
+                    17-19 July 2026 Belgian Grand Prix
+                    Held in Circuit de Spa-Francorchamps, Stavelot
             6:
               title: "Free Practice 2"
               sort_title: "Free Practice 2"
@@ -1076,6 +1174,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season13.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-07-24"
+              content_rating: "PG-13"
+              summary: |-
+                    24-26 July 2026 Hungarian Grand Prix
+                    Held in Hungaroring, Mogyoród
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-07-24"
@@ -1125,6 +1231,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season14.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-08-21"
+              content_rating: "PG-13"
+              summary: |-
+                    21-23 August 2026 Dutch Grand Prix
+                    Held in Circuit Zandvoort, Zandvoort
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-08-21"
@@ -1132,7 +1246,7 @@ metadata:
               summary: |-
                     21-23 August 2026 Dutch Grand Prix
                     Held in Circuit Zandvoort, Zandvoort
-            2:
+            3:
               title: "Sprint Qualifying Session"
               sort_title: "Sprint Qualifying Session"
               originally_available: "2026-08-21"
@@ -1140,7 +1254,7 @@ metadata:
               summary: |-
                     21-23 August 2026 Dutch Grand Prix
                     Held in Circuit Zandvoort, Zandvoort
-            3:
+            4:
               title: "Pre-Sprint Buildup"
               sort_title: "Pre-Sprint Buildup"
               originally_available: "2026-08-21"
@@ -1148,7 +1262,7 @@ metadata:
               summary: |-
                     21-23 August 2026 Dutch Grand Prix
                     Held in Circuit Zandvoort, Zandvoort
-            4:
+            5:
               title: "Sprint Session"
               sort_title: "Sprint Session"
               originally_available: "2026-08-22"
@@ -1156,7 +1270,7 @@ metadata:
               summary: |-
                     21-23 August 2026 Dutch Grand Prix
                     Held in Circuit Zandvoort, Zandvoort
-            5:
+            6:
               title: "Post-Sprint Analysis"
               sort_title: "Post-Sprint Analysis"
               originally_available: "2026-08-22"
@@ -1164,7 +1278,7 @@ metadata:
               summary: |-
                     21-23 August 2026 Dutch Grand Prix
                     Held in Circuit Zandvoort, Zandvoort
-            8:
+            9:
               title: "Pre-Qualifying Buildup"
               sort_title: "Pre-Qualifying Buildup"
               originally_available: "2026-08-22"
@@ -1172,7 +1286,7 @@ metadata:
               summary: |-
                     21-23 August 2026 Dutch Grand Prix
                     Held in Circuit Zandvoort, Zandvoort
-            9:
+            10:
               title: "Qualifying Session"
               sort_title: "Qualifying Session"
               originally_available: "2026-08-22"
@@ -1180,7 +1294,7 @@ metadata:
               summary: |-
                     21-23 August 2026 Dutch Grand Prix
                     Held in Circuit Zandvoort, Zandvoort
-            10:
+            11:
               title: "Post-Qualifying Analysis"
               sort_title: "Post-Qualifying Analysis"
               originally_available: "2026-08-22"
@@ -1188,7 +1302,7 @@ metadata:
               summary: |-
                     21-23 August 2026 Dutch Grand Prix
                     Held in Circuit Zandvoort, Zandvoort
-            11:
+            12:
               title: "Pre-Race Buildup"
               sort_title: "Pre-Race Buildup"
               originally_available: "2026-08-22"
@@ -1196,7 +1310,7 @@ metadata:
               summary: |-
                     21-23 August 2026 Dutch Grand Prix
                     Held in Circuit Zandvoort, Zandvoort
-            12:
+            13:
               title: "Race Session"
               sort_title: "Race Session"
               originally_available: "2026-08-23"
@@ -1204,7 +1318,7 @@ metadata:
               summary: |-
                     21-23 August 2026 Dutch Grand Prix
                     Held in Circuit Zandvoort, Zandvoort
-            13:
+            14:
               title: "Post-Race Analysis"
               sort_title: "Post-Race Analysis"
               originally_available: "2026-08-22"
@@ -1222,6 +1336,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season15.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-09-04"
+              content_rating: "PG-13"
+              summary: |-
+                    4-6 September 2026 Italian Grand Prix
+                    Held in Monza Circuit, Monza
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-09-04"
@@ -1303,6 +1425,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season16.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-09-11"
+              content_rating: "PG-13"
+              summary: |-
+                    11-13 September 2026 Spanish Grand Prix
+                    Held in Madring Street Circuit, Madrid
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-09-11"
@@ -1384,6 +1514,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season17.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-09-24"
+              content_rating: "PG-13"
+              summary: |-
+                    24-26 September 2026 Azerbaijan Grand Prix
+                    Held in Baku City Circuit, Baku
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-09-24"
@@ -1465,6 +1603,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season18.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-10-09"
+              content_rating: "PG-13"
+              summary: |-
+                    9-11 October 2026 Singapore Grand Prix
+                    Held in Marina Bay Street Circuit, Singapore
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-10-09"
@@ -1472,7 +1618,7 @@ metadata:
               summary: |-
                     9-11 October 2026 Singapore Grand Prix
                     Held in Marina Bay Street Circuit, Singapore
-            2:
+            3:
               title: "Sprint Qualifying Session"
               sort_title: "Sprint Qualifying Session"
               originally_available: "2026-10-09"
@@ -1480,7 +1626,7 @@ metadata:
               summary: |-
                     9-11 October 2026 Singapore Grand Prix
                     Held in Marina Bay Street Circuit, Singapore
-            3:
+            4:
               title: "Pre-Sprint Buildup"
               sort_title: "Pre-Sprint Buildup"
               originally_available: "2026-10-09"
@@ -1488,7 +1634,7 @@ metadata:
               summary: |-
                     9-11 October 2026 Singapore Grand Prix
                     Held in Marina Bay Street Circuit, Singapore           
-            4:
+            5:
               title: "Sprint Session"
               sort_title: "Sprint Session"
               originally_available: "2026-10-10"
@@ -1496,7 +1642,7 @@ metadata:
               summary: |-
                     9-11 October 2026 Singapore Grand Prix
                     Held in Marina Bay Street Circuit, Singapore
-            5:
+            6:
               title: "Post-Sprint Analysis"
               sort_title: "Post-Sprint Analysis"
               originally_available: "2026-10-10"
@@ -1504,7 +1650,7 @@ metadata:
               summary: |-
                     9-11 October 2026 Singapore Grand Prix
                     Held in Marina Bay Street Circuit, Singapore
-            8:
+            9:
               title: "Pre-Qualifying Buildup"
               sort_title: "Pre-Qualifying Buildup"
               originally_available: "2026-10-10"
@@ -1512,7 +1658,7 @@ metadata:
               summary: |-
                     9-11 October 2026 Singapore Grand Prix
                     Held in Marina Bay Street Circuit, Singapore
-            9:
+            10:
               title: "Qualifying Session"
               sort_title: "Qualifying Session"
               originally_available: "2026-10-10"
@@ -1520,7 +1666,7 @@ metadata:
               summary: |-
                     9-11 October 2026 Singapore Grand Prix
                     Held in Marina Bay Street Circuit, Singapore
-            10:
+            11:
               title: "Post-Qualifying Analysis"
               sort_title: "Post-Qualifying Analysis"
               originally_available: "2026-10-10"
@@ -1528,7 +1674,7 @@ metadata:
               summary: |-
                     9-11 October 2026 Singapore Grand Prix
                     Held in Marina Bay Street Circuit, Singapore
-            11:
+            12:
               title: "Pre-Race Buildup"
               sort_title: "Pre-Race Buildup"
               originally_available: "2026-10-10"
@@ -1536,7 +1682,7 @@ metadata:
               summary: |-
                     9-11 October 2026 Singapore Grand Prix
                     Held in Marina Bay Street Circuit, Singapore
-            12:
+            13:
               title: "Race Session"
               sort_title: "Race Session"
               originally_available: "2026-10-11"
@@ -1544,7 +1690,7 @@ metadata:
               summary: |-
                     9-11 October 2026 Singapore Grand Prix
                     Held in Marina Bay Street Circuit, Singapore
-            13:
+            14:
                title: "Post-Race Analysis"
                sort_title: "Post-Race Analysis"
                originally_available: "2026-10-10"
@@ -1562,6 +1708,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season19.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-10-23"
+              content_rating: "PG-13"
+              summary: |-
+                    23-25 October 2026 United States Grand Prix
+                    Held in Circuit of the Americas, Austin, Texas
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-10-23"
@@ -1643,6 +1797,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season20.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-10-30"
+              content_rating: "PG-13"
+              summary: |-
+                    30 Oct-1 Nov 2026 Mexico City Grand Prix
+                    Held in Autódromo Hermanos Rodríguez, Mexico City
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-10-30"
@@ -1724,6 +1886,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season21.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-11-06"
+              content_rating: "PG-13"
+              summary: |-
+                    6-8 November 2026 São Paulo Grand Prix
+                    Held in Interlagos Circuit, São Paulo
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-11-06"
@@ -1805,6 +1975,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season22.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-11-19"
+              content_rating: "PG-13"
+              summary: |-
+                    19-21 November 2026 Las Vegas Grand Prix
+                    Held in Las Vegas Strip Circuit, Paradise, Nevada
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-11-19"
@@ -1886,6 +2064,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season23.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-11-27"
+              content_rating: "PG-13"
+              summary: |-
+                    27-29 November 2026 Qatar Grand Prix
+                    Held in Lusail International Circuit, Lusail
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-11-27"
@@ -1967,6 +2153,14 @@ metadata:
         file_poster: config/assets/formula1/2026/season24.jpg
         episodes:
             1:
+              title: "Weekend Warm-Up"
+              sort_title: "Weekend Warm-Up"
+              originally_available: "2026-12-04"
+              content_rating: "PG-13"
+              summary: |-
+                    4-6 December 2026 Abu Dhabi Grand Prix
+                    Held in Yas Marina Circuit, Abu Dhabi
+            2:
               title: "Free Practice 1"
               sort_title: "Free Practice 1"
               originally_available: "2026-12-04"

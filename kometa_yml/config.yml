@@ -240,16 +240,14 @@ settings:
   cache: true
   cache_expiration: 2           # Cache files expiration in days
   asset_directory:              # config/assets
-  - config/assets/movie
-  - config/assets/tv
   - config/assets/collection
   asset_folders: true
   asset_depth: 1
-  create_asset_folders: true
+  create_asset_folders: false
   prioritize_assets: true
   dimensional_asset_rename: false
   download_url_assets: true
-  show_missing_assets: true
+  show_missing_assets: false
   show_missing_season_assets: false
   show_missing_episode_assets: false
   show_asset_not_needed: true
@@ -268,12 +266,12 @@ settings:
   show_options: false
   show_missing: false
   save_report: true
-  playlist_report: true
+  playlist_report: false
   tvdb_language: eng
   ignore_ids:
   ignore_imdb_ids:
   item_refresh_delay: 0
-  playlist_sync_to_user: all
+  playlist_sync_to_user: 
   playlist_exclude_users:
   verify_ssl: true
   custom_repo:
