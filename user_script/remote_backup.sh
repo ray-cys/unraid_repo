@@ -311,8 +311,7 @@ preflight_labels() {
       local latest
       latest=$(find "$dest_m" -maxdepth 1 -type f -name "${safe_label}_manifest_*.txt" -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1{print $2}' || true)
       if [ -z "$latest" ] || [ ! -f "$latest" ]; then
-        log "No manifest found for $label; creating baseline manifest"
-        write_manifest "$label" "${SRCS_ARRAY[$idx]}"
+        log "No manifest found for $label; estimating using total size (first run)"
       else
         log "Found existing manifest for $label: $latest"
       fi
@@ -885,7 +884,7 @@ compose_notification() {
       if [ "$transferred" -eq 0 ] && [ "$files" -eq 0 ] && [ "$deletes" -eq 0 ]; then
         detailed_body+="$lbl: $human_total total, no changes, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
       else
-        detailed_body+="$lbl: $human_total total, $human_est est_changed, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
+        detailed_body+="$lbl: $human_total total, $human_est changed, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
       fi
       condensed_parts+=("$lbl: $human_transferred (${percent_total}%)")
     done
