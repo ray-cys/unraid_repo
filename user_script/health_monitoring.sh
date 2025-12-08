@@ -1031,13 +1031,22 @@ parity_state() {
             if [[ -n "$sb" ]]; then
                 case "$sb" in 1|yes|true) PARITY_VALID_FLAG="1";; 0|no|false) PARITY_VALID_FLAG="0";; esac
             else
-                if [[ -n "$act" && "$act" != "idle" ]]; then
+                # Derive validity without sbclean: treat as active only if metrics indicate progress
+                local _act_lc _is_active=0
+                _act_lc=$(printf "%s" "$act" | awk '{print tolower($1)}')
+                if [[ -n "$_act_lc" && "$_act_lc" != "idle" ]]; then
+                    if [[ -n "$spk" && "$spk" =~ ^[0-9]+$ && $((10#$spk)) -gt 0 ]]; then _is_active=1
+                    elif [[ -n "$rem" && "$rem" =~ ^[0-9]+$ && $((10#$rem)) -gt 0 ]]; then _is_active=1
+                    elif [[ -n "$pos" && -n "$size" && "$pos" =~ ^[0-9]+$ && "$size" =~ ^[0-9]+$ && $((10#$pos)) -gt 0 && $((10#$pos)) -lt $((10#$size)) ]]; then _is_active=1
+                    fi
+                fi
+                if (( _is_active == 1 )); then
                     PARITY_VALID_FLAG="0"
                 else
                     local _errs_ok=""
-                    if [[ -n "$errs" && "$errs" =~ ^[0-9]+$ && $errs -eq 0 ]]; then _errs_ok=1; fi
+                    if [[ -n "$errs" && "$errs" =~ ^[0-9]+$ && $((10#$errs)) -eq 0 ]]; then _errs_ok=1; fi
                     local _completed=""
-                    if [[ -n "$pos" && -n "$size" && "$pos" =~ ^[0-9]+$ && "$size" =~ ^[0-9]+$ && $pos -eq $size ]]; then _completed=1; fi
+                    if [[ -n "$pos" && -n "$size" && "$pos" =~ ^[0-9]+$ && "$size" =~ ^[0-9]+$ && $((10#$pos)) -eq $((10#$size)) ]]; then _completed=1; fi
                     if [[ "$st" == "started" || -n "$_errs_ok" || -n "$_completed" ]]; then
                         PARITY_VALID_FLAG="1"
                     else
@@ -1120,24 +1129,28 @@ discover_parity_and_status() {
     local clean_flag="${PARITY_VALID_FLAG:-}" 
     PARITY_CLEAN_FLAG="$clean_flag"
 
-    # Derive high-level status line based on validity flag (with labels if present)
+    # Derive high-level status line based on validity flag and active operation
+    local is_active=0
     if [[ -n "$clean_flag" ]]; then
-        local action_word="${PARITY_ACTION:-}"
-        action_word=$(printf "%s" "$action_word" | awk '{print tolower($1)}')
-        if [[ "$action_word" != "" && "$action_word" != "idle" ]]; then
-            # When an operation is active, show in-progress status rather than invalid/valid labels
-            local corr_label
-            if [[ "${PARITY_CORR:-}" == "1" ]]; then corr_label="correcting"; else corr_label="non-correcting"; fi
-            PARITY_STATUS_LINE=$([[ -n "$labels_join" ]] && echo "Parity ($labels_join): in progress (${corr_label})" || echo "Parity: in progress (${corr_label})")
+        local _act_lc="${PARITY_ACTION:-}"
+        _act_lc=$(printf "%s" "$_act_lc" | awk '{print tolower($1)}')
+        # Determine true activity: action non-idle AND (pos<size OR rem>0 OR speed>0)
+        local _pos="${PARITY_POS:-}" _size="${PARITY_SIZE:-}" _rem="${PARITY_REM:-}" _spk="${PARITY_SPEED_K:-}"
+        if [[ -n "$_act_lc" && "$_act_lc" != "idle" ]]; then
+            if [[ "$_spk" =~ ^[0-9]+$ && $((10#$_spk)) -gt 0 ]]; then is_active=1
+            elif [[ "$_rem" =~ ^[0-9]+$ && $((10#$_rem)) -gt 0 ]]; then is_active=1
+            elif [[ "$_pos" =~ ^[0-9]+$ && "$_size" =~ ^[0-9]+$ && $((10#$_pos)) -gt 0 && $((10#$_pos)) -lt $((10#$_size)) ]]; then is_active=1
+            fi
+        fi
+        if (( is_active == 1 )); then
+            PARITY_STATUS_LINE=$([[ -n "$labels_join" ]] && echo "Parity ($labels_join):" || echo "Parity:")
         elif [[ "$clean_flag" == "1" ]]; then
             PARITY_STATUS_LINE=$([[ -n "$labels_join" ]] && echo "Parity ($labels_join): Valid" || echo "Parity: Valid")
         else
             PARITY_STATUS_LINE=$([[ -n "$labels_join" ]] && echo "Parity ($labels_join): Invalid (sync required)" || echo "Parity: Invalid (sync required)")
-            # Only alert if no parity operation is currently running (avoid post-check transient)
             record_alert warning "Parity Status" "Parity invalid (sync required)"
         fi
     else
-        # Unknown parity state (no parity devices configured)
         PARITY_STATUS_LINE="Parity: Unknown"
     fi
 
@@ -1150,12 +1163,12 @@ discover_parity_and_status() {
     if [[ -n "$pos" && -n "$size" ]]; then
         pct=$(awk -v p="$pos" -v s="$size" 'BEGIN{ if (s>0) printf "%.1f", (p/s)*100; }')
     fi
-    # Consider paused if action is non-idle but reported speed is 0 and pos<size
-    if [[ -n "$action_word" && "$action_word" != "idle" ]]; then
+    # Consider paused if action is active but reported speed is 0 and pos<size
+    if (( is_active == 1 )); then
         if [[ -n "$speed_k" && "$speed_k" =~ ^[0-9]+$ && "$speed_k" -eq 0 && -n "$pos" && -n "$size" && "$size" =~ ^[0-9]+$ && "$pos" =~ ^[0-9]+$ && $pos -lt $size ]]; then
             paused=" (paused)"
         fi
-        PARITY_STATUS_LINE+=" — ${action_word} in progress${paused} (${corr_label})"
+        PARITY_STATUS_LINE+=" ${action_word} in progress${paused} (${corr_label})"
         [[ -n "$pct" ]] && PARITY_STATUS_LINE+=", ~${pct}%"
         PARITY_DETAILS_SECTION="Parity Details:\n"
         PARITY_DETAILS_SECTION+=" - Action: ${action_word}${paused} (${corr_label})\n"
@@ -1207,7 +1220,7 @@ discover_parity_and_status() {
         # Persist current position snapshot for next run speed/ETA calculation
         if [[ -n "$pos" ]]; then echo "$pos $curr_ts" > "$progress_file" 2>/dev/null || true; fi
         # Parity sync error alerts. Use thresholds if defined.
-        if [[ -n "$errs" && "$errs" =~ ^[0-9]+$ && "$action_word" != "idle" ]]; then
+        if [[ -n "$errs" && "$errs" =~ ^[0-9]+$ ]] && (( is_active == 1 )); then
             local perr_warn=${PARITY_SYNC_ERR_WARN:-1} perr_crit=${PARITY_SYNC_ERR_CRIT:-10}
             if (( errs >= perr_crit )); then
                 record_alert critical "Parity Sync Errors" "Parity operation has ${errs} sync errors; investigate disks (SMART long tests), cabling, and consider corrective check."
@@ -4041,11 +4054,18 @@ build_health_alerts() {
         fi
     fi
     # If parity operation is active (non-idle), prefer in-progress guidance and suppress invalid
-    local _act_lc=""
+    local _act_lc="" _pos_cf="${PARITY_POS:-}" _size_cf="${PARITY_SIZE:-}" _rem_cf="${PARITY_REM:-}" _spk_cf="${PARITY_SPEED_K:-}"
     if [[ -n "${PARITY_ACTION:-}" ]]; then _act_lc=$(printf "%s" "${PARITY_ACTION}" | awk '{print tolower($1)}'); fi
     if [[ -n "${_act_lc}" && "${_act_lc}" != "idle" ]]; then
-        local _corr_lbl; _corr_lbl=$([[ "${PARITY_CORR:-}" == "1" ]] && echo "correcting" || echo "non-correcting")
-        rec+=" - Parity: in progress (${_corr_lbl}); capacity forecast and write metrics may be skewed; defer interpretation and re-check after completion.\n"
+        local _active_cf=0
+        if [[ "$_spk_cf" =~ ^[0-9]+$ && $((10#$_spk_cf)) -gt 0 ]]; then _active_cf=1
+        elif [[ "$_rem_cf" =~ ^[0-9]+$ && $((10#$_rem_cf)) -gt 0 ]]; then _active_cf=1
+        elif [[ "$_pos_cf" =~ ^[0-9]+$ && "$_size_cf" =~ ^[0-9]+$ && $((10#$_pos_cf)) -gt 0 && $((10#$_pos_cf)) -lt $((10#$_size_cf)) ]]; then _active_cf=1
+        fi
+        if (( _active_cf == 1 )); then
+            local _corr_lbl; _corr_lbl=$([[ "${PARITY_CORR:-}" == "1" ]] && echo "correcting" || echo "non-correcting")
+            rec+=" - Parity: in progress (${_corr_lbl}); capacity forecast and write metrics may be skewed; defer interpretation and re-check after completion.\n"
+        fi
     else
         if [[ "${PARITY_CLEAN_FLAG:-1}" == "0" ]]; then
             rec+=" - Parity: invalid; run non-correcting parity check first (investigate recent SMART pending/reallocated/uncorrectable deltas), then correcting if errors found.\n"
@@ -4290,12 +4310,13 @@ build_trend_section() {
         declare -A TT_MIN TT_MAX TT_SUM TT_CNT TT_FIRST TT_LAST TT_FIRST_TS TT_LAST_TS
         while read -r line; do
             [[ -z "$line" ]] && continue
-            local ts dev tmp crit
-            ts=$(awk '{print $1}' <<<"$line")
+            local dt dev tmp crit ts
+            dt=$(awk '{print $1}' <<<"$line")
             dev=$(awk '{print $2}' <<<"$line")
             tmp=$(awk '{print $3}' <<<"$line")
             crit=$(awk '{print $4}' <<<"$line")
-            [[ -z "$ts" || -z "$dev" || -z "$tmp" ]] && continue
+            [[ -z "$dt" || -z "$dev" || -z "$tmp" ]] && continue
+            ts=$(date -d "$dt" +%s 2>/dev/null || echo 0)
             (( ts >= cut_ts )) || continue
             [[ "$tmp" =~ ^[0-9]+$ ]] || continue
             if [[ -z "${TT_MIN[$dev]}" || "${TT_MIN[$dev]}" -gt "$tmp" ]]; then TT_MIN[$dev]="$tmp"; fi
@@ -4856,12 +4877,16 @@ build_trend_section() {
             else
                 _cf_p="pools ${POOL_DAYS_TO_THRESHOLD:-N/A}d→${THRESHOLD}% (${POOL_GROWTH_STR:-N/A}/d)"
             fi
-            # Annotate CF when parity is in progress to indicate potential skew
+            # Annotate CF only when parity is truly in progress to indicate potential skew
             if [[ -n "${PARITY_ACTION:-}" ]]; then
-                local _act
+                local _act _pos _size _rem _spk
                 _act=$(printf "%s" "${PARITY_ACTION}" | awk '{print tolower($1)}')
-                if [[ "${_act}" != "idle" ]]; then
-                    _cf_suffix=" (parity in progress; forecast may be skewed)"
+                _pos="${PARITY_POS:-}"; _size="${PARITY_SIZE:-}"; _rem="${PARITY_REM:-}"; _spk="${PARITY_SPEED_K:-}"
+                if [[ -n "$_act" && "$_act" != "idle" ]]; then
+                    if [[ "$_spk" =~ ^[0-9]+$ && $((10#$_spk)) -gt 0 ]]; then _cf_suffix=" (parity in progress; forecast may be skewed)"
+                    elif [[ "$_rem" =~ ^[0-9]+$ && $((10#$_rem)) -gt 0 ]]; then _cf_suffix=" (parity in progress; forecast may be skewed)"
+                    elif [[ "$_pos" =~ ^[0-9]+$ && "$_size" =~ ^[0-9]+$ && $((10#$_pos)) -gt 0 && $((10#$_pos)) -lt $((10#$_size)) ]]; then _cf_suffix=" (parity in progress; forecast may be skewed)"
+                    fi
                 fi
             fi
             _add_line "CF" "${_cf_a}; ${_cf_p}${_cf_suffix}"
