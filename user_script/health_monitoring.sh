@@ -1031,9 +1031,19 @@ parity_state() {
             if [[ -n "$sb" ]]; then
                 case "$sb" in 1|yes|true) PARITY_VALID_FLAG="1";; 0|no|false) PARITY_VALID_FLAG="0";; esac
             else
-                if [[ -n "$act" && "$act" != "idle" ]]; then PARITY_VALID_FLAG="0"
-                elif [[ "$st" == "started" ]]; then PARITY_VALID_FLAG="1"
-                else PARITY_VALID_FLAG=""; fi
+                if [[ -n "$act" && "$act" != "idle" ]]; then
+                    PARITY_VALID_FLAG="0"
+                else
+                    local _errs_ok=""
+                    if [[ -n "$errs" && "$errs" =~ ^[0-9]+$ && $errs -eq 0 ]]; then _errs_ok=1; fi
+                    local _completed=""
+                    if [[ -n "$pos" && -n "$size" && "$pos" =~ ^[0-9]+$ && "$size" =~ ^[0-9]+$ && $pos -eq $size ]]; then _completed=1; fi
+                    if [[ "$st" == "started" || -n "$_errs_ok" || -n "$_completed" ]]; then
+                        PARITY_VALID_FLAG="1"
+                    else
+                        PARITY_VALID_FLAG=""
+                    fi
+                fi
             fi
             PARITY_ACTION="$act"
             PARITY_CORR="$corr"
@@ -1112,14 +1122,19 @@ discover_parity_and_status() {
 
     # Derive high-level status line based on validity flag (with labels if present)
     if [[ -n "$clean_flag" ]]; then
-        if [[ "$clean_flag" == "1" ]]; then
+        local action_word="${PARITY_ACTION:-}"
+        action_word=$(printf "%s" "$action_word" | awk '{print tolower($1)}')
+        if [[ "$action_word" != "" && "$action_word" != "idle" ]]; then
+            # When an operation is active, show in-progress status rather than invalid/valid labels
+            local corr_label
+            if [[ "${PARITY_CORR:-}" == "1" ]]; then corr_label="correcting"; else corr_label="non-correcting"; fi
+            PARITY_STATUS_LINE=$([[ -n "$labels_join" ]] && echo "Parity ($labels_join): in progress (${corr_label})" || echo "Parity: in progress (${corr_label})")
+        elif [[ "$clean_flag" == "1" ]]; then
             PARITY_STATUS_LINE=$([[ -n "$labels_join" ]] && echo "Parity ($labels_join): Valid" || echo "Parity: Valid")
         else
             PARITY_STATUS_LINE=$([[ -n "$labels_join" ]] && echo "Parity ($labels_join): Invalid (sync required)" || echo "Parity: Invalid (sync required)")
             # Only alert if no parity operation is currently running (avoid post-check transient)
-            if [[ -z "${PARITY_ACTION:-}" || "${PARITY_ACTION,,}" == "idle" ]]; then
-                record_alert warning "Parity Status" "Parity invalid (sync required)"
-            fi
+            record_alert warning "Parity Status" "Parity invalid (sync required)"
         fi
     else
         # Unknown parity state (no parity devices configured)
@@ -5354,7 +5369,12 @@ build_disk_health_summary() {
     add_line "Critical" "$crit_count"
     add_line "Warning" "$warn_count"
     local parity_invalid=0
-    if [[ "${PARITY_CLEAN_FLAG:-}" == "0" ]]; then parity_invalid=1; fi
+    # Only mark invalid when array is idle; suppress during active parity operations
+    if [[ "${PARITY_CLEAN_FLAG:-}" == "0" ]]; then
+        if [[ -z "${PARITY_ACTION:-}" || "${PARITY_ACTION,,}" == "idle" ]]; then
+            parity_invalid=1
+        fi
+    fi
     add_line "Parity invalid" "$parity_invalid"
     add_line "Pending sectors" "$pending_count"
     add_line "Uncorrectable errors" "$uncorrect_count"
