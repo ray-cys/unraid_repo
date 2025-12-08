@@ -1116,7 +1116,10 @@ discover_parity_and_status() {
             PARITY_STATUS_LINE=$([[ -n "$labels_join" ]] && echo "Parity ($labels_join): Valid" || echo "Parity: Valid")
         else
             PARITY_STATUS_LINE=$([[ -n "$labels_join" ]] && echo "Parity ($labels_join): Invalid (sync required)" || echo "Parity: Invalid (sync required)")
-            record_alert warning "Parity Status" "Parity invalid (sync required)"
+            # Only alert if no parity operation is currently running (avoid post-check transient)
+            if [[ -z "${PARITY_ACTION:-}" || "${PARITY_ACTION,,}" == "idle" ]]; then
+                record_alert warning "Parity Status" "Parity invalid (sync required)"
+            fi
         fi
     else
         # Unknown parity state (no parity devices configured)
@@ -4305,7 +4308,7 @@ build_trend_section() {
                 fi
             fi
             if (( TEMP_RATE_ALERT_ENABLED == 1 )) && [[ -n "$rate" && "$days" != "0.00" ]]; then
-                if (( ${days%.*} >= TEMP_RATE_MIN_SPAN_DAYS )); then
+                if (( 10#${days%.*} >= TEMP_RATE_MIN_SPAN_DAYS )); then
                     local rate_int
                     rate_int="${rate%.*}"
                     if (( rate_int >= TEMP_RATE_CRIT_C_PER_DAY )); then
@@ -4423,8 +4426,8 @@ build_trend_section() {
                                 show_attr=1
                                 case "$a" in
                                     nvme_percent_used) wear_delta="$delta" ;;
-                                    unsafe_shutdowns) if [[ $delta =~ ^[0-9]+$ ]] && (( ${delta%.*} > 0 && ${delta%.*} < ${UNSAFE_SDWN_DELTA_WARN:-999999} )); then unsafe_low=1; fi ;;
-                                    pcie_corr) if [[ $delta =~ ^[0-9]+$ ]] && (( ${delta%.*} > 0 && ${delta%.*} < ${NVME_PCIE_CORR_DELTA_WARN:-999999} )); then pcie_corr_low_flag=1; fi ;;
+                                    unsafe_shutdowns) if [[ $delta =~ ^[0-9]+$ ]] && (( 10#${delta%.*} > 0 && 10#${delta%.*} < ${UNSAFE_SDWN_DELTA_WARN:-999999} )); then unsafe_low=1; fi ;;
+                                    pcie_corr) if [[ $delta =~ ^[0-9]+$ ]] && (( 10#${delta%.*} > 0 && 10#${delta%.*} < ${NVME_PCIE_CORR_DELTA_WARN:-999999} )); then pcie_corr_low_flag=1; fi ;;
                                     media_errors) if [[ $delta =~ ^[0-9]+(\.[0-9]+)?$ && ! $delta =~ ^0+(\.0+)?$ ]]; then media_growth_flag=1; fi ;;
                                     therm_t1) if [[ $delta =~ ^[0-9]+(\.[0-9]+)?$ && ! $delta =~ ^0+(\.0+)?$ ]]; then therm_warn=1; fi ;;
                                     therm_t2) if [[ $delta =~ ^[0-9]+(\.[0-9]+)?$ && ! $delta =~ ^0+(\.0+)?$ ]]; then therm_crit=1; fi ;;
@@ -4440,7 +4443,7 @@ build_trend_section() {
                     local base tag model_suffix disk codes="" score=0
                     disk="$dev"; base="$(base_device "$disk")"; tag="$(basename "$base")"; model_suffix="$(model_suffix_for "$base")"
                     (( hv_writer_flag )) && { codes+="HVW "; ((score++)); }
-                    if [[ -n "$wear_delta" ]] && (( ${wear_delta%.*} >= 1 )); then
+                    if [[ -n "$wear_delta" ]] && (( 10#${wear_delta%.*} >= 1 )); then
                         local current_wear="${CUR_ATTR[$disk|nvme_percent_used]:-0}"
                         if [[ $current_wear =~ ^[0-9]+$ ]] && (( current_wear < NVME_PERCENT_USED_WARN )); then
                             codes+="W+${wear_delta}% "; ((score++))
@@ -4451,8 +4454,8 @@ build_trend_section() {
                     (( media_growth_flag )) && { codes+="MEDIA "; ((score++)); }
                     (( therm_warn )) && { codes+="T1 "; ((score++)); }
                     (( therm_crit )) && { codes+="T2 "; ((score++)); }
-                    if [[ -n "$warn_temp_delta" ]] && (( ${warn_temp_delta%.*} > 0 )); then codes+="WT+${warn_temp_delta}s "; ((score++)); fi
-                    if [[ -n "$crit_temp_delta" ]] && (( ${crit_temp_delta%.*} > 0 )); then codes+="CT+${crit_temp_delta}s "; ((score++)); fi
+                    if [[ -n "$warn_temp_delta" ]] && (( 10#${warn_temp_delta%.*} > 0 )); then codes+="WT+${warn_temp_delta}s "; ((score++)); fi
+                    if [[ -n "$crit_temp_delta" ]] && (( 10#${crit_temp_delta%.*} > 0 )); then codes+="CT+${crit_temp_delta}s "; ((score++)); fi
                     if [[ -n "${AGE_CLASS[$disk]:-}" && "${AGE_CLASS[$disk]}" == "Near endurance" ]]; then codes+="NR "; ((score++)); fi
                     if (( score > 0 )); then
                         SMARTG_CODES["$disk"]="${codes% }"
