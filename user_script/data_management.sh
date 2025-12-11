@@ -17,7 +17,7 @@ CHMOD_DIR=0775                        # Directory permissions
 CHMOD_FILE=0775                       # File permissions
 OWN_USER="nobody"                     # Owner user for files and directories
 # ---------------- Arrays (patterns / filters / subdirectories) ----------------
-RENAME_PATTERNS=("hhd800.com@" "gg5.co@" "-C_GG5" "ch" "uncensored")
+RENAME_PATTERNS=("hhd800.com@" "gg5.co@" "-C_GG5" "ch" "uncensored" "-C_X1080X")
 UNWANTED_EXTS=("url" "html" "mht" "gif" "txt" "rar" "apk" "jpg")
 UNWANTED_NAMES=("18+游戏大全(996gg.cc)-七龍珠H版-三國志H版-三國群淫傳等.mp4")
 PRIVATE_SUBDIRS=(
