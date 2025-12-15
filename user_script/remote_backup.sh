@@ -350,6 +350,9 @@ preflight_labels() {
       local raw_line
       raw_line=$(grep -i 'Total transferred file size' "$tmp_est" | tail -n1 | awk -F: '{print $2}' | sed -E 's/^\s+//')
       estimated_changed=$(human_to_bytes "${raw_line}")
+      if [ -z "$raw_line" ] || ! [[ "$estimated_changed" =~ ^[0-9]+$ ]]; then
+        estimated_changed="$src_bytes"
+      fi
       rm -f "$tmp_est" 2>/dev/null || true
       local human_est human_avail human_buf safety_buffer
       human_est=$(bytes_human "$estimated_changed")
@@ -366,6 +369,7 @@ preflight_labels() {
       estimated_changed=$src_bytes
     fi
     estimated_changed_bytes["$label"]=$estimated_changed
+    log "Preflight estimate resolved ($label): $(bytes_human \"$estimated_changed\") (${estimated_changed} bytes)"
 
     local df_out
     df_out=""
@@ -646,7 +650,7 @@ rsync_label() {
     "${exec_cmd[@]}" 2>&1 \
       | tee "$tmp_rslog" \
       | awk '{ cmd="date +%Y/%m/%d%t%T"; cmd | getline ts; close(cmd); print ts, ":", $0 }' \
-      | tee -a "$LOG_FILE" >/dev/null
+      | tee -a "$LOG_FILE"
     last_status=${PIPESTATUS[0]:-0}
 
     if [ -f "$tmp_rslog" ]; then
@@ -671,6 +675,9 @@ rsync_label() {
         local safe_label=${label// /_}
         ssh_run "ln -snf '$effective_dest' '$SNAPSHOT_ROOT/$safe_label/latest'" || true
         ssh_run "ls -1dt '$SNAPSHOT_ROOT/$safe_label'/*/ 2>/dev/null | tail -n +$((SNAPSHOT_KEEP+1)) | xargs -r rm -rf --" || true
+        write_manifest "$label" "$src"
+      fi
+      if [ "$ENABLE_SNAPSHOTS" != true ]; then
         write_manifest "$label" "$src"
       fi
       rsync_results[$label]=0
@@ -1149,7 +1156,6 @@ main() {
 
   ## Verification, notification and (optional) shutdown
   collect_notification_artifacts || true
-  # Derive status inline: 0=success,1=failure
   local _status
   [ "${#failed_labels[@]}" -eq 0 ] && _status=0 || _status=1
   compose_notification "$_status"
@@ -1176,5 +1182,4 @@ main() {
   prune_old_logs || true
   exit 0
   }
-# Entry Point Exit
 main "$@"
