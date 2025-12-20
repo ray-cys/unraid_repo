@@ -5636,7 +5636,20 @@ compute_share_breakdown() {
 # Track capacity usage history, compute growth trends, estimate days to threshold, export JSON
 capacity_forecast_and_export() {
     # Consolidated math using scaled integers (milli-percent) to reduce multiple awk processes.
-    convert_pct_to_milli() { local p="$1"; if [[ $p =~ ^[0-9]+$ ]]; then echo $(( p*1000 )); elif [[ $p =~ ^([0-9]+)\.([0-9]+)$ ]]; then local whole=${BASH_REMATCH[1]}; local frac=${BASH_REMATCH[2]}; frac=${frac:0:3}; while (( ${#frac} < 3 )); do frac+="0"; done; echo $(( whole*1000 + frac )); else echo 0; fi; }
+    convert_pct_to_milli() { 
+        local p="$1"
+        if [[ $p =~ ^[0-9]+$ ]]; then
+            echo $(( 10#$p * 1000 ))
+        elif [[ $p =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+            local whole=${BASH_REMATCH[1]}
+            local frac=${BASH_REMATCH[2]}
+            frac=${frac:0:3}
+            while (( ${#frac} < 3 )); do frac+="0"; done
+            echo $(( 10#$whole * 1000 + 10#$frac ))
+        else
+            echo 0
+        fi
+    }
     local now_date
     now_date=$(date '+%Y-%m-%d')
     # Prefer computing percent from bytes for maximum precision
