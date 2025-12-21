@@ -611,12 +611,12 @@ notify_unraid() {
     esac
     # Extract per-subsystem states from summary lines
     local sm_state bt_state xfs_state cap_state pm_state pr_state
-    sm_state=$(echo "$SUBSYSTEM_LINES" | awk -F': ' '/^SMART:/ {print $2; exit}')
-    bt_state=$(echo "$SUBSYSTEM_LINES" | awk -F': ' '/^Btrfs:/ {print $2; exit}')
-    xfs_state=$(echo "$SUBSYSTEM_LINES" | sed -n 's/^XFS:[ \t]*\(.*\)$/\1/p' | head -n1)
-    cap_state=$(echo "$SUBSYSTEM_LINES" | awk -F': ' '/^Capacity:/ {print $2; exit}')
-    pr_state=$(echo "$SUBSYSTEM_LINES" | awk -F': ' '/^Parity:/ {print $2; exit}')
-    pm_state=$(echo "$SUBSYSTEM_LINES" | awk -F': ' '/^Per-Mount:/ {print $2; exit}')
+    sm_state=$(echo "${SUBSYSTEM_LINES:-}" | awk -F': ' '/^SMART:/ {print $2; exit}')
+    bt_state=$(echo "${SUBSYSTEM_LINES:-}" | awk -F': ' '/^Btrfs:/ {print $2; exit}')
+    xfs_state=$(echo "${SUBSYSTEM_LINES:-}" | sed -n 's/^XFS:[ \t]*\(.*\)$/\1/p' | head -n1)
+    cap_state=$(echo "${SUBSYSTEM_LINES:-}" | awk -F': ' '/^Capacity:/ {print $2; exit}')
+    pr_state=$(echo "${SUBSYSTEM_LINES:-}" | awk -F': ' '/^Parity:/ {print $2; exit}')
+    pm_state=$(echo "${SUBSYSTEM_LINES:-}" | awk -F': ' '/^Per-Mount:/ {print $2; exit}')
     # Build filtered summary string
     local parts=()
     add_if() { local k="$1" v="$2"; [[ -z "$v" ]] && return; if [[ "$v" == "Disabled" && ${SHOW_DISABLED_SUBSYSTEMS:-0} -eq 0 ]]; then return; fi; if [[ ${SHOW_OK_SUBSYSTEMS:-0} -eq 0 && "$v" == "OK" ]]; then return; fi; if [[ "$v" == "N/A" ]]; then return; fi; parts+=("$k $v"); }
@@ -4094,8 +4094,10 @@ build_health_alerts() {
             local base model_suffix
             base="$(basename "$dev")"
             model_suffix="$(model_suffix_for "$(base_device "$dev")")"
+            local base_dev
+            base_dev="$(base_device "$dev")"
             # Composite score (SMART + I/O error + capacity)
-            local st sm_raw sm_norm uniq err_norm cap_norm=0 arr_slot="" k base_dev
+            local st sm_raw sm_norm uniq err_norm cap_norm=0 arr_slot="" k
             st="${SMART_STATE[$dev]:-OK}"
             sm_raw="$(risk_score_quick "$st" "${SMART_MSGS[$dev]:-}")"; [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
             sm_norm=$(( sm_raw > 100 ? 100 : sm_raw ))
@@ -4105,7 +4107,6 @@ build_health_alerts() {
                             sm_norm=$(( sm_norm + _burst_boost ))
                             (( sm_norm > 100 )) && sm_norm=100
                         fi
-            base_dev="$(base_device "$dev")"
             uniq="${IO_ERROR_UNIQUE_MAP[$dev]:-${IO_ERROR_UNIQUE_MAP[$base_dev]:-0}}"; [[ "$uniq" =~ ^[0-9]+$ ]] || uniq=0
             if (( uniq >= ${IO_ERROR_CRIT_THRESHOLD:-20} )); then err_norm=100
             elif (( uniq >= ${IO_ERROR_WARN_THRESHOLD:-5} )); then err_norm=65
@@ -4427,6 +4428,7 @@ build_trend_section() {
         local win_attr=${SMART_ATTR_TREND_WINDOW_DAYS:-7}
         local cutoff_attr
         cutoff_attr=$(date -d "-${win_attr} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
+        declare -A first_line_attr last_line_attr first_dt_attr last_dt_attr
         if [[ -f "$SMART_ATTR_HISTORY_FILE" ]]; then
             local lines_attr
             lines_attr=$(tail -n 50000 "$SMART_ATTR_HISTORY_FILE" 2>/dev/null || true)
@@ -4435,7 +4437,6 @@ build_trend_section() {
                 tmp_attr=$(mktemp) || { log_warn "mktemp failed; skipping SMART attribute trend block"; tmp_attr=""; }
                 if [[ -n "$tmp_attr" ]]; then
                     printf "%s\n" "$lines_attr" | awk -v c="$cutoff_attr" '$1>=c' > "$tmp_attr"
-                declare -A first_line_attr last_line_attr first_dt_attr last_dt_attr
                 while read -r dt dev rest; do
                     [[ -z "$dt" || -z "$dev" ]] && continue
                     if [[ -z "${first_dt_attr[$dev]:-}" || "$dt" < "${first_dt_attr[$dev]}" ]]; then first_dt_attr[$dev]="$dt"; first_line_attr[$dev]="$rest"; fi
@@ -4482,7 +4483,7 @@ build_trend_section() {
                     disk="$dev"; base="$(base_device "$disk")"; tag="$(basename "$base")"; model_suffix="$(model_suffix_for "$base")"
                     (( hv_writer_flag )) && { codes+="HVW "; ((score++)); }
                     if [[ -n "$wear_delta" ]] && (( 10#${wear_delta%.*} >= 1 )); then
-                        local current_wear="${CUR_ATTR[$disk|nvme_percent_used]:-0}"
+                        local current_wear="${CUR_ATTR["$disk|nvme_percent_used"]:-0}"
                         if [[ $current_wear =~ ^[0-9]+$ ]] && (( current_wear < NVME_PERCENT_USED_WARN )); then
                             codes+="W+${wear_delta}% "; ((score++))
                         fi
@@ -4972,6 +4973,7 @@ build_trend_section() {
                 _tmp_s=$(mktemp) || { log_warn "mktemp failed; skipping share growth block"; _tmp_s=""; }
                 if [[ -n "$_tmp_s" ]]; then
                     printf "%s\n" "$_lines_s" | awk -v c="$_cut_s" '$1>=c{print}' | awk '{s=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="bytes") b=a[2]} if(s!="" && b!=""){print $1,s,b}}' > "$_tmp_s"
+                # Predeclare arrays to avoid nounset when data is sparse
                 declare -A _SFDT _SFB _SLDT _SLB
                 while read -r dt s b; do
                     if [[ -z "${_SFDT[$s]:-}" || "$dt" < "${_SFDT[$s]}" ]]; then _SFDT[$s]="$dt"; _SFB[$s]="$b"; fi
@@ -5230,7 +5232,7 @@ build_trend_section() {
                     else
                         _line+="$(basename "$dev") ${suffix}; "
                     fi
-                done < <(printf "%s\n" "$\_sorted")
+                done < <(printf "%s\n" "$_sorted")
                 _line="${_line%'; '}"
                 [[ -n "$_line" ]] && _add_line "AGE↑" "$_line"
             fi
@@ -6335,7 +6337,7 @@ ${TAIL_SECTIONS}"
 if (( ${#ALERT_CRIT[@]} > 0 )); then
     _final_sev=critical
 elif (( ${#ALERT_WARN[@]} > 0 )); then
-    if [[ -z "${HEALTH_ALERTS_SECTION}" ]]; then
+    if [[ -z "${HEALTH_ALERTS_SECTION:-}" ]]; then
         _final_sev=normal
     else
         _final_sev=warning
