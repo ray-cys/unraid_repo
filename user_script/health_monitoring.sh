@@ -3715,6 +3715,7 @@ build_health_alerts() {
                         fi
                         # Append unique type token
                         if [[ -n "$type" ]]; then
+                            if [[ ! -v "FR_EVENTS[$bdev]" ]]; then FR_EVENTS["$bdev"]=""; fi
                             if [[ " ${FR_EVENTS[$bdev]} " != *" $type "* ]]; then
                                 FR_EVENTS["$bdev"]+=" $type"
                             fi
@@ -3907,7 +3908,7 @@ build_health_alerts() {
         # Emit aggregated firmware reset guidance lines (after collecting all events)
         local fr_dev
         for fr_dev in "${!FR_COUNT[@]}"; do
-            local friendly_tag="${FR_FRIENDLY[$fr_dev]}" model_suffix="${FR_MODEL_SUFFIX[$fr_dev]}" types="${FR_EVENTS[$fr_dev]}" cnt="${FR_COUNT[$fr_dev]}"
+            local friendly_tag="${FR_FRIENDLY[$fr_dev]:-}" model_suffix="${FR_MODEL_SUFFIX[$fr_dev]:-}" types="${FR_EVENTS[$fr_dev]:-}" cnt="${FR_COUNT[$fr_dev]:-0}"
             types=${types# }
             local agg_line="Firmware/controller counter regressions detected (${cnt} event${cnt>1?"s":""}: ${types// /, })"
             if [[ -n "${FR_CRIT[$fr_dev]:-}" ]]; then
