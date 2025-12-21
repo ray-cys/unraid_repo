@@ -3910,7 +3910,8 @@ build_health_alerts() {
         for fr_dev in "${!FR_COUNT[@]}"; do
             local friendly_tag="${FR_FRIENDLY[$fr_dev]:-}" model_suffix="${FR_MODEL_SUFFIX[$fr_dev]:-}" types="${FR_EVENTS[$fr_dev]:-}" cnt="${FR_COUNT[$fr_dev]:-0}"
             types=${types# }
-            local agg_line="Firmware/controller counter regressions detected (${cnt} event${cnt>1?"s":""}: ${types// /, })"
+            local plural=""; (( cnt > 1 )) && plural="s"
+            local agg_line="Firmware/controller counter regressions detected (${cnt} event${plural}: ${types// /, })"
             if [[ -n "${FR_CRIT[$fr_dev]:-}" ]]; then
                 agg_line="Multiple / critical firmware or controller counter regressions (${cnt} events: ${types// /, }); immediate firmware check, controller/backplane inspection, and backup before next parity/scrub."
             fi
