@@ -5032,7 +5032,6 @@ build_trend_section() {
         if declare -p TBW_DAILY >/dev/null 2>&1; then
             local wear_items=() sep_w=" | "
             for dev in "${!TBW_DAILY[@]}"; do
-                # Restrict to SSD/NVMe (ROTA=0 or nvme path)
                 local is_ssd=0
                 if [[ "$dev" == /dev/nvme* ]]; then is_ssd=1; else
                     local rota; rota=$(lsblk_rota_cached "$dev" 2>/dev/null || echo 1)
@@ -5043,13 +5042,13 @@ build_trend_section() {
                 model=$(get_device_model "$dev")
                 cap_tb=$(get_device_capacity_tb "$dev")
                 tbw_thresh_tb=$(tbw_threshold_tb_for_device "$model" "$cap_tb")
-                [[ -z "$tbw_thresh_tb" || "$tbw_thresh_tb" == 0 ]] && continue
+                [[ -z "$tbw_thresh_tb" ]] && continue
+                if ! [[ "$tbw_thresh_tb" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then continue; fi
                 local daily_bytes total_bytes rate_pct_day_raw rate_pct_day_disp
                 daily_bytes=${TBW_DAILY[$dev]:-0}
-                total_bytes=$(( tbw_thresh_tb * 1000 * 1000 * 1000 * 1000 ))
+                total_bytes=$(awk -v t="$tbw_thresh_tb" 'BEGIN{printf "%d", int(t * 1000*1000*1000*1000)}')
                 if (( daily_bytes > 0 && total_bytes > 0 )); then
                     rate_pct_day_raw=$(awk -v d="$daily_bytes" -v t="$total_bytes" 'BEGIN{printf "%.8f", (d/t)*100.0}')
-                    # Display at 4 decimals; if non-zero but rounds to 0.0000, show ~0.0001
                     rate_pct_day_disp=$(awk -v r="$rate_pct_day_raw" 'BEGIN{printf "%.4f", r}')
                     if awk -v r="$rate_pct_day_raw" -v d="$rate_pct_day_disp" 'BEGIN{exit (r>0 && d==0)?0:1}'; then
                         rate_pct_day_disp="~0.0001"
