@@ -4629,7 +4629,7 @@ build_trend_section() {
                             for d in "${daily_deltas[@]:0:${#daily_deltas[@]}-1}"; do
                                 if awk -v x="$d" 'BEGIN{exit (x<0)?0:1}'; then
                                     sum=$(awk -v s="$sum" -v x="$d" 'BEGIN{printf "%.3f", s + x}')
-                                    ((cnt++))
+                                    ((++cnt))
                                 fi
                             done
                             if (( cnt > 0 )) && awk -v ld="$last_delta" -v mn="$accel_min" 'BEGIN{exit (ld<=-mn)?0:1}'; then
