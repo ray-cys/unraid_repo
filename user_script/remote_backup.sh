@@ -581,27 +581,83 @@ manifest_diff_bytes() {
     du -sb "$src" 2>/dev/null | cut -f1 || echo 0
     return 0
   fi
-  declare -A man
-  while IFS=$'\t' read -r path size; do
-    man["$path"]=$size
-  done < <(awk -F'\t' '{print $1"\t"$2}' "$manifest_file")
+  declare -A man_size
+  declare -A man_mtime
+  while IFS=$'\t' read -r m_path m_size m_mtime; do
+    man_size["$m_path"]=$m_size
+    man_mtime["$m_path"]=$m_mtime
+  done < <(awk -F'\t' '{printf "%s\t%s\t%s\n", $1, $2, ($3==""?0:$3)}' "$manifest_file")
+
+  local -a _ex_patterns=()
+  local p raw
+  for p in "${DEFAULT_EXCLUDES[@]:-}"; do
+    raw=${p#--exclude=}
+    raw=${raw%\'}; raw=${raw#\'}
+    raw=${raw%\"}; raw=${raw#\"}
+    [ -n "$raw" ] && _ex_patterns+=("$raw")
+  done
+  local idx=-1 i
+  for i in "${!LABELS_ARRAY[@]}"; do
+    if [ "${LABELS_ARRAY[$i]}" = "$label" ]; then idx=$i; break; fi
+  done
+  if [ "$idx" -ge 0 ]; then
+    local extra_pat="${RSYNC_EXTRA_EXCLUDES[$idx]:-}"
+    if [ -n "$extra_pat" ]; then _ex_patterns+=("$extra_pat"); fi
+  fi
+
+  _mf_should_exclude() {
+    local rel="$1"
+    local pat
+    for pat in "${_ex_patterns[@]:-}"; do
+      pat=${pat%\'}; pat=${pat#\'}; pat=${pat%\"}; pat=${pat#\"}
+      if [ -z "$pat" ]; then continue; fi
+      if [[ "$pat" == /* ]]; then
+        local ap=${pat#/}
+        if [[ "$ap" == */ ]]; then
+          [[ "$rel" == $ap* ]] && return 0
+        fi
+        if [[ "$ap" == *[*?[]* ]]; then
+          [[ "$rel" == "$ap" ]] && return 0
+        else
+          [[ "$rel" == "$ap" ]] && return 0
+          [[ "$rel" == $ap/* ]] && return 0
+        fi
+      else
+        if [[ "$pat" == */ ]]; then
+          local dp=${pat%/}
+          [[ "$rel" == $dp* ]] && return 0
+        fi
+        [[ "$rel" == "$pat" ]] && return 0
+      fi
+    done
+    return 1
+  }
 
   local sum=0
-  while IFS= read -r -d '' f; do
-    rel=${f#./}
-    if [ -z "$rel" ]; then
-      rel="$f"
-    fi
-    if [ -f "$f" ]; then
-      s=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
-      old=${man["$rel"]:-0}
-      if [ "$s" -gt "$old" ]; then
-        sum=$((sum + (s - old)))
+  (
+    cd "$src" >/dev/null 2>&1 || exit 0
+    while IFS= read -r -d '' f; do
+      local rel s cur_mtime old_size old_mtime
+      rel=${f#./}
+      if _mf_should_exclude "$rel"; then
+        continue
       fi
-    fi
-  done < <(cd "$src" && find . -type f -print0)
-
-  echo "$sum"
+      s=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
+      cur_mtime=$(stat -c%Y "$f" 2>/dev/null || stat -f%m "$f" 2>/dev/null || echo 0)
+      old_size=${man_size["$rel"]:-}
+      old_mtime=${man_mtime["$rel"]:-0}
+      if [ -z "$old_size" ]; then
+        sum=$((sum + s))
+      else
+        if [ "$s" -gt "$old_size" ]; then
+          sum=$((sum + (s - old_size)))
+        elif [ "$cur_mtime" -gt "$old_mtime" ] && [ "$s" -eq "$old_size" ]; then
+          sum=$((sum + s))
+        fi
+      fi
+    done < <(find . -type f -print0)
+    echo "$sum"
+  )
 }
 # --- Main Functions ---
 # Unified rsync for a label (handles snapshots, retries, logging, stats)
