@@ -4304,7 +4304,11 @@ build_health_alerts() {
 # === Main Function ===
 # Build non-critical trend / advisory analytics section
 build_trend_section() {
+    # Minimal ERR trap to log which sub-block failed while compiling trends
+    trap 'log_crit "Trend sub-block failed [${CURRENT_TREND_BLOCK:-unknown}] at line ${LINENO}: ${BASH_COMMAND}"' ERR
+    CURRENT_TREND_BLOCK="init"
     # Temperature Evolution subsection
+    CURRENT_TREND_BLOCK="temperature"
     if [[ -f "${TEMP_HISTORY_FILE}" ]]; then
         local temp_win=${TEMP_TREND_WINDOW_DAYS:-14}
         local now_ts
@@ -4423,6 +4427,7 @@ build_trend_section() {
     declare -g DL_SHRINK_LINE EARLY_ERR_LINE BTRFS_SUM_LINE SMART_GROWTH_LINE POH_GROWTH_LINE
     DL_SHRINK_LINE=""; EARLY_ERR_LINE=""; BTRFS_SUM_LINE=""; SMART_GROWTH_LINE=""; POH_GROWTH_LINE=""
     # SMART attribute growth trend computation
+    CURRENT_TREND_BLOCK="smart-attr-trend"
     if (( SMART_ATTR_TREND_ENABLED == 1 )); then
         declare -A SMARTG_CODES=() SMARTG_SCORE=()
         local win_attr=${SMART_ATTR_TREND_WINDOW_DAYS:-7}
@@ -4495,7 +4500,9 @@ build_trend_section() {
                     (( therm_crit )) && { codes+="T2 "; ((score++)); }
                     if [[ -n "$warn_temp_delta" ]] && (( 10#${warn_temp_delta%.*} > 0 )); then codes+="WT+${warn_temp_delta}s "; ((score++)); fi
                     if [[ -n "$crit_temp_delta" ]] && (( 10#${crit_temp_delta%.*} > 0 )); then codes+="CT+${crit_temp_delta}s "; ((score++)); fi
-                    if [[ -n "${AGE_CLASS[$disk]:-}" && "${AGE_CLASS[$disk]}" == "Near endurance" ]]; then codes+="NR "; ((score++)); fi
+                    # Avoid double expansion of possibly-unset AGE_CLASS under nounset
+                    local ac="${AGE_CLASS[$disk]:-}"
+                    if [[ -n "$ac" && "$ac" == "Near endurance" ]]; then codes+="NR "; ((score++)); fi
                     if (( score > 0 )); then
                         SMARTG_CODES["$disk"]="${codes% }"
                         SMARTG_SCORE["$disk"]="$score"
@@ -4520,6 +4527,7 @@ build_trend_section() {
         fi
     fi
     # Endurance aging + TBW days-left shrink & acceleration (ranking)
+    CURRENT_TREND_BLOCK="endurance-trend"
     if (( ${POH_TREND_ENABLED:-0} == 1 || ${TBW_TREND_ENABLED:-0} == 1 )); then
         local win_end=${ENDURANCE_TREND_WINDOW_DAYS:-7}
         local cutoff_end
@@ -4658,6 +4666,7 @@ build_trend_section() {
         fi
     fi
     # Btrfs/XFS error rate acceleration summary (top-N)
+    CURRENT_TREND_BLOCK="fs-error-accel"
     if (( ERROR_RATE_TREND_ENABLED == 1 )); then
         local win_err=${ERROR_RATE_TREND_WINDOW_DAYS:-7} cutoff_err accel_factor_err=${ERROR_RATE_ACCEL_FACTOR_PCT:-100} accel_min_err=${ERROR_RATE_ACCEL_MIN_DELTA:-2} top_err=${ERROR_RATE_TREND_TOP_N:-5}
         local decay_days=7  # Error aging decay constant for acceleration weighting (e^{-age/decay_days})
@@ -4824,6 +4833,7 @@ build_trend_section() {
         fi
     fi
     # Btrfs cumulative device/mount/key totals
+    CURRENT_TREND_BLOCK="btrfs-cumulative"
     if (( BTRFS_DEV_TREND_ENABLED == 1 )); then
         local win_bt=${BTRFS_TREND_WINDOW_DAYS:-7} cutoff_bt
         cutoff_bt=$(date -d "-${win_bt} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
@@ -4864,10 +4874,12 @@ build_trend_section() {
         fi
     fi
     # Build compact one-liner Trend output with key metrics
+    CURRENT_TREND_BLOCK="trend-one-liners"
     {
         declare -a _TL=()
         _add_line() { local tag="$1" text="$2"; [[ -n "$text" ]] && _TL+=("${tag}: ${text}"); }
         # Capacity forecast
+        CURRENT_TREND_BLOCK="TL: capacity-forecast"
         if [[ -n "${ARR_GROWTH_STR:-}" || -n "${POOL_GROWTH_STR:-}" || -n "${ARR_DAYS_TO_THRESHOLD:-}" || -n "${POOL_DAYS_TO_THRESHOLD:-}" ]]; then
             local _cf_a _cf_p _cf_suffix=""
             if (( ${ARR_HISTORY_COUNT:-0} < 2 )); then
@@ -4895,6 +4907,7 @@ build_trend_section() {
             _add_line "CF" "${_cf_a}; ${_cf_p}${_cf_suffix}"
         fi
         # Disk growth (top 5)
+        CURRENT_TREND_BLOCK="TL: disk-growth"
         if (( ${DISK_GROWTH_ENABLED:-1} == 1 )) && [[ -f "${DISK_CAP_HISTORY_FILE}" ]]; then
             local _win_dg _lines_dg _cutoff_dg _tmp_dg
             _win_dg=$HISTORY_WINDOW_DAYS
@@ -4964,6 +4977,7 @@ build_trend_section() {
             fi
         fi
         # Share growth (top N)
+        CURRENT_TREND_BLOCK="TL: share-growth"
         if (( ${SHARE_BREAKDOWN_ENABLED:-0} == 1 )) && [[ -f "${SHARE_USAGE_HISTORY_FILE}" ]]; then
             local _win_s _cut_s _lines_s _tmp_s
             _win_s=$HISTORY_WINDOW_DAYS
@@ -5029,6 +5043,7 @@ build_trend_section() {
             fi
         fi
         # NVMe/SATA SSD wear rate (TBW-derived percent/day)
+        CURRENT_TREND_BLOCK="TL: wear-rate"
         if declare -p TBW_DAILY >/dev/null 2>&1; then
             local wear_items=() sep_w=" | "
             for dev in "${!TBW_DAILY[@]}"; do
@@ -5070,12 +5085,14 @@ build_trend_section() {
             fi
         fi
         # Maintenance: long SMART tests due soon
+        CURRENT_TREND_BLOCK="TL: maintenance"
         if declare -p LONG_TEST_DUE_SOON &>/dev/null; then
             local _near=() _k _d
             for _k in "${!LONG_TEST_DUE_SOON[@]}"; do _d=${LONG_TEST_DUE_SOON[$_k]}; _near+=("$(basename "$_k")(${_d}d)"); done
             if (( ${#_near[@]} > 0 )); then _add_line "MTN" "${_near[*]}"; fi
         fi
         # TBW trend (forecast days-left) and heavy writers compact
+        CURRENT_TREND_BLOCK="TL: tbw-trend"
         if (( ${TBW_TREND_ENABLED:-0} == 1 )) && declare -p TBW_DAYS_LEFT &>/dev/null; then
             local _tbw="" _writers=""
             for dev in "${!TBW_DAYS_LEFT[@]}"; do
@@ -5138,6 +5155,7 @@ build_trend_section() {
             fi
         fi
         # NVMe wear depletion projection line (percent_used slope)
+        CURRENT_TREND_BLOCK="TL: wear-depletion"
         if (( ${WEAR_TREND_ENABLED:-0} == 1 )) && declare -p NVME_WEAR_DAYS_LEFT &>/dev/null; then
             local _wear_items=() dev
             for dev in "${!NVME_WEAR_DAYS_LEFT[@]}"; do
@@ -5163,6 +5181,7 @@ build_trend_section() {
             fi
         fi
         # Lifecycle
+        CURRENT_TREND_BLOCK="TL: lifecycle"
         {
             local rcnt=0 mcnt=0 rshow="" mshow="" life_line="" top=${LIFECYCLE_ALERT_TOP_N}
             if declare -p REPLACE_LIST &>/dev/null || declare -p MONITOR_LIST &>/dev/null; then
@@ -5197,6 +5216,7 @@ build_trend_section() {
             [[ -n "$life_line" ]] && _add_line "LIFE" "$life_line"
         }
         # POH growth (aging rate)
+        CURRENT_TREND_BLOCK="TL: POH-growth"
         if [[ -n "${POH_GROWTH_LINE:-}" ]]; then
             local _poh_items=() _ppart
             IFS=';' read -r -a _poh_parts <<< "${POH_GROWTH_LINE}" || true
@@ -5208,6 +5228,7 @@ build_trend_section() {
             [[ ${#_poh_items[@]} -gt 0 ]] && _add_line "POH↑" "$(IFS=' | '; echo "${_poh_items[*]}")"
         fi
         # POH Age : show top-N highest POH with class
+        CURRENT_TREND_BLOCK="TL: POH-age"
         if (( AGE_AWARE_ENABLED==1 )) && [[ -n "${AGE_AWARE_LINES:-}" ]]; then
             local _rank=()
             while IFS= read -r l; do
@@ -5237,6 +5258,7 @@ build_trend_section() {
             fi
         fi
         # Smart growth and early warnings compact summaries
+        CURRENT_TREND_BLOCK="TL: SMART-growth"
         if [[ -n "${SMART_GROWTH_LINE:-}" ]]; then
             local _items=() _part
             IFS=';' read -r -a _parts <<< "${SMART_GROWTH_LINE}" || true
@@ -5247,6 +5269,7 @@ build_trend_section() {
             done
             [[ ${#_items[@]} -gt 0 ]] && _add_line "SMART↑" "$(IFS=' | '; echo "${_items[*]}")"
         fi
+        CURRENT_TREND_BLOCK="TL: DL-shrink"
         if [[ -n "${DL_SHRINK_LINE:-}" ]]; then
             local _dl_items=() _dpart
             IFS=';' read -r -a _dl_parts <<< "${DL_SHRINK_LINE}" || true
@@ -5257,6 +5280,7 @@ build_trend_section() {
             done
             [[ ${#_dl_items[@]} -gt 0 ]] && _add_line "DL🔻" "$(IFS=' | '; echo "${_dl_items[*]}")"
         fi
+        CURRENT_TREND_BLOCK="TL: early-err"
         if [[ -n "${EARLY_ERR_LINE:-}" ]]; then
             local _err_items=() _epart
             IFS=';' read -r -a _err_parts <<< "${EARLY_ERR_LINE}" || true
@@ -5267,6 +5291,7 @@ build_trend_section() {
             done
             [[ ${#_err_items[@]} -gt 0 ]] && _add_line "ERR↑" "$(IFS=' | '; echo "${_err_items[*]}")"
         fi
+        CURRENT_TREND_BLOCK="TL: btrfs-sum"
         if [[ -n "${BTRFS_SUM_LINE:-}" ]]; then
             local _b_items=() _bpart
             IFS=';' read -r -a _b_parts <<< "${BTRFS_SUM_LINE}" || true
@@ -5278,6 +5303,7 @@ build_trend_section() {
             [[ ${#_b_items[@]} -gt 0 ]] && _add_line "BTRFSΣ" "$(IFS=' | '; echo "${_b_items[*]}")"
         fi
         # SATA link instability (events + streak), also raises alerts here
+        CURRENT_TREND_BLOCK="TL: sata-link"
         if (( ${SATA_LINK_INSTABILITY_ENABLED:-0} == 1 )) && [[ -f "${SATA_LINK_HISTORY_FILE}" ]]; then
             local _win_sat=${SATA_LINK_INSTABILITY_WINDOW_DAYS:-14}
             local _cut_sat
@@ -5338,6 +5364,8 @@ build_trend_section() {
             TREND_SECTION=""
         fi
     }
+    # Clear local trap before returning
+    trap - ERR
 }
 
 # === Helper Function ===
