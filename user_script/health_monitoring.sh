@@ -4322,25 +4322,25 @@ build_trend_section() {
             ts=$(date -d "$dt" +%s 2>/dev/null || echo 0)
             (( ts >= cut_ts )) || continue
             [[ "$tmp" =~ ^[0-9]+$ ]] || continue
-            if [[ -z "${TT_MIN[$dev]}" || "${TT_MIN[$dev]}" -gt "$tmp" ]]; then TT_MIN[$dev]="$tmp"; fi
-            if [[ -z "${TT_MAX[$dev]}" || "${TT_MAX[$dev]}" -lt "$tmp" ]]; then TT_MAX[$dev]="$tmp"; fi
+            if [[ -z "${TT_MIN[$dev]:-}" || "${TT_MIN[$dev]:-}" -gt "$tmp" ]]; then TT_MIN[$dev]="$tmp"; fi
+            if [[ -z "${TT_MAX[$dev]:-}" || "${TT_MAX[$dev]:-}" -lt "$tmp" ]]; then TT_MAX[$dev]="$tmp"; fi
             TT_SUM[$dev]=$(( ${TT_SUM[$dev]:-0} + tmp ))
             TT_CNT[$dev]=$(( ${TT_CNT[$dev]:-0} + 1 ))
-            if [[ -z "${TT_FIRST[$dev]}" ]]; then TT_FIRST[$dev]="$tmp"; TT_FIRST_TS[$dev]="$ts"; fi
+            if [[ -z "${TT_FIRST[$dev]:-}" ]]; then TT_FIRST[$dev]="$tmp"; TT_FIRST_TS[$dev]="$ts"; fi
             TT_LAST[$dev]="$tmp"; TT_LAST_TS[$dev]="$ts"
         done < "${TEMP_HISTORY_FILE}"
         local tdev
         for tdev in "${!TT_CNT[@]}"; do
             local rise rate days
-            if [[ -n "${TT_FIRST[$tdev]}" && -n "${TT_LAST[$tdev]}" ]]; then
-                rise=$(( ${TT_LAST[$tdev]} - ${TT_FIRST[$tdev]} ))
+            if [[ -n "${TT_FIRST[$tdev]:-}" && -n "${TT_LAST[$tdev]:-}" ]]; then
+                rise=$(( ${TT_LAST[$tdev]:-0} - ${TT_FIRST[$tdev]:-0} ))
             else
                 rise=0
             fi
             rate="0.0"; days=0
-            if [[ -n "${TT_FIRST_TS[$tdev]}" && -n "${TT_LAST_TS[$tdev]}" ]]; then
+            if [[ -n "${TT_FIRST_TS[$tdev]:-}" && -n "${TT_LAST_TS[$tdev]:-}" ]]; then
                 local span
-                span=$(( ${TT_LAST_TS[$tdev]} - ${TT_FIRST_TS[$tdev]} ))
+                span=$(( ${TT_LAST_TS[$tdev]:-0} - ${TT_FIRST_TS[$tdev]:-0} ))
                 if (( span > 0 )); then
                     days=$(awk -v s="$span" 'BEGIN{printf "%.2f", s/86400.0}')
                     rate=$(awk -v r="$rise" -v d="$days" 'BEGIN{ if(d>0) printf "%.2f", r/d; else print "0.0" }')
