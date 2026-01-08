@@ -3083,7 +3083,7 @@ scan_syslog_disk_errors() {
         fi
         local w_cap=20; local w_smart=60; local w_err=20; local total=$(( w_cap + w_smart + w_err )); local comp
         comp=$(awk -v c="$cap_norm" -v s="$sm_norm" -v e="$err_norm" -v wc="$w_cap" -v ws="$w_smart" -v we="$w_err" -v t="$total" 'BEGIN{ printf "%d", int((wc*c + ws*s + we*e)/t) }')
-        _io_rank+=("$comp\t$(basename "$dev")\t$raw_count\t$uniq_count\t${mark}")
+        _io_rank+=("$comp"$'\t'"$(basename "$dev")"$'\t'"$raw_count"$'\t'"$uniq_count"$'\t'"${mark}")
     done
     if (( ${#_io_rank[@]} > 0 )); then
         local sorted_io
@@ -4020,7 +4020,7 @@ build_health_alerts() {
             # Weighted composite (0–100)
             local w_cap=20; local w_smart=60; local w_err=20; local total=$(( w_cap + w_smart + w_err )); local comp
             comp=$(awk -v c="$cap_norm" -v s="$sm_norm" -v e="$err_norm" -v wc="$w_cap" -v ws="$w_smart" -v we="$w_err" -v t="$total" 'BEGIN{ printf "%d", int((wc*c + ws*s + we*e)/t) }')
-            rank_lines+=("$comp\t$dev\t$base")
+            rank_lines+=("$comp"$'\t'"$dev"$'\t'"$base")
         done
         # Sort by composite score descending and emit prioritized SMART alerts
         if (( ${#rank_lines[@]} > 0 )); then
@@ -4130,17 +4130,20 @@ build_health_alerts() {
             local w_cap=20; local w_smart=60; local w_err=20; local total=$(( w_cap + w_smart + w_err )); local comp
             comp=$(awk -v c="$cap_norm" -v s="$sm_norm" -v e="$err_norm" -v wc="$w_cap" -v ws="$w_smart" -v we="$w_err" -v t="$total" 'BEGIN{ printf "%d", int((wc*c + ws*s + we*e)/t) }')
             if (( crit_thr>0 && dl <= crit_thr )); then
-                _wear_rank+=("$comp\t${base}${model_suffix}\tCRIT\t${dl}\t${crit_thr}\t${rate}")
+                _wear_rank+=("$comp"$'\t'"${base}${model_suffix}"$'\t'"CRIT"$'\t'"${dl}"$'\t'"${crit_thr}"$'\t'"${rate}")
                 guid_added=1
             elif (( warn_thr>0 && dl <= warn_thr )); then
-                _wear_rank+=("$comp\t${base}${model_suffix}\tWARN\t${dl}\t${warn_thr}\t${rate}")
+                _wear_rank+=("$comp"$'\t'"${base}${model_suffix}"$'\t'"WARN"$'\t'"${dl}"$'\t'"${warn_thr}"$'\t'"${rate}")
                 guid_added=1
             fi
         done
         if (( ${#_wear_rank[@]} > 0 )); then
             local sorted_w
             sorted_w=$(printf "%s\n" "${_wear_rank[@]}" | sort -nr -k1,1)
-            while IFS=$'\t' read -r comp_score tag sev dl thr rate; do
+            while read -r _ln; do
+                local _ltab
+                _ltab=$(printf "%s" "$_ln" | sed -E 's/\\t/\t/g')
+                IFS=$'\t' read -r comp_score tag sev dl thr rate <<< "$_ltab"
                 if [[ "$sev" == "CRIT" ]]; then
                     HEALTH_ALERTS_SECTION+="\n - ${tag}: NVMe wear projected depletion ${dl}d <= ${thr}d; backup & replace scheduling now (rate ${rate}%/d). (priority ${comp_score})"
                 else
@@ -4206,17 +4209,20 @@ build_health_alerts() {
                 comp=$(awk -v wn="$writer_norm" -v s="$sm_norm" -v e="$err_norm" 'BEGIN{ printf "%d", int((2*wn + s + e)/4) }')
                 local tag model_suffix
                 tag="$(basename "$dev")"; model_suffix="$(model_suffix_for "$base_dev")"
-                _hw_rank+=("$comp\t${tag}${model_suffix}\t$w")
+                _hw_rank+=("$comp"$'\t'"${tag}${model_suffix}"$'\t'"$w")
             fi
         done
         if (( ${#_hw_rank[@]} > 0 )); then
             local sorted_hw
             sorted_hw=$(printf "%s\n" "${_hw_rank[@]}" | sort -nr -k1,1)
-            while IFS=$'\t' read -r comp_score tag ww; do
+            while read -r _ln; do
+                local _ltab
+                _ltab=$(printf "%s" "$_ln" | sed -E 's/\\t/\t/g')
+                IFS=$'\t' read -r comp_score tag ww <<< "$_ltab"
                 if awk -v ww="$ww" -v c="$WRITER_WEEKLY_CRIT_PCT" 'BEGIN{exit (ww>=c)?0:1}'; then
-                    HEALTH_ALERTS_SECTION+="\n - ${tag}: Extremely heavy write rate ~$(awk -v w=\""$ww"\" 'BEGIN{printf \"%.2f\", w}')% cap/week; redistribute workloads, review logging, expect accelerated wear. (priority ${comp_score})"
+                    HEALTH_ALERTS_SECTION+="\n - ${tag}: Extremely heavy write rate ~$(awk -v w=\""$ww"\" 'BEGIN{printf "%.2f", w}')% cap/week; redistribute workloads, review logging, expect accelerated wear. (priority ${comp_score})"
                 else
-                    HEALTH_ALERTS_SECTION+="\n - ${tag}: Heavy write rate ~$(awk -v w=\""$ww"\" 'BEGIN{printf \"%.2f\", w}')% cap/week; monitor and consider moving high-churn data to lower-tier media. (priority ${comp_score})"
+                    HEALTH_ALERTS_SECTION+="\n - ${tag}: Heavy write rate ~$(awk -v w=\""$ww"\" 'BEGIN{printf "%.2f", w}')% cap/week; monitor and consider moving high-churn data to lower-tier media. (priority ${comp_score})"
                 fi
             done <<< "$sorted_hw"
         else
@@ -4289,12 +4295,15 @@ build_health_alerts() {
             accel_days=$(( base_days / accel_factor )); (( accel_days < min_days )) && accel_days=$min_days
             recommend_date=$(date -d "+${accel_days} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
             base_short="$(basename "$dev")"; model_suffix="$(model_suffix_for "$(base_device "$dev")")"
-            _lt_rank+=("$comp\t${base_short}${model_suffix}\t${recommend_date}\t${age_days}\t${accel_days}")
+            _lt_rank+=("$comp"$'\t'"${base_short}${model_suffix}"$'\t'"${recommend_date}"$'\t'"${age_days}"$'\t'"${accel_days}")
         done
         if (( ${#_lt_rank[@]} > 0 )); then
             local sorted_lt
             sorted_lt=$(printf "%s\n" "${_lt_rank[@]}" | sort -nr -k1,1)
-            while IFS=$'\t' read -r comp_score tag rec_date age_days accel_days; do
+            while read -r _ln; do
+                local _ltab
+                _ltab=$(printf "%s" "$_ln" | sed -E 's/\\t/\t/g')
+                IFS=$'\t' read -r comp_score tag rec_date age_days accel_days <<< "$_ltab"
                 HEALTH_ALERTS_SECTION+="\n - ${tag}: Accelerate next long SMART test to ${rec_date} (risk spike ${age_days}d ago; interval ~${accel_days}d vs base ${base_days}d). (priority ${comp_score})"
             done <<< "$sorted_lt"
         fi
@@ -4411,7 +4420,7 @@ build_trend_section() {
                     local comp tag model_suffix
                     comp=$(awk -v rn="$rate_norm" -v s="$sm_norm" -v e="$err_norm" 'BEGIN{ printf "%d", int((2*rn + s + e)/4) }')
                     tag="$(basename "$tdev")"; model_suffix="$(model_suffix_for "$base_dev")"
-                    _tr_rank+=("$comp\t${tag}${model_suffix}\t${rise}\t${days}\t${rate}")
+                    _tr_rank+=("$comp"$'\t'"${tag}${model_suffix}"$'\t'"${rise}"$'\t'"${days}"$'\t'"${rate}")
                 fi
             done
             if (( ${#_tr_rank[@]} > 0 )); then
