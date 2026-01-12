@@ -68,6 +68,7 @@ RSYNC_BWLIMITS=(0 0)                                                  # 0 means 
 PREFLIGHT_MODE="metadata"                                              # Use one of: estimate|metadata|total
 PREFLIGHT_MIN_BUFFER_BYTES=1073741824                                   # Minimum safety buffer (bytes)
 PREFLIGHT_BUFFER_PERCENT=5                                              # Percent of estimated change used as buffer
+MANIFEST_SCAN_TIMEOUT=120                                               # Max seconds to scan files per label in metadata preflight (0=disable)
 SHUTDOWN_ON_FAILURE=false                                              # Shutdown source NAS on failure
 
 # === Notifications & Logging ===
@@ -333,7 +334,10 @@ preflight_labels() {
 
     local estimated_changed=0
     if [ "$PREFLIGHT_MODE" = "metadata" ]; then
+      log "Preflight (metadata): computing manifest diff for $label..."
+      local _t0; _t0=$(now_s)
       estimated_changed=$(manifest_diff_bytes "$label" "$src" 2>/dev/null || echo 0)
+      log "Preflight (metadata): manifest diff for $label done in $(( $(now_s) - _t0 ))s"
     elif [ "$PREFLIGHT_MODE" = "estimate" ]; then
       local tmp_est
       tmp_est=$(mktemp /tmp/rsync_est.XXXXXX)
@@ -575,6 +579,7 @@ write_manifest() {
 manifest_diff_bytes() {
   local label="$1"
   local src="$2"
+  local scan_timeout=${MANIFEST_SCAN_TIMEOUT:-0}
   local manifest_file
   manifest_file=$(find "$LOG_FILE_SUBDIR/manifests" -maxdepth 1 -type f -name "${label// /_}_manifest_*.txt" -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1{print $2}' || true)
   if [ -z "$manifest_file" ] || [ ! -f "$manifest_file" ]; then
@@ -636,6 +641,12 @@ manifest_diff_bytes() {
   local sum=0
   (
     cd "$src" >/dev/null 2>&1 || exit 0
+    # Use timeout for large trees if available to avoid long stalls
+    if command -v timeout >/dev/null 2>&1 && [ "$scan_timeout" -gt 0 ]; then
+      _find_cmd=(timeout "$scan_timeout" find . -type f -print0)
+    else
+      _find_cmd=(find . -type f -print0)
+    fi
     while IFS= read -r -d '' f; do
       local rel s cur_mtime old_size old_mtime
       rel=${f#./}
@@ -655,7 +666,7 @@ manifest_diff_bytes() {
           sum=$((sum + s))
         fi
       fi
-    done < <(find . -type f -print0)
+    done < <("${_find_cmd[@]}")
     echo "$sum"
   )
 }
