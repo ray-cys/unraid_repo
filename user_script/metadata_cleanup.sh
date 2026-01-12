@@ -52,6 +52,7 @@ contains_only_metadata() {
     -iname "*.webp" -o \
     -iname "*.tbn" -o \
     -iname "*.srt" -o \
+    -iname "*.sdh" -o \
     -iname "*.ass" -o \
     -iname "*.sub" -o \
     -iname "*.idx" \
@@ -60,12 +61,12 @@ contains_only_metadata() {
   find "$dir" -maxdepth 1 -type f \( \
     -iname "*.nfo" -o \
     -iname "*.jpg" -o \
-    -iname "*.png" \
+    -iname "*.srt" \
   \) -print -quit | read -r _ || return 1
   return 0
 }
 
-# MOVIES Cleanup (Depth-Limited)
+# Movies Cleanup (Depth-Limited)
 cleanup_movies() {
   log "Scanning Movies for metadata-only directories..."
   while IFS= read -r movie_dir; do
@@ -81,7 +82,7 @@ cleanup_movies() {
   done < <(find "$MOVIES_DIR" -mindepth 1 -maxdepth 1 -type d)
 }
 
-# TV SEASON Cleanup (Second Level)
+# TV Seasons Cleanup (Second Level)
 cleanup_empty_tv_seasons() {
   log "Scanning TV Seasons for metadata-only directories..."
   while IFS= read -r season_dir; do
@@ -97,7 +98,7 @@ cleanup_empty_tv_seasons() {
   done < <(find "$TV_DIR" -mindepth 2 -maxdepth 2 -type d)
 }
 
-# TV SHOW Cleanup (Root Level)
+# TV Shows Cleanup (Root Level)
 cleanup_empty_tv_shows() {
   log "Scanning TV Shows for metadata-only directories..."
   while IFS= read -r show_dir; do
