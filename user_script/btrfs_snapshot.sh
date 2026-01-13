@@ -12,8 +12,8 @@ fi
 
 # === Scope ===
 #Which pools and shares to snapshot
-POOLS=(/mnt/cache /mnt/vault)                         # BTRFS mount points (pools)
-SHARES=("appdata" "domains" "system" "node" "cloud")  # Subvolume names under each pool
+POOLS=(/mnt/cache)                     # BTRFS mount points (pools)
+SHARES=("appdata" "domains" "system")  # Subvolume names under each pool
 
 # == Usage Thresholds ===
 # Drive overall status & notifications
