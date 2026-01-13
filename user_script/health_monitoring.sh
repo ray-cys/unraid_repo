@@ -22,14 +22,14 @@ SHORT_TEST_POLL=1                               # Poll short test until it compl
 SHORT_TEST_MAX_WAIT=180                         # Max seconds to wait while polling short tests
 SHORT_TEST_POLL_INTERVAL=10                     # Interval between polls (seconds)
 LONG_TEST_ACCEL_FACTOR=2                        # Accelerate next long test interval (divide) after recent risk spike
-LONG_TEST_MIN_INTERVAL_DAYS=30                  # Do not recommend long test sooner than this many days after last long
-LONG_TEST_MAX_INTERVAL_DAYS=90                  # Maximum fallback days between long tests when no recent risk spike
-LONG_TEST_RISK_LOOKBACK_DAYS=14                 # Consider risk spikes within this many days for acceleration
-LONG_TEST_RISK_THRESHOLD=50                     # Risk score >= triggers long test consideration
+LONG_TEST_MIN_INTERVAL_DAYS=45                  # Do not recommend long test sooner than this many days after last long
+LONG_TEST_MAX_INTERVAL_DAYS=120                 # Maximum fallback days between long tests when no recent risk spike
+LONG_TEST_RISK_LOOKBACK_DAYS=7                  # Consider risk spikes within this many days for acceleration
+LONG_TEST_RISK_THRESHOLD=60                     # Risk score >= triggers long test consideration
 LONG_TEST_CRITICAL_MIN_DAYS=7                   # Critical SMART & last long age >= days -> force long
 LONG_TEST_RISK_MIN_DAYS=0                       # Min days since last long before risk-based scheduling applies
 LONG_TEST_DECISION=""                           # Accumulator for long test scheduling decisions
-LONG_TEST_NEAR_WINDOW_DAYS=7                    # Show health alert when long test is due within N days
+LONG_TEST_NEAR_WINDOW_DAYS=5                    # Show health alert when long test is due within N days
 LONG_TEST_INITIAL_FORCE=0                       # When no prior long test record, force an immediate long (1=enable, 0=skip)
 REPLACEMENT_AUTO_RESET=1                        # Automatically detect drive replacement via POH drop and reset state
 REPLACEMENT_POH_DROP_THRESHOLD_HOURS=24         # Default fallback drop threshold (hours) if type unknown
@@ -137,8 +137,8 @@ VERBOSE_OK=1                                    # Show OK lines (0=suppress)
 SHOW_ZERO_COUNTS=0                              # Hide zero-count summary lines (1=show)
 
 # === Temperature Trend / Rate Thresholds (Global) ===
-TEMP_RATE_WARN_C_PER_DAY=2.5                    # Avg rise °C/day >= warning threshold (global)
-TEMP_RATE_CRIT_C_PER_DAY=5.0                    # Avg rise °C/day >= critical threshold (global)
+TEMP_RATE_WARN_C_PER_DAY=4.0                    # Avg rise °C/day >= warning threshold (global)
+TEMP_RATE_CRIT_C_PER_DAY=8.0                    # Avg rise °C/day >= critical threshold (global)
 TEMP_RATE_MIN_SPAN_DAYS=1.0                     # Minimum span days required to evaluate rate (global)
 
 # === SMART Thresholds (SATA) ===
@@ -169,11 +169,11 @@ NVME_TEMP_CRITICAL=80                            # NVMe temp C >= critical
 NVME_PERCENT_USED_WARN=80                        # NVMe wear percent >= warning
 NVME_PERCENT_USED_CRIT=90                        # NVMe wear percent >= critical
 WEAR_TREND_ENABLED=1                             # Enable NVMe wear depletion projection
-WEAR_TREND_WINDOW_DAYS=90                        # Window for percent_used slope (days)
+WEAR_TREND_WINDOW_DAYS=120                       # Window for percent_used slope (days)
 WEAR_TREND_TOP_N=5                               # Top N soonest depletion estimates
-WEAR_STABLE_MIN_RATE=0.005                       # Percent/day below which treat as stable (shows ∞)
-WEAR_DAYS_LEFT_WARN=180                          # Projected days-left <= warning threshold (0=disable)
-WEAR_DAYS_LEFT_CRIT=90                           # Projected days-left <= critical threshold (0=disable)
+WEAR_STABLE_MIN_RATE=0.001                       # Percent/day below which treat as stable (shows ∞)
+WEAR_DAYS_LEFT_WARN=120                          # Projected days-left <= warning threshold (0=disable)
+WEAR_DAYS_LEFT_CRIT=60                           # Projected days-left <= critical threshold (0=disable)
 WRITER_WEEKLY_WARN_PCT=3                         # Weekly write volume as % of capacity >= warning
 WRITER_WEEKLY_CRIT_PCT=5                         # Weekly write volume as % of capacity >= critical
 WRITER_TIER_MODERATE_PCT=1                       # Weekly % >= this and < warn -> Moderate tier; below -> Light
@@ -189,8 +189,8 @@ NVME_PCIE_UNC_DELTA_WARN=1                       # NVMe PCIe Uncorrectable Error
 NVME_PCIE_UNC_DELTA_CRIT=1                       # NVMe PCIe Uncorrectable Error Count delta >= critical (any increase)
 NVME_THERM_T1_DELTA_WARN=1                       # NVMe Thermal Management T1 Transitions delta >= warn
 NVME_THERM_T2_DELTA_WARN=1                       # NVMe Thermal Management T2 Transitions delta >= warn (treat as critical if >=1)
-NVME_WARN_TEMP_TIME_DELTA_WARN=60                # NVMe Warning Comp. Temperature Time delta (seconds) >= warn
-NVME_CRIT_TEMP_TIME_DELTA_WARN=10                # NVMe Critical Comp. Temperature Time delta (seconds) >= warn (usually critical if >0)
+NVME_WARN_TEMP_TIME_DELTA_WARN=300               # NVMe Warning Comp. Temperature Time delta (seconds) >= warn
+NVME_CRIT_TEMP_TIME_DELTA_WARN=60                # NVMe Critical Comp. Temperature Time delta (seconds) >= warn (usually critical if >0)
 
 # === Btrfs / XFS Snapshot & Device Thresholds ===
 SNAPSHOT_WARN=100                                # btrfs snapshot count >= warning
@@ -240,7 +240,7 @@ W_NVME_PCIE_CORR=10                              # NVMe PCIe correctable errors 
 W_NVME_PCIE_UNC=50                               # NVMe PCIe uncorrectable errors growth weight
 W_NVME_THERM_TRANS=10                            # NVMe thermal transition growth weight
 W_NVME_TEMP_TIME=15                              # NVMe temperature time accumulation weight
-W_TEMP=10                                        # High temperature weight
+W_TEMP=5                                         # High temperature weight
 W_E2E=40                                         # End-to-End errors weight
 W_SOFT_READ=10                                   # Soft read error rate weight
 W_NVME_RO=80                                     # NVMe read-only mode weight
