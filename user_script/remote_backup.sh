@@ -65,10 +65,10 @@ DEST_CONCURRENCY_LIMIT=1                                              # Max conc
 RSYNC_BWLIMITS=(0 0)                                                  # 0 means unlimited; set e.g., 20480 for ~20MB/s
 
 # === Preflight / Safety / Behavior ===
-PREFLIGHT_MODE="metadata"                                              # Use one of: estimate|metadata|total
+PREFLIGHT_MODE="estimate"                                              # Use one of: estimate|metadata|total
 PREFLIGHT_MIN_BUFFER_BYTES=1073741824                                   # Minimum safety buffer (bytes)
 PREFLIGHT_BUFFER_PERCENT=5                                              # Percent of estimated change used as buffer
-MANIFEST_SCAN_TIMEOUT=120                                               # Max seconds to scan files per label in metadata preflight (0=disable)
+MANIFEST_SCAN_TIMEOUT=600                                               # Max seconds to scan files per label in metadata preflight (0=disable)
 SHUTDOWN_ON_FAILURE=false                                              # Shutdown source NAS on failure
 
 # === Notifications & Logging ===
@@ -559,7 +559,8 @@ write_manifest() {
   chmod "$LOG_DIR_MODE" "$dest" 2>/dev/null || true
   local out
   out="$dest/${label// /_}_manifest_$(date +%Y%m%d_%H%M%S).txt"
-  (cd "$src" && find . -type f -printf '%P\t%s\t%T@\n') > "$out" 2>/dev/null || true
+  # Store integer mtimes to match stat -c%Y used during diff
+  (cd "$src" && find . -type f -printf '%P\t%s\t%T@\n' | awk -F'\t' '{printf "%s\t%s\t%.0f\n", $1, $2, $3}') > "$out" 2>/dev/null || true
   if [ -f "$out" ]; then
     chown "$LOG_USER" "$out" 2>/dev/null || true
     chmod "$LOG_FILE_MODE" "$out" 2>/dev/null || true
@@ -591,7 +592,7 @@ manifest_diff_bytes() {
   while IFS=$'\t' read -r m_path m_size m_mtime; do
     man_size["$m_path"]=$m_size
     man_mtime["$m_path"]=$m_mtime
-  done < <(awk -F'\t' '{printf "%s\t%s\t%s\n", $1, $2, ($3==""?0:$3)}' "$manifest_file")
+  done < <(awk -F'\t' '{s=($2==""?0:$2)+0; mt=($3==""?0:$3)+0; printf "%s\t%d\t%d\n", $1, s, mt}' "$manifest_file")
 
   local -a _ex_patterns=()
   local p raw
