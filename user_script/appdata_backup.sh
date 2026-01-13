@@ -423,8 +423,6 @@ main() {
   # Record start time and announce start
   start_time=$(date +%s)
   log "BACKUP|INFO|Scheduled $SRC_DIR_NAME backup start: $(date)"
-  # Pruning of old backups/logs
-  cleanup_old_artifacts
   assess_space
 # Set directory for appdata backup
   backup_dir="${DEST_DIR}/backup_${DATETIME}"
@@ -746,6 +744,8 @@ fi
       rm -f "$tmp_rsync_log" 2>/dev/null || true
     done
   fi
+  # Pruning of old backups/logs
+  cleanup_old_artifacts
 # Record runtime AFTER both Docker compression and Shares rsync phases
   full_runtime_secs=$(($(date +%s) - start_time))
   full_runtime_hms=$(format_duration "$full_runtime_secs")
