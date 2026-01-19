@@ -941,7 +941,7 @@ compose_notification() {
     local condensed_parts=() detailed_body
     detailed_body=$'Runtime: '"${runtime_now}"$'\n'
     for lbl in "${LABELS_ARRAY[@]}"; do
-      local transferred files deletes sent total est human_transferred human_total human_est human_sent percent_total
+      local transferred files deletes sent total est human_transferred human_total human_est human_sent percent_total changed_segment
       transferred=${rsync_transferred_bytes[$lbl]:-0}
       files=${rsync_files[$lbl]:-0}
       deletes=${rsync_deletes[$lbl]:-0}
@@ -956,10 +956,14 @@ compose_notification() {
       if [ "$total" -gt 0 ] && [ "$transferred" -gt 0 ]; then
         percent_total=$(awk -v t="$total" -v tr="$transferred" 'BEGIN{printf "%.1f", (tr/t)*100}')
       fi
+      changed_segment=""
+      if [ "$est" -gt 0 ]; then
+        changed_segment=", $human_est changed"
+      fi
       if [ "$transferred" -eq 0 ] && [ "$files" -eq 0 ] && [ "$deletes" -eq 0 ]; then
         detailed_body+="$lbl: $human_total total, no changes, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
       else
-        detailed_body+="$lbl: $human_total total, $human_est changed, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
+        detailed_body+="$lbl: $human_total total${changed_segment}, transferred $human_transferred (${percent_total}%), files $files, deleted $deletes, sent $human_sent"$'\n'
       fi
       condensed_parts+=("$lbl: $human_transferred (${percent_total}%)")
     done
