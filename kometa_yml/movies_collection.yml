@@ -103,6 +103,7 @@ dynamic_collections:
       Wandering Earth Collection: 流浪地球
       Young and Dangerous Collection: 古惑仔
       Gatao Collection: 角头
+      Assassination of Novelists (Series): 刺杀小说家
     title_override:
       233112: 掃毒
       1403134: 紮職系列
@@ -135,6 +136,7 @@ dynamic_collections:
       762278: 拆彈專家
       222639: 神探狄仁傑
       717062: 角头
+      945803: 刺杀小说家
     exclude:
       - Godzilla (MonsterVerse)
       - Godzilla One Collection
