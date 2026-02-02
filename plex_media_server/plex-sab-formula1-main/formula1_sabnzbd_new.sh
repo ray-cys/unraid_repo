@@ -1,10 +1,16 @@
 #!/bin/bash
 
+# NZB RSS Feed Keywords: formula1
+# sabnzbd RSS Filters:
+# 0 : Requires : MWR
+# 1 : Reject : re: proper|notebook|multi
+# 2 : Requires : re: F1TV|SKY
+# 3 : Requires : re: FP1|FP2|FP3|Sprint|Qualifying|Race|Pre|Post|Warm-Up|Conference|Morning|Afternoon|Post-Testing|Round00
+# 4 : *
+
 # set to SKY or F1LIVE
 PREFERRED_FEED="F1LIVE"
-
 DEST_DIR="/data/formula1"
-
 SRC_DIR="$1"
 JOB_NAME="$3"
 SAB_FILE=$(find "$SRC_DIR" -type f | sort -n | tail -1)
