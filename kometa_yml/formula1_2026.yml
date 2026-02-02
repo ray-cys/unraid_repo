@@ -32,6 +32,60 @@ metadata:
     file_background: config/assets/formula1/background8.jpg
     visible_library: true
     seasons:
+      ## Formula 1 Pre-Season Testing 2026
+      00:
+        title: "Specials"
+        sort_title: "Pre-Season Testing"
+        summary: |-
+              Bahrain International Circuit, Sakhir
+              Official Formula 1 pre-season testing ahead of the 2026 season.
+              First on-track running of the new 2026 regulations.
+        file_poster: config/assets/formula1/2026/season00.jpg
+        episodes:
+            1:
+              title: "Pre-Season Testing: Day 1 Morning Session"
+              sort_title: "Pre-Season Testing: Day 1 Morning"
+              originally_available: "2026-02-25"
+              content_rating: "PG-13"
+              summary: |-
+                    Formula 1 Pre-Season Testing 2026
+                    Bahrain International Circuit, Sakhir
+
+            2:
+              title: "Pre-Season Testing: Day 1 Afternoon Session"
+              sort_title: "Pre-Season Testing: Day 1 Afternoon"
+              originally_available: "2026-02-25"
+              content_rating: "PG-13"
+
+            3:
+              title: "Pre-Season Testing: Day 2 Morning Session"
+              sort_title: "Pre-Season Testing: Day 2 Morning"
+              originally_available: "2026-02-26"
+              content_rating: "PG-13"
+
+            4:
+              title: "Pre-Season Testing: Day 2 Afternoon Session"
+              sort_title: "Pre-Season Testing: Day 2 Afternoon"
+              originally_available: "2026-02-26"
+              content_rating: "PG-13"
+
+            5:
+              title: "Pre-Season Testing: Day 3 Morning Session"
+              sort_title: "Pre-Season Testing: Day 3 Morning"
+              originally_available: "2026-02-27"
+              content_rating: "PG-13"
+
+            6:
+              title: "Pre-Season Testing: Day 3 Afternoon Session"
+              sort_title: "Pre-Season Testing: Day 3 Afternoon"
+              originally_available: "2026-02-27"
+              content_rating: "PG-13"
+
+            7:
+              title: "Pre-Season Testing: Post-Testing Analysis"
+              sort_title: "Pre-Season Testing: Post-Testing Analysis"
+              originally_available: "2026-02-27"
+              content_rating: "PG-13"
       ## Formula 1 Australian Grand Prix 2026
       1:
         title: "Round 01 - Australian Grand Prix"
