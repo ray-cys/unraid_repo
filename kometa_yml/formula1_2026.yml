@@ -33,7 +33,7 @@ metadata:
     visible_library: true
     seasons:
       ## Formula 1 Pre-Season Testing 2026
-      00:
+      0:
         title: "Specials"
         sort_title: "Pre-Season Testing"
         summary: |-
