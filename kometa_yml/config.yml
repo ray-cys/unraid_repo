@@ -39,7 +39,7 @@ libraries:
     ## Operations
     operations:
     - schedule: daily
-      assets_for_all: true
+      assets_for_all: false
       show_missing_assets: true
       metadata_backup:
         path: config/backups/movie_backup.yml
@@ -162,7 +162,7 @@ libraries:
     ## Operations
     operations:
     - schedule: daily
-      assets_for_all: true
+      assets_for_all: false
       show_missing_assets: true
       metadata_backup:
         path: config/backups/tv_backup.yml
@@ -240,8 +240,8 @@ settings:
   cache: true
   cache_expiration: 2           # Cache files expiration in days
   asset_directory:              # config/assets
-  - config/assets/collection
-  asset_folders: true
+  - config/assets
+  asset_folders: false
   asset_depth: 1
   create_asset_folders: false
   prioritize_assets: true
