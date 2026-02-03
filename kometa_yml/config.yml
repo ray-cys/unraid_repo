@@ -221,6 +221,7 @@ libraries:
       schedule: daily
     settings:
       save_report: false
+      prioritize_assets: true
       create_asset_folders: false
       asset_directory: config/assets/formula1
       show_missing_assets: false
