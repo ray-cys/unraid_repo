@@ -104,9 +104,6 @@ external_templates:
           - type: edition
             res: 1080p
             value: 202
-          - type: edition
-            res: 720p
-            value: 200
       group:
         conditions:
           - type: [resolution, edition]
@@ -219,8 +216,6 @@ templates:
               - <<key>>
       resolution:
         conditions:
-          - key: 730P
-            value: 1080p
           - key: 1080P
             value: 1080p
           - key: Ultra-HD
@@ -445,9 +440,6 @@ overlays:
     variables: { key: DV-Plus-TrueHD-Atmos, weight: 550, type: combined }
     template: [ name: standard, name: codec_info ]
 
-  720P:
-    variables: { key: 720P, weight: 480, type: resolution }
-    template: [ name: standard, name: resolution_info ]
   1080P:
     variables: { key: 1080P, weight: 490, type: resolution }
     template: [ name: standard, name: resolution_info ]
