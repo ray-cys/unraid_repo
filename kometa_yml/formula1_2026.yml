@@ -43,37 +43,48 @@ metadata:
         file_poster: config/assets/formula1/2026/season00.jpg
         episodes:
             1:
-              title: "Pre-Season Testing: Day 1
-              sort_title: "Pre-Season Testing: Day 1"
+              title: "Pre-Season Testing: Day 1 Morning"
               originally_available: "2026-02-25"
               content_rating: "PG-13"
               summary: |-
                     Formula 1 Pre-Season Testing 2026
                     Bahrain International Circuit, Sakhir
             2:
-              title: "Pre-Season Testing: Day 2"
-              sort_title: "Pre-Season Testing: Day 2"
+              title: "Pre-Season Testing: Day 1 Afternoon"
+              originally_available: "2026-02-25"
+              content_rating: "PG-13"
+              summary: |-
+                    Formula 1 Pre-Season Testing 2026
+                    Bahrain International Circuit, Sakhir
+            3:
+              title: "Pre-Season Testing: Day 2 Morning"
               originally_available: "2026-02-26"
               content_rating: "PG-13"
               summary: |-
                   Formula 1 Pre-Season Testing 2026
                   Bahrain International Circuit, Sakhir
-            3:
-              title: "Pre-Season Testing: Day 3"
-              sort_title: "Pre-Season Testing: Day 3"
-              originally_available: "2026-02-27"
+            4:
+              title: "Pre-Season Testing: Day 2 Afternoon"
+              originally_available: "2026-02-26"
               content_rating: "PG-13"
               summary: |-
                   Formula 1 Pre-Season Testing 2026
                   Bahrain International Circuit, Sakhir
-            7:
-              title: "Pre-Season Testing: Post-Testing Analysis"
-              sort_title: "Pre-Season Testing: Post-Testing Analysis"
+            5:
+              title: "Pre-Season Testing: Day 3 Morning"
               originally_available: "2026-02-27"
               content_rating: "PG-13"
               summary: |-
-                  Formula 1 Pre-Season Testing 2026
-                  Bahrain International Circuit, Sakhir
+                    Formula 1 Pre-Season Testing 2026
+                    Bahrain International Circuit, Sakhir
+            6:
+              title: "Pre-Season Testing: Day 3 Afternoon"
+              originally_available: "2026-02-27"
+              content_rating: "PG-13"
+              summary: |-
+                    Formula 1 Pre-Season Testing 2026
+                    Bahrain International Circuit, Sakhir
+
             8:
               title: "Pre-Season Testing: Day 1 Wrap-Up Show"
               sort_title: "Pre-Season Testing: Day 1 Wrap-Up Show"
