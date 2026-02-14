@@ -63,26 +63,27 @@ if echo "${NEW_FILENAME}" | grep -qiE "(Pre-Season[._ ]Testing|[._ ]Round00[._ ]
     TEST_WRAPUP=1
   fi
 
-  # Extract Day (One|Two|Three|1|2|3) if present
-  DAY_TOKEN=$(echo "${NEW_FILENAME}" | grep -oiE "Day[-._ ](One|Two|Three|1|2|3)" | head -1 | sed -E 's/[-._ ]/./g')
-  if [[ -n "${DAY_TOKEN}" ]]; then
-    DAY_WORD=$(echo "${DAY_TOKEN}" | cut -d. -f2)
+  # Extract Day (One|Two|Three|1|2|3|01|02|03) with optional delimiter
+  DAY_MATCH=$(echo "${NEW_FILENAME}" | grep -oiE "Day[-._ ]?(One|Two|Three|0?1|0?2|0?3)" | head -1)
+  if [[ -n "${DAY_MATCH}" ]]; then
+    DAY_WORD=$(echo "${DAY_MATCH}" | sed -E 's/[Dd]ay[-._ ]?//')
     case "${DAY_WORD}" in
-      One|1) TEST_DAY_NUM=1 ;;
-      Two|2) TEST_DAY_NUM=2 ;;
-      Three|3) TEST_DAY_NUM=3 ;;
+      One|01|1) TEST_DAY_NUM=1 ;;
+      Two|02|2) TEST_DAY_NUM=2 ;;
+      Three|03|3) TEST_DAY_NUM=3 ;;
     esac
   fi
 
   # If no explicit Day token, try extracting Test number as day surrogate
+  # If no explicit Day token, try extracting Test number as day surrogate
   if [[ -z "${TEST_DAY_NUM}" ]]; then
-    TEST_TOKEN=$(echo "${NEW_FILENAME}" | grep -oiE "Test[-._ ](One|Two|Three|1|2|3)" | head -1 | sed -E 's/[-._ ]/./g')
-    if [[ -n "${TEST_TOKEN}" ]]; then
-      TEST_WORD=$(echo "${TEST_TOKEN}" | cut -d. -f2)
+    TEST_MATCH=$(echo "${NEW_FILENAME}" | grep -oiE "Test[-._ ]?(One|Two|Three|0?1|0?2|0?3)" | head -1)
+    if [[ -n "${TEST_MATCH}" ]]; then
+      TEST_WORD=$(echo "${TEST_MATCH}" | sed -E 's/[Tt]est[-._ ]?//')
       case "${TEST_WORD}" in
-        One|1) TEST_DAY_NUM=1 ;;
-        Two|2) TEST_DAY_NUM=2 ;;
-        Three|3) TEST_DAY_NUM=3 ;;
+        One|01|1) TEST_DAY_NUM=1 ;;
+        Two|02|2) TEST_DAY_NUM=2 ;;
+        Three|03|3) TEST_DAY_NUM=3 ;;
       esac
     fi
   fi
@@ -97,11 +98,12 @@ fi
 ##################################
 if [[ $IS_TESTING -eq 1 ]]; then
   YEAR=$(echo "${NEW_FILENAME}" | grep -oE '[12][0-9]{3}' | head -1)
-
-  # Default day if not present
   if [[ -z "${TEST_DAY_NUM}" ]]; then
     TEST_DAY_NUM=1
   fi
+
+  MORNING_EP=$(( (TEST_DAY_NUM - 1) * 2 + 1 ))
+  AFTERNOON_EP=$(( MORNING_EP + 1 ))
 
   if [[ ${TEST_ANALYSIS} -eq 1 ]]; then
     EPISODE=7
@@ -110,14 +112,35 @@ if [[ $IS_TESTING -eq 1 ]]; then
     EPISODE=$(( 6 + TEST_DAY_NUM + 1 ))
     DISPLAY_KEY="Day ${TEST_DAY_NUM} Wrap-Up Show"
   elif [[ "${TEST_SESSION}" =~ ^[Mm]orning$ ]]; then
-    EPISODE=$(( (TEST_DAY_NUM - 1) * 2 + 1 ))
+    EPISODE=${MORNING_EP}
     DISPLAY_KEY="Day ${TEST_DAY_NUM} Morning"
   elif [[ "${TEST_SESSION}" =~ ^[Aa]fternoon$ ]]; then
-    EPISODE=$(( (TEST_DAY_NUM - 1) * 2 + 2 ))
+    EPISODE=${AFTERNOON_EP}
     DISPLAY_KEY="Day ${TEST_DAY_NUM} Afternoon"
   else
-    EPISODE=$(( (TEST_DAY_NUM - 1) * 2 + 1 ))
-    DISPLAY_KEY="Day ${TEST_DAY_NUM}"
+    PLEX_DIR_CHECK="${DEST_DIR}/F1 ${YEAR}/Specials"
+    M_GLOB="${PLEX_DIR_CHECK}/S00E$(printf "%02d" ${MORNING_EP}) - Pre-Season Testing – Day ${TEST_DAY_NUM} Morning*"
+    A_GLOB="${PLEX_DIR_CHECK}/S00E$(printf "%02d" ${AFTERNOON_EP}) - Pre-Season Testing – Day ${TEST_DAY_NUM} Afternoon*"
+    shopt -s nullglob
+    M_MATCHES=( $M_GLOB )
+    A_MATCHES=( $A_GLOB )
+    shopt -u nullglob
+    M_EXISTS=$([[ ${#M_MATCHES[@]} -gt 0 ]] && echo 1 || echo 0)
+    A_EXISTS=$([[ ${#A_MATCHES[@]} -gt 0 ]] && echo 1 || echo 0)
+
+    if [[ ${M_EXISTS} -eq 0 && ${A_EXISTS} -eq 0 ]]; then
+      EPISODE=${MORNING_EP}
+      DISPLAY_KEY="Day ${TEST_DAY_NUM} Morning"
+    elif [[ ${M_EXISTS} -eq 1 && ${A_EXISTS} -eq 0 ]]; then
+      EPISODE=${AFTERNOON_EP}
+      DISPLAY_KEY="Day ${TEST_DAY_NUM} Afternoon"
+    elif [[ ${M_EXISTS} -eq 0 && ${A_EXISTS} -eq 1 ]]; then
+      EPISODE=${MORNING_EP}
+      DISPLAY_KEY="Day ${TEST_DAY_NUM} Morning"
+    else
+      EPISODE=${MORNING_EP}
+      DISPLAY_KEY="Day ${TEST_DAY_NUM} Morning"
+    fi
   fi
 
   EPISODE=$(printf "%02d" "${EPISODE}")
@@ -166,16 +189,55 @@ NETWORK=$(echo "${NEW_FILENAME}" | sed -E 's/.*[._ ]([A-Za-z0-9]+)[._ ]WEB.*/\1/
 
 if echo "${NETWORK}" | grep -qEio "${PREFERRED_FEED}"; then
   DEST_FILE="${PLEX_DIR}/${PLEX_FILENAME}"
-  mv "${SAB_FILE}" "${DEST_FILE}"
+  if [[ $IS_TESTING -eq 1 ]]; then
+    SESSION_LABEL=$(echo "${DISPLAY_KEY}" | grep -oiE 'Morning|Afternoon' | head -1)
+    ALT_EP=""
+    ALT_SESSION_LABEL=""
+    if [[ "${SESSION_LABEL}" =~ ^[Mm]orning$ ]]; then
+      ALT_EP=$(printf "%02d" $(( AFTERNOON_EP )))
+      ALT_SESSION_LABEL="Afternoon"
+    else
+      ALT_EP=$(printf "%02d" $(( MORNING_EP )))
+      ALT_SESSION_LABEL="Morning"
+    fi
+    ALT_NAME="S00E${ALT_EP} - Pre-Season Testing – Day ${TEST_DAY_NUM} ${ALT_SESSION_LABEL}"
+    ALT_FILE="${PLEX_DIR}/${ALT_NAME}.${EXTENSION}"
+    if [[ -f "${DEST_FILE}" && ! -f "${ALT_FILE}" ]]; then
+      PLEX_NAME="${ALT_NAME}"
+      PLEX_FILENAME="${PLEX_NAME}.${EXTENSION}"
+      DEST_FILE="${PLEX_DIR}/${PLEX_FILENAME}"
+    fi
+  fi
+  mv -n "${SAB_FILE}" "${DEST_FILE}"
 else
   PLEX_NAME_NET="${PLEX_NAME} – ${NETWORK}"
   PLEX_FILENAME_NET="${PLEX_NAME_NET}.${EXTENSION}"
   DEST_FILE="${PLEX_DIR}/${PLEX_FILENAME_NET}"
+  if [[ $IS_TESTING -eq 1 ]]; then
+    SESSION_LABEL=$(echo "${DISPLAY_KEY}" | grep -oiE 'Morning|Afternoon' | head -1)
+    ALT_EP=""
+    ALT_SESSION_LABEL=""
+    if [[ "${SESSION_LABEL}" =~ ^[Mm]orning$ ]]; then
+      ALT_EP=$(printf "%02d" $(( AFTERNOON_EP )))
+      ALT_SESSION_LABEL="Afternoon"
+    else
+      ALT_EP=$(printf "%02d" $(( MORNING_EP )))
+      ALT_SESSION_LABEL="Morning"
+    fi
+    ALT_NAME_NET="S00E${ALT_EP} - Pre-Season Testing – Day ${TEST_DAY_NUM} ${ALT_SESSION_LABEL} – ${NETWORK}"
+    ALT_FILE_NET="${PLEX_DIR}/${ALT_NAME_NET}.${EXTENSION}"
+    if [[ -f "${DEST_FILE}" && ! -f "${ALT_FILE_NET}" ]]; then
+      PLEX_NAME_NET="${ALT_NAME_NET}"
+      PLEX_FILENAME_NET="${PLEX_NAME_NET}.${EXTENSION}"
+      DEST_FILE="${PLEX_DIR}/${PLEX_FILENAME_NET}"
+    fi
+  fi
   if [ ! -f "${DEST_FILE}" ]; then
-    mv "${SAB_FILE}" "${DEST_FILE}"
+    mv -n "${SAB_FILE}" "${DEST_FILE}"
   else
-    rm -rf "${SRC_DIR}"
-    exit 0
+    SUFFIXED="${DEST_FILE%.*} (2).${EXTENSION}"
+    mv -n "${SAB_FILE}" "${SUFFIXED}"
+    DEST_FILE="${SUFFIXED}"
   fi
 fi
 
