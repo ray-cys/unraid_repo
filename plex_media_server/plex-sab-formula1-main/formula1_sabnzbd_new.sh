@@ -53,9 +53,9 @@ TEST_DAY_NUM=""
 TEST_SESSION="" # Morning | Afternoon | (empty => full day)
 TEST_ANALYSIS=0
 TEST_WRAPUP=0
+TEST_PERIOD_NUM=1
 
 if echo "${NEW_FILENAME}" | grep -qiE "(Pre-Season[._ ]Testing|[._ ]Round00[._ ]).*(Test|Day|Analysis|Wrap[-._ ]?Up)"; then
-  # Detect analysis and wrap-up flags
   if echo "${NEW_FILENAME}" | grep -qiE "Post[-._ ]Testing[-._ ]Analysis"; then
     TEST_ANALYSIS=1
   fi
@@ -63,7 +63,6 @@ if echo "${NEW_FILENAME}" | grep -qiE "(Pre-Season[._ ]Testing|[._ ]Round00[._ ]
     TEST_WRAPUP=1
   fi
 
-  # Extract Day (One|Two|Three|1|2|3|01|02|03) with optional delimiter
   DAY_MATCH=$(echo "${NEW_FILENAME}" | grep -oiE "Day[-._ ]?(One|Two|Three|0?1|0?2|0?3)" | head -1)
   if [[ -n "${DAY_MATCH}" ]]; then
     DAY_WORD=$(echo "${DAY_MATCH}" | sed -E 's/[Dd]ay[-._ ]?//')
@@ -74,12 +73,15 @@ if echo "${NEW_FILENAME}" | grep -qiE "(Pre-Season[._ ]Testing|[._ ]Round00[._ ]
     esac
   fi
 
-  # If no explicit Day token, try extracting Test number as day surrogate
-  # If no explicit Day token, try extracting Test number as day surrogate
-  if [[ -z "${TEST_DAY_NUM}" ]]; then
-    TEST_MATCH=$(echo "${NEW_FILENAME}" | grep -oiE "Test[-._ ]?(One|Two|Three|0?1|0?2|0?3)" | head -1)
-    if [[ -n "${TEST_MATCH}" ]]; then
-      TEST_WORD=$(echo "${TEST_MATCH}" | sed -E 's/[Tt]est[-._ ]?//')
+  TEST_TOKEN=$(echo "${NEW_FILENAME}" | grep -oiE "Test[-._ ]?(One|Two|Three|0?1|0?2|0?3)" | head -1)
+  if [[ -n "${TEST_TOKEN}" ]]; then
+    TEST_WORD=$(echo "${TEST_TOKEN}" | sed -E 's/[Tt]est[-._ ]?//')
+    case "${TEST_WORD}" in
+      One|01|1) TEST_PERIOD_NUM=1 ;;
+      Two|02|2) TEST_PERIOD_NUM=2 ;;
+      Three|03|3) TEST_PERIOD_NUM=3 ;;
+    esac
+    if [[ -z "${DAY_MATCH}" && -z "${TEST_DAY_NUM}" ]]; then
       case "${TEST_WORD}" in
         One|01|1) TEST_DAY_NUM=1 ;;
         Two|02|2) TEST_DAY_NUM=2 ;;
@@ -88,7 +90,6 @@ if echo "${NEW_FILENAME}" | grep -qiE "(Pre-Season[._ ]Testing|[._ ]Round00[._ ]
     fi
   fi
 
-  # Extract session if present
   TEST_SESSION=$(echo "${NEW_FILENAME}" | grep -oiE "Morning|Afternoon" | head -1)
   IS_TESTING=1
 fi
@@ -102,14 +103,15 @@ if [[ $IS_TESTING -eq 1 ]]; then
     TEST_DAY_NUM=1
   fi
 
-  MORNING_EP=$(( (TEST_DAY_NUM - 1) * 2 + 1 ))
+  BASE_OFFSET=$(( (TEST_PERIOD_NUM - 1) * 10 ))
+  MORNING_EP=$(( BASE_OFFSET + ( (TEST_DAY_NUM - 1) * 2 + 1 ) ))
   AFTERNOON_EP=$(( MORNING_EP + 1 ))
 
   if [[ ${TEST_ANALYSIS} -eq 1 ]]; then
-    EPISODE=7
+    EPISODE=$(( BASE_OFFSET + 7 ))
     DISPLAY_KEY="Post-Testing Analysis"
   elif [[ ${TEST_WRAPUP} -eq 1 ]]; then
-    EPISODE=$(( 6 + TEST_DAY_NUM + 1 ))
+    EPISODE=$(( BASE_OFFSET + 7 + TEST_DAY_NUM ))
     DISPLAY_KEY="Day ${TEST_DAY_NUM} Wrap-Up Show"
   elif [[ "${TEST_SESSION}" =~ ^[Mm]orning$ ]]; then
     EPISODE=${MORNING_EP}
@@ -148,6 +150,7 @@ if [[ $IS_TESTING -eq 1 ]]; then
   PLEX_DIR="${DEST_DIR}/F1 ${YEAR}/Specials"
   PLEX_NAME="S00E${EPISODE} - Pre-Season Testing – ${DISPLAY_KEY}"
   PLEX_FILENAME="${PLEX_NAME}.${EXTENSION}"
+  echo "SABNZBD: Pre-Season → Period ${TEST_PERIOD_NUM}, Day ${TEST_DAY_NUM}, ${DISPLAY_KEY} → S00E${EPISODE}"
 
 ##################################
 # RACE WEEKEND HANDLING
@@ -175,6 +178,7 @@ else
   PLEX_DIR="${DEST_DIR}/F1 ${YEAR}/${SEASON} - ${LOCATION} GP"
   PLEX_NAME="${SEASON}x${EPISODE} - ${LOCATION} Grand Prix - ${KEY}"
   PLEX_FILENAME="${PLEX_NAME}.${EXTENSION}"
+  echo "SABNZBD: Race Weekend → ${PLEX_NAME}"
 fi
 
 ############################
@@ -208,6 +212,7 @@ if echo "${NETWORK}" | grep -qEio "${PREFERRED_FEED}"; then
       DEST_FILE="${PLEX_DIR}/${PLEX_FILENAME}"
     fi
   fi
+  echo "SABNZBD: Saving → ${DEST_FILE}"
   mv -n "${SAB_FILE}" "${DEST_FILE}"
 else
   PLEX_NAME_NET="${PLEX_NAME} – ${NETWORK}"
@@ -233,9 +238,11 @@ else
     fi
   fi
   if [ ! -f "${DEST_FILE}" ]; then
+    echo "SABNZBD: Saving → ${DEST_FILE}"
     mv -n "${SAB_FILE}" "${DEST_FILE}"
   else
     SUFFIXED="${DEST_FILE%.*} (2).${EXTENSION}"
+    echo "SABNZBD: Slot occupied; saving as → ${SUFFIXED}"
     mv -n "${SAB_FILE}" "${SUFFIXED}"
     DEST_FILE="${SUFFIXED}"
   fi
