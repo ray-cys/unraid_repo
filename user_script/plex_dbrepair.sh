@@ -5,47 +5,78 @@ if ! flock -n 9; then
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "Another plex_dbrepair.sh run is active, exiting (lock: $LOCKFILE)"
   exit 1
 fi
+
 ################################################################################
 # ---------------- Configuration ----------------
-# Plex DBRepair Automation Script
-# Automates running the Plex DBRepair script inside specified Plex Docker containers.
 ################################################################################
 
-CONTAINERS=("plex-media-server" "plex-media")         # Plex container names here (multiple instances)
-REPAIR_PATHS=("/config/PlexDBRepair/DBRepair.sh")     # Common path for Plex DBRepair script inside container
-DBREPAIR_ARGS=("stop" "auto" "start" "exit")          # DBRepair non-interactive run: ("stop" "auto" "start" "exit")
+CONTAINERS=("plex-media-server" "plex-media")
+REPAIR_PATHS=("/config/DBRepair/DBRepair.sh")
+DBREPAIR_ARGS=("stop" "auto" "start" "exit")
+
+DOWNLOAD_URL="https://github.com/ChuckPa/DBRepair/releases/latest/download/DBRepair.sh"
+TMP_FILE="/tmp/DBRepair.sh"
 
 ################################################################################
 
-# Logging to stdout/stderr 
 log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 err() { printf '%s ERROR: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
-# Docker container processing
+
+################################################################################
+# ---------------- Update DBRepair Script ----------------
+################################################################################
+
+log "Downloading latest DBRepair script..."
+
+if curl -fsSL "$DOWNLOAD_URL" -o "$TMP_FILE"; then
+  chmod +x "$TMP_FILE"
+  log "Download successful."
+else
+  err "Failed to download DBRepair. Continuing with existing version."
+fi
+
+################################################################################
+# ---------------- Process Containers ----------------
+################################################################################
+
 if ! command -v docker >/dev/null 2>&1; then
   err "Docker CLI not found in PATH. Aborting."
   exit 1
 fi
-# Start time
+
 log "Starting automated Plex DBRepair for containers: ${CONTAINERS[*]}"
+
 for CONTAINER in "${CONTAINERS[@]}"; do
   log "Processing container: $CONTAINER"
 
   if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
-    err "Plex container '$CONTAINER' not found. Skipping."
+    err "Container '$CONTAINER' not found. Skipping."
     continue
   fi
-  # Check if container is running, start if not
+
   was_running=true
   if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" != "true" ]; then
     was_running=false
-    log "Plex container $CONTAINER is not running — starting container"
-    if ! docker start "$CONTAINER" >/dev/null 2>&1; then
-      err "Failed to start Plex container $CONTAINER. Skipping."
-      continue
-    fi
+    log "Container $CONTAINER not running — starting"
+    docker start "$CONTAINER" >/dev/null 2>&1 || { err "Failed to start $CONTAINER"; continue; }
     sleep 3
   fi
-  # Locate the DBRepair script inside the container
+
+  ##############################################################################
+  # Inject updated DBRepair into container
+  ##############################################################################
+
+  if [ -f "$TMP_FILE" ]; then
+    log "Updating DBRepair inside $CONTAINER"
+    docker exec "$CONTAINER" mkdir -p /config/DBRepair >/dev/null 2>&1 || true
+    docker cp "$TMP_FILE" "$CONTAINER:/config/DBRepair/DBRepair.sh"
+    docker exec "$CONTAINER" chmod +x /config/DBRepair/DBRepair.sh >/dev/null 2>&1 || true
+  fi
+
+  ##############################################################################
+  # Locate DBRepair script
+  ##############################################################################
+
   found_path=""
   for p in "${REPAIR_PATHS[@]}"; do
     if docker exec "$CONTAINER" test -f "$p" >/dev/null 2>&1; then
@@ -53,39 +84,29 @@ for CONTAINER in "${CONTAINERS[@]}"; do
       break
     fi
   done
-  # Check if we found the DBRepair script
+
   if [ -z "$found_path" ]; then
-    err "Plex DBRepair script not found in Plex container $CONTAINER. Checked: ${REPAIR_PATHS[*]}. Skipping."
-    if [ "$was_running" = false ]; then
-      log "Stopping Plex container $CONTAINER (Auto-stop by Plex DBRepair)"
-      docker stop "$CONTAINER" >/dev/null 2>&1 || true
-    fi
+    err "DBRepair not found in $CONTAINER. Skipping."
+    [ "$was_running" = false ] && docker stop "$CONTAINER" >/dev/null 2>&1 || true
     continue
   fi
-  log "Found Plex DBRepair at $found_path in Plex container $CONTAINER"
-  # Ensure the script is executable every run
-  log "Ensuring $found_path is executable inside Plex container $CONTAINER"
-  if ! docker exec "$CONTAINER" chmod +x "$found_path" >/dev/null 2>&1; then
-    err "Failed chmod +x $found_path inside Plex container $CONTAINER"
+
+  log "Executing DBRepair in $CONTAINER"
+  docker exec -i "$CONTAINER" bash -lc "\"$found_path\" ${DBREPAIR_ARGS[*]}"
+  rc=$?
+
+  if [ "$rc" -eq 0 ]; then
+    log "DBRepair completed successfully for $CONTAINER"
+  else
+    err "DBRepair returned exit code $rc for $CONTAINER"
   fi
-  # Execute the repair script inside container
-  args="${DBREPAIR_ARGS[*]}"
-  log "Executing Plex DBRepair non-interactively: $found_path $args"
-    log "Starting Plex DBRepair for container: $CONTAINER"
-    set +e
-    docker exec -i "$CONTAINER" bash -lc "\"$found_path\" ${DBREPAIR_ARGS[*]}"
-    rc=${PIPESTATUS[0]:-1}
-    set -euo pipefail
-    if [ "$rc" -eq 0 ]; then
-      log "Plex DBRepair completed for container $CONTAINER (exit $rc)"
-    else
-      err "Plex DBRepair encountered errors for container $CONTAINER (exit $rc)"
-    fi
 
   if [ "$was_running" = false ]; then
-    log "Stopping Plex container $CONTAINER (Auto-stop by Plex DBRepair)"
-    docker stop "$CONTAINER" >/dev/null 2>&1 || log "Failed to stop Plex container $CONTAINER"
+    log "Stopping container $CONTAINER (auto-stop)"
+    docker stop "$CONTAINER" >/dev/null 2>&1 || true
   fi
 done
-log "Plex DBRepair completed."
+
+rm -f "$TMP_FILE"
+log "All Plex DBRepair operations completed."
 exit 0
