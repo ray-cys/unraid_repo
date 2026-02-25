@@ -159,7 +159,7 @@ libraries:
         back_width_canceled: 430
         back_width_ended: 280
         back_height: 34
-        font: config/fonts/Arial.ttf
+        font: config/overlays/fonts/Arial.ttf
         font_size: 46
     - file: config/overlays/media_info.yml
       template_variables:
@@ -181,7 +181,7 @@ libraries:
         text: 'R U N T I M E: '
         format: <<runtimeH>> H <<runtimeM>> M
         back_color: '#00000000'
-        font: config/fonts/Arial.ttf
+        font: config/overlays/fonts/Arial.ttf
         font_size: 46
     settings:
       asset_directory: config/assets/tv
