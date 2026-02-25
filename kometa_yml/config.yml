@@ -28,7 +28,38 @@ libraries:
     schedule_overlays: non_existing
     overlay_files:
     - file: config/overlays/media_info.yml
+      template_variables:
+        file_DV-HDR: config/overlays/images/media_info/codec/DV-HDR_extended.png
+        file_DV-Plus: config/overlays/images/media_info/codec/DV-Plus_extended.png
     - file: config/overlays/audience_rating.yml
+    - default: languages            
+      template_variables:
+        languages:
+          - en                      # First language - left to the rating overlay
+        use_subtitles: false
+        file: config/overlays/flags/<<key>>.png
+        hide_text: true
+        back_width: 40
+        back_height: 80
+        back_color: "#FFFFFF00"
+        horizontal_offset: 179
+        horizontal_align: right
+        vertical_offset: 50
+        vertical_align: bottom
+    - default: languages            
+      template_variables:
+        languages:
+          - zh                      # Second language - right to the rating overlay
+        use_subtitles: false
+        file: config/overlays/flags/<<key>>.png
+        hide_text: true
+        back_width: 40
+        back_height: 80
+        back_color: "#FFFFFF00"
+        horizontal_offset: 179
+        horizontal_align: right
+        vertical_offset: 50
+        vertical_align: bottom
     settings:
       asset_directory: config/assets/movie
       prioritize_assets: true
