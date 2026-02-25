@@ -6,35 +6,35 @@
 ## Kometa reads this file as default directory as /config/collections.yml
 
 collections:
-  # IMDb Watchlist
-  IMDb Watchlist:
-    imdb_watchlist:
-      user_id: ur170668654
-    smart_label: release.desc
-    sync_mode: sync
-    file_poster: config/assets/collection/Must-See-Shows.jpg
-    summary: >-
-            A collection of IMDb Watchlist.
-    content_rating: TV-MA
-    sort_title: +1
-    sonarr_add_missing: true
-    sonarr_search: true
-    sonarr_monitor: all
-    item_sonarr_tag: imdb-watchlist
+  # # IMDb Watchlist
+  # IMDb Watchlist:
+  #   imdb_watchlist:
+  #     user_id: ur170668654
+  #   smart_label: release.desc
+  #   sync_mode: sync
+  #   file_poster: config/assets/collection/Must-See-Shows.jpg
+  #   summary: >-
+  #           A collection of IMDb Watchlist.
+  #   content_rating: TV-MA
+  #   sort_title: +1
+  #   sonarr_add_missing: true
+  #   sonarr_search: true
+  #   sonarr_monitor: all
+  #   item_sonarr_tag: imdb-watchlist
 
-  # IMDb Most Popular
-  IMDb Most Popular TV Shows:
-    schedule: weekly(wednesday|saturday)
-    imdb_chart: popular
-    filters:
-      original_language: en, ja, th, zh
-    smart_label: release.desc
-    sync_mode: sync
-    file_poster: config/assets/collection/IMDb-Popular.jpg
-    summary: >-
-            A collection of IMDb user determined popular TV Shows.
-    content_rating: TV-MA
-    sort_title: +1
+  # # IMDb Most Popular
+  # IMDb Most Popular TV Shows:
+  #   schedule: weekly(wednesday|saturday)
+  #   imdb_chart: popular
+  #   filters:
+  #     original_language: en, ja, th, zh
+  #   smart_label: release.desc
+  #   sync_mode: sync
+  #   file_poster: config/assets/collection/IMDb-Popular.jpg
+  #   summary: >-
+  #           A collection of IMDb user determined popular TV Shows.
+  #   content_rating: TV-MA
+  #   sort_title: +1
 
   ## TMDb On The Air
   TMDb On The Air:
