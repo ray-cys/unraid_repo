@@ -69,6 +69,7 @@
 dynamic_collections:
   TMDb Collections:
     type: tmdb_collection
+    collection_order: release
     sync: true
     remove_suffix: 
       - "Collection"
