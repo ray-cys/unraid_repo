@@ -4495,23 +4495,23 @@ build_trend_section() {
                     if [[ -n "$tbw_delta" ]] && [[ $tbw_delta =~ ^[0-9]+$ ]] && (( tbw_delta >= 500000000000 )); then hv_writer_flag=1; fi
                     local base tag model_suffix disk codes="" score=0
                     disk="$dev"; base="$(base_device "$disk")"; tag="$(basename "$base")"; model_suffix="$(model_suffix_for "$base")"
-                    (( hv_writer_flag )) && { codes+="HVW "; ((score++)); }
+                    (( hv_writer_flag )) && { codes+="HVW "; ((++score)); }
                     if [[ -n "$wear_delta" ]] && (( 10#${wear_delta%.*} >= 1 )); then
                         local current_wear="${CUR_ATTR["$disk|nvme_percent_used"]:-0}"
                         if [[ $current_wear =~ ^[0-9]+$ ]] && (( current_wear < NVME_PERCENT_USED_WARN )); then
-                            codes+="W+${wear_delta}% "; ((score++))
+                            codes+="W+${wear_delta}% "; ((++score))
                         fi
                     fi
-                    (( unsafe_low )) && { codes+="US "; ((score++)); }
-                    (( pcie_corr_low_flag )) && { codes+="PCIE "; ((score++)); }
-                    (( media_growth_flag )) && { codes+="MEDIA "; ((score++)); }
-                    (( therm_warn )) && { codes+="T1 "; ((score++)); }
-                    (( therm_crit )) && { codes+="T2 "; ((score++)); }
-                    if [[ -n "$warn_temp_delta" ]] && (( 10#${warn_temp_delta%.*} > 0 )); then codes+="WT+${warn_temp_delta}s "; ((score++)); fi
-                    if [[ -n "$crit_temp_delta" ]] && (( 10#${crit_temp_delta%.*} > 0 )); then codes+="CT+${crit_temp_delta}s "; ((score++)); fi
+                    (( unsafe_low )) && { codes+="US "; ((++score)); }
+                    (( pcie_corr_low_flag )) && { codes+="PCIE "; ((++score)); }
+                    (( media_growth_flag )) && { codes+="MEDIA "; ((++score)); }
+                    (( therm_warn )) && { codes+="T1 "; ((++score)); }
+                    (( therm_crit )) && { codes+="T2 "; ((++score)); }
+                    if [[ -n "$warn_temp_delta" ]] && (( 10#${warn_temp_delta%.*} > 0 )); then codes+="WT+${warn_temp_delta}s "; ((++score)); fi
+                    if [[ -n "$crit_temp_delta" ]] && (( 10#${crit_temp_delta%.*} > 0 )); then codes+="CT+${crit_temp_delta}s "; ((++score)); fi
                     # Avoid double expansion of possibly-unset AGE_CLASS under nounset
                     local ac="${AGE_CLASS[$disk]:-}"
-                    if [[ -n "$ac" && "$ac" == "Near endurance" ]]; then codes+="NR "; ((score++)); fi
+                    if [[ -n "$ac" && "$ac" == "Near endurance" ]]; then codes+="NR "; ((++score)); fi
                     if (( score > 0 )); then
                         SMARTG_CODES["$disk"]="${codes% }"
                         SMARTG_SCORE["$disk"]="$score"
