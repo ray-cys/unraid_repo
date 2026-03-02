@@ -17,10 +17,51 @@ DBREPAIR_ARGS=("stop" "auto" "start" "exit")
 DOWNLOAD_URL="https://github.com/ChuckPa/DBRepair/releases/latest/download/DBRepair.sh"
 TMP_FILE="/tmp/DBRepair.sh"
 
+# --- Logging ---
+SCRIPT_NAME="plex_dbrepair"
+DATETIME="$(date +%Y%m%d_%H%M%S)"
+LOG_FILE_SUBDIR="/mnt/user/cloud/logs/dbrepair_logs"
+LOG_FILE="${LOG_FILE_SUBDIR}/${SCRIPT_NAME}-${DATETIME}.log"
+
+LOG_OWNER="${LOG_OWNER:-nobody}"
+LOG_DIR_PERMS="${LOG_DIR_PERMS:-0775}"
+LOG_FILE_PERMS="${LOG_FILE_PERMS:-0664}"
+
+ensure_dir() {
+  local path="$1" perm="${2:-$LOG_DIR_PERMS}" owner="${3:-$LOG_OWNER}"
+  if [ ! -d "$path" ]; then mkdir -p "$path" 2>/dev/null || return 1; fi
+  chown "$owner" "$path" 2>/dev/null || true
+  chmod "$perm" "$path" 2>/dev/null || true
+}
+
+ensure_dir "$LOG_FILE_SUBDIR" "$LOG_DIR_PERMS" "$LOG_OWNER"
+: > "$LOG_FILE"
+chown "$LOG_OWNER" "$LOG_FILE" 2>/dev/null || true
+chmod "$LOG_FILE_PERMS" "$LOG_FILE" 2>/dev/null || true
+
+log() {
+  local msg="$*"
+  echo "$(date '+%Y/%m/%d %T') : [DBREPAIR][INFO] ${msg}" | tee -a "$LOG_FILE"
+}
+
+err() {
+  local msg="$*"
+  echo "$(date '+%Y/%m/%d %T') : [DBREPAIR][ERROR] ${msg}" | tee -a "$LOG_FILE" >&2
+}
 ################################################################################
 
-log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
-err() { printf '%s ERROR: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
+# Keep only the newest 3 dbrepair logs, delete older ones
+cleanup_old_logs() {
+  local max_logs=3
+  local logs=()
+  if [ -d "$LOG_FILE_SUBDIR" ]; then
+    mapfile -t logs < <(find "${LOG_FILE_SUBDIR}/" -mindepth 1 -maxdepth 1 -type f -printf '%T+\t%p\n' 2>/dev/null | sort | cut -f2)
+    while [ "${#logs[@]}" -gt "$max_logs" ]; do
+      rm -f -- "${logs[0]}" 2>/dev/null || true
+      logs=("${logs[@]:1}")
+    done
+  fi
+}
 
 ################################################################################
 # ---------------- Update DBRepair Script ----------------
@@ -109,4 +150,5 @@ done
 
 rm -f "$TMP_FILE"
 log "All Plex DBRepair operations completed."
+cleanup_old_logs
 exit 0
