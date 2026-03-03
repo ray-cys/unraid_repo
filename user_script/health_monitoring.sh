@@ -499,53 +499,6 @@ prune_history_files() {
 }
 prune_history_files
 
-# === Helper Function ===
-# Apply owner/permissions directly to all logs and persistent files.
-enforce_state_tree_perms() {
-    local f
-    local count_files=0
-    local count_dirs=0
-    local count_logs=0
-    for f in "${STATE_FILES_ALERT_RUNTIME[@]}" "${STATE_FILES_TREND_HISTORY[@]}" "$STORAGE_DISCREPANCY_STATE_FILE"; do
-        [[ -e "$f" ]] || continue
-        chmod 0664 "$f" 2>/dev/null || true
-        chown nobody "$f" 2>/dev/null || true
-        ((count_files++)) || true
-    done
-    # State subdirectories contents
-    local d
-    for d in "$SMART_SELFTEST_DIR" "$UNSAFE_SDWN_STATE_DIR" "$BTRFS_SCRUB_STATE_DIR" "$CMD_TIMEOUT_STATE_DIR"; do
-        [[ -d "$d" ]] || continue
-        ((count_dirs++)) || true
-        while IFS= read -r sf; do
-            chmod 0664 "$sf" 2>/dev/null || true
-            chown nobody "$sf" 2>/dev/null || true
-            ((count_files++)) || true
-        done < <(find "$d" -type f 2>/dev/null)
-    done
-    # Logs: master log and any .log in LOG_DIR
-    if [[ -n "$LOG_DIR" ]]; then        
-        chmod 0775 "$LOG_DIR" 2>/dev/null || true
-        chown nobody "$LOG_DIR" 2>/dev/null || true
-        ((count_dirs++)) || true
-    fi
-    if [[ -n "$MASTER_LOG" ]]; then
-        # Ensure master log exists and apply permissions
-        touch "$MASTER_LOG" 2>/dev/null || true
-        chmod 0664 "$MASTER_LOG" 2>/dev/null || true
-        chown nobody "$MASTER_LOG" 2>/dev/null || true
-        ((count_logs++)) || true
-    fi
-    if [[ -d "$LOG_DIR" ]]; then
-        while IFS= read -r lf; do
-            chmod 0664 "$lf" 2>/dev/null || true
-            chown nobody "$lf" 2>/dev/null || true
-            ((count_logs++)) || true
-        done < <(find "$LOG_DIR" -type f -name '*.log' 2>/dev/null)
-    fi
-    log_info "Permissions sweep: files=$count_files dirs=$count_dirs logs=$count_logs"
-}
-
 # === Helper Functions ===
 # Caching wrappers for external commands to minimize repeated calls
 declare LSBLK_ALL_CACHE=""
@@ -6441,5 +6394,4 @@ persist_risk_scores() {
 }
 persist_risk_scores
 prune_old_run_logs
-enforce_state_tree_perms
 exit 0
