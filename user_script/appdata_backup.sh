@@ -61,11 +61,6 @@ RSYNC_IONICE_CLASS=${RSYNC_IONICE_CLASS:-2}                                   # 
 RSYNC_IONICE_PRIO=${RSYNC_IONICE_PRIO:-7}                                     # ionice priority (0-7 lower is higher priority)
 RSYNC_NICE=${RSYNC_NICE:-10}                                                  # nice adjustment for rsync
 
-# === Ownership / Permissions ===
-LOG_OWNER="${LOG_OWNER:-nobody}"                               # Owner user for log directory and files
-LOG_DIR_PERMS="${LOG_DIR_PERMS:-0775}"                         # Directory permissions (keep group write if share exported)
-LOG_FILE_PERMS="${LOG_FILE_PERMS:-0664}"                       # File permissions
-
 # === Runtime State (internal; do not modify) ===
 # Metrics and transient status values collected during execution.
 dest_dir_was_missing=0                                         # Flag if destination was auto-created
@@ -86,17 +81,13 @@ estimated_compressed_total=0                                   # Estimated compr
 ################################################################################
 
 # === Helper Functions ===
-# Create directory and log file if missing; apply owner & perms
+# Create directory if missing
 ensure_dir() {
-  local path="$1" perm="${2:-$LOG_DIR_PERMS}" owner="${3:-$LOG_OWNER}"
+  local path="$1"
   if [ ! -d "$path" ]; then mkdir -p "$path" 2>/dev/null || return 1; fi
-  chown "$owner" "$path" 2>/dev/null || true
-  chmod "$perm" "$path" 2>/dev/null || true
 }
-ensure_dir "$LOG_FILE_SUBDIR" "$LOG_DIR_PERMS" "$LOG_OWNER"
+ensure_dir "$LOG_FILE_SUBDIR"
 : > "$LOG_FILE"
-chown "$LOG_OWNER" "$LOG_FILE" 2>/dev/null || true
-chmod "$LOG_FILE_PERMS" "$LOG_FILE" 2>/dev/null || true
 # Build skip map & tar exclude array
 declare -A SKIP_MAP=()
 exclude_opts=()
