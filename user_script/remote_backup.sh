@@ -75,11 +75,6 @@ SHUTDOWN_ON_FAILURE=false                                              # Shutdow
 NOTIF_CONDENSED_MAX_LABELS=3                                           # Maximum number of labels to include in condensed notifications
 NOTIF_EXCERPT_LINES=8                                                  # Number of lines to include in notification excerpts
 
-# === Log Ownership & Permissions ===
-LOG_USER="${LOG_USER:-nobody}"                                         # Log file owner user
-LOG_DIR_MODE="${LOG_DIR_MODE:-0775}"                                   # Log directory mode
-LOG_FILE_MODE="${LOG_FILE_MODE:-0664}"                                 # Log file mode
-
 # === SSH wait / Timings ===
 MAX_SSH_WAIT=420                                                       # Total seconds to wait for SSH to become reachable
 SSH_WAIT_INTERVAL=20                                                   # Sleep interval between SSH reachability checks
@@ -110,23 +105,9 @@ declare -A DF_AVAIL_BY_DEST                                             # Availa
 ################################################################################
 
 # --- Helpers Functions ---
-# Ensure log directories and files exist with proper ownership and permissions
-ensure_dir() {
-  local p="$1" m="${2:-$LOG_DIR_MODE}" u="${3:-$LOG_USER}"
-  mkdir -p "$p" 2>/dev/null || true
-  chown "$u" "$p" 2>/dev/null || true
-  chmod "$m" "$p" 2>/dev/null || true
-}
-ensure_file() {
-  local f="$1" m="${2:-$LOG_FILE_MODE}" u="${3:-$LOG_USER}"
-  : > "$f"
-  chown "$u" "$f" 2>/dev/null || true
-  chmod "$m" "$f" 2>/dev/null || true
-}
-ensure_dir "$LOG_FILE_SUBDIR"
-ensure_dir "$PRESERVED_RAW_LOG_DIR"
-ensure_dir "$LOG_FILE_SUBDIR/manifests"
-ensure_file "$LOG_FILE"
+# Ensure log directories and files exist (use default Unraid owner/perms)
+mkdir -p "$LOG_FILE_SUBDIR" "$PRESERVED_RAW_LOG_DIR" "$LOG_FILE_SUBDIR/manifests" 2>/dev/null || true
+: > "$LOG_FILE"
 log() {
   local msg="$1"
   echo "$(date "+%Y/%m/%d %T") : $msg" | tee -a "$LOG_FILE"
@@ -555,15 +536,11 @@ write_manifest() {
   local src="$2"
   local dest="$LOG_FILE_SUBDIR/manifests"
   mkdir -p "$dest" 2>/dev/null || true
-  chown "$LOG_USER" "$dest" 2>/dev/null || true
-  chmod "$LOG_DIR_MODE" "$dest" 2>/dev/null || true
   local out
   out="$dest/${label// /_}_manifest_$(date +%Y%m%d_%H%M%S).txt"
   # Store integer mtimes to match stat -c%Y used during diff
   (cd "$src" && find . -type f -printf '%P\t%s\t%T@\n' | awk -F'\t' '{printf "%s\t%s\t%.0f\n", $1, $2, $3}') > "$out" 2>/dev/null || true
   if [ -f "$out" ]; then
-    chown "$LOG_USER" "$out" 2>/dev/null || true
-    chmod "$LOG_FILE_MODE" "$out" 2>/dev/null || true
     log "Wrote manifest for $label: $out"
   else
     log "Warning: manifest write failed for $label (attempted $out)"
@@ -734,8 +711,6 @@ rsync_label() {
         saved_copy+="_success.log"
       fi
       cp "$tmp_rslog" "$saved_copy" 2>/dev/null || true
-      chown "$LOG_USER" "$saved_copy" 2>/dev/null || true
-      chmod "$LOG_FILE_MODE" "$saved_copy" 2>/dev/null || true
     fi
 
     if [ "$last_status" -eq 0 ]; then
@@ -1055,8 +1030,6 @@ prune_old_logs() {
 collect_notification_artifacts() {
   local outdir="$PRESERVED_RAW_LOG_DIR/notify_artifacts"
   mkdir -p "$outdir" 2>/dev/null || true
-  chown "$LOG_USER" "$outdir" 2>/dev/null || true
-  chmod "$LOG_DIR_MODE" "$outdir" 2>/dev/null || true
   local ts
   ts=$(date +%Y%m%d_%H%M%S)
   notify_df_file="$outdir/remote_df_${ts}.txt"
@@ -1067,8 +1040,6 @@ collect_notification_artifacts() {
   else
     echo "(remote df unavailable)" > "$notify_df_file"
   fi
-  chown "$LOG_USER" "$notify_df_file" 2>/dev/null || true
-  chmod "$LOG_FILE_MODE" "$notify_df_file" 2>/dev/null || true
 
   : > "$notify_snap_file"
   for lbl in "${LABELS_ARRAY[@]}"; do
@@ -1079,9 +1050,7 @@ collect_notification_artifacts() {
       echo "${lbl}: (snapshot info unavailable)" >> "$notify_snap_file"
     fi
   done
-  chown "$LOG_USER" "$notify_snap_file" 2>/dev/null || true
-  chmod "$LOG_FILE_MODE" "$notify_snap_file" 2>/dev/null || true
-
+  
   return 0
 }
 
