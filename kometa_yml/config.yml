@@ -76,39 +76,6 @@ libraries:
         path: config/backups/movie_backup.yml
         sync_tags: true
         add_blank_entries: false
-        exclude:
-          - DV
-          - HDR
-          - Plus
-          - DV-HDR
-          - DV-Plus
-          - DigitalPlus
-          - DTS-HD
-          - Atmos
-          - TrueHD-Atmos
-          - DV-DigitalPlus
-          - HDR-DigitalPlus
-          - Plus-DigitalPlus
-          - DV-HDR-DigitalPlus
-          - DV-Plus-DigitalPlus
-          - DV-DTS-HD
-          - HDR-DTS-HD
-          - Plus-DTS-HD
-          - DV-HDR-DTS-HD
-          - DV-Plus-DTS-HD
-          - DV-Atmos
-          - HDR-Atmos
-          - Plus-Atmos
-          - DV-HDR-Atmos
-          - DV-Plus-Atmos
-          - DV-TrueHD-Atmos
-          - HDR-TrueHD-Atmos
-          - Plus-TrueHD-Atmos
-          - DV-HDR-TrueHD-Atmos
-          - DV-Plus-TrueHD-Atmos
-          - 720P
-          - 1080P
-          - Ultra-HD
     - schedule: weekly(wednesday|saturday|sunday)
       mass_user_rating_update: imdb
       mass_genre_update: tmdb
@@ -199,39 +166,6 @@ libraries:
         path: config/backups/tv_backup.yml
         sync_tags: true
         add_blank_entries: false
-        exclude:
-          - DV
-          - HDR
-          - Plus
-          - DV-HDR
-          - DV-Plus
-          - DigitalPlus
-          - DTS-HD
-          - Atmos
-          - TrueHD-Atmos
-          - DV-DigitalPlus
-          - HDR-DigitalPlus
-          - Plus-DigitalPlus
-          - DV-HDR-DigitalPlus
-          - DV-Plus-DigitalPlus
-          - DV-DTS-HD
-          - HDR-DTS-HD
-          - Plus-DTS-HD
-          - DV-HDR-DTS-HD
-          - DV-Plus-DTS-HD
-          - DV-Atmos
-          - HDR-Atmos
-          - Plus-Atmos
-          - DV-HDR-Atmos
-          - DV-Plus-Atmos
-          - DV-TrueHD-Atmos
-          - HDR-TrueHD-Atmos
-          - Plus-TrueHD-Atmos
-          - DV-HDR-TrueHD-Atmos
-          - DV-Plus-TrueHD-Atmos
-          - 720P
-          - 1080P
-          - Ultra-HD
     - schedule: weekly(wednesday|saturday|sunday)
       mass_user_rating_update: imdb
       mass_episode_user_rating_update: tmdb
