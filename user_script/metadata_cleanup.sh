@@ -10,13 +10,28 @@ fi
 ############################################
 MOVIES_DIR="/mnt/user/media/movies"
 TV_DIR="/mnt/user/media/series"
-LOG_FILE="/mnt/user/cloud/logs/metadata_cleanup.log"
+LOG_DIR="/mnt/user/cloud/logs/metadata_cleanup"
+LOG_FILE="$LOG_DIR/metadata_$(date +%Y%m%d_%H%M%S).log"
 DRY_RUN=false   # true = safe, false = delete
 ############################################
 
 # Logging
+mkdir -p "$LOG_DIR" 2>/dev/null || true
 log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S')  $1" | tee -a "$LOG_FILE"
+}
+
+# Keep only the newest 2 log files (current + previous)
+cleanup_old_logs() {
+  local max_logs=2
+  local logs=()
+  if [ -d "$LOG_DIR" ]; then
+    mapfile -t logs < <(find "$LOG_DIR/" -mindepth 1 -maxdepth 1 -type f -name 'metadata_cleanup_*.log' -printf '%T+\t%p\n' 2>/dev/null | sort | cut -f2)
+    while [ "${#logs[@]}" -gt "$max_logs" ]; do
+      rm -f -- "${logs[0]}" 2>/dev/null || true
+      logs=("${logs[@]:1}")
+    done
+  fi
 }
 
 # Media Detection
@@ -125,3 +140,4 @@ cleanup_empty_tv_seasons
 cleanup_empty_tv_shows
 
 log "===== Cleanup COMPLETE ====="
+cleanup_old_logs
