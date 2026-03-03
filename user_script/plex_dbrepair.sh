@@ -18,26 +18,11 @@ DOWNLOAD_URL="https://github.com/ChuckPa/DBRepair/releases/latest/download/DBRep
 TMP_FILE="/tmp/DBRepair.sh"
 
 # --- Logging ---
-SCRIPT_NAME="plex_dbrepair"
 DATETIME="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE_SUBDIR="/mnt/user/cloud/logs/dbrepair_logs"
-LOG_FILE="${LOG_FILE_SUBDIR}/${SCRIPT_NAME}-${DATETIME}.log"
-
-LOG_OWNER="${LOG_OWNER:-nobody}"
-LOG_DIR_PERMS="${LOG_DIR_PERMS:-0775}"
-LOG_FILE_PERMS="${LOG_FILE_PERMS:-0664}"
-
-ensure_dir() {
-  local path="$1" perm="${2:-$LOG_DIR_PERMS}" owner="${3:-$LOG_OWNER}"
-  if [ ! -d "$path" ]; then mkdir -p "$path" 2>/dev/null || return 1; fi
-  chown "$owner" "$path" 2>/dev/null || true
-  chmod "$perm" "$path" 2>/dev/null || true
-}
-
-ensure_dir "$LOG_FILE_SUBDIR" "$LOG_DIR_PERMS" "$LOG_OWNER"
+LOG_FILE="${LOG_FILE_SUBDIR}/dbrepair-${DATETIME}.log"
+mkdir -p "$LOG_FILE_SUBDIR" 2>/dev/null || true
 : > "$LOG_FILE"
-chown "$LOG_OWNER" "$LOG_FILE" 2>/dev/null || true
-chmod "$LOG_FILE_PERMS" "$LOG_FILE" 2>/dev/null || true
 
 log() {
   local msg="$*"
