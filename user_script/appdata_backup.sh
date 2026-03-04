@@ -12,7 +12,7 @@ fi
 
 # === Core Paths & Identification ===
 SRC_DIR="/mnt/cache/appdata"                                  # Source (Docker appdata) directory
-DEST_DIR="/mnt/user/node/cache"                               # Destination directory (contains dated backup subdir)
+DEST_DIR="/mnt/user/backup/cache"                             # Destination directory (contains dated backup subdir)
 SRC_DIR_NAME="$(basename "$SRC_DIR")"                         # Derived name for logging & log path prefix
 DATETIME="$(date +%Y%m%d_%H%M%S)"                             # Run timestamp
 TMP_DIR=""                                                    # Optional temp staging dir (empty -> inside backup_dir)
@@ -53,7 +53,7 @@ REQUIRED_RATIO=${REQUIRED_RATIO:-0.6}                          # Estimated compr
 # === Shares Backup (Rsync) ===
 # Descriptor-based: "name=<n> src=<path> dest=<path> excludes=<p1,p2> excludes_file=/path/to/file"
 ADD_SHARES=(
-  "name=system src=/mnt/cache/system dest=/mnt/user/node/shares/system excludes="
+  # "name=system src=/mnt/cache/system dest=/mnt/user/node/shares/system excludes="
 )
 ADD_RSYNC_BASE_ARGS=("-aH" "--delete-delay" "--stats" "--protect-args" "--partial") # Base rsync args
 ADD_USE_IONICE=true                                                           # Ionice/nice wrappers for rsync if available
