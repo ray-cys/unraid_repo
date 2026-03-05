@@ -19,7 +19,7 @@ TMP_FILE="/tmp/DBRepair.sh"
 
 # --- Logging ---
 DATETIME="$(date +%Y%m%d_%H%M%S)"
-LOG_FILE_SUBDIR="/mnt/user/cloud/logs/dbrepair_logs"
+LOG_FILE_SUBDIR="/mnt/vault/cloud/logs/dbrepair_logs"
 LOG_FILE="${LOG_FILE_SUBDIR}/dbrepair-${DATETIME}.log"
 mkdir -p "$LOG_FILE_SUBDIR" 2>/dev/null || true
 : > "$LOG_FILE"
