@@ -10,7 +10,7 @@ fi
 # Flash Backup Settings
 ################################################################################
 
-BACKUP_DIR="/mnt/user/backup/flash"                               # Destination directory for flash backups
+BACKUP_DIR="/mnt/vault/backup/flash"                              # Destination directory for flash backups
 MAX_BACKUP=3                                                      # Number of backups to keep
 
 ################################################################################
