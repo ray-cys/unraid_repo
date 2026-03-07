@@ -73,7 +73,7 @@ libraries:
       assets_for_all: false
       show_missing_assets: true
       metadata_backup:
-        path: config/backups/movie_backup.yml
+        path: backup/movie_backup.yml
         sync_tags: true
         add_blank_entries: false
     - schedule: weekly(wednesday|saturday|sunday)
@@ -163,7 +163,7 @@ libraries:
       assets_for_all: false
       show_missing_assets: true
       metadata_backup:
-        path: config/backups/tv_backup.yml
+        path: backup/tv_backup.yml
         sync_tags: true
         add_blank_entries: false
     - schedule: weekly(wednesday|saturday|sunday)
@@ -192,6 +192,10 @@ libraries:
       show_missing_assets: false
     operations:
       assets_for_all: false
+      metadata_backup:
+        path: backup/formula1_backup.yml
+        sync_tags: true
+        add_blank_entries: false
       
 #####################################
 #       Global Configuration        #
