@@ -1,0 +1,16 @@
+#####################################
+#           Metadata YAML          #
+#####################################
+
+## This file is a Kometa metadata file using builders
+## Kometa reads this file as default directory as /config/metadata.yml
+## Metadata source: https://www.imdb.com/title/tt6758316/
+## Race schedule: https://www.formula1.com
+## Event posters: https://www.eventartworks.de
+## Race information: https://en.wikipedia.org/wiki/Formula_One
+
+metadata:
+  Season 2026:
+    f1_season: 2026
+    round_prefix: true
+    shorten_gp: true
