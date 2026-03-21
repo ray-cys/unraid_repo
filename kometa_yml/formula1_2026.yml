@@ -454,202 +454,8 @@ metadata:
               summary: |-
                     27-29 March 2026 Japanese Grand Prix 
                     Held in Suzuka Circuit, Suzuka
-      ## Formula 1 Bahrain Grand Prix 2026
-      4:
-        title: "Round 04 - Bahrain Grand Prix"
-        summary: |-
-              Bahrain International Circuit, Sakhir
-              Circuit Length: 5.412 km
-              Race Distance: 308.238 km, Laps: 57
-        file_poster: config/assets/formula1/2026/season04.jpg
-        episodes:
-            1:
-              title: "Weekend Warm-Up"
-              sort_title: "Weekend Warm-Up"
-              originally_available: "2026-04-10"
-              content_rating: "PG-13"
-              summary: |-
-                    10-12 April 2026 Bahrain Grand Prix 
-                    Held in Bahrain International Circuit, Sakhir
-            2:
-              title: "Free Practice 1"
-              sort_title: "Free Practice 1"
-              originally_available: "2026-04-10"
-              content_rating: "PG-13"
-              summary: |-
-                    10-12 April 2026 Bahrain Grand Prix 
-                    Held in Bahrain International Circuit, Sakhir
-            7:
-              title: "Free Practice 2"
-              sort_title: "Free Practice 2"
-              originally_available: "2026-04-10"
-              content_rating: "PG-13"
-              summary: |-
-                    10-12 April 2026 Bahrain Grand Prix 
-                    Held in Bahrain International Circuit, Sakhir
-            8:
-              title: "Free Practice 3"
-              sort_title: "Free Practice 3"
-              originally_available: "2026-04-11"
-              content_rating: "PG-13"
-              summary: |-
-                    10-12 April 2026 Bahrain Grand Prix 
-                    Held in Bahrain International Circuit, Sakhir
-            9:
-              title: "Pre-Qualifying Buildup"
-              sort_title: "Pre-Qualifying Buildup"
-              originally_available: "2026-04-11"
-              content_rating: "PG-13"
-              summary: |-
-                    10-12 April 2026 Bahrain Grand Prix 
-                    Held in Bahrain International Circuit, Sakhir
-            10:
-              title: "Qualifying Session"
-              sort_title: "Qualifying Session"
-              originally_available: "2026-04-11"
-              content_rating: "PG-13"
-              summary: |-
-                    10-12 April 2026 Bahrain Grand Prix 
-                    Held in Bahrain International Circuit, Sakhir
-            11:
-              title: "Post-Qualifying Analysis"
-              sort_title: "Post-Qualifying Analysis"
-              originally_available: "2026-04-11"
-              content_rating: "PG-13"
-              summary: |-
-                    10-12 April 2026 Bahrain Grand Prix 
-                    Held in Bahrain International Circuit, Sakhir
-            12:
-              title: "Pre-Race Buildup"
-              sort_title: "Pre-Race Buildup"
-              originally_available: "2026-04-11"
-              content_rating: "PG-13"
-              summary: |-
-                    10-12 April 2026 Bahrain Grand Prix 
-                    Held in Bahrain International Circuit, Sakhir
-            13:
-              title: "Race Session"
-              sort_title: "Race Session"
-              originally_available: "2026-04-12"
-              content_rating: "PG-13"
-              summary: |-
-                    10-12 April 2026 Bahrain Grand Prix 
-                    Held in Bahrain International Circuit, Sakhir
-            14:
-              title: "Post-Race Analysis"
-              sort_title: "Post-Race Analysis"
-              originally_available: "2026-04-11"
-              content_rating: "PG-13"
-              summary: |-
-                    10-12 April 2026 Bahrain Grand Prix 
-                    Held in Bahrain International Circuit, Sakhir
-            15:
-              title: "Post-Race Press Conference"
-              sort_title: "Post-Race Press Conference"
-              originally_available: "2026-04-11"
-              content_rating: "PG-13"
-              summary: |-
-                    10-12 April 2026 Bahrain Grand Prix 
-                    Held in Bahrain International Circuit, Sakhir
-      ## Formula 1 Saudi Arabian Grand Prix 2026
-      5:
-        title: "Round 05 - Saudi Arabian Grand Prix"
-        summary: |-
-              Jeddah Corniche Circuit, Jeddah
-              Circuit Length: 6.174 km
-              Race Distance: 308.45 km, Laps: 50
-        file_poster: config/assets/formula1/2026/season05.jpg
-        episodes:
-            1:
-              title: "Weekend Warm-Up"
-              sort_title: "Weekend Warm-Up"
-              originally_available: "2026-04-17"
-              content_rating: "PG-13"
-              summary: |-
-                    17-19 April 2026 Saudi Arabian Grand Prix 
-                    Held in Jeddah Corniche Circuit, Jeddah
-            2:
-              title: "Free Practice 1"
-              sort_title: "Free Practice 1"
-              originally_available: "2026-04-17"
-              content_rating: "PG-13"
-              summary: |-
-                    17-19 April 2026 Saudi Arabian Grand Prix 
-                    Held in Jeddah Corniche Circuit, Jeddah
-            7:
-              title: "Free Practice 2"
-              sort_title: "Free Practice 2"
-              originally_available: "2026-04-17"
-              content_rating: "PG-13"
-              summary: |-
-                    17-19 April 2026 Saudi Arabian Grand Prix 
-                    Held in Jeddah Corniche Circuit, Jeddah
-            8:
-              title: "Free Practice 3"
-              sort_title: "Free Practice 3"
-              originally_available: "2026-04-18"
-              content_rating: "PG-13"
-              summary: |-
-                    17-19 April 2026 Saudi Arabian Grand Prix 
-                    Held in Jeddah Corniche Circuit, Jeddah
-            9:
-              title: "Pre-Qualifying Buildup"
-              sort_title: "Pre-Qualifying Buildup"
-              originally_available: "2026-04-18"
-              content_rating: "PG-13"
-              summary: |-
-                    17-19 April 2026 Saudi Arabian Grand Prix 
-                    Held in Jeddah Corniche Circuit, Jeddah
-            10:
-              title: "Qualifying Session"
-              sort_title: "Qualifying Session"
-              originally_available: "2026-04-18"
-              content_rating: "PG-13"
-              summary: |-
-                    17-19 April 2026 Saudi Arabian Grand Prix 
-                    Held in Jeddah Corniche Circuit, Jeddah
-            11:
-              title: "Post-Qualifying Analysis"
-              sort_title: "Post-Qualifying Analysis"
-              originally_available: "2026-04-18"
-              content_rating: "PG-13"
-              summary: |-
-                    17-19 April 2026 Saudi Arabian Grand Prix 
-                    Held in Jeddah Corniche Circuit, Jeddah
-            12:
-              title: "Pre-Race Buildup"
-              sort_title: "Pre-Race Buildup"
-              originally_available: "2026-04-18"
-              content_rating: "PG-13"
-              summary: |-
-                    17-19 April 2026 Saudi Arabian Grand Prix 
-                    Held in Jeddah Corniche Circuit, Jeddah
-            13:
-              title: "Race Session"
-              sort_title: "Race Session"
-              originally_available: "2026-04-19"
-              content_rating: "PG-13"
-              summary: |-
-                    17-19 April 2026 Saudi Arabian Grand Prix 
-                    Held in Jeddah Corniche Circuit, Jeddah
-            14:
-              title: "Post-Race Analysis"
-              sort_title: "Post-Race Analysis"
-              originally_available: "2026-04-18"
-              content_rating: "PG-13"
-              summary: |-
-                    17-19 April 2026 Saudi Arabian Grand Prix 
-                    Held in Jeddah Corniche Circuit, Jeddah
-            15:
-              title: "Post-Race Press Conference"
-              sort_title: "Post-Race Press Conference"
-              originally_available: "2026-04-18"
-              content_rating: "PG-13"
-              summary: |-
-                    17-19 April 2026 Saudi Arabian Grand Prix 
-                    Held in Jeddah Corniche Circuit, Jeddah
       ## Formula 1 Miami Grand Prix 2026 (Sprint)
-      6:
+      4:
         title: "Round 06 - Miami Grand Prix"
         summary: |- 
               Miami International Autodrome, Miami Gardens, Florida
@@ -762,7 +568,7 @@ metadata:
                     1-3 May 2026 Miami Grand Prix 
                     Held in Miami International Autodrome, Miami Gardens, Florida
       ## Formula 1 Canadian Grand Prix 2026 (Sprint)
-      7:
+      5:
         title: "Round 07 - Canadian Grand Prix"
         summary: |-
               Circuit Gilles Villeneuve, Montreal
@@ -875,7 +681,7 @@ metadata:
                     22-24 May 2026 Canadian Grand Prix 
                     Held in Circuit Gilles Villeneuve, Montreal
       ## Formula 1 Monaco Grand Prix 2026
-      8:
+      6:
         title: "Round 08 - Monaco Grand Prix"
         summary: |-
               Circuit de Monaco, Monaco
@@ -972,7 +778,7 @@ metadata:
                     5-7 June 2026 Monaco Grand Prix
                     Held in Circuit de Monaco, Monaco
       ## Formula 1 Barcelona-Catalunya Grand Prix 2026
-      9:
+      7:
         title: "Round 09 - Barcelona-Catalunya Grand Prix"
         summary: |-
               Circuit de Barcelona-Catalunya, Montmeló
@@ -1069,7 +875,7 @@ metadata:
                     12-14 June 2026 Barcelona-Catalunya Grand Prix 
                     Held in Circuit de Barcelona-Catalunya, Montmeló
       ## Formula 1 Austrian Grand Prix 2026
-      10:
+      8:
         title: "Round 10 - Austrian Grand Prix"
         summary: |-
               Red Bull Ring, Spielberg
@@ -1166,7 +972,7 @@ metadata:
                     26-28 June 2026 Austrian Grand Prix
                     Held in Red Bull Ring, Spielberg
       ## Formula 1 British Grand Prix 2026 (Sprint)
-      11:
+      9:
         title: "Round 11 - British Grand Prix"
         summary: |-
               Silverstone Circuit, Silverstone
@@ -1279,7 +1085,7 @@ metadata:
                     3-5 July 2026 British Grand Prix 
                     Held in Silverstone Circuit, Silverstone
       ## Formula 1 Belgian Grand Prix 2026
-      12:
+      10:
         title: "Round 12 - Belgian Grand Prix"
         summary: |-
               Circuit de Spa-Francorchamps, Stavelot
@@ -1376,7 +1182,7 @@ metadata:
                     17-19 July 2026 Belgian Grand Prix
                     Held in Circuit de Spa-Francorchamps, Stavelot
       ## Formula 1 Hungarian Grand Prix 2026
-      13:
+      11:
         title: "Round 13 - Hungarian Grand Prix"
         summary: |-
               Hungaroring, Mogyoród
@@ -1473,7 +1279,7 @@ metadata:
                     24-26 July 2026 Hungarian Grand Prix
                     Held in Hungaroring, Mogyoród
       ## Formula 1 Dutch Grand Prix 2026 (Sprint)
-      14:
+      12:
         title: "Round 14 - Dutch Grand Prix"
         summary: |-
               Circuit Zandvoort, Zandvoort
@@ -1586,7 +1392,7 @@ metadata:
                     21-23 August 2026 Dutch Grand Prix
                     Held in Circuit Zandvoort, Zandvoort
       ## Formula 1 Italian Grand Prix 2026
-      15:
+      13:
         title: "Round 15 - Italian Grand Prix"
         summary: |-
               Monza Circuit, Monza
@@ -1683,7 +1489,7 @@ metadata:
                     4-6 September 2026 Italian Grand Prix
                     Held in Monza Circuit, Monza
       ## Formula 1 Spanish Grand Prix (Madrid) 2026
-      16:
+      14:
         title: "Round 16 - Spanish Grand Prix"
         summary: |-
               Madring Street Circuit, Madrid
@@ -1780,7 +1586,7 @@ metadata:
                     11-13 September 2026 Spanish Grand Prix
                     Held in Madring Street Circuit, Madrid
       ## Formula 1 Azerbaijan Grand Prix 2026 (Saturday race)
-      17:
+      15:
         title: "Round 17 - Azerbaijan Grand Prix"
         summary: |-
               Baku City Circuit, Baku
@@ -1877,7 +1683,7 @@ metadata:
                     24-26 September 2026 Azerbaijan Grand Prix
                     Held in Baku City Circuit, Baku
       ## Formula 1 Singapore Grand Prix 2026 (Sprint)
-      18:
+      16:
         title: "Round 18 - Singapore Grand Prix"
         summary: |-
               Marina Bay Street Circuit, Singapore
@@ -1990,7 +1796,7 @@ metadata:
                     9-11 October 2026 Singapore Grand Prix
                     Held in Marina Bay Street Circuit, Singapore
       ## Formula 1 United States Grand Prix 2026
-      19:
+      17:
         title: "Round 19 - United States Grand Prix"
         summary: |-
               Circuit of the Americas, Austin, Texas
@@ -2087,7 +1893,7 @@ metadata:
                     23-25 October 2026 United States Grand Prix
                     Held in Circuit of the Americas, Austin, Texas
       ## Formula 1 Mexico City Grand Prix 2026
-      20:
+      18:
         title: "Round 20 - Mexico City Grand Prix"
         summary: |-
               Autódromo Hermanos Rodríguez, Mexico City
@@ -2184,7 +1990,7 @@ metadata:
                     30 Oct-1 Nov 2026 Mexico City Grand Prix
                     Held in Autódromo Hermanos Rodríguez, Mexico City
       ## Formula 1 São Paulo Grand Prix 2026
-      21:
+      19:
         title: "Round 21 - São Paulo Grand Prix"
         summary: |-
               Interlagos Circuit, São Paulo
@@ -2281,7 +2087,7 @@ metadata:
                     6-8 November 2026 São Paulo Grand Prix
                     Held in Interlagos Circuit, São Paulo
       ## Formula 1 Las Vegas Grand Prix 2026 (Saturday race)
-      22:
+      20:
         title: "Round 22 - Las Vegas Grand Prix"
         summary: |-
               Las Vegas Strip Circuit, Paradise, Nevada
@@ -2378,7 +2184,7 @@ metadata:
                     19-21 November 2026 Las Vegas Grand Prix
                     Held in Las Vegas Strip Circuit, Paradise, Nevada
       ## Formula 1 Qatar Grand Prix 2026
-      23:
+      21:
         title: "Round 23 - Qatar Grand Prix"
         summary: |-
               Lusail International Circuit, Lusail
@@ -2475,7 +2281,7 @@ metadata:
                     27-29 November 2026 Qatar Grand Prix
                     Held in Lusail International Circuit, Lusail
       ## Formula 1 Abu Dhabi Grand Prix 2026
-      24:
+      22:
         title: "Round 24 - Abu Dhabi Grand Prix"
         summary: |-
               Yas Marina Circuit, Abu Dhabi
