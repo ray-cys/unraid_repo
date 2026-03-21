@@ -77,6 +77,7 @@ libraries:
         sync_tags: true
         add_blank_entries: false
     - schedule: weekly(wednesday|saturday|sunday)
+      mass_critic_rating_update: imdb
       mass_user_rating_update: imdb
       mass_genre_update: tmdb
       mass_content_rating_update: 
@@ -167,7 +168,9 @@ libraries:
         sync_tags: true
         add_blank_entries: false
     - schedule: weekly(wednesday|saturday|sunday)
-      mass_user_rating_update: imdb
+      mass_critic_rating_update: tmdb
+      mass_user_rating_update: tmdb
+      mass_episode_critic_rating_update: tmdb
       mass_episode_user_rating_update: tmdb
       mass_genre_update: tmdb
       mass_content_rating_update: 
