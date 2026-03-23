@@ -23,7 +23,7 @@ LOG_FILE="$LOG_FILE_SUBDIR/$SRC_DIR_NAME-$DATETIME.log"       # Per-run log file
 SKIP_CONTAINERS=()                                            # Array: container names to skip (exact match)
 
 # === Backup Retention ===
-MAX_BACKUPS=2                                                 # Max dated backup directories to retain
+MAX_BACKUPS=1                                                 # Max dated backup directories to retain
 MAX_LOGS=2                                                    # Max log files to retain
 KEEP_PARTIAL=${KEEP_PARTIAL:-true}                            # Keep failed/partial backup directory (true/false)
 KEEP_TEMP_ERR=${KEEP_TEMP_ERR:-false}                         # Keep individual .err files after success (true/false)
