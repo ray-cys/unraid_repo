@@ -31,7 +31,7 @@ SONARR_API_KEY="feda53a1ba44401fb441f3f0cd77d6bb"
 # ---------------------------------------------------------------------------
 # State / logging
 # ---------------------------------------------------------------------------
-STATE_DIR="/mnt/user/appdata/sonarr/delete-monitor"
+STATE_DIR="/mnt/user/cloud/logs/sonarr_delete_monitor"
 STATE_FILE="${STATE_DIR}/state.json"
 STATE_BACKUP="${STATE_DIR}/state.json.bak"
 LOG_FILE="${STATE_DIR}/delete-monitor.log"
