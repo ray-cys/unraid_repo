@@ -228,15 +228,32 @@ cp -f "$STATE_FILE" "$STATE_BACKUP"
 
 api_get() {
     local endpoint="$1"
-    curl \
-        --silent \
-        --show-error \
-        --fail \
-        --connect-timeout 10 \
-        --max-time 120 \
-        -H "X-Api-Key: ${SONARR_API_KEY}" \
-        -H "Accept: application/json" \
-        "${SONARR_URL}${endpoint}"
+    local response
+    local http_code
+
+    response="$(
+        curl \
+            --silent \
+            --show-error \
+            --connect-timeout 10 \
+            --max-time 120 \
+            -H "X-Api-Key: ${SONARR_API_KEY}" \
+            -H "Accept: application/json" \
+            -w $'\n%{http_code}' \
+            "${SONARR_URL}${endpoint}" \
+            2>&1
+    )"
+
+    http_code="${response##*$'\n'}"
+    response="${response%$'\n'*}"
+
+    if [[ "$http_code" != "2"* ]]; then
+        log "ERROR" \
+            "Sonarr API GET failed: ${endpoint} HTTP ${http_code}: ${response}"
+        return 1
+    fi
+
+    printf '%s' "$response"
 }
 
 api_post_json() {
@@ -762,179 +779,267 @@ while read -r SERIES; do
         done
     done
 
+###############################################################################
+# SEASON CHECK
+###############################################################################
+
+if [[ "$UNMONITOR_SEASON" == "true" ]]; then
+
+    log "INFO" \
+        "Checking seasons for ${SERIES_TITLE}"
+
     ###########################################################################
-    # SEASON CHECK
+    # We deliberately DO NOT call:
+    #
+    #   /api/v3/season?seriesId=...
+    #
+    # Sonarr v4 does not require this endpoint for our purpose.
+    #
+    # The series object already contains its season objects, including:
+    #
+    #   seasons[].id
+    #   seasons[].seasonNumber
+    #   seasons[].monitored
+    #
+    # Therefore retrieve the series object directly.
     ###########################################################################
 
-    if [[ "$UNMONITOR_SEASON" == "true" ]]; then
-        log "INFO" \
-            "Checking seasons for ${SERIES_TITLE}"
+    SERIES_DETAIL="$(api_get \
+        "/api/v3/series/${SERIES_ID}" \
+        2>/dev/null)"
 
-        SEASONS_JSON="$(api_get \
-            "/api/v3/season?seriesId=${SERIES_ID}" \
-            2>/dev/null)"
+    if [[ -z "$SERIES_DETAIL" ]] ||
+       ! echo "$SERIES_DETAIL" | jq empty >/dev/null 2>&1; then
 
-        if [[ -z "$SEASONS_JSON" ]] ||
-           ! echo "$SEASONS_JSON" | jq empty >/dev/null 2>&1; then
-            log "ERROR" \
-                "Unable to retrieve seasons for ${SERIES_TITLE}"
-        else
+        log "ERROR" \
+            "Unable to retrieve series details for ${SERIES_TITLE}. " \
+            "Skipping season handling."
 
-            echo "$SEASONS_JSON" |
-            jq -r '
+    else
+
+        #######################################################################
+        # Discover seasons from the episode data we already retrieved.
+        #
+        # This means there is no separate season API dependency.
+        #######################################################################
+
+        echo "$EPISODES_CURRENT" |
+        jq -r '
+            [
                 .[]
                 | select(.seasonNumber > 0)
                 | .seasonNumber
-            ' |
-            while read -r SEASON_NUMBER; do
-                [[ -z "$SEASON_NUMBER" ]] && continue
+            ]
+            | unique
+            | .[]
+        ' |
+        while read -r SEASON_NUMBER; do
 
-                ################################################################
-                # Get current episodes in season.
-                ################################################################
+            [[ -z "$SEASON_NUMBER" ]] && continue
 
-                SEASON_EPISODES="$(
-                    echo "$EPISODES_CURRENT" |
-                    jq -c \
-                        --argjson season "$SEASON_NUMBER" \
-                        '[.[] | select(.seasonNumber == $season)]'
-                )"
+            ###################################################################
+            # Get current episodes belonging to this season.
+            ###################################################################
 
-                ################################################################
-                # Was there at least one previously downloaded episode?
-                ################################################################
+            SEASON_EPISODES="$(
+                echo "$EPISODES_CURRENT" |
+                jq -c \
+                    --argjson season "$SEASON_NUMBER" \
+                    '[
+                        .[]
+                        | select(.seasonNumber == $season)
+                    ]'
+            )"
 
-                PREVIOUSLY_DOWNLOADED="$(
-                    jq -r \
-                        --arg sid "$SERIES_ID" \
-                        --arg season "$SEASON_NUMBER" '
-                        [
-                            .episodes[]
-                            | select(
-                                (.seriesId | tostring) == $sid
-                                and
-                                (.seasonNumber | tostring) == $season
-                                and
-                                (.lastKnownFileId // 0) != 0
-                            )
-                        ]
-                        | length
-                        ' \
-                        "$WORKING_STATE"
-                )"
+            ###################################################################
+            # Was this season previously known to contain downloaded files?
+            #
+            # We use the persistent state rather than merely the current
+            # Sonarr response because the whole point of this script is to
+            # detect disappearance of files.
+            ###################################################################
 
-                if (( PREVIOUSLY_DOWNLOADED == 0 )); then
-                    continue
-                fi
+            PREVIOUSLY_DOWNLOADED="$(
+                jq -r \
+                    --arg sid "$SERIES_ID" \
+                    --arg season "$SEASON_NUMBER" '
+                    [
+                        .episodes[]
+                        | select(
+                            (.seriesId | tostring) == $sid
+                            and
+                            (.seasonNumber | tostring) == $season
+                            and
+                            (.lastKnownFileId // 0) != 0
+                        )
+                    ]
+                    | length
+                    ' \
+                    "$WORKING_STATE"
+            )"
 
-                ################################################################
-                # Count current files.
-                ################################################################
+            if (( PREVIOUSLY_DOWNLOADED == 0 )); then
+                continue
+            fi
 
-                CURRENT_FILE_COUNT="$(
-                    echo "$SEASON_EPISODES" |
-                    jq '
-                        [
-                            .[]
-                            | select(.hasFile == true)
-                        ]
-                        | length
+            ###################################################################
+            # Count current files.
+            ###################################################################
+
+            CURRENT_FILE_COUNT="$(
+                echo "$SEASON_EPISODES" |
+                jq '
+                    [
+                        .[]
+                        | select(
+                            .hasFile == true
+                            and
+                            (.episodeFileId // 0) != 0
+                        )
+                    ]
+                    | length
+                '
+            )"
+
+            ###################################################################
+            # If even one file remains, the season has NOT been emptied.
+            ###################################################################
+
+            if (( CURRENT_FILE_COUNT != 0 )); then
+                log "INFO" \
+                    "Season ${SEASON_NUMBER}: ${CURRENT_FILE_COUNT} file(s) " \
+                    "still present. Leaving season monitored."
+                continue
+            fi
+
+            ###################################################################
+            # Count currently monitored episodes.
+            #
+            # This is deliberately checked before changing the season.
+            #
+            # Example:
+            #
+            #   S01E01 deleted -> unmonitored
+            #   S01E02 deleted -> unmonitored
+            #   S01E03 never downloaded -> still monitored
+            #
+            # In that situation the season MUST remain monitored.
+            ###################################################################
+
+            MONITORED_COUNT="$(
+                echo "$SEASON_EPISODES" |
+                jq '
+                    [
+                        .[]
+                        | select(.monitored == true)
+                    ]
+                    | length
+                '
+            )"
+
+            if (( MONITORED_COUNT != 0 )); then
+                log "INFO" \
+                    "Season ${SEASON_NUMBER}: no files remain, " \
+                    "${MONITORED_COUNT} monitored episode(s) remain. " \
+                    "Leaving season monitored."
+                continue
+            fi
+
+            ###################################################################
+            # Locate the actual season object inside the series response.
+            #
+            # This gives us the real Sonarr season ID required for PUT.
+            ###################################################################
+
+            SEASON_OBJECT="$(
+                echo "$SERIES_DETAIL" |
+                jq -c \
+                    --argjson season "$SEASON_NUMBER" \
                     '
-                )"
-
-                if (( CURRENT_FILE_COUNT != 0 )); then
-                    continue
-                fi
-
-                ################################################################
-                # Count monitored episodes.
-                #
-                # If monitored episodes remain, this is likely NOT an
-                # intentionally deleted complete season.
-                ################################################################
-
-                MONITORED_COUNT="$(
-                    echo "$SEASON_EPISODES" |
-                    jq '
-                        [
-                            .[]
-                            | select(.monitored == true)
-                        ]
-                        | length
+                    .seasons[]
+                    | select(.seasonNumber == $season)
                     '
-                )"
+            )"
 
-                if (( MONITORED_COUNT != 0 )); then
-                    log "INFO" \
-                        "Season ${SEASON_NUMBER}: no files remain, " \
-                        "${MONITORED_COUNT} monitored episodes remain. " \
-                        "Leaving season monitored."
-                    continue
-                fi
+            if [[ -z "$SEASON_OBJECT" ]]; then
+                log "ERROR" \
+                    "Season ${SEASON_NUMBER} was not found in the Sonarr " \
+                    "series object for ${SERIES_TITLE}. Skipping."
+                continue
+            fi
 
-                ################################################################
-                # Retrieve season object.
-                ################################################################
+            SEASON_ID="$(
+                echo "$SEASON_OBJECT" |
+                jq -r '.id // empty'
+            )"
 
-                SEASON_OBJECT="$(
-                    echo "$SEASONS_JSON" |
-                    jq -c \
-                        --argjson season "$SEASON_NUMBER" \
-                        '.[] | select(.seasonNumber == $season)'
-                )"
+            SEASON_MONITORED="$(
+                echo "$SEASON_OBJECT" |
+                jq -r '.monitored // false'
+            )"
 
-                [[ -z "$SEASON_OBJECT" ]] && continue
-                SEASON_MONITORED="$(
-                    echo "$SEASON_OBJECT" |
-                    jq -r '.monitored // false'
-                )"
+            ###################################################################
+            # The season may already have been manually unmonitored.
+            ###################################################################
 
-                if [[ "$SEASON_MONITORED" != "true" ]]; then
-                    continue
-                fi
+            if [[ "$SEASON_MONITORED" != "true" ]]; then
+                log "INFO" \
+                    "Season ${SEASON_NUMBER} is already unmonitored. " \
+                    "Nothing to do."
+                continue
+            fi
 
-                SEASON_ID="$(
-                    echo "$SEASON_OBJECT" |
-                    jq -r '.id'
-                )"
+            if [[ -z "$SEASON_ID" ]]; then
+                log "ERROR" \
+                    "Season ${SEASON_NUMBER} has no Sonarr season ID. " \
+                    "Skipping."
+                continue
+            fi
 
-                ################################################################
-                # At this point:
-                #
-                # - At least one file previously existed
-                # - No files currently exist
-                # - No monitored episodes remain
-                #
-                # This is our conservative "season emptied" condition.
-                ################################################################
+            ###################################################################
+            # Conservative season-empty condition has now been satisfied:
+            #
+            #   1. At least one episode in this season previously had a file.
+            #   2. No files currently remain.
+            #   3. No monitored episodes remain.
+            #   4. Season itself is still monitored.
+            #
+            # Therefore the season appears to have been intentionally emptied.
+            ###################################################################
 
-                if [[ "$DRY_RUN" == "true" ]]; then
-                    log "WARNING" \
-                        "DRY RUN: Would unmonitor " \
-                        "${SERIES_TITLE} Season ${SEASON_NUMBER}"
-                else
+            if [[ "$DRY_RUN" == "true" ]]; then
+                log "WARNING" \
+                    "DRY RUN: Would unmonitor " \
+                    "${SERIES_TITLE} Season ${SEASON_NUMBER} " \
+                    "(season ID ${SEASON_ID})"
+                continue
+            fi
 
-                    MODIFIED_SEASON="$(
-                        echo "$SEASON_OBJECT" |
-                        jq '.monitored = false'
-                    )"
+            ###################################################################
+            # UNMONITOR SEASON
+            ###################################################################
 
-                    if api_put_json \
-                        "/api/v3/season/${SEASON_ID}" \
-                        "$MODIFIED_SEASON" \
-                        >/dev/null 2>&1; then
-                        log "INFO" \
-                            "Season unmonitored: " \
-                            "${SERIES_TITLE} Season ${SEASON_NUMBER}"
-                    else
-                        log "ERROR" \
-                            "Failed to unmonitor " \
-                            "${SERIES_TITLE} Season ${SEASON_NUMBER}"
-                    fi
-                fi
-            done
-        fi
+            MODIFIED_SEASON="$(
+                echo "$SEASON_OBJECT" |
+                jq '.monitored = false'
+            )"
+
+            if api_put_json \
+                "/api/v3/season/${SEASON_ID}" \
+                "$MODIFIED_SEASON" \
+                >/dev/null 2>&1; then
+                log "INFO" \
+                    "Season unmonitored: " \
+                    "${SERIES_TITLE} Season ${SEASON_NUMBER}"
+            else
+                log "ERROR" \
+                    "Failed to unmonitor " \
+                    "${SERIES_TITLE} Season ${SEASON_NUMBER} " \
+                    "(season ID ${SEASON_ID})"
+            fi
+        done
     fi
+fi
 done
 
 ###############################################################################
