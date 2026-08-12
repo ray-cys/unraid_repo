@@ -1,0 +1,1386 @@
+#!/bin/bash
+
+###############################################################################
+# Sonarr - Plex Delete Sync
+#
+# PURPOSE
+# -------
+# Detect media files previously known to Sonarr that have subsequently been
+# deleted, for example through Plex.
+#
+# When a genuine deletion is confirmed:
+#
+#   Episode -> unmonitored
+#
+# If an entire season appears to have been intentionally emptied:
+#
+#   Season -> unmonitored
+#
+# The SERIES itself is NEVER automatically unmonitored.
+#
+# Designed for:
+#   Unraid User Scripts
+#   Sonarr v4+
+#
+###############################################################################
+
+set -uo pipefail
+
+###############################################################################
+# CONFIGURATION
+###############################################################################
+
+# ---------------------------------------------------------------------------
+# Sonarr
+# ---------------------------------------------------------------------------
+
+SONARR_URL="http://192.168.1.100:8989"
+
+SONARR_API_KEY="PUT_YOUR_SONARR_API_KEY_HERE"
+
+
+# ---------------------------------------------------------------------------
+# State / logging
+# ---------------------------------------------------------------------------
+
+STATE_DIR="/mnt/user/appdata/sonarr-delete-monitor"
+
+STATE_FILE="${STATE_DIR}/state.json"
+
+STATE_BACKUP="${STATE_DIR}/state.json.bak"
+
+LOG_FILE="${STATE_DIR}/sonarr-delete-monitor.log"
+
+LOCK_FILE="${STATE_DIR}/sonarr-delete-monitor.lock"
+
+
+# ---------------------------------------------------------------------------
+# Safety
+# ---------------------------------------------------------------------------
+
+# FIRST RUN:
+#
+# Keep this TRUE.
+#
+# The script will detect and log what it WOULD do, but will not change Sonarr.
+#
+# Once you have verified the logs:
+#
+# DRY_RUN=false
+#
+DRY_RUN=true
+
+
+# ---------------------------------------------------------------------------
+# Verification
+# ---------------------------------------------------------------------------
+
+# Number of refresh/verification passes performed during one execution.
+#
+# 2 is recommended.
+#
+VERIFICATION_PASSES=2
+
+
+# Seconds between verification passes.
+#
+# 60 seconds is normally sufficient.
+#
+VERIFICATION_DELAY=60
+
+
+# ---------------------------------------------------------------------------
+# Season handling
+# ---------------------------------------------------------------------------
+
+# Automatically unmonitor a season when all episodes that were previously
+# downloaded have disappeared AND no monitored episodes remain in that season.
+#
+# This protects against accidentally unmonitoring a partially downloaded
+# season.
+#
+UNMONITOR_SEASON=true
+
+
+# NEVER enable this unless you explicitly want entire series automatically
+# unmonitored.
+#
+# Recommended:
+#
+UNMONITOR_SERIES=false
+
+
+# ---------------------------------------------------------------------------
+# Refresh behavior
+# ---------------------------------------------------------------------------
+
+# Force Sonarr to perform a RefreshSeries before checking deletions.
+#
+# Recommended TRUE because this makes the script independent of Sonarr's
+# normal scheduled disk scan.
+#
+FORCE_REFRESH=true
+
+
+# Only refresh monitored series.
+#
+# TRUE is recommended to reduce API/IO workload.
+#
+REFRESH_MONITORED_SERIES_ONLY=true
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+# Maximum log size before rotation.
+#
+MAX_LOG_SIZE_MB=10
+
+# Number of rotated logs to keep.
+#
+MAX_LOG_FILES=5
+
+
+###############################################################################
+# END CONFIGURATION
+###############################################################################
+
+
+###############################################################################
+# FUNCTIONS - LOGGING
+###############################################################################
+
+log() {
+
+    local level="$1"
+    shift
+
+    local message="$*"
+
+    local timestamp
+
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+
+    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+}
+
+
+###############################################################################
+# LOG ROTATION
+###############################################################################
+
+rotate_log() {
+
+    [[ ! -f "$LOG_FILE" ]] && return 0
+
+    local size_bytes
+
+    size_bytes="$(stat -c '%s' "$LOG_FILE" 2>/dev/null || echo 0)"
+
+    local max_bytes
+
+    max_bytes=$((MAX_LOG_SIZE_MB * 1024 * 1024))
+
+    if (( size_bytes < max_bytes )); then
+        return 0
+    fi
+
+    log "INFO" "Rotating log file."
+
+    local i
+
+    for ((i=MAX_LOG_FILES-1; i>=1; i--)); do
+
+        if [[ -f "${LOG_FILE}.${i}" ]]; then
+            mv -f "${LOG_FILE}.${i}" "${LOG_FILE}.$((i+1))"
+        fi
+
+    done
+
+    mv -f "$LOG_FILE" "${LOG_FILE}.1"
+
+    touch "$LOG_FILE"
+}
+
+
+###############################################################################
+# INITIALIZATION
+###############################################################################
+
+mkdir -p "$STATE_DIR"
+
+touch "$LOG_FILE"
+
+rotate_log
+
+
+###############################################################################
+# DEPENDENCY CHECK
+###############################################################################
+
+if ! command -v curl >/dev/null 2>&1; then
+
+    log "ERROR" "curl is required."
+
+    exit 1
+
+fi
+
+
+if ! command -v jq >/dev/null 2>&1; then
+
+    log "ERROR" "jq is required."
+
+    exit 1
+
+fi
+
+
+###############################################################################
+# CONFIG VALIDATION
+###############################################################################
+
+if [[ "$SONARR_API_KEY" == "PUT_YOUR_SONARR_API_KEY_HERE" ]]; then
+
+    log "ERROR" "Sonarr API key has not been configured."
+
+    exit 1
+
+fi
+
+
+if [[ -z "$SONARR_URL" ]]; then
+
+    log "ERROR" "SONARR_URL is empty."
+
+    exit 1
+
+fi
+
+
+if (( VERIFICATION_PASSES < 2 )); then
+
+    log "ERROR" "VERIFICATION_PASSES must be at least 2."
+
+    exit 1
+
+fi
+
+
+###############################################################################
+# LOCK
+###############################################################################
+
+if [[ -e "$LOCK_FILE" ]]; then
+
+    OLD_PID="$(cat "$LOCK_FILE" 2>/dev/null || true)"
+
+    if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+
+        log "WARNING" \
+            "Another instance appears to be running. PID=${OLD_PID}"
+
+        exit 0
+
+    fi
+
+    log "WARNING" "Stale lock detected. Removing it."
+
+    rm -f "$LOCK_FILE"
+
+fi
+
+
+echo "$$" > "$LOCK_FILE"
+
+
+cleanup() {
+
+    rm -f "$LOCK_FILE"
+
+}
+
+
+trap cleanup EXIT
+
+
+###############################################################################
+# STATE INITIALIZATION
+###############################################################################
+
+if [[ ! -f "$STATE_FILE" ]]; then
+
+    log "INFO" "Creating initial state file."
+
+    cat > "$STATE_FILE" <<'EOF'
+{
+  "version": 2,
+  "last_run": null,
+  "episodes": {}
+}
+EOF
+
+fi
+
+
+###############################################################################
+# STATE VALIDATION
+###############################################################################
+
+if ! jq empty "$STATE_FILE" >/dev/null 2>&1; then
+
+    log "ERROR" "State file contains invalid JSON."
+
+    exit 1
+
+fi
+
+
+###############################################################################
+# BACKUP STATE
+###############################################################################
+
+cp -f "$STATE_FILE" "$STATE_BACKUP"
+
+
+###############################################################################
+# API FUNCTIONS
+###############################################################################
+
+api_get() {
+
+    local endpoint="$1"
+
+    curl \
+        --silent \
+        --show-error \
+        --fail \
+        --connect-timeout 10 \
+        --max-time 120 \
+        -H "X-Api-Key: ${SONARR_API_KEY}" \
+        -H "Accept: application/json" \
+        "${SONARR_URL}${endpoint}"
+}
+
+
+api_post_json() {
+
+    local endpoint="$1"
+    local payload="$2"
+
+    curl \
+        --silent \
+        --show-error \
+        --fail \
+        --connect-timeout 10 \
+        --max-time 120 \
+        -X POST \
+        -H "X-Api-Key: ${SONARR_API_KEY}" \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json" \
+        --data "$payload" \
+        "${SONARR_URL}${endpoint}"
+}
+
+
+api_put_json() {
+
+    local endpoint="$1"
+    local payload="$2"
+
+    curl \
+        --silent \
+        --show-error \
+        --fail \
+        --connect-timeout 10 \
+        --max-time 120 \
+        -X PUT \
+        -H "X-Api-Key: ${SONARR_API_KEY}" \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json" \
+        --data "$payload" \
+        "${SONARR_URL}${endpoint}"
+}
+
+
+###############################################################################
+# SONARR CONNECTIVITY
+###############################################################################
+
+log "INFO" "Testing Sonarr connection."
+
+SYSTEM_JSON="$(api_get "/api/v3/system/status" 2>/dev/null)"
+
+if [[ -z "$SYSTEM_JSON" ]] || ! echo "$SYSTEM_JSON" | jq empty >/dev/null 2>&1; then
+
+    log "ERROR" "Unable to communicate with Sonarr."
+
+    exit 1
+
+fi
+
+
+SONARR_VERSION="$(echo "$SYSTEM_JSON" |
+    jq -r '.version // "unknown"')"
+
+
+log "INFO" "Connected to Sonarr version ${SONARR_VERSION}."
+
+
+###############################################################################
+# COMMAND HELPERS
+###############################################################################
+
+get_command_status() {
+
+    local command_id="$1"
+
+    api_get "/api/v3/command/${command_id}" 2>/dev/null
+
+}
+
+
+wait_for_command() {
+
+    local command_id="$1"
+
+    local timeout_seconds="${2:-300}"
+
+    local start_time
+
+    start_time="$(date +%s)"
+
+
+    while true; do
+
+        local command_json
+
+        command_json="$(get_command_status "$command_id")"
+
+
+        if [[ -z "$command_json" ]]; then
+
+            log "ERROR" \
+                "Unable to retrieve Sonarr command ${command_id}."
+
+            return 1
+
+        fi
+
+
+        local status
+
+        status="$(echo "$command_json" |
+            jq -r '.status // "unknown"')"
+
+
+        case "$status" in
+
+            completed)
+
+                return 0
+                ;;
+
+            failed)
+
+                log "ERROR" \
+                    "Sonarr command ${command_id} failed."
+
+                return 1
+                ;;
+
+            aborted)
+
+                log "ERROR" \
+                    "Sonarr command ${command_id} was aborted."
+
+                return 1
+                ;;
+
+        esac
+
+
+        local now
+
+        now="$(date +%s)"
+
+
+        if (( now - start_time >= timeout_seconds )); then
+
+            log "ERROR" \
+                "Timed out waiting for Sonarr command ${command_id}."
+
+            return 1
+
+        fi
+
+
+        sleep 5
+
+    done
+
+}
+
+
+###############################################################################
+# REFRESH SERIES
+###############################################################################
+
+refresh_series() {
+
+    local series_id="$1"
+
+    local series_title="$2"
+
+
+    if [[ "$FORCE_REFRESH" != "true" ]]; then
+
+        return 0
+
+    fi
+
+
+    log "INFO" \
+        "Requesting Sonarr refresh: ${series_title} [${series_id}]"
+
+
+    local payload
+
+    payload="$(jq -cn \
+        --argjson id "$series_id" \
+        '{
+            name: "RescanSeries",
+            seriesId: $id
+        }'
+    )"
+
+
+    local response
+
+    response="$(api_post_json "/api/v3/command" "$payload" 2>/dev/null)"
+
+
+    if [[ -z "$response" ]]; then
+
+        log "ERROR" \
+            "Failed to submit RescanSeries for ${series_title}."
+
+        return 1
+
+    fi
+
+
+    local command_id
+
+    command_id="$(echo "$response" |
+        jq -r '.id // empty')"
+
+
+    if [[ -z "$command_id" ]]; then
+
+        log "ERROR" \
+            "Sonarr did not return a command ID for ${series_title}."
+
+        return 1
+
+    fi
+
+
+    if wait_for_command "$command_id" 600; then
+
+        log "INFO" \
+            "Refresh completed: ${series_title}"
+
+        return 0
+
+    fi
+
+
+    return 1
+
+}
+
+
+###############################################################################
+# GET SERIES
+###############################################################################
+
+log "INFO" "Retrieving Sonarr series."
+
+SERIES_JSON="$(api_get "/api/v3/series" 2>/dev/null)"
+
+
+if [[ -z "$SERIES_JSON" ]] ||
+   ! echo "$SERIES_JSON" | jq empty >/dev/null 2>&1; then
+
+    log "ERROR" "Unable to retrieve Sonarr series."
+
+    exit 1
+
+fi
+
+
+SERIES_COUNT="$(echo "$SERIES_JSON" | jq 'length')"
+
+
+log "INFO" "Found ${SERIES_COUNT} series."
+
+
+###############################################################################
+# STATE WORKING COPY
+###############################################################################
+
+WORKING_STATE="${STATE_FILE}.working.$$"
+
+cp "$STATE_FILE" "$WORKING_STATE"
+
+
+###############################################################################
+# MAIN SERIES LOOP
+###############################################################################
+
+echo "$SERIES_JSON" |
+jq -c '.[]' |
+while read -r SERIES; do
+
+
+    SERIES_ID="$(echo "$SERIES" |
+        jq -r '.id')"
+
+
+    SERIES_TITLE="$(echo "$SERIES" |
+        jq -r '.title // "Unknown"')"
+
+
+    SERIES_MONITORED="$(echo "$SERIES" |
+        jq -r '.monitored // false')"
+
+
+    if [[ "$REFRESH_MONITORED_SERIES_ONLY" == "true" ]] &&
+       [[ "$SERIES_MONITORED" != "true" ]]; then
+
+        continue
+
+    fi
+
+
+    ###########################################################################
+    # REFRESH
+    ###########################################################################
+
+    if ! refresh_series "$SERIES_ID" "$SERIES_TITLE"; then
+
+        log "ERROR" \
+            "Skipping ${SERIES_TITLE} because refresh failed."
+
+        continue
+
+    fi
+
+
+    ###########################################################################
+    # FIRST SNAPSHOT
+    ###########################################################################
+
+    EPISODES_A="$(api_get \
+        "/api/v3/episode?seriesId=${SERIES_ID}" \
+        2>/dev/null)"
+
+
+    if [[ -z "$EPISODES_A" ]] ||
+       ! echo "$EPISODES_A" | jq empty >/dev/null 2>&1; then
+
+        log "ERROR" \
+            "Unable to retrieve episodes for ${SERIES_TITLE}."
+
+        continue
+
+    fi
+
+
+    ###########################################################################
+    # UPDATE STATE WITH CURRENT FILES
+    #
+    # This is the baseline for future deletion detection.
+    ###########################################################################
+
+    echo "$EPISODES_A" |
+    jq -c '.[]' |
+    while read -r EPISODE; do
+
+        EPISODE_ID="$(echo "$EPISODE" |
+            jq -r '.id')"
+
+
+        HAS_FILE="$(echo "$EPISODE" |
+            jq -r '.hasFile // false')"
+
+
+        FILE_ID="$(echo "$EPISODE" |
+            jq -r '.episodeFileId // 0')"
+
+
+        if [[ "$HAS_FILE" == "true" ]] &&
+           [[ "$FILE_ID" != "0" ]]; then
+
+
+            SEASON_NUMBER="$(echo "$EPISODE" |
+                jq -r '.seasonNumber')"
+
+
+            EPISODE_NUMBER="$(echo "$EPISODE" |
+                jq -r '.episodeNumber')"
+
+
+            EPISODE_TITLE="$(echo "$EPISODE" |
+                jq -r '.title // "Unknown"')"
+
+
+            NOW="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+
+
+            jq \
+                --arg id "$EPISODE_ID" \
+                --arg seriesId "$SERIES_ID" \
+                --arg seriesTitle "$SERIES_TITLE" \
+                --arg season "$SEASON_NUMBER" \
+                --arg episode "$EPISODE_NUMBER" \
+                --arg title "$EPISODE_TITLE" \
+                --arg fileId "$FILE_ID" \
+                --arg timestamp "$NOW" \
+                '
+                .episodes[$id] =
+                (
+                    (.episodes[$id] // {})
+                    +
+                    {
+                        episodeId: ($id | tonumber),
+                        seriesId: ($seriesId | tonumber),
+                        seriesTitle: $seriesTitle,
+                        seasonNumber: ($season | tonumber),
+                        episodeNumber: ($episode | tonumber),
+                        episodeTitle: $title,
+                        lastKnownFileId: ($fileId | tonumber),
+                        lastSeenWithFile: $timestamp,
+                        missing: false,
+                        deletionVerified: false,
+                        actionTaken: false
+                    }
+                )
+                ' \
+                "$WORKING_STATE" \
+                > "${WORKING_STATE}.next"
+
+
+            mv -f \
+                "${WORKING_STATE}.next" \
+                "$WORKING_STATE"
+
+        fi
+
+    done
+
+
+    ###########################################################################
+    # VERIFICATION PASSES
+    ###########################################################################
+
+    for ((PASS=1; PASS<=VERIFICATION_PASSES; PASS++)); do
+
+
+        log "INFO" \
+            "Deletion verification pass ${PASS}/${VERIFICATION_PASSES}: ${SERIES_TITLE}"
+
+
+        if (( PASS > 1 )); then
+
+            sleep "$VERIFICATION_DELAY"
+
+
+            if ! refresh_series "$SERIES_ID" "$SERIES_TITLE"; then
+
+                log "ERROR" \
+                    "Verification refresh failed for ${SERIES_TITLE}."
+
+                break
+
+            fi
+
+        fi
+
+
+        EPISODES_CURRENT="$(api_get \
+            "/api/v3/episode?seriesId=${SERIES_ID}" \
+            2>/dev/null)"
+
+
+        if [[ -z "$EPISODES_CURRENT" ]] ||
+           ! echo "$EPISODES_CURRENT" | jq empty >/dev/null 2>&1; then
+
+            log "ERROR" \
+                "Unable to retrieve verification data for ${SERIES_TITLE}."
+
+            break
+
+        fi
+
+
+        #######################################################################
+        # CHECK STATE RECORDS FOR THIS SERIES
+        #######################################################################
+
+        jq -r \
+            --arg sid "$SERIES_ID" \
+            '
+            .episodes
+            | to_entries[]
+            | select((.value.seriesId | tostring) == $sid)
+            | .key
+            ' \
+            "$WORKING_STATE" |
+        while read -r EPISODE_ID; do
+
+
+            [[ -z "$EPISODE_ID" ]] && continue
+
+
+            ###################################################################
+            # Skip already-handled records.
+            ###################################################################
+
+            ACTION_TAKEN="$(jq -r \
+                --arg id "$EPISODE_ID" \
+                '.episodes[$id].actionTaken // false' \
+                "$WORKING_STATE")"
+
+
+            if [[ "$ACTION_TAKEN" == "true" ]]; then
+
+                continue
+
+            fi
+
+
+            ###################################################################
+            # Previous file ID
+            ###################################################################
+
+            OLD_FILE_ID="$(jq -r \
+                --arg id "$EPISODE_ID" \
+                '.episodes[$id].lastKnownFileId // 0' \
+                "$WORKING_STATE")"
+
+
+            if [[ "$OLD_FILE_ID" == "0" ]]; then
+
+                continue
+
+            fi
+
+
+            ###################################################################
+            # Find current episode
+            ###################################################################
+
+            CURRENT_EPISODE="$(
+                echo "$EPISODES_CURRENT" |
+                jq -c \
+                    --argjson id "$EPISODE_ID" \
+                    '.[] | select(.id == $id)'
+            )"
+
+
+            if [[ -z "$CURRENT_EPISODE" ]]; then
+
+                log "WARNING" \
+                    "Episode ${EPISODE_ID} no longer exists in Sonarr. Skipping."
+
+                continue
+
+            fi
+
+
+            CURRENT_HAS_FILE="$(echo "$CURRENT_EPISODE" |
+                jq -r '.hasFile // false')"
+
+
+            CURRENT_FILE_ID="$(echo "$CURRENT_EPISODE" |
+                jq -r '.episodeFileId // 0')"
+
+
+            CURRENT_MONITORED="$(echo "$CURRENT_EPISODE" |
+                jq -r '.monitored // false')"
+
+
+            SEASON_NUMBER="$(echo "$CURRENT_EPISODE" |
+                jq -r '.seasonNumber')"
+
+
+            EPISODE_NUMBER="$(echo "$CURRENT_EPISODE" |
+                jq -r '.episodeNumber')"
+
+
+            EPISODE_TITLE="$(echo "$CURRENT_EPISODE" |
+                jq -r '.title // "Unknown"')"
+
+
+            ###################################################################
+            # File is back.
+            #
+            # This can happen if Sonarr imported/replaced the file between
+            # verification passes.
+            ###################################################################
+
+            if [[ "$CURRENT_HAS_FILE" == "true" ]] &&
+               [[ "$CURRENT_FILE_ID" != "0" ]]; then
+
+                continue
+
+            fi
+
+
+            ###################################################################
+            # Episode must still be monitored.
+            #
+            # If something else already unmonitored it, we don't touch it.
+            ###################################################################
+
+            if [[ "$CURRENT_MONITORED" != "true" ]]; then
+
+                continue
+
+            fi
+
+
+            ###################################################################
+            # Verify the OLD episode file directly.
+            #
+            # This is the extra safety layer.
+            ###################################################################
+
+            OLD_FILE_JSON="$(api_get \
+                "/api/v3/episodefile/${OLD_FILE_ID}" \
+                2>/dev/null || true)"
+
+
+            OLD_FILE_EXISTS=false
+
+
+            if [[ -n "$OLD_FILE_JSON" ]] &&
+               echo "$OLD_FILE_JSON" | jq empty >/dev/null 2>&1; then
+
+                OLD_FILE_EXISTS=true
+
+            fi
+
+
+            ###################################################################
+            # If Sonarr can still retrieve the old EpisodeFile object,
+            # do NOT treat this as a confirmed deletion.
+            ###################################################################
+
+            if [[ "$OLD_FILE_EXISTS" == "true" ]]; then
+
+                log "INFO" \
+                    "EpisodeFile ${OLD_FILE_ID} still exists in Sonarr. " \
+                    "Not treating ${SERIES_TITLE} S${SEASON_NUMBER}E${EPISODE_NUMBER} " \
+                    "as deleted."
+
+                continue
+
+            fi
+
+
+            ###################################################################
+            # Deletion verified for this pass.
+            ###################################################################
+
+            log "WARNING" \
+                "Verified missing EpisodeFile ${OLD_FILE_ID}: " \
+                "${SERIES_TITLE} S${SEASON_NUMBER}E${EPISODE_NUMBER} - ${EPISODE_TITLE}"
+
+
+            ###################################################################
+            # Only act on final verification pass.
+            ###################################################################
+
+            if (( PASS < VERIFICATION_PASSES )); then
+
+                continue
+
+            fi
+
+
+            ###################################################################
+            # DRY RUN
+            ###################################################################
+
+            if [[ "$DRY_RUN" == "true" ]]; then
+
+                log "WARNING" \
+                    "DRY RUN: Would unmonitor " \
+                    "${SERIES_TITLE} S${SEASON_NUMBER}E${EPISODE_NUMBER}"
+
+                continue
+
+            fi
+
+
+            ###################################################################
+            # UNMONITOR EPISODE
+            ###################################################################
+
+            MODIFIED_EPISODE="$(
+                echo "$CURRENT_EPISODE" |
+                jq '.monitored = false'
+            )"
+
+
+            if api_put_json \
+                "/api/v3/episode/${EPISODE_ID}" \
+                "$MODIFIED_EPISODE" \
+                >/dev/null 2>&1; then
+
+
+                log "INFO" \
+                    "Episode unmonitored: " \
+                    "${SERIES_TITLE} S${SEASON_NUMBER}E${EPISODE_NUMBER}"
+
+
+                NOW="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+
+
+                jq \
+                    --arg id "$EPISODE_ID" \
+                    --arg timestamp "$NOW" \
+                    '
+                    .episodes[$id].missing = true |
+                    .episodes[$id].deletionVerified = true |
+                    .episodes[$id].actionTaken = true |
+                    .episodes[$id].actionTimestamp = $timestamp |
+                    .episodes[$id].action = "episode_unmonitored"
+                    ' \
+                    "$WORKING_STATE" \
+                    > "${WORKING_STATE}.next"
+
+
+                mv -f \
+                    "${WORKING_STATE}.next" \
+                    "$WORKING_STATE"
+
+
+            else
+
+                log "ERROR" \
+                    "Failed to unmonitor " \
+                    "${SERIES_TITLE} S${SEASON_NUMBER}E${EPISODE_NUMBER}"
+
+            fi
+
+
+        done
+
+    done
+
+
+    ###########################################################################
+    # SEASON CHECK
+    ###########################################################################
+
+    if [[ "$UNMONITOR_SEASON" == "true" ]]; then
+
+
+        log "INFO" \
+            "Checking seasons for ${SERIES_TITLE}"
+
+
+        SEASONS_JSON="$(api_get \
+            "/api/v3/season?seriesId=${SERIES_ID}" \
+            2>/dev/null)"
+
+
+        if [[ -z "$SEASONS_JSON" ]] ||
+           ! echo "$SEASONS_JSON" | jq empty >/dev/null 2>&1; then
+
+            log "ERROR" \
+                "Unable to retrieve seasons for ${SERIES_TITLE}"
+
+        else
+
+
+            echo "$SEASONS_JSON" |
+            jq -r '
+                .[]
+                | select(.seasonNumber > 0)
+                | .seasonNumber
+            ' |
+            while read -r SEASON_NUMBER; do
+
+
+                [[ -z "$SEASON_NUMBER" ]] && continue
+
+
+                ################################################################
+                # Get current episodes in season.
+                ################################################################
+
+                SEASON_EPISODES="$(
+                    echo "$EPISODES_CURRENT" |
+                    jq -c \
+                        --argjson season "$SEASON_NUMBER" \
+                        '[.[] | select(.seasonNumber == $season)]'
+                )"
+
+
+                ################################################################
+                # Was there at least one previously downloaded episode?
+                ################################################################
+
+                PREVIOUSLY_DOWNLOADED="$(
+                    jq -r \
+                        --arg sid "$SERIES_ID" \
+                        --arg season "$SEASON_NUMBER" '
+                        [
+                            .episodes[]
+                            | select(
+                                (.seriesId | tostring) == $sid
+                                and
+                                (.seasonNumber | tostring) == $season
+                                and
+                                (.lastKnownFileId // 0) != 0
+                            )
+                        ]
+                        | length
+                        ' \
+                        "$WORKING_STATE"
+                )"
+
+
+                if (( PREVIOUSLY_DOWNLOADED == 0 )); then
+
+                    continue
+
+                fi
+
+
+                ################################################################
+                # Count current files.
+                ################################################################
+
+                CURRENT_FILE_COUNT="$(
+                    echo "$SEASON_EPISODES" |
+                    jq '
+                        [
+                            .[]
+                            | select(.hasFile == true)
+                        ]
+                        | length
+                    '
+                )"
+
+
+                if (( CURRENT_FILE_COUNT != 0 )); then
+
+                    continue
+
+                fi
+
+
+                ################################################################
+                # Count monitored episodes.
+                #
+                # If monitored episodes remain, this is likely NOT an
+                # intentionally deleted complete season.
+                ################################################################
+
+                MONITORED_COUNT="$(
+                    echo "$SEASON_EPISODES" |
+                    jq '
+                        [
+                            .[]
+                            | select(.monitored == true)
+                        ]
+                        | length
+                    '
+                )"
+
+
+                if (( MONITORED_COUNT != 0 )); then
+
+                    log "INFO" \
+                        "Season ${SEASON_NUMBER}: no files remain, " \
+                        "${MONITORED_COUNT} monitored episodes remain. " \
+                        "Leaving season monitored."
+
+                    continue
+
+                fi
+
+
+                ################################################################
+                # Retrieve season object.
+                ################################################################
+
+                SEASON_OBJECT="$(
+                    echo "$SEASONS_JSON" |
+                    jq -c \
+                        --argjson season "$SEASON_NUMBER" \
+                        '.[] | select(.seasonNumber == $season)'
+                )"
+
+
+                [[ -z "$SEASON_OBJECT" ]] && continue
+
+
+                SEASON_MONITORED="$(
+                    echo "$SEASON_OBJECT" |
+                    jq -r '.monitored // false'
+                )"
+
+
+                if [[ "$SEASON_MONITORED" != "true" ]]; then
+
+                    continue
+
+                fi
+
+
+                SEASON_ID="$(
+                    echo "$SEASON_OBJECT" |
+                    jq -r '.id'
+                )"
+
+
+                ################################################################
+                # At this point:
+                #
+                # - At least one file previously existed
+                # - No files currently exist
+                # - No monitored episodes remain
+                #
+                # This is our conservative "season emptied" condition.
+                ################################################################
+
+                if [[ "$DRY_RUN" == "true" ]]; then
+
+                    log "WARNING" \
+                        "DRY RUN: Would unmonitor " \
+                        "${SERIES_TITLE} Season ${SEASON_NUMBER}"
+
+                else
+
+
+                    MODIFIED_SEASON="$(
+                        echo "$SEASON_OBJECT" |
+                        jq '.monitored = false'
+                    )"
+
+
+                    if api_put_json \
+                        "/api/v3/season/${SEASON_ID}" \
+                        "$MODIFIED_SEASON" \
+                        >/dev/null 2>&1; then
+
+
+                        log "INFO" \
+                            "Season unmonitored: " \
+                            "${SERIES_TITLE} Season ${SEASON_NUMBER}"
+
+                    else
+
+                        log "ERROR" \
+                            "Failed to unmonitor " \
+                            "${SERIES_TITLE} Season ${SEASON_NUMBER}"
+
+                    fi
+
+                fi
+
+            done
+
+        fi
+
+    fi
+
+
+done
+
+
+###############################################################################
+# SERIES-LEVEL LOGIC
+###############################################################################
+
+if [[ "$UNMONITOR_SERIES" == "true" ]]; then
+
+    log "WARNING" \
+        "UNMONITOR_SERIES=true. Series-level handling is enabled."
+
+    # Intentionally not implemented by default.
+    #
+    # This script's production-safe behavior is to NEVER automatically
+    # unmonitor the series.
+    #
+    # Set this manually in Sonarr if required.
+
+fi
+
+
+###############################################################################
+# UPDATE LAST RUN
+###############################################################################
+
+RUN_TIMESTAMP="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+
+
+jq \
+    --arg timestamp "$RUN_TIMESTAMP" \
+    '.last_run = $timestamp' \
+    "$WORKING_STATE" \
+    > "${WORKING_STATE}.final"
+
+
+if [[ $? -ne 0 ]]; then
+
+    log "ERROR" \
+        "Failed to update state file."
+
+    rm -f "$WORKING_STATE" "$WORKING_STATE.final"
+
+    exit 1
+
+fi
+
+
+###############################################################################
+# ATOMIC STATE REPLACEMENT
+###############################################################################
+
+mv -f \
+    "${WORKING_STATE}.final" \
+    "$STATE_FILE"
+
+
+rm -f "$WORKING_STATE"
+
+
+###############################################################################
+# SUMMARY
+###############################################################################
+
+STATE_COUNT="$(
+    jq '.episodes | length' "$STATE_FILE" 2>/dev/null || echo "unknown"
+)"
+
+
+log "INFO" \
+    "Run completed successfully."
+
+log "INFO" \
+    "Tracked episode records: ${STATE_COUNT}"
+
+log "INFO" \
+    "------------------------------------------------------------"
+
+
+exit 0
