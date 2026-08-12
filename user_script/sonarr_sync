@@ -37,6 +37,13 @@ UNMONITOR_SEASON=true
 # download history in its state file.
 UNMONITOR_SERIES=false
 
+# Sonarr tags are series-level only.  The first tag means one or more seasons
+# of that series were unmonitored after a Plex deletion; it does NOT mean that
+# the entire series was deleted.  The second tag is added only if this script
+# unmonitors the series itself.  Existing series tags are always preserved.
+PLEX_DELETED_SEASON_TAG="plex-deleted-season"
+PLEX_DELETED_SERIES_TAG="plex-deleted-series"
+
 # API-only detection cannot see a filesystem deletion until Sonarr has scanned
 # it.  Leave this false for the fast mode: the script uses Sonarr's existing
 # database state and adds season unmonitoring after Sonarr's normal scan has
@@ -80,6 +87,10 @@ EPISODES_CONFIRMED=0
 EPISODE_ACTIONS=0
 SEASON_ACTIONS=0
 SERIES_ACTIONS=0
+TAGGED_SERIES_ACTIONS=0
+TAG_CATALOG=''
+PLEX_DELETED_SEASON_TAG_ID=''
+PLEX_DELETED_SERIES_TAG_ID=''
 
 log() {
     local level="$1"
@@ -235,6 +246,50 @@ api_put_json() {
 
 api_post_json() {
     api_request POST "$1" "$2"
+}
+
+# Load the small tag catalogue once in live mode.  Dry-run deliberately skips
+# it: previews must not create tags or otherwise modify Sonarr.
+load_tag_catalog() {
+    local tags
+    tags="$(api_get_json "/api/v3/tag")" || return 1
+    if ! jq -e 'type == "array"' >/dev/null 2>&1 <<< "$tags"; then
+        log ERROR "Sonarr /tag did not return an array."
+        return 1
+    fi
+    TAG_CATALOG="$tags"
+}
+
+# Set the named global variable to an existing tag ID or create the tag.
+# A failed create is followed by one catalogue refresh to tolerate another
+# Sonarr client creating the same tag at the same time.
+ensure_tag_id() {
+    local label="$1"
+    local destination="$2"
+    local id payload created
+
+    id="$(jq -r --arg label "$label" 'first(.[] | select(.label == $label) | .id) // empty' <<< "$TAG_CATALOG")"
+    if [[ ! "$id" =~ ^[0-9]+$ ]]; then
+        payload="$(jq -cn --arg label "$label" '{label: $label}')"
+        created="$(api_post_json "/api/v3/tag" "$payload" || true)"
+        id="$(jq -r '.id // empty' <<< "$created" 2>/dev/null || true)"
+
+        if [[ ! "$id" =~ ^[0-9]+$ ]]; then
+            load_tag_catalog || return 1
+            id="$(jq -r --arg label "$label" 'first(.[] | select(.label == $label) | .id) // empty' <<< "$TAG_CATALOG")"
+            [[ "$id" =~ ^[0-9]+$ ]] || {
+                log ERROR "Could not create or find Sonarr tag '$label'."
+                return 1
+            }
+        else
+            TAG_CATALOG="$(jq --arg label "$label" --argjson id "$id" '
+                if any(.[]; .id == $id) then . else . + [{id: $id, label: $label}] end
+            ' <<< "$TAG_CATALOG")" || return 1
+            log INFO "Created Sonarr tag '$label'."
+        fi
+    fi
+
+    printf -v "$destination" '%s' "$id"
 }
 
 # Submit one all-library RescanSeries command.  Omitting seriesId is deliberate:
@@ -583,6 +638,12 @@ command -v jq >/dev/null 2>&1 || die "jq is required."
     die "UNMONITOR_SEASON must be true or false."
 [[ "$UNMONITOR_SERIES" == true || "$UNMONITOR_SERIES" == false ]] ||
     die "UNMONITOR_SERIES must be true or false."
+[[ "$PLEX_DELETED_SEASON_TAG" =~ ^[a-z0-9-]+$ ]] ||
+    die "PLEX_DELETED_SEASON_TAG may contain only lowercase letters, numbers, and hyphens."
+[[ "$PLEX_DELETED_SERIES_TAG" =~ ^[a-z0-9-]+$ ]] ||
+    die "PLEX_DELETED_SERIES_TAG may contain only lowercase letters, numbers, and hyphens."
+[[ "$PLEX_DELETED_SEASON_TAG" != "$PLEX_DELETED_SERIES_TAG" ]] ||
+    die "PLEX_DELETED_SEASON_TAG and PLEX_DELETED_SERIES_TAG must be different."
 [[ "$TRIGGER_SONARR_RESCAN" == true || "$TRIGGER_SONARR_RESCAN" == false ]] ||
     die "TRIGGER_SONARR_RESCAN must be true or false."
 [[ "$CONFIRMATION_RUNS" =~ ^[0-9]+$ ]] && (( CONFIRMATION_RUNS >= 2 )) ||
@@ -647,6 +708,13 @@ SYSTEM="$(api_get_json "/api/v3/system/status")" || {
     die "Cannot contact Sonarr; state was not changed."
 }
 log INFO "Connected to Sonarr $(jq -r '.version // "unknown"' <<< "$SYSTEM")."
+
+if [[ "$DRY_RUN" == false ]]; then
+    load_tag_catalog || {
+        ((API_FAILURES += 1))
+        die "Could not load Sonarr tags; state was not changed."
+    }
+fi
 
 if [[ "$TRIGGER_SONARR_RESCAN" == true ]]; then
     RESCAN_ID="$(start_library_rescan)" || {
@@ -812,6 +880,11 @@ while IFS= read -r SERIES_ID; do
         continue
     fi
 
+    ACTION_TAG_LABELS=()
+    (( ACTIVE_COUNT > 0 )) && ACTION_TAG_LABELS+=("$PLEX_DELETED_SEASON_TAG")
+    [[ "$SERIES_ACTION" == true ]] && ACTION_TAG_LABELS+=("$PLEX_DELETED_SERIES_TAG")
+    ACTION_TAG_LABEL_TEXT="$(jq -rn --args '$ARGS.positional | join(", ")' "${ACTION_TAG_LABELS[@]}")"
+
     if [[ "$DRY_RUN" == true ]]; then
         if (( ACTIVE_COUNT > 0 )); then
             log INFO "DRY RUN: would unmonitor season(s) $(jq -r 'join(", ")' <<< "$ACTIVE") for $SERIES_TITLE."
@@ -821,13 +894,35 @@ while IFS= read -r SERIES_ID; do
             log INFO "DRY RUN: would unmonitor series $SERIES_TITLE after all normal seasons are unmonitored."
             ((SERIES_ACTIONS += 1))
         fi
+        log INFO "DRY RUN: would ensure series tag(s) [$ACTION_TAG_LABEL_TEXT] on $SERIES_TITLE."
+        ((TAGGED_SERIES_ACTIONS += 1))
         continue
     fi
 
     # Preserve the full resource and all season values except the selected
-    # season updates.  A series action changes only top-level .monitored.
+    # season updates. A series action changes only top-level .monitored. The
+    # selected audit tags are appended to the existing series-level tags list.
+    ACTION_TAG_IDS='[]'
+    if (( ACTIVE_COUNT > 0 )); then
+        ensure_tag_id "$PLEX_DELETED_SEASON_TAG" PLEX_DELETED_SEASON_TAG_ID || {
+            ((API_FAILURES += 1))
+            log ERROR "Could not prepare '$PLEX_DELETED_SEASON_TAG' for $SERIES_TITLE; no monitoring changes were sent."
+            continue
+        }
+        ACTION_TAG_IDS="$(jq -cn --argjson tags "$ACTION_TAG_IDS" --argjson id "$PLEX_DELETED_SEASON_TAG_ID" '$tags + [$id] | unique')"
+    fi
+    if [[ "$SERIES_ACTION" == true ]]; then
+        ensure_tag_id "$PLEX_DELETED_SERIES_TAG" PLEX_DELETED_SERIES_TAG_ID || {
+            ((API_FAILURES += 1))
+            log ERROR "Could not prepare '$PLEX_DELETED_SERIES_TAG' for $SERIES_TITLE; no monitoring changes were sent."
+            continue
+        }
+        ACTION_TAG_IDS="$(jq -cn --argjson tags "$ACTION_TAG_IDS" --argjson id "$PLEX_DELETED_SERIES_TAG_ID" '$tags + [$id] | unique')"
+    fi
     SERIES_PAYLOAD="$(
-        jq --argjson active "$ACTIVE" --argjson unmonitor_series "$SERIES_ACTION" '
+        jq --argjson active "$ACTIVE" \
+            --argjson unmonitor_series "$SERIES_ACTION" \
+            --argjson action_tags "$ACTION_TAG_IDS" '
             .seasons |= map(
                 .seasonNumber as $season
                 | if ($active | index($season)) != null then
@@ -837,6 +932,8 @@ while IFS= read -r SERIES_ID; do
                   end
             )
             | if $unmonitor_series then .monitored = false else . end
+            | .tags //= []
+            | .tags |= ((. + $action_tags) | unique)
         ' <<< "$DETAIL"
     )"
     if api_put_json "/api/v3/series/$SERIES_ID" "$SERIES_PAYLOAD"; then
@@ -852,6 +949,8 @@ while IFS= read -r SERIES_ID; do
                 die "Could not record series action in temporary state."
             ((SERIES_ACTIONS += 1))
         fi
+        log INFO "Ensured series tag(s) [$ACTION_TAG_LABEL_TEXT] on $SERIES_TITLE."
+        ((TAGGED_SERIES_ACTIONS += 1))
     else
         ((API_FAILURES += 1))
         log ERROR "Season/series update failed for $SERIES_TITLE; it will be retried next run."
@@ -868,7 +967,7 @@ WORK_STATE=""
 
 ACTION_LABEL=applied
 [[ "$DRY_RUN" == true ]] && ACTION_LABEL=would-apply
-log INFO "Summary: series-listed=$SERIES_LISTED, series-scanned=$SERIES_SCANNED, episodes=$EPISODES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$EPISODES_CONFIRMED, episode-actions-$ACTION_LABEL=$EPISODE_ACTIONS, season-actions-$ACTION_LABEL=$SEASON_ACTIONS, series-actions-$ACTION_LABEL=$SERIES_ACTIONS, api-failures=$API_FAILURES."
+log INFO "Summary: series-listed=$SERIES_LISTED, series-scanned=$SERIES_SCANNED, episodes=$EPISODES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$EPISODES_CONFIRMED, episode-actions-$ACTION_LABEL=$EPISODE_ACTIONS, season-actions-$ACTION_LABEL=$SEASON_ACTIONS, series-actions-$ACTION_LABEL=$SERIES_ACTIONS, tagged-series-$ACTION_LABEL=$TAGGED_SERIES_ACTIONS, api-failures=$API_FAILURES."
 
 if (( API_FAILURES > 0 )); then
     log WARNING "Completed with API failures; only successfully retrieved series advanced their confirmation state."
