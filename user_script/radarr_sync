@@ -1,0 +1,720 @@
+#!/usr/bin/env bash
+#
+# Radarr - Plex Delete Sync
+#
+# Once-daily, persistent-state detection for movies that Radarr previously
+# reported as having a file, but now reports as fileless and unmonitored.
+#
+# This script NEVER rescans Radarr, reads media storage, unmonitors a movie,
+# deletes a movie, or changes any tag other than adding PLEX_DELETED_TAG.
+# It relies on Radarr's existing database and its own deletion/unmonitoring
+# policy.  The tag means "previously downloaded here, then observed deleted";
+# the API cannot prove which external application performed that deletion.
+#
+# Requirements: bash 4+, curl, jq.
+
+set -uo pipefail
+IFS=$'\n\t'
+umask 077
+
+###############################################################################
+# CONFIGURATION
+###############################################################################
+
+# No trailing slash.
+RADARR_URL="http://192.168.50.4:7878"
+RADARR_API_KEY="PUT_YOUR_RADARR_API_KEY_HERE"
+
+STATE_DIR="/mnt/user/cloud/logs/radarr_delete_monitor"
+STATE_FILE="$STATE_DIR/state.json"
+STATE_BACKUP="$STATE_DIR/state.json.bak"
+LOG_FILE="$STATE_DIR/delete-monitor.log"
+LOCK_DIR="$STATE_DIR/delete-monitor.lock"
+
+# Keep true for at least two scheduled runs before changing it to false.
+# Dry-run still creates and updates state, but never creates a tag or changes
+# Radarr.  That is necessary for the confirmation counter to work.
+DRY_RUN=true
+CONFIRMATION_RUNS=2
+
+# The label added to a qualifying movie.  Radarr tags are movie-level.
+PLEX_DELETED_TAG="plex-deleted"
+
+# Safety gate: a missing file becomes a candidate only while Radarr also says
+# the movie is unmonitored.  This matches Radarr's "Unmonitor Deleted Movies"
+# behaviour and avoids tagging a temporarily missing file that Radarr still
+# intends to search for.  Leave true for the intended Plex workflow.
+REQUIRE_MOVIE_UNMONITORED=true
+
+# Optional audit evidence.  For qualifying, untagged movies only, query
+# /api/v3/history/movie?movieId=...&eventType=movieFileDeleted and record the
+# newest event in state.json and the log.  It is not a required proof by
+# default because history can be pruned and does not identify Plex as the
+# deleting client.
+#
+# This adds zero History requests when there are no new tag actions.  The cap
+# prevents an unusually large deletion from turning one daily run into a long
+# per-movie API loop.  Any cap-skipped movie remains eligible on the next run.
+INSPECT_RADARR_HISTORY=true
+REQUIRE_HISTORY_DELETE_EVENT=false
+MAX_HISTORY_INSPECTIONS_PER_RUN=50
+
+MAX_LOG_SIZE_MB=10
+MAX_LOG_FILES=5
+HTTP_CONNECT_TIMEOUT=10
+HTTP_MAX_TIME=90
+HTTP_RETRIES=2
+USER_AGENT="Radarr-Delete-Monitor/1.0"
+
+###############################################################################
+# END CONFIGURATION
+###############################################################################
+
+RUN_AT="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+LOCK_HELD=false
+WORK_STATE=""
+MOVIES_FILE=""
+API_FAILURES=0
+HISTORY_FAILURES=0
+MOVIES_LISTED=0
+MOVIES_SCANNED=0
+FILES_PRESENT=0
+FIRST_MISSING=0
+MOVIES_CONFIRMED=0
+HISTORY_INSPECTIONS=0
+HISTORY_DELETE_EVENTS=0
+HISTORY_LIMIT_SKIPS=0
+TAG_ACTIONS=0
+TAG_CATALOG=''
+PLEX_DELETED_TAG_ID=''
+
+log() {
+    local level="$1"
+    shift
+    printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" |
+        tee -a "$LOG_FILE" >&2
+}
+
+die() {
+    log ERROR "$*"
+    exit 1
+}
+
+cleanup() {
+    local status=$?
+    [[ -n "$WORK_STATE" && -f "$WORK_STATE" ]] && rm -f -- "$WORK_STATE"
+    [[ -n "$MOVIES_FILE" && -f "$MOVIES_FILE" ]] && rm -f -- "$MOVIES_FILE"
+    if [[ "$LOCK_HELD" == true ]]; then
+        rm -f -- "$LOCK_DIR/pid"
+        rmdir -- "$LOCK_DIR" 2>/dev/null || true
+    fi
+    trap - EXIT
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+rotate_log() {
+    local bytes i
+    [[ -f "$LOG_FILE" ]] || return 0
+    bytes="$(stat -c '%s' "$LOG_FILE" 2>/dev/null ||
+        stat -f '%z' "$LOG_FILE" 2>/dev/null || printf 0)"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    (( bytes >= MAX_LOG_SIZE_MB * 1024 * 1024 )) || return 0
+
+    rm -f -- "$LOG_FILE.$MAX_LOG_FILES"
+    for (( i=MAX_LOG_FILES-1; i>=1; i-- )); do
+        [[ -f "$LOG_FILE.$i" ]] && mv -f -- "$LOG_FILE.$i" "$LOG_FILE.$((i + 1))"
+    done
+    mv -f -- "$LOG_FILE" "$LOG_FILE.1"
+    : > "$LOG_FILE"
+}
+
+# Temporary files live beside state.json so the final replacement is atomic.
+# Traps remove them during a normal exit.  A forced stop or reboot can prevent
+# that cleanup; remove only this script's old files after taking the lock.
+remove_stale_temp_files() {
+    local file removed=0 nullglob_was_set=false
+    local -a stale_files
+
+    shopt -q nullglob && nullglob_was_set=true
+    shopt -s nullglob
+    stale_files=(
+        "$STATE_DIR"/.state-working.*
+        "$STATE_DIR"/.state-snapshot.*
+        "$STATE_DIR"/.state-history.*
+        "$STATE_DIR"/.state-action.*
+        "$STATE_DIR"/.state-final.*
+        "$STATE_DIR"/.state-backup.*
+        "$STATE_DIR"/.state-initial.*
+        "$STATE_DIR"/.movies.*
+        "$STATE_DIR"/.radarr-body.*
+        "$STATE_DIR"/.radarr-error.*
+    )
+    [[ "$nullglob_was_set" == true ]] || shopt -u nullglob
+
+    for file in "${stale_files[@]}"; do
+        [[ -f "$file" ]] || continue
+        rm -f -- "$file"
+        ((removed += 1))
+    done
+
+    (( removed == 0 )) ||
+        log INFO "Removed $removed stale temporary file(s) from an interrupted previous run."
+}
+
+###############################################################################
+# API: one response body on stdout; useful diagnostics on errors
+###############################################################################
+
+api_request() {
+    local method="$1"
+    local endpoint="$2"
+    local payload="$3"
+    local body err http_status curl_status message
+
+    body="$(mktemp "$STATE_DIR/.radarr-body.XXXXXX")" || return 1
+    err="$(mktemp "$STATE_DIR/.radarr-error.XXXXXX")" || {
+        rm -f -- "$body"
+        return 1
+    }
+
+    if [[ "$method" == GET ]]; then
+        http_status="$(
+            curl --silent --show-error \
+                --connect-timeout "$HTTP_CONNECT_TIMEOUT" \
+                --max-time "$HTTP_MAX_TIME" \
+                --retry "$HTTP_RETRIES" --retry-all-errors \
+                --request GET \
+                --header "X-Api-Key: $RADARR_API_KEY" \
+                --header 'Accept: application/json' \
+                --header "User-Agent: $USER_AGENT" \
+                --output "$body" --write-out '%{http_code}' \
+                "$RADARR_URL$endpoint" 2>"$err"
+        )"
+    else
+        http_status="$(
+            curl --silent --show-error \
+                --connect-timeout "$HTTP_CONNECT_TIMEOUT" \
+                --max-time "$HTTP_MAX_TIME" \
+                --retry "$HTTP_RETRIES" --retry-all-errors \
+                --request "$method" \
+                --header "X-Api-Key: $RADARR_API_KEY" \
+                --header 'Accept: application/json' \
+                --header 'Content-Type: application/json' \
+                --header "User-Agent: $USER_AGENT" \
+                --data-binary "$payload" \
+                --output "$body" --write-out '%{http_code}' \
+                "$RADARR_URL$endpoint" 2>"$err"
+        )"
+    fi
+    curl_status=$?
+
+    if (( curl_status != 0 )) || ! [[ "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+        message="$({ tr '\r\n' ' ' < "$err"; tr '\r\n' ' ' < "$body"; } | cut -c1-500)"
+        [[ -n "$http_status" ]] || http_status=none
+        [[ -n "$message" ]] || message="no response body"
+        log ERROR "Radarr $method $endpoint failed (curl=$curl_status HTTP=$http_status): $message"
+        rm -f -- "$body" "$err"
+        return 1
+    fi
+
+    cat "$body"
+    rm -f -- "$body" "$err"
+}
+
+api_get_json() {
+    local endpoint="$1"
+    local json
+    json="$(api_request GET "$endpoint" "")" || return 1
+    if ! jq -e . >/dev/null 2>&1 <<< "$json"; then
+        log ERROR "Radarr GET $endpoint returned invalid JSON."
+        return 1
+    fi
+    printf '%s' "$json"
+}
+
+api_put_json() {
+    api_request PUT "$1" "$2" >/dev/null
+}
+
+api_post_json() {
+    api_request POST "$1" "$2"
+}
+
+# The tag catalogue is small and read only.  It is requested only when a
+# confirmed movie needs a tag; there is no tag API request on ordinary runs.
+load_tag_catalog() {
+    local tags
+    tags="$(api_get_json "/api/v3/tag")" || return 1
+    if ! jq -e 'type == "array"' >/dev/null 2>&1 <<< "$tags"; then
+        log ERROR "Radarr /tag did not return an array."
+        return 1
+    fi
+    TAG_CATALOG="$tags"
+}
+
+# Set the named global variable to an existing tag ID or create the tag.  A
+# failed create is followed by one catalogue refresh in case another Radarr
+# client created the same label first.
+ensure_tag_id() {
+    local label="$1"
+    local destination="$2"
+    local id payload created
+
+    id="$(jq -r --arg label "$label" 'first(.[] | select(.label == $label) | .id) // empty' <<< "$TAG_CATALOG")"
+    if [[ ! "$id" =~ ^[0-9]+$ ]]; then
+        payload="$(jq -cn --arg label "$label" '{label: $label}')"
+        created="$(api_post_json "/api/v3/tag" "$payload" || true)"
+        id="$(jq -r '.id // empty' <<< "$created" 2>/dev/null || true)"
+
+        if [[ ! "$id" =~ ^[0-9]+$ ]]; then
+            load_tag_catalog || return 1
+            id="$(jq -r --arg label "$label" 'first(.[] | select(.label == $label) | .id) // empty' <<< "$TAG_CATALOG")"
+            [[ "$id" =~ ^[0-9]+$ ]] || {
+                log ERROR "Could not create or find Radarr tag '$label'."
+                return 1
+            }
+        else
+            TAG_CATALOG="$(jq --arg label "$label" --argjson id "$id" '
+                if any(.[]; .id == $id) then . else . + [{id: $id, label: $label}] end
+            ' <<< "$TAG_CATALOG")" || return 1
+            log INFO "Created Radarr tag '$label'."
+        fi
+    fi
+
+    printf -v "$destination" '%s' "$id"
+}
+
+###############################################################################
+# STATE: work only in a temporary copy until final atomic commit
+###############################################################################
+
+# A tracked record is created only after Radarr first reports hasFile=true.
+# A missing run counts only when the movie is fileless and, when configured,
+# unmonitored.  A fileless but still-monitored movie therefore resets the
+# confirmation counter instead of being treated as a deletion.
+apply_snapshot() {
+    local movies_file="$1"
+    local next
+    next="$(mktemp "$STATE_DIR/.state-snapshot.XXXXXX")" || return 1
+
+    if ! jq --arg now "$RUN_AT" \
+        --argjson require_unmonitored "$REQUIRE_MOVIE_UNMONITORED" \
+        --slurpfile source "$movies_file" '($source[0] // []) as $movies
+        | .movies //= {}
+        | reduce $movies[] as $movie (.;
+            ($movie.id | tostring) as $key
+            | (.movies[$key] // {}) as $old
+            | {
+                movieId: $movie.id,
+                title: ($movie.title // "Unknown"),
+                year: ($movie.year // null),
+                tmdbId: ($movie.tmdbId // null),
+                lastObservedAt: $now,
+                lastObservedMonitored: ($movie.monitored == true)
+              } as $identity
+            | if $movie.hasFile == true then
+                .movies[$key] = (
+                    $old + $identity + {
+                        everHadFile: true,
+                        lastKnownMovieFileId: ($movie.movieFileId // 0),
+                        lastSeenWithFileAt: $now,
+                        missingSince: null,
+                        missingRuns: 0
+                    }
+                )
+              elif $old.everHadFile == true then
+                .movies[$key] = (
+                    $old + $identity +
+                    (if (($require_unmonitored | not) or ($movie.monitored != true)) then
+                        {
+                            missingSince: ($old.missingSince // $now),
+                            missingRuns: (($old.missingRuns // 0) + 1)
+                        }
+                     else
+                        {
+                            missingSince: null,
+                            missingRuns: 0
+                        }
+                     end)
+                )
+              else
+                .
+              end
+        )
+    ' "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$WORK_STATE"
+}
+
+new_candidate_count() {
+    jq --arg now "$RUN_AT" '
+        [
+            .movies[]
+            | select(.missingSince == $now and .missingRuns == 1)
+        ]
+        | length
+    ' "$WORK_STATE"
+}
+
+log_new_candidates() {
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && log WARNING "$line"
+    done < <(
+        jq -r --arg now "$RUN_AT" '
+            .movies[]
+            | select(.missingSince == $now and .missingRuns == 1)
+            | "Deletion candidate: \(.title)\(if .year == null then "" else " (\(.year))" end) [movie \(.movieId)]; confirmation pending."
+        ' "$WORK_STATE"
+    )
+}
+
+# Current Radarr data is always required in addition to state.  This prevents
+# a removed Radarr movie from being acted on and makes an old state file alone
+# insufficient to create a tag.
+confirmed_movies() {
+    local movies_file="$1"
+    jq --slurpfile source "$movies_file" \
+        --argjson require_unmonitored "$REQUIRE_MOVIE_UNMONITORED" \
+        --argjson needed "$CONFIRMATION_RUNS" '($source[0] // []) as $movies
+        | .movies as $state
+        | [
+            $movies[]
+            | select(.hasFile != true)
+            | select(($require_unmonitored | not) or (.monitored != true))
+            | . as $movie
+            | ($movie.id | tostring) as $key
+            | ($state[$key] // {}) as $record
+            | select($record.everHadFile == true and ($record.missingRuns // 0) >= $needed)
+            | {
+                id: $movie.id,
+                title: ($movie.title // "Unknown"),
+                year: ($movie.year // null),
+                tags: ($movie.tags // [])
+              }
+          ]
+        | unique_by(.id)
+    ' "$WORK_STATE"
+}
+
+movies_missing_tag() {
+    local candidates="$1"
+    local tag_id="$2"
+
+    if [[ "$tag_id" =~ ^[0-9]+$ ]]; then
+        jq --argjson tag_id "$tag_id" '
+            [ .[] | select(((.tags // []) | index($tag_id)) == null) ]
+        ' <<< "$candidates"
+    else
+        printf '%s' "$candidates"
+    fi
+}
+
+record_history_evidence() {
+    local movie_id="$1"
+    local evidence="$2"
+    local next
+    next="$(mktemp "$STATE_DIR/.state-history.XXXXXX")" || return 1
+
+    if ! jq --arg now "$RUN_AT" --argjson movie_id "$movie_id" \
+        --argjson evidence "$evidence" '
+        .movies[($movie_id | tostring)] |= . + {
+            lastHistoryInspectionAt: $now,
+            latestMovieFileDeletedHistory: $evidence
+        }
+    ' "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$WORK_STATE"
+}
+
+# This endpoint returns an array for one movie, so it cannot create a costly
+# full-library History sweep.  Only the newest movieFileDeleted record is kept.
+history_delete_event() {
+    local movie_id="$1"
+    local history
+
+    history="$(api_get_json "/api/v3/history/movie?movieId=$movie_id&eventType=movieFileDeleted")" || return 1
+    if ! jq -e 'type == "array"' >/dev/null 2>&1 <<< "$history"; then
+        log ERROR "Radarr History for movie $movie_id did not return an array."
+        return 1
+    fi
+    jq '[
+            .[]
+            | select(.eventType == "movieFileDeleted")
+            | {id: .id, date: .date, eventType: .eventType, data: (.data // {})}
+        ]
+        | sort_by(.date // "")
+        | last // null
+    ' <<< "$history"
+}
+
+mark_tag_actions() {
+    local ids="$1"
+    local next
+    next="$(mktemp "$STATE_DIR/.state-action.XXXXXX")" || return 1
+    if ! jq --arg now "$RUN_AT" --argjson ids "$ids" '
+        reduce $ids[] as $id (.;
+            .movies[($id | tostring)] |= . + {lastPlexDeletedTagAppliedAt: $now}
+        )
+    ' "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$WORK_STATE"
+}
+
+commit_state() {
+    local final backup had_errors
+    final="$(mktemp "$STATE_DIR/.state-final.XXXXXX")" || return 1
+    had_errors=false
+    (( API_FAILURES > 0 || HISTORY_FAILURES > 0 )) && had_errors=true
+
+    if ! jq --arg now "$RUN_AT" --argjson had_errors "$had_errors" '
+        .version = 1
+        | .lastRun = $now
+        | .lastRunHadApiErrors = $had_errors
+        | .movies //= {}
+    ' "$WORK_STATE" > "$final" ||
+       ! jq -e 'type == "object" and (.movies | type == "object")' "$final" >/dev/null; then
+        rm -f -- "$final"
+        return 1
+    fi
+
+    backup="$(mktemp "$STATE_DIR/.state-backup.XXXXXX")" || return 1
+    if cp -- "$STATE_FILE" "$backup"; then
+        mv -f -- "$backup" "$STATE_BACKUP"
+    else
+        rm -f -- "$backup"
+        log WARNING "Could not update state backup."
+    fi
+    mv -f -- "$final" "$STATE_FILE"
+}
+
+movie_name() {
+    local movie="$1"
+    jq -r '"\(.title)\(if .year == null then "" else " (\(.year))" end) [movie \(.id)]"' <<< "$movie"
+}
+
+###############################################################################
+# INITIALIZATION
+###############################################################################
+
+mkdir -p -- "$STATE_DIR" || exit 1
+touch "$LOG_FILE" || exit 1
+command -v curl >/dev/null 2>&1 || die "curl is required."
+command -v jq >/dev/null 2>&1 || die "jq is required."
+[[ -n "$RADARR_URL" && "$RADARR_URL" != */ ]] || die "Set RADARR_URL without a trailing slash."
+[[ -n "$RADARR_API_KEY" && "$RADARR_API_KEY" != PUT_YOUR_RADARR_API_KEY_HERE ]] ||
+    die "Set RADARR_API_KEY."
+[[ "$DRY_RUN" == true || "$DRY_RUN" == false ]] || die "DRY_RUN must be true or false."
+[[ "$REQUIRE_MOVIE_UNMONITORED" == true || "$REQUIRE_MOVIE_UNMONITORED" == false ]] ||
+    die "REQUIRE_MOVIE_UNMONITORED must be true or false."
+[[ "$INSPECT_RADARR_HISTORY" == true || "$INSPECT_RADARR_HISTORY" == false ]] ||
+    die "INSPECT_RADARR_HISTORY must be true or false."
+[[ "$REQUIRE_HISTORY_DELETE_EVENT" == true || "$REQUIRE_HISTORY_DELETE_EVENT" == false ]] ||
+    die "REQUIRE_HISTORY_DELETE_EVENT must be true or false."
+[[ "$INSPECT_RADARR_HISTORY" == true || "$REQUIRE_HISTORY_DELETE_EVENT" == false ]] ||
+    die "REQUIRE_HISTORY_DELETE_EVENT=true requires INSPECT_RADARR_HISTORY=true."
+[[ "$PLEX_DELETED_TAG" =~ ^[a-z0-9-]+$ ]] ||
+    die "PLEX_DELETED_TAG may contain only lowercase letters, numbers, and hyphens."
+[[ "$CONFIRMATION_RUNS" =~ ^[0-9]+$ ]] && (( CONFIRMATION_RUNS >= 2 )) ||
+    die "CONFIRMATION_RUNS must be an integer of at least 2."
+[[ "$MAX_HISTORY_INSPECTIONS_PER_RUN" =~ ^[1-9][0-9]*$ ]] ||
+    die "MAX_HISTORY_INSPECTIONS_PER_RUN must be a positive integer."
+[[ "$MAX_LOG_SIZE_MB" =~ ^[1-9][0-9]*$ && "$MAX_LOG_FILES" =~ ^[1-9][0-9]*$ ]] ||
+    die "MAX_LOG_SIZE_MB and MAX_LOG_FILES must be positive integers."
+[[ "$HTTP_CONNECT_TIMEOUT" =~ ^[1-9][0-9]*$ && "$HTTP_MAX_TIME" =~ ^[1-9][0-9]*$ && "$HTTP_RETRIES" =~ ^[0-9]+$ ]] ||
+    die "HTTP timeout values must be positive integers and HTTP_RETRIES must be a non-negative integer."
+rotate_log
+
+# Atomic directory creation avoids the race in a normal PID-file lock.
+if ! mkdir -- "$LOCK_DIR" 2>/dev/null; then
+    OLD_PID=""
+    [[ -r "$LOCK_DIR/pid" ]] && OLD_PID="$(<"$LOCK_DIR/pid")"
+    if [[ "$OLD_PID" =~ ^[0-9]+$ ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+        log WARNING "Another instance is already running (PID $OLD_PID); exiting."
+        exit 0
+    fi
+    log WARNING "Removing stale lock."
+    rm -f -- "$LOCK_DIR/pid"
+    rmdir -- "$LOCK_DIR" 2>/dev/null || die "Cannot clear stale lock directory."
+    mkdir -- "$LOCK_DIR" || die "Cannot acquire lock."
+fi
+printf '%s\n' "$$" > "$LOCK_DIR/pid" || die "Cannot write lock PID."
+LOCK_HELD=true
+
+remove_stale_temp_files
+
+if [[ ! -f "$STATE_FILE" ]]; then
+    INITIAL_STATE="$(mktemp "$STATE_DIR/.state-initial.XXXXXX")" ||
+        die "Cannot create initial state file."
+    printf '%s\n' '{"version":1,"lastRun":null,"lastRunHadApiErrors":false,"movies":{}}' > "$INITIAL_STATE" &&
+        mv -f -- "$INITIAL_STATE" "$STATE_FILE" || {
+            rm -f -- "$INITIAL_STATE"
+            die "Cannot create state file."
+        }
+    log INFO "Created state file; this first run establishes a baseline."
+fi
+if ! jq -e 'type == "object" and (.movies | type == "object")' "$STATE_FILE" >/dev/null; then
+    die "State file is invalid: $STATE_FILE"
+fi
+WORK_STATE="$(mktemp "$STATE_DIR/.state-working.XXXXXX")" || die "Cannot create working state."
+cp -- "$STATE_FILE" "$WORK_STATE" || die "Cannot copy state to working file."
+
+###############################################################################
+# RUN
+###############################################################################
+
+log INFO "Starting once-daily delete sync (dry-run=$DRY_RUN, confirmations=$CONFIRMATION_RUNS)."
+log INFO "Using Radarr's current database state; no rescan or filesystem access will be requested."
+
+SYSTEM="$(api_get_json "/api/v3/system/status")" || {
+    ((API_FAILURES += 1))
+    die "Cannot contact Radarr; state was not changed."
+}
+log INFO "Connected to Radarr $(jq -r '.version // "unknown"' <<< "$SYSTEM")."
+
+# Keep this potentially large response in a file.  Passing a full library as
+# jq --argjson would put it in exec(2)'s argument vector and can cause
+# "Argument list too long" on larger libraries.
+MOVIES_FILE="$(mktemp "$STATE_DIR/.movies.XXXXXX")" ||
+    die "Cannot create temporary movie snapshot."
+if ! api_get_json "/api/v3/movie" > "$MOVIES_FILE"; then
+    ((API_FAILURES += 1))
+    die "Could not retrieve movies; state was not changed."
+fi
+jq -e 'type == "array"' "$MOVIES_FILE" >/dev/null ||
+    die "Radarr /movie did not return an array."
+
+MOVIES_LISTED="$(jq length "$MOVIES_FILE")"
+MOVIES_SCANNED="$MOVIES_LISTED"
+FILES_PRESENT="$(jq '[.[] | select(.hasFile == true)] | length' "$MOVIES_FILE")"
+
+apply_snapshot "$MOVIES_FILE" || die "Could not update temporary state."
+
+FIRST_MISSING="$(new_candidate_count)"
+(( FIRST_MISSING == 0 )) || log_new_candidates
+
+CONFIRMED="$(confirmed_movies "$MOVIES_FILE")" ||
+    die "Could not calculate tag action plan."
+MOVIES_CONFIRMED="$(jq length <<< "$CONFIRMED")"
+
+if (( MOVIES_CONFIRMED > 0 )); then
+    if ! load_tag_catalog; then
+        ((API_FAILURES += 1))
+        log ERROR "Could not load Radarr tags; confirmed movies will be retried next run."
+    else
+        PLEX_DELETED_TAG_ID="$(jq -r --arg label "$PLEX_DELETED_TAG" 'first(.[] | select(.label == $label) | .id) // empty' <<< "$TAG_CATALOG")"
+        ACTION_CANDIDATES="$(movies_missing_tag "$CONFIRMED" "$PLEX_DELETED_TAG_ID")" ||
+            die "Could not calculate movies that need the '$PLEX_DELETED_TAG' tag."
+        ACTION_CANDIDATE_COUNT="$(jq length <<< "$ACTION_CANDIDATES")"
+
+        if (( ACTION_CANDIDATE_COUNT == 0 )); then
+            log INFO "All $MOVIES_CONFIRMED confirmed movie(s) already have the '$PLEX_DELETED_TAG' tag."
+        else
+            ELIGIBLE_IDS='[]'
+            while IFS= read -r MOVIE; do
+                [[ -n "$MOVIE" ]] || continue
+                MOVIE_ID="$(jq -r '.id' <<< "$MOVIE")"
+                MOVIE_LABEL="$(movie_name "$MOVIE")"
+                HISTORY_EVIDENCE=null
+                HISTORY_INSPECTED=false
+
+                if [[ "$INSPECT_RADARR_HISTORY" == true ]]; then
+                    if (( HISTORY_INSPECTIONS < MAX_HISTORY_INSPECTIONS_PER_RUN )); then
+                        HISTORY_INSPECTED=true
+                        ((HISTORY_INSPECTIONS += 1))
+                        if HISTORY_EVIDENCE="$(history_delete_event "$MOVIE_ID")"; then
+                            record_history_evidence "$MOVIE_ID" "$HISTORY_EVIDENCE" ||
+                                die "Could not record History evidence for $MOVIE_LABEL."
+                            if [[ "$HISTORY_EVIDENCE" != null ]]; then
+                                ((HISTORY_DELETE_EVENTS += 1))
+                                log INFO "History audit: $MOVIE_LABEL has movieFileDeleted event $(jq -r '.id // "unknown"' <<< "$HISTORY_EVIDENCE") at $(jq -r '.date // "unknown"' <<< "$HISTORY_EVIDENCE")."
+                            else
+                                log INFO "History audit: $MOVIE_LABEL has no movieFileDeleted event."
+                            fi
+                        else
+                            ((HISTORY_FAILURES += 1))
+                            log WARNING "History audit failed for $MOVIE_LABEL."
+                        fi
+                    else
+                        ((HISTORY_LIMIT_SKIPS += 1))
+                        log WARNING "History inspection cap reached; deferred audit for $MOVIE_LABEL."
+                    fi
+                fi
+
+                if [[ "$REQUIRE_HISTORY_DELETE_EVENT" == true ]] &&
+                   { [[ "$HISTORY_INSPECTED" != true ]] || [[ "$HISTORY_EVIDENCE" == null ]]; }; then
+                    log INFO "Not tagging $MOVIE_LABEL because no verified movieFileDeleted History event is available."
+                    continue
+                fi
+
+                ELIGIBLE_IDS="$(jq --argjson movie_id "$MOVIE_ID" '. + [$movie_id] | unique' <<< "$ELIGIBLE_IDS")" ||
+                    die "Could not extend the tag action plan."
+            done < <(jq -c '.[]' <<< "$ACTION_CANDIDATES")
+
+            ELIGIBLE_COUNT="$(jq length <<< "$ELIGIBLE_IDS")"
+            if (( ELIGIBLE_COUNT > 0 )); then
+                if [[ "$DRY_RUN" == true ]]; then
+                    if [[ ! "$PLEX_DELETED_TAG_ID" =~ ^[0-9]+$ ]]; then
+                        log INFO "DRY RUN: would create Radarr tag '$PLEX_DELETED_TAG'."
+                    fi
+                    while IFS= read -r MOVIE; do
+                        [[ -n "$MOVIE" ]] || continue
+                        log INFO "DRY RUN: would add '$PLEX_DELETED_TAG' to $(movie_name "$MOVIE")."
+                    done < <(
+                        jq --argjson ids "$ELIGIBLE_IDS" '
+                            [ .[] | . as $movie | select(($ids | index($movie.id)) != null) ][]
+                        ' <<< "$ACTION_CANDIDATES" | jq -c .
+                    )
+                    TAG_ACTIONS="$ELIGIBLE_COUNT"
+                else
+                    ensure_tag_id "$PLEX_DELETED_TAG" PLEX_DELETED_TAG_ID || {
+                        ((API_FAILURES += 1))
+                        log ERROR "Could not prepare '$PLEX_DELETED_TAG'; confirmed movies will be retried next run."
+                        PLEX_DELETED_TAG_ID=''
+                    }
+                    if [[ "$PLEX_DELETED_TAG_ID" =~ ^[0-9]+$ ]]; then
+                        PAYLOAD="$(jq -cn --argjson ids "$ELIGIBLE_IDS" --argjson tag_id "$PLEX_DELETED_TAG_ID" '
+                            {movieIds: $ids, tags: [$tag_id], applyTags: "add"}
+                        ')"
+                        if api_put_json "/api/v3/movie/editor" "$PAYLOAD"; then
+                            mark_tag_actions "$ELIGIBLE_IDS" ||
+                                die "Could not record applied tag actions."
+                            while IFS= read -r MOVIE; do
+                                [[ -n "$MOVIE" ]] || continue
+                                log INFO "Added '$PLEX_DELETED_TAG' to $(movie_name "$MOVIE")."
+                            done < <(
+                                jq --argjson ids "$ELIGIBLE_IDS" '
+                                    [ .[] | . as $movie | select(($ids | index($movie.id)) != null) ][]
+                                ' <<< "$ACTION_CANDIDATES" | jq -c .
+                            )
+                            TAG_ACTIONS="$ELIGIBLE_COUNT"
+                        else
+                            ((API_FAILURES += 1))
+                            log ERROR "Bulk tag update failed; confirmed movies will be retried next run."
+                        fi
+                    fi
+                fi
+            fi
+        fi
+    fi
+fi
+
+commit_state || die "Could not atomically save state."
+WORK_STATE=""
+
+ACTION_LABEL=applied
+[[ "$DRY_RUN" == true ]] && ACTION_LABEL=would-apply
+log INFO "Summary: movies-listed=$MOVIES_LISTED, movies-scanned=$MOVIES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$MOVIES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, tag-actions-$ACTION_LABEL=$TAG_ACTIONS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES."
+
+if (( API_FAILURES > 0 || HISTORY_FAILURES > 0 )); then
+    log WARNING "Completed with API failures; safely retrieved state was saved and unfinished tag actions will be retried."
+    exit 2
+fi
+log INFO "Completed successfully."
