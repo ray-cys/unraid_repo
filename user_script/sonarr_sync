@@ -214,7 +214,6 @@ start_library_rescan() {
         log ERROR "Sonarr accepted RescanSeries but did not return a command ID."
         return 1
     }
-    RESCAN_COMMAND_ID="$command_id"
     printf '%s' "$command_id"
 }
 
