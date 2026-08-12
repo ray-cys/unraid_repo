@@ -71,7 +71,6 @@ LOCK_HELD=false
 WORK_STATE=""
 CURRENT_EPISODES_FILE=""
 API_FAILURES=0
-RESCAN_COMMAND_ID=""
 SERIES_LISTED=0
 SERIES_SCANNED=0
 EPISODES_SCANNED=0
@@ -123,6 +122,40 @@ rotate_log() {
     done
     mv -f -- "$LOG_FILE" "$LOG_FILE.1"
     : > "$LOG_FILE"
+}
+
+# Temporary files live beside state.json so state replacement stays atomic.
+# A normal exit removes them through cleanup(), but SIGKILL, a reboot, or a
+# forced stop in User Scripts can prevent traps from running.  This runs only
+# after the exclusive lock is held, so no active instance's files are touched.
+remove_stale_temp_files() {
+    local file removed=0 nullglob_was_set=false
+    local -a stale_files
+
+    shopt -q nullglob && nullglob_was_set=true
+    shopt -s nullglob
+    stale_files=(
+        "$STATE_DIR"/.state-working.*
+        "$STATE_DIR"/.state-snapshot.*
+        "$STATE_DIR"/.state-action.*
+        "$STATE_DIR"/.state-season.*
+        "$STATE_DIR"/.state-final.*
+        "$STATE_DIR"/.state-backup.*
+        "$STATE_DIR"/.state-initial.*
+        "$STATE_DIR"/.episodes.*
+        "$STATE_DIR"/.sonarr-body.*
+        "$STATE_DIR"/.sonarr-error.*
+    )
+    [[ "$nullglob_was_set" == true ]] || shopt -u nullglob
+
+    for file in "${stale_files[@]}"; do
+        [[ -f "$file" ]] || continue
+        rm -f -- "$file"
+        ((removed += 1))
+    done
+
+    (( removed == 0 )) ||
+        log INFO "Removed $removed stale temporary file(s) from an interrupted previous run."
 }
 
 ###############################################################################
@@ -577,6 +610,10 @@ if ! mkdir -- "$LOCK_DIR" 2>/dev/null; then
 fi
 printf '%s\n' "$$" > "$LOCK_DIR/pid" || die "Cannot write lock PID."
 LOCK_HELD=true
+
+# Safe only after the lock above: an existing running instance would have made
+# this invocation exit instead of reaching this point.
+remove_stale_temp_files
 
 if [[ ! -f "$STATE_FILE" ]]; then
     INITIAL_STATE="$(mktemp "$STATE_DIR/.state-initial.XXXXXX")" ||
