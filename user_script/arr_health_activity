@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Download / Import Stall Monitor v2.5
+# ARR Download / Import Monitor v2.6
 #
 # PURPOSE
 # -------
@@ -350,7 +350,7 @@ ARR_TELEMETRY_REVIEW_TOP=10
 # Notifications
 # ---------------------------------------------------------------------------
 
-SEND_NOTIFICATIONS=false
+SEND_NOTIFICATIONS=true
 
 NOTIFY="/usr/local/emhttp/webGui/scripts/notify"
 
@@ -414,6 +414,41 @@ AUDIT_DETAIL_MAX_ITEMS=20
 # This is LOG ONLY.
 # It does not generate additional notifications.
 PIPELINE_HEALTH_ENABLED=true
+
+# ---------------------------------------------------------------------------
+# Activity flow anomaly detection - v2.6
+# ---------------------------------------------------------------------------
+
+FLOW_ANOMALY_ENABLED=true
+
+# Analyze a shorter recent window than the general 24-hour activity audit.
+#
+# IMPORTANT:
+# This must not exceed ACTIVITY_AUDIT_LOOKBACK_HOURS because v2.6 reuses
+# the Sonarr/Radarr history already fetched by v2.5.
+FLOW_ANOMALY_LOOKBACK_HOURS=12
+
+# Require meaningful SAB activity before considering zero Arr imports unusual.
+#
+# Example:
+#
+#   SAB TV completed: 1
+#   Sonarr imports:   0
+#
+# Not enough evidence.
+#
+#   SAB TV completed: 4
+#   Sonarr imports:   0
+#
+# Eligible for flow-anomaly evaluation.
+FLOW_MIN_SAB_ACTIVITY=3
+
+# If the same anomaly remains continuously active for this long,
+# change its lifecycle stage to ESCALATED.
+#
+# Severity remains WARNING, but the changed signature allows one additional
+# grouped notification.
+FLOW_ANOMALY_ESCALATE_HOURS=24
 
 # ---------------------------------------------------------------------------
 # Runtime
@@ -515,6 +550,27 @@ SAB_AUDIT_WINDOW_INCOMPLETE=false
 
 PIPELINE_STATUS="UNKNOWN"
 PIPELINE_REASON="Not assessed"
+
+###############################################################################
+# ACTIVITY FLOW ANOMALY - v2.6
+###############################################################################
+
+FLOW_CUTOFF_EPOCH=0
+
+FLOW_SAB_TV_COMPLETED=0
+FLOW_SAB_MOVIE_COMPLETED=0
+
+FLOW_SONARR_IMPORTS=0
+FLOW_RADARR_IMPORTS=0
+
+FLOW_SONARR_EXPLANATIONS=0
+FLOW_RADARR_EXPLANATIONS=0
+
+FLOW_ANOMALY_COUNT=0
+FLOW_ANOMALY_SUPPRESSED_COUNT=0
+
+FLOW_ANALYSIS_OK=false
+FLOW_ANALYSIS_REASON="Not evaluated"
 
 ###############################################################################
 # BASIC FUNCTIONS
@@ -1173,7 +1229,8 @@ classification_severity() {
         FILE_LOCKED|\
         SAMPLE_DETECTION|\
         TITLE_MISMATCH|\
-        QUALITY_PARSE)
+        QUALITY_PARSE|\
+        ACTIVITY_FLOW_ANOMALY)
 
             echo "WARNING"
             ;;
@@ -1359,7 +1416,11 @@ classification_reason() {
         ARR_IMPORT_STALLED)
             echo "Completed download remains tracked by Arr but has not progressed to import"
             ;;
-
+        
+        ACTIVITY_FLOW_ANOMALY)
+            echo "Recent SAB completions were observed but the corresponding Arr application recorded no successful imports during the activity-flow window"
+            ;;
+            
         *)
             echo "Unknown"
             ;;
@@ -4899,9 +4960,663 @@ write_persistent_activity_summary() {
             "lookback=${ACTIVITY_AUDIT_LOOKBACK_HOURS}h | SAB movie_completed=${SAB_AUDIT_MOVIE_COMPLETED} tv_completed=${SAB_AUDIT_TV_COMPLETED} failed=$((SAB_AUDIT_MOVIE_FAILED + SAB_AUDIT_TV_FAILED)) | Sonarr imports=${SONARR_AUDIT_IMPORTED} failed=${SONARR_AUDIT_DOWNLOAD_FAILED} | Radarr imports=${RADARR_AUDIT_IMPORTED} failed=${RADARR_AUDIT_DOWNLOAD_FAILED}"
     fi
 
+    if [ "$FLOW_ANOMALY_ENABLED" = true ]; then
+
+        persistent_log \
+            "FLOW" \
+            "window=${FLOW_ANOMALY_LOOKBACK_HOURS}h | SAB_tv=${FLOW_SAB_TV_COMPLETED} Sonarr_imports=${FLOW_SONARR_IMPORTS} | SAB_movie=${FLOW_SAB_MOVIE_COMPLETED} Radarr_imports=${FLOW_RADARR_IMPORTS} | anomalies=${FLOW_ANOMALY_COUNT} suppressed=${FLOW_ANOMALY_SUPPRESSED_COUNT}"
+    fi
+
     persistent_log \
         "PIPELINE" \
         "status=${PIPELINE_STATUS} | ${PIPELINE_REASON}"
+}
+
+###############################################################################
+# ACTIVITY FLOW ANOMALY DETECTION - v2.6
+###############################################################################
+
+###############################################################################
+# INITIALIZE FLOW WINDOW
+###############################################################################
+
+initialize_flow_anomaly_window() {
+
+    FLOW_ANALYSIS_OK=false
+    FLOW_ANALYSIS_REASON="Not evaluated"
+
+    if [ "$FLOW_ANOMALY_ENABLED" != true ]; then
+
+        FLOW_ANALYSIS_REASON="Flow anomaly detection disabled"
+
+        return 1
+    fi
+
+    ###########################################################################
+    # v2.6 REUSES THE HISTORY FETCHED BY v2.5
+    #
+    # Therefore the flow window cannot be larger than the activity-audit
+    # history window.
+    ###########################################################################
+
+    if (( FLOW_ANOMALY_LOOKBACK_HOURS > ACTIVITY_AUDIT_LOOKBACK_HOURS )); then
+
+        FLOW_ANALYSIS_REASON="Flow window exceeds available activity-audit history"
+
+        log "WARNING: FLOW_ANOMALY_LOOKBACK_HOURS=${FLOW_ANOMALY_LOOKBACK_HOURS}"
+        log "WARNING: ACTIVITY_AUDIT_LOOKBACK_HOURS=${ACTIVITY_AUDIT_LOOKBACK_HOURS}"
+        log "WARNING: Activity-flow analysis skipped"
+
+        return 1
+    fi
+
+    FLOW_CUTOFF_EPOCH=$(
+        date \
+            -d "${FLOW_ANOMALY_LOOKBACK_HOURS} hours ago" \
+            '+%s'
+    )
+
+    return 0
+}
+
+###############################################################################
+# COUNT ARR IMPORT EVENTS SINCE FLOW CUTOFF
+###############################################################################
+
+count_arr_imports_since() {
+
+    local history_file="$1"
+    local cutoff="$2"
+
+    local count=0
+    local event_type
+    local event_date
+    local event_epoch
+
+    [ -f "$history_file" ] || {
+        echo 0
+        return
+    }
+
+    while IFS=$'\t' read -r \
+        event_type \
+        event_date
+    do
+
+        [ "$event_type" = "downloadFolderImported" ] || continue
+
+        event_epoch=$(date_to_epoch "$event_date")
+
+        if (( event_epoch >= cutoff )); then
+
+            ((count++)) || true
+        fi
+
+    done < <(
+        jq -r '
+            .[]?
+            |
+            [
+                (.eventType // ""),
+                (.date // "")
+            ]
+            |
+            @tsv
+        ' "$history_file"
+    )
+
+    echo "$count"
+}
+
+###############################################################################
+# CALCULATE SAB ACTIVITY INSIDE FLOW WINDOW
+###############################################################################
+
+calculate_flow_sab_activity() {
+
+    FLOW_SAB_TV_COMPLETED=0
+    FLOW_SAB_MOVIE_COMPLETED=0
+
+    [ -f "$SAB_HISTORY" ] || return 1
+
+    local item
+    local status
+    local category
+    local event_epoch
+
+    while IFS= read -r item; do
+
+        [ -n "$item" ] || continue
+
+        status=$(
+            echo "$item" |
+                jq -r '.status // ""'
+        )
+
+        #######################################################################
+        # ONLY SUCCESSFULLY COMPLETED SAB JOBS ARE RELEVANT HERE
+        #######################################################################
+
+        [ "${status,,}" = "completed" ] || continue
+
+        category=$(
+            echo "$item" |
+                jq -r '.category // ""'
+        )
+
+        #######################################################################
+        # F1 REMAINS COMPLETELY OUTSIDE THIS WORKFLOW
+        #######################################################################
+
+        if [ "${category,,}" = "${SAB_IGNORED_CATEGORY,,}" ]; then
+            continue
+        fi
+
+        event_epoch=$(sab_history_event_epoch "$item")
+
+        (( event_epoch > 0 )) || continue
+
+        if (( event_epoch < FLOW_CUTOFF_EPOCH )); then
+            continue
+        fi
+
+        #######################################################################
+        # TV
+        #######################################################################
+
+        if [ "${category,,}" = "${SAB_TV_CATEGORY,,}" ]; then
+
+            ((FLOW_SAB_TV_COMPLETED++)) || true
+
+            continue
+        fi
+
+        #######################################################################
+        # MOVIES
+        #######################################################################
+
+        if [ "${category,,}" = "${SAB_MOVIE_CATEGORY,,}" ]; then
+
+            ((FLOW_SAB_MOVIE_COMPLETED++)) || true
+        fi
+
+    done < <(
+        jq -c '.history.slots[]?' "$SAB_HISTORY"
+    )
+
+    return 0
+}
+
+###############################################################################
+# COUNT EXISTING ISSUES THAT MAY ALREADY EXPLAIN A FLOW PROBLEM
+#
+# This is intentionally conservative.
+#
+# If Sonarr already has a CF/TBA/import/etc issue, or SAB already has a
+# stranded-download issue, v2.6 does not add another higher-level warning.
+#
+# ACTIVITY_FLOW_ANOMALY itself is excluded so an existing flow issue does not
+# suppress its own next observation.
+###############################################################################
+
+flow_explaining_issue_count() {
+
+    local app="$1"
+
+    jq -r \
+        --arg app "$app" \
+        '
+        [
+            (
+                .issues
+                // {}
+                | to_entries[]
+            )
+
+            | select(
+                (.value.active // false) == true
+            )
+
+            | select(
+                (.value.classification // "")
+                !=
+                "ACTIVITY_FLOW_ANOMALY"
+            )
+
+            | select(
+                (
+                    (.value.app // "") == $app
+                )
+                or
+                (
+                    (.value.app // "") == "SABnzbd"
+                )
+            )
+        ]
+        | length
+        ' \
+        "$STATE_FILE" 2>/dev/null ||
+        echo 0
+}
+
+###############################################################################
+# PRESERVE EXISTING FLOW ISSUE WHEN THE FLOW ANALYSIS CANNOT RUN
+#
+# Without this safeguard:
+#
+#   history API fails
+#       ↓
+#   flow detector cannot evaluate
+#       ↓
+#   issue isn't seen
+#       ↓
+#   normal lifecycle code could incorrectly mark it RESOLVED
+#
+###############################################################################
+
+preserve_existing_flow_issue() {
+
+    local app="$1"
+    local kind="$2"
+
+    local issue_key="FLOW:${app}:${kind}"
+
+    local active
+
+    active=$(
+        jq -r \
+            --arg key "$issue_key" \
+            '(.issues[$key].active // false) | tostring' \
+            "$STATE_FILE" 2>/dev/null
+    )
+
+    if [ "$active" = "true" ]; then
+
+        mark_seen "$issue_key"
+    fi
+}
+
+###############################################################################
+# DETERMINE FLOW ISSUE LIFECYCLE STAGE
+###############################################################################
+
+flow_anomaly_stage() {
+
+    local issue_key="$1"
+
+    local active
+    local first_seen
+    local now
+    local elapsed
+
+    active=$(
+        jq -r \
+            --arg key "$issue_key" \
+            '(.issues[$key].active // false) | tostring' \
+            "$STATE_FILE" 2>/dev/null
+    )
+
+    ###########################################################################
+    # NEW OR PREVIOUSLY RESOLVED ISSUE
+    #
+    # Do not inherit the old firstSeen timestamp.
+    ###########################################################################
+
+    if [ "$active" != "true" ]; then
+
+        echo "INITIAL"
+
+        return
+    fi
+
+    first_seen=$(
+        jq -r \
+            --arg key "$issue_key" \
+            '.issues[$key].firstSeen // 0' \
+            "$STATE_FILE" 2>/dev/null
+    )
+
+    [[ "$first_seen" =~ ^[0-9]+$ ]] || first_seen=0
+
+    if (( first_seen <= 0 )); then
+
+        echo "INITIAL"
+
+        return
+    fi
+
+    now=$(date '+%s')
+
+    elapsed=$(( now - first_seen ))
+
+    if (( elapsed >= FLOW_ANOMALY_ESCALATE_HOURS * 3600 )); then
+
+        echo "ESCALATED"
+
+    else
+
+        echo "INITIAL"
+    fi
+}
+
+###############################################################################
+# RECORD ACTIVITY FLOW ANOMALY
+###############################################################################
+
+record_activity_flow_anomaly() {
+
+    local app="$1"
+    local kind="$2"
+    local sab_completed="$3"
+    local arr_imports="$4"
+
+    local issue_key
+    local title
+    local classification
+    local severity
+    local stage
+    local message
+    local signature
+    local signature_message
+    local persist_issue_transition=false
+
+    issue_key="FLOW:${app}:${kind}"
+
+    title="${kind} activity flow"
+
+    classification="ACTIVITY_FLOW_ANOMALY"
+
+    severity="WARNING"
+
+    stage=$(flow_anomaly_stage "$issue_key")
+
+    ###########################################################################
+    # HUMAN-READABLE MESSAGE
+    ###########################################################################
+
+    message="SAB completed ${sab_completed} ${kind} job(s) during the last ${FLOW_ANOMALY_LOOKBACK_HOURS}h, but ${app} recorded ${arr_imports} successful import event(s). No currently tracked ${app}/SAB issue explains the inactivity."
+
+    ###########################################################################
+    # STABLE SIGNATURE MESSAGE
+    #
+    # Do NOT put the live SAB count into the signature.
+    #
+    # Otherwise:
+    #
+    #   3 completions -> notification
+    #   4 completions -> changed signature -> notification
+    #   5 completions -> changed signature -> notification
+    #
+    # The signature should change only when lifecycle stage changes.
+    ###########################################################################
+
+    signature_message="SAB activity present but ${app} recorded zero successful imports during ${FLOW_ANOMALY_LOOKBACK_HOURS}h flow window"
+
+    signature=$(
+        issue_signature \
+            "$app" \
+            "$issue_key" \
+            "$classification" \
+            "$severity" \
+            "$stage" \
+            "$signature_message"
+    )
+
+    if issue_transition_should_persist \
+        "$issue_key" \
+        "$signature"
+    then
+
+        persist_issue_transition=true
+    fi
+
+    update_issue_state \
+        "$issue_key" \
+        "$signature" \
+        "$app" \
+        "$title" \
+        "$classification" \
+        "$severity" \
+        "$stage" \
+        "$message"
+
+    ###########################################################################
+    # COUNTERS
+    ###########################################################################
+
+    ((FLOW_ANOMALY_COUNT++)) || true
+    ((WARNING_COUNT++)) || true
+    ((TOTAL_ISSUES++)) || true
+
+    ###########################################################################
+    # CURRENT RUN LOG
+    ###########################################################################
+
+    log ""
+    log "Activity flow anomaly detected"
+    log "Application: $app"
+    log "Media type: $kind"
+    log "Flow window: ${FLOW_ANOMALY_LOOKBACK_HOURS}h"
+    log "SAB completed jobs: $sab_completed"
+    log "Arr successful imports: $arr_imports"
+    log "Stage: $stage"
+
+    ###########################################################################
+    # PERSIST ONLY NEW / CHANGED / RETURNED ISSUE
+    ###########################################################################
+
+    if [ "$persist_issue_transition" = true ]; then
+
+        persistent_log \
+            "ISSUE" \
+            "${app} | ${classification} | ${severity} | ${kind} | SAB_completed=${sab_completed} | Arr_imports=${arr_imports} | window=${FLOW_ANOMALY_LOOKBACK_HOURS}h | stage=${stage}"
+    fi
+}
+
+###############################################################################
+# ASSESS ACTIVITY FLOW
+###############################################################################
+
+assess_activity_flow() {
+
+    FLOW_ANALYSIS_OK=false
+    FLOW_ANALYSIS_REASON="Not evaluated"
+
+    ###########################################################################
+    # FEATURE DISABLED
+    ###########################################################################
+
+    if [ "$FLOW_ANOMALY_ENABLED" != true ]; then
+
+        FLOW_ANALYSIS_REASON="Flow anomaly detection disabled"
+
+        preserve_existing_flow_issue \
+            "Sonarr" \
+            "TV"
+
+        preserve_existing_flow_issue \
+            "Radarr" \
+            "Movie"
+
+        return
+    fi
+
+    ###########################################################################
+    # v2.5 ACTIVITY AUDIT IS REQUIRED
+    ###########################################################################
+
+    if [ "$ACTIVITY_AUDIT_ENABLED" != true ]; then
+
+        FLOW_ANALYSIS_REASON="Activity audit disabled; flow data unavailable"
+
+        preserve_existing_flow_issue \
+            "Sonarr" \
+            "TV"
+
+        preserve_existing_flow_issue \
+            "Radarr" \
+            "Movie"
+
+        return
+    fi
+
+    ###########################################################################
+    # INITIALIZE WINDOW
+    ###########################################################################
+
+    if ! initialize_flow_anomaly_window; then
+
+        preserve_existing_flow_issue \
+            "Sonarr" \
+            "TV"
+
+        preserve_existing_flow_issue \
+            "Radarr" \
+            "Movie"
+
+        return
+    fi
+
+    ###########################################################################
+    # SAB DATA MUST BE HEALTHY
+    ###########################################################################
+
+    if [ "$SAB_AUDIT_OK" != true ]; then
+
+        FLOW_ANALYSIS_REASON="SAB activity data unavailable"
+
+        preserve_existing_flow_issue \
+            "Sonarr" \
+            "TV"
+
+        preserve_existing_flow_issue \
+            "Radarr" \
+            "Movie"
+
+        return
+    fi
+
+    if ! calculate_flow_sab_activity; then
+
+        FLOW_ANALYSIS_REASON="Unable to calculate SAB flow activity"
+
+        preserve_existing_flow_issue \
+            "Sonarr" \
+            "TV"
+
+        preserve_existing_flow_issue \
+            "Radarr" \
+            "Movie"
+
+        return
+    fi
+
+    ###########################################################################
+    # SONARR IMPORT ACTIVITY
+    ###########################################################################
+
+    if [ "$SONARR_ENABLED" = true ] &&
+       [ "$SONARR_AUDIT_OK" = true ] &&
+       [ -f "$SONARR_AUDIT_HISTORY" ]
+    then
+
+        FLOW_SONARR_IMPORTS=$(
+            count_arr_imports_since \
+                "$SONARR_AUDIT_HISTORY" \
+                "$FLOW_CUTOFF_EPOCH"
+        )
+
+        FLOW_SONARR_EXPLANATIONS=$(
+            flow_explaining_issue_count \
+                "Sonarr"
+        )
+
+        #######################################################################
+        # STRONG ANOMALY:
+        #
+        # meaningful SAB activity
+        # +
+        # absolutely zero successful Sonarr imports
+        #######################################################################
+
+        if (( FLOW_SAB_TV_COMPLETED >= FLOW_MIN_SAB_ACTIVITY )) &&
+           (( FLOW_SONARR_IMPORTS == 0 ))
+        then
+
+            if (( FLOW_SONARR_EXPLANATIONS == 0 )); then
+
+                record_activity_flow_anomaly \
+                    "Sonarr" \
+                    "TV" \
+                    "$FLOW_SAB_TV_COMPLETED" \
+                    "$FLOW_SONARR_IMPORTS"
+
+            else
+
+                ((FLOW_ANOMALY_SUPPRESSED_COUNT++)) || true
+
+                log "Sonarr flow anomaly candidate suppressed"
+                log "Reason: ${FLOW_SONARR_EXPLANATIONS} active Sonarr/SAB issue(s) already tracked"
+            fi
+        fi
+
+    else
+
+        preserve_existing_flow_issue \
+            "Sonarr" \
+            "TV"
+    fi
+
+    ###########################################################################
+    # RADARR IMPORT ACTIVITY
+    ###########################################################################
+
+    if [ "$RADARR_ENABLED" = true ] &&
+       [ "$RADARR_AUDIT_OK" = true ] &&
+       [ -f "$RADARR_AUDIT_HISTORY" ]
+    then
+
+        FLOW_RADARR_IMPORTS=$(
+            count_arr_imports_since \
+                "$RADARR_AUDIT_HISTORY" \
+                "$FLOW_CUTOFF_EPOCH"
+        )
+
+        FLOW_RADARR_EXPLANATIONS=$(
+            flow_explaining_issue_count \
+                "Radarr"
+        )
+
+        if (( FLOW_SAB_MOVIE_COMPLETED >= FLOW_MIN_SAB_ACTIVITY )) &&
+           (( FLOW_RADARR_IMPORTS == 0 ))
+        then
+
+            if (( FLOW_RADARR_EXPLANATIONS == 0 )); then
+
+                record_activity_flow_anomaly \
+                    "Radarr" \
+                    "Movie" \
+                    "$FLOW_SAB_MOVIE_COMPLETED" \
+                    "$FLOW_RADARR_IMPORTS"
+
+            else
+
+                ((FLOW_ANOMALY_SUPPRESSED_COUNT++)) || true
+
+                log "Radarr flow anomaly candidate suppressed"
+                log "Reason: ${FLOW_RADARR_EXPLANATIONS} active Radarr/SAB issue(s) already tracked"
+            fi
+        fi
+
+    else
+
+        preserve_existing_flow_issue \
+            "Radarr" \
+            "Movie"
+    fi
+
+    FLOW_ANALYSIS_OK=true
+    FLOW_ANALYSIS_REASON="Flow analysis completed"
 }
 
 ###############################################################################
@@ -5064,7 +5779,7 @@ rotate_persistent_log
 
 persistent_log \
     "START" \
-    "ARR Import Monitor v2.5"
+    "ARR Import Monitor v2.6"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -5077,7 +5792,7 @@ fi
 # START
 ###############################################################################
 
-log "Starting ARR Import Monitor v2.5"
+log "Starting ARR Import Monitor v2.6"
 log "Recommended schedule: hourly"
 log "Notifications enabled: $SEND_NOTIFICATIONS"
 log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -5287,6 +6002,12 @@ fi
 process_sab_orphans
 
 ###############################################################################
+# ACTIVITY FLOW ANOMALY - v2.6
+###############################################################################
+
+assess_activity_flow
+
+###############################################################################
 # RESOLUTION CHECK
 #
 # Done only after all current issues have been marked seen.
@@ -5321,7 +6042,7 @@ write_persistent_activity_summary
 RUNTIME=$(runtime)
 
 log "============================================================"
-log "ARR Import Monitor v2.5 completed"
+log "ARR Import Monitor v2.6 completed"
 
 log ""
 log "SCAN HEALTH"
@@ -5424,6 +6145,34 @@ fi
 
 if (( PROMOTION_CANDIDATES > 0 )); then
     log_arr_telemetry_review_candidates
+fi
+
+log ""
+log "ACTIVITY FLOW - LAST ${FLOW_ANOMALY_LOOKBACK_HOURS}H"
+
+if [ "$FLOW_ANOMALY_ENABLED" = true ]; then
+
+    log ""
+    log "Sonarr / TV"
+    log "SAB TV jobs completed: $FLOW_SAB_TV_COMPLETED"
+    log "Sonarr successful imports: $FLOW_SONARR_IMPORTS"
+    log "Existing issue explanations: $FLOW_SONARR_EXPLANATIONS"
+
+    log ""
+    log "Radarr / Movies"
+    log "SAB movie jobs completed: $FLOW_SAB_MOVIE_COMPLETED"
+    log "Radarr successful imports: $FLOW_RADARR_IMPORTS"
+    log "Existing issue explanations: $FLOW_RADARR_EXPLANATIONS"
+
+    log ""
+    log "Flow anomalies: $FLOW_ANOMALY_COUNT"
+    log "Candidates suppressed by existing issues: $FLOW_ANOMALY_SUPPRESSED_COUNT"
+    log "Flow analysis successful: $FLOW_ANALYSIS_OK"
+    log "Flow analysis status: $FLOW_ANALYSIS_REASON"
+
+else
+
+    log "Activity flow anomaly detection: DISABLED"
 fi
 
 log ""
