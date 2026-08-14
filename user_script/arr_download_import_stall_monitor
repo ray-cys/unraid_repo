@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Download / Import Stall Monitor v2.4
+# ARR Download / Import Stall Monitor v2.5
 #
 # PURPOSE
 # -------
@@ -172,7 +172,7 @@
 #
 # ISSUE LIFECYCLE
 # ---------------
-# v2.3 records:
+# v2.2 records:
 #
 #   firstSeen
 #   lastSeen
@@ -274,7 +274,7 @@ STALL_AFTER_HOURS=6
 POLICY_ESCALATE_AFTER_HOURS=72
 
 # ---------------------------------------------------------------------------
-# SAB stranded download thresholds - v2.3
+# SAB stranded download thresholds - v2.2
 # ---------------------------------------------------------------------------
 
 # Ignore all possible SAB leftovers younger than this.
@@ -350,7 +350,6 @@ ARR_TELEMETRY_REVIEW_TOP=10
 # Notifications
 # ---------------------------------------------------------------------------
 
-# Keep false while validating v2.3.
 SEND_NOTIFICATIONS=false
 
 NOTIFY="/usr/local/emhttp/webGui/scripts/notify"
@@ -373,6 +372,48 @@ STATE_BACKUP="${STATE_DIR}/state.json.bak"
 
 # Resolved historical issues older than this are removed from state.
 STATE_RETENTION_DAYS=14
+
+# ---------------------------------------------------------------------------
+# Persistent operational log - v2.5
+# ---------------------------------------------------------------------------
+
+LOG_FILE="${STATE_DIR}/arr_import_monitor.log"
+
+# Rotate after approximately 10 MiB.
+LOG_MAX_SIZE_MB=10
+
+# Keep:
+#   arr_import_monitor.log
+#   arr_import_monitor.log.1
+#   arr_import_monitor.log.2
+#   arr_import_monitor.log.3
+LOG_BACKUPS=3
+
+# ---------------------------------------------------------------------------
+# Recent activity audit - v2.5
+# ---------------------------------------------------------------------------
+
+ACTIVITY_AUDIT_ENABLED=true
+
+# Look backwards this many hours for actual download/import activity.
+ACTIVITY_AUDIT_LOOKBACK_HOURS=24
+
+# Normally only aggregate successful imports are shown.
+#
+# Set true temporarily when troubleshooting to print individual successful
+# Sonarr/Radarr imports in the User Scripts output.
+#
+# Individual successes are NOT written to the persistent audit log.
+AUDIT_SUCCESS_DETAILS=false
+
+# Maximum successful imports displayed when AUDIT_SUCCESS_DETAILS=true.
+AUDIT_DETAIL_MAX_ITEMS=20
+
+# Produce a conservative overall pipeline assessment.
+#
+# This is LOG ONLY.
+# It does not generate additional notifications.
+PIPELINE_HEALTH_ENABLED=true
 
 # ---------------------------------------------------------------------------
 # Runtime
@@ -438,8 +479,42 @@ BATCHED_NOTIFICATION_ITEMS=0
 TELEMETRY_OBSERVATIONS=0
 TELEMETRY_NEW_PATTERNS=0
 TELEMETRY_EXISTING_PATTERNS=0
+
 PROMOTION_RULE_MATCHES=0
 PROMOTION_CANDIDATES=0
+
+###############################################################################
+# ACTIVITY AUDIT - v2.5
+###############################################################################
+
+AUDIT_CUTOFF_EPOCH=0
+AUDIT_SINCE_ISO=""
+
+SONARR_AUDIT_HISTORY=""
+RADARR_AUDIT_HISTORY=""
+
+SONARR_AUDIT_OK=false
+RADARR_AUDIT_OK=false
+SAB_AUDIT_OK=false
+
+SONARR_AUDIT_IMPORTED=0
+SONARR_AUDIT_DOWNLOAD_FAILED=0
+
+RADARR_AUDIT_IMPORTED=0
+RADARR_AUDIT_DOWNLOAD_FAILED=0
+
+SAB_AUDIT_MOVIE_COMPLETED=0
+SAB_AUDIT_TV_COMPLETED=0
+
+SAB_AUDIT_MOVIE_FAILED=0
+SAB_AUDIT_TV_FAILED=0
+
+SAB_AUDIT_F1_IGNORED=0
+
+SAB_AUDIT_WINDOW_INCOMPLETE=false
+
+PIPELINE_STATUS="UNKNOWN"
+PIPELINE_REASON="Not assessed"
 
 ###############################################################################
 # BASIC FUNCTIONS
@@ -447,6 +522,85 @@ PROMOTION_CANDIDATES=0
 
 log() {
     printf '%s : %s\n' "$(date '+%Y/%m/%d %T')" "$*"
+}
+
+###############################################################################
+# PERSISTENT OPERATIONAL LOG - v2.5
+###############################################################################
+
+persistent_log() {
+
+    local level="$1"
+    shift
+
+    if [ -z "$LOG_FILE" ]; then
+        return
+    fi
+
+    if ! printf '%s | %s | %s\n' \
+        "$(date '+%Y/%m/%d %T')" \
+        "$level" \
+        "$*" \
+        >>"$LOG_FILE" 2>/dev/null
+    then
+
+        log "WARNING: Unable to write persistent log: $LOG_FILE"
+    fi
+}
+
+###############################################################################
+# PERSISTENT LOG ROTATION
+###############################################################################
+
+rotate_persistent_log() {
+
+    [ -f "$LOG_FILE" ] || return 0
+
+    local size
+    local max_bytes
+    local i
+
+    size=$(stat -c '%s' "$LOG_FILE" 2>/dev/null || echo 0)
+
+    [[ "$size" =~ ^[0-9]+$ ]] || size=0
+
+    max_bytes=$(( LOG_MAX_SIZE_MB * 1024 * 1024 ))
+
+    if (( size < max_bytes )); then
+        return 0
+    fi
+
+    log "Rotating persistent ARR monitor log"
+
+    ###########################################################################
+    # REMOVE OLDEST
+    ###########################################################################
+
+    if (( LOG_BACKUPS > 0 )); then
+
+        rm -f -- "${LOG_FILE}.${LOG_BACKUPS}" 2>/dev/null || true
+
+        #######################################################################
+        # SHIFT EXISTING BACKUPS
+        #######################################################################
+
+        for (( i=LOG_BACKUPS-1; i>=1; i-- )); do
+
+            if [ -f "${LOG_FILE}.${i}" ]; then
+
+                mv -f \
+                    "${LOG_FILE}.${i}" \
+                    "${LOG_FILE}.$((i + 1))"
+            fi
+
+        done
+
+        mv -f "$LOG_FILE" "${LOG_FILE}.1"
+
+    else
+
+        : >"$LOG_FILE"
+    fi
 }
 
 runtime() {
@@ -1332,31 +1486,6 @@ issue_seen_this_run() {
 }
 
 ###############################################################################
-# ISSUE SIGNATURE
-###############################################################################
-
-issue_signature() {
-
-    local app="$1"
-    local id="$2"
-    local classification="$3"
-    local severity="$4"
-    local stage="$5"
-    local message="$6"
-
-    #   - Its underlying Arr/SAB issue message changes
-    printf '%s|%s|%s|%s|%s|%s' \
-        "$app" \
-        "$id" \
-        "$classification" \
-        "$severity" \
-        "$stage" \
-        "$message" |
-        sha256sum |
-        awk '{print $1}'
-}
-
-###############################################################################
 # ARR MESSAGE TELEMETRY - v2.3
 #
 # Telemetry is observational only.
@@ -1983,6 +2112,75 @@ log_arr_telemetry_review_candidates() {
 }
 
 ###############################################################################
+# ISSUE SIGNATURE
+###############################################################################
+
+issue_signature() {
+
+    local app="$1"
+    local id="$2"
+    local classification="$3"
+    local severity="$4"
+    local stage="$5"
+    local message="$6"
+
+    #   - Its underlying Arr/SAB issue message changes
+    printf '%s|%s|%s|%s|%s|%s' \
+        "$app" \
+        "$id" \
+        "$classification" \
+        "$severity" \
+        "$stage" \
+        "$message" |
+        sha256sum |
+        awk '{print $1}'
+}
+
+###############################################################################
+# PERSISTENT ISSUE TRANSITION CHECK - v2.5
+#
+# Persist only when:
+#
+#   - issue is new
+#   - a resolved issue returns
+#   - classification/severity/stage/message changes
+#
+###############################################################################
+
+issue_transition_should_persist() {
+
+    local issue_key="$1"
+    local signature="$2"
+
+    local previous_signature
+    local previous_active
+
+    previous_signature=$(
+        jq -r \
+            --arg key "$issue_key" \
+            '.issues[$key].signature // ""' \
+            "$STATE_FILE"
+    )
+
+    previous_active=$(
+        jq -r \
+            --arg key "$issue_key" \
+            '(.issues[$key].active // false) | tostring' \
+            "$STATE_FILE"
+    )
+
+    if [ "$previous_active" != "true" ]; then
+        return 0
+    fi
+
+    if [ "$previous_signature" != "$signature" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+###############################################################################
 # ISSUE STATE UPDATE
 #
 # If an issue was previously resolved and returns:
@@ -2286,6 +2484,9 @@ resolve_missing_issues() {
             log "Previous classification: $classification"
             log "Observed lifetime: approximately ${lifetime_hours}h"
             log "Resolution notification: disabled by design"
+            persistent_log \
+                "RESOLVED" \
+                "${source} | ${classification} | ${title} | lifetime=${lifetime_hours}h"
 
         else
 
@@ -3081,6 +3282,15 @@ process_queue() {
                 "$message"
         )
 
+        local persist_issue_transition=false
+
+        if issue_transition_should_persist \
+            "$issue_key" \
+            "$signature"
+        then
+            persist_issue_transition=true
+        fi
+
         update_issue_state \
             "$issue_key" \
             "$signature" \
@@ -3090,6 +3300,13 @@ process_queue() {
             "$severity" \
             "$stage" \
             "$message"
+
+        if [ "$persist_issue_transition" = true ]; then
+
+            persistent_log \
+                "ISSUE" \
+                "${app} | ${classification} | ${severity} | ${media_name} | age=${age}h"
+        fi
 
         #######################################################################
         # GROUP NOTIFICATION
@@ -4043,6 +4260,15 @@ process_sab_orphans() {
                 "$message"
         )
 
+        local persist_issue_transition=false
+
+        if issue_transition_should_persist \
+            "$issue_key" \
+            "$signature"
+        then
+            persist_issue_transition=true
+        fi
+
         update_issue_state \
             "$issue_key" \
             "$signature" \
@@ -4052,6 +4278,13 @@ process_sab_orphans() {
             "$severity" \
             "$stage" \
             "$message"
+
+        if [ "$persist_issue_transition" = true ]; then
+
+            persistent_log \
+                "ISSUE" \
+                "SABnzbd | ${classification} | ${severity} | ${name} | owner=${owner} | age=${age}h | remaining=$(bytes_human "$total_bytes")"
+        fi
 
         #######################################################################
         # CANDIDATE = LOG ONLY
@@ -4109,6 +4342,566 @@ process_sab_orphans() {
         fi
 
     done <<<"$records"
+}
+
+###############################################################################
+# ACTIVITY AUDIT WINDOW - v2.5
+###############################################################################
+
+initialize_activity_audit_window() {
+
+    AUDIT_CUTOFF_EPOCH=$(
+        date \
+            -d "${ACTIVITY_AUDIT_LOOKBACK_HOURS} hours ago" \
+            '+%s'
+    )
+
+    AUDIT_SINCE_ISO=$(
+        date \
+            -u \
+            -d "@${AUDIT_CUTOFF_EPOCH}" \
+            '+%Y-%m-%dT%H:%M:%SZ'
+    )
+}
+
+###############################################################################
+# FETCH RECENT ARR HISTORY - v2.5
+###############################################################################
+
+fetch_arr_activity_history() {
+
+    local app="$1"
+    local base_url="$2"
+    local api_key="$3"
+    local output="$4"
+
+    local endpoint
+
+    case "$app" in
+
+        Sonarr)
+
+            endpoint="${base_url%/}/api/v3/history/since?date=${AUDIT_SINCE_ISO}&includeSeries=true&includeEpisode=true"
+            ;;
+
+        Radarr)
+
+            endpoint="${base_url%/}/api/v3/history/since?date=${AUDIT_SINCE_ISO}&includeMovie=true"
+            ;;
+
+        *)
+
+            return 1
+            ;;
+    esac
+
+    api_get \
+        "$endpoint" \
+        "$api_key" \
+        "$output"
+}
+
+###############################################################################
+# PROCESS RECENT ARR ACTIVITY - v2.5
+###############################################################################
+
+process_arr_activity_audit() {
+
+    local app="$1"
+    local history_file="$2"
+
+    local imported
+    local failed
+
+    imported=$(
+        jq \
+            '[
+                .[]?
+                | select(
+                    .eventType == "downloadFolderImported"
+                )
+            ]
+            | length' \
+            "$history_file" 2>/dev/null ||
+            echo 0
+    )
+
+    failed=$(
+        jq \
+            '[
+                .[]?
+                | select(
+                    .eventType == "downloadFailed"
+                )
+            ]
+            | length' \
+            "$history_file" 2>/dev/null ||
+            echo 0
+    )
+
+    case "$app" in
+
+        Sonarr)
+
+            SONARR_AUDIT_IMPORTED="$imported"
+            SONARR_AUDIT_DOWNLOAD_FAILED="$failed"
+            ;;
+
+        Radarr)
+
+            RADARR_AUDIT_IMPORTED="$imported"
+            RADARR_AUDIT_DOWNLOAD_FAILED="$failed"
+            ;;
+    esac
+
+    [ "$AUDIT_SUCCESS_DETAILS" = true ] || return 0
+    (( imported > 0 )) || return 0
+
+    log ""
+    log "$app recent successful imports"
+
+    if [ "$app" = "Sonarr" ]; then
+
+        jq -r \
+            --argjson maximum "$AUDIT_DETAIL_MAX_ITEMS" \
+            '
+            def pad2:
+                tostring
+                | if length < 2
+                  then "0" + .
+                  else .
+                  end;
+
+            [
+                .[]?
+                | select(
+                    .eventType == "downloadFolderImported"
+                )
+            ]
+
+            | sort_by(.date)
+            | reverse
+            | .[:$maximum]
+            | .[]
+
+            |
+
+            if
+                (.series.title // "") != ""
+                and
+                (.episode.seasonNumber // null) != null
+                and
+                (.episode.episodeNumber // null) != null
+
+            then
+
+                (.series.title)
+                + " - S"
+                + (.episode.seasonNumber | pad2)
+                + "E"
+                + (.episode.episodeNumber | pad2)
+                +
+                (
+                    if (.episode.title // "") != ""
+                    then " - " + .episode.title
+                    else ""
+                    end
+                )
+
+            else
+
+                (.sourceTitle // "Unknown")
+
+            end
+            ' \
+            "$history_file" |
+        while IFS= read -r item; do
+
+            [ -n "$item" ] &&
+                log "  + $item"
+
+        done
+
+    else
+
+        jq -r \
+            --argjson maximum "$AUDIT_DETAIL_MAX_ITEMS" \
+            '
+            [
+                .[]?
+                | select(
+                    .eventType == "downloadFolderImported"
+                )
+            ]
+
+            | sort_by(.date)
+            | reverse
+            | .[:$maximum]
+            | .[]
+
+            |
+
+            if (.movie.title // "") != ""
+            then
+
+                .movie.title
+                +
+                (
+                    if (.movie.year // 0) > 0
+                    then " (" + (.movie.year | tostring) + ")"
+                    else ""
+                    end
+                )
+
+            else
+
+                (.sourceTitle // "Unknown")
+
+            end
+            ' \
+            "$history_file" |
+        while IFS= read -r item; do
+
+            [ -n "$item" ] &&
+                log "  + $item"
+
+        done
+    fi
+}
+
+###############################################################################
+# SAB HISTORY EVENT TIME - v2.5
+#
+# Reuses the timestamp styles SAB has already exposed to this script.
+###############################################################################
+
+sab_history_event_epoch() {
+
+    local item="$1"
+
+    local value
+
+    value=$(
+        echo "$item" |
+        jq -r '
+            .completed
+            // .completed_time
+            // .completedTime
+            // .completionTime
+            // .time_completed
+            // ""
+        '
+    )
+
+    date_to_epoch "$value"
+}
+
+###############################################################################
+# PROCESS RECENT SAB ACTIVITY - v2.5
+###############################################################################
+
+process_sab_activity_audit() {
+
+    if [ "$SAB_SCAN_OK" != true ] ||
+       [ -z "$SAB_HISTORY" ] ||
+       [ ! -f "$SAB_HISTORY" ]
+    then
+
+        SAB_AUDIT_OK=false
+        return
+    fi
+
+    local loaded
+    local oldest_epoch=0
+
+    loaded=$(
+        jq '.history.slots // [] | length' \
+            "$SAB_HISTORY" 2>/dev/null ||
+            echo 0
+    )
+
+    while IFS= read -r item; do
+
+        [ -n "$item" ] || continue
+
+        local status
+        local category
+        local event_epoch
+
+        status=$(
+            echo "$item" |
+                jq -r '.status // ""'
+        )
+
+        category=$(
+            echo "$item" |
+                jq -r '.category // ""'
+        )
+
+        event_epoch=$(sab_history_event_epoch "$item")
+
+        if (( event_epoch <= 0 )); then
+            continue
+        fi
+
+        if (( oldest_epoch == 0 || event_epoch < oldest_epoch )); then
+            oldest_epoch="$event_epoch"
+        fi
+
+        if (( event_epoch < AUDIT_CUTOFF_EPOCH )); then
+            continue
+        fi
+
+        #######################################################################
+        # F1 IS AUDIT-IGNORED
+        #######################################################################
+
+        if [ "${category,,}" = "${SAB_IGNORED_CATEGORY,,}" ]; then
+
+            ((SAB_AUDIT_F1_IGNORED++)) || true
+            continue
+        fi
+
+        #######################################################################
+        # MOVIES
+        #######################################################################
+
+        if [ "${category,,}" = "${SAB_MOVIE_CATEGORY,,}" ]; then
+
+            case "${status,,}" in
+
+                completed)
+                    ((SAB_AUDIT_MOVIE_COMPLETED++)) || true
+                    ;;
+
+                failed)
+                    ((SAB_AUDIT_MOVIE_FAILED++)) || true
+                    ;;
+            esac
+
+            continue
+        fi
+
+        #######################################################################
+        # TV
+        #######################################################################
+
+        if [ "${category,,}" = "${SAB_TV_CATEGORY,,}" ]; then
+
+            case "${status,,}" in
+
+                completed)
+                    ((SAB_AUDIT_TV_COMPLETED++)) || true
+                    ;;
+
+                failed)
+                    ((SAB_AUDIT_TV_FAILED++)) || true
+                    ;;
+            esac
+        fi
+
+    done < <(
+        jq -c '.history.slots[]?' "$SAB_HISTORY"
+    )
+
+    ###########################################################################
+    # DETECT POSSIBLY TRUNCATED HISTORY
+    #
+    # If all SAB_HISTORY_LIMIT records are loaded and even the oldest loaded
+    # record is still newer than our requested audit cutoff, SAB may contain
+    # additional relevant records beyond the API limit.
+    ###########################################################################
+
+    SAB_AUDIT_WINDOW_INCOMPLETE=false
+
+    if (( loaded >= SAB_HISTORY_LIMIT )) &&
+       (( oldest_epoch > AUDIT_CUTOFF_EPOCH ))
+    then
+
+        SAB_AUDIT_WINDOW_INCOMPLETE=true
+    fi
+
+    SAB_AUDIT_OK=true
+}
+
+###############################################################################
+# PIPELINE HEALTH ASSESSMENT - v2.5
+#
+# Operational evidence only.
+#
+# This does NOT claim one-to-one verification between SAB jobs and Arr files.
+###############################################################################
+
+assess_pipeline_health() {
+
+    if [ "$PIPELINE_HEALTH_ENABLED" != true ]; then
+
+        PIPELINE_STATUS="DISABLED"
+        PIPELINE_REASON="Pipeline health assessment disabled"
+
+        return
+    fi
+
+    local recent_failure_signals=0
+    local recent_activity=0
+
+    recent_failure_signals=$(
+        (
+            SAB_AUDIT_MOVIE_FAILED
+            + SAB_AUDIT_TV_FAILED
+            + SONARR_AUDIT_DOWNLOAD_FAILED
+            + RADARR_AUDIT_DOWNLOAD_FAILED
+        )
+    )
+
+    recent_activity=$(
+        (
+            SAB_AUDIT_MOVIE_COMPLETED
+            + SAB_AUDIT_TV_COMPLETED
+            + SONARR_AUDIT_IMPORTED
+            + RADARR_AUDIT_IMPORTED
+        )
+    )
+
+    ###########################################################################
+    # REQUIRED API UNAVAILABLE
+    ###########################################################################
+
+    if { [ "$SONARR_ENABLED" = true ] &&
+         [ "$SONARR_SCAN_OK" != true ]; } ||
+       { [ "$RADARR_ENABLED" = true ] &&
+         [ "$RADARR_SCAN_OK" != true ]; } ||
+       { [ "$SAB_ENABLED" = true ] &&
+         [ "$SAB_SCAN_OK" != true ]; }
+    then
+
+        PIPELINE_STATUS="UNAVAILABLE"
+        PIPELINE_REASON="One or more required application APIs could not be queried"
+
+        return
+    fi
+
+    ###########################################################################
+    # ACTIVITY AUDIT COULD NOT COMPLETE
+    ###########################################################################
+
+    if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
+
+        if { [ "$SONARR_ENABLED" = true ] &&
+             [ "$SONARR_AUDIT_OK" != true ]; } ||
+           { [ "$RADARR_ENABLED" = true ] &&
+             [ "$RADARR_AUDIT_OK" != true ]; } ||
+           { [ "$SAB_ENABLED" = true ] &&
+             [ "$SAB_AUDIT_OK" != true ]; }
+        then
+
+            PIPELINE_STATUS="DEGRADED"
+            PIPELINE_REASON="Core APIs are reachable but recent activity audit is incomplete"
+
+            return
+        fi
+    fi
+
+    ###########################################################################
+    # ACTIVE ERROR
+    ###########################################################################
+
+    if (( ERROR_COUNT > 0 )); then
+
+        PIPELINE_STATUS="DEGRADED"
+        PIPELINE_REASON="${ERROR_COUNT} active error-level issue(s) detected"
+
+        return
+    fi
+
+    ###########################################################################
+    # ACTIVE WARNING
+    ###########################################################################
+
+    if (( WARNING_COUNT > 0 )); then
+
+        PIPELINE_STATUS="ATTENTION"
+        PIPELINE_REASON="${WARNING_COUNT} active warning-level issue(s) detected"
+
+        return
+    fi
+
+    ###########################################################################
+    # RECENT HISTORICAL FAILURE SIGNAL
+    ###########################################################################
+
+    if (( recent_failure_signals > 0 )); then
+
+        PIPELINE_STATUS="ATTENTION"
+        PIPELINE_REASON="${recent_failure_signals} recent download-failure signal(s) observed within the audit window"
+
+        return
+    fi
+
+    ###########################################################################
+    # SAB AUDIT WINDOW MAY BE INCOMPLETE
+    ###########################################################################
+
+    if [ "$SAB_AUDIT_WINDOW_INCOMPLETE" = true ]; then
+
+        PIPELINE_STATUS="ATTENTION"
+        PIPELINE_REASON="SAB history limit was reached before the full audit window could be confirmed"
+
+        return
+    fi
+
+    ###########################################################################
+    # INFORMATIONAL ACTIVE ISSUES
+    ###########################################################################
+
+    if (( INFO_COUNT > 0 )); then
+
+        PIPELINE_STATUS="HEALTHY / INFO"
+        PIPELINE_REASON="Pipeline operational with ${INFO_COUNT} informational unresolved issue(s)"
+
+        return
+    fi
+
+    ###########################################################################
+    # RECENT SUCCESSFUL ACTIVITY
+    ###########################################################################
+
+    if (( recent_activity > 0 )); then
+
+        PIPELINE_STATUS="HEALTHY"
+        PIPELINE_REASON="APIs healthy, recent successful activity observed, no significant active problems detected"
+
+        return
+    fi
+
+    ###########################################################################
+    # NOTHING HAPPENED RECENTLY
+    ###########################################################################
+
+    PIPELINE_STATUS="HEALTHY / IDLE"
+    PIPELINE_REASON="APIs healthy and no significant problems detected; no recent relevant activity available to validate"
+}
+
+###############################################################################
+# WRITE COMPACT PERSISTENT AUDIT RECORD - v2.5
+###############################################################################
+
+write_persistent_activity_summary() {
+
+    persistent_log \
+        "API" \
+        "Sonarr=${SONARR_SCAN_OK} | Radarr=${RADARR_SCAN_OK} | SABnzbd=${SAB_SCAN_OK}"
+
+    if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
+
+        persistent_log \
+            "AUDIT" \
+            "lookback=${ACTIVITY_AUDIT_LOOKBACK_HOURS}h | SAB movie_completed=${SAB_AUDIT_MOVIE_COMPLETED} tv_completed=${SAB_AUDIT_TV_COMPLETED} failed=$((SAB_AUDIT_MOVIE_FAILED + SAB_AUDIT_TV_FAILED)) | Sonarr imports=${SONARR_AUDIT_IMPORTED} failed=${SONARR_AUDIT_DOWNLOAD_FAILED} | Radarr imports=${RADARR_AUDIT_IMPORTED} failed=${RADARR_AUDIT_DOWNLOAD_FAILED}"
+    fi
+
+    persistent_log \
+        "PIPELINE" \
+        "status=${PIPELINE_STATUS} | ${PIPELINE_REASON}"
 }
 
 ###############################################################################
@@ -4231,6 +5024,7 @@ fi
 require_command curl
 require_command jq
 require_command date
+require_command stat
 require_command sed
 require_command sort
 require_command comm
@@ -4263,10 +5057,27 @@ SEEN_ISSUES_FILE="${TMP_DIR}/seen_issues.txt"
 initialize_state
 
 ###############################################################################
+# v2.5 PERSISTENT LOG / ACTIVITY AUDIT INITIALIZATION
+###############################################################################
+
+rotate_persistent_log
+
+persistent_log \
+    "START" \
+    "ARR Import Monitor v2.5"
+
+if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
+
+    initialize_activity_audit_window
+
+    log "Activity audit window: last ${ACTIVITY_AUDIT_LOOKBACK_HOURS}h"
+fi
+
+###############################################################################
 # START
 ###############################################################################
 
-log "Starting ARR Import Monitor v2.4"
+log "Starting ARR Import Monitor v2.5"
 log "Recommended schedule: hourly"
 log "Notifications enabled: $SEND_NOTIFICATIONS"
 log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -4385,6 +5196,91 @@ if [ "$RADARR_ENABLED" = true ]; then
 fi
 
 ###############################################################################
+# RECENT ACTIVITY AUDIT - v2.5
+###############################################################################
+
+if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
+
+    log "Running recent operational activity audit"
+
+    ###########################################################################
+    # SABNZBD
+    ###########################################################################
+
+    process_sab_activity_audit
+
+    ###########################################################################
+    # SONARR HISTORY
+    ###########################################################################
+
+    if [ "$SONARR_ENABLED" = true ] &&
+       [ "$SONARR_SCAN_OK" = true ]
+    then
+
+        SONARR_AUDIT_HISTORY="${TMP_DIR}/sonarr_history_audit.json"
+
+        if fetch_arr_activity_history \
+            "Sonarr" \
+            "$SONARR_URL" \
+            "$SONARR_API_KEY" \
+            "$SONARR_AUDIT_HISTORY"
+        then
+
+            SONARR_AUDIT_OK=true
+
+            process_arr_activity_audit \
+                "Sonarr" \
+                "$SONARR_AUDIT_HISTORY"
+
+        else
+
+            SONARR_AUDIT_OK=false
+
+            log "WARNING: Unable to retrieve recent Sonarr history"
+
+            persistent_log \
+                "ERROR" \
+                "Unable to retrieve recent Sonarr history"
+        fi
+    fi
+
+    ###########################################################################
+    # RADARR HISTORY
+    ###########################################################################
+
+    if [ "$RADARR_ENABLED" = true ] &&
+       [ "$RADARR_SCAN_OK" = true ]
+    then
+
+        RADARR_AUDIT_HISTORY="${TMP_DIR}/radarr_history_audit.json"
+
+        if fetch_arr_activity_history \
+            "Radarr" \
+            "$RADARR_URL" \
+            "$RADARR_API_KEY" \
+            "$RADARR_AUDIT_HISTORY"
+        then
+
+            RADARR_AUDIT_OK=true
+
+            process_arr_activity_audit \
+                "Radarr" \
+                "$RADARR_AUDIT_HISTORY"
+
+        else
+
+            RADARR_AUDIT_OK=false
+
+            log "WARNING: Unable to retrieve recent Radarr history"
+
+            persistent_log \
+                "ERROR" \
+                "Unable to retrieve recent Radarr history"
+        fi
+    fi
+fi
+
+###############################################################################
 # SAB CROSS-APP CHECK
 ###############################################################################
 
@@ -4411,19 +5307,60 @@ send_grouped_notification
 prune_state
 
 ###############################################################################
+# PIPELINE HEALTH - v2.5
+###############################################################################
+
+assess_pipeline_health
+
+write_persistent_activity_summary
+
+###############################################################################
 # SUMMARY
 ###############################################################################
 
 RUNTIME=$(runtime)
 
 log "============================================================"
-log "ARR Import Monitor v2.4 completed"
+log "ARR Import Monitor v2.5 completed"
 
 log ""
 log "SCAN HEALTH"
 log "Sonarr scan successful: $SONARR_SCAN_OK"
 log "Radarr scan successful: $RADARR_SCAN_OK"
 log "SABnzbd scan successful: $SAB_SCAN_OK"
+
+log ""
+log "RECENT ACTIVITY - LAST ${ACTIVITY_AUDIT_LOOKBACK_HOURS}H"
+
+if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
+
+    log ""
+    log "SABnzbd"
+    log "Movie jobs completed: $SAB_AUDIT_MOVIE_COMPLETED"
+    log "TV jobs completed: $SAB_AUDIT_TV_COMPLETED"
+    log "Movie jobs failed: $SAB_AUDIT_MOVIE_FAILED"
+    log "TV jobs failed: $SAB_AUDIT_TV_FAILED"
+    log "F1 jobs ignored by audit: $SAB_AUDIT_F1_IGNORED"
+
+    if [ "$SAB_AUDIT_WINDOW_INCOMPLETE" = true ]; then
+
+        log "WARNING: SAB history may not cover the complete audit window"
+    fi
+
+    log ""
+    log "Sonarr"
+    log "Successful import events: $SONARR_AUDIT_IMPORTED"
+    log "Download-failed events: $SONARR_AUDIT_DOWNLOAD_FAILED"
+
+    log ""
+    log "Radarr"
+    log "Successful import events: $RADARR_AUDIT_IMPORTED"
+    log "Download-failed events: $RADARR_AUDIT_DOWNLOAD_FAILED"
+
+else
+
+    log "Activity audit: DISABLED"
+fi
 
 log ""
 log "ARR QUEUES"
@@ -4490,6 +5427,11 @@ if (( PROMOTION_CANDIDATES > 0 )); then
 fi
 
 log ""
+log "PIPELINE HEALTH"
+log "Status: $PIPELINE_STATUS"
+log "Reason: $PIPELINE_REASON"
+
+log ""
 log "NOTIFICATIONS"
 log "New/escalated issues queued for grouping: $BATCHED_NOTIFICATION_ITEMS"
 
@@ -4509,4 +5451,8 @@ log "Recommended run interval: hourly"
 log "Runtime: $RUNTIME"
 log "============================================================"
 
+persistent_log \
+    "END" \
+    "runtime=${RUNTIME} | active_issues=${TOTAL_ISSUES} | info=${INFO_COUNT} | warnings=${WARNING_COUNT} | errors=${ERROR_COUNT}"
+    
 exit 0
