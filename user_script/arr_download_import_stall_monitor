@@ -1,28 +1,167 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Download / Import Stall Monitor v2.0.1
+# ARR Download / Import Stall Monitor v2.4
 #
-# MONITORS
-# --------
-# Sonarr + Radarr:
-#   - Custom Format rejection
-#   - Lower/equal CF score
-#   - Upgrade rejection
-#   - TBA / metadata waiting
-#   - Unmatched media
-#   - No importable files
-#   - Manual intervention
-#   - Permission errors
-#   - Missing paths
-#   - Import failures
-#   - Generic warnings/errors/stalls
+# PURPOSE
+# -------
+# Read-only monitoring of the Usenet -> Arr import workflow:
 #
-# SABnzbd:
-#   - Completed movie job no longer tracked by Radarr
-#   - Completed TV job no longer tracked by Sonarr
-#   - Completed data still physically present
-#   - Empty leftover directories
+#   SABnzbd
+#      |
+#      +--> Sonarr
+#      |
+#      +--> Radarr
+#
+# The script detects downloads that completed successfully but were not
+# imported, were rejected by Arr policy, require manual attention, or have
+# become stranded outside the normal Arr workflow.
+#
+#
+# RECOMMENDED SCHEDULE
+# --------------------
+# Run this script ONCE PER HOUR using Unraid User Scripts.
+#
+# Recommended cron:
+#
+#   0 * * * *
+#
+# The script itself does NOT create or manage its schedule.
+#
+# With an hourly schedule, notification timing is approximately:
+#
+#   ARR errors:
+#       Eligible after ERROR_AFTER_HOURS
+#
+#   ARR warnings / CF rejection / TBA:
+#       Eligible after WARNING_AFTER_HOURS
+#
+#   Generic Arr import stalls:
+#       Eligible after STALL_AFTER_HOURS
+#
+#   CF / upgrade / TBA unresolved escalation:
+#       Additional notification after POLICY_ESCALATE_AFTER_HOURS
+#
+#   SAB stranded downloads:
+#
+#       < SAB_ORPHAN_IGNORE_HOURS
+#           Ignore
+#
+#       Media payload:
+#           Eligible for warning after SAB_MEDIA_WARN_HOURS
+#
+#       Archive payload:
+#           Eligible for warning after SAB_ARCHIVE_WARN_HOURS
+#
+#       Significant unknown payload:
+#           Eligible for warning after SAB_OTHER_WARN_HOURS
+#
+#       Before the applicable warning threshold:
+#           Log as an early candidate only
+#
+#       >= SAB_ORPHAN_ESCALATE_HOURS
+#           One additional escalation notification
+#
+#       Sample / repair / metadata residue:
+#           Log only; no notification
+#
+#       Empty leftover directory:
+#           Log only; no notification
+#
+# Because this is normally run hourly, a threshold may be detected up to
+# approximately one run interval after it is crossed.
+#
+#
+# NOTIFICATION BEHAVIOR
+# ---------------------
+# Notifications are GROUPED.
+#
+# If one run discovers:
+#
+#   3 Sonarr issues
+#   2 Radarr issues
+#   1 SAB issue
+#
+# the script sends ONE grouped Unraid notification rather than six.
+#
+# Already-notified unchanged issues are suppressed individually.
+#
+# An issue is allowed another notification when:
+#
+#   - Its classification changes
+#   - Its severity changes
+#   - It crosses an escalation threshold
+#   - It was previously resolved and later reappears
+#
+# Resolutions are logged but DO NOT generate notifications.
+#
+#
+# ARR-SIDE DETECTION
+# ------------------
+#   CF_REJECT_LOWER_SCORE
+#   CF_REJECT_EQUAL_SCORE
+#   CF_REJECT
+#   UPGRADE_REJECT
+#   TBA_METADATA
+#   UNMATCHED_MEDIA
+#   NO_IMPORTABLE_FILES
+#   MANUAL
+#   PERMISSION
+#   PATH
+#   IMPORT_FAILED
+#   ARR_IMPORT_STALLED
+#   WARNING
+#   ERROR
+#
+#
+# ARR MESSAGE TELEMETRY - v2.3
+# ----------------------------
+# Generic Sonarr/Radarr issues are recorded over time when they currently
+# fall through to:
+#
+#   WARNING
+#   ERROR
+#   ARR_IMPORT_STALLED
+#
+# The underlying queue message is normalized so variable paths, UUIDs and
+# episode numbers do not unnecessarily create separate patterns.
+#
+# Telemetry records:
+#
+#   firstSeen
+#   lastSeen
+#   observations
+#   distinctIssues
+#   normalizedMessage
+#   representative examples
+#   most recent Arr queue status/state
+#
+# Telemetry DOES NOT automatically alter classifications.
+#
+# A recurring unknown pattern must first be observed and reviewed before it
+# is promoted into a specific classification in a future version.
+#
+#
+# SAB CROSS-APP DETECTION
+# -----------------------
+#   SAB_STRANDED_MEDIA
+#       Full movie/episode media remains
+#
+#   SAB_STRANDED_ARCHIVE
+#       Archive payload remains
+#
+#   SAB_STRANDED_OTHER
+#       Significant unclassified data remains
+#
+#   SAB_RESIDUE_SAMPLE
+#       Sample/trailer residue; log only
+#
+#   SAB_RESIDUE
+#       Repair/metadata/small miscellaneous residue; log only
+#
+#   SAB_EMPTY_LEFTOVER
+#       Empty directory; log only
+#
 #
 # SAB CATEGORY MAPPING
 # --------------------
@@ -30,24 +169,38 @@
 #   tv    -> Sonarr
 #   f1    -> ignored
 #
-# NOTIFICATIONS
-# -------------
-# Newly reportable issues discovered during the same run are grouped into
-# ONE Unraid notification.
 #
-# Existing notified issues are suppressed individually by state.
+# ISSUE LIFECYCLE
+# ---------------
+# v2.3 records:
 #
-# Individual issues are only marked notified AFTER the grouped notification
-# is successfully sent.
+#   firstSeen
+#   lastSeen
+#   occurrences
+#   active
+#   resolvedAt
+#   notifiedSignature
+#
+# When an issue disappears during a successful scan:
+#
+#   active = false
+#   resolvedAt = current time
+#
+# No resolution email is sent.
+#
+# If the same issue later returns, it starts a new lifecycle and may generate
+# a new notification.
+#
 #
 # SAFETY
 # ------
 # READ ONLY.
 #
 # This script NEVER:
-#   - Deletes SAB downloads
-#   - Deletes SAB history
-#   - Removes Arr queue entries
+#
+#   - Deletes downloads
+#   - Removes SAB history
+#   - Removes Sonarr/Radarr queue entries
 #   - Forces imports
 #   - Marks downloads failed
 #   - Changes monitoring
@@ -98,65 +251,127 @@ SAB_MOVIE_DIR="${SAB_COMPLETE_ROOT}/movies"
 SAB_TV_CATEGORY="tv"
 SAB_TV_DIR="${SAB_COMPLETE_ROOT}/series"
 
-# Explicitly excluded from orphan monitoring.
+# Explicitly excluded because it has a separate workflow/script.
 SAB_IGNORED_CATEGORY="f1"
 
 # ---------------------------------------------------------------------------
-# ARR detection thresholds
+# ARR thresholds
 # ---------------------------------------------------------------------------
 
+# Ignore very fresh queue entries.
 IGNORE_BEFORE_HOURS=1
 
+# Normal policy / metadata / warning threshold.
 WARNING_AFTER_HOURS=3
+
+# Genuine import/system errors.
 ERROR_AFTER_HOURS=2
+
+# Generic completed-but-not-progressing items.
 STALL_AFTER_HOURS=6
 
-# CF / upgrade / TBA items become unresolved warnings after this long.
+# CF / upgrade / TBA escalation.
 POLICY_ESCALATE_AFTER_HOURS=72
 
 # ---------------------------------------------------------------------------
-# SAB stranded download thresholds
+# SAB stranded download thresholds - v2.3
 # ---------------------------------------------------------------------------
 
-# Younger than this:
-# completely ignore.
+# Ignore all possible SAB leftovers younger than this.
 SAB_ORPHAN_IGNORE_HOURS=6
 
-# Between IGNORE and WARN:
-# log candidate only.
-SAB_ORPHAN_WARN_HOURS=12
+# Full media still present.
+SAB_MEDIA_WARN_HOURS=12
 
-# Still stranded beyond this:
-# one additional escalation warning.
+# RAR/7z/etc. archive payload still present.
+SAB_ARCHIVE_WARN_HOURS=12
+
+# Unknown but materially large data.
+SAB_OTHER_WARN_HOURS=24
+
+# Any actionable stranded condition still present after this age gets one
+# additional escalation notification.
 SAB_ORPHAN_ESCALATE_HOURS=72
+
+# Unknown files smaller than this are treated as residue rather than a
+# stranded download.
+#
+# 100 MiB.
+SAB_SIGNIFICANT_OTHER_BYTES=$((100 * 1024 * 1024))
+
+# ---------------------------------------------------------------------------
+# Arr message telemetry - v2.3
+# ---------------------------------------------------------------------------
+
+# Learn from real Sonarr/Radarr messages that currently fall through to
+# generic WARNING, ERROR, or ARR_IMPORT_STALLED classifications.
+ARR_TELEMETRY_ENABLED=true
+
+# Historical normalized message patterns remain available this long.
+ARR_TELEMETRY_RETENTION_DAYS=60
+
+# Prevent telemetry from growing indefinitely.
+ARR_TELEMETRY_MAX_PATTERNS=250
+
+# Remember at most this many distinct issue/download IDs for each pattern.
+ARR_TELEMETRY_MAX_ISSUE_KEYS=50
+
+# Keep a few representative real messages for later review.
+ARR_TELEMETRY_MAX_EXAMPLES=3
+
+# Maximum raw message length retained as an example.
+ARR_TELEMETRY_EXAMPLE_MAX_CHARS=1500
+
+# Log whenever an entirely new normalized pattern is discovered.
+ARR_TELEMETRY_LOG_NEW_PATTERNS=true
+
+# ---------------------------------------------------------------------------
+# Classification refinement - v2.4
+# ---------------------------------------------------------------------------
+
+# Enable reviewed telemetry patterns to be promoted into precise
+# classifications.
+#
+# No promotion occurs unless a rule is explicitly added to
+# classify_promoted_arr_pattern().
+ARR_PROMOTION_RULES_ENABLED=true
+
+# A telemetry pattern becomes a REVIEW CANDIDATE only after it has been seen
+# across at least this many different queue/download issues.
+ARR_TELEMETRY_REVIEW_MIN_DISTINCT_ISSUES=2
+
+# It must also have accumulated at least this many observations.
+ARR_TELEMETRY_REVIEW_MIN_OBSERVATIONS=4
+
+# Maximum candidates displayed in each script summary.
+ARR_TELEMETRY_REVIEW_TOP=10
 
 # ---------------------------------------------------------------------------
 # Notifications
 # ---------------------------------------------------------------------------
 
-# Keep false while testing v2.0.1.
+# Keep false while validating v2.3.
 SEND_NOTIFICATIONS=false
 
 NOTIFY="/usr/local/emhttp/webGui/scripts/notify"
 
 NOTIFY_ONCE=true
 
-# Maximum number of individual issues shown in the grouped notification.
+# Maximum individual issues shown in one grouped notification.
 #
-# All issues are still recorded in state and logs.
-# If more than this number are newly reportable, the notification will say
-# how many additional issues were omitted from its body.
+# Additional issues remain visible in the User Scripts log.
 GROUP_NOTIFICATION_MAX_ITEMS=20
 
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
-STATE_DIR="/mnt/user/appdata/arr_import_monitor"
+STATE_DIR="/mnt/vault/cloud/logs/arr_import_monitor"
 
 STATE_FILE="${STATE_DIR}/state.json"
 STATE_BACKUP="${STATE_DIR}/state.json.bak"
 
+# Resolved historical issues older than this are removed from state.
 STATE_RETENTION_DAYS=14
 
 # ---------------------------------------------------------------------------
@@ -176,10 +391,16 @@ START_TIME=$(date +%s)
 
 TMP_DIR=""
 NOTIFICATION_BATCH=""
+SEEN_ISSUES_FILE=""
 
 SONARR_QUEUE=""
 RADARR_QUEUE=""
 SAB_HISTORY=""
+
+# Scan health.
+SONARR_SCAN_OK=false
+RADARR_SCAN_OK=false
+SAB_SCAN_OK=false
 
 TOTAL_QUEUE=0
 TOTAL_ISSUES=0
@@ -199,12 +420,26 @@ SAB_HISTORY_CHECKED=0
 SAB_IGNORED_COUNT=0
 SAB_STRANDED_COUNT=0
 SAB_CANDIDATE_COUNT=0
+SAB_MEDIA_STRANDED_COUNT=0
+SAB_ARCHIVE_STRANDED_COUNT=0
+SAB_OTHER_STRANDED_COUNT=0
+
+SAB_RESIDUE_COUNT=0
+SAB_SAMPLE_RESIDUE_COUNT=0
 SAB_EMPTY_COUNT=0
+
+RESOLVED_COUNT=0
 
 NOTIFICATIONS_SENT=0
 NOTIFICATIONS_SUPPRESSED=0
-
 BATCHED_NOTIFICATION_ITEMS=0
+
+# Arr message telemetry.
+TELEMETRY_OBSERVATIONS=0
+TELEMETRY_NEW_PATTERNS=0
+TELEMETRY_EXISTING_PATTERNS=0
+PROMOTION_RULE_MATCHES=0
+PROMOTION_CANDIDATES=0
 
 ###############################################################################
 # BASIC FUNCTIONS
@@ -254,42 +489,6 @@ cleanup() {
 trap 'cleanup' EXIT
 
 ###############################################################################
-# UNRAID NOTIFICATION
-###############################################################################
-
-notify() {
-
-    local importance="$1"
-    local description="$2"
-    local message="$3"
-
-    if [ "$SEND_NOTIFICATIONS" != true ]; then
-        return 2
-    fi
-
-    if [ ! -x "$NOTIFY" ]; then
-        log "WARNING: Unraid notification command unavailable"
-        return 1
-    fi
-
-    if "$NOTIFY" \
-        -i "$importance" \
-        -s "ARR Import Monitor" \
-        -d "$description" \
-        -m "$message" \
-        >/dev/null 2>&1
-    then
-
-        ((NOTIFICATIONS_SENT++)) || true
-        return 0
-    fi
-
-    log "WARNING: Failed to send grouped Unraid notification"
-
-    return 1
-}
-
-###############################################################################
 # REQUIRE COMMAND
 ###############################################################################
 
@@ -304,7 +503,46 @@ require_command() {
 }
 
 ###############################################################################
-# ARR API
+# UNRAID NOTIFICATION
+###############################################################################
+
+notify() {
+
+    local importance="$1"
+    local description="$2"
+    local message="$3"
+
+    if [ "$SEND_NOTIFICATIONS" != true ]; then
+        return 2
+    fi
+
+    if [ ! -x "$NOTIFY" ]; then
+
+        log "WARNING: Unraid notification command unavailable"
+
+        return 1
+    fi
+
+    if "$NOTIFY" \
+        -i "$importance" \
+        -s "ARR Import Monitor" \
+        -d "$description" \
+        -m "$message" \
+        >/dev/null 2>&1
+    then
+
+        ((NOTIFICATIONS_SENT++)) || true
+
+        return 0
+    fi
+
+    log "WARNING: Failed to send grouped Unraid notification"
+
+    return 1
+}
+
+###############################################################################
+# APIs
 ###############################################################################
 
 api_get() {
@@ -328,10 +566,6 @@ api_get() {
 
     jq empty "$output" >/dev/null 2>&1
 }
-
-###############################################################################
-# SAB API
-###############################################################################
 
 sab_get() {
 
@@ -362,7 +596,7 @@ sab_get() {
 }
 
 ###############################################################################
-# TIME FUNCTIONS
+# TIME
 ###############################################################################
 
 date_to_epoch() {
@@ -401,7 +635,7 @@ age_hours() {
 }
 
 ###############################################################################
-# ARR STATUS MESSAGE
+# ARR MESSAGE
 ###############################################################################
 
 queue_message() {
@@ -500,7 +734,7 @@ release_name() {
 }
 
 ###############################################################################
-# CUSTOM FORMAT EXTRACTION
+# CUSTOM FORMAT PARSING
 ###############################################################################
 
 extract_cf_new_score() {
@@ -566,6 +800,24 @@ cf_difference() {
         <(normalize_cf_list "$second")
 }
 
+join_lines() {
+
+    awk '
+        NF {
+            if (seen)
+                printf ", "
+
+            printf "%s", $0
+            seen=1
+        }
+
+        END {
+            if (seen)
+                printf "\n"
+        }
+    '
+}
+
 ###############################################################################
 # CLASSIFICATION
 ###############################################################################
@@ -621,6 +873,7 @@ classify_issue() {
        grep -Eq \
        '(^|[^[:alpha:]])tba([^[:alpha:]]|$)|title.*not available|metadata.*not available|metadata.*not ready|waiting.*metadata'
     then
+
         echo "TBA_METADATA"
         return
     fi
@@ -629,6 +882,7 @@ classify_issue() {
        grep -Eq \
        'unable to match|could not match|cannot match|failed to match|unable to identify|could not identify|cannot identify|unknown series|unknown movie'
     then
+
         echo "UNMATCHED_MEDIA"
         return
     fi
@@ -637,6 +891,7 @@ classify_issue() {
        grep -Eq \
        'no files.*eligible.*import|no importable files|no files found.*import|no video files|nothing.*to import'
     then
+
         echo "NO_IMPORTABLE_FILES"
         return
     fi
@@ -645,6 +900,7 @@ classify_issue() {
        grep -Eq \
        'not an upgrade|existing file.*better|existing.*preferred|quality.*not.*upgrade|does not improve|not an improvement'
     then
+
         echo "UPGRADE_REJECT"
         return
     fi
@@ -653,6 +909,7 @@ classify_issue() {
        grep -Eq \
        'permission denied|access.*denied|unauthorized access|not permitted|operation not permitted'
     then
+
         echo "PERMISSION"
         return
     fi
@@ -661,6 +918,7 @@ classify_issue() {
        grep -Eq \
        'path.*does not exist|folder.*does not exist|directory.*does not exist|cannot find|no such file|not accessible|unable to access|folder is missing'
     then
+
         echo "PATH"
         return
     fi
@@ -669,6 +927,7 @@ classify_issue() {
        grep -Eq \
        'import failed|failed to import|unable to import|import error|could not import|cannot import'
     then
+
         echo "IMPORT_FAILED"
         return
     fi
@@ -677,6 +936,7 @@ classify_issue() {
        grep -Eq \
        'manual import|manual intervention|requires manual|manually import|needs manual'
     then
+
         echo "MANUAL"
         return
     fi
@@ -698,6 +958,7 @@ classify_issue() {
        grep -Eq \
        'downloaded|completed|importpending|import blocked|waiting'
     then
+
         echo "ARR_IMPORT_STALLED"
         return
     fi
@@ -706,7 +967,7 @@ classify_issue() {
 }
 
 ###############################################################################
-# POLICY REJECTION
+# CLASSIFICATION SEVERITY
 ###############################################################################
 
 is_policy_rejection() {
@@ -724,10 +985,6 @@ is_policy_rejection() {
 
     return 1
 }
-
-###############################################################################
-# SEVERITY
-###############################################################################
 
 classification_severity() {
 
@@ -756,7 +1013,14 @@ classification_severity() {
             fi
             ;;
 
-        WARNING|MANUAL|ARR_IMPORT_STALLED)
+        WARNING|\
+        MANUAL|\
+        ARR_IMPORT_STALLED|\
+        FILE_LOCKED|\
+        SAMPLE_DETECTION|\
+        TITLE_MISMATCH|\
+        QUALITY_PARSE)
+
             echo "WARNING"
             ;;
 
@@ -765,7 +1029,14 @@ classification_severity() {
         PERMISSION|\
         PATH|\
         IMPORT_FAILED|\
-        ERROR)
+        ERROR|\
+        DISK_SPACE|\
+        MOVE_FAILED|\
+        COPY_FAILED|\
+        REMOTE_PATH_MAPPING|\
+        DOWNLOAD_CLIENT|\
+        FILE_TOO_SMALL|\
+        DESTINATION_CONFLICT)
 
             echo "ERROR"
             ;;
@@ -786,7 +1057,11 @@ classification_min_age() {
         UPGRADE_REJECT|\
         TBA_METADATA|\
         WARNING|\
-        MANUAL)
+        MANUAL|\
+        FILE_LOCKED|\
+        SAMPLE_DETECTION|\
+        TITLE_MISMATCH|\
+        QUALITY_PARSE)
 
             echo "$WARNING_AFTER_HOURS"
             ;;
@@ -796,6 +1071,13 @@ classification_min_age() {
         PERMISSION|\
         PATH|\
         IMPORT_FAILED|\
+        DISK_SPACE|\
+        MOVE_FAILED|\
+        COPY_FAILED|\
+        REMOTE_PATH_MAPPING|\
+        DOWNLOAD_CLIENT|\
+        FILE_TOO_SMALL|\
+        DESTINATION_CONFLICT|\
         ERROR)
 
             echo "$ERROR_AFTER_HOURS"
@@ -856,6 +1138,50 @@ classification_reason() {
             echo "Filesystem permission/access problem"
             ;;
 
+        DISK_SPACE)
+            echo "Arr reports insufficient filesystem space for the import operation"
+            ;;
+
+        MOVE_FAILED)
+            echo "Arr could not move the downloaded media into the library"
+            ;;
+
+        COPY_FAILED)
+            echo "Arr could not copy the downloaded media into the library"
+            ;;
+
+        REMOTE_PATH_MAPPING)
+            echo "Arr appears unable to correctly translate the download client's path"
+            ;;
+
+        DOWNLOAD_CLIENT)
+            echo "Arr reports a problem communicating with or processing data from the download client"
+            ;;
+
+        FILE_LOCKED)
+            echo "The downloaded or destination file appears to be locked or temporarily unavailable"
+            ;;
+
+        FILE_TOO_SMALL)
+            echo "The media file appears too small to be accepted as the expected movie or episode"
+            ;;
+
+        SAMPLE_DETECTION)
+            echo "Arr is unable to reliably determine whether the downloaded media is a sample"
+            ;;
+
+        TITLE_MISMATCH)
+            echo "The downloaded title does not sufficiently match the expected movie or episode"
+            ;;
+
+        QUALITY_PARSE)
+            echo "Arr could not reliably determine the quality or release characteristics"
+            ;;
+
+        DESTINATION_CONFLICT)
+            echo "The import appears blocked by an existing or conflicting destination file"
+            ;;
+
         PATH)
             echo "Downloaded path is missing or inaccessible"
             ;;
@@ -887,7 +1213,7 @@ classification_reason() {
 }
 
 ###############################################################################
-# STATE
+# STATE INITIALIZATION
 ###############################################################################
 
 initialize_state() {
@@ -901,8 +1227,12 @@ initialize_state() {
 
         cat >"$STATE_FILE" <<'EOF'
 {
-  "version": 5,
-  "issues": {}
+  "version": 7,
+  "issues": {},
+  "telemetry": {
+    "version": 1,
+    "patterns": {}
+  }
 }
 EOF
     fi
@@ -916,6 +1246,7 @@ EOF
         then
 
             log "Restoring state from backup"
+
             cp -f "$STATE_BACKUP" "$STATE_FILE"
 
         else
@@ -924,11 +1255,52 @@ EOF
 
             cat >"$STATE_FILE" <<'EOF'
 {
-  "version": 5,
-  "issues": {}
+  "version": 7,
+  "issues": {},
+  "telemetry": {
+    "version": 1,
+    "patterns": {}
+  }
 }
 EOF
         fi
+    fi
+    ###########################################################################
+    # v2.3 STATE MIGRATION
+    #
+    # Existing v2.1/v2.2 state files are upgraded in place.
+    ###########################################################################
+
+    local migrate_tmp
+
+    migrate_tmp="$TMP_DIR/state.migrate.json"
+
+    if jq '
+        .version = 7
+        |
+        .issues = (.issues // {})
+        |
+        .telemetry = (
+            .telemetry
+            // {
+                version: 1,
+                patterns: {}
+            }
+        )
+        |
+        .telemetry.version = 1
+        |
+        .telemetry.patterns = (.telemetry.patterns // {})
+        ' \
+        "$STATE_FILE" >"$migrate_tmp"
+    then
+
+        save_state "$migrate_tmp"
+
+    else
+
+        log "ERROR: Unable to migrate state file to schema version 7"
+        exit 3
     fi
 }
 
@@ -937,7 +1309,26 @@ save_state() {
     local new_state="$1"
 
     cp -f "$STATE_FILE" "$STATE_BACKUP" 2>/dev/null || true
+
     mv -f "$new_state" "$STATE_FILE"
+}
+
+###############################################################################
+# SEEN ISSUE TRACKING
+###############################################################################
+
+mark_seen() {
+
+    local issue_key="$1"
+
+    printf '%s\n' "$issue_key" >>"$SEEN_ISSUES_FILE"
+}
+
+issue_seen_this_run() {
+
+    local issue_key="$1"
+
+    grep -Fqx -- "$issue_key" "$SEEN_ISSUES_FILE" 2>/dev/null
 }
 
 ###############################################################################
@@ -953,6 +1344,7 @@ issue_signature() {
     local stage="$5"
     local message="$6"
 
+    #   - Its underlying Arr/SAB issue message changes
     printf '%s|%s|%s|%s|%s|%s' \
         "$app" \
         "$id" \
@@ -965,37 +1357,641 @@ issue_signature() {
 }
 
 ###############################################################################
-# NOTIFICATION DEDUP
+# ARR MESSAGE TELEMETRY - v2.3
+#
+# Telemetry is observational only.
+#
+# It does NOT:
+#   - change classifications
+#   - change severity
+#   - generate extra notifications
+#   - modify Sonarr/Radarr
+#
+# It records only generic fallback classifications:
+#
+#   WARNING
+#   ERROR
+#   ARR_IMPORT_STALLED
+#
 ###############################################################################
 
-should_notify() {
+telemetry_classification_eligible() {
 
-    local issue_key="$1"
-    local signature="$2"
+    case "$1" in
 
-    if [ "$NOTIFY_ONCE" != true ]; then
-        return 0
+        WARNING|ERROR|ARR_IMPORT_STALLED)
+            return 0
+            ;;
+
+        *)
+            return 1
+            ;;
+    esac
+}
+
+###############################################################################
+# NORMALIZE ARR MESSAGE
+#
+# Remove variable data that would otherwise make the same underlying error
+# look like hundreds of unique patterns.
+#
+# Examples removed/normalized:
+#
+#   UUIDs
+#   URLs
+#   filesystem paths
+#   long hexadecimal identifiers
+#   episode numbers such as S03E07
+#   repeated whitespace
+#
+###############################################################################
+
+normalize_arr_message() {
+
+    local message="$1"
+
+    printf '%s' "$message" |
+        tr '\r\n\t' '   ' |
+        tr '[:upper:]' '[:lower:]' |
+        sed -E \
+            -e 's/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/<uuid>/g' \
+            -e 's#https?://[^[:space:]|]+#<url>#g' \
+            -e 's#([a-z]:\\[^[:space:]|]+)#<path>#g' \
+            -e 's#(/[^[:space:]|]+)+#<path>#g' \
+            -e 's/s[0-9]{1,2}e[0-9]{1,3}/s<season>e<episode>/g' \
+            -e 's/[0-9a-f]{20,}/<hex>/g' \
+            -e 's/[[:space:]]+/ /g' \
+            -e 's/^ //' \
+            -e 's/ $//'
+}
+
+###############################################################################
+# BUILD CONSISTENT ARR PATTERN MESSAGE - v2.4
+#
+# Telemetry collection and promotion matching MUST use exactly the same
+# source message. Otherwise a telemetry pattern collected in v2.3 could fail
+# to match the corresponding promotion rule later.
+###############################################################################
+
+arr_pattern_raw_message() {
+
+    local tracked_status="$1"
+    local tracked_state="$2"
+    local arr_status="$3"
+    local message="$4"
+
+    if [ -n "$message" ]; then
+
+        printf '%s' "$message"
+
+    else
+
+        printf 'No explicit Arr queue message; status=%s; trackedStatus=%s; trackedState=%s' \
+            "$arr_status" \
+            "$tracked_status" \
+            "$tracked_state"
+    fi
+}
+
+###############################################################################
+# PROMOTED ARR CLASSIFICATION RULES - v2.4
+#
+# IMPORTANT
+# ---------
+# Rules are added here ONLY after a real normalized telemetry pattern has
+# been reviewed.
+#
+# Never automatically populate this function from telemetry.
+#
+# The script remains single-file and deterministic.
+###############################################################################
+
+classify_promoted_arr_pattern() {
+
+    local app="$1"
+    local tracked_status="$2"
+    local tracked_state="$3"
+    local arr_status="$4"
+    local message="$5"
+
+    if [ "$ARR_PROMOTION_RULES_ENABLED" != true ]; then
+
+        echo "NONE"
+
+        return
     fi
 
-    local previous
+    local raw_message
+    local normalized
 
-    previous=$(
-        jq -r \
-            --arg key "$issue_key" \
-            '.issues[$key].notifiedSignature // ""' \
-            "$STATE_FILE"
+    raw_message=$(
+        arr_pattern_raw_message \
+            "$tracked_status" \
+            "$tracked_state" \
+            "$arr_status" \
+            "$message"
     )
 
-    if [ "$previous" = "$signature" ]; then
-        ((NOTIFICATIONS_SUPPRESSED++)) || true
-        return 1
+    normalized=$(normalize_arr_message "$raw_message")
+
+    [ -n "$normalized" ] || {
+        echo "NONE"
+        return
+    }
+
+    ###########################################################################
+    # SONARR PROMOTED RULES
+    ###########################################################################
+
+    if [ "$app" = "Sonarr" ]; then
+
+        #
+        # FUTURE EXAMPLE ONLY — DO NOT ENABLE WITHOUT REAL TELEMETRY:
+        #
+        # if [[ "$normalized" == *"some reviewed normalized message"* ]]; then
+        #     echo "FILE_LOCKED"
+        #     return
+        # fi
+        #
+
+        :
+    fi
+
+    ###########################################################################
+    # RADARR PROMOTED RULES
+    ###########################################################################
+
+    if [ "$app" = "Radarr" ]; then
+
+        #
+        # FUTURE EXAMPLE ONLY — DO NOT ENABLE WITHOUT REAL TELEMETRY:
+        #
+        # if [[ "$normalized" == *"some reviewed normalized message"* ]]; then
+        #     echo "DISK_SPACE"
+        #     return
+        # fi
+        #
+
+        :
+    fi
+
+    echo "NONE"
+}
+
+###############################################################################
+# PROMOTED CLASSIFICATION IDENTIFICATION
+#
+# These classifications are available to future reviewed rules.
+#
+# Merely listing them here does NOT activate them.
+###############################################################################
+
+is_promoted_classification() {
+
+    case "$1" in
+
+        DISK_SPACE|\
+        MOVE_FAILED|\
+        COPY_FAILED|\
+        REMOTE_PATH_MAPPING|\
+        DOWNLOAD_CLIENT|\
+        FILE_LOCKED|\
+        FILE_TOO_SMALL|\
+        SAMPLE_DETECTION|\
+        TITLE_MISMATCH|\
+        QUALITY_PARSE|\
+        DESTINATION_CONFLICT)
+
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+###############################################################################
+# TELEMETRY PATTERN KEY
+###############################################################################
+
+arr_telemetry_pattern_key() {
+
+    local app="$1"
+    local classification="$2"
+    local normalized="$3"
+
+    printf '%s|%s|%s' \
+        "$app" \
+        "$classification" \
+        "$normalized" |
+        sha256sum |
+        awk '{print $1}'
+}
+
+###############################################################################
+# RECORD GENERIC ARR MESSAGE
+###############################################################################
+
+record_arr_telemetry() {
+
+    local app="$1"
+    local issue_key="$2"
+    local media="$3"
+    local release="$4"
+
+    local classification="$5"
+    local tracked_status="$6"
+    local tracked_state="$7"
+    local arr_status="$8"
+    local message="$9"
+
+    [ "$ARR_TELEMETRY_ENABLED" = true ] || return 0
+
+    telemetry_classification_eligible "$classification" || return 0
+
+    ###########################################################################
+    # BUILD RAW MESSAGE
+    #
+    # Some generic queue states contain little/no explicit message text.
+    # In that case preserve the status combination itself as telemetry.
+    ###########################################################################
+
+    local raw_message
+
+    raw_message=$(
+        arr_pattern_raw_message \
+            "$tracked_status" \
+            "$tracked_state" \
+            "$arr_status" \
+            "$message"
+    )
+
+    ###########################################################################
+    # NORMALIZE
+    ###########################################################################
+
+    local normalized
+
+    normalized=$(normalize_arr_message "$raw_message")
+
+    [ -n "$normalized" ] || return 0
+
+    local pattern_key
+
+    pattern_key=$(
+        arr_telemetry_pattern_key \
+            "$app" \
+            "$classification" \
+            "$normalized"
+    )
+
+    ###########################################################################
+    # DETERMINE WHETHER WE HAVE SEEN THIS PATTERN BEFORE
+    ###########################################################################
+
+    local pattern_exists=false
+
+    if jq -e \
+        --arg key "$pattern_key" \
+        '.telemetry.patterns[$key] != null' \
+        "$STATE_FILE" >/dev/null 2>&1
+    then
+
+        pattern_exists=true
+        ((TELEMETRY_EXISTING_PATTERNS++)) || true
+
+    else
+
+        ((TELEMETRY_NEW_PATTERNS++)) || true
+    fi
+
+    ((TELEMETRY_OBSERVATIONS++)) || true
+
+    ###########################################################################
+    # CAP EXAMPLE SIZE
+    ###########################################################################
+
+    local example_message
+
+    example_message="${raw_message:0:${ARR_TELEMETRY_EXAMPLE_MAX_CHARS}}"
+
+    local now
+    local tmp
+
+    now=$(date +%s)
+
+    tmp="$TMP_DIR/state.telemetry.json"
+
+    ###########################################################################
+    # UPDATE TELEMETRY PATTERN
+    ###########################################################################
+
+    jq \
+        --arg key "$pattern_key" \
+        --arg app "$app" \
+        --arg classification "$classification" \
+        --arg normalized "$normalized" \
+        --arg issueKey "$issue_key" \
+        --arg media "$media" \
+        --arg release "$release" \
+        --arg trackedStatus "$tracked_status" \
+        --arg trackedState "$tracked_state" \
+        --arg arrStatus "$arr_status" \
+        --arg exampleMessage "$example_message" \
+        --argjson now "$now" \
+        --argjson maxIssueKeys "$ARR_TELEMETRY_MAX_ISSUE_KEYS" \
+        --argjson maxExamples "$ARR_TELEMETRY_MAX_EXAMPLES" \
+        '
+        .version = 7
+        |
+        .telemetry = (
+            .telemetry
+            // {
+                version: 1,
+                patterns: {}
+            }
+        )
+        |
+        .telemetry.version = 1
+        |
+        .telemetry.patterns = (.telemetry.patterns // {})
+        |
+        (.telemetry.patterns[$key] // {}) as $old
+        |
+        ($old.issueKeys // []) as $oldKeys
+        |
+        (
+            ($oldKeys + [$issueKey])
+            | unique
+            |
+            if length > $maxIssueKeys
+            then .[-$maxIssueKeys:]
+            else .
+            end
+        ) as $issueKeys
+        |
+        ($old.examples // []) as $oldExamples
+        |
+        (
+            if any($oldExamples[]?; .message == $exampleMessage)
+            then
+
+                $oldExamples
+
+            else
+
+                (
+                    $oldExamples
+                    +
+                    [
+                        {
+                            message: $exampleMessage,
+                            media: $media,
+                            release: $release,
+                            seenAt: $now
+                        }
+                    ]
+                )
+            end
+            |
+            sort_by(.seenAt)
+            |
+            if length > $maxExamples
+            then .[-$maxExamples:]
+            else .
+            end
+        ) as $examples
+        |
+        .telemetry.patterns[$key] = {
+
+            patternKey: $key,
+
+            app: $app,
+
+            genericClassification: $classification,
+
+            normalizedMessage: $normalized,
+
+            firstSeen:
+                (
+                    $old.firstSeen
+                    // $now
+                ),
+
+            lastSeen: $now,
+
+            observations:
+                (
+                    ($old.observations // 0)
+                    + 1
+                ),
+
+            distinctIssues:
+                (
+                    $issueKeys
+                    | length
+                ),
+
+            issueKeys: $issueKeys,
+
+            lastMedia: $media,
+
+            lastRelease: $release,
+
+            lastTrackedStatus: $trackedStatus,
+
+            lastTrackedState: $trackedState,
+
+            lastArrStatus: $arrStatus,
+
+            examples: $examples
+        }
+        ' \
+        "$STATE_FILE" >"$tmp" || {
+
+            log "WARNING: Unable to update Arr message telemetry"
+
+            return 1
+        }
+
+    save_state "$tmp"
+
+    ###########################################################################
+    # LOG NEW PATTERNS
+    ###########################################################################
+
+    if [ "$pattern_exists" = false ] &&
+       [ "$ARR_TELEMETRY_LOG_NEW_PATTERNS" = true ]
+    then
+
+        log "------------------------------------------------------------"
+        log "New Arr telemetry pattern discovered"
+        log "Application: $app"
+        log "Generic classification: $classification"
+        log "Pattern ID: ${pattern_key:0:12}"
+        log "Media: $media"
+        log "Normalized message: $normalized"
     fi
 
     return 0
 }
 
 ###############################################################################
-# UPDATE ISSUE STATE
+# TELEMETRY PATTERN COUNT
+###############################################################################
+
+arr_telemetry_pattern_count() {
+
+    if [ "$ARR_TELEMETRY_ENABLED" != true ]; then
+
+        echo 0
+
+        return
+    fi
+
+    jq -r \
+        '.telemetry.patterns // {} | length' \
+        "$STATE_FILE" 2>/dev/null ||
+        echo 0
+}
+
+###############################################################################
+# TELEMETRY REVIEW CANDIDATES - v2.4
+###############################################################################
+
+arr_telemetry_review_candidate_count() {
+
+    if [ "$ARR_TELEMETRY_ENABLED" != true ]; then
+
+        echo 0
+
+        return
+    fi
+
+    jq -r \
+        --argjson minDistinct "$ARR_TELEMETRY_REVIEW_MIN_DISTINCT_ISSUES" \
+        --argjson minObservations "$ARR_TELEMETRY_REVIEW_MIN_OBSERVATIONS" \
+        '
+        [
+            (
+                .telemetry.patterns
+                // {}
+                | to_entries[]
+            )
+
+            | select(
+
+                (.value.distinctIssues // 0) >= $minDistinct
+
+                and
+
+                (.value.observations // 0) >= $minObservations
+            )
+        ]
+        | length
+        ' \
+        "$STATE_FILE" 2>/dev/null ||
+        echo 0
+}
+
+###############################################################################
+# LOG TOP REVIEW CANDIDATES
+###############################################################################
+
+log_arr_telemetry_review_candidates() {
+
+    [ "$ARR_TELEMETRY_ENABLED" = true ] || return
+
+    local candidates
+
+    candidates=$(
+        jq -r \
+            --argjson minDistinct "$ARR_TELEMETRY_REVIEW_MIN_DISTINCT_ISSUES" \
+            --argjson minObservations "$ARR_TELEMETRY_REVIEW_MIN_OBSERVATIONS" \
+            --argjson top "$ARR_TELEMETRY_REVIEW_TOP" \
+            '
+            [
+                (
+                    .telemetry.patterns
+                    // {}
+                    | to_entries[]
+                )
+
+                | select(
+
+                    (.value.distinctIssues // 0) >= $minDistinct
+
+                    and
+
+                    (.value.observations // 0) >= $minObservations
+                )
+            ]
+
+            | sort_by(
+                [
+                    (.value.distinctIssues // 0),
+                    (.value.observations // 0),
+                    (.value.lastSeen // 0)
+                ]
+            )
+
+            | reverse
+
+            | .[:$top]
+
+            | .[]
+
+            | [
+                (.key[0:12]),
+                (.value.app // "Unknown"),
+                (.value.genericClassification // "Unknown"),
+                ((.value.distinctIssues // 0) | tostring),
+                ((.value.observations // 0) | tostring),
+                (.value.normalizedMessage // "")
+            ]
+
+            | @tsv
+            ' \
+            "$STATE_FILE" 2>/dev/null
+    )
+
+    [ -n "$candidates" ] || return
+
+    log ""
+    log "ARR TELEMETRY REVIEW CANDIDATES"
+    log "------------------------------------------------------------"
+
+    while IFS=$'\t' read -r \
+        pattern_id \
+        app \
+        classification \
+        distinct \
+        observations \
+        normalized
+    do
+
+        [ -n "$pattern_id" ] || continue
+
+        log "Candidate pattern: $pattern_id"
+        log "Application: $app"
+        log "Current classification: $classification"
+        log "Distinct issues: $distinct"
+        log "Observations: $observations"
+        log "Normalized message: $normalized"
+        log "------------------------------------------------------------"
+
+    done <<<"$candidates"
+}
+
+###############################################################################
+# ISSUE STATE UPDATE
+#
+# If an issue was previously resolved and returns:
+#
+#   - firstSeen resets
+#   - occurrences resets
+#   - notifiedSignature resets
+#
+# This allows the returning issue to alert again.
 ###############################################################################
 
 update_issue_state() {
@@ -1027,32 +2023,90 @@ update_issue_state() {
         --arg message "$message" \
         --argjson now "$now" \
         '
-        .version = 5
+        .version = 7
         |
         (.issues[$key] // {}) as $old
         |
+        ($old.active // false) as $wasActive
+        |
         .issues[$key] = {
             signature: $signature,
-            notifiedSignature: ($old.notifiedSignature // ""),
+
+            notifiedSignature:
+                (
+                    if $wasActive
+                    then ($old.notifiedSignature // "")
+                    else ""
+                    end
+                ),
+
             app: $app,
             title: $title,
             classification: $classification,
             severity: $severity,
             stage: $stage,
             message: $message,
-            firstSeen: ($old.firstSeen // $now),
+
+            firstSeen:
+                (
+                    if $wasActive
+                    then ($old.firstSeen // $now)
+                    else $now
+                    end
+                ),
+
             lastSeen: $now,
-            occurrences: (($old.occurrences // 0) + 1)
+
+            occurrences:
+                (
+                    if $wasActive
+                    then (($old.occurrences // 0) + 1)
+                    else 1
+                    end
+                ),
+
+            active: true,
+            resolvedAt: null
         }
         ' \
         "$STATE_FILE" >"$tmp" || return 1
 
     save_state "$tmp"
+
+    mark_seen "$issue_key"
 }
 
 ###############################################################################
-# MARK ISSUE AS NOTIFIED
+# NOTIFICATION DEDUP
 ###############################################################################
+
+should_notify() {
+
+    local issue_key="$1"
+    local signature="$2"
+
+    if [ "$NOTIFY_ONCE" != true ]; then
+        return 0
+    fi
+
+    local previous
+
+    previous=$(
+        jq -r \
+            --arg key "$issue_key" \
+            '.issues[$key].notifiedSignature // ""' \
+            "$STATE_FILE"
+    )
+
+    if [ "$previous" = "$signature" ]; then
+
+        ((NOTIFICATIONS_SUPPRESSED++)) || true
+
+        return 1
+    fi
+
+    return 0
+}
 
 mark_notified() {
 
@@ -1079,9 +2133,170 @@ mark_notified() {
 }
 
 ###############################################################################
-# NOTIFICATION BATCH
-#
-# Each line in NOTIFICATION_BATCH is one JSON object.
+# RESOLUTION TRACKING
+###############################################################################
+
+mark_issue_resolved() {
+
+    local issue_key="$1"
+
+    local now
+    local tmp
+
+    now=$(date +%s)
+
+    tmp="$TMP_DIR/state.resolved.json"
+
+    jq \
+        --arg key "$issue_key" \
+        --argjson now "$now" \
+        '
+        if .issues[$key] then
+
+            .issues[$key].active = false
+            |
+            .issues[$key].resolvedAt = $now
+
+        else
+            .
+        end
+        ' \
+        "$STATE_FILE" >"$tmp" || return 1
+
+    save_state "$tmp"
+}
+
+###############################################################################
+# DETERMINE WHETHER SOURCE WAS HEALTHY ENOUGH TO DECLARE RESOLUTION
+###############################################################################
+
+source_can_resolve() {
+
+    local source="$1"
+
+    case "$source" in
+
+        Sonarr)
+
+            [ "$SONARR_SCAN_OK" = true ]
+            ;;
+
+        Radarr)
+
+            [ "$RADARR_SCAN_OK" = true ]
+            ;;
+
+        SABnzbd)
+
+            #
+            # SAB_STRANDED depends on SAB plus Arr queue knowledge.
+            #
+            # Be deliberately conservative:
+            # only resolve SAB cross-app issues if SAB AND both Arr queues
+            # were successfully scanned.
+            #
+
+            [ "$SAB_SCAN_OK" = true ] &&
+            [ "$SONARR_SCAN_OK" = true ] &&
+            [ "$RADARR_SCAN_OK" = true ]
+            ;;
+
+        *)
+
+            return 1
+            ;;
+    esac
+}
+
+###############################################################################
+# RESOLVE ISSUES NOT SEEN THIS RUN
+###############################################################################
+
+resolve_missing_issues() {
+
+    log "Checking previously active issues for resolution"
+
+    local active_records
+
+    active_records=$(
+        jq -c '
+            .issues
+            | to_entries[]
+            | select(.value.active == true)
+        ' "$STATE_FILE"
+    )
+
+    [ -n "$active_records" ] || {
+        log "No previously active issues require resolution checking"
+        return
+    }
+
+    while IFS= read -r record; do
+
+        [ -n "$record" ] || continue
+
+        local issue_key
+        local source
+        local title
+        local classification
+        local first_seen
+        local now
+        local lifetime_hours
+
+        issue_key=$(echo "$record" | jq -r '.key')
+        source=$(echo "$record" | jq -r '.value.app // ""')
+        title=$(echo "$record" | jq -r '.value.title // "Unknown"')
+        classification=$(echo "$record" | jq -r '.value.classification // "Unknown"')
+
+        if issue_seen_this_run "$issue_key"; then
+            continue
+        fi
+
+        #
+        # Do not declare resolution if the relevant API was unavailable.
+        #
+
+        if ! source_can_resolve "$source"; then
+
+            log "Resolution deferred for $issue_key because required source scan was unavailable"
+
+            continue
+        fi
+
+        first_seen=$(echo "$record" | jq -r '.value.firstSeen // 0')
+
+        now=$(date +%s)
+
+        lifetime_hours=0
+
+        if [[ "$first_seen" =~ ^[0-9]+$ ]] &&
+           (( first_seen > 0 ))
+        then
+            lifetime_hours=$(( (now - first_seen) / 3600 ))
+        fi
+
+        if mark_issue_resolved "$issue_key"; then
+
+            ((RESOLVED_COUNT++)) || true
+
+            log "------------------------------------------------------------"
+            log "Issue resolved"
+            log "Source: $source"
+            log "Media: $title"
+            log "Previous classification: $classification"
+            log "Observed lifetime: approximately ${lifetime_hours}h"
+            log "Resolution notification: disabled by design"
+
+        else
+
+            log "WARNING: Failed to mark issue resolved: $issue_key"
+        fi
+
+    done <<<"$active_records"
+}
+
+###############################################################################
+# GROUPED NOTIFICATION BATCH
 ###############################################################################
 
 queue_group_notification() {
@@ -1121,10 +2336,6 @@ queue_group_notification() {
     log "Queued issue for grouped notification"
 }
 
-###############################################################################
-# BATCH HIGHEST SEVERITY
-###############################################################################
-
 batch_highest_severity() {
 
     if jq -e \
@@ -1148,10 +2359,6 @@ batch_highest_severity() {
     echo "INFO"
 }
 
-###############################################################################
-# SEND GROUPED NOTIFICATION
-###############################################################################
-
 send_grouped_notification() {
 
     [ -f "$NOTIFICATION_BATCH" ] || return 0
@@ -1174,22 +2381,25 @@ send_grouped_notification() {
 
     total=$(wc -l <"$NOTIFICATION_BATCH" | tr -d ' ')
 
-    [ "$total" -gt 0 ] || return 0
+    (( total > 0 )) || return 0
 
     highest=$(batch_highest_severity)
 
     info_new=$(
-        jq -s '[.[] | select(.severity == "INFO")] | length' \
+        jq -s \
+            '[.[] | select(.severity == "INFO")] | length' \
             "$NOTIFICATION_BATCH"
     )
 
     warning_new=$(
-        jq -s '[.[] | select(.severity == "WARNING")] | length' \
+        jq -s \
+            '[.[] | select(.severity == "WARNING")] | length' \
             "$NOTIFICATION_BATCH"
     )
 
     error_new=$(
-        jq -s '[.[] | select(.severity == "ERROR")] | length' \
+        jq -s \
+            '[.[] | select(.severity == "ERROR")] | length' \
             "$NOTIFICATION_BATCH"
     )
 
@@ -1216,10 +2426,6 @@ send_grouped_notification() {
 
     shown=0
 
-    ###########################################################################
-    # GROUP BY APPLICATION
-    ###########################################################################
-
     for source in Sonarr Radarr SABnzbd; do
 
         local source_count
@@ -1231,9 +2437,7 @@ send_grouped_notification() {
                 "$NOTIFICATION_BATCH"
         )
 
-        if (( source_count == 0 )); then
-            continue
-        fi
+        (( source_count > 0 )) || continue
 
         body+=$'\n'
         body+="${source} (${source_count})"$'\n'
@@ -1267,8 +2471,11 @@ send_grouped_notification() {
             if [ -n "$detail" ]; then
 
                 while IFS= read -r detail_line; do
+
                     [ -n "$detail_line" ] || continue
+
                     body+="  ${detail_line}"$'\n'
+
                 done <<<"$detail"
             fi
 
@@ -1294,15 +2501,12 @@ send_grouped_notification() {
     if (( omitted > 0 )); then
 
         body+="Additional issues omitted: ${omitted}"$'\n'
-        body+="See the Unraid User Scripts log for full details."$'\n'
+        body+="See the User Scripts log for full details."$'\n'
     fi
 
     body+=$'\n'
+    body+="Monitor schedule: hourly recommended"$'\n'
     body+="Runtime: $(runtime)"
-
-    ###########################################################################
-    # SEND
-    ###########################################################################
 
     notify \
         "$importance" \
@@ -1327,11 +2531,9 @@ send_grouped_notification() {
         return 1
     fi
 
-    ###########################################################################
-    # MARK EVERY BATCHED ISSUE AS NOTIFIED
     #
-    # This occurs only after the grouped notification succeeds.
-    ###########################################################################
+    # Mark individual issues only after successful grouped send.
+    #
 
     while IFS= read -r record; do
 
@@ -1342,6 +2544,7 @@ send_grouped_notification() {
         signature=$(echo "$record" | jq -r '.signature')
 
         if ! mark_notified "$issue_key" "$signature"; then
+
             log "WARNING: Failed to mark issue notified: $issue_key"
         fi
 
@@ -1354,7 +2557,7 @@ send_grouped_notification() {
 }
 
 ###############################################################################
-# SAB HISTORY LOOKUP FOR ARR
+# SAB LOOKUP
 ###############################################################################
 
 sab_history_lookup() {
@@ -1365,7 +2568,9 @@ sab_history_lookup() {
        [ -z "$SAB_HISTORY" ] ||
        [ ! -f "$SAB_HISTORY" ]
     then
+
         echo '{}'
+
         return
     fi
 
@@ -1386,7 +2591,7 @@ sab_history_lookup() {
 }
 
 ###############################################################################
-# ARR DOWNLOAD-ID LOOKUP
+# ARR DOWNLOAD LOOKUP
 ###############################################################################
 
 arr_tracks_download() {
@@ -1399,20 +2604,27 @@ arr_tracks_download() {
     case "$app" in
 
         Sonarr)
+
+            [ "$SONARR_SCAN_OK" = true ] || return 2
+
             queue="$SONARR_QUEUE"
             ;;
 
         Radarr)
+
+            [ "$RADARR_SCAN_OK" = true ] || return 2
+
             queue="$RADARR_QUEUE"
             ;;
 
         *)
-            return 1
+
+            return 2
             ;;
     esac
 
-    [ -n "$queue" ] || return 1
-    [ -f "$queue" ] || return 1
+    [ -n "$queue" ] || return 2
+    [ -f "$queue" ] || return 2
 
     jq -e \
         --arg id "$download_id" \
@@ -1428,7 +2640,7 @@ arr_tracks_download() {
 }
 
 ###############################################################################
-# CF DETAILS
+# CF LOG / GROUP DETAILS
 ###############################################################################
 
 log_cf_details() {
@@ -1438,8 +2650,10 @@ log_cf_details() {
     local new_score
     local existing_score
     local difference
+
     local new_formats
     local existing_formats
+
     local gained
     local missing
 
@@ -1487,10 +2701,6 @@ log_cf_details() {
     fi
 }
 
-###############################################################################
-# COMPACT CF DETAILS FOR GROUPED NOTIFICATION
-###############################################################################
-
 build_cf_group_detail() {
 
     local message="$1"
@@ -1520,8 +2730,11 @@ build_cf_group_detail() {
         difference=$(( new_score - existing_score ))
 
         if (( difference > 0 )); then
+
             output+="CF: ${new_score} vs ${existing_score} (+${difference})"
+
         else
+
             output+="CF: ${new_score} vs ${existing_score} (${difference})"
         fi
     fi
@@ -1537,14 +2750,9 @@ build_cf_group_detail() {
 
             local gained_line
 
-            gained_line=$(
-                echo "$gained" |
-                paste -sd ', ' -
-            )
+            gained_line=$(echo "$gained" | join_lines)
 
-            if [ -n "$output" ]; then
-                output+=$'\n'
-            fi
+            [ -z "$output" ] || output+=$'\n'
 
             output+="Download-only CF: ${gained_line}"
         fi
@@ -1553,14 +2761,9 @@ build_cf_group_detail() {
 
             local missing_line
 
-            missing_line=$(
-                echo "$missing" |
-                paste -sd ', ' -
-            )
+            missing_line=$(echo "$missing" | join_lines)
 
-            if [ -n "$output" ]; then
-                output+=$'\n'
-            fi
+            [ -z "$output" ] || output+=$'\n'
 
             output+="Existing-only CF: ${missing_line}"
         fi
@@ -1583,7 +2786,9 @@ process_queue() {
     records=$(jq -c '.records[]?' "$queue_file")
 
     if [ -z "$records" ]; then
+
         log "$app queue: no entries"
+
         return
     fi
 
@@ -1649,6 +2854,97 @@ process_queue() {
 
         [ "$classification" != "NONE" ] || continue
 
+        ###############################################################################
+        # v2.4 REVIEWED CLASSIFICATION PROMOTION
+        #
+        # Only generic fallback classifications are eligible.
+        #
+        # Existing known classifiers always take precedence.
+        ###############################################################################
+
+        if telemetry_classification_eligible "$classification"; then
+
+            local promoted_classification
+
+            promoted_classification=$(
+                classify_promoted_arr_pattern \
+                    "$app" \
+                    "$tracked_status" \
+                    "$tracked_state" \
+                    "$status" \
+                    "$message"
+            )
+
+            if [ "$promoted_classification" != "NONE" ]; then
+
+                #######################################################################
+                # VALIDATE PROMOTED CLASSIFICATION
+                #
+                # Promotion rules are manually maintained.
+                # This prevents an accidental typo or unsupported classification from
+                # entering state, notifications, or severity logic.
+                #######################################################################
+
+                if is_promoted_classification "$promoted_classification"; then
+
+                    log "Arr generic classification promoted"
+                    log "Application: $app"
+                    log "From: $classification"
+                    log "To: $promoted_classification"
+
+                    classification="$promoted_classification"
+
+                    ((PROMOTION_RULE_MATCHES++)) || true
+
+                else
+
+                    log "WARNING: Invalid promoted Arr classification returned"
+                    log "Application: $app"
+                    log "Returned classification: $promoted_classification"
+                    log "Original classification retained: $classification"
+                fi
+            fi
+        fi
+
+        ###############################################################################
+        # BUILD ISSUE KEY EARLY
+        #
+        # v2.3 telemetry records generic Arr messages even before the normal
+        # notification-age threshold is reached.
+        ###############################################################################
+
+        local issue_key
+
+        if [ -n "$download_id" ]; then
+
+            issue_key="${app}:${download_id}"
+
+        else
+
+            issue_key="${app}:queue:${id}"
+        fi
+
+        ###############################################################################
+        # ARR MESSAGE TELEMETRY
+        #
+        # This has NO effect on notification eligibility or classification.
+        ###############################################################################
+
+        record_arr_telemetry \
+            "$app" \
+            "$issue_key" \
+            "$media_name" \
+            "$release" \
+            "$classification" \
+            "$tracked_status" \
+            "$tracked_state" \
+            "$status" \
+            "$message"
+
+        ###############################################################################
+        # NORMAL AGE THRESHOLD
+        ###############################################################################
+
         min_age=$(classification_min_age "$classification")
 
         if (( age < min_age )); then
@@ -1670,18 +2966,45 @@ process_queue() {
         ((TOTAL_ISSUES++)) || true
 
         case "$severity" in
-            INFO) ((INFO_COUNT++)) || true ;;
-            WARNING) ((WARNING_COUNT++)) || true ;;
-            ERROR) ((ERROR_COUNT++)) || true ;;
+
+            INFO)
+                ((INFO_COUNT++)) || true
+                ;;
+
+            WARNING)
+                ((WARNING_COUNT++)) || true
+                ;;
+
+            ERROR)
+                ((ERROR_COUNT++)) || true
+                ;;
         esac
 
         case "$classification" in
-            CF_REJECT*) ((CF_REJECT_COUNT++)) || true ;;
-            UPGRADE_REJECT) ((UPGRADE_REJECT_COUNT++)) || true ;;
-            TBA_METADATA) ((TBA_COUNT++)) || true ;;
-            UNMATCHED_MEDIA) ((UNMATCHED_COUNT++)) || true ;;
-            NO_IMPORTABLE_FILES) ((NO_IMPORT_COUNT++)) || true ;;
-            ARR_IMPORT_STALLED) ((STALL_COUNT++)) || true ;;
+
+            CF_REJECT*)
+                ((CF_REJECT_COUNT++)) || true
+                ;;
+
+            UPGRADE_REJECT)
+                ((UPGRADE_REJECT_COUNT++)) || true
+                ;;
+
+            TBA_METADATA)
+                ((TBA_COUNT++)) || true
+                ;;
+
+            UNMATCHED_MEDIA)
+                ((UNMATCHED_COUNT++)) || true
+                ;;
+
+            NO_IMPORTABLE_FILES)
+                ((NO_IMPORT_COUNT++)) || true
+                ;;
+
+            ARR_IMPORT_STALLED)
+                ((STALL_COUNT++)) || true
+                ;;
         esac
 
         #######################################################################
@@ -1733,10 +3056,9 @@ process_queue() {
             log "Arr message: $message"
 
         #######################################################################
-        # STATE / SIGNATURE
+        # STATE
         #######################################################################
 
-        local issue_key
         local signature
         local stage="normal"
 
@@ -1747,12 +3069,6 @@ process_queue() {
             if (( age >= POLICY_ESCALATE_AFTER_HOURS )); then
                 stage="escalated"
             fi
-        fi
-
-        if [ -n "$download_id" ]; then
-            issue_key="${app}:${download_id}"
-        else
-            issue_key="${app}:queue:${id}"
         fi
 
         signature=$(
@@ -1776,7 +3092,7 @@ process_queue() {
             "$message"
 
         #######################################################################
-        # GROUPED NOTIFICATION QUEUE
+        # GROUP NOTIFICATION
         #######################################################################
 
         if should_notify "$issue_key" "$signature"; then
@@ -1784,9 +3100,11 @@ process_queue() {
             local detail=""
 
             if [[ "$classification" == CF_REJECT* ]]; then
+
                 detail=$(build_cf_group_detail "$message")
 
             elif [ -n "$reason" ]; then
+
                 detail="$reason"
             fi
 
@@ -1809,7 +3127,7 @@ process_queue() {
 }
 
 ###############################################################################
-# SAB COMPLETION TIME
+# SAB HELPERS
 ###############################################################################
 
 sab_completed_epoch() {
@@ -1832,21 +3150,21 @@ sab_completed_epoch() {
     date_to_epoch "$value"
 }
 
-###############################################################################
-# CATEGORY OWNER
-###############################################################################
-
 sab_category_owner() {
 
     local category="${1,,}"
 
     if [ "$category" = "${SAB_MOVIE_CATEGORY,,}" ]; then
+
         echo "Radarr"
+
         return
     fi
 
     if [ "$category" = "${SAB_TV_CATEGORY,,}" ]; then
+
         echo "Sonarr"
+
         return
     fi
 
@@ -1858,12 +3176,16 @@ sab_category_root() {
     local category="${1,,}"
 
     if [ "$category" = "${SAB_MOVIE_CATEGORY,,}" ]; then
+
         echo "$SAB_MOVIE_DIR"
+
         return
     fi
 
     if [ "$category" = "${SAB_TV_CATEGORY,,}" ]; then
+
         echo "$SAB_TV_DIR"
+
         return
     fi
 
@@ -1871,7 +3193,7 @@ sab_category_root() {
 }
 
 ###############################################################################
-# RESOLVE SAB COMPLETED PATH
+# SAB PATH RESOLUTION
 ###############################################################################
 
 resolve_sab_path() {
@@ -1894,34 +3216,55 @@ resolve_sab_path() {
         jq -r '.name // .nzb_name // ""'
     )
 
+    #
+    # SAB returned host-visible path.
+    #
+
     if [ -n "$storage" ] &&
        [ -e "$storage" ]
     then
+
         printf '%s' "$storage"
+
         return 0
     fi
+
+    #
+    # Container-side path:
+    # try basename underneath category's host directory.
+    #
 
     if [ -n "$storage" ]; then
 
         base=$(basename "${storage%/}")
 
-        if [ -n "$base" ] && [ "$base" != "/" ]; then
+        if [ -n "$base" ] &&
+           [ "$base" != "/" ]
+        then
 
             candidate="${root}/${base}"
 
             if [ -e "$candidate" ]; then
+
                 printf '%s' "$candidate"
+
                 return 0
             fi
         fi
     fi
+
+    #
+    # Fallback from SAB job name.
+    #
 
     if [ -n "$name" ]; then
 
         candidate="${root}/${name}"
 
         if [ -e "$candidate" ]; then
+
             printf '%s' "$candidate"
+
             return 0
         fi
     fi
@@ -1930,93 +3273,401 @@ resolve_sab_path() {
 }
 
 ###############################################################################
-# FILESYSTEM STATS
+# SAB LEFTOVER ANALYSIS - v2.2
+#
+# Inspect what actually remains inside a completed SAB download.
+#
+# Categories:
+#
+#   media
+#       Real movie/episode files
+#
+#   sample
+#       Sample/trailer media files
+#
+#   archive
+#       RAR/7z/ZIP/multipart payload
+#
+#   repair
+#       PAR2/SFV repair/check files
+#
+#   metadata
+#       NFO/subtitles/images/text metadata
+#
+#   other
+#       Anything not classified above
+#
 ###############################################################################
 
-path_file_count() {
+analyze_sab_path() {
 
     local path="$1"
 
-    if [ -f "$path" ]; then
-        echo 1
-        return
-    fi
+    local total_files=0
+    local total_bytes=0
 
-    if [ ! -d "$path" ]; then
-        echo 0
-        return
-    fi
+    local media_files=0
+    local media_bytes=0
 
-    find "$path" \
-        -type f \
-        -printf '.' 2>/dev/null |
-        wc -c |
-        tr -d ' '
-}
+    local sample_files=0
+    local sample_bytes=0
 
-path_media_count() {
+    local archive_files=0
+    local archive_bytes=0
 
-    local path="$1"
+    local repair_files=0
+    local repair_bytes=0
 
-    if [ ! -d "$path" ]; then
+    local metadata_files=0
+    local metadata_bytes=0
 
-        case "${path,,}" in
+    local other_files=0
+    local other_bytes=0
+
+    local file
+    local size
+    local lower
+    local base
+
+    ###########################################################################
+    # FILE ITERATOR
+    ###########################################################################
+
+    while IFS= read -r -d '' file; do
+
+        size=$(stat -c '%s' "$file" 2>/dev/null || echo 0)
+
+        if ! [[ "$size" =~ ^[0-9]+$ ]]; then
+            size=0
+        fi
+
+        lower="${file,,}"
+        base="${lower##*/}"
+
+        ((total_files++)) || true
+        ((total_bytes += size)) || true
+
+        #######################################################################
+        # SAMPLE / TRAILER MEDIA
+        #
+        # Check this BEFORE normal media classification.
+        #######################################################################
+
+        if [[ "$base" =~ (^|[._\ -])(sample|trailer)([._\ -]|$) ]] &&
+           [[ "$base" =~ \.(mkv|mp4|m4v|avi|mov|ts)$ ]]
+        then
+
+            ((sample_files++)) || true
+            ((sample_bytes += size)) || true
+
+            continue
+        fi
+
+        #######################################################################
+        # REAL MEDIA
+        #######################################################################
+
+        case "$base" in
+
             *.mkv|*.mp4|*.m4v|*.avi|*.mov|*.ts)
-                [ -f "$path" ] && echo 1 || echo 0
-                ;;
-            *)
-                echo 0
+
+                ((media_files++)) || true
+                ((media_bytes += size)) || true
+
+                continue
                 ;;
         esac
 
-        return
-    fi
+        #######################################################################
+        # ARCHIVES
+        #######################################################################
 
-    find "$path" \
-        -type f \
-        \( \
-            -iname '*.mkv' \
-            -o -iname '*.mp4' \
-            -o -iname '*.m4v' \
-            -o -iname '*.avi' \
-            -o -iname '*.mov' \
-            -o -iname '*.ts' \
-        \) \
-        -printf '.' 2>/dev/null |
-        wc -c |
-        tr -d ' '
-}
+        case "$base" in
 
-path_total_bytes() {
+            *.rar|\
+            *.r[0-9][0-9]|\
+            *.7z|\
+            *.zip|\
+            *.[0-9][0-9][0-9])
 
-    local path="$1"
+                ((archive_files++)) || true
+                ((archive_bytes += size)) || true
 
-    if [ -f "$path" ]; then
-        stat -c '%s' "$path" 2>/dev/null || echo 0
-        return
-    fi
+                continue
+                ;;
+        esac
 
-    if [ ! -d "$path" ]; then
-        echo 0
-        return
-    fi
+        #######################################################################
+        # REPAIR / VERIFICATION FILES
+        #######################################################################
 
-    find "$path" \
-        -type f \
-        -printf '%s\n' 2>/dev/null |
-        awk '
-            { total += $1 }
-            END { printf "%.0f\n", total + 0 }
-        '
+        case "$base" in
+
+            *.par2|\
+            *.sfv|\
+            *.md5|\
+            *.sha1|\
+            *.sha256)
+
+                ((repair_files++)) || true
+                ((repair_bytes += size)) || true
+
+                continue
+                ;;
+        esac
+
+        #######################################################################
+        # METADATA / SUBTITLES / IMAGES
+        #######################################################################
+
+        case "$base" in
+
+            *.nfo|\
+            *.srt|\
+            *.ass|\
+            *.ssa|\
+            *.sub|\
+            *.idx|\
+            *.vtt|\
+            *.jpg|\
+            *.jpeg|\
+            *.png|\
+            *.webp|\
+            *.txt|\
+            *.xml|\
+            *.json)
+
+                ((metadata_files++)) || true
+                ((metadata_bytes += size)) || true
+
+                continue
+                ;;
+        esac
+
+        #######################################################################
+        # UNKNOWN
+        #######################################################################
+
+        ((other_files++)) || true
+        ((other_bytes += size)) || true
+
+    done < <(
+
+        if [ -f "$path" ]; then
+
+            printf '%s\0' "$path"
+
+        elif [ -d "$path" ]; then
+
+            find "$path" \
+                -type f \
+                -print0 2>/dev/null
+
+        fi
+    )
+
+    ###########################################################################
+    # RETURN JSON
+    #######################################################################
+
+    jq -nc \
+        --argjson totalFiles "$total_files" \
+        --argjson totalBytes "$total_bytes" \
+        --argjson mediaFiles "$media_files" \
+        --argjson mediaBytes "$media_bytes" \
+        --argjson sampleFiles "$sample_files" \
+        --argjson sampleBytes "$sample_bytes" \
+        --argjson archiveFiles "$archive_files" \
+        --argjson archiveBytes "$archive_bytes" \
+        --argjson repairFiles "$repair_files" \
+        --argjson repairBytes "$repair_bytes" \
+        --argjson metadataFiles "$metadata_files" \
+        --argjson metadataBytes "$metadata_bytes" \
+        --argjson otherFiles "$other_files" \
+        --argjson otherBytes "$other_bytes" \
+        '{
+            totalFiles: $totalFiles,
+            totalBytes: $totalBytes,
+
+            mediaFiles: $mediaFiles,
+            mediaBytes: $mediaBytes,
+
+            sampleFiles: $sampleFiles,
+            sampleBytes: $sampleBytes,
+
+            archiveFiles: $archiveFiles,
+            archiveBytes: $archiveBytes,
+
+            repairFiles: $repairFiles,
+            repairBytes: $repairBytes,
+
+            metadataFiles: $metadataFiles,
+            metadataBytes: $metadataBytes,
+
+            otherFiles: $otherFiles,
+            otherBytes: $otherBytes
+        }'
 }
 
 ###############################################################################
-# PROCESS SAB ORPHANS
+# CLASSIFY SAB LEFTOVER
+###############################################################################
+
+classify_sab_leftover() {
+
+    local stats="$1"
+
+    local media
+    local archive
+    local sample
+    local repair
+    local metadata
+    local other
+    local other_bytes
+
+    media=$(echo "$stats" | jq -r '.mediaFiles')
+    archive=$(echo "$stats" | jq -r '.archiveFiles')
+    sample=$(echo "$stats" | jq -r '.sampleFiles')
+    repair=$(echo "$stats" | jq -r '.repairFiles')
+    metadata=$(echo "$stats" | jq -r '.metadataFiles')
+    other=$(echo "$stats" | jq -r '.otherFiles')
+    other_bytes=$(echo "$stats" | jq -r '.otherBytes')
+
+    ###########################################################################
+    # HIGH CONFIDENCE: ACTUAL MEDIA REMAINS
+    ###########################################################################
+
+    if (( media > 0 )); then
+
+        echo "SAB_STRANDED_MEDIA"
+
+        return
+    fi
+
+    ###########################################################################
+    # HIGH CONFIDENCE: UNEXTRACTED / LEFTOVER ARCHIVE PAYLOAD
+    ###########################################################################
+
+    if (( archive > 0 )); then
+
+        echo "SAB_STRANDED_ARCHIVE"
+
+        return
+    fi
+
+    ###########################################################################
+    # UNKNOWN BUT MATERIAL AMOUNT OF DATA
+    ###########################################################################
+
+    if (( other > 0 )) &&
+       (( other_bytes >= SAB_SIGNIFICANT_OTHER_BYTES ))
+    then
+
+        echo "SAB_STRANDED_OTHER"
+
+        return
+    fi
+
+    ###########################################################################
+    # SAMPLE ONLY
+    ###########################################################################
+
+    if (( sample > 0 )) &&
+       (( repair == 0 )) &&
+       (( metadata == 0 )) &&
+       (( other == 0 ))
+    then
+
+        echo "SAB_RESIDUE_SAMPLE"
+
+        return
+    fi
+
+    ###########################################################################
+    # EVERYTHING ELSE IS LOW-VALUE RESIDUE
+    ###########################################################################
+
+    echo "SAB_RESIDUE"
+}
+
+###############################################################################
+# SAB STRANDED THRESHOLD BY TYPE
+###############################################################################
+
+sab_warning_threshold() {
+
+    case "$1" in
+
+        SAB_STRANDED_MEDIA)
+
+            echo "$SAB_MEDIA_WARN_HOURS"
+            ;;
+
+        SAB_STRANDED_ARCHIVE)
+
+            echo "$SAB_ARCHIVE_WARN_HOURS"
+            ;;
+
+        SAB_STRANDED_OTHER)
+
+            echo "$SAB_OTHER_WARN_HOURS"
+            ;;
+
+        *)
+
+            echo 999999
+            ;;
+    esac
+}
+
+###############################################################################
+# HUMAN DESCRIPTION
+###############################################################################
+
+sab_leftover_reason() {
+
+    case "$1" in
+
+        SAB_STRANDED_MEDIA)
+
+            echo "Completed media file(s) remain on disk but the expected Arr application no longer tracks the download."
+            ;;
+
+        SAB_STRANDED_ARCHIVE)
+
+            echo "Archive payload remains after SAB completion and the expected Arr application no longer tracks the download."
+            ;;
+
+        SAB_STRANDED_OTHER)
+
+            echo "A significant amount of unclassified data remains after SAB completion and the expected Arr application no longer tracks the download."
+            ;;
+
+        SAB_RESIDUE_SAMPLE)
+
+            echo "Only sample/trailer media remains. Treated as cleanup residue."
+            ;;
+
+        SAB_RESIDUE)
+
+            echo "Only low-priority repair, metadata, subtitle, or small miscellaneous files remain."
+            ;;
+
+        *)
+
+            echo "Unknown SAB leftover condition"
+            ;;
+    esac
+}
+
+###############################################################################
+# PROCESS SAB CROSS-APP ISSUES - v2.2
 ###############################################################################
 
 process_sab_orphans() {
 
     [ "$SAB_ENABLED" = true ] || return
+    [ "$SAB_SCAN_OK" = true ] || return
     [ -n "$SAB_HISTORY" ] || return
     [ -f "$SAB_HISTORY" ] || return
 
@@ -2045,21 +3696,27 @@ process_sab_orphans() {
         nzo_id=$(echo "$item" | jq -r '.nzo_id // ""')
         name=$(echo "$item" | jq -r '.name // .nzb_name // "Unknown"')
 
+        #######################################################################
+        # ONLY COMPLETED JOBS
+        #######################################################################
+
         [ "${status,,}" = "completed" ] || continue
 
         ((SAB_HISTORY_CHECKED++)) || true
 
         #######################################################################
-        # F1 EXCLUSION
+        # IGNORE F1
         #######################################################################
 
         if [ "${category,,}" = "${SAB_IGNORED_CATEGORY,,}" ]; then
+
             ((SAB_IGNORED_COUNT++)) || true
+
             continue
         fi
 
         #######################################################################
-        # ONLY MOVIE / TV
+        # EXPECTED ARR OWNER
         #######################################################################
 
         local owner
@@ -2067,11 +3724,36 @@ process_sab_orphans() {
 
         owner=$(sab_category_owner "$category")
 
-        if [ -z "$owner" ]; then
-            continue
-        fi
+        [ -n "$owner" ] || continue
 
         root=$(sab_category_root "$category")
+
+        #######################################################################
+        # REQUIRE HEALTHY ARR SCAN
+        #######################################################################
+
+        case "$owner" in
+
+            Sonarr)
+
+                if [ "$SONARR_SCAN_OK" != true ]; then
+
+                    log "Skipping SAB orphan check for '$name': Sonarr scan unavailable"
+
+                    continue
+                fi
+                ;;
+
+            Radarr)
+
+                if [ "$RADARR_SCAN_OK" != true ]; then
+
+                    log "Skipping SAB orphan check for '$name': Radarr scan unavailable"
+
+                    continue
+                fi
+                ;;
+        esac
 
         #######################################################################
         # COMPLETION AGE
@@ -2085,7 +3767,9 @@ process_sab_orphans() {
         now=$(date +%s)
 
         if (( completed_epoch <= 0 )); then
+
             log "WARNING: Unable to determine SAB completion time: $name"
+
             continue
         fi
 
@@ -2098,17 +3782,18 @@ process_sab_orphans() {
         fi
 
         #######################################################################
-        # EXPECTED ARR STILL TRACKS IT
+        # ARR STILL TRACKING DOWNLOAD
         #######################################################################
 
         if [ -n "$nzo_id" ] &&
            arr_tracks_download "$owner" "$nzo_id"
         then
+
             continue
         fi
 
         #######################################################################
-        # RESOLVE FILESYSTEM DATA
+        # RESOLVE COMPLETED PATH
         #######################################################################
 
         local completed_path=""
@@ -2117,29 +3802,60 @@ process_sab_orphans() {
             resolve_sab_path "$item" "$root" || true
         )
 
+        #
+        # Nothing remains on disk.
+        #
+        # This is normally a successful Arr import.
+        #
+
         if [ -z "$completed_path" ] ||
            [ ! -e "$completed_path" ]
         then
+
             continue
         fi
 
-        local file_count
-        local media_count
-        local remaining_bytes
-
-        file_count=$(path_file_count "$completed_path")
-        media_count=$(path_media_count "$completed_path")
-        remaining_bytes=$(path_total_bytes "$completed_path")
-
-        file_count=${file_count:-0}
-        media_count=${media_count:-0}
-        remaining_bytes=${remaining_bytes:-0}
-
         #######################################################################
-        # EMPTY LEFTOVER
+        # ANALYZE REMAINING CONTENT
         #######################################################################
 
-        if (( file_count == 0 )); then
+        local stats
+
+        stats=$(analyze_sab_path "$completed_path")
+
+        local total_files
+        local total_bytes
+
+        local media_files
+        local media_bytes
+
+        local sample_files
+        local archive_files
+        local repair_files
+        local metadata_files
+
+        local other_files
+        local other_bytes
+
+        total_files=$(echo "$stats" | jq -r '.totalFiles')
+        total_bytes=$(echo "$stats" | jq -r '.totalBytes')
+
+        media_files=$(echo "$stats" | jq -r '.mediaFiles')
+        media_bytes=$(echo "$stats" | jq -r '.mediaBytes')
+
+        sample_files=$(echo "$stats" | jq -r '.sampleFiles')
+        archive_files=$(echo "$stats" | jq -r '.archiveFiles')
+        repair_files=$(echo "$stats" | jq -r '.repairFiles')
+        metadata_files=$(echo "$stats" | jq -r '.metadataFiles')
+
+        other_files=$(echo "$stats" | jq -r '.otherFiles')
+        other_bytes=$(echo "$stats" | jq -r '.otherBytes')
+
+        #######################################################################
+        # EMPTY
+        #######################################################################
+
+        if (( total_files == 0 )); then
 
             ((SAB_EMPTY_COUNT++)) || true
 
@@ -2156,24 +3872,98 @@ process_sab_orphans() {
         fi
 
         #######################################################################
-        # STRANDED DOWNLOAD
+        # CLASSIFY REMAINING DATA
         #######################################################################
 
+        local classification
+        local reason
+
+        classification=$(classify_sab_leftover "$stats")
+        reason=$(sab_leftover_reason "$classification")
+
+        #######################################################################
+        # LOW-PRIORITY RESIDUE
+        #######################################################################
+
+        case "$classification" in
+
+            SAB_RESIDUE_SAMPLE)
+
+                ((SAB_SAMPLE_RESIDUE_COUNT++)) || true
+                ((SAB_RESIDUE_COUNT++)) || true
+
+                log "------------------------------------------------------------"
+                log "SAB sample residue"
+                log "Expected owner: $owner"
+                log "Category: $category"
+                log "Release: $name"
+                log "Age: ${age}h"
+                log "Path: $completed_path"
+                log "Samples: $sample_files"
+                log "Remaining size: $(bytes_human "$total_bytes")"
+                log "Action: log only"
+
+                continue
+                ;;
+
+            SAB_RESIDUE)
+
+                ((SAB_RESIDUE_COUNT++)) || true
+
+                log "------------------------------------------------------------"
+                log "SAB cleanup residue"
+                log "Expected owner: $owner"
+                log "Category: $category"
+                log "Release: $name"
+                log "Age: ${age}h"
+                log "Path: $completed_path"
+                log "Repair files: $repair_files"
+                log "Metadata files: $metadata_files"
+                log "Other files: $other_files"
+                log "Remaining size: $(bytes_human "$total_bytes")"
+                log "Action: log only"
+
+                continue
+                ;;
+        esac
+
+        #######################################################################
+        # ACTIONABLE STRANDED DATA
+        #######################################################################
+
+        local warn_after
         local severity="INFO"
         local stage="candidate"
+
+        warn_after=$(sab_warning_threshold "$classification")
 
         if (( age >= SAB_ORPHAN_ESCALATE_HOURS )); then
 
             severity="WARNING"
             stage="escalated"
 
-        elif (( age >= SAB_ORPHAN_WARN_HOURS )); then
+        elif (( age >= warn_after )); then
 
             severity="WARNING"
             stage="warning"
         fi
 
         ((SAB_STRANDED_COUNT++)) || true
+
+        case "$classification" in
+
+            SAB_STRANDED_MEDIA)
+                ((SAB_MEDIA_STRANDED_COUNT++)) || true
+                ;;
+
+            SAB_STRANDED_ARCHIVE)
+                ((SAB_ARCHIVE_STRANDED_COUNT++)) || true
+                ;;
+
+            SAB_STRANDED_OTHER)
+                ((SAB_OTHER_STRANDED_COUNT++)) || true
+                ;;
+        esac
 
         if [ "$stage" = "candidate" ]; then
             ((SAB_CANDIDATE_COUNT++)) || true
@@ -2182,18 +3972,29 @@ process_sab_orphans() {
         ((TOTAL_ISSUES++)) || true
 
         case "$severity" in
-            INFO) ((INFO_COUNT++)) || true ;;
-            WARNING) ((WARNING_COUNT++)) || true ;;
+
+            INFO)
+                ((INFO_COUNT++)) || true
+                ;;
+
+            WARNING)
+                ((WARNING_COUNT++)) || true
+                ;;
         esac
+
+        #######################################################################
+        # LOG
+        #######################################################################
 
         log "------------------------------------------------------------"
         log "SAB stranded download detected"
         log "Expected owner: $owner"
         log "Category: $category"
         log "Release: $name"
-        log "Classification: SAB_STRANDED"
+        log "Classification: $classification"
         log "Severity: $severity"
         log "Stage: $stage"
+        log "Reason: $reason"
         log "SAB status: $status"
         log "Completed age: ${age}h"
         log "$owner queue: Not found"
@@ -2202,9 +4003,16 @@ process_sab_orphans() {
             log "Download ID: $nzo_id"
 
         log "Completed path: $completed_path"
-        log "Files remaining: $file_count"
-        log "Media files remaining: $media_count"
-        log "Remaining size: $(bytes_human "$remaining_bytes")"
+
+        log "Total files: $total_files"
+        log "Total size: $(bytes_human "$total_bytes")"
+
+        log "Media files: $media_files ($(bytes_human "$media_bytes"))"
+        log "Archive files: $archive_files"
+        log "Sample files: $sample_files"
+        log "Repair files: $repair_files"
+        log "Metadata files: $metadata_files"
+        log "Other files: $other_files ($(bytes_human "$other_bytes"))"
 
         #######################################################################
         # STATE
@@ -2215,18 +4023,21 @@ process_sab_orphans() {
         local message
 
         if [ -n "$nzo_id" ]; then
+
             issue_key="SAB:${nzo_id}"
+
         else
+
             issue_key="SAB:${category}:${name}"
         fi
 
-        message="Completed SAB data remains on disk but is no longer tracked by ${owner}"
+        message="${reason}"
 
         signature=$(
             issue_signature \
                 "SABnzbd" \
                 "${nzo_id:-${category}:${name}}" \
-                "SAB_STRANDED" \
+                "$classification" \
                 "$severity" \
                 "$stage" \
                 "$message"
@@ -2237,7 +4048,7 @@ process_sab_orphans() {
             "$signature" \
             "SABnzbd" \
             "$name" \
-            "SAB_STRANDED" \
+            "$classification" \
             "$severity" \
             "$stage" \
             "$message"
@@ -2248,13 +4059,13 @@ process_sab_orphans() {
 
         if [ "$stage" = "candidate" ]; then
 
-            log "Candidate only: notification threshold is ${SAB_ORPHAN_WARN_HOURS}h"
+            log "Candidate only: $classification notification threshold is ${warn_after}h"
 
             continue
         fi
 
         #######################################################################
-        # ADD TO GROUPED NOTIFICATION
+        # GROUP NOTIFICATION
         #######################################################################
 
         if should_notify "$issue_key" "$signature"; then
@@ -2262,15 +4073,32 @@ process_sab_orphans() {
             local sab_detail
 
             sab_detail="Owner: ${owner}"$'\n'
-            sab_detail+="Files: ${file_count}, media: ${media_count}"$'\n'
-            sab_detail+="Remaining: $(bytes_human "$remaining_bytes")"
+            sab_detail+="Remaining: $(bytes_human "$total_bytes")"$'\n'
+
+            case "$classification" in
+
+                SAB_STRANDED_MEDIA)
+
+                    sab_detail+="Media: ${media_files} file(s), $(bytes_human "$media_bytes")"
+                    ;;
+
+                SAB_STRANDED_ARCHIVE)
+
+                    sab_detail+="Archive files: ${archive_files}"
+                    ;;
+
+                SAB_STRANDED_OTHER)
+
+                    sab_detail+="Unknown files: ${other_files}, $(bytes_human "$other_bytes")"
+                    ;;
+            esac
 
             queue_group_notification \
                 "$issue_key" \
                 "$signature" \
                 "SABnzbd" \
                 "$name" \
-                "SAB_STRANDED" \
+                "$classification" \
                 "$severity" \
                 "$age" \
                 "$sab_detail"
@@ -2284,27 +4112,98 @@ process_sab_orphans() {
 }
 
 ###############################################################################
-# PRUNE OLD STATE
+# PRUNE STATE - v2.3
+#
+# Issue lifecycle:
+#   Active issues are retained regardless of age.
+#   Old resolved issues are removed.
+#
+# Arr telemetry:
+#   Patterns older than ARR_TELEMETRY_RETENTION_DAYS are removed.
+#   Pattern count is also capped at ARR_TELEMETRY_MAX_PATTERNS.
 ###############################################################################
 
 prune_state() {
 
-    local cutoff
+    local issue_cutoff
+    local telemetry_cutoff
     local tmp
 
-    cutoff=$(
+    issue_cutoff=$(
         date -d "${STATE_RETENTION_DAYS} days ago" '+%s'
+    )
+
+    telemetry_cutoff=$(
+        date -d "${ARR_TELEMETRY_RETENTION_DAYS} days ago" '+%s'
     )
 
     tmp="$TMP_DIR/state.pruned.json"
 
     jq \
-        --argjson cutoff "$cutoff" \
+        --argjson issueCutoff "$issue_cutoff" \
+        --argjson telemetryCutoff "$telemetry_cutoff" \
+        --argjson telemetryMax "$ARR_TELEMETRY_MAX_PATTERNS" \
         '
+        #######################################################################
+        # ISSUE LIFECYCLE
+        #######################################################################
+
         .issues |= with_entries(
+
             select(
-                (.value.lastSeen // 0) >= $cutoff
+
+                (.value.active == true)
+
+                or
+
+                (
+                    (
+                        .value.resolvedAt
+                        // .value.lastSeen
+                        // 0
+                    )
+                    >= $issueCutoff
+                )
             )
+        )
+
+        |
+
+        #######################################################################
+        # ARR TELEMETRY
+        #######################################################################
+
+        .telemetry = (
+            .telemetry
+            // {
+                version: 1,
+                patterns: {}
+            }
+        )
+
+        |
+
+        .telemetry.patterns = (
+
+            (.telemetry.patterns // {})
+
+            | to_entries
+
+            | map(
+
+                select(
+                    (.value.lastSeen // 0)
+                    >= $telemetryCutoff
+                )
+            )
+
+            | sort_by(.value.lastSeen)
+
+            | reverse
+
+            | .[:$telemetryMax]
+
+            | from_entries
         )
         ' \
         "$STATE_FILE" >"$tmp" || return
@@ -2319,7 +4218,9 @@ prune_state() {
 exec 9>"$LOCKFILE"
 
 if ! flock -n 9; then
+
     log "Another ARR import monitor run is already active"
+
     exit 1
 fi
 
@@ -2337,8 +4238,8 @@ require_command tr
 require_command sha256sum
 require_command find
 require_command awk
-require_command paste
 require_command wc
+require_command grep
 
 ###############################################################################
 # TEMP DIRECTORY
@@ -2350,14 +4251,25 @@ TMP_DIR=$(mktemp -d /tmp/arr_import_monitor.XXXXXX) || {
 }
 
 NOTIFICATION_BATCH="${TMP_DIR}/notification_batch.jsonl"
+SEEN_ISSUES_FILE="${TMP_DIR}/seen_issues.txt"
 
 : >"$NOTIFICATION_BATCH"
+: >"$SEEN_ISSUES_FILE"
 
 ###############################################################################
 # STATE
 ###############################################################################
 
 initialize_state
+
+###############################################################################
+# START
+###############################################################################
+
+log "Starting ARR Import Monitor v2.4"
+log "Recommended schedule: hourly"
+log "Notifications enabled: $SEND_NOTIFICATIONS"
+log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
 
 ###############################################################################
 # SABNZBD
@@ -2371,6 +4283,8 @@ if [ "$SAB_ENABLED" = true ]; then
 
     if sab_get history "$SAB_HISTORY"; then
 
+        SAB_SCAN_OK=true
+
         SAB_COUNT=$(
             jq '.history.slots | length' \
             "$SAB_HISTORY" 2>/dev/null ||
@@ -2381,8 +4295,10 @@ if [ "$SAB_ENABLED" = true ]; then
 
     else
 
-        log "WARNING: Unable to retrieve SABnzbd history"
+        SAB_SCAN_OK=false
         SAB_HISTORY=""
+
+        log "WARNING: Unable to retrieve SABnzbd history"
     fi
 fi
 
@@ -2404,6 +4320,8 @@ if [ "$SONARR_ENABLED" = true ]; then
         "$SONARR_QUEUE"
     then
 
+        SONARR_SCAN_OK=true
+
         SONARR_COUNT=$(
             jq '.records | length' \
             "$SONARR_QUEUE" 2>/dev/null ||
@@ -2418,8 +4336,10 @@ if [ "$SONARR_ENABLED" = true ]; then
 
     else
 
-        log "ERROR: Unable to retrieve Sonarr queue"
+        SONARR_SCAN_OK=false
         SONARR_QUEUE=""
+
+        log "ERROR: Unable to retrieve Sonarr queue"
     fi
 fi
 
@@ -2441,6 +4361,8 @@ if [ "$RADARR_ENABLED" = true ]; then
         "$RADARR_QUEUE"
     then
 
+        RADARR_SCAN_OK=true
+
         RADARR_COUNT=$(
             jq '.records | length' \
             "$RADARR_QUEUE" 2>/dev/null ||
@@ -2455,16 +4377,26 @@ if [ "$RADARR_ENABLED" = true ]; then
 
     else
 
-        log "ERROR: Unable to retrieve Radarr queue"
+        RADARR_SCAN_OK=false
         RADARR_QUEUE=""
+
+        log "ERROR: Unable to retrieve Radarr queue"
     fi
 fi
 
 ###############################################################################
-# SAB CROSS-APP ORPHAN CHECK
+# SAB CROSS-APP CHECK
 ###############################################################################
 
 process_sab_orphans
+
+###############################################################################
+# RESOLUTION CHECK
+#
+# Done only after all current issues have been marked seen.
+###############################################################################
+
+resolve_missing_issues
 
 ###############################################################################
 # SEND ONE GROUPED NOTIFICATION
@@ -2473,7 +4405,7 @@ process_sab_orphans
 send_grouped_notification
 
 ###############################################################################
-# STATE CLEANUP
+# PRUNE OLD RESOLVED STATE
 ###############################################################################
 
 prune_state
@@ -2485,7 +4417,13 @@ prune_state
 RUNTIME=$(runtime)
 
 log "============================================================"
-log "ARR Import Monitor v2.0.1 completed"
+log "ARR Import Monitor v2.4 completed"
+
+log ""
+log "SCAN HEALTH"
+log "Sonarr scan successful: $SONARR_SCAN_OK"
+log "Radarr scan successful: $RADARR_SCAN_OK"
+log "SABnzbd scan successful: $SAB_SCAN_OK"
 
 log ""
 log "ARR QUEUES"
@@ -2501,20 +4439,59 @@ log ""
 log "SAB CROSS-APP"
 log "Completed SAB jobs examined: $SAB_HISTORY_CHECKED"
 log "F1 jobs ignored: $SAB_IGNORED_COUNT"
+
 log "Stranded downloads: $SAB_STRANDED_COUNT"
+log "  Media payload: $SAB_MEDIA_STRANDED_COUNT"
+log "  Archive payload: $SAB_ARCHIVE_STRANDED_COUNT"
+log "  Significant other data: $SAB_OTHER_STRANDED_COUNT"
+
 log "Early stranded candidates: $SAB_CANDIDATE_COUNT"
+
+log "Cleanup residue: $SAB_RESIDUE_COUNT"
+log "  Sample-only residue: $SAB_SAMPLE_RESIDUE_COUNT"
+
 log "Empty leftover directories: $SAB_EMPTY_COUNT"
 
 log ""
+log "LIFECYCLE"
+log "Issues resolved this run: $RESOLVED_COUNT"
+
+log ""
 log "TOTAL"
-log "Issues detected: $TOTAL_ISSUES"
+log "Active issues detected this run: $TOTAL_ISSUES"
 log "Informational: $INFO_COUNT"
 log "Warnings: $WARNING_COUNT"
 log "Errors: $ERROR_COUNT"
 
 log ""
+log "ARR MESSAGE TELEMETRY"
+
+if [ "$ARR_TELEMETRY_ENABLED" = true ]; then
+
+    TELEMETRY_TOTAL_PATTERNS=$(arr_telemetry_pattern_count)
+    PROMOTION_CANDIDATES=$(arr_telemetry_review_candidate_count)
+
+    log "Generic Arr observations this run: $TELEMETRY_OBSERVATIONS"
+    log "New normalized patterns: $TELEMETRY_NEW_PATTERNS"
+    log "Existing pattern matches: $TELEMETRY_EXISTING_PATTERNS"
+    log "Stored telemetry patterns: $TELEMETRY_TOTAL_PATTERNS"
+    log "Telemetry retention: ${ARR_TELEMETRY_RETENTION_DAYS} days"
+    log "Review candidates: $PROMOTION_CANDIDATES"
+    log "Promotion-rule matches this run: $PROMOTION_RULE_MATCHES"
+    log "Telemetry retention: ${ARR_TELEMETRY_RETENTION_DAYS} days"
+
+else
+
+    log "Telemetry: DISABLED"
+fi
+
+if (( PROMOTION_CANDIDATES > 0 )); then
+    log_arr_telemetry_review_candidates
+fi
+
+log ""
 log "NOTIFICATIONS"
-log "New issues queued for grouping: $BATCHED_NOTIFICATION_ITEMS"
+log "New/escalated issues queued for grouping: $BATCHED_NOTIFICATION_ITEMS"
 
 if [ "$SEND_NOTIFICATIONS" = true ]; then
 
@@ -2527,6 +4504,8 @@ else
     log "Previously-notified issues suppressed: $NOTIFICATIONS_SUPPRESSED"
 fi
 
+log ""
+log "Recommended run interval: hourly"
 log "Runtime: $RUNTIME"
 log "============================================================"
 
