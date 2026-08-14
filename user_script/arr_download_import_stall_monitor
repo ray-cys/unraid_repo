@@ -1,0 +1,2424 @@
+#!/bin/bash
+
+###############################################################################
+# ARR Download / Import Stall Monitor v2.0
+#
+# MONITORS
+# --------
+# Sonarr + Radarr:
+#   - Custom Format rejection
+#   - Lower/equal CF score
+#   - Upgrade rejection
+#   - TBA / metadata waiting
+#   - Unmatched media
+#   - No importable files
+#   - Manual intervention
+#   - Permission errors
+#   - Missing paths
+#   - Import failures
+#   - Generic warnings/errors/stalls
+#
+# SABnzbd:
+#   - Completed movie job no longer tracked by Radarr
+#   - Completed TV job no longer tracked by Sonarr
+#   - Completed data still physically present
+#   - Empty leftover directories
+#
+# SAB CATEGORY MAPPING
+# --------------------
+#   movie -> Radarr
+#   tv    -> Sonarr
+#   f1    -> ignored
+#
+# SAFETY
+# ------
+# READ ONLY.
+#
+# This script NEVER:
+#   - Deletes SAB downloads
+#   - Deletes SAB history
+#   - Removes Arr queue entries
+#   - Forces imports
+#   - Marks downloads failed
+#   - Changes monitoring
+#   - Changes quality profiles
+#   - Changes Custom Formats
+#
+###############################################################################
+
+set -uo pipefail
+
+###############################################################################
+# CONFIGURATION
+###############################################################################
+
+# ---------------------------------------------------------------------------
+# Sonarr
+# ---------------------------------------------------------------------------
+
+SONARR_ENABLED=true
+SONARR_URL="http://192.168.50.4:8989"
+SONARR_API_KEY="PUT_YOUR_SONARR_API_KEY_HERE"
+
+# ---------------------------------------------------------------------------
+# Radarr
+# ---------------------------------------------------------------------------
+
+RADARR_ENABLED=true
+RADARR_URL="http://192.168.50.4:7878"
+RADARR_API_KEY="PUT_YOUR_RADARR_API_KEY_HERE"
+
+# ---------------------------------------------------------------------------
+# SABnzbd
+# ---------------------------------------------------------------------------
+
+SAB_ENABLED=true
+SAB_URL="http://192.168.50.4:8080"
+SAB_API_KEY="PUT_YOUR_SABNZBD_API_KEY_HERE"
+
+# ---------------------------------------------------------------------------
+# SAB completed download locations
+# ---------------------------------------------------------------------------
+
+SAB_COMPLETE_ROOT="/mnt/user/media/net/complete"
+
+SAB_MOVIE_CATEGORY="movie"
+SAB_MOVIE_DIR="${SAB_COMPLETE_ROOT}/movies"
+
+SAB_TV_CATEGORY="tv"
+SAB_TV_DIR="${SAB_COMPLETE_ROOT}/series"
+
+# Explicitly excluded from orphan monitoring.
+SAB_IGNORED_CATEGORY="f1"
+
+# ---------------------------------------------------------------------------
+# ARR detection thresholds
+# ---------------------------------------------------------------------------
+
+IGNORE_BEFORE_HOURS=1
+
+WARNING_AFTER_HOURS=3
+ERROR_AFTER_HOURS=2
+STALL_AFTER_HOURS=6
+
+# CF / upgrade / TBA items become an unresolved warning after this long.
+POLICY_ESCALATE_AFTER_HOURS=72
+
+# ---------------------------------------------------------------------------
+# SAB stranded download thresholds
+# ---------------------------------------------------------------------------
+
+# Younger than this:
+# completely ignore.
+SAB_ORPHAN_IGNORE_HOURS=6
+
+# Between IGNORE and WARN:
+# log as candidate but don't notify.
+SAB_ORPHAN_WARN_HOURS=12
+
+# Still stranded beyond this:
+# send one additional escalation warning.
+SAB_ORPHAN_ESCALATE_HOURS=72
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+
+# Keep false while testing v2.
+SEND_NOTIFICATIONS=false
+
+NOTIFY="/usr/local/emhttp/webGui/scripts/notify"
+
+NOTIFY_ONCE=true
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+
+STATE_DIR="/mnt/user/appdata/arr_import_monitor"
+
+STATE_FILE="${STATE_DIR}/state.json"
+STATE_BACKUP="${STATE_DIR}/state.json.bak"
+
+STATE_RETENTION_DAYS=14
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+
+LOCKFILE="/tmp/arr_import_monitor.lock"
+
+QUEUE_PAGE_SIZE=1000
+SAB_HISTORY_LIMIT=500
+
+###############################################################################
+# INITIALIZATION
+###############################################################################
+
+START_TIME=$(date +%s)
+
+TMP_DIR=""
+
+SONARR_QUEUE=""
+RADARR_QUEUE=""
+SAB_HISTORY=""
+
+TOTAL_QUEUE=0
+TOTAL_ISSUES=0
+
+INFO_COUNT=0
+WARNING_COUNT=0
+ERROR_COUNT=0
+
+CF_REJECT_COUNT=0
+UPGRADE_REJECT_COUNT=0
+TBA_COUNT=0
+UNMATCHED_COUNT=0
+NO_IMPORT_COUNT=0
+STALL_COUNT=0
+
+SAB_HISTORY_CHECKED=0
+SAB_IGNORED_COUNT=0
+SAB_STRANDED_COUNT=0
+SAB_CANDIDATE_COUNT=0
+SAB_EMPTY_COUNT=0
+
+NOTIFICATIONS_SENT=0
+NOTIFICATIONS_SUPPRESSED=0
+
+###############################################################################
+# BASIC FUNCTIONS
+###############################################################################
+
+log() {
+    printf '%s : %s\n' "$(date '+%Y/%m/%d %T')" "$*"
+}
+
+runtime() {
+
+    local seconds=$(( $(date +%s) - START_TIME ))
+
+    printf '%dh:%dm:%ds' \
+        $((seconds / 3600)) \
+        $(((seconds % 3600) / 60)) \
+        $((seconds % 60))
+}
+
+bytes_human() {
+
+    local bytes="${1:-0}"
+
+    awk -v b="$bytes" '
+        BEGIN {
+            if (b >= 1099511627776)
+                printf "%.2f TB", b / 1099511627776
+            else if (b >= 1073741824)
+                printf "%.2f GB", b / 1073741824
+            else if (b >= 1048576)
+                printf "%.2f MB", b / 1048576
+            else if (b >= 1024)
+                printf "%.2f KB", b / 1024
+            else
+                printf "%d B", b
+        }
+    '
+}
+
+cleanup() {
+
+    if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
+        rm -rf -- "$TMP_DIR" 2>/dev/null || true
+    fi
+}
+
+trap 'cleanup' EXIT
+
+###############################################################################
+# NOTIFICATION
+###############################################################################
+
+notify() {
+
+    local importance="$1"
+    local description="$2"
+    local message="$3"
+
+    #
+    # Return 2 to distinguish "disabled" from an actual notification failure.
+    #
+
+    if [ "$SEND_NOTIFICATIONS" != true ]; then
+        return 2
+    fi
+
+    if [ ! -x "$NOTIFY" ]; then
+        log "WARNING: Unraid notification command unavailable"
+        return 1
+    fi
+
+    if "$NOTIFY" \
+        -i "$importance" \
+        -s "ARR Import Monitor" \
+        -d "$description" \
+        -m "$message" \
+        >/dev/null 2>&1
+    then
+        ((NOTIFICATIONS_SENT++)) || true
+        return 0
+    fi
+
+    log "WARNING: Failed to send Unraid notification"
+
+    return 1
+}
+
+###############################################################################
+# REQUIRE COMMAND
+###############################################################################
+
+require_command() {
+
+    local command="$1"
+
+    if ! command -v "$command" >/dev/null 2>&1; then
+        log "ERROR: Required command not found: $command"
+        exit 2
+    fi
+}
+
+###############################################################################
+# ARR API
+###############################################################################
+
+api_get() {
+
+    local url="$1"
+    local api_key="$2"
+    local output="$3"
+
+    if ! curl \
+        --silent \
+        --show-error \
+        --fail \
+        --connect-timeout 10 \
+        --max-time 30 \
+        -H "X-Api-Key: $api_key" \
+        "$url" \
+        -o "$output"
+    then
+        return 1
+    fi
+
+    jq empty "$output" >/dev/null 2>&1
+}
+
+###############################################################################
+# SAB API
+###############################################################################
+
+sab_get() {
+
+    local mode="$1"
+    local output="$2"
+
+    local url="${SAB_URL%/}/api"
+
+    if ! curl \
+        --silent \
+        --show-error \
+        --fail \
+        --connect-timeout 10 \
+        --max-time 30 \
+        --get \
+        --data-urlencode "mode=$mode" \
+        --data-urlencode "output=json" \
+        --data-urlencode "apikey=$SAB_API_KEY" \
+        --data-urlencode "start=0" \
+        --data-urlencode "limit=$SAB_HISTORY_LIMIT" \
+        "$url" \
+        -o "$output"
+    then
+        return 1
+    fi
+
+    jq empty "$output" >/dev/null 2>&1
+}
+
+###############################################################################
+# TIME FUNCTIONS
+###############################################################################
+
+date_to_epoch() {
+
+    local value="$1"
+
+    if [ -z "$value" ]; then
+        echo 0
+        return
+    fi
+
+    #
+    # Unix timestamp.
+    #
+
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$value"
+        return
+    fi
+
+    #
+    # Date string.
+    #
+
+    date -d "$value" '+%s' 2>/dev/null || echo 0
+}
+
+age_hours() {
+
+    local timestamp="$1"
+
+    local epoch
+    local now
+
+    epoch=$(date_to_epoch "$timestamp")
+    now=$(date +%s)
+
+    if (( epoch <= 0 || now <= epoch )); then
+        echo 0
+        return
+    fi
+
+    echo $(( (now - epoch) / 3600 ))
+}
+
+###############################################################################
+# ARR STATUS MESSAGE
+###############################################################################
+
+queue_message() {
+
+    local item="$1"
+
+    echo "$item" |
+        jq -r '
+            [
+                (.errorMessage // empty),
+
+                (
+                    .statusMessages[]?
+                    | .messages[]?
+                )
+            ]
+            | map(select(. != null and . != ""))
+            | unique
+            | join(" | ")
+        '
+}
+
+###############################################################################
+# FRIENDLY MEDIA NAME
+###############################################################################
+
+friendly_media_name() {
+
+    local app="$1"
+    local item="$2"
+
+    if [ "$app" = "Sonarr" ]; then
+
+        echo "$item" |
+            jq -r '
+                if (.series.title // "") != "" then
+
+                    if (.episode.seasonNumber // null) != null
+                       and (.episode.episodeNumber // null) != null
+                    then
+
+                        (.series.title)
+                        + " - S"
+                        + (
+                            (.episode.seasonNumber | tostring)
+                            | if length < 2 then "0" + . else . end
+                        )
+                        + "E"
+                        + (
+                            (.episode.episodeNumber | tostring)
+                            | if length < 2 then "0" + . else . end
+                        )
+                        + (
+                            if (.episode.title // "") != ""
+                            then " - " + .episode.title
+                            else ""
+                            end
+                        )
+
+                    else
+                        .series.title
+                    end
+
+                else
+                    (.title // "Unknown")
+                end
+            '
+
+    else
+
+        echo "$item" |
+            jq -r '
+                if (.movie.title // "") != "" then
+
+                    .movie.title
+                    + (
+                        if (.movie.year // 0) > 0
+                        then " (" + (.movie.year | tostring) + ")"
+                        else ""
+                        end
+                    )
+
+                else
+                    (.title // "Unknown")
+                end
+            '
+    fi
+}
+
+release_name() {
+
+    local item="$1"
+
+    echo "$item" |
+        jq -r '.title // "Unknown"'
+}
+
+###############################################################################
+# CUSTOM FORMAT EXTRACTION
+###############################################################################
+
+extract_cf_new_score() {
+
+    local message="$1"
+
+    echo "$message" |
+        sed -nE \
+        's/.*New: \[[^]]*\] \((-?[0-9]+)\).*Existing:.*/\1/p' |
+        head -n 1
+}
+
+extract_cf_existing_score() {
+
+    local message="$1"
+
+    echo "$message" |
+        sed -nE \
+        's/.*Existing: \[[^]]*\] \((-?[0-9]+)\).*/\1/p' |
+        head -n 1
+}
+
+extract_cf_new_formats() {
+
+    local message="$1"
+
+    echo "$message" |
+        sed -nE \
+        's/.*New: \[([^]]*)\] \(-?[0-9]+\).*Existing:.*/\1/p' |
+        head -n 1
+}
+
+extract_cf_existing_formats() {
+
+    local message="$1"
+
+    echo "$message" |
+        sed -nE \
+        's/.*Existing: \[([^]]*)\] \(-?[0-9]+\).*/\1/p' |
+        head -n 1
+}
+
+normalize_cf_list() {
+
+    local value="$1"
+
+    printf '%s\n' "$value" |
+        tr ',' '\n' |
+        sed \
+            -e 's/^[[:space:]]*//' \
+            -e 's/[[:space:]]*$//' |
+        sed '/^$/d' |
+        sort -u
+}
+
+cf_difference() {
+
+    local first="$1"
+    local second="$2"
+
+    comm -23 \
+        <(normalize_cf_list "$first") \
+        <(normalize_cf_list "$second")
+}
+
+###############################################################################
+# CLASSIFICATION
+###############################################################################
+
+classify_issue() {
+
+    local tracked_status="$1"
+    local tracked_state="$2"
+    local status="$3"
+    local message="$4"
+
+    local combined
+    local new_score
+    local existing_score
+
+    combined="$(
+        printf '%s %s %s %s' \
+            "$tracked_status" \
+            "$tracked_state" \
+            "$status" \
+            "$message" |
+        tr '[:upper:]' '[:lower:]'
+    )"
+
+    ###########################################################################
+    # CUSTOM FORMAT
+    ###########################################################################
+
+    if echo "$combined" |
+       grep -Eq \
+       'custom format|customformat|custom-format|format score'
+    then
+
+        new_score=$(extract_cf_new_score "$message")
+        existing_score=$(extract_cf_existing_score "$message")
+
+        if [[ "$new_score" =~ ^-?[0-9]+$ ]] &&
+           [[ "$existing_score" =~ ^-?[0-9]+$ ]]
+        then
+
+            if (( new_score < existing_score )); then
+                echo "CF_REJECT_LOWER_SCORE"
+                return
+            fi
+
+            if (( new_score == existing_score )); then
+                echo "CF_REJECT_EQUAL_SCORE"
+                return
+            fi
+        fi
+
+        echo "CF_REJECT"
+        return
+    fi
+
+    ###########################################################################
+    # TBA / METADATA
+    ###########################################################################
+
+    if echo "$combined" |
+       grep -Eq \
+       '(^|[^[:alpha:]])tba([^[:alpha:]]|$)|title.*not available|metadata.*not available|metadata.*not ready|waiting.*metadata'
+    then
+
+        echo "TBA_METADATA"
+        return
+    fi
+
+    ###########################################################################
+    # UNMATCHED
+    ###########################################################################
+
+    if echo "$combined" |
+       grep -Eq \
+       'unable to match|could not match|cannot match|failed to match|unable to identify|could not identify|cannot identify|unknown series|unknown movie'
+    then
+
+        echo "UNMATCHED_MEDIA"
+        return
+    fi
+
+    ###########################################################################
+    # NO IMPORTABLE FILE
+    ###########################################################################
+
+    if echo "$combined" |
+       grep -Eq \
+       'no files.*eligible.*import|no importable files|no files found.*import|no video files|nothing.*to import'
+    then
+
+        echo "NO_IMPORTABLE_FILES"
+        return
+    fi
+
+    ###########################################################################
+    # UPGRADE REJECTION
+    ###########################################################################
+
+    if echo "$combined" |
+       grep -Eq \
+       'not an upgrade|existing file.*better|existing.*preferred|quality.*not.*upgrade|does not improve|not an improvement'
+    then
+
+        echo "UPGRADE_REJECT"
+        return
+    fi
+
+    ###########################################################################
+    # PERMISSION
+    ###########################################################################
+
+    if echo "$combined" |
+       grep -Eq \
+       'permission denied|access.*denied|unauthorized access|not permitted|operation not permitted'
+    then
+
+        echo "PERMISSION"
+        return
+    fi
+
+    ###########################################################################
+    # PATH
+    ###########################################################################
+
+    if echo "$combined" |
+       grep -Eq \
+       'path.*does not exist|folder.*does not exist|directory.*does not exist|cannot find|no such file|not accessible|unable to access|folder is missing'
+    then
+
+        echo "PATH"
+        return
+    fi
+
+    ###########################################################################
+    # IMPORT FAILURE
+    ###########################################################################
+
+    if echo "$combined" |
+       grep -Eq \
+       'import failed|failed to import|unable to import|import error|could not import|cannot import'
+    then
+
+        echo "IMPORT_FAILED"
+        return
+    fi
+
+    ###########################################################################
+    # MANUAL INTERVENTION
+    ###########################################################################
+
+    if echo "$combined" |
+       grep -Eq \
+       'manual import|manual intervention|requires manual|manually import|needs manual'
+    then
+
+        echo "MANUAL"
+        return
+    fi
+
+    ###########################################################################
+    # FALLBACK STATUS
+    ###########################################################################
+
+    case "${tracked_status,,}" in
+
+        warning)
+            echo "WARNING"
+            return
+            ;;
+
+        error)
+            echo "ERROR"
+            return
+            ;;
+
+    esac
+
+    ###########################################################################
+    # GENERIC STALL
+    ###########################################################################
+
+    if echo "$combined" |
+       grep -Eq \
+       'downloaded|completed|importpending|import blocked|waiting'
+    then
+
+        echo "ARR_IMPORT_STALLED"
+        return
+    fi
+
+    echo "NONE"
+}
+
+###############################################################################
+# POLICY REJECTION
+###############################################################################
+
+is_policy_rejection() {
+
+    case "$1" in
+
+        CF_REJECT_LOWER_SCORE|\
+        CF_REJECT_EQUAL_SCORE|\
+        CF_REJECT|\
+        UPGRADE_REJECT)
+
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+###############################################################################
+# SEVERITY
+###############################################################################
+
+classification_severity() {
+
+    local classification="$1"
+    local age="$2"
+
+    if is_policy_rejection "$classification"; then
+
+        if (( age >= POLICY_ESCALATE_AFTER_HOURS )); then
+            echo "WARNING"
+        else
+            echo "INFO"
+        fi
+
+        return
+    fi
+
+    case "$classification" in
+
+        TBA_METADATA)
+
+            if (( age >= POLICY_ESCALATE_AFTER_HOURS )); then
+                echo "WARNING"
+            else
+                echo "INFO"
+            fi
+            ;;
+
+        WARNING|MANUAL|ARR_IMPORT_STALLED)
+            echo "WARNING"
+            ;;
+
+        UNMATCHED_MEDIA|\
+        NO_IMPORTABLE_FILES|\
+        PERMISSION|\
+        PATH|\
+        IMPORT_FAILED|\
+        ERROR)
+
+            echo "ERROR"
+            ;;
+
+        *)
+            echo "NONE"
+            ;;
+
+    esac
+}
+
+classification_min_age() {
+
+    case "$1" in
+
+        CF_REJECT_LOWER_SCORE|\
+        CF_REJECT_EQUAL_SCORE|\
+        CF_REJECT|\
+        UPGRADE_REJECT|\
+        TBA_METADATA|\
+        WARNING|\
+        MANUAL)
+
+            echo "$WARNING_AFTER_HOURS"
+            ;;
+
+        UNMATCHED_MEDIA|\
+        NO_IMPORTABLE_FILES|\
+        PERMISSION|\
+        PATH|\
+        IMPORT_FAILED|\
+        ERROR)
+
+            echo "$ERROR_AFTER_HOURS"
+            ;;
+
+        ARR_IMPORT_STALLED)
+
+            echo "$STALL_AFTER_HOURS"
+            ;;
+
+        *)
+
+            echo 999999
+            ;;
+
+    esac
+}
+
+classification_reason() {
+
+    local classification="$1"
+    local age="$2"
+
+    local escalation=""
+
+    if (( age >= POLICY_ESCALATE_AFTER_HOURS )); then
+        escalation=" Issue has remained unresolved for at least ${POLICY_ESCALATE_AFTER_HOURS} hours."
+    fi
+
+    case "$classification" in
+
+        CF_REJECT_LOWER_SCORE)
+            echo "Downloaded release has a lower Custom Format score than the existing media.${escalation}"
+            ;;
+
+        CF_REJECT_EQUAL_SCORE)
+            echo "Downloaded release has the same Custom Format score and is not considered an upgrade.${escalation}"
+            ;;
+
+        CF_REJECT)
+            echo "Custom Format scoring or requirements prevented automatic import.${escalation}"
+            ;;
+
+        UPGRADE_REJECT)
+            echo "Downloaded release is not considered an upgrade over the existing media.${escalation}"
+            ;;
+
+        TBA_METADATA)
+            echo "Media metadata/title appears incomplete or TBA and automatic import is waiting or blocked.${escalation}"
+            ;;
+
+        UNMATCHED_MEDIA)
+            echo "Arr could not reliably match or identify the downloaded media"
+            ;;
+
+        NO_IMPORTABLE_FILES)
+            echo "Arr could not find an eligible/importable media file in the completed download"
+            ;;
+
+        PERMISSION)
+            echo "Filesystem permission/access problem"
+            ;;
+
+        PATH)
+            echo "Downloaded path is missing or inaccessible"
+            ;;
+
+        IMPORT_FAILED)
+            echo "Automatic import failed"
+            ;;
+
+        MANUAL)
+            echo "Manual import/intervention is required"
+            ;;
+
+        WARNING)
+            echo "Arr reports a download/import warning"
+            ;;
+
+        ERROR)
+            echo "Arr reports a download/import error"
+            ;;
+
+        ARR_IMPORT_STALLED)
+            echo "Completed download remains tracked by Arr but has not progressed to import"
+            ;;
+
+        *)
+            echo "Unknown"
+            ;;
+
+    esac
+}
+
+###############################################################################
+# STATE
+###############################################################################
+
+initialize_state() {
+
+    mkdir -p "$STATE_DIR" || {
+        log "ERROR: Unable to create state directory: $STATE_DIR"
+        exit 3
+    }
+
+    if [ ! -f "$STATE_FILE" ]; then
+
+        cat >"$STATE_FILE" <<'EOF'
+{
+  "version": 4,
+  "issues": {}
+}
+EOF
+    fi
+
+    if ! jq empty "$STATE_FILE" >/dev/null 2>&1; then
+
+        log "WARNING: State file is invalid"
+
+        if [ -f "$STATE_BACKUP" ] &&
+           jq empty "$STATE_BACKUP" >/dev/null 2>&1
+        then
+
+            log "Restoring state from backup"
+            cp -f "$STATE_BACKUP" "$STATE_FILE"
+
+        else
+
+            log "Creating new state file"
+
+            cat >"$STATE_FILE" <<'EOF'
+{
+  "version": 4,
+  "issues": {}
+}
+EOF
+        fi
+    fi
+}
+
+save_state() {
+
+    local new_state="$1"
+
+    cp -f "$STATE_FILE" "$STATE_BACKUP" 2>/dev/null || true
+    mv -f "$new_state" "$STATE_FILE"
+}
+
+###############################################################################
+# ISSUE SIGNATURE
+###############################################################################
+
+issue_signature() {
+
+    local app="$1"
+    local id="$2"
+    local classification="$3"
+    local severity="$4"
+    local stage="$5"
+    local message="$6"
+
+    printf '%s|%s|%s|%s|%s|%s' \
+        "$app" \
+        "$id" \
+        "$classification" \
+        "$severity" \
+        "$stage" \
+        "$message" |
+        sha256sum |
+        awk '{print $1}'
+}
+
+###############################################################################
+# NOTIFICATION DEDUP
+#
+# Important:
+#
+# We compare against notifiedSignature, NOT merely the current issue signature.
+#
+# Therefore running with SEND_NOTIFICATIONS=false does not permanently suppress
+# the first real notification when notifications are later enabled.
+###############################################################################
+
+should_notify() {
+
+    local issue_key="$1"
+    local signature="$2"
+
+    if [ "$NOTIFY_ONCE" != true ]; then
+        return 0
+    fi
+
+    local previous
+
+    previous=$(
+        jq -r \
+            --arg key "$issue_key" \
+            '.issues[$key].notifiedSignature // ""' \
+            "$STATE_FILE"
+    )
+
+    if [ "$previous" = "$signature" ]; then
+        ((NOTIFICATIONS_SUPPRESSED++)) || true
+        return 1
+    fi
+
+    return 0
+}
+
+###############################################################################
+# UPDATE ISSUE STATE
+###############################################################################
+
+update_issue_state() {
+
+    local issue_key="$1"
+    local signature="$2"
+    local app="$3"
+    local title="$4"
+    local classification="$5"
+    local severity="$6"
+    local stage="$7"
+    local message="$8"
+
+    local now
+    local tmp
+
+    now=$(date +%s)
+
+    tmp="$TMP_DIR/state.new.json"
+
+    jq \
+        --arg key "$issue_key" \
+        --arg signature "$signature" \
+        --arg app "$app" \
+        --arg title "$title" \
+        --arg classification "$classification" \
+        --arg severity "$severity" \
+        --arg stage "$stage" \
+        --arg message "$message" \
+        --argjson now "$now" \
+        '
+        .version = 4
+        |
+        (.issues[$key] // {}) as $old
+        |
+        .issues[$key] = {
+            signature: $signature,
+            notifiedSignature: ($old.notifiedSignature // ""),
+            app: $app,
+            title: $title,
+            classification: $classification,
+            severity: $severity,
+            stage: $stage,
+            message: $message,
+            firstSeen: ($old.firstSeen // $now),
+            lastSeen: $now,
+            occurrences: (($old.occurrences // 0) + 1)
+        }
+        ' \
+        "$STATE_FILE" >"$tmp" || return 1
+
+    save_state "$tmp"
+}
+
+###############################################################################
+# MARK ISSUE AS NOTIFIED
+###############################################################################
+
+mark_notified() {
+
+    local issue_key="$1"
+    local signature="$2"
+
+    local tmp
+
+    tmp="$TMP_DIR/state.notified.json"
+
+    jq \
+        --arg key "$issue_key" \
+        --arg signature "$signature" \
+        '
+        if .issues[$key] then
+            .issues[$key].notifiedSignature = $signature
+        else
+            .
+        end
+        ' \
+        "$STATE_FILE" >"$tmp" || return
+
+    save_state "$tmp"
+}
+
+###############################################################################
+# SAB HISTORY LOOKUP FOR ARR
+###############################################################################
+
+sab_history_lookup() {
+
+    local download_id="$1"
+
+    if [ "$SAB_ENABLED" != true ] ||
+       [ -z "$SAB_HISTORY" ] ||
+       [ ! -f "$SAB_HISTORY" ]
+    then
+        echo '{}'
+        return
+    fi
+
+    jq -c \
+        --arg id "$download_id" \
+        '
+        .history.slots // []
+        | map(
+            select(
+                (.nzo_id // "" | ascii_downcase)
+                ==
+                ($id | ascii_downcase)
+            )
+        )
+        | first // {}
+        ' \
+        "$SAB_HISTORY"
+}
+
+###############################################################################
+# ARR DOWNLOAD-ID LOOKUP
+###############################################################################
+
+arr_tracks_download() {
+
+    local app="$1"
+    local download_id="$2"
+
+    local queue=""
+
+    case "$app" in
+
+        Sonarr)
+            queue="$SONARR_QUEUE"
+            ;;
+
+        Radarr)
+            queue="$RADARR_QUEUE"
+            ;;
+
+        *)
+            return 1
+            ;;
+    esac
+
+    [ -n "$queue" ] || return 1
+    [ -f "$queue" ] || return 1
+
+    jq -e \
+        --arg id "$download_id" \
+        '
+        any(
+            .records[]?;
+            ((.downloadId // "") | ascii_downcase)
+            ==
+            ($id | ascii_downcase)
+        )
+        ' \
+        "$queue" >/dev/null 2>&1
+}
+
+###############################################################################
+# CF DETAILS
+###############################################################################
+
+log_cf_details() {
+
+    local message="$1"
+
+    local new_score
+    local existing_score
+    local difference
+    local new_formats
+    local existing_formats
+    local gained
+    local missing
+
+    new_score=$(extract_cf_new_score "$message")
+    existing_score=$(extract_cf_existing_score "$message")
+
+    new_formats=$(extract_cf_new_formats "$message")
+    existing_formats=$(extract_cf_existing_formats "$message")
+
+    if [[ "$new_score" =~ ^-?[0-9]+$ ]] &&
+       [[ "$existing_score" =~ ^-?[0-9]+$ ]]
+    then
+
+        difference=$(( new_score - existing_score ))
+
+        log "New CF score: $new_score"
+        log "Existing CF score: $existing_score"
+        log "CF score difference: $difference"
+    fi
+
+    if [ -n "$new_formats" ] &&
+       [ -n "$existing_formats" ]
+    then
+
+        gained=$(cf_difference "$new_formats" "$existing_formats")
+        missing=$(cf_difference "$existing_formats" "$new_formats")
+
+        if [ -n "$gained" ]; then
+            log "CFs only in downloaded release:"
+
+            while IFS= read -r cf; do
+                [ -n "$cf" ] && log "  + $cf"
+            done <<<"$gained"
+        fi
+
+        if [ -n "$missing" ]; then
+            log "CFs only in existing media:"
+
+            while IFS= read -r cf; do
+                [ -n "$cf" ] && log "  + $cf"
+            done <<<"$missing"
+        fi
+    fi
+}
+
+build_cf_notification_details() {
+
+    local message="$1"
+
+    local new_score
+    local existing_score
+    local difference
+
+    local new_formats
+    local existing_formats
+
+    local gained
+    local missing
+
+    local output=""
+
+    new_score=$(extract_cf_new_score "$message")
+    existing_score=$(extract_cf_existing_score "$message")
+
+    new_formats=$(extract_cf_new_formats "$message")
+    existing_formats=$(extract_cf_existing_formats "$message")
+
+    if [[ "$new_score" =~ ^-?[0-9]+$ ]] &&
+       [[ "$existing_score" =~ ^-?[0-9]+$ ]]
+    then
+
+        difference=$(( new_score - existing_score ))
+
+        output+="New CF score: ${new_score}"$'\n'
+        output+="Existing CF score: ${existing_score}"$'\n'
+
+        if (( difference > 0 )); then
+            output+="Difference: +${difference}"$'\n'
+        else
+            output+="Difference: ${difference}"$'\n'
+        fi
+    fi
+
+    if [ -n "$new_formats" ] &&
+       [ -n "$existing_formats" ]
+    then
+
+        gained=$(cf_difference "$new_formats" "$existing_formats")
+        missing=$(cf_difference "$existing_formats" "$new_formats")
+
+        if [ -n "$gained" ]; then
+
+            output+=$'\n'"Downloaded release adds:"$'\n'
+
+            while IFS= read -r cf; do
+                [ -n "$cf" ] && output+="  + ${cf}"$'\n'
+            done <<<"$gained"
+        fi
+
+        if [ -n "$missing" ]; then
+
+            output+=$'\n'"Existing media has but download lacks:"$'\n'
+
+            while IFS= read -r cf; do
+                [ -n "$cf" ] && output+="  + ${cf}"$'\n'
+            done <<<"$missing"
+        fi
+    fi
+
+    printf '%s' "$output"
+}
+
+###############################################################################
+# PROCESS ARR QUEUE
+###############################################################################
+
+process_queue() {
+
+    local app="$1"
+    local queue_file="$2"
+
+    local records
+
+    records=$(jq -c '.records[]?' "$queue_file")
+
+    if [ -z "$records" ]; then
+        log "$app queue: no entries"
+        return
+    fi
+
+    while IFS= read -r item; do
+
+        [ -n "$item" ] || continue
+
+        ((TOTAL_QUEUE++)) || true
+
+        local id
+        local download_id
+        local media_name
+        local release
+
+        local status
+        local tracked_status
+        local tracked_state
+
+        local added
+        local age
+
+        local message
+        local classification
+        local severity
+        local min_age
+        local reason
+
+        id=$(echo "$item" | jq -r '.id // ""')
+        download_id=$(echo "$item" | jq -r '.downloadId // ""')
+
+        media_name=$(friendly_media_name "$app" "$item")
+        release=$(release_name "$item")
+
+        status=$(echo "$item" | jq -r '.status // "unknown"')
+
+        tracked_status=$(
+            echo "$item" |
+            jq -r '.trackedDownloadStatus // "unknown"'
+        )
+
+        tracked_state=$(
+            echo "$item" |
+            jq -r '.trackedDownloadState // "unknown"'
+        )
+
+        added=$(echo "$item" | jq -r '.added // ""')
+
+        age=$(age_hours "$added")
+
+        if (( age < IGNORE_BEFORE_HOURS )); then
+            continue
+        fi
+
+        message=$(queue_message "$item")
+
+        classification=$(
+            classify_issue \
+                "$tracked_status" \
+                "$tracked_state" \
+                "$status" \
+                "$message"
+        )
+
+        [ "$classification" != "NONE" ] || continue
+
+        min_age=$(classification_min_age "$classification")
+
+        if (( age < min_age )); then
+            continue
+        fi
+
+        severity=$(
+            classification_severity \
+                "$classification" \
+                "$age"
+        )
+
+        reason=$(
+            classification_reason \
+                "$classification" \
+                "$age"
+        )
+
+        ((TOTAL_ISSUES++)) || true
+
+        case "$severity" in
+            INFO) ((INFO_COUNT++)) || true ;;
+            WARNING) ((WARNING_COUNT++)) || true ;;
+            ERROR) ((ERROR_COUNT++)) || true ;;
+        esac
+
+        case "$classification" in
+            CF_REJECT*) ((CF_REJECT_COUNT++)) || true ;;
+            UPGRADE_REJECT) ((UPGRADE_REJECT_COUNT++)) || true ;;
+            TBA_METADATA) ((TBA_COUNT++)) || true ;;
+            UNMATCHED_MEDIA) ((UNMATCHED_COUNT++)) || true ;;
+            NO_IMPORTABLE_FILES) ((NO_IMPORT_COUNT++)) || true ;;
+            ARR_IMPORT_STALLED) ((STALL_COUNT++)) || true ;;
+        esac
+
+        #######################################################################
+        # SAB CORRELATION
+        #######################################################################
+
+        local sab_item
+        local sab_status
+        local sab_name
+
+        sab_status="Unknown"
+        sab_name=""
+
+        if [ -n "$download_id" ]; then
+
+            sab_item=$(sab_history_lookup "$download_id")
+
+            sab_status=$(
+                echo "$sab_item" |
+                jq -r '.status // "Unknown"'
+            )
+
+            sab_name=$(
+                echo "$sab_item" |
+                jq -r '.name // .nzb_name // ""'
+            )
+        fi
+
+        #######################################################################
+        # LOG
+        #######################################################################
+
+        log "------------------------------------------------------------"
+        log "$app issue detected"
+        log "Media: $media_name"
+        log "Release: $release"
+        log "Classification: $classification"
+        log "Severity: $severity"
+        log "Reason: $reason"
+        log "Queue age: ${age}h"
+        log "Arr status: $status"
+        log "Tracked status: $tracked_status"
+        log "Tracked state: $tracked_state"
+
+        [ -n "$download_id" ] &&
+            log "Download ID: $download_id"
+
+        [ "$sab_status" != "Unknown" ] &&
+            log "SAB status: $sab_status"
+
+        if [[ "$classification" == CF_REJECT* ]]; then
+            log_cf_details "$message"
+        fi
+
+        [ -n "$message" ] &&
+            log "Arr message: $message"
+
+        #######################################################################
+        # STATE / SIGNATURE
+        #######################################################################
+
+        local issue_key
+        local signature
+        local stage="normal"
+
+        if is_policy_rejection "$classification" ||
+           [ "$classification" = "TBA_METADATA" ]
+        then
+
+            if (( age >= POLICY_ESCALATE_AFTER_HOURS )); then
+                stage="escalated"
+            fi
+        fi
+
+        if [ -n "$download_id" ]; then
+            issue_key="${app}:${download_id}"
+        else
+            issue_key="${app}:queue:${id}"
+        fi
+
+        signature=$(
+            issue_signature \
+                "$app" \
+                "${download_id:-$id}" \
+                "$classification" \
+                "$severity" \
+                "$stage" \
+                "$message"
+        )
+
+        #######################################################################
+        # UPDATE STATE BEFORE NOTIFY
+        #######################################################################
+
+        update_issue_state \
+            "$issue_key" \
+            "$signature" \
+            "$app" \
+            "$media_name" \
+            "$classification" \
+            "$severity" \
+            "$stage" \
+            "$message"
+
+        #######################################################################
+        # NOTIFICATION
+        #######################################################################
+
+        if should_notify "$issue_key" "$signature"; then
+
+            local notify_importance
+            local notify_title
+            local body
+            local cf_details
+            local notify_rc
+
+            case "$severity" in
+
+                INFO)
+
+                    notify_importance="normal"
+
+                    case "$classification" in
+                        CF_REJECT*)
+                            notify_title="🟡 Import - CF REVIEW"
+                            ;;
+                        TBA_METADATA)
+                            notify_title="🟡 Import - METADATA WAIT"
+                            ;;
+                        *)
+                            notify_title="🟡 Import - REVIEW"
+                            ;;
+                    esac
+                    ;;
+
+                WARNING)
+
+                    notify_importance="warning"
+
+                    if [ "$stage" = "escalated" ]; then
+                        notify_title="🟠 Import - UNRESOLVED"
+                    else
+                        notify_title="🟠 Import - ATTENTION"
+                    fi
+                    ;;
+
+                ERROR)
+                    notify_importance="alert"
+                    notify_title="🔴 Import - FAILED"
+                    ;;
+
+                *)
+                    notify_importance="normal"
+                    notify_title="ARR Import Monitor"
+                    ;;
+            esac
+
+            body="${app}"$'\n'
+            body+="Media: ${media_name}"$'\n'
+            body+="Release: ${release}"$'\n'
+
+            body+=$'\n'"Reason:"$'\n'
+            body+="${reason}"$'\n'
+
+            if [[ "$classification" == CF_REJECT* ]]; then
+
+                cf_details=$(
+                    build_cf_notification_details "$message"
+                )
+
+                if [ -n "$cf_details" ]; then
+                    body+=$'\n'"${cf_details}"$'\n'
+                fi
+            fi
+
+            body+=$'\n'"Queue age: ${age}h"$'\n'
+            body+="Arr status: ${status}"$'\n'
+            body+="Tracked status: ${tracked_status}"$'\n'
+            body+="Tracked state: ${tracked_state}"$'\n'
+
+            if [ "$sab_status" != "Unknown" ]; then
+                body+="SAB status: ${sab_status}"$'\n'
+            fi
+
+            if [ -n "$sab_name" ] &&
+               [ "$sab_name" != "$release" ]
+            then
+                body+="SAB job: ${sab_name}"$'\n'
+            fi
+
+            if [ -n "$message" ]; then
+                body+=$'\n'"Arr message:"$'\n'
+                body+="${message}"
+            fi
+
+            notify \
+                "$notify_importance" \
+                "$notify_title" \
+                "$body"
+
+            notify_rc=$?
+
+            if [ "$notify_rc" -eq 0 ]; then
+                mark_notified "$issue_key" "$signature"
+
+            elif [ "$notify_rc" -eq 2 ]; then
+                log "Notification disabled; issue logged only"
+            fi
+
+        else
+
+            log "Notification suppressed: issue already reported"
+        fi
+
+    done <<<"$records"
+}
+
+###############################################################################
+# SAB COMPLETION TIME
+###############################################################################
+
+sab_completed_epoch() {
+
+    local item="$1"
+
+    local value
+
+    value=$(
+        echo "$item" |
+        jq -r '
+            .completed
+            // .completed_time
+            // .completedTime
+            // .completionTime
+            // ""
+        '
+    )
+
+    date_to_epoch "$value"
+}
+
+###############################################################################
+# CATEGORY OWNER
+###############################################################################
+
+sab_category_owner() {
+
+    local category="${1,,}"
+
+    if [ "$category" = "${SAB_MOVIE_CATEGORY,,}" ]; then
+        echo "Radarr"
+        return
+    fi
+
+    if [ "$category" = "${SAB_TV_CATEGORY,,}" ]; then
+        echo "Sonarr"
+        return
+    fi
+
+    echo ""
+}
+
+sab_category_root() {
+
+    local category="${1,,}"
+
+    if [ "$category" = "${SAB_MOVIE_CATEGORY,,}" ]; then
+        echo "$SAB_MOVIE_DIR"
+        return
+    fi
+
+    if [ "$category" = "${SAB_TV_CATEGORY,,}" ]; then
+        echo "$SAB_TV_DIR"
+        return
+    fi
+
+    echo ""
+}
+
+###############################################################################
+# RESOLVE SAB COMPLETED PATH
+###############################################################################
+
+resolve_sab_path() {
+
+    local item="$1"
+    local root="$2"
+
+    local storage
+    local name
+    local base
+    local candidate
+
+    storage=$(
+        echo "$item" |
+        jq -r '.storage // .path // ""'
+    )
+
+    name=$(
+        echo "$item" |
+        jq -r '.name // .nzb_name // ""'
+    )
+
+    #
+    # 1. SAB returned an actual host-visible path.
+    #
+
+    if [ -n "$storage" ] &&
+       [ -e "$storage" ]
+    then
+        printf '%s' "$storage"
+        return 0
+    fi
+
+    #
+    # 2. SAB storage may be a container-side path.
+    #
+    # Use its basename under the category's known host root.
+    #
+
+    if [ -n "$storage" ]; then
+
+        base=$(basename "${storage%/}")
+
+        if [ -n "$base" ] && [ "$base" != "/" ]; then
+
+            candidate="${root}/${base}"
+
+            if [ -e "$candidate" ]; then
+                printf '%s' "$candidate"
+                return 0
+            fi
+        fi
+    fi
+
+    #
+    # 3. Reconstruct from SAB job name.
+    #
+
+    if [ -n "$name" ]; then
+
+        candidate="${root}/${name}"
+
+        if [ -e "$candidate" ]; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+###############################################################################
+# FILESYSTEM STATS
+###############################################################################
+
+path_file_count() {
+
+    local path="$1"
+
+    if [ -f "$path" ]; then
+        echo 1
+        return
+    fi
+
+    if [ ! -d "$path" ]; then
+        echo 0
+        return
+    fi
+
+    find "$path" \
+        -type f \
+        -printf '.' 2>/dev/null |
+        wc -c |
+        tr -d ' '
+}
+
+path_media_count() {
+
+    local path="$1"
+
+    if [ ! -d "$path" ]; then
+
+        case "${path,,}" in
+            *.mkv|*.mp4|*.m4v|*.avi|*.mov|*.ts)
+                [ -f "$path" ] && echo 1 || echo 0
+                ;;
+            *)
+                echo 0
+                ;;
+        esac
+
+        return
+    fi
+
+    find "$path" \
+        -type f \
+        \( \
+            -iname '*.mkv' \
+            -o -iname '*.mp4' \
+            -o -iname '*.m4v' \
+            -o -iname '*.avi' \
+            -o -iname '*.mov' \
+            -o -iname '*.ts' \
+        \) \
+        -printf '.' 2>/dev/null |
+        wc -c |
+        tr -d ' '
+}
+
+path_total_bytes() {
+
+    local path="$1"
+
+    if [ -f "$path" ]; then
+        stat -c '%s' "$path" 2>/dev/null || echo 0
+        return
+    fi
+
+    if [ ! -d "$path" ]; then
+        echo 0
+        return
+    fi
+
+    find "$path" \
+        -type f \
+        -printf '%s\n' 2>/dev/null |
+        awk '
+            { total += $1 }
+            END { printf "%.0f\n", total + 0 }
+        '
+}
+
+###############################################################################
+# PROCESS SAB ORPHANS
+###############################################################################
+
+process_sab_orphans() {
+
+    [ "$SAB_ENABLED" = true ] || return
+    [ -n "$SAB_HISTORY" ] || return
+    [ -f "$SAB_HISTORY" ] || return
+
+    log "Checking SABnzbd completed jobs for stranded downloads"
+
+    local records
+
+    records=$(jq -c '.history.slots[]?' "$SAB_HISTORY")
+
+    [ -n "$records" ] || {
+        log "SABnzbd history contains no jobs"
+        return
+    }
+
+    while IFS= read -r item; do
+
+        [ -n "$item" ] || continue
+
+        local status
+        local category
+        local nzo_id
+        local name
+
+        status=$(echo "$item" | jq -r '.status // ""')
+        category=$(echo "$item" | jq -r '.category // ""')
+        nzo_id=$(echo "$item" | jq -r '.nzo_id // ""')
+        name=$(echo "$item" | jq -r '.name // .nzb_name // "Unknown"')
+
+        #
+        # Only completed jobs matter.
+        #
+
+        [ "${status,,}" = "completed" ] || continue
+
+        ((SAB_HISTORY_CHECKED++)) || true
+
+        #######################################################################
+        # F1 EXCLUSION
+        #######################################################################
+
+        if [ "${category,,}" = "${SAB_IGNORED_CATEGORY,,}" ]; then
+            ((SAB_IGNORED_COUNT++)) || true
+            continue
+        fi
+
+        #######################################################################
+        # ONLY MOVIE / TV
+        #######################################################################
+
+        local owner
+        local root
+
+        owner=$(sab_category_owner "$category")
+
+        if [ -z "$owner" ]; then
+            continue
+        fi
+
+        root=$(sab_category_root "$category")
+
+        #######################################################################
+        # COMPLETION AGE
+        #######################################################################
+
+        local completed_epoch
+        local now
+        local age
+
+        completed_epoch=$(sab_completed_epoch "$item")
+        now=$(date +%s)
+
+        if (( completed_epoch <= 0 )); then
+            log "WARNING: Unable to determine SAB completion time: $name"
+            continue
+        fi
+
+        age=$(( (now - completed_epoch) / 3600 ))
+
+        (( age >= 0 )) || age=0
+
+        if (( age < SAB_ORPHAN_IGNORE_HOURS )); then
+            continue
+        fi
+
+        #######################################################################
+        # EXPECTED ARR STILL TRACKS IT
+        #######################################################################
+
+        if [ -n "$nzo_id" ] &&
+           arr_tracks_download "$owner" "$nzo_id"
+        then
+
+            #
+            # v1.2/v2 Arr-side logic already deals with it.
+            #
+
+            continue
+        fi
+
+        #######################################################################
+        # RESOLVE REMAINING FILESYSTEM DATA
+        #######################################################################
+
+        local completed_path=""
+
+        completed_path=$(
+            resolve_sab_path "$item" "$root" || true
+        )
+
+        #
+        # Nothing remains in completed downloads.
+        #
+        # This is the normal successful-import case.
+        #
+
+        if [ -z "$completed_path" ] ||
+           [ ! -e "$completed_path" ]
+        then
+            continue
+        fi
+
+        local file_count
+        local media_count
+        local remaining_bytes
+
+        file_count=$(path_file_count "$completed_path")
+        media_count=$(path_media_count "$completed_path")
+        remaining_bytes=$(path_total_bytes "$completed_path")
+
+        file_count=${file_count:-0}
+        media_count=${media_count:-0}
+        remaining_bytes=${remaining_bytes:-0}
+
+        #######################################################################
+        # EMPTY LEFTOVER
+        #######################################################################
+
+        if (( file_count == 0 )); then
+
+            ((SAB_EMPTY_COUNT++)) || true
+
+            log "------------------------------------------------------------"
+            log "SAB empty leftover"
+            log "Expected owner: $owner"
+            log "Category: $category"
+            log "Release: $name"
+            log "Age: ${age}h"
+            log "Path: $completed_path"
+            log "Action: log only"
+
+            continue
+        fi
+
+        #######################################################################
+        # STRANDED DOWNLOAD
+        #######################################################################
+
+        local severity="INFO"
+        local stage="candidate"
+
+        if (( age >= SAB_ORPHAN_ESCALATE_HOURS )); then
+
+            severity="WARNING"
+            stage="escalated"
+
+        elif (( age >= SAB_ORPHAN_WARN_HOURS )); then
+
+            severity="WARNING"
+            stage="warning"
+        fi
+
+        ((SAB_STRANDED_COUNT++)) || true
+
+        if [ "$stage" = "candidate" ]; then
+            ((SAB_CANDIDATE_COUNT++)) || true
+        fi
+
+        ((TOTAL_ISSUES++)) || true
+
+        case "$severity" in
+            INFO) ((INFO_COUNT++)) || true ;;
+            WARNING) ((WARNING_COUNT++)) || true ;;
+        esac
+
+        log "------------------------------------------------------------"
+        log "SAB stranded download detected"
+        log "Expected owner: $owner"
+        log "Category: $category"
+        log "Release: $name"
+        log "Classification: SAB_STRANDED"
+        log "Severity: $severity"
+        log "Stage: $stage"
+        log "SAB status: $status"
+        log "Completed age: ${age}h"
+        log "$owner queue: Not found"
+
+        [ -n "$nzo_id" ] &&
+            log "Download ID: $nzo_id"
+
+        log "Completed path: $completed_path"
+        log "Files remaining: $file_count"
+        log "Media files remaining: $media_count"
+        log "Remaining size: $(bytes_human "$remaining_bytes")"
+
+        #######################################################################
+        # STATE
+        #######################################################################
+
+        local issue_key
+        local signature
+        local message
+
+        if [ -n "$nzo_id" ]; then
+            issue_key="SAB:${nzo_id}"
+        else
+            issue_key="SAB:${category}:${name}"
+        fi
+
+        message="Completed SAB data remains on disk but is no longer tracked by ${owner}"
+
+        signature=$(
+            issue_signature \
+                "SABnzbd" \
+                "${nzo_id:-${category}:${name}}" \
+                "SAB_STRANDED" \
+                "$severity" \
+                "$stage" \
+                "$message"
+        )
+
+        update_issue_state \
+            "$issue_key" \
+            "$signature" \
+            "SABnzbd" \
+            "$name" \
+            "SAB_STRANDED" \
+            "$severity" \
+            "$stage" \
+            "$message"
+
+        #######################################################################
+        # CANDIDATE STAGE = LOG ONLY
+        #######################################################################
+
+        if [ "$stage" = "candidate" ]; then
+
+            log "Candidate only: notification threshold is ${SAB_ORPHAN_WARN_HOURS}h"
+
+            continue
+        fi
+
+        #######################################################################
+        # NOTIFY
+        #######################################################################
+
+        if should_notify "$issue_key" "$signature"; then
+
+            local body
+            local title
+            local notify_rc
+
+            if [ "$stage" = "escalated" ]; then
+                title="🟠 SAB - LONG-TERM STRANDED"
+            else
+                title="🟠 SAB - STRANDED DOWNLOAD"
+            fi
+
+            body="Expected owner: ${owner}"$'\n'
+            body+="Category: ${category}"$'\n'
+            body+="Release: ${name}"$'\n\n'
+
+            body+="SAB status: ${status}"$'\n'
+            body+="Completed age: ${age}h"$'\n'
+            body+="${owner} queue: Not found"$'\n\n'
+
+            body+="Completed data still exists:"$'\n'
+            body+="${completed_path}"$'\n\n'
+
+            body+="Files remaining: ${file_count}"$'\n'
+            body+="Media files: ${media_count}"$'\n'
+            body+="Size remaining: $(bytes_human "$remaining_bytes")"$'\n\n'
+
+            body+="Manual review recommended."
+
+            notify warning "$title" "$body"
+
+            notify_rc=$?
+
+            if [ "$notify_rc" -eq 0 ]; then
+                mark_notified "$issue_key" "$signature"
+
+            elif [ "$notify_rc" -eq 2 ]; then
+                log "Notification disabled; issue logged only"
+            fi
+
+        else
+
+            log "Notification suppressed: stranded issue already reported"
+        fi
+
+    done <<<"$records"
+}
+
+###############################################################################
+# PRUNE OLD STATE
+###############################################################################
+
+prune_state() {
+
+    local cutoff
+    local tmp
+
+    cutoff=$(
+        date -d "${STATE_RETENTION_DAYS} days ago" '+%s'
+    )
+
+    tmp="$TMP_DIR/state.pruned.json"
+
+    jq \
+        --argjson cutoff "$cutoff" \
+        '
+        .issues |= with_entries(
+            select(
+                (.value.lastSeen // 0) >= $cutoff
+            )
+        )
+        ' \
+        "$STATE_FILE" >"$tmp" || return
+
+    save_state "$tmp"
+}
+
+###############################################################################
+# LOCK
+###############################################################################
+
+exec 9>"$LOCKFILE"
+
+if ! flock -n 9; then
+    log "Another ARR import monitor run is already active"
+    exit 1
+fi
+
+###############################################################################
+# REQUIREMENTS
+###############################################################################
+
+require_command curl
+require_command jq
+require_command date
+require_command sed
+require_command sort
+require_command comm
+require_command tr
+require_command sha256sum
+require_command find
+require_command awk
+
+###############################################################################
+# TEMP DIRECTORY
+###############################################################################
+
+TMP_DIR=$(mktemp -d /tmp/arr_import_monitor.XXXXXX) || {
+    log "ERROR: Unable to create temporary directory"
+    exit 3
+}
+
+###############################################################################
+# STATE
+###############################################################################
+
+initialize_state
+
+###############################################################################
+# SABNZBD
+###############################################################################
+
+if [ "$SAB_ENABLED" = true ]; then
+
+    log "Connecting to SABnzbd"
+
+    SAB_HISTORY="$TMP_DIR/sab_history.json"
+
+    if sab_get history "$SAB_HISTORY"; then
+
+        SAB_COUNT=$(
+            jq '.history.slots | length' \
+            "$SAB_HISTORY" 2>/dev/null ||
+            echo 0
+        )
+
+        log "SABnzbd history records loaded: $SAB_COUNT"
+
+    else
+
+        log "WARNING: Unable to retrieve SABnzbd history"
+        SAB_HISTORY=""
+    fi
+fi
+
+###############################################################################
+# SONARR
+###############################################################################
+
+if [ "$SONARR_ENABLED" = true ]; then
+
+    log "Checking Sonarr queue"
+
+    SONARR_QUEUE="$TMP_DIR/sonarr_queue.json"
+
+    SONARR_ENDPOINT="${SONARR_URL%/}/api/v3/queue?page=1&pageSize=${QUEUE_PAGE_SIZE}&includeUnknownSeriesItems=true&includeSeries=true&includeEpisode=true"
+
+    if api_get \
+        "$SONARR_ENDPOINT" \
+        "$SONARR_API_KEY" \
+        "$SONARR_QUEUE"
+    then
+
+        SONARR_COUNT=$(
+            jq '.records | length' \
+            "$SONARR_QUEUE" 2>/dev/null ||
+            echo 0
+        )
+
+        log "Sonarr queue entries: $SONARR_COUNT"
+
+        process_queue \
+            "Sonarr" \
+            "$SONARR_QUEUE"
+
+    else
+
+        log "ERROR: Unable to retrieve Sonarr queue"
+        SONARR_QUEUE=""
+    fi
+fi
+
+###############################################################################
+# RADARR
+###############################################################################
+
+if [ "$RADARR_ENABLED" = true ]; then
+
+    log "Checking Radarr queue"
+
+    RADARR_QUEUE="$TMP_DIR/radarr_queue.json"
+
+    RADARR_ENDPOINT="${RADARR_URL%/}/api/v3/queue?page=1&pageSize=${QUEUE_PAGE_SIZE}&includeUnknownMovieItems=true&includeMovie=true"
+
+    if api_get \
+        "$RADARR_ENDPOINT" \
+        "$RADARR_API_KEY" \
+        "$RADARR_QUEUE"
+    then
+
+        RADARR_COUNT=$(
+            jq '.records | length' \
+            "$RADARR_QUEUE" 2>/dev/null ||
+            echo 0
+        )
+
+        log "Radarr queue entries: $RADARR_COUNT"
+
+        process_queue \
+            "Radarr" \
+            "$RADARR_QUEUE"
+
+    else
+
+        log "ERROR: Unable to retrieve Radarr queue"
+        RADARR_QUEUE=""
+    fi
+fi
+
+###############################################################################
+# SAB CROSS-APP ORPHAN CHECK
+###############################################################################
+
+process_sab_orphans
+
+###############################################################################
+# STATE CLEANUP
+###############################################################################
+
+prune_state
+
+###############################################################################
+# SUMMARY
+###############################################################################
+
+RUNTIME=$(runtime)
+
+log "============================================================"
+log "ARR Import Monitor v2.0 completed"
+
+log ""
+log "ARR QUEUES"
+log "Queue entries examined: $TOTAL_QUEUE"
+log "CF rejections: $CF_REJECT_COUNT"
+log "Other upgrade rejections: $UPGRADE_REJECT_COUNT"
+log "TBA / metadata waits: $TBA_COUNT"
+log "Unmatched media: $UNMATCHED_COUNT"
+log "No-importable-file issues: $NO_IMPORT_COUNT"
+log "ARR import stalls: $STALL_COUNT"
+
+log ""
+log "SAB CROSS-APP"
+log "Completed SAB jobs examined: $SAB_HISTORY_CHECKED"
+log "F1 jobs ignored: $SAB_IGNORED_COUNT"
+log "Stranded downloads: $SAB_STRANDED_COUNT"
+log "Early stranded candidates: $SAB_CANDIDATE_COUNT"
+log "Empty leftover directories: $SAB_EMPTY_COUNT"
+
+log ""
+log "TOTAL"
+log "Issues detected: $TOTAL_ISSUES"
+log "Informational: $INFO_COUNT"
+log "Warnings: $WARNING_COUNT"
+log "Errors: $ERROR_COUNT"
+
+if [ "$SEND_NOTIFICATIONS" = true ]; then
+
+    log "Notifications sent: $NOTIFICATIONS_SENT"
+    log "Duplicate notifications suppressed: $NOTIFICATIONS_SUPPRESSED"
+
+else
+
+    log "Notifications: DISABLED"
+    log "Previously-notified duplicates suppressed: $NOTIFICATIONS_SUPPRESSED"
+fi
+
+log "Runtime: $RUNTIME"
+log "============================================================"
+
+exit 0

@@ -1,0 +1,230 @@
+#!/bin/bash
+
+###############################################################################
+# SABnzbd Backup Cleanup
+#
+# Cleans:
+#   1. Old NZB backup files
+#   2. Old SABnzbd application backup ZIP files
+#
+# Designed for Unraid User Scripts.
+###############################################################################
+
+set -uo pipefail
+
+###############################################################################
+# CONFIGURATION
+###############################################################################
+
+SAB_BACKUP_DIR="/mnt/vault/backup/arr_db/sabnzbd"
+NZB_BACKUP_DIR="${SAB_BACKUP_DIR}/nzb"
+# Retention periods
+NZB_RETENTION_DAYS=60
+APP_BACKUP_RETENTION_DAYS=7
+# Safety
+DRY_RUN=true
+LOCKFILE="/tmp/sabnzbd_backup_cleanup.lock"
+
+###############################################################################
+# INITIALIZATION
+###############################################################################
+
+START_TIME=$(date +%s)
+NZB_COUNT=0
+APP_COUNT=0
+NZB_BYTES=0
+APP_BYTES=0
+
+###############################################################################
+# FUNCTIONS
+###############################################################################
+
+log() {
+    printf '%s : %s\n' "$(date '+%Y/%m/%d %T')" "$*"
+}
+
+runtime() {
+    local seconds=$(( $(date +%s) - START_TIME ))
+
+    printf '%dh:%dm:%ds' \
+        $((seconds / 3600)) \
+        $(((seconds % 3600) / 60)) \
+        $((seconds % 60))
+}
+
+bytes_human() {
+    local bytes="${1:-0}"
+
+    awk -v b="$bytes" '
+        BEGIN {
+            if (b >= 1099511627776)
+                printf "%.2f TB", b / 1099511627776
+            else if (b >= 1073741824)
+                printf "%.2f GB", b / 1073741824
+            else if (b >= 1048576)
+                printf "%.2f MB", b / 1048576
+            else if (b >= 1024)
+                printf "%.2f KB", b / 1024
+            else
+                printf "%d B", b
+        }
+    '
+}
+
+###############################################################################
+# LOCK
+###############################################################################
+
+exec 9>"$LOCKFILE"
+
+if ! flock -n 9; then
+    log "Another SABnzbd backup cleanup is already running"
+    exit 1
+fi
+
+###############################################################################
+# VALIDATION
+###############################################################################
+
+log "Starting SABnzbd backup cleanup"
+if [ ! -d "$SAB_BACKUP_DIR" ]; then
+    log "ERROR: SABnzbd backup directory does not exist:"
+    log "$SAB_BACKUP_DIR"
+    exit 2
+fi
+if [ ! -d "$NZB_BACKUP_DIR" ]; then
+    log "WARNING: NZB backup directory does not exist:"
+    log "$NZB_BACKUP_DIR"
+fi
+log "Application backup retention: ${APP_BACKUP_RETENTION_DAYS} days"
+log "NZB backup retention: ${NZB_RETENTION_DAYS} days"
+log "DRY_RUN: $DRY_RUN"
+
+###############################################################################
+# CLEAN OLD NZB BACKUPS
+###############################################################################
+
+if [ -d "$NZB_BACKUP_DIR" ]; then
+    log "Scanning NZB backups"
+    while IFS= read -r -d '' file; do
+        size=$(stat -c '%s' "$file" 2>/dev/null || echo 0)
+        if ! [[ "$size" =~ ^[0-9]+$ ]]; then
+            size=0
+        fi
+        if [ "$DRY_RUN" = true ]; then
+            log "[DRY RUN] Would delete NZB: $file"
+            ((NZB_COUNT++)) || true
+            ((NZB_BYTES += size)) || true
+        else
+            if rm -f -- "$file"; then
+                log "Deleted NZB: $file"
+                ((NZB_COUNT++)) || true
+                ((NZB_BYTES += size)) || true
+            else
+                log "WARNING: Failed to delete NZB: $file"
+            fi
+        fi
+
+    done < <(
+        find "$NZB_BACKUP_DIR" \
+            -type f \
+            \( \
+                -iname '*.nzb' \
+                -o -iname '*.nzb.gz' \
+            \) \
+            -mmin +$(( NZB_RETENTION_DAYS * 1440 )) \
+            -print0
+    )
+else
+    log "Skipping NZB cleanup because directory is unavailable"
+fi
+
+###############################################################################
+# CLEAN OLD SABNZBD APPLICATION BACKUPS
+###############################################################################
+
+log "Scanning SABnzbd application backups"
+
+#
+# maxdepth 1 is intentional.
+# This prevents the application backup cleanup from descending into:
+#   /sabnzbd/nzb
+# Application cleanup is also restricted to ZIP files.
+#
+
+while IFS= read -r -d '' file; do
+    size=$(stat -c '%s' "$file" 2>/dev/null || echo 0)
+    if ! [[ "$size" =~ ^[0-9]+$ ]]; then
+        size=0
+    fi
+
+    if [ "$DRY_RUN" = true ]; then
+        log "[DRY RUN] Would delete application backup: $file"
+        ((APP_COUNT++)) || true
+        ((APP_BYTES += size)) || true
+    else
+        if rm -f -- "$file"; then
+            log "Deleted application backup: $file"
+            ((APP_COUNT++)) || true
+            ((APP_BYTES += size)) || true
+        else
+            log "WARNING: Failed to delete application backup: $file"
+        fi
+    fi
+
+done < <(
+    find "$SAB_BACKUP_DIR" \
+        -maxdepth 1 \
+        -type f \
+        -iname '*.zip' \
+        -mmin +$(( APP_BACKUP_RETENTION_DAYS * 1440 )) \
+        -print0
+)
+
+###############################################################################
+# REMOVE EMPTY DIRECTORIES UNDER NZB BACKUP
+###############################################################################
+
+#
+# Only perform directory deletion during a real cleanup.
+# NZB_BACKUP_DIR itself is protected by -mindepth 1.
+#
+
+if [ "$DRY_RUN" = false ] && [ -d "$NZB_BACKUP_DIR" ]; then
+    log "Removing empty directories under NZB backup directory"
+    find "$NZB_BACKUP_DIR" \
+        -mindepth 1 \
+        -depth \
+        -type d \
+        -empty \
+        -delete 2>/dev/null || true
+fi
+
+###############################################################################
+# SUMMARY
+###############################################################################
+
+RUNTIME=$(runtime)
+
+if [ "$DRY_RUN" = true ]; then
+    log "DRY RUN completed"
+    log "NZB backups eligible: $NZB_COUNT"
+    log "NZB space that would be recovered: $(bytes_human "$NZB_BYTES")"
+    log "Application backups eligible: $APP_COUNT"
+    log "Application space that would be recovered: $(bytes_human "$APP_BYTES")"
+    log "Total files eligible: $(( NZB_COUNT + APP_COUNT ))"
+    log "Total space that would be recovered: $(bytes_human $(( NZB_BYTES + APP_BYTES )))"
+    log "No files were deleted"
+    log "Runtime: $RUNTIME"
+else
+    log "Cleanup completed"
+    log "NZB backups deleted: $NZB_COUNT"
+    log "NZB space recovered: $(bytes_human "$NZB_BYTES")"
+    log "Application backups deleted: $APP_COUNT"
+    log "Application backup space recovered: $(bytes_human "$APP_BYTES")"
+    log "Total files deleted: $(( NZB_COUNT + APP_COUNT ))"
+    log "Total space recovered: $(bytes_human $(( NZB_BYTES + APP_BYTES )))"
+    log "Runtime: $RUNTIME"
+fi
+
+exit 0
