@@ -1,458 +1,780 @@
 #!/bin/bash
+
+###############################################################################
+# Unraid Boot Device Backup
+#
+# Designed for Unraid 7.3+
+#
+# Uses Unraid's native boot-device backup helper, verifies the generated ZIP,
+# copies it safely to the configured SSD backup directory, verifies the copied
+# archive, then removes the temporary source archive.
+###############################################################################
+
+set -uo pipefail
+
+###############################################################################
+# CONFIGURATION
+###############################################################################
+
+BACKUP_DIR="/mnt/vault/backup/flash"
+POOL_PATH="/mnt/vault"
+
+MAX_BACKUPS=3
+
+HELPER="/usr/local/emhttp/webGui/scripts/flash_backup"
+NOTIFY="/usr/local/emhttp/webGui/scripts/notify"
+
 LOCKFILE="/tmp/flash_backup.lock"
-exec 9>"$LOCKFILE"
-if ! flock -n 9; then
-  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "Another flash_backup.sh run is active, exiting (lock: $LOCKFILE)"
-  exit 1
-fi
-################################################################################
-# ---------------- Configuration ----------------
-# Flash Backup Settings
-################################################################################
 
-BACKUP_DIR="/mnt/vault/backup/flash"                              # Destination directory for flash backups
-MAX_BACKUP=3                                                      # Number of backups to keep
+###############################################################################
+# INITIALIZATION
+###############################################################################
 
-################################################################################
+START_TIME=$(date +%s)
 
-# Record start time
-start_time=$(date +%s)
+MARKER=""
+HELPER_LOG=""
+TEMP_FILE=""
 
-# === Helpers Functions ===
-# Logging
+###############################################################################
+# FUNCTIONS
+###############################################################################
+
 log() {
-  local msg="$*"
-  echo "$(date '+%Y/%m/%d %T') : $msg"
+    printf '%s : %s\n' "$(date '+%Y/%m/%d %T')" "$*"
 }
 
-# === Helpers Functions ===
-# Centralized syslog function
 syslog() {
-  local level="$1"; shift || true
-  local msg="$*"
-  local prio
-  case "$level" in
-    debug) prio="user.debug" ;;
-    info) prio="user.info" ;;
-    notice) prio="user.notice" ;;
-    warning|warn) prio="user.warning" ;;
-    err|error) prio="user.err" ;;
-    crit) prio="user.crit" ;;
-    *) prio="user.notice" ;;
-  esac
-  logger -i -t flash_backup -p "$prio" "$msg"
+    local level="$1"
+    shift
+
+    logger \
+        -t flash_backup \
+        -p "user.${level}" \
+        -- "$*"
 }
 
-# === Helpers Functions ===
-# Convert a bytes integer into a human-readable string using binary units
+runtime() {
+    local seconds=$(( $(date +%s) - START_TIME ))
+    printf '%dh:%dm:%ds' \
+        $((seconds / 3600)) \
+        $(((seconds % 3600) / 60)) \
+        $((seconds % 60))
+}
+
 bytes_human() {
-  local bytes=${1:-0}
-  local TB=1099511627776
-  local GB=1073741824
-  local MB=1048576
-  local KB=1024
-  if [ "$bytes" -ge "$TB" ]; then
-    awk "BEGIN{printf \"%.2f TB\", $bytes/$TB}"
-  elif [ "$bytes" -ge "$GB" ]; then
-    awk "BEGIN{printf \"%.2f GB\", $bytes/$GB}"
-  elif [ "$bytes" -ge "$MB" ]; then
-    awk "BEGIN{printf \"%.2f MB\", $bytes/$MB}"
-  elif [ "$bytes" -ge "$KB" ]; then
-    awk "BEGIN{printf \"%.2f KB\", $bytes/$KB}"
-  else
-    printf "%d B" "$bytes"
-  fi
+    local bytes="${1:-0}"
+    awk -v b="$bytes" '
+        BEGIN {
+            if (b >= 1099511627776)
+                printf "%.2f TB", b / 1099511627776
+            else if (b >= 1073741824)
+                printf "%.2f GB", b / 1073741824
+            else if (b >= 1048576)
+                printf "%.2f MB", b / 1048576
+            else if (b >= 1024)
+                printf "%.2f KB", b / 1024
+            else
+                printf "%d B", b
+        }
+    '
 }
 
-# === Helpers Functions ===
-# Returns human runtime string computed from start time
-format_runtime() {
-  if [ -z "${start_time:-}" ]; then
-    echo "0h:0m:0s"
-    return
-  fi
-  local secs=$(( $(date +%s) - start_time ))
-  printf '%dh:%dm:%ds' $((secs/3600)) $((secs%3600/60)) $((secs%60))
-}
+notify() {
+    local importance="$1"
+    local description="$2"
+    local message="$3"
 
-# === Helpers Functions ===
-# Centralized wrapper around the Unraid notify command to ensure consistent
-notify_send() {
-  local level="$1"; shift
-  local subject="$1"; shift
-  local detail="$1"; shift
-  local body="$1"; shift || true
-  /usr/local/emhttp/webGui/scripts/notify -i "$level" -b -s "$subject" -d "$detail" -m "$body"
-  local nrc=$?
-  if [ $nrc -ne 0 ]; then
-    log "Notification command failed with exit code $nrc for subject: $subject"
-  fi
-  return $nrc
-}
-
-# === Helpers Functions ===
-# Check whether a file looks like a zip archive without relying on its name.
-is_zip_file() {
-  local candidate="$1"
-  local signature
-  [ -f "$candidate" ] || return 1
-  [ -s "$candidate" ] || return 1
-  signature=$(head -c 4 "$candidate" 2>/dev/null || true)
-  case "$signature" in
-    $'PK\003\004'|$'PK\005\006'|$'PK\007\008') return 0 ;;
-  esac
-  return 1
-}
-
-# === Helpers Functions ===
-# Resolve the built-in Unraid helper responsible for creating the boot-device zip.
-resolve_backup_helper() {
-  local candidate
-  for candidate in \
-    "/usr/local/emhttp/webGui/scripts/boot_device_backup" \
-    "/usr/local/emhttp/webGui/scripts/flash_backup" \
-    "/usr/local/emhttp/webGui/scripts/boot_backup"
-  do
-    [ -x "$candidate" ] || continue
-    printf '%s' "$candidate"
-    return 0
-  done
-  return 1
-}
-
-# === Helpers Functions ===
-# Extract absolute zip paths that the Unraid helper mentioned while running.
-extract_helper_zip_paths() {
-  local helper_log="$1"
-  [ -f "$helper_log" ] || return 0
-  grep -Eo '/[^[:space:]]+\.zip' "$helper_log" 2>/dev/null | sort -u
-}
-
-# === Helpers Functions ===
-# Extract zip basenames mentioned by the helper, including newer boot-device naming.
-extract_helper_zip_basenames() {
-  local helper_log="$1"
-  [ -f "$helper_log" ] || return 0
-  grep -Eio '([[:alnum:]_.-]*(flash|boot|backup|unraid|config)[[:alnum:]_.-]*\.zip)' "$helper_log" 2>/dev/null | sort -u
-}
-
-# === Helpers Functions ===
-# Search likely Unraid locations for zip files created after the helper started.
-find_recent_backup_zips() {
-  local marker="$1"
-  local spec dir depth
-  [ -f "$marker" ] || return 0
-
-  for spec in \
-    "/usr/local/emhttp:4" \
-    "/boot:4" \
-    "/tmp:2" \
-    "/var/tmp:2" \
-    "/var/lib:4" \
-    "/root:3"
-  do
-    dir=${spec%:*}
-    depth=${spec##*:}
-    [ -d "$dir" ] || continue
-    find "$dir" -maxdepth "$depth" -type f -name '*.zip' -newer "$marker" -printf '%T@|%p\n' 2>/dev/null
-  done | sort -t'|' -k1,1nr | cut -d'|' -f2-
-}
-
-# === Helpers Functions ===
-# Resolve the newest backup zip created by the helper using output hints first,
-# then a timestamp-based search across common Unraid locations.
-find_latest_backup_zip() {
-  local marker="$1"
-  local helper_log="$2"
-  local candidate best='' best_mtime=0 mtime hinted_name
-
-  while IFS= read -r candidate; do
-    [ -n "$candidate" ] || continue
-    [ -f "$candidate" ] || continue
-    mtime=$(stat -c%Y "$candidate" 2>/dev/null || stat -f%m "$candidate" 2>/dev/null || echo 0)
-    if [ "$mtime" -gt "$best_mtime" ]; then
-      best_mtime=$mtime
-      best="$candidate"
-    fi
-  done < <(extract_helper_zip_paths "$helper_log")
-
-  if [ -n "$best" ]; then
-    printf '%s' "$best"
-    return 0
-  fi
-
-  while IFS= read -r hinted_name; do
-    [ -n "$hinted_name" ] || continue
-    while IFS= read -r candidate; do
-      [ -n "$candidate" ] || continue
-      [ "$(basename "$candidate")" = "$hinted_name" ] || continue
-      printf '%s' "$candidate"
-      return 0
-    done < <(find_recent_backup_zips "$marker")
-  done < <(extract_helper_zip_basenames "$helper_log")
-
-  while IFS= read -r candidate; do
-    [ -n "$candidate" ] || continue
-    case "$(basename "$candidate")" in
-      *flash*backup*.zip|*boot*backup*.zip|*backup*.zip|*unraid*.zip|*config*.zip)
-        printf '%s' "$candidate"
+    if [ ! -x "$NOTIFY" ]; then
+        log "WARNING: Unraid notify command not found"
         return 0
-        ;;
+    fi
+
+    "$NOTIFY" \
+        -i "$importance" \
+        -s "Boot Device Backup" \
+        -d "$description" \
+        -m "$message" \
+        >/dev/null 2>&1 || \
+        log "WARNING: Notification command failed"
+}
+
+cleanup() {
+
+    if [ -n "$MARKER" ]; then
+        rm -f -- "$MARKER" 2>/dev/null || true
+    fi
+
+    if [ -n "$HELPER_LOG" ]; then
+        rm -f -- "$HELPER_LOG" 2>/dev/null || true
+    fi
+
+    if [ -n "$TEMP_FILE" ] && [ -f "$TEMP_FILE" ]; then
+        rm -f -- "$TEMP_FILE" 2>/dev/null || true
+    fi
+}
+
+cleanup_webgui_symlinks() {
+
+    [ -d /usr/local/emhttp ] || return 0
+    while IFS= read -r -d '' link; do
+        log "Removing WebGUI backup symlink: $link"
+        if ! rm -f -- "$link"; then
+            syslog warning \
+                "Unable to remove WebGUI backup symlink: $link"
+        fi
+    done < <(
+        find /usr/local/emhttp \
+            -maxdepth 1 \
+            -type l \
+            \( \
+                -name '*-boot-backup-*.zip' \
+                -o -name '*-flash-backup-*.zip' \
+            \) \
+            -print0 2>/dev/null
+    )
+}
+
+verify_zip() {
+    local file="$1"
+    [ -f "$file" ] || return 1
+    [ -s "$file" ] || return 1
+
+    #
+    # Prefer a full ZIP integrity test.
+    #
+
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -tq "$file" >/dev/null 2>&1
+        return $?
+    fi
+
+    #
+    # Fallback to ZIP signature verification.
+    #
+
+    local sig
+
+    sig=$(head -c 4 "$file" 2>/dev/null || true)
+    case "$sig" in
+        $'PK\003\004'|$'PK\005\006'|$'PK\007\008')
+            return 0
+            ;;
     esac
-  done < <(find_recent_backup_zips "$marker")
 
-  find_recent_backup_zips "$marker" | head -n 1
+    return 1
 }
 
-# === Helpers Functions ===
-# Remove stale symlinks left behind by the WebGUI helper once the zip is moved.
-cleanup_helper_symlinks() {
-  local source_path="$1"
-  local sl sl_target
-  [ -n "$source_path" ] || return 0
-  [ -d "/usr/local/emhttp" ] || return 0
+prune_backups() {
+    local -a files=()
+    local entry
+    local count
+    local i
 
-  while IFS= read -r sl; do
-    [ -L "$sl" ] || continue
-    if command -v readlink >/dev/null 2>&1; then
-      sl_target=$(readlink -f "$sl" 2>/dev/null || true)
-    else
-      sl_target=$(realpath "$sl" 2>/dev/null || true)
+    while IFS= read -r -d '' entry; do
+        files+=("${entry#*|}")
+    done < <(
+        find "$BACKUP_DIR" \
+            -maxdepth 1 \
+            -type f \
+            \( \
+                -name '*-boot-backup-*.zip' \
+                -o -name '*-flash-backup-*.zip' \
+            \) \
+            -printf '%T@|%p\0' 2>/dev/null |
+            sort -z -t'|' -k1,1nr
+    )
+
+    count=${#files[@]}
+
+    if (( count <= MAX_BACKUPS )); then
+        log "Backup retention: ${count}/${MAX_BACKUPS}; nothing to prune"
+        return 0
     fi
-    if [ -n "$sl_target" ] && [ "$sl_target" = "$source_path" ]; then
-      rm -f -- "$sl" 2>/dev/null || syslog warning "Failed to remove symlink $sl"
-      log "Removed symlink $sl that pointed to moved file"
-    fi
-  done < <(find /usr/local/emhttp -maxdepth 2 -type l -name '*.zip' -print 2>/dev/null)
+    for ((i=MAX_BACKUPS; i<count; i++)); do
+
+        log "Deleting old backup: ${files[$i]}"
+
+        if ! rm -f -- "${files[$i]}"; then
+            syslog warning \
+                "Unable to delete old boot backup: ${files[$i]}"
+        fi
+    done
 }
 
-# === Helpers Functions ===
-# Function to prune old files in a directory
-prune_old_files() {
-  local dir="$1"
-  local max="$2"
-  local pattern="${3:-*}"
-  [ -d "$dir" ] || return 0
-  mapfile -t files < <(find "$dir" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null | sort -n | awk '{print $2}')
-  local total=${#files[@]}
-  if [ "$total" -le "$max" ]; then
-    return 0
-  fi
-  local to_delete=$(( total - max ))
-  local i
-  for ((i=0; i<to_delete; i++)); do
-    local f="${files[i]}"
-    log "Deleting old backup: $f (keeping newest ${max}; total found: ${total})"
-    if rm -f -- "$f" 2>/dev/null; then
-      log "Deleted old backup: $f"
-    else
-      syslog warning "Failed to remove old flash backup $f"
-    fi
-  done
-}
+###############################################################################
+# LOCK
+###############################################################################
 
-# === Main Script Execution ===
-log 'Initialize Unraid boot-device backup'
+exec 9>"$LOCKFILE"
 
-backup_helper=$(resolve_backup_helper)
-if [ -z "$backup_helper" ]; then
-  syslog err "Unraid boot-device backup helper not found"
-  notify_send alert "Flash Backup - FAIL" "Boot-device backup helper missing" "Unable to find Unraid backup helper under /usr/local/emhttp/webGui/scripts\n\nRuntime: $(format_runtime)"
-  exit 127
+if ! flock -n 9; then
+    log "Another boot-device backup is already running."
+    syslog warning \
+        "Backup skipped because another instance is running"
+    exit 1
 fi
 
-helper_started_marker=$(mktemp -t flash_backup_started.XXXXXX) || helper_started_marker="/tmp/flash_backup_started.$$"
-helper_out=$(mktemp -t flash_backup_helper.XXXXXX) || helper_out="/tmp/flash_backup_helper.$$"
-helper_stdout=$(mktemp -t flash_backup_stdout.XXXXXX) || helper_stdout="/tmp/flash_backup_stdout.$$"
-helper_stderr=$(mktemp -t flash_backup_stderr.XXXXXX) || helper_stderr="/tmp/flash_backup_stderr.$$"
+###############################################################################
+# CLEANUP TRAP
+###############################################################################
 
-if "$backup_helper" >"$helper_stdout" 2>"$helper_stderr"; then
-  cat "$helper_stdout" "$helper_stderr" >"$helper_out" 2>/dev/null || true
-  if ! is_zip_file "$helper_stdout"; then
-    while IFS= read -r _line; do
-      echo "$(date '+%Y/%m/%d %T') : ${_line}"
-    done <"$helper_out"
-  fi
-  log "Boot-device backup helper finished (exit 0); searching for created zip"
-else
-  rc=$?
-  cat "$helper_stdout" "$helper_stderr" >"$helper_out" 2>/dev/null || true
-  if ! is_zip_file "$helper_stdout"; then
-    while IFS= read -r _line; do
-      echo "$(date '+%Y/%m/%d %T') : ${_line}"
-    done <"$helper_out"
-  fi
-  syslog err "Boot-device backup helper failed with exit $rc"
-  excerpt=$(tail -n 40 "$helper_out" 2>/dev/null || true)
-  notify_send alert "Flash Backup - FAIL" "Boot-device backup failed" "Exit code: ${rc}\n\nExcerpt:\n${excerpt}\n\nRuntime: $(format_runtime)"
-  log "Boot-device backup failed; see job log"
-  rm -f -- "$helper_out" "$helper_stdout" "$helper_stderr" "$helper_started_marker" 2>/dev/null || true
-  exit $rc
-fi
+trap 'cleanup' EXIT
 
-# Creating flash backup directory and ensure correct permissions
-if [ ! -d "$BACKUP_DIR" ] ; then
-  log "Create backup directory as it does not exist"
-  if mkdir -p "$BACKUP_DIR" 2>/dev/null; then
-    chmod 0755 "$BACKUP_DIR" 2>/dev/null || syslog warning "chmod failed for $BACKUP_DIR"
-    chown -R nobody:users "$BACKUP_DIR" 2>/dev/null || syslog warning "chown failed for $BACKUP_DIR"
-    log "Created $BACKUP_DIR backup directory with mode 0755 and owner nobody:users"
-  else
-    syslog err "Failed to create backup directory $BACKUP_DIR"
-    log "Failed to create $BACKUP_DIR"
-    rm -f -- "$helper_out" "$helper_stdout" "$helper_stderr" "$helper_started_marker" 2>/dev/null || true
+###############################################################################
+# PRE-FLIGHT CHECKS
+###############################################################################
+
+log "Starting Unraid boot-device backup"
+
+#
+# Ensure the destination pool exists.
+#
+# This protects against accidentally creating /mnt/vault in RAM if the pool
+# disappears or fails to mount.
+#
+
+if [ ! -d "$POOL_PATH" ]; then
+    log "ERROR: Pool path does not exist: $POOL_PATH"
+    syslog err \
+        "Boot backup aborted: pool unavailable: $POOL_PATH"
+    notify alert \
+        "🔴 Backup - POOL UNAVAILABLE" \
+        "Destination pool is unavailable."$'\n\n'"Pool: $POOL_PATH"$'\n'"Runtime: $(runtime)"
     exit 2
-  fi
-else
-  chmod 0775 "$BACKUP_DIR" 2>/dev/null || syslog warning "chmod failed for $BACKUP_DIR"
-  chown -R nobody:users "$BACKUP_DIR" 2>/dev/null || syslog warning "chown failed for $BACKUP_DIR"
-  log "Directory $BACKUP_DIR exists; ensured mode 0775 and owner nobody:users"
 fi
 
-# Retry a few times in case the file appears slightly later.
-retries=6
-latest_zip=''
-if is_zip_file "$helper_stdout"; then
-  streamed_zip="$helper_stdout"
-  log "Detected boot-device backup zip streamed directly from helper stdout"
-fi
-for i in $(seq 1 $retries); do
-  if [ -n "${streamed_zip:-}" ]; then
-    latest_zip="$streamed_zip"
-    break
-  fi
-  latest_zip=$(find_latest_backup_zip "$helper_started_marker" "$helper_out")
-  if [ -n "$latest_zip" ]; then
-    break
-  fi
-  sleep 1
-done
+#
+# Verify that POOL_PATH itself is an active mount point.
+#
 
-log "Search result for boot-device backup zip: ${latest_zip:-<none>}"
-if [ -n "$latest_zip" ] && [ -f "$latest_zip" ]; then
-  src_bytes=$(stat -c%s "$latest_zip" 2>/dev/null || stat -f%z "$latest_zip" 2>/dev/null || echo 0)
-  dest_avail=$(df --output=avail -B1 "$BACKUP_DIR" 2>/dev/null | tail -n1 || echo 0)
-  dest_total=$(df --output=size -B1 "$BACKUP_DIR" 2>/dev/null | tail -n1 || echo 0)
-  src_bytes=${src_bytes:-0}
-  dest_avail=${dest_avail:-0}
-  dest_total=${dest_total:-0}
-  if ! [[ "$dest_avail" =~ ^[0-9]+$ ]]; then dest_avail=0; fi
-  if ! [[ "$dest_total" =~ ^[0-9]+$ ]]; then dest_total=0; fi
-  human_src_size=$(bytes_human "$src_bytes")
-  need_bytes=$(( src_bytes + 1024 * 1024 ))
+if command -v findmnt >/dev/null 2>&1; then
+    mount_target=$(
+        findmnt -rn -T "$POOL_PATH" -o TARGET 2>/dev/null || true
+    )
+    if [ "$mount_target" != "$POOL_PATH" ]; then
+        log "ERROR: $POOL_PATH is not an active mount point"
+        log "Detected mount target: ${mount_target:-<none>}"
+        syslog err \
+            "Boot backup aborted because $POOL_PATH is not mounted"
+        notify alert \
+            "🔴 Backup - POOL NOT MOUNTED" \
+            "$POOL_PATH is not mounted."$'\n\n'"Backup aborted to prevent writing into RAM."$'\n'"Runtime: $(runtime)"
 
-  if [ "$dest_avail" -lt "$need_bytes" ]; then
-    human_need=$(bytes_human "$need_bytes")
-    human_avail=$(bytes_human "$dest_avail")
-    syslog err "Insufficient space to move boot-device backup zip: need ${human_need}, available ${human_avail}"
-    if [[ "$dest_avail" =~ ^[0-9]+$ ]] && [ "$dest_avail" -gt 0 ]; then
-      req_pct_of_free=$(awk -v r="$need_bytes" -v f="$dest_avail" 'BEGIN{printf "%.2f", (r*100)/f}')
-      no_space_body="Space: Free = ${human_avail}, Required = ${human_need}\nRequired vs Free: ${req_pct_of_free}%"
-    else
-      no_space_body="Space: Free = ${human_avail}, Required = ${human_need}\nRequired vs Free: Unknown"
+        exit 2
     fi
-    notify_send alert "Flash Backup" "🔵 Backup - NO SPACE" "$no_space_body"
-    log "Insufficient space for moving $latest_zip: need ${human_need} available ${human_avail}"
-  else
-    target="$latest_zip"
-    final="$BACKUP_DIR/$(basename "$target")"
-    tmp="$BACKUP_DIR/.tmp.$(basename "$target").$$"
-    src_dev=$(stat -c %d "$target" 2>/dev/null || echo "")
-    dest_dev=$(stat -c %d "$BACKUP_DIR" 2>/dev/null || echo "")
+fi
 
-    if [ -n "$src_dev" ] && [ -n "$dest_dev" ] && [ "$src_dev" = "$dest_dev" ]; then
-      if mv -- "$target" "$final"; then
-        moved_file="$final"
-        moved_size=$(stat -c%s "$moved_file" 2>/dev/null || stat -f%z "$moved_file" 2>/dev/null || echo 0)
-        human_moved_size=$(bytes_human "$moved_size")
-        log "Moved $target to $final"
-        log "Moved file: $moved_file size: ${human_moved_size}"
-        cleanup_helper_symlinks "$target"
-      else
-        rc=$?
-        syslog warning "mv (same FS) failed with exit $rc; attempting copy-to-temp+rename fallback for $target"
-        if cp --reflink=auto --sparse=always --preserve=mode,timestamps -- "$target" "$tmp" 2>/dev/null \
-           && mv -f -- "$tmp" "$final" 2>/dev/null \
-           && rm -f -- "$target" 2>/dev/null; then
-          moved_file="$final"
-          moved_size=$(stat -c%s "$moved_file" 2>/dev/null || stat -f%z "$moved_file" 2>/dev/null || echo 0)
-          human_moved_size=$(bytes_human "$moved_size")
-          log "Copied via temp and removed original: $target -> $final"
-          cleanup_helper_symlinks "$target"
+#
+# Native Unraid helper must exist.
+#
+
+if [ ! -x "$HELPER" ]; then
+    log "ERROR: Native Unraid backup helper not found: $HELPER"
+    syslog err \
+        "Native Unraid boot backup helper missing"
+    notify alert \
+        "🔴 Backup - HELPER MISSING" \
+        "Unable to locate:"$'\n'"$HELPER"$'\n\n'"Runtime: $(runtime)"
+    exit 127
+fi
+
+###############################################################################
+# DESTINATION
+###############################################################################
+
+if [ ! -d "$BACKUP_DIR" ]; then
+    log "Creating backup directory: $BACKUP_DIR"
+    if ! mkdir -p -- "$BACKUP_DIR"; then
+        log "ERROR: Unable to create $BACKUP_DIR"
+        notify alert \
+            "🔴 Backup - DIRECTORY ERROR" \
+            "Unable to create:"$'\n'"$BACKUP_DIR"$'\n\n'"Runtime: $(runtime)"
+        exit 3
+    fi
+fi
+chmod 0775 "$BACKUP_DIR" 2>/dev/null || true
+
+#
+# Verify actual destination write access.
+#
+
+WRITE_TEST="$BACKUP_DIR/.flash_backup_write_test.$$"
+
+if ! touch "$WRITE_TEST" 2>/dev/null; then
+    log "ERROR: Destination is not writable: $BACKUP_DIR"
+    notify alert \
+        "🔴 Backup - NOT WRITABLE" \
+        "Backup destination is not writable:"$'\n'"$BACKUP_DIR"$'\n\n'"Runtime: $(runtime)"
+    exit 3
+fi
+
+rm -f -- "$WRITE_TEST"
+
+###############################################################################
+# DESTINATION SPACE
+###############################################################################
+
+AVAILABLE_BYTES=$(
+    df -B1 --output=avail "$BACKUP_DIR" 2>/dev/null |
+    tail -n 1 |
+    tr -d ' '
+)
+
+AVAILABLE_BYTES="${AVAILABLE_BYTES:-0}"
+
+if ! [[ "$AVAILABLE_BYTES" =~ ^[0-9]+$ ]]; then
+    AVAILABLE_BYTES=0
+fi
+
+log "Destination free space: $(bytes_human "$AVAILABLE_BYTES")"
+
+###############################################################################
+# CREATE MARKER
+###############################################################################
+
+MARKER=$(mktemp /tmp/flash_backup_marker.XXXXXX) || {
+    log "ERROR: Unable to create backup marker"
+    exit 4
+}
+
+HELPER_LOG=$(mktemp /tmp/flash_backup_helper.XXXXXX) || {
+    log "ERROR: Unable to create helper log"
+    exit 4
+}
+
+###############################################################################
+# RUN UNRAID BACKUP HELPER
+###############################################################################
+
+log "Running native Unraid backup helper"
+if "$HELPER" >"$HELPER_LOG" 2>&1; then
+    log "Native backup helper completed successfully"
+else
+
+    RC=$?
+
+    log "ERROR: Native backup helper exited with code $RC"
+    while IFS= read -r line; do
+        log "HELPER: $line"
+    done < "$HELPER_LOG"
+    syslog err \
+        "Native boot backup helper failed with exit code $RC"
+    HELPER_EXCERPT=$(
+        tail -n 20 "$HELPER_LOG" 2>/dev/null || true
+    )
+    notify alert \
+        "🔴 Backup - FAILED" \
+        "Native Unraid backup helper failed."$'\n\n'"Exit code: $RC"$'\n\n'"${HELPER_EXCERPT}"$'\n\n'"Runtime: $(runtime)"
+
+    exit "$RC"
+fi
+
+###############################################################################
+# LOCATE NEW ARCHIVE
+###############################################################################
+
+#
+# Unraid 7.3 creates a boot-backup ZIP and may expose a WebGUI symlink.
+#
+# Do not assume a specific hostname/prefix such as "unraid-".
+# Identify only backup ZIPs created after this run started.
+#
+
+BACKUP_SOURCE=$(
+    find / \
+        -maxdepth 1 \
+        -type f \
+        \( \
+            -name '*-boot-backup-*.zip' \
+            -o -name '*-flash-backup-*.zip' \
+        \) \
+        -newer "$MARKER" \
+        -printf '%T@|%p\n' 2>/dev/null |
+        sort -t'|' -k1,1nr |
+        head -n 1 |
+        cut -d'|' -f2-
+)
+
+if [ -z "$BACKUP_SOURCE" ] || [ ! -f "$BACKUP_SOURCE" ]; then
+
+    log "No new backup archive detected directly in /"
+    log "Checking WebGUI backup symlinks"
+
+    #
+    # Unraid may expose the generated archive through a symlink in
+    # /usr/local/emhttp. Resolve that symlink to the actual file.
+    #
+
+    WEBGUI_LINK=$(
+        find /usr/local/emhttp \
+            -maxdepth 1 \
+            -type l \
+            \( \
+                -name '*-boot-backup-*.zip' \
+                -o -name '*-flash-backup-*.zip' \
+            \) \
+            -printf '%T@|%p\n' 2>/dev/null |
+            sort -t'|' -k1,1nr |
+            head -n 1 |
+            cut -d'|' -f2-
+    )
+
+    if [ -n "$WEBGUI_LINK" ]; then
+
+        log "Found WebGUI backup symlink: $WEBGUI_LINK"
+
+        RESOLVED_SOURCE=$(
+            readlink -f "$WEBGUI_LINK" 2>/dev/null || true
+        )
+
+        if [ -n "$RESOLVED_SOURCE" ] && [ -f "$RESOLVED_SOURCE" ]; then
+
+            BACKUP_SOURCE="$RESOLVED_SOURCE"
+
+            log "Resolved backup source: $BACKUP_SOURCE"
+
         else
-          rm -f -- "$tmp" 2>/dev/null || true
-          syslog err "Failed to move (same FS) $target to $final via fallback"
-          log "mv/copy fallback failed for $target"
+
+            log "WARNING: WebGUI symlink could not be resolved to a regular file"
+            log "Symlink target: $(readlink "$WEBGUI_LINK" 2>/dev/null || echo '<unknown>')"
         fi
-      fi
-    else
-      if cp --reflink=auto --sparse=always --preserve=mode,timestamps -- "$target" "$tmp" 2>/dev/null; then
-        if mv -f -- "$tmp" "$final" 2>/dev/null; then
-          if rm -f -- "$target" 2>/dev/null; then
-            moved_file="$final"
-            moved_size=$(stat -c%s "$moved_file" 2>/dev/null || stat -f%z "$moved_file" 2>/dev/null || echo 0)
-            human_moved_size=$(bytes_human "$moved_size")
-            log "Copied to dest (reflink where possible) and finalized: $target -> $final"
-            cleanup_helper_symlinks "$target"
-          else
-            moved_file="$final"
-            moved_size=$(stat -c%s "$moved_file" 2>/dev/null || stat -f%z "$moved_file" 2>/dev/null || echo 0)
-            human_moved_size=$(bytes_human "$moved_size")
-            syslog warning "Copied and finalized at destination but failed to remove source $target"
-            log "Copied and finalized at destination; please manually remove source: $target"
-          fi
-        else
-          rc=$?
-          rm -f -- "$tmp" 2>/dev/null || true
-          syslog err "Failed to finalize rename of $tmp to $final (exit $rc)"
-          log "Failed to finalize move at destination"
-        fi
-      else
-        rc=$?
-        rm -f -- "$tmp" 2>/dev/null || true
-        syslog err "Failed to copy $target to temporary file $tmp in $BACKUP_DIR (exit $rc)"
-        log "Copy to destination temp failed for $target"
-      fi
     fi
-  fi
-else
-  log "No boot-device backup zip found after helper run"
 fi
 
-# Remove old backups
-prune_old_files "$BACKUP_DIR" "$MAX_BACKUP" "*.zip"
+###############################################################################
+# FALLBACK SEARCH
+###############################################################################
 
-# Syslog and notification
-runtime_now=$(format_runtime)
-if [ -n "${moved_file:-}" ]; then
-  syslog info "Flash Backup: Unraid boot device backed up on $(date) (Runtime: ${runtime_now})"
-  notify_body="Boot-device backup moved to ${BACKUP_DIR}\nRuntime: ${runtime_now}"
-  notify_body+="\nMoved: $(basename "${moved_file}") (${human_moved_size})"
-  if [ -n "${need_bytes:-}" ]; then
-    req_human=$(bytes_human "$need_bytes")
-    free_human=$(bytes_human "${dest_avail:-0}")
-    notify_body+=$'\n'"Space: Free = ${free_human}, Required = ${req_human}"
-    if [[ "${dest_avail:-0}" =~ ^[0-9]+$ ]] && [ "${dest_avail:-0}" -gt 0 ]; then
-      req_pct_of_free=$(awk -v r="$need_bytes" -v f="${dest_avail:-0}" 'BEGIN{printf "%.2f", (r*100)/f}')
-      notify_body+=$'\n'"Required vs Free: ${req_pct_of_free}%"
-    else
-      notify_body+=$'\n'"Required vs Free: Unknown"
-    fi
-  fi
-  notify_send normal "Flash Backup" "🟢 Backup - OK" "$notify_body"
-else
-  syslog err "Flash Backup: No boot-device backup moved on $(date) (Runtime: ${runtime_now})"
-  notify_body="Boot-device backup did NOT move to ${BACKUP_DIR}\nRuntime: ${runtime_now}"
-  if [ -n "${latest_zip:-}" ] && [ -f "${latest_zip}" ]; then
-    notify_body+="\nFound source zip: ${latest_zip} (${human_src_size})"
-  else
-    notify_body+="\nNo boot-device backup zip was found after the helper completed"
-  fi
-  notify_send alert "Flash Backup" "🔴 Backup - FAIL" "$notify_body"
-  rm -f -- "${helper_out:-/tmp/flash_backup_helper.$$}" "${helper_stdout:-/tmp/flash_backup_stdout.$$}" "${helper_stderr:-/tmp/flash_backup_stderr.$$}" "${helper_started_marker:-/tmp/flash_backup_started.$$}" 2>/dev/null || true
-  exit 1
+#
+# If neither / nor the WebGUI symlink revealed the source, perform a limited
+# search of locations Unraid may use for temporary files.
+#
+# Avoid scanning /mnt so we cannot accidentally select one of our existing
+# destination backups.
+#
+
+if [ -z "${BACKUP_SOURCE:-}" ] || [ ! -f "${BACKUP_SOURCE:-}" ]; then
+
+    log "Backup source still not located; performing limited fallback search"
+
+    BACKUP_SOURCE=$(
+        {
+            find /tmp \
+                -maxdepth 3 \
+                -type f \
+                \( \
+                    -name '*-boot-backup-*.zip' \
+                    -o -name '*-flash-backup-*.zip' \
+                \) \
+                -newer "$MARKER" \
+                -printf '%T@|%p\n' 2>/dev/null
+
+            find /var/tmp \
+                -maxdepth 3 \
+                -type f \
+                \( \
+                    -name '*-boot-backup-*.zip' \
+                    -o -name '*-flash-backup-*.zip' \
+                \) \
+                -newer "$MARKER" \
+                -printf '%T@|%p\n' 2>/dev/null
+
+            find /boot \
+                -maxdepth 2 \
+                -type f \
+                \( \
+                    -name '*-boot-backup-*.zip' \
+                    -o -name '*-flash-backup-*.zip' \
+                \) \
+                -newer "$MARKER" \
+                -printf '%T@|%p\n' 2>/dev/null
+        } |
+        sort -t'|' -k1,1nr |
+        head -n 1 |
+        cut -d'|' -f2-
+    )
 fi
 
-# Cleanup helper output temporary file
-rm -f -- "${helper_out:-/tmp/flash_backup_helper.$$}" "${helper_stdout:-/tmp/flash_backup_stdout.$$}" "${helper_stderr:-/tmp/flash_backup_stderr.$$}" "${helper_started_marker:-/tmp/flash_backup_started.$$}" 2>/dev/null || true
+###############################################################################
+# CONFIRM SOURCE
+###############################################################################
+
+if [ -z "${BACKUP_SOURCE:-}" ] || [ ! -f "$BACKUP_SOURCE" ]; then
+
+    log "ERROR: Helper completed successfully but no new boot backup archive could be located"
+
+    #
+    # Print helper output into the User Scripts log for diagnosis.
+    #
+
+    if [ -s "$HELPER_LOG" ]; then
+
+        log "Native helper output follows:"
+
+        while IFS= read -r line; do
+            log "HELPER: $line"
+        done < "$HELPER_LOG"
+
+    else
+        log "Native helper produced no stdout/stderr output"
+    fi
+
+    #
+    # Show any matching WebGUI entries, even if they could not be resolved.
+    #
+
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        log "WEBGUI BACKUP ENTRY: $entry"
+    done < <(
+        find /usr/local/emhttp \
+            -maxdepth 1 \
+            \( \
+                -name '*-boot-backup-*.zip' \
+                -o -name '*-flash-backup-*.zip' \
+            \) \
+            -exec ls -la {} \; 2>/dev/null
+    )
+
+    syslog err \
+        "Backup helper completed but generated archive could not be located"
+
+    notify alert \
+        "🔴 Backup - NO ARCHIVE" \
+        "The native Unraid helper completed successfully but the generated boot-backup ZIP could not be located."$'\n\n'"Check the User Scripts log for helper and WebGUI details."$'\n\n'"Runtime: $(runtime)"
+
+    exit 5
+fi
+
+log "Found source archive: $BACKUP_SOURCE"
+
+###############################################################################
+# VERIFY SOURCE ARCHIVE
+###############################################################################
+
+SOURCE_SIZE=$(
+    stat -c '%s' "$BACKUP_SOURCE" 2>/dev/null || echo 0
+)
+
+log "Source size: $(bytes_human "$SOURCE_SIZE")"
+log "Verifying source ZIP archive"
+if ! verify_zip "$BACKUP_SOURCE"; then
+    log "ERROR: Source ZIP verification failed"
+    syslog err \
+        "Boot backup source archive failed ZIP verification: $BACKUP_SOURCE"
+    notify alert \
+        "🔴 Backup - CORRUPT ARCHIVE" \
+        "Unraid created a backup archive but ZIP integrity verification failed."$'\n\n'"File: $(basename "$BACKUP_SOURCE")"$'\n'"Size: $(bytes_human "$SOURCE_SIZE")"$'\n'"Runtime: $(runtime)"
+    exit 6
+fi
+
+log "Source ZIP verification passed"
+
+###############################################################################
+# CHECK DESTINATION SPACE
+###############################################################################
+
+#
+# Re-read free space now that we know the actual archive size.
+#
+# Keep 1 MiB extra safety margin.
+#
+
+AVAILABLE_BYTES=$(
+    df -B1 --output=avail "$BACKUP_DIR" 2>/dev/null |
+    tail -n 1 |
+    tr -d ' '
+)
+
+AVAILABLE_BYTES="${AVAILABLE_BYTES:-0}"
+
+if ! [[ "$AVAILABLE_BYTES" =~ ^[0-9]+$ ]]; then
+    AVAILABLE_BYTES=0
+fi
+
+REQUIRED_BYTES=$(( SOURCE_SIZE + 1048576 ))
+
+if (( AVAILABLE_BYTES < REQUIRED_BYTES )); then
+    log "ERROR: Insufficient destination space"
+    log "Required: $(bytes_human "$REQUIRED_BYTES")"
+    log "Available: $(bytes_human "$AVAILABLE_BYTES")"
+    syslog err \
+        "Insufficient space for boot backup"
+    notify alert \
+        "🔵 Backup - NO SPACE" \
+        "Insufficient destination space."$'\n\n'"Required: $(bytes_human "$REQUIRED_BYTES")"$'\n'"Available: $(bytes_human "$AVAILABLE_BYTES")"$'\n'"Destination: $BACKUP_DIR"$'\n'"Runtime: $(runtime)"
+    exit 7
+fi
+
+###############################################################################
+# COPY TO SSD
+###############################################################################
+
+BACKUP_NAME=$(basename "$BACKUP_SOURCE")
+BACKUP_FILE="$BACKUP_DIR/$BACKUP_NAME"
+
+#
+# Copy to a hidden temporary file first.
+#
+# If the copy is interrupted, it cannot be mistaken for a valid completed
+# backup by the retention logic.
+#
+
+TEMP_FILE="$BACKUP_DIR/.${BACKUP_NAME}.tmp.$$"
+
+log "Copying backup to SSD"
+log "Destination: $BACKUP_FILE"
+if ! cp -- "$BACKUP_SOURCE" "$TEMP_FILE"; then
+    log "ERROR: Failed to copy backup to destination"
+    syslog err \
+        "Unable to copy boot backup to $BACKUP_DIR"
+    notify alert \
+        "🔴 Backup - COPY FAILED" \
+        "Unable to copy boot backup to:"$'\n'"$BACKUP_DIR"$'\n\n'"Runtime: $(runtime)"
+    exit 8
+fi
+
+###############################################################################
+# VERIFY DESTINATION COPY
+###############################################################################
+
+DEST_SIZE=$(
+    stat -c '%s' "$TEMP_FILE" 2>/dev/null || echo 0
+)
+
+if [ "$SOURCE_SIZE" -ne "$DEST_SIZE" ]; then
+    log "ERROR: Source and destination sizes differ"
+    log "Source: $SOURCE_SIZE bytes"
+    log "Destination: $DEST_SIZE bytes"
+    syslog err \
+        "Boot backup copy size mismatch"
+    notify alert \
+        "🔴 Backup - SIZE MISMATCH" \
+        "Backup copy verification failed."$'\n\n'"Source: $(bytes_human "$SOURCE_SIZE")"$'\n'"Destination: $(bytes_human "$DEST_SIZE")"$'\n'"Runtime: $(runtime)"
+    exit 9
+fi
+
+log "Destination size matches source"
+log "Verifying copied ZIP archive"
+
+if ! verify_zip "$TEMP_FILE"; then
+    log "ERROR: Destination ZIP verification failed"
+    syslog err \
+        "Copied boot backup failed ZIP verification"
+    notify alert \
+        "🔴 Backup - COPY CORRUPT" \
+        "The backup was copied to the SSD but failed ZIP integrity verification."$'\n\n'"Runtime: $(runtime)"
+    exit 10
+fi
+log "Copied ZIP verification passed"
+
+###############################################################################
+# FINALIZE DESTINATION
+###############################################################################
+
+#
+# TEMP_FILE and BACKUP_FILE live on the same filesystem, so rename is atomic.
+#
+
+if ! mv -f -- "$TEMP_FILE" "$BACKUP_FILE"; then
+    log "ERROR: Unable to finalize destination archive"
+    syslog err \
+        "Unable to finalize boot backup at destination"
+    notify alert \
+        "🔴 Backup - FINALIZE FAILED" \
+        "Backup was copied but could not be finalized."$'\n\n'"Destination: $BACKUP_FILE"$'\n'"Runtime: $(runtime)"
+    exit 11
+fi
+
+TEMP_FILE=""
+log "Backup finalized successfully"
+
+###############################################################################
+# DESTINATION OWNERSHIP
+###############################################################################
+
+#
+# Only adjust the newly created backup file.
+#
+
+chown nobody:users "$BACKUP_FILE" 2>/dev/null || \
+    syslog warning "Unable to chown $BACKUP_FILE"
+
+chmod 0644 "$BACKUP_FILE" 2>/dev/null || \
+    syslog warning "Unable to chmod $BACKUP_FILE"
+
+###############################################################################
+# REMOVE SOURCE ARCHIVE
+###############################################################################
+
+#
+# Only delete the helper-created source after:
+#
+#   - source ZIP passed verification
+#   - destination copy completed
+#   - destination size matched
+#   - destination ZIP passed verification
+#   - destination was finalized
+#
+
+if rm -f -- "$BACKUP_SOURCE"; then
+    log "Removed temporary Unraid source archive: $BACKUP_SOURCE"
+else
+    log "WARNING: Unable to remove source archive: $BACKUP_SOURCE"
+    syslog warning \
+        "Unable to remove temporary boot backup source: $BACKUP_SOURCE"
+fi
+
+###############################################################################
+# CLEAN WEBGUI SYMLINK
+###############################################################################
+
+cleanup_webgui_symlinks
+
+###############################################################################
+# RETENTION
+###############################################################################
+
+prune_backups
+
+###############################################################################
+# FINAL INFORMATION
+###############################################################################
+
+BACKUP_SIZE=$(
+    stat -c '%s' "$BACKUP_FILE" 2>/dev/null || echo 0
+)
+
+AVAILABLE_BYTES=$(
+    df -B1 --output=avail "$BACKUP_DIR" 2>/dev/null |
+    tail -n 1 |
+    tr -d ' '
+)
+
+AVAILABLE_BYTES="${AVAILABLE_BYTES:-0}"
+
+if ! [[ "$AVAILABLE_BYTES" =~ ^[0-9]+$ ]]; then
+    AVAILABLE_BYTES=0
+fi
+
+RUNTIME=$(runtime)
+
+###############################################################################
+# SUCCESS
+###############################################################################
+
+log "Boot-device backup completed successfully"
+log "File: $(basename "$BACKUP_FILE")"
+log "Size: $(bytes_human "$BACKUP_SIZE")"
+log "Destination: $BACKUP_DIR"
+log "Runtime: $RUNTIME"
+
+syslog info \
+    "Boot device backup successful: $(basename "$BACKUP_FILE"), size $(bytes_human "$BACKUP_SIZE"), runtime $RUNTIME"
+
+notify normal \
+    "🟢 Backup - OK" \
+    "Boot-device backup completed successfully."$'\n\n'"File: $(basename "$BACKUP_FILE")"$'\n'"Size: $(bytes_human "$BACKUP_SIZE")"$'\n'"Destination: $BACKUP_DIR"$'\n'"Free space: $(bytes_human "$AVAILABLE_BYTES")"$'\n'"Retention: $MAX_BACKUPS backups"$'\n'"Runtime: $RUNTIME"
+
 exit 0
