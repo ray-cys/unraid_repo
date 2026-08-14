@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Download / Import Stall Monitor v2.0
+# ARR Download / Import Stall Monitor v2.0.1
 #
 # MONITORS
 # --------
@@ -29,6 +29,16 @@
 #   movie -> Radarr
 #   tv    -> Sonarr
 #   f1    -> ignored
+#
+# NOTIFICATIONS
+# -------------
+# Newly reportable issues discovered during the same run are grouped into
+# ONE Unraid notification.
+#
+# Existing notified issues are suppressed individually by state.
+#
+# Individual issues are only marked notified AFTER the grouped notification
+# is successfully sent.
 #
 # SAFETY
 # ------
@@ -101,7 +111,7 @@ WARNING_AFTER_HOURS=3
 ERROR_AFTER_HOURS=2
 STALL_AFTER_HOURS=6
 
-# CF / upgrade / TBA items become an unresolved warning after this long.
+# CF / upgrade / TBA items become unresolved warnings after this long.
 POLICY_ESCALATE_AFTER_HOURS=72
 
 # ---------------------------------------------------------------------------
@@ -113,23 +123,30 @@ POLICY_ESCALATE_AFTER_HOURS=72
 SAB_ORPHAN_IGNORE_HOURS=6
 
 # Between IGNORE and WARN:
-# log as candidate but don't notify.
+# log candidate only.
 SAB_ORPHAN_WARN_HOURS=12
 
 # Still stranded beyond this:
-# send one additional escalation warning.
+# one additional escalation warning.
 SAB_ORPHAN_ESCALATE_HOURS=72
 
 # ---------------------------------------------------------------------------
 # Notifications
 # ---------------------------------------------------------------------------
 
-# Keep false while testing v2.
+# Keep false while testing v2.0.1.
 SEND_NOTIFICATIONS=false
 
 NOTIFY="/usr/local/emhttp/webGui/scripts/notify"
 
 NOTIFY_ONCE=true
+
+# Maximum number of individual issues shown in the grouped notification.
+#
+# All issues are still recorded in state and logs.
+# If more than this number are newly reportable, the notification will say
+# how many additional issues were omitted from its body.
+GROUP_NOTIFICATION_MAX_ITEMS=20
 
 # ---------------------------------------------------------------------------
 # State
@@ -158,6 +175,7 @@ SAB_HISTORY_LIMIT=500
 START_TIME=$(date +%s)
 
 TMP_DIR=""
+NOTIFICATION_BATCH=""
 
 SONARR_QUEUE=""
 RADARR_QUEUE=""
@@ -185,6 +203,8 @@ SAB_EMPTY_COUNT=0
 
 NOTIFICATIONS_SENT=0
 NOTIFICATIONS_SUPPRESSED=0
+
+BATCHED_NOTIFICATION_ITEMS=0
 
 ###############################################################################
 # BASIC FUNCTIONS
@@ -234,7 +254,7 @@ cleanup() {
 trap 'cleanup' EXIT
 
 ###############################################################################
-# NOTIFICATION
+# UNRAID NOTIFICATION
 ###############################################################################
 
 notify() {
@@ -242,10 +262,6 @@ notify() {
     local importance="$1"
     local description="$2"
     local message="$3"
-
-    #
-    # Return 2 to distinguish "disabled" from an actual notification failure.
-    #
 
     if [ "$SEND_NOTIFICATIONS" != true ]; then
         return 2
@@ -263,11 +279,12 @@ notify() {
         -m "$message" \
         >/dev/null 2>&1
     then
+
         ((NOTIFICATIONS_SENT++)) || true
         return 0
     fi
 
-    log "WARNING: Failed to send Unraid notification"
+    log "WARNING: Failed to send grouped Unraid notification"
 
     return 1
 }
@@ -357,18 +374,10 @@ date_to_epoch() {
         return
     fi
 
-    #
-    # Unix timestamp.
-    #
-
     if [[ "$value" =~ ^[0-9]+$ ]]; then
         echo "$value"
         return
     fi
-
-    #
-    # Date string.
-    #
 
     date -d "$value" '+%s' 2>/dev/null || echo 0
 }
@@ -581,10 +590,6 @@ classify_issue() {
         tr '[:upper:]' '[:lower:]'
     )"
 
-    ###########################################################################
-    # CUSTOM FORMAT
-    ###########################################################################
-
     if echo "$combined" |
        grep -Eq \
        'custom format|customformat|custom-format|format score'
@@ -612,113 +617,69 @@ classify_issue() {
         return
     fi
 
-    ###########################################################################
-    # TBA / METADATA
-    ###########################################################################
-
     if echo "$combined" |
        grep -Eq \
        '(^|[^[:alpha:]])tba([^[:alpha:]]|$)|title.*not available|metadata.*not available|metadata.*not ready|waiting.*metadata'
     then
-
         echo "TBA_METADATA"
         return
     fi
-
-    ###########################################################################
-    # UNMATCHED
-    ###########################################################################
 
     if echo "$combined" |
        grep -Eq \
        'unable to match|could not match|cannot match|failed to match|unable to identify|could not identify|cannot identify|unknown series|unknown movie'
     then
-
         echo "UNMATCHED_MEDIA"
         return
     fi
-
-    ###########################################################################
-    # NO IMPORTABLE FILE
-    ###########################################################################
 
     if echo "$combined" |
        grep -Eq \
        'no files.*eligible.*import|no importable files|no files found.*import|no video files|nothing.*to import'
     then
-
         echo "NO_IMPORTABLE_FILES"
         return
     fi
-
-    ###########################################################################
-    # UPGRADE REJECTION
-    ###########################################################################
 
     if echo "$combined" |
        grep -Eq \
        'not an upgrade|existing file.*better|existing.*preferred|quality.*not.*upgrade|does not improve|not an improvement'
     then
-
         echo "UPGRADE_REJECT"
         return
     fi
-
-    ###########################################################################
-    # PERMISSION
-    ###########################################################################
 
     if echo "$combined" |
        grep -Eq \
        'permission denied|access.*denied|unauthorized access|not permitted|operation not permitted'
     then
-
         echo "PERMISSION"
         return
     fi
-
-    ###########################################################################
-    # PATH
-    ###########################################################################
 
     if echo "$combined" |
        grep -Eq \
        'path.*does not exist|folder.*does not exist|directory.*does not exist|cannot find|no such file|not accessible|unable to access|folder is missing'
     then
-
         echo "PATH"
         return
     fi
-
-    ###########################################################################
-    # IMPORT FAILURE
-    ###########################################################################
 
     if echo "$combined" |
        grep -Eq \
        'import failed|failed to import|unable to import|import error|could not import|cannot import'
     then
-
         echo "IMPORT_FAILED"
         return
     fi
-
-    ###########################################################################
-    # MANUAL INTERVENTION
-    ###########################################################################
 
     if echo "$combined" |
        grep -Eq \
        'manual import|manual intervention|requires manual|manually import|needs manual'
     then
-
         echo "MANUAL"
         return
     fi
-
-    ###########################################################################
-    # FALLBACK STATUS
-    ###########################################################################
 
     case "${tracked_status,,}" in
 
@@ -731,18 +692,12 @@ classify_issue() {
             echo "ERROR"
             return
             ;;
-
     esac
-
-    ###########################################################################
-    # GENERIC STALL
-    ###########################################################################
 
     if echo "$combined" |
        grep -Eq \
        'downloaded|completed|importpending|import blocked|waiting'
     then
-
         echo "ARR_IMPORT_STALLED"
         return
     fi
@@ -818,7 +773,6 @@ classification_severity() {
         *)
             echo "NONE"
             ;;
-
     esac
 }
 
@@ -848,15 +802,12 @@ classification_min_age() {
             ;;
 
         ARR_IMPORT_STALLED)
-
             echo "$STALL_AFTER_HOURS"
             ;;
 
         *)
-
             echo 999999
             ;;
-
     esac
 }
 
@@ -932,7 +883,6 @@ classification_reason() {
         *)
             echo "Unknown"
             ;;
-
     esac
 }
 
@@ -951,7 +901,7 @@ initialize_state() {
 
         cat >"$STATE_FILE" <<'EOF'
 {
-  "version": 4,
+  "version": 5,
   "issues": {}
 }
 EOF
@@ -974,7 +924,7 @@ EOF
 
             cat >"$STATE_FILE" <<'EOF'
 {
-  "version": 4,
+  "version": 5,
   "issues": {}
 }
 EOF
@@ -1016,13 +966,6 @@ issue_signature() {
 
 ###############################################################################
 # NOTIFICATION DEDUP
-#
-# Important:
-#
-# We compare against notifiedSignature, NOT merely the current issue signature.
-#
-# Therefore running with SEND_NOTIFICATIONS=false does not permanently suppress
-# the first real notification when notifications are later enabled.
 ###############################################################################
 
 should_notify() {
@@ -1084,7 +1027,7 @@ update_issue_state() {
         --arg message "$message" \
         --argjson now "$now" \
         '
-        .version = 4
+        .version = 5
         |
         (.issues[$key] // {}) as $old
         |
@@ -1130,9 +1073,284 @@ mark_notified() {
             .
         end
         ' \
-        "$STATE_FILE" >"$tmp" || return
+        "$STATE_FILE" >"$tmp" || return 1
 
     save_state "$tmp"
+}
+
+###############################################################################
+# NOTIFICATION BATCH
+#
+# Each line in NOTIFICATION_BATCH is one JSON object.
+###############################################################################
+
+queue_group_notification() {
+
+    local issue_key="$1"
+    local signature="$2"
+    local source="$3"
+    local title="$4"
+    local classification="$5"
+    local severity="$6"
+    local age="$7"
+    local detail="$8"
+
+    jq -nc \
+        --arg issueKey "$issue_key" \
+        --arg signature "$signature" \
+        --arg source "$source" \
+        --arg title "$title" \
+        --arg classification "$classification" \
+        --arg severity "$severity" \
+        --arg age "$age" \
+        --arg detail "$detail" \
+        '{
+            issueKey: $issueKey,
+            signature: $signature,
+            source: $source,
+            title: $title,
+            classification: $classification,
+            severity: $severity,
+            age: $age,
+            detail: $detail
+        }' \
+        >>"$NOTIFICATION_BATCH"
+
+    ((BATCHED_NOTIFICATION_ITEMS++)) || true
+
+    log "Queued issue for grouped notification"
+}
+
+###############################################################################
+# BATCH HIGHEST SEVERITY
+###############################################################################
+
+batch_highest_severity() {
+
+    if jq -e \
+        'select(.severity == "ERROR")' \
+        "$NOTIFICATION_BATCH" \
+        >/dev/null 2>&1
+    then
+        echo "ERROR"
+        return
+    fi
+
+    if jq -e \
+        'select(.severity == "WARNING")' \
+        "$NOTIFICATION_BATCH" \
+        >/dev/null 2>&1
+    then
+        echo "WARNING"
+        return
+    fi
+
+    echo "INFO"
+}
+
+###############################################################################
+# SEND GROUPED NOTIFICATION
+###############################################################################
+
+send_grouped_notification() {
+
+    [ -f "$NOTIFICATION_BATCH" ] || return 0
+    [ -s "$NOTIFICATION_BATCH" ] || return 0
+
+    local total
+    local shown
+    local omitted
+
+    local highest
+    local importance
+    local description
+
+    local info_new
+    local warning_new
+    local error_new
+
+    local body=""
+    local source
+
+    total=$(wc -l <"$NOTIFICATION_BATCH" | tr -d ' ')
+
+    [ "$total" -gt 0 ] || return 0
+
+    highest=$(batch_highest_severity)
+
+    info_new=$(
+        jq -s '[.[] | select(.severity == "INFO")] | length' \
+            "$NOTIFICATION_BATCH"
+    )
+
+    warning_new=$(
+        jq -s '[.[] | select(.severity == "WARNING")] | length' \
+            "$NOTIFICATION_BATCH"
+    )
+
+    error_new=$(
+        jq -s '[.[] | select(.severity == "ERROR")] | length' \
+            "$NOTIFICATION_BATCH"
+    )
+
+    case "$highest" in
+
+        ERROR)
+            importance="alert"
+            description="🔴 Import Monitor - ${total} New Issue(s)"
+            ;;
+
+        WARNING)
+            importance="warning"
+            description="🟠 Import Monitor - ${total} New Issue(s)"
+            ;;
+
+        *)
+            importance="normal"
+            description="🟡 Import Monitor - ${total} New Issue(s)"
+            ;;
+    esac
+
+    body="New issues detected: ${total}"$'\n'
+    body+="Info: ${info_new} | Warnings: ${warning_new} | Errors: ${error_new}"$'\n'
+
+    shown=0
+
+    ###########################################################################
+    # GROUP BY APPLICATION
+    ###########################################################################
+
+    for source in Sonarr Radarr SABnzbd; do
+
+        local source_count
+
+        source_count=$(
+            jq -s \
+                --arg source "$source" \
+                '[.[] | select(.source == $source)] | length' \
+                "$NOTIFICATION_BATCH"
+        )
+
+        if (( source_count == 0 )); then
+            continue
+        fi
+
+        body+=$'\n'
+        body+="${source} (${source_count})"$'\n'
+        body+="--------------------"$'\n'
+
+        while IFS= read -r record; do
+
+            if (( shown >= GROUP_NOTIFICATION_MAX_ITEMS )); then
+                break
+            fi
+
+            local item_title
+            local classification
+            local severity
+            local age
+            local detail
+
+            item_title=$(echo "$record" | jq -r '.title')
+            classification=$(echo "$record" | jq -r '.classification')
+            severity=$(echo "$record" | jq -r '.severity')
+            age=$(echo "$record" | jq -r '.age')
+            detail=$(echo "$record" | jq -r '.detail')
+
+            body+="• ${item_title}"$'\n'
+            body+="  ${classification} [${severity}]"$'\n'
+
+            if [ -n "$age" ] && [ "$age" != "0" ]; then
+                body+="  Age: ${age}h"$'\n'
+            fi
+
+            if [ -n "$detail" ]; then
+
+                while IFS= read -r detail_line; do
+                    [ -n "$detail_line" ] || continue
+                    body+="  ${detail_line}"$'\n'
+                done <<<"$detail"
+            fi
+
+            body+=$'\n'
+
+            ((shown++)) || true
+
+        done < <(
+            jq -c \
+                --arg source "$source" \
+                'select(.source == $source)' \
+                "$NOTIFICATION_BATCH"
+        )
+
+        if (( shown >= GROUP_NOTIFICATION_MAX_ITEMS )); then
+            break
+        fi
+
+    done
+
+    omitted=$(( total - shown ))
+
+    if (( omitted > 0 )); then
+
+        body+="Additional issues omitted: ${omitted}"$'\n'
+        body+="See the Unraid User Scripts log for full details."$'\n'
+    fi
+
+    body+=$'\n'
+    body+="Runtime: $(runtime)"
+
+    ###########################################################################
+    # SEND
+    ###########################################################################
+
+    notify \
+        "$importance" \
+        "$description" \
+        "$body"
+
+    local notify_rc=$?
+
+    if [ "$notify_rc" -eq 2 ]; then
+
+        log "Grouped notifications disabled"
+        log "New issues that would be grouped: $total"
+
+        return 0
+    fi
+
+    if [ "$notify_rc" -ne 0 ]; then
+
+        log "ERROR: Grouped notification failed"
+        log "Issue notification state will NOT be marked as sent"
+
+        return 1
+    fi
+
+    ###########################################################################
+    # MARK EVERY BATCHED ISSUE AS NOTIFIED
+    #
+    # This occurs only after the grouped notification succeeds.
+    ###########################################################################
+
+    while IFS= read -r record; do
+
+        local issue_key
+        local signature
+
+        issue_key=$(echo "$record" | jq -r '.issueKey')
+        signature=$(echo "$record" | jq -r '.signature')
+
+        if ! mark_notified "$issue_key" "$signature"; then
+            log "WARNING: Failed to mark issue notified: $issue_key"
+        fi
+
+    done <"$NOTIFICATION_BATCH"
+
+    log "Grouped notification sent successfully"
+    log "Issues included: $total"
+
+    return 0
 }
 
 ###############################################################################
@@ -1250,6 +1468,7 @@ log_cf_details() {
         missing=$(cf_difference "$existing_formats" "$new_formats")
 
         if [ -n "$gained" ]; then
+
             log "CFs only in downloaded release:"
 
             while IFS= read -r cf; do
@@ -1258,6 +1477,7 @@ log_cf_details() {
         fi
 
         if [ -n "$missing" ]; then
+
             log "CFs only in existing media:"
 
             while IFS= read -r cf; do
@@ -1267,7 +1487,11 @@ log_cf_details() {
     fi
 }
 
-build_cf_notification_details() {
+###############################################################################
+# COMPACT CF DETAILS FOR GROUPED NOTIFICATION
+###############################################################################
+
+build_cf_group_detail() {
 
     local message="$1"
 
@@ -1295,13 +1519,10 @@ build_cf_notification_details() {
 
         difference=$(( new_score - existing_score ))
 
-        output+="New CF score: ${new_score}"$'\n'
-        output+="Existing CF score: ${existing_score}"$'\n'
-
         if (( difference > 0 )); then
-            output+="Difference: +${difference}"$'\n'
+            output+="CF: ${new_score} vs ${existing_score} (+${difference})"
         else
-            output+="Difference: ${difference}"$'\n'
+            output+="CF: ${new_score} vs ${existing_score} (${difference})"
         fi
     fi
 
@@ -1314,20 +1535,34 @@ build_cf_notification_details() {
 
         if [ -n "$gained" ]; then
 
-            output+=$'\n'"Downloaded release adds:"$'\n'
+            local gained_line
 
-            while IFS= read -r cf; do
-                [ -n "$cf" ] && output+="  + ${cf}"$'\n'
-            done <<<"$gained"
+            gained_line=$(
+                echo "$gained" |
+                paste -sd ', ' -
+            )
+
+            if [ -n "$output" ]; then
+                output+=$'\n'
+            fi
+
+            output+="Download-only CF: ${gained_line}"
         fi
 
         if [ -n "$missing" ]; then
 
-            output+=$'\n'"Existing media has but download lacks:"$'\n'
+            local missing_line
 
-            while IFS= read -r cf; do
-                [ -n "$cf" ] && output+="  + ${cf}"$'\n'
-            done <<<"$missing"
+            missing_line=$(
+                echo "$missing" |
+                paste -sd ', ' -
+            )
+
+            if [ -n "$output" ]; then
+                output+=$'\n'
+            fi
+
+            output+="Existing-only CF: ${missing_line}"
         fi
     fi
 
@@ -1455,10 +1690,8 @@ process_queue() {
 
         local sab_item
         local sab_status
-        local sab_name
 
         sab_status="Unknown"
-        sab_name=""
 
         if [ -n "$download_id" ]; then
 
@@ -1467,11 +1700,6 @@ process_queue() {
             sab_status=$(
                 echo "$sab_item" |
                 jq -r '.status // "Unknown"'
-            )
-
-            sab_name=$(
-                echo "$sab_item" |
-                jq -r '.name // .nzb_name // ""'
             )
         fi
 
@@ -1537,10 +1765,6 @@ process_queue() {
                 "$message"
         )
 
-        #######################################################################
-        # UPDATE STATE BEFORE NOTIFY
-        #######################################################################
-
         update_issue_state \
             "$issue_key" \
             "$signature" \
@@ -1552,109 +1776,29 @@ process_queue() {
             "$message"
 
         #######################################################################
-        # NOTIFICATION
+        # GROUPED NOTIFICATION QUEUE
         #######################################################################
 
         if should_notify "$issue_key" "$signature"; then
 
-            local notify_importance
-            local notify_title
-            local body
-            local cf_details
-            local notify_rc
-
-            case "$severity" in
-
-                INFO)
-
-                    notify_importance="normal"
-
-                    case "$classification" in
-                        CF_REJECT*)
-                            notify_title="🟡 Import - CF REVIEW"
-                            ;;
-                        TBA_METADATA)
-                            notify_title="🟡 Import - METADATA WAIT"
-                            ;;
-                        *)
-                            notify_title="🟡 Import - REVIEW"
-                            ;;
-                    esac
-                    ;;
-
-                WARNING)
-
-                    notify_importance="warning"
-
-                    if [ "$stage" = "escalated" ]; then
-                        notify_title="🟠 Import - UNRESOLVED"
-                    else
-                        notify_title="🟠 Import - ATTENTION"
-                    fi
-                    ;;
-
-                ERROR)
-                    notify_importance="alert"
-                    notify_title="🔴 Import - FAILED"
-                    ;;
-
-                *)
-                    notify_importance="normal"
-                    notify_title="ARR Import Monitor"
-                    ;;
-            esac
-
-            body="${app}"$'\n'
-            body+="Media: ${media_name}"$'\n'
-            body+="Release: ${release}"$'\n'
-
-            body+=$'\n'"Reason:"$'\n'
-            body+="${reason}"$'\n'
+            local detail=""
 
             if [[ "$classification" == CF_REJECT* ]]; then
+                detail=$(build_cf_group_detail "$message")
 
-                cf_details=$(
-                    build_cf_notification_details "$message"
-                )
-
-                if [ -n "$cf_details" ]; then
-                    body+=$'\n'"${cf_details}"$'\n'
-                fi
+            elif [ -n "$reason" ]; then
+                detail="$reason"
             fi
 
-            body+=$'\n'"Queue age: ${age}h"$'\n'
-            body+="Arr status: ${status}"$'\n'
-            body+="Tracked status: ${tracked_status}"$'\n'
-            body+="Tracked state: ${tracked_state}"$'\n'
-
-            if [ "$sab_status" != "Unknown" ]; then
-                body+="SAB status: ${sab_status}"$'\n'
-            fi
-
-            if [ -n "$sab_name" ] &&
-               [ "$sab_name" != "$release" ]
-            then
-                body+="SAB job: ${sab_name}"$'\n'
-            fi
-
-            if [ -n "$message" ]; then
-                body+=$'\n'"Arr message:"$'\n'
-                body+="${message}"
-            fi
-
-            notify \
-                "$notify_importance" \
-                "$notify_title" \
-                "$body"
-
-            notify_rc=$?
-
-            if [ "$notify_rc" -eq 0 ]; then
-                mark_notified "$issue_key" "$signature"
-
-            elif [ "$notify_rc" -eq 2 ]; then
-                log "Notification disabled; issue logged only"
-            fi
+            queue_group_notification \
+                "$issue_key" \
+                "$signature" \
+                "$app" \
+                "$media_name" \
+                "$classification" \
+                "$severity" \
+                "$age" \
+                "$detail"
 
         else
 
@@ -1750,22 +1894,12 @@ resolve_sab_path() {
         jq -r '.name // .nzb_name // ""'
     )
 
-    #
-    # 1. SAB returned an actual host-visible path.
-    #
-
     if [ -n "$storage" ] &&
        [ -e "$storage" ]
     then
         printf '%s' "$storage"
         return 0
     fi
-
-    #
-    # 2. SAB storage may be a container-side path.
-    #
-    # Use its basename under the category's known host root.
-    #
 
     if [ -n "$storage" ]; then
 
@@ -1781,10 +1915,6 @@ resolve_sab_path() {
             fi
         fi
     fi
-
-    #
-    # 3. Reconstruct from SAB job name.
-    #
 
     if [ -n "$name" ]; then
 
@@ -1915,10 +2045,6 @@ process_sab_orphans() {
         nzo_id=$(echo "$item" | jq -r '.nzo_id // ""')
         name=$(echo "$item" | jq -r '.name // .nzb_name // "Unknown"')
 
-        #
-        # Only completed jobs matter.
-        #
-
         [ "${status,,}" = "completed" ] || continue
 
         ((SAB_HISTORY_CHECKED++)) || true
@@ -1978,16 +2104,11 @@ process_sab_orphans() {
         if [ -n "$nzo_id" ] &&
            arr_tracks_download "$owner" "$nzo_id"
         then
-
-            #
-            # v1.2/v2 Arr-side logic already deals with it.
-            #
-
             continue
         fi
 
         #######################################################################
-        # RESOLVE REMAINING FILESYSTEM DATA
+        # RESOLVE FILESYSTEM DATA
         #######################################################################
 
         local completed_path=""
@@ -1995,12 +2116,6 @@ process_sab_orphans() {
         completed_path=$(
             resolve_sab_path "$item" "$root" || true
         )
-
-        #
-        # Nothing remains in completed downloads.
-        #
-        # This is the normal successful-import case.
-        #
 
         if [ -z "$completed_path" ] ||
            [ ! -e "$completed_path" ]
@@ -2128,7 +2243,7 @@ process_sab_orphans() {
             "$message"
 
         #######################################################################
-        # CANDIDATE STAGE = LOG ONLY
+        # CANDIDATE = LOG ONLY
         #######################################################################
 
         if [ "$stage" = "candidate" ]; then
@@ -2139,48 +2254,26 @@ process_sab_orphans() {
         fi
 
         #######################################################################
-        # NOTIFY
+        # ADD TO GROUPED NOTIFICATION
         #######################################################################
 
         if should_notify "$issue_key" "$signature"; then
 
-            local body
-            local title
-            local notify_rc
+            local sab_detail
 
-            if [ "$stage" = "escalated" ]; then
-                title="🟠 SAB - LONG-TERM STRANDED"
-            else
-                title="🟠 SAB - STRANDED DOWNLOAD"
-            fi
+            sab_detail="Owner: ${owner}"$'\n'
+            sab_detail+="Files: ${file_count}, media: ${media_count}"$'\n'
+            sab_detail+="Remaining: $(bytes_human "$remaining_bytes")"
 
-            body="Expected owner: ${owner}"$'\n'
-            body+="Category: ${category}"$'\n'
-            body+="Release: ${name}"$'\n\n'
-
-            body+="SAB status: ${status}"$'\n'
-            body+="Completed age: ${age}h"$'\n'
-            body+="${owner} queue: Not found"$'\n\n'
-
-            body+="Completed data still exists:"$'\n'
-            body+="${completed_path}"$'\n\n'
-
-            body+="Files remaining: ${file_count}"$'\n'
-            body+="Media files: ${media_count}"$'\n'
-            body+="Size remaining: $(bytes_human "$remaining_bytes")"$'\n\n'
-
-            body+="Manual review recommended."
-
-            notify warning "$title" "$body"
-
-            notify_rc=$?
-
-            if [ "$notify_rc" -eq 0 ]; then
-                mark_notified "$issue_key" "$signature"
-
-            elif [ "$notify_rc" -eq 2 ]; then
-                log "Notification disabled; issue logged only"
-            fi
+            queue_group_notification \
+                "$issue_key" \
+                "$signature" \
+                "SABnzbd" \
+                "$name" \
+                "SAB_STRANDED" \
+                "$severity" \
+                "$age" \
+                "$sab_detail"
 
         else
 
@@ -2244,6 +2337,8 @@ require_command tr
 require_command sha256sum
 require_command find
 require_command awk
+require_command paste
+require_command wc
 
 ###############################################################################
 # TEMP DIRECTORY
@@ -2253,6 +2348,10 @@ TMP_DIR=$(mktemp -d /tmp/arr_import_monitor.XXXXXX) || {
     log "ERROR: Unable to create temporary directory"
     exit 3
 }
+
+NOTIFICATION_BATCH="${TMP_DIR}/notification_batch.jsonl"
+
+: >"$NOTIFICATION_BATCH"
 
 ###############################################################################
 # STATE
@@ -2368,6 +2467,12 @@ fi
 process_sab_orphans
 
 ###############################################################################
+# SEND ONE GROUPED NOTIFICATION
+###############################################################################
+
+send_grouped_notification
+
+###############################################################################
 # STATE CLEANUP
 ###############################################################################
 
@@ -2380,7 +2485,7 @@ prune_state
 RUNTIME=$(runtime)
 
 log "============================================================"
-log "ARR Import Monitor v2.0 completed"
+log "ARR Import Monitor v2.0.1 completed"
 
 log ""
 log "ARR QUEUES"
@@ -2407,15 +2512,19 @@ log "Informational: $INFO_COUNT"
 log "Warnings: $WARNING_COUNT"
 log "Errors: $ERROR_COUNT"
 
+log ""
+log "NOTIFICATIONS"
+log "New issues queued for grouping: $BATCHED_NOTIFICATION_ITEMS"
+
 if [ "$SEND_NOTIFICATIONS" = true ]; then
 
-    log "Notifications sent: $NOTIFICATIONS_SENT"
-    log "Duplicate notifications suppressed: $NOTIFICATIONS_SUPPRESSED"
+    log "Grouped notifications sent: $NOTIFICATIONS_SENT"
+    log "Previously-notified issues suppressed: $NOTIFICATIONS_SUPPRESSED"
 
 else
 
     log "Notifications: DISABLED"
-    log "Previously-notified duplicates suppressed: $NOTIFICATIONS_SUPPRESSED"
+    log "Previously-notified issues suppressed: $NOTIFICATIONS_SUPPRESSED"
 fi
 
 log "Runtime: $RUNTIME"
