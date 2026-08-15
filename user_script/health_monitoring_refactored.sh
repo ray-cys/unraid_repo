@@ -3,7 +3,7 @@
 noParity=true
 set -uo pipefail
 
-# Disk Health Monitor for Unraid
+# Disk Health Monitor for Unraid v2.2
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
@@ -323,6 +323,9 @@ declare -A RISK_SPIKE_TS                          # Map device -> epoch timestam
 declare -A ALERT_SEEN                             # Exact alert de-duplication within a run
 declare -A SATA_POWER_STATE SMART_DEFERRED         # Cached SATA power state and deferred SMART checks
 declare -A PREVIOUS_RISK                           # Previous persisted risk, retained when a disk stays asleep
+declare -A DEVICE_ID_BY_PATH DEVICE_PATH_BY_ID     # Runtime path <-> stable persistent identity
+declare -A DEVICE_ID_SOURCE                        # Identity source: WWN, by-id, serial, or path fallback
+declare -a DISCOVERED_DISKS                        # Ordered SMART-capable base-device candidates
 declare -A RISK_MAP AGE_CLASS                     # Canonical risk results and lifecycle annotations
 declare -a NOTIFY_SECTIONS                        # Final notification sections
 declare -a TBW_EVAL_MESSAGES                      # Output from direct TBW evaluation
@@ -335,6 +338,7 @@ SMART_CACHE_DIR=""
 CLEANUP_DONE=0
 PARITY_STATE_LOADED=0
 PARITY_ACTIVE=0
+DEVICE_INVENTORY_READY=0
 
 # === Logs Paths ===
 STATE_DIR="$LOG_DIR/state"
@@ -389,6 +393,8 @@ BTRFS_SCRUB_STATE_DIR="$STATE_DIR/btrfs_scrub_status"               # Per-pool s
 XFS_PROC_PREV_FILE="$STATE_DIR/xfs_proc_stats_prev.log"             # Previous XFS /proc snapshot (delta anomaly detection)
 STORAGE_DISCREPANCY_STATE_FILE="$STATE_DIR/storage_discrepancy_streak.log"  # Storage discrepancy streak counter
 RISK_SPIKE_FILE="$STATE_DIR/risk_spikes.log"                        # Persisted risk spike timestamps (accelerated scheduling)
+DEVICE_ID_MAP_FILE="$STATE_DIR/device_identity_map.log"             # Stable ID to current /dev path inventory
+DEVICE_ID_SCHEMA_FILE="$STATE_DIR/device_identity_schema.version"   # One-time /dev history migration marker
 REPLACEMENT_EVENTS_FILE="$STATE_DIR/replacement_events.log"         # Drive replacement lifecycle events (alerts context)
 SATA_LINK_HISTORY_FILE="$STATE_DIR/sata_link_downshift_history.log" # SATA link instability events (alert context)
 # --- Trend / Historical Analytics (longer-term forecasting, prioritization, trajectory) ---
@@ -686,17 +692,17 @@ declare LSBLK_ALL_CACHE=""
 declare -A BTRFS_DF_CACHE_DATA BTRFS_DF_CACHE_META
 cache_lsblk_all() {
     if [[ -z "$LSBLK_ALL_CACHE" ]]; then
-        LSBLK_ALL_CACHE="$(lsblk -b -dn -o NAME,SIZE,ROTA 2>/dev/null || true)"
+        LSBLK_ALL_CACHE="$(lsblk -b -dn -o NAME,SIZE,ROTA,TYPE 2>/dev/null || true)"
     fi
 }
 lsblk_size_cached() {
     local dev="$1" source="$LSBLK_ALL_CACHE"
-    [[ -n "$source" ]] || source="$(lsblk -b -dn -o NAME,SIZE,ROTA 2>/dev/null || true)"
+    [[ -n "$source" ]] || source="$(lsblk -b -dn -o NAME,SIZE,ROTA,TYPE 2>/dev/null || true)"
     awk -v d="${dev##*/}" '$1==d{print $2; exit}' <<<"$source"
 }
 lsblk_rota_cached() {
     local dev="$1" source="$LSBLK_ALL_CACHE"
-    [[ -n "$source" ]] || source="$(lsblk -b -dn -o NAME,SIZE,ROTA 2>/dev/null || true)"
+    [[ -n "$source" ]] || source="$(lsblk -b -dn -o NAME,SIZE,ROTA,TYPE 2>/dev/null || true)"
     awk -v d="${dev##*/}" '$1==d{print $3; exit}' <<<"$source"
 }
 
@@ -1256,34 +1262,327 @@ poh_thresholds_for_device() {
     echo "$warn $crit"
 }
 
-# === Helper Function ===
-# Enumerate base SATA and NVMe devices excluding boot root device
-get_all_disks() {
-    local d boot_src boot_root=""
-    local -a candidates=() out=()
+# === Device discovery and stable identity ===
+# Choose the best /dev/disk/by-id name without accessing drive media.
+best_by_id_for_device() {
+    local disk="$1"
+    local link resolved name rank best="" best_rank=99
 
-    for d in /dev/sd?; do
-        [[ -b "$d" ]] && candidates+=("$d")
+    for link in /dev/disk/by-id/*; do
+        [[ -L "$link" ]] || continue
+        name="${link##*/}"
+        [[ "$name" == *-part[0-9]* ]] && continue
+        resolved=$(readlink -f -- "$link" 2>/dev/null || true)
+        [[ "$resolved" == "$disk" ]] || continue
+
+        case "$name" in
+            wwn-*|nvme-eui.*|nvme-uuid.*) rank=1 ;;
+            ata-*|nvme-*) rank=2 ;;
+            scsi-*) rank=3 ;;
+            usb-*) rank=4 ;;
+            *) rank=5 ;;
+        esac
+
+        if (( rank < best_rank )) ||
+           { (( rank == best_rank )) && [[ -z "$best" || "$name" < "$best" ]]; }
+        then
+            best="$name"
+            best_rank=$rank
+        fi
     done
 
-    for d in /dev/nvme?n?; do
-        [[ -b "$d" ]] && candidates+=("$d")
+    printf '%s' "$best"
+}
+
+register_device_identity() {
+    local disk="$1"
+    local wwn serial by_id component identity source fingerprint existing
+
+    [[ -b "$disk" ]] || return 1
+    [[ -n "${DEVICE_ID_BY_PATH[$disk]:-}" ]] && return 0
+
+    wwn=$(lsblk -dn -o WWN "$disk" 2>/dev/null | awk '{$1=$1; print; exit}')
+    serial=$(lsblk -dn -o SERIAL "$disk" 2>/dev/null | awk '{$1=$1; print; exit}')
+    by_id=$(best_by_id_for_device "$disk")
+
+    component=$(safe_state_name "$wwn")
+    if [[ -n "$wwn" && "$component" =~ [1-9A-Fa-f] ]]; then
+        identity="wwn_${component}"
+        source="wwn"
+    elif [[ -n "$by_id" ]]; then
+        identity="byid_$(safe_state_name "$by_id")"
+        source="by-id"
+    elif [[ -n "$serial" ]]; then
+        identity="serial_$(safe_state_name "$serial")"
+        source="serial"
+    else
+        identity="path_$(safe_state_name "$disk")"
+        source="path-fallback"
+    fi
+
+    existing="${DEVICE_PATH_BY_ID[$identity]:-}"
+    if [[ -n "$existing" && "$existing" != "$disk" ]]; then
+        fingerprint=$(printf '%s' "$disk|$wwn|$serial|$by_id" | cksum | awk '{print $1}')
+        identity="${identity}_${fingerprint}"
+        log "INVENTORY" "WARN" \
+            "Duplicate device identity detected for $disk and $existing; using disambiguated key $identity"
+    fi
+
+    DEVICE_ID_BY_PATH[$disk]="$identity"
+    DEVICE_PATH_BY_ID[$identity]="$disk"
+    DEVICE_ID_SOURCE[$identity]="$source"
+
+    if [[ "$source" == "path-fallback" ]]; then
+        log "INVENTORY" "WARN" \
+            "No WWN, by-id, or serial available for $disk; persistent identity falls back to its path"
+    fi
+}
+
+discover_device_inventory() {
+    local boot_src boot_root="" name type disk device_name temp_file identity source
+    local -a candidates=()
+    local -A seen=()
+
+    DEVICE_ID_BY_PATH=()
+    DEVICE_PATH_BY_ID=()
+    DEVICE_ID_SOURCE=()
+    DISCOVERED_DISKS=()
+    DEVICE_INVENTORY_READY=0
+
+    cache_lsblk_all
+    while read -r name _size _rota type; do
+        [[ "$type" == "disk" ]] || continue
+        [[ "$name" =~ ^sd[a-z]+$ || "$name" =~ ^nvme[0-9]+n[0-9]+$ ]] || continue
+        disk="/dev/$name"
+        [[ -b "$disk" && -z "${seen[$disk]:-}" ]] || continue
+        seen[$disk]=1
+        candidates+=("$disk")
+    done <<< "$LSBLK_ALL_CACHE"
+
+    # Include devices explicitly assigned by Unraid even if a controller omits
+    # useful TYPE metadata from lsblk.
+    if [[ -r /var/local/emhttp/disks.ini ]]; then
+        while IFS= read -r device_name; do
+            device_name="${device_name#/dev/}"
+            [[ "$device_name" =~ ^(sd[a-z]+|nvme[0-9]+n[0-9]+)$ ]] || continue
+            disk="/dev/$device_name"
+            [[ -b "$disk" && -z "${seen[$disk]:-}" ]] || continue
+            seen[$disk]=1
+            candidates+=("$disk")
+        done < <(
+            awk -F= 'tolower($1)=="device" {
+                value=$2
+                gsub(/"/, "", value)
+                gsub(/^[ \t]+|[ \t]+$/, "", value)
+                if (value != "") print value
+            }' /var/local/emhttp/disks.ini 2>/dev/null
+        )
+    fi
+
+    # Last-resort discovery for unusual lsblk/controller output.
+    for disk in /dev/sd* /dev/nvme*n*; do
+        [[ -b "$disk" ]] || continue
+        name="${disk##*/}"
+        [[ "$name" =~ ^sd[a-z]+$ || "$name" =~ ^nvme[0-9]+n[0-9]+$ ]] || continue
+        [[ -z "${seen[$disk]:-}" ]] || continue
+        seen[$disk]=1
+        candidates+=("$disk")
     done
 
     boot_src=$(findmnt -n -o SOURCE /boot 2>/dev/null || true)
     if [[ -n "$boot_src" ]]; then
-        if [[ "$boot_src" == /dev/nvme* ]]; then
-            boot_root=$(echo "$boot_src" | sed -E 's/p[0-9]+$//')
-        else
-            boot_root=$(echo "$boot_src" | sed -E 's/[0-9]+$//')
-        fi
+        boot_src=$(readlink -f -- "$boot_src" 2>/dev/null || printf '%s' "$boot_src")
     fi
-    for d in "${candidates[@]}"; do
-        [[ -n "$boot_root" && "$d" == "$boot_root" ]] && continue
-        out+=("$d")
+    [[ -n "$boot_src" ]] && boot_root=$(base_device "$boot_src")
+
+    mapfile -t DISCOVERED_DISKS < <(
+        printf '%s\n' "${candidates[@]}" |
+            awk 'NF' |
+            sort -Vu
+    )
+
+    candidates=()
+    for disk in "${DISCOVERED_DISKS[@]}"; do
+        [[ -n "$boot_root" && "$disk" == "$boot_root" ]] && continue
+        register_device_identity "$disk" || continue
+        candidates+=("$disk")
+    done
+    DISCOVERED_DISKS=("${candidates[@]}")
+
+    temp_file="$(state_temp_file "$DEVICE_ID_MAP_FILE")" || return 1
+    for disk in "${DISCOVERED_DISKS[@]}"; do
+        identity="${DEVICE_ID_BY_PATH[$disk]}"
+        source="${DEVICE_ID_SOURCE[$identity]}"
+        printf '%s %s source=%s\n' "$identity" "$disk" "$source" >> "$temp_file"
+    done
+    atomic_commit "$temp_file" "$DEVICE_ID_MAP_FILE" || return 1
+    DEVICE_INVENTORY_READY=1
+
+    if (( ${#DISCOVERED_DISKS[@]} == 0 )); then
+        log "INVENTORY" "WARN" "No non-boot SATA/SAS/NVMe disks were discovered"
+    else
+        log "INVENTORY" "INFO" \
+            "Discovered ${#DISCOVERED_DISKS[@]} disk(s) with stable identity mapping"
+    fi
+}
+
+persistent_device_key() {
+    local device="$1"
+    local base suffix identity
+
+    [[ "$device" == /dev/* ]] || { printf '%s' "$device"; return 0; }
+    base=$(base_device "$device")
+    [[ -n "$base" ]] || { printf 'path_%s' "$(safe_state_name "$device")"; return 0; }
+    suffix="${device#$base}"
+    identity="${DEVICE_ID_BY_PATH[$base]:-}"
+    [[ -n "$identity" ]] || identity="path_$(safe_state_name "$base")"
+    printf '%s%s' "$identity" "${suffix:+@$suffix}"
+}
+
+runtime_device_path() {
+    local key="$1"
+    local identity suffix="" base
+
+    if [[ "$key" == /dev/* ]]; then
+        printf '%s' "$key"
+        return 0
+    fi
+
+    identity="${key%%@*}"
+    [[ "$key" == *@* ]] && suffix="${key#*@}"
+    base="${DEVICE_PATH_BY_ID[$identity]:-}"
+    [[ -n "$base" ]] || return 1
+    printf '%s%s' "$base" "$suffix"
+}
+
+persistent_seen_key() {
+    local key="$1" device remainder
+    if [[ "$key" == /dev/*'|'* ]]; then
+        device="${key%%|*}"
+        remainder="${key#*|}"
+        printf '%s|%s' "$(persistent_device_key "$device")" "$remainder"
+    else
+        printf '%s' "$key"
+    fi
+}
+
+runtime_seen_key() {
+    local key="$1" identity remainder device
+    [[ "$key" == *'|'* ]] || { printf '%s' "$key"; return 0; }
+    identity="${key%%|*}"
+    remainder="${key#*|}"
+    if device=$(runtime_device_path "$identity"); then
+        printf '%s|%s' "$device" "$remainder"
+    else
+        printf '%s' "$key"
+    fi
+}
+
+migrate_device_identity_histories() {
+    local current_version="" file temp_file disk identity legacy_name stable_name directory
+    local migration_failed=0
+    local -a files=(
+        "$TEMP_HISTORY_FILE"
+        "$SATA_LINK_HISTORY_FILE"
+        "$REPLACEMENT_EVENTS_FILE"
+        "$SELFTEST_HISTORY_FILE"
+        "$POH_HISTORY_FILE"
+        "$SMART_ATTR_HISTORY_FILE"
+        "$RISK_SCORES_HISTORY_FILE"
+        "$TBW_HISTORY_FILE"
+        "$HEAVY_WRITER_HISTORY_FILE"
+        "$TBW_DAYSLEFT_HISTORY_FILE"
+        "$BTRFS_DEV_HIST_FILE"
+        "$STATE_DIR/btrfs_device_stats.prev"
+        "$IO_ERROR_HISTORY_FILE"
+    )
+
+    [[ -r "$DEVICE_ID_SCHEMA_FILE" ]] && read -r current_version < "$DEVICE_ID_SCHEMA_FILE" || true
+    [[ "$current_version" == "2" ]] && return 0
+
+    if (( ${#DISCOVERED_DISKS[@]} == 0 )); then
+        log "STATE" "WARN" \
+            "Deferring stable identity migration because no data disks were discovered"
+        return 1
+    fi
+
+    log "STATE" "INFO" "Migrating persisted device references to stable identity schema v2"
+
+    for file in "${files[@]}"; do
+        [[ -s "$file" ]] || continue
+        temp_file="$(state_temp_file "$file")" || {
+            migration_failed=1
+            continue
+        }
+        cp -p -- "$file" "$temp_file" 2>/dev/null || {
+            rm -f -- "$temp_file" 2>/dev/null || true
+            migration_failed=1
+            continue
+        }
+
+        for disk in "${DISCOVERED_DISKS[@]}"; do
+            identity="${DEVICE_ID_BY_PATH[$disk]:-}"
+            [[ -n "$identity" ]] || continue
+            sed -E \
+                -e "s#${disk}(p?[0-9]+)#${identity}@\\1#g" \
+                -e "s#${disk}([^A-Za-z0-9]|$)#${identity}\\1#g" \
+                "$temp_file" > "${temp_file}.next" 2>/dev/null || {
+                    migration_failed=1
+                    rm -f -- "${temp_file}.next" 2>/dev/null || true
+                    break
+                }
+            mv -f -- "${temp_file}.next" "$temp_file" || {
+                migration_failed=1
+                break
+            }
+        done
+
+        if (( migration_failed == 0 )); then
+            atomic_commit "$temp_file" "$file" || migration_failed=1
+        else
+            rm -f -- "$temp_file" "${temp_file}.next" 2>/dev/null || true
+            break
+        fi
     done
 
-    printf '%s\n' "${out[@]}"
+    # Migrate per-device cooldown and self-test filenames where a legacy file
+    # exists. The file contents themselves remain unchanged.
+    if (( migration_failed == 0 )); then
+        for disk in "${DISCOVERED_DISKS[@]}"; do
+            identity="${DEVICE_ID_BY_PATH[$disk]:-}"
+            [[ -n "$identity" ]] || continue
+            legacy_name=$(safe_state_name "$disk")
+            stable_name=$(safe_state_name "$identity")
+
+            for directory in "$UNSAFE_SDWN_STATE_DIR" "$CMD_TIMEOUT_STATE_DIR"; do
+                if [[ -e "$directory/${legacy_name}.lastwarn" && ! -e "$directory/${stable_name}.lastwarn" ]]; then
+                    mv -f -- "$directory/${legacy_name}.lastwarn" "$directory/${stable_name}.lastwarn" 2>/dev/null || true
+                fi
+            done
+
+            if [[ -e "$SMART_SELFTEST_DIR/${disk##*/}.snapshot" && ! -e "$SMART_SELFTEST_DIR/${stable_name}.snapshot" ]]; then
+                mv -f -- \
+                    "$SMART_SELFTEST_DIR/${disk##*/}.snapshot" \
+                    "$SMART_SELFTEST_DIR/${stable_name}.snapshot" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    if (( migration_failed == 1 )); then
+        log "STATE" "WARN" "Stable identity history migration was incomplete; it will retry next run"
+        return 1
+    fi
+
+    atomic_write_text "$DEVICE_ID_SCHEMA_FILE" $'2\n' || return 1
+    log "STATE" "INFO" "Stable identity history migration completed"
+}
+
+# Enumerate the inventory captured once by main().
+get_all_disks() {
+    if (( DEVICE_INVENTORY_READY == 0 )); then
+        discover_device_inventory || true
+    fi
+    printf '%s\n' "${DISCOVERED_DISKS[@]}"
 }
 
 # === Helper Function ===
@@ -1580,13 +1879,14 @@ save_risk_spikes() {
         if (( age_days > lookback_days )); then unset 'RISK_SPIKE_TS[$dev]'; fi
     done
     # Write file atomically
-    local tmp
+    local tmp state_key
     tmp="$(state_temp_file "$RISK_SPIKE_FILE")" || {
         log_warn "Unable to create risk-spike state temporary file"
         return 0
     }
     for dev in "${!RISK_SPIKE_TS[@]}"; do
-        printf '%s %s\n' "$dev" "${RISK_SPIKE_TS[$dev]}" >> "$tmp"
+        state_key=$(persistent_device_key "$dev")
+        printf '%s %s\n' "$state_key" "${RISK_SPIKE_TS[$dev]}" >> "$tmp"
     done
     atomic_commit "$tmp" "$RISK_SPIKE_FILE" || true
 }
@@ -1603,14 +1903,15 @@ smart_device_for_mount() {
 }
 
 load_persistent_state() {
-    local disk date dev rest token k v line key poh cnt ts score
+    local disk date dev rest token k v line key poh cnt ts score stored_key
     local now_ts prune_days age_days
 
     now_ts="$(date +%s)"
     prune_days=${LONG_TEST_RISK_LOOKBACK_DAYS:-14}
 
 if [ -f "$SMART_LAST" ]; then
-    while read -r disk date rest; do
+    while read -r stored_key date rest; do
+        disk=$(runtime_device_path "$stored_key" 2>/dev/null || true)
         [[ -n "$disk" && -n "$date" ]] || continue
         LAST_TEST["$disk"]=$date
         for token in $rest; do
@@ -1628,7 +1929,8 @@ if [ -f "$SMART_LAST" ]; then
 fi
 
 if [ -f "$NVME_STATE_FILE" ]; then
-    while read -r dev rest; do
+    while read -r stored_key rest; do
+        dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
         [[ -z "$dev" ]] && continue
         # Support legacy format: dev <unsafe_shutdowns>
         if [[ -z "$rest" ]]; then
@@ -1665,7 +1967,9 @@ if [ -f "$PREV_ATTR_FILE" ]; then
         [[ -z "$line" ]] && continue
         disk=""
         token=""
-        disk=$(echo "$line" | awk '{print $1}')
+        stored_key=$(echo "$line" | awk '{print $1}')
+        disk=$(runtime_device_path "$stored_key" 2>/dev/null || true)
+        [[ -n "$disk" ]] || continue
         for token in $(echo "$line" | awk '{for(i=2;i<=NF;i++) print $i}'); do
             k=""; v=""
             k=${token%%=*}; v=${token#*=}
@@ -1675,20 +1979,23 @@ if [ -f "$PREV_ATTR_FILE" ]; then
 fi
 
 if [ -f "$RISK_PREV_FILE" ]; then
-    while read -r disk score; do
+    while read -r stored_key score; do
+        disk=$(runtime_device_path "$stored_key" 2>/dev/null || true)
         [[ -n "$disk" && "$score" =~ ^[0-9]+$ ]] || continue
         PREVIOUS_RISK["$disk"]="$score"
     done < "$RISK_PREV_FILE"
 fi
 if [ -f "$ALERT_NEW_SEEN_FILE" ]; then
     while IFS= read -r key; do
+        key=$(runtime_seen_key "$key")
         [[ -n "$key" ]] && NEW_SEEN["$key"]=1
     done < "$ALERT_NEW_SEEN_FILE"
 fi
 
 # Load persisted last long self-test lifetime hours
 if [ -f "$SMART_LONG_LAST_POH_FILE" ]; then
-    while read -r disk poh; do
+    while read -r stored_key poh; do
+        disk=$(runtime_device_path "$stored_key" 2>/dev/null || true)
         [[ -z "$disk" || -z "$poh" ]] && continue
         [[ "$poh" =~ ^[0-9]+$ ]] || continue
         LONG_LAST_POH["$disk"]="$poh"
@@ -1697,7 +2004,8 @@ fi
 
 # Load previous Command_Timeout counts for delta alerts
 if [ -f "$CMD_TIMEOUT_LAST_FILE" ]; then
-    while read -r disk cnt; do
+    while read -r stored_key cnt; do
+        disk=$(runtime_device_path "$stored_key" 2>/dev/null || true)
         [[ -z "$disk" || -z "$cnt" ]] && continue
         [[ "$cnt" =~ ^[0-9]+$ ]] || continue
         CMD_TIMEOUT_LAST["$disk"]="$cnt"
@@ -1706,7 +2014,8 @@ fi
 
 # Load persisted risk spike timestamps (prune entries older than lookback)
 if [ -f "$RISK_SPIKE_FILE" ]; then
-    while read -r disk ts; do
+    while read -r stored_key ts; do
+        disk=$(runtime_device_path "$stored_key" 2>/dev/null || true)
         [[ -z "$disk" || -z "$ts" ]] && continue
         [[ "$ts" =~ ^[0-9]+$ ]] || continue
         # Apply lookback pruning at load time
@@ -1721,11 +2030,12 @@ fi
 # === Helper Function ===
 # Persist actual SMART test-start metadata for a device
 save_last_test() {
-    local temp_file disk
+    local temp_file disk state_key
     temp_file="$(state_temp_file "$SMART_LAST")" || return 1
     for disk in "${!LAST_TEST[@]}"; do
+        state_key=$(persistent_device_key "$disk")
         printf '%s %s epoch=%s type=%s\n' \
-            "$disk" \
+            "$state_key" \
             "${LAST_TEST[$disk]}" \
             "${LAST_TEST_EPOCH[$disk]:-0}" \
             "${LAST_TEST_KIND[$disk]:-unknown}" >> "$temp_file"
@@ -1736,10 +2046,11 @@ save_last_test() {
 # === Helper Function ===
 # Persist last-run NVMe health snapshot for a device
 save_nvme_state() {
-    local temp_file dev line
+    local temp_file dev line state_key
     temp_file="$(state_temp_file "$NVME_STATE_FILE")" || return 1
     for dev in "${!NVME_LAST_UNSAFE[@]}"; do
-        line="$dev unsafe=${NVME_LAST_UNSAFE[$dev]:-0}"
+        state_key=$(persistent_device_key "$dev")
+        line="$state_key unsafe=${NVME_LAST_UNSAFE[$dev]:-0}"
         line+=" errlog=${NVME_LAST_ERRLOG[$dev]:-0}"
         line+=" pc_corr=${NVME_LAST_PCIE_CORR[$dev]:-0}"
         line+=" pc_unc=${NVME_LAST_PCIE_UNC[$dev]:-0}"
@@ -1755,10 +2066,11 @@ save_nvme_state() {
 # === Helper Function ===
 # Persist last observed long self-test lifetime hours per disk
 save_long_last_poh() {
-    local temp_file disk
+    local temp_file disk state_key
     temp_file="$(state_temp_file "$SMART_LONG_LAST_POH_FILE")" || return 1
     for disk in "${!LONG_LAST_POH[@]}"; do
-        printf '%s %s\n' "$disk" "${LONG_LAST_POH[$disk]}" >> "$temp_file"
+        state_key=$(persistent_device_key "$disk")
+        printf '%s %s\n' "$state_key" "${LONG_LAST_POH[$disk]}" >> "$temp_file"
     done
     atomic_commit "$temp_file" "$SMART_LONG_LAST_POH_FILE"
 }
@@ -1766,10 +2078,11 @@ save_long_last_poh() {
 # === Helper Function ===
 # Persist last observed Command_Timeout counts per disk
 save_cmd_timeout_last() {
-    local temp_file disk
+    local temp_file disk state_key
     temp_file="$(state_temp_file "$CMD_TIMEOUT_LAST_FILE")" || return 1
     for disk in "${!CMD_TIMEOUT_LAST[@]}"; do
-        printf '%s %s\n' "$disk" "${CMD_TIMEOUT_LAST[$disk]}" >> "$temp_file"
+        state_key=$(persistent_device_key "$disk")
+        printf '%s %s\n' "$state_key" "${CMD_TIMEOUT_LAST[$disk]}" >> "$temp_file"
     done
     atomic_commit "$temp_file" "$CMD_TIMEOUT_LAST_FILE"
 }
@@ -1840,7 +2153,7 @@ evaluate_smart() {
         # Parse temperature and evaluate wear percent thresholds
         nvme_temp=$(echo "$nvme_output" | awk -F: '/Temperature/ {print $2; exit}' | grep -oE '[0-9]+' | head -n1 || true)
         if [[ -n "$nvme_temp" && "$nvme_temp" =~ ^[0-9]+$ ]]; then
-            printf '%s %s %s\n' "$(date '+%Y-%m-%d')" "$disk" "$nvme_temp" >> "$TEMP_HISTORY_FILE" 2>/dev/null || true
+            printf '%s %s %s\n' "$(date '+%Y-%m-%d')" "$(persistent_device_key "$disk")" "$nvme_temp" >> "$TEMP_HISTORY_FILE" 2>/dev/null || true
         fi
         if [[ $percent_used -ge $NVME_PERCENT_USED_CRIT ]]; then
             state="CRITICAL"; messages+=("NVMe wear ${percent_used}% >= ${NVME_PERCENT_USED_CRIT}%")
@@ -1966,7 +2279,13 @@ evaluate_smart() {
             total_ok=0
         fi
         local cooldown_ok=1
-        local warn_file="$UNSAFE_SDWN_STATE_DIR/$(safe_state_name "$disk").lastwarn"
+        local cooldown_key legacy_warn_file
+        cooldown_key=$(persistent_device_key "$disk")
+        local warn_file="$UNSAFE_SDWN_STATE_DIR/$(safe_state_name "$cooldown_key").lastwarn"
+        legacy_warn_file="$UNSAFE_SDWN_STATE_DIR/$(safe_state_name "$disk").lastwarn"
+        if [[ ! -e "$warn_file" && -e "$legacy_warn_file" ]]; then
+            mv -f -- "$legacy_warn_file" "$warn_file" 2>/dev/null || true
+        fi
         if [[ ${UNSAFE_SDWN_COOLDOWN_DAYS:-0} -gt 0 ]]; then
             if [[ -f "$warn_file" ]]; then
                 local last_ts now diff cooldown_sec
@@ -2095,7 +2414,13 @@ evaluate_smart() {
                     local cooldown_ok=1
                     if [[ $CMD_TIMEOUT_COOLDOWN_DAYS -gt 0 ]]; then
                         mkdir -p "$CMD_TIMEOUT_STATE_DIR" 2>/dev/null || true
-                        local warn_file="$CMD_TIMEOUT_STATE_DIR/$(safe_state_name "$disk").lastwarn"
+                        local cooldown_key legacy_warn_file
+                        cooldown_key=$(persistent_device_key "$disk")
+                        local warn_file="$CMD_TIMEOUT_STATE_DIR/$(safe_state_name "$cooldown_key").lastwarn"
+                        legacy_warn_file="$CMD_TIMEOUT_STATE_DIR/$(safe_state_name "$disk").lastwarn"
+                        if [[ ! -e "$warn_file" && -e "$legacy_warn_file" ]]; then
+                            mv -f -- "$legacy_warn_file" "$warn_file" 2>/dev/null || true
+                        fi
                         if [[ -f "$warn_file" ]]; then
                             local last_ts now diff cooldown_sec
                             last_ts=$(cat "$warn_file" 2>/dev/null || echo 0)
@@ -2143,7 +2468,7 @@ evaluate_smart() {
         temp=$(echo "$attr" | awk '/Temperature_Celsius|Airflow_Temperature_Cel/ {print $10; exit}')
         temp=${temp:-0}
         if [[ -n "$temp" && "$temp" =~ ^[0-9]+$ && "$temp" != 0 ]]; then
-            printf '%s %s %s\n' "$(date '+%Y-%m-%d')" "$disk" "$temp" >> "$TEMP_HISTORY_FILE" 2>/dev/null || true
+            printf '%s %s %s\n' "$(date '+%Y-%m-%d')" "$(persistent_device_key "$disk")" "$temp" >> "$TEMP_HISTORY_FILE" 2>/dev/null || true
         fi
         local bdv
         bdv=$(base_device "$disk")
@@ -2316,11 +2641,11 @@ evaluate_smart() {
                                 tmp=""
                             }
                             if [[ -n "$tmp" ]]; then
-                                awk -v d="$today" -v dev="$disk" '!( $1==d && $2==dev )' "$SATA_LINK_HISTORY_FILE" > "$tmp" 2>/dev/null || true
+                                awk -v d="$today" -v dev="$(persistent_device_key "$disk")" '!( $1==d && $2==dev )' "$SATA_LINK_HISTORY_FILE" > "$tmp" 2>/dev/null || true
                                 atomic_commit "$tmp" "$SATA_LINK_HISTORY_FILE" || true
                             fi
                         fi
-                        echo "$today $disk max=$max_speed current=$current_speed" >> "$SATA_LINK_HISTORY_FILE"
+                        echo "$today $(persistent_device_key "$disk") max=$max_speed current=$current_speed" >> "$SATA_LINK_HISTORY_FILE"
                     fi
                 fi
             fi
@@ -2482,7 +2807,7 @@ classify_selftest_status() {
 # Persist a compact snapshot of the latest SMART self-test (or capabilities fallback)
 save_selftest_snapshot() {
     local disk="$1"
-    local info num type status lifetime remaining sev msg target temp_file
+    local info num type status lifetime remaining sev msg target temp_file state_key
     info=$(get_latest_selftest_info "$disk")
     IFS='|' read -r num type status lifetime remaining <<< "$info"
     # Classify status for quick glance
@@ -2490,9 +2815,8 @@ save_selftest_snapshot() {
     cls=$(classify_selftest_status "$status")
     sev=$(echo "$cls" | awk -F'|' '{print $1}')
     msg=$(echo "$cls" | awk -F'|' '{print $2}')
-    local base
-    base=$(basename "$disk")
-    target="$SMART_SELFTEST_DIR/${base}.snapshot"
+    state_key=$(persistent_device_key "$disk")
+    target="$SMART_SELFTEST_DIR/$(safe_state_name "$state_key").snapshot"
     temp_file="$(state_temp_file "$target")" || return 1
     {
         printf "Captured: %s\n" "$(date '+%Y-%m-%d %H:%M:%S')"
@@ -2666,14 +2990,17 @@ run_smart_test() {
             if (( persisted_ll - current_poh >= drop_threshold )); then
                 log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Possible replacement detected on $disk: current POH ${current_poh}h << last-long POH ${persisted_ll}h (≥${drop_threshold}h drop). Resetting state and forcing initial long test."
                 record_alert warning "Drive Replacement" "Detected possible drive replacement on $disk (POH drop ${persisted_ll}->${current_poh} ≥ ${drop_threshold}h). Baseline reset and long test forced."
-                printf '%s %s prev_poh=%s new_poh=%s drop=%s threshold=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$disk" "$persisted_ll" "$current_poh" "$(( persisted_ll - current_poh ))" "$drop_threshold" >> "$REPLACEMENT_EVENTS_FILE" 2>/dev/null || true
+                printf '%s %s prev_poh=%s new_poh=%s drop=%s threshold=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(persistent_device_key "$disk")" "$persisted_ll" "$current_poh" "$(( persisted_ll - current_poh ))" "$drop_threshold" >> "$REPLACEMENT_EVENTS_FILE" 2>/dev/null || true
                 unset 'LONG_LAST_POH["$disk"]'
                 # Prune processed long-test id for this disk to avoid stale suppression
                 if [[ -f "$SMART_LONG_STATE_FILE" ]]; then
-                    local processed_temp
+                    local processed_temp processed_state_key
                     processed_temp="$(state_temp_file "$SMART_LONG_STATE_FILE")" || processed_temp=""
                     if [[ -n "$processed_temp" ]]; then
-                        awk -v dev="$disk" '$1 != dev' "$SMART_LONG_STATE_FILE" > "$processed_temp" 2>/dev/null || true
+                        processed_state_key=$(persistent_device_key "$disk")
+                        awk -v dev="$disk" -v stable="$processed_state_key" \
+                            '$1 != dev && $1 != stable' \
+                            "$SMART_LONG_STATE_FILE" > "$processed_temp" 2>/dev/null || true
                         atomic_commit "$processed_temp" "$SMART_LONG_STATE_FILE" || true
                     fi
                 fi
@@ -2844,7 +3171,7 @@ run_smart_test() {
     fi
     if [[ $existing_in_progress -eq 1 ]]; then
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Self-test already in progress on $disk; skipping new start (status: ${exec_status})"
-        printf '%s %s in_progress status=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$disk" "$exec_status" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
+        printf '%s %s in_progress status=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(persistent_device_key "$disk")" "$exec_status" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
     elif (( test_due == 1 )); then
         local test_start_output="" test_start_rc=0
         if [[ $disk == /dev/nvme* ]]; then
@@ -2863,7 +3190,7 @@ run_smart_test() {
         then
             test_started=1
             mark_test_started "$disk" "$test_kind"
-            printf '%s %s start type=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$disk" "${test_kind}" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
+            printf '%s %s start type=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(persistent_device_key "$disk")" "${test_kind}" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
             if [[ $test_kind == long || $test_kind == extended ]]; then
                 LONG_TEST_RUNNING_LONG["$disk"]=1
             fi
@@ -2882,13 +3209,13 @@ run_smart_test() {
         msg=$(echo "$result" | awk -F'|' '{print $2}')
         if [[ $sev != INPROGRESS ]]; then
             log_smart "$(date '+%Y-%m-%d %H:%M:%S') - $disk short self-test status: $msg"
-            printf '%s %s complete type=short sev=%s msg="%s"\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$disk" "$sev" "$msg" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
+            printf '%s %s complete type=short sev=%s msg="%s"\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(persistent_device_key "$disk")" "$sev" "$msg" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
             if [[ $sev == WARNING ]]; then
                 record_alert warning "$NOTIFY_TITLE_SMART" "Disk $disk short self-test warning: $msg"
             fi
         else
             log_smart "$(date '+%Y-%m-%d %H:%M:%S') - $disk short self-test still in progress after wait window"
-            printf '%s %s incomplete type=short status=in_progress\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$disk" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
+            printf '%s %s incomplete type=short status=in_progress\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(persistent_device_key "$disk")" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
         fi
     else
         if [[ $existing_in_progress -eq 1 ]]; then
@@ -2969,10 +3296,13 @@ augment_messages_with_deltas() {
 check_completed_long_tests() {
     declare -A PROCESSED
     local -a disks=()
-    local disk temp_file d id
+    local disk temp_file d id stored_key state_key
 
     if [[ -f "$SMART_LONG_STATE_FILE" ]]; then
-        while read -r d id; do PROCESSED[$d]="$id"; done < "$SMART_LONG_STATE_FILE"
+        while read -r stored_key id; do
+            d=$(runtime_device_path "$stored_key" 2>/dev/null || true)
+            [[ -n "$d" && -n "$id" ]] && PROCESSED[$d]="$id"
+        done < "$SMART_LONG_STATE_FILE"
     fi
     mapfile -t disks < <(get_all_disks)
     for disk in "${disks[@]}"; do
@@ -3027,7 +3357,7 @@ check_completed_long_tests() {
         elif [[ $sev == CRITICAL ]]; then
             record_alert critical "$NOTIFY_TITLE_SMART" "Disk $disk long self-test CRITICAL: $msg"
         fi
-        printf '%s %s complete type=long id=%s sev=%s msg="%s"\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$disk" "$id" "$sev" "$msg" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
+        printf '%s %s complete type=long id=%s sev=%s msg="%s"\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(persistent_device_key "$disk")" "$id" "$sev" "$msg" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
         local lifetime poh current_poh
         # Broaden lifetime extraction: first try token before 'hours'; else choose largest numeric token after id
         lifetime=$(echo "$line" | awk '{for(i=1;i<=NF;i++){if($i ~ /hours/){print $(i-1); exit}}}')
@@ -3079,7 +3409,8 @@ check_completed_long_tests() {
 
     temp_file="$(state_temp_file "$SMART_LONG_STATE_FILE")" || return 0
     for disk in "${!PROCESSED[@]}"; do
-        printf '%s %s\n' "$disk" "${PROCESSED[$disk]}" >> "$temp_file"
+        state_key=$(persistent_device_key "$disk")
+        printf '%s %s\n' "$state_key" "${PROCESSED[$disk]}" >> "$temp_file"
     done
     atomic_commit "$temp_file" "$SMART_LONG_STATE_FILE" || true
 }
@@ -3285,7 +3616,7 @@ evaluate_per_mount_thresholds() {
 # Run SMART tests, record daily SMART history, and calculate NVMe wear projection.
 collect_smart_health() {
     local -a disks=()
-    local disk today tmp poh line key val
+    local disk today tmp poh line key val stored_key
     local win_wear cutoff_wear dt dev rest pu fv lv span_days growth rate remaining dl warn_thr crit_thr
 
     log_smart "Starting SMART tests (short by default; long scheduled per risk)"
@@ -3315,7 +3646,7 @@ if (( POH_TREND_ENABLED == 1 )); then
         [[ -n "${SMART_DEFERRED[$disk]:-}" ]] && continue
         poh=${CUR_ATTR["$disk|poh"]:-}
         if [[ -n "$poh" && "$poh" =~ ^[0-9]+$ ]]; then
-            echo "$today $disk poh=$poh" >> "$POH_HISTORY_FILE"
+            echo "$today $(persistent_device_key "$disk") poh=$poh" >> "$POH_HISTORY_FILE"
         fi
     done
 fi
@@ -3335,7 +3666,7 @@ fi
     for disk in "${!SMART_STATE[@]}"; do
         [[ -n "${SMART_DEFERRED[$disk]:-}" ]] && continue
         # Build compact attribute line: date device attr=value ... (subset of noisy attrs)
-        line="$today $disk"
+        line="$today $(persistent_device_key "$disk")"
         for key in realloc pending offunc reported_uncorr cmd_timeout realloc_events udma soft_read_err nvme_percent_used unsafe_shutdowns media_errors err_logs pcie_corr pcie_unc therm_t1 therm_t2 warn_temp_time crit_temp_time tbw_bytes poh; do
             val=${CUR_ATTR["$disk|$key"]:-}
             [[ -n "$val" ]] && line+=" $key=$val"
@@ -3349,7 +3680,8 @@ fi
         cutoff_wear=$(date -d "-${win_wear} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
         if [[ -f "$SMART_ATTR_HISTORY_FILE" ]]; then
             declare -A _WEAR_FDT _WEAR_FVAL _WEAR_LDT _WEAR_LVAL
-            while read -r dt dev rest; do
+            while read -r dt stored_key rest; do
+                dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
                 [[ -z "$dt" || -z "$dev" || "$dt" < "$cutoff_wear" ]] && continue
                 [[ "$dev" != /dev/nvme* ]] && continue
                 pu=$(printf "%s" "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^nvme_percent_used=/){sub(/nvme_percent_used=/,"",$i); print $i; break}}}')
@@ -3433,7 +3765,7 @@ scan_syslog_disk_errors() {
     local now_epoch
     now_epoch=$(date +%s)
     local cutoff=$(( now_epoch - window_sec ))
-    local log_src
+    local log_src stored_key
     if [[ -f "$IO_ERROR_LOG_FILE" ]]; then
         log_src=$(tail -n 20000 "$IO_ERROR_LOG_FILE" 2>/dev/null || true)
     else
@@ -3441,7 +3773,8 @@ scan_syslog_disk_errors() {
     fi
     declare -A HASH_SEEN
     if [[ -f "$IO_ERROR_HISTORY_FILE" ]]; then
-        while read -r ts dev hash; do
+        while read -r ts stored_key hash; do
+            dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
             [[ -z "$ts" || -z "$dev" || -z "$hash" ]] && continue
             if (( ts >= cutoff )); then
                 if [[ -z "${HASH_SEEN["$dev|$hash"]:-}" ]]; then
@@ -3458,7 +3791,8 @@ scan_syslog_disk_errors() {
     }
     for key in "${!HASH_SEEN[@]}"; do
         if [[ -n "$new_hist" ]]; then
-            local ts="${HASH_SEEN[$key]}" dv="${key%%|*}" h="${key#*|}"; printf "%s %s %s\n" "$ts" "$dv" "$h" >> "$new_hist"
+            local ts="${HASH_SEEN[$key]}" dv="${key%%|*}" h="${key#*|}"
+            printf "%s %s %s\n" "$ts" "$(persistent_device_key "$dv")" "$h" >> "$new_hist"
         fi
     done
     while read -r line; do
@@ -3494,7 +3828,7 @@ scan_syslog_disk_errors() {
                 continue
             fi
             HASH_SEEN["$dev|$hash"]=$epoch
-            [[ -n "$new_hist" ]] && printf "%s %s %s\n" "$epoch" "$dev" "$hash" >> "$new_hist"
+            [[ -n "$new_hist" ]] && printf "%s %s %s\n" "$epoch" "$(persistent_device_key "$dev")" "$hash" >> "$new_hist"
             IO_ERROR_UNIQUE_MAP["$dev"]=$(( ${IO_ERROR_UNIQUE_MAP["$dev"]:-0} + 1 ))
         done
     done < <(printf "%s\n" "$log_src")
@@ -4777,6 +5111,7 @@ build_trend_section() {
             local dt dev tmp crit ts
             dt=$(awk '{print $1}' <<<"$line")
             dev=$(awk '{print $2}' <<<"$line")
+            dev=$(runtime_device_path "$dev" 2>/dev/null || true)
             tmp=$(awk '{print $3}' <<<"$line")
             crit=$(awk '{print $4}' <<<"$line")
             # Accept both the corrected numeric format and legacy temp=NN rows.
@@ -4910,7 +5245,9 @@ build_trend_section() {
                 tmp_attr=$(mktemp) || { log_warn "mktemp failed; skipping SMART attribute trend block"; tmp_attr=""; }
                 if [[ -n "$tmp_attr" ]]; then
                     printf "%s\n" "$lines_attr" | awk -v c="$cutoff_attr" '$1>=c' > "$tmp_attr"
-                while read -r dt dev rest; do
+                local stored_key
+                while read -r dt stored_key rest; do
+                    dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
                     [[ -z "$dt" || -z "$dev" ]] && continue
                     if [[ -z "${first_dt_attr[$dev]:-}" || "$dt" < "${first_dt_attr[$dev]}" ]]; then first_dt_attr[$dev]="$dt"; first_line_attr[$dev]="$rest"; fi
                     if [[ -z "${last_dt_attr[$dev]:-}" || "$dt" > "${last_dt_attr[$dev]}" ]]; then last_dt_attr[$dev]="$dt"; last_line_attr[$dev]="$rest"; fi
@@ -5003,13 +5340,18 @@ build_trend_section() {
         # --- POH Aging Ranking ---
         if (( POH_TREND_ENABLED == 1 )) && [[ -f "$POH_HISTORY_FILE" ]]; then
             local poh_lines tmp_poh
-            poh_lines=$(tail -n 50000 "$POH_HISTORY_FILE" 2>/dev/null || true | awk -v c="$cutoff_end" '$1>=c')
+            poh_lines=$(
+                (tail -n 50000 "$POH_HISTORY_FILE" 2>/dev/null || true) |
+                    awk -v c="$cutoff_end" '$1>=c'
+            )
             if [[ -n "$poh_lines" ]]; then
                 tmp_poh=$(mktemp) || { log_warn "mktemp failed; skipping POH trend block"; tmp_poh=""; }
                 if [[ -n "$tmp_poh" ]]; then
                     printf "%s\n" "$poh_lines" | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="poh") v=a[2]} if(d!="" && v!=""){print $1,d,v}}' > "$tmp_poh"
                 declare -A poh_first_dt poh_first_v poh_last_dt poh_last_v
-                while read -r dt dev v; do
+                local stored_key
+                while read -r dt stored_key v; do
+                    dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
                     [[ -z "$dev" || -z "$v" ]] && continue
                     if [[ -z "${poh_first_dt[$dev]:-}" || "$dt" < "${poh_first_dt[$dev]}" ]]; then poh_first_dt[$dev]="$dt"; poh_first_v[$dev]="$v"; fi
                     if [[ -z "${poh_last_dt[$dev]:-}" || "$dt" > "${poh_last_dt[$dev]}" ]]; then poh_last_dt[$dev]="$dt"; poh_last_v[$dev]="$v"; fi
@@ -5051,13 +5393,18 @@ build_trend_section() {
         # --- TBW Days-Left Shrink & Acceleration ---
         if (( ${TBW_TREND_ENABLED:-0} == 1 )) && [[ -f "$TBW_DAYSLEFT_HISTORY_FILE" ]]; then
             local dl_lines tmp_dl accel_factor=${ENDURANCE_DAYSLEFT_ACCEL_FACTOR_PCT:-50} accel_min=${ENDURANCE_DAYSLEFT_ACCEL_MIN_DELTA:-0.5}
-            dl_lines=$(tail -n 50000 "$TBW_DAYSLEFT_HISTORY_FILE" 2>/dev/null || true | awk -v c="$cutoff_end" '$1>=c')
+            dl_lines=$(
+                (tail -n 50000 "$TBW_DAYSLEFT_HISTORY_FILE" 2>/dev/null || true) |
+                    awk -v c="$cutoff_end" '$1>=c'
+            )
             if [[ -n "$dl_lines" ]]; then
                 tmp_dl=$(mktemp) || { log_warn "mktemp failed; skipping TBW days-left trend block"; tmp_dl=""; }
                 if [[ -n "$tmp_dl" ]]; then
                     printf "%s\n" "$dl_lines" | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="days_left") v=a[2]} if(d!="" && v!=""){print $1,d,v}}' > "$tmp_dl"
                 declare -A dl_first_dt dl_first_v dl_last_dt dl_last_v dl_seq
-                while read -r dt dev v; do
+                local stored_key
+                while read -r dt stored_key v; do
+                    dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
                     [[ -z "$dev" || -z "$v" ]] && continue
                     if [[ -z "${dl_first_dt[$dev]:-}" || "$dt" < "${dl_first_dt[$dev]}" ]]; then dl_first_dt[$dev]="$dt"; dl_first_v[$dev]="$v"; fi
                     if [[ -z "${dl_last_dt[$dev]:-}" || "$dt" > "${dl_last_dt[$dev]}" ]]; then dl_last_dt[$dev]="$dt"; dl_last_v[$dev]="$v"; fi
@@ -5147,11 +5494,12 @@ build_trend_section() {
         if [[ -n "$btrfs_lines" ]]; then
             while read -r dt rest; do
                 [[ -z "$dt" || "$dt" < "$cutoff_err" ]] && continue
-                local key mount delta dev
+                local key mount delta dev stored_key
                 key=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^key=/){sub(/key=/,"",$i); print $i; break}}}')
                 mount=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^mount=/){sub(/mount=/,"",$i); print $i; break}}}')
                 delta=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^delta=/){sub(/delta=/,"",$i); print $i; break}}}')
-                dev=$(echo "$rest" | awk '{print $NF}')
+                stored_key=$(echo "$rest" | awk '{print $1}')
+                dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
                 [[ -z "$dev" || -z "$delta" || -z "$key" ]] && continue
                 [[ "$delta" =~ ^[0-9]+$ ]] || continue
                 BSEQ["$dev|$key"]+="${dt}:${delta} "
@@ -5312,8 +5660,9 @@ build_trend_section() {
                 declare -A SUM_KEY DEV_SUM SUM_MOUNT_KEY MOUNT_SUM KEY_SUM
                 while read -r dt rest; do
                     [[ -z "$dt" || "$dt" < "$cutoff_bt" ]] && continue
-                    local dev mount key delta
-                    dev=$(echo "$rest" | awk '{print $1}')
+                    local dev stored_key mount key delta
+                    stored_key=$(echo "$rest" | awk '{print $1}')
+                    dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
                     key=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^key=/){sub(/key=/,"",$i); print $i; break}}}')
                     mount=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^mount=/){sub(/mount=/,"",$i); print $i; break}}}')
                     delta=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^delta=/){sub(/delta=/,"",$i); print $i; break}}}')
@@ -5765,7 +6114,9 @@ build_trend_section() {
             _lines_sat=$(tail -n 20000 "${SATA_LINK_HISTORY_FILE}" 2>/dev/null || true)
             if [[ -n "$_lines_sat" ]]; then
                 declare -A _DEV_DATES _DEV_LAST_MAX _DEV_LAST_CURR
-                while read -r dt dev rest; do
+                local stored_key
+                while read -r dt stored_key rest; do
+                    dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
                     [[ -z "$dt" || -z "$dev" || "$dt" < "$_cut_sat" ]] && continue
                     _DEV_DATES["$dev"]+="$dt "
                     local mx cur
@@ -6070,7 +6421,7 @@ persist_risk_tier_history() {
                 awk -v d="$today_r" '$1!=d{print}' "$RISK_SCORES_HISTORY_FILE" > "$tmp_scores" || true
             fi
             for d in "${!RISK_MAP[@]}"; do
-                printf '%s %s risk=%s\n' "$today_r" "$d" "${RISK_MAP[$d]}" >> "$tmp_scores"
+                printf '%s %s risk=%s\n' "$today_r" "$(persistent_device_key "$d")" "${RISK_MAP[$d]}" >> "$tmp_scores"
             done
             atomic_commit "$tmp_scores" "$RISK_SCORES_HISTORY_FILE" || true
         fi
@@ -6280,7 +6631,7 @@ tbw_forecast_and_heavy_writers() {
     for dev in "${!SMART_STATE[@]}"; do
         [[ -n "${SMART_DEFERRED[$dev]:-}" ]] && continue
         local tbw=${CUR_ATTR["$dev|tbw_bytes"]:-}
-        [[ -n "$tbw" ]] && echo "$today $dev tbw=$tbw" >> "$TBW_HISTORY_FILE"
+        [[ -n "$tbw" ]] && echo "$today $(persistent_device_key "$dev") tbw=$tbw" >> "$TBW_HISTORY_FILE"
     done
     local win=$HISTORY_WINDOW_DAYS
     # Compute per-device daily TBW deltas over window and estimate days to threshold
@@ -6293,7 +6644,10 @@ tbw_forecast_and_heavy_writers() {
     tmp=$(mktemp) || { log_warn "mktemp failed; skipping TBW window aggregation"; return 0; }
     printf "%s\n" "$lines" | awk -v c="$cutoff" '$1>=c{print}' | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="tbw") v=a[2]} if(d!="" && v!="" && v ~ /^[0-9]+$/){print $1,d,v}}' > "$tmp"
     declare -A first_dt first_v last_dt last_v
-    while read -r dt dev v; do
+    local stored_key
+    while read -r dt stored_key v; do
+        dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
+        [[ -n "$dev" ]] || continue
         if [[ -z "${first_dt[$dev]:-}" || "$dt" < "${first_dt[$dev]}" ]]; then first_dt[$dev]="$dt"; first_v[$dev]="$v"; fi
         if [[ -z "${last_dt[$dev]:-}" || "$dt" > "${last_dt[$dev]}" ]]; then last_dt[$dev]="$dt"; last_v[$dev]="$v"; fi
     done < "$tmp"
@@ -6375,7 +6729,7 @@ tbw_forecast_and_heavy_writers() {
         sorted=$(printf "%s\n" "${heavy_rank[@]}" | sort -nr -k1,1 | head -n 5)
         while read -r pct dev daily cap_tb; do
             [[ -z "$dev" ]] && continue
-            echo "$today $dev norm=$pct daily=$daily" >> "$HEAVY_WRITER_HISTORY_FILE"
+            echo "$today $(persistent_device_key "$dev") norm=$pct daily=$daily" >> "$HEAVY_WRITER_HISTORY_FILE"
         done < <(printf "%s\n" "$sorted")
     fi
     # Generate TBW endurance alerts
@@ -6411,7 +6765,7 @@ tbw_forecast_and_heavy_writers() {
                 for dev in "${!TBW_DAYS_LEFT[@]}"; do
             local dl
             dl="${TBW_DAYS_LEFT[$dev]}"
-            [[ -n "$dl" ]] && echo "$today $dev days_left=${dl}" >> "$TBW_DAYSLEFT_HISTORY_FILE"
+            [[ -n "$dl" ]] && echo "$today $(persistent_device_key "$dev") days_left=${dl}" >> "$TBW_DAYSLEFT_HISTORY_FILE"
         done
             fi
         fi
@@ -6453,11 +6807,12 @@ collect_btrfs_device_stats() {
     # Snapshot per-device btrfs error counters; compute deltas vs previous run; raise alerts and record history
     (( ${ENABLE_BTRFS_DEVICE_STATS:-0} == 1 )) || return 0
     local prev_file="$STATE_DIR/btrfs_device_stats.prev"
-    local snapshot_temp today
+    local snapshot_temp today stored_key state_key dev
     declare -A PREV_STAT
     # Load previous counters for delta computation
     if [[ -f "$prev_file" ]]; then
-        while read -r dev key val; do
+        while read -r stored_key key val; do
+            dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
             [[ -z "$dev" || -z "$key" || -z "$val" ]] && continue
             PREV_STAT["$dev|$key"]="$val"
         done < "$prev_file"
@@ -6492,8 +6847,11 @@ collect_btrfs_device_stats() {
 
             if [[ -n "$dev" ]]; then
                 [[ -z "$dev" || -z "$key" || -z "$val" ]] && continue
-                # Write current snapshot line
-                echo "$dev $key $val" >> "$snapshot_temp"
+                # Persist the counter under the physical disk identity (plus
+                # partition suffix), while all runtime maps continue to use
+                # the current kernel device path.
+                state_key=$(persistent_device_key "$dev")
+                printf '%s %s %s\n' "$state_key" "$key" "$val" >> "$snapshot_temp"
                 out_has=1
                 if [[ "$val" =~ ^[0-9]+$ ]]; then
                         local prev
@@ -6521,7 +6879,24 @@ collect_btrfs_device_stats() {
                         local last_delta ratio
                         last_delta=0
                         if [[ -f "$BTRFS_DEV_HIST_FILE" ]]; then
-                            last_delta=$(grep -E " key=$key " "$BTRFS_DEV_HIST_FILE" 2>/dev/null | tail -n1 | awk '{for(i=1;i<=NF;i++){ if($i ~ /^delta=/){sub(/delta=/,"",$i); print $i; break } }}' || true)
+                            last_delta=$(
+                                awk -v stable="$state_key" -v legacy="$dev" -v wanted="$key" '
+                                    $2 != stable && $2 != legacy { next }
+                                    {
+                                        matched = 0
+                                        value = ""
+                                        for (i = 3; i <= NF; i++) {
+                                            if ($i == "key=" wanted) matched = 1
+                                            if ($i ~ /^delta=/) {
+                                                value = $i
+                                                sub(/^delta=/, "", value)
+                                            }
+                                        }
+                                        if (matched && value ~ /^[0-9]+$/) print value
+                                    }
+                                ' "$BTRFS_DEV_HIST_FILE" 2>/dev/null |
+                                    tail -n 1 || true
+                            )
                             [[ -n "$last_delta" && "$last_delta" =~ ^[0-9]+$ ]] || last_delta=0
                         fi
                         if (( last_delta > 0 )); then
@@ -6547,7 +6922,7 @@ collect_btrfs_device_stats() {
                         # Persist delta to time-series history
                         local today
                         today=$(date '+%Y-%m-%d')
-                        echo "$today $dev mount=$m key=$key delta=$delta value=$val" >> "$BTRFS_DEV_HIST_FILE"
+                        echo "$today $(persistent_device_key "$dev") mount=$m key=$key delta=$delta value=$val" >> "$BTRFS_DEV_HIST_FILE"
                         # Attach message to base block device SMART messages for summary sections
                         local bdev
                         bdev=$(base_device "$dev")
@@ -6813,12 +7188,13 @@ compose_notification() {
 # ---------------------------------------------------------------------------
 
 persist_current_attrs() {
-    local temp_file disk key value line
+    local temp_file disk key value line state_key
 
     temp_file="$(state_temp_file "$PREV_ATTR_FILE")" || return 1
 
     for disk in "${!SMART_STATE[@]}"; do
-        line="$disk state=${SMART_STATE[$disk]}"
+        state_key=$(persistent_device_key "$disk")
+        line="$state_key state=${SMART_STATE[$disk]}"
 
         for key in \
             realloc pending offunc reported_uncorr cmd_timeout realloc_events \
@@ -6839,12 +7215,13 @@ persist_current_attrs() {
 
 
 persist_new_seen() {
-    local temp_file key
+    local temp_file key state_key
 
     temp_file="$(state_temp_file "$ALERT_NEW_SEEN_FILE")" || return 1
 
     for key in "${!NEW_SEEN[@]}"; do
-        printf '%s\n' "$key" >> "$temp_file"
+        state_key=$(persistent_seen_key "$key")
+        printf '%s\n' "$state_key" >> "$temp_file"
     done
 
     atomic_commit "$temp_file" "$ALERT_NEW_SEEN_FILE"
@@ -6852,7 +7229,7 @@ persist_new_seen() {
 
 
 persist_risk_scores() {
-    local temp_file dev score previous delta
+    local temp_file dev score previous delta state_key
 
     temp_file="$(state_temp_file "$RISK_PREV_FILE")" || return 1
 
@@ -6874,7 +7251,8 @@ persist_risk_scores() {
             fi
         fi
 
-        printf '%s %s\n' "$dev" "$score" >> "$temp_file"
+        state_key=$(persistent_device_key "$dev")
+        printf '%s %s\n' "$state_key" "$score" >> "$temp_file"
         PREVIOUS_RISK["$dev"]="$score"
     done
 
@@ -6905,6 +7283,7 @@ validate_runtime_dependencies() {
     local -a required_commands=(
         awk
         cksum
+        cp
         date
         df
         findmnt
@@ -6914,6 +7293,7 @@ validate_runtime_dependencies() {
         mount
         mountpoint
         mktemp
+        readlink
         sed
         sha1sum
         smartctl
@@ -6957,9 +7337,11 @@ main() {
 
     log "RUN" "INFO" "Starting Unraid disk health monitoring"
 
+    cache_lsblk_all
+    discover_device_inventory || return 1
+    migrate_device_identity_histories || true
     load_persistent_state
     parity_state || true
-    cache_lsblk_all
     build_mount_device_map
 
     log "SMART" "INFO" \
