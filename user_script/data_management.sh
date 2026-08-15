@@ -1199,8 +1199,6 @@ safe_move() {
 
     remove_empty_dirs "$src"
 
-    SAFE_MOVE_LAST_BYTES="$transfer_bytes"
-
     log info \
         "MV: completed '$src' transferred=$(human_readable "$transfer_bytes")"
 
