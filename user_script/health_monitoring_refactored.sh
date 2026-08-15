@@ -13,6 +13,8 @@ set -uo pipefail
 ################################################################################
 
 # === SMART Test Scheduling ===
+SHORT_TEST_INTERVAL_DAYS=7                      # Run automatic short tests no more often than this (0=disable)
+SMART_ALLOW_SPINUP=0                            # Allow SMART collection/tests to wake standby SATA HDDs (0=defer)
 SHORT_TEST_POLL=1                               # Poll short test until it completes (0=fire-and-forget)
 SHORT_TEST_MAX_WAIT=180                         # Max seconds to wait while polling short tests
 SHORT_TEST_POLL_INTERVAL=10                     # Interval between polls (seconds)
@@ -301,6 +303,7 @@ declare -A NVME_WEAR_DAYS_LEFT NVME_WEAR_RATE     # NVMe depletion projection
 declare -A IO_ERROR_RAW_MAP                       # Map device -> raw I/O error line count (duplicates included)
 declare -A IO_ERROR_UNIQUE_MAP                    # Map device -> unique I/O error event count (dedup within window)
 declare -A LAST_TEST                              # Map device -> last SMART test timestamp
+declare -A LAST_TEST_EPOCH LAST_TEST_KIND         # Actual test-start epoch/type (legacy date state remains supported)
 declare -A NVME_LAST_UNSAFE                       # NVMe device -> last unsafe shutdown count
 declare -A NVME_LAST_ERRLOG                       # NVMe device -> last error information log entries
 declare -A NVME_LAST_PCIE_CORR                    # NVMe device -> last PCIe correctable error count
@@ -318,6 +321,8 @@ declare -A CMD_TIMEOUT_LAST                       # Map device -> previous comma
 declare -A LONG_TEST_RUNNING_LONG                 # Map device -> 1 if a long/extended self-test is currently in progress
 declare -A RISK_SPIKE_TS                          # Map device -> epoch timestamp of last captured risk spike
 declare -A ALERT_SEEN                             # Exact alert de-duplication within a run
+declare -A SATA_POWER_STATE SMART_DEFERRED         # Cached SATA power state and deferred SMART checks
+declare -A PREVIOUS_RISK                           # Previous persisted risk, retained when a disk stays asleep
 declare -A RISK_MAP AGE_CLASS                     # Canonical risk results and lifecycle annotations
 declare -a NOTIFY_SECTIONS                        # Final notification sections
 declare -a TBW_EVAL_MESSAGES                      # Output from direct TBW evaluation
@@ -694,6 +699,158 @@ lsblk_rota_cached() {
     [[ -n "$source" ]] || source="$(lsblk -b -dn -o NAME,SIZE,ROTA 2>/dev/null || true)"
     awk -v d="${dev##*/}" '$1==d{print $3; exit}' <<<"$source"
 }
+
+# Read a SATA device's power state without intentionally waking it. The result
+# is cached for the run so every SMART-related phase makes the same decision.
+refresh_sata_power_state() {
+    local disk="$1"
+    local state="" probe="" rota=""
+
+    [[ "$disk" == /dev/sd* ]] || return 0
+    [[ -n "${SATA_POWER_STATE[$disk]:-}" ]] && return 0
+
+    if command -v hdparm >/dev/null 2>&1; then
+        state=$(hdparm -C "$disk" 2>/dev/null |
+            awk -F: '/state is/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print tolower($2); exit}')
+    fi
+
+    case "$state" in
+        standby|sleeping|sleep) SATA_POWER_STATE[$disk]="standby"; return 0 ;;
+        active/idle|active|idle) SATA_POWER_STATE[$disk]="active"; return 0 ;;
+    esac
+
+    # smartctl -n exits before normal SMART access when a rotational device is
+    # sleeping. This is a fallback for controllers not supported by hdparm.
+    probe=$(smartctl -n standby -i "$disk" 2>&1 || true)
+    if printf '%s' "$probe" | grep -qiE 'device is in (standby|sleep)|standby mode|sleep mode'; then
+        SATA_POWER_STATE[$disk]="standby"
+        return 0
+    fi
+    if printf '%s' "$probe" | grep -qiE 'device model|model family|smart support|serial number'; then
+        SATA_POWER_STATE[$disk]="active"
+        return 0
+    fi
+
+    rota=$(lsblk_rota_cached "$disk" 2>/dev/null || true)
+    if [[ "$rota" == "0" ]]; then
+        SATA_POWER_STATE[$disk]="solid-state"
+    else
+        SATA_POWER_STATE[$disk]="unknown"
+    fi
+}
+
+# Prepare a device for full SMART access. Return 1 when a rotational SATA disk
+# is asleep (or its power state cannot be proven safe) and wake-up is disabled.
+prepare_smart_access() {
+    local disk="$1"
+    local state
+
+    [[ "$disk" == /dev/sd* ]] || return 0
+    refresh_sata_power_state "$disk"
+    state="${SATA_POWER_STATE[$disk]:-unknown}"
+
+    case "$state" in
+        active|solid-state) return 0 ;;
+        standby|unknown)
+            if (( SMART_ALLOW_SPINUP == 0 )); then
+                return 1
+            fi
+            log "SMART" "INFO" "Wake-up permitted for $disk (power state: $state)"
+            if command -v hdparm >/dev/null 2>&1; then
+                hdparm -I "$disk" >/dev/null 2>&1 || true
+            fi
+            SATA_POWER_STATE[$disk]="active"
+            return 0
+            ;;
+    esac
+
+    return 0
+}
+
+retain_previous_smart_snapshot() {
+    local disk="$1"
+    local power_state="${2:-standby}"
+    local previous_state="${PREV_ATTR["$disk|state"]:-OK}"
+    local composite attr value dedup_key message
+
+    case "$previous_state" in
+        OK|WARNING|CRITICAL) ;;
+        *) previous_state="OK" ;;
+    esac
+
+    SMART_DEFERRED[$disk]="$power_state"
+    SMART_STATE[$disk]="$previous_state"
+    SMART_MSGS[$disk]="SMART collection and self-test deferred (${power_state}; automatic spin-up disabled)"
+
+    # Preserve the previous attribute baseline so persistence and trend delta
+    # calculations do not erase or reset a sleeping disk's last known values.
+    for composite in "${!PREV_ATTR[@]}"; do
+        [[ "$composite" == "$disk|"* ]] || continue
+        attr="${composite#"$disk|"}"
+        [[ "$attr" == "state" ]] && continue
+        value="${PREV_ATTR[$composite]}"
+        CUR_ATTR["$disk|$attr"]="$value"
+    done
+
+    message="Disk $disk remains ${power_state}; previous SMART state $previous_state retained"
+    dedup_key="${previous_state,,}|$NOTIFY_TITLE_SMART|$message"
+    if [[ "$previous_state" == "CRITICAL" && -z "${ALERT_SEEN[$dedup_key]:-}" ]]; then
+        ALERT_SEEN[$dedup_key]=1
+        ALERT_CRIT+=("$NOTIFY_TITLE_SMART: $message")
+        log_crit "$message"
+    elif [[ "$previous_state" == "WARNING" && -z "${ALERT_SEEN[$dedup_key]:-}" ]]; then
+        ALERT_SEEN[$dedup_key]=1
+        ALERT_WARN+=("$NOTIFY_TITLE_SMART: $message")
+        log_warn "$message"
+    fi
+
+    log "SMART" "INFO" "Deferred live SMART collection and self-test for $disk (power state: $power_state)"
+}
+
+short_test_is_due() {
+    local disk="$1"
+    local interval_days="${SHORT_TEST_INTERVAL_DAYS:-0}"
+    local last_epoch="${LAST_TEST_EPOCH[$disk]:-}"
+    local last_date="${LAST_TEST[$disk]:-}"
+    local now_epoch
+
+    [[ "$interval_days" =~ ^[0-9]+$ ]] || return 1
+    (( 10#$interval_days > 0 )) || return 1
+
+    if [[ ! "$last_epoch" =~ ^[0-9]+$ && -n "$last_date" ]]; then
+        last_epoch=$(date -d "$last_date" +%s 2>/dev/null || true)
+    fi
+    [[ "$last_epoch" =~ ^[0-9]+$ ]] || return 0
+
+    now_epoch=$(date +%s)
+    (( now_epoch - last_epoch >= 10#$interval_days * 86400 ))
+}
+
+short_test_next_date() {
+    local disk="$1"
+    local last_epoch="${LAST_TEST_EPOCH[$disk]:-}"
+    local last_date="${LAST_TEST[$disk]:-}"
+    local interval_days="${SHORT_TEST_INTERVAL_DAYS:-0}"
+
+    if [[ ! "$last_epoch" =~ ^[0-9]+$ && -n "$last_date" ]]; then
+        last_epoch=$(date -d "$last_date" +%s 2>/dev/null || true)
+    fi
+    if [[ "$last_epoch" =~ ^[0-9]+$ && "$interval_days" =~ ^[0-9]+$ ]]; then
+        date -d "@$(( last_epoch + 10#$interval_days * 86400 ))" '+%Y-%m-%d %H:%M' 2>/dev/null || true
+    fi
+}
+
+mark_test_started() {
+    local disk="$1"
+    local test_kind="$2"
+    local now_epoch
+
+    now_epoch=$(date +%s)
+    LAST_TEST[$disk]=$(date '+%Y-%m-%d')
+    LAST_TEST_EPOCH[$disk]="$now_epoch"
+    LAST_TEST_KIND[$disk]="$test_kind"
+}
+
 smartctl_cached() {
     local key cache_file temp_file device_arg device_key
 
@@ -877,6 +1034,9 @@ get_device_model() {
     local d
     d=$(base_device "$1")
     [[ -z "$d" ]] && echo "" && return 0
+    # Model lookup uses smartctl and can wake a SATA HDD. Defer it along with
+    # the rest of SMART collection when this run intentionally kept it asleep.
+    [[ -n "${SMART_DEFERRED[$d]:-}" ]] && echo "" && return 0
     if [[ "$d" == /dev/nvme* ]]; then
         smartctl_cached -i -d nvme "$d" 2>/dev/null |
             awk -F: '/Model Number/ {sub(/^ +/,"",$2); print $2; exit}'
@@ -891,6 +1051,10 @@ get_device_model() {
 model_suffix_for() {
     local dev="$1"
     local suffix=""
+    if [[ -n "$dev" && -n "${SMART_DEFERRED[$dev]:-}" ]]; then
+        printf '%s' "$suffix"
+        return 0
+    fi
     if (( ${ENABLE_MODEL_IN_ALERTS:-0} == 1 )) && [[ -n "$dev" ]]; then
         local mdl
         mdl="$(get_device_model "$dev" 2>/dev/null)"
@@ -1439,15 +1603,27 @@ smart_device_for_mount() {
 }
 
 load_persistent_state() {
-    local disk date dev rest token k v line key poh cnt ts
+    local disk date dev rest token k v line key poh cnt ts score
     local now_ts prune_days age_days
 
     now_ts="$(date +%s)"
     prune_days=${LONG_TEST_RISK_LOOKBACK_DAYS:-14}
 
 if [ -f "$SMART_LAST" ]; then
-    while read -r disk date; do
+    while read -r disk date rest; do
+        [[ -n "$disk" && -n "$date" ]] || continue
         LAST_TEST["$disk"]=$date
+        for token in $rest; do
+            k=${token%%=*}
+            v=${token#*=}
+            case "$k" in
+                epoch) [[ "$v" =~ ^[0-9]+$ ]] && LAST_TEST_EPOCH["$disk"]="$v" ;;
+                type) [[ -n "$v" ]] && LAST_TEST_KIND["$disk"]="$v" ;;
+            esac
+        done
+        if [[ ! "${LAST_TEST_EPOCH[$disk]:-}" =~ ^[0-9]+$ ]]; then
+            LAST_TEST_EPOCH["$disk"]=$(date -d "$date" +%s 2>/dev/null || true)
+        fi
     done < "$SMART_LAST"
 fi
 
@@ -1497,6 +1673,13 @@ if [ -f "$PREV_ATTR_FILE" ]; then
         done
     done < "$PREV_ATTR_FILE"
 fi
+
+if [ -f "$RISK_PREV_FILE" ]; then
+    while read -r disk score; do
+        [[ -n "$disk" && "$score" =~ ^[0-9]+$ ]] || continue
+        PREVIOUS_RISK["$disk"]="$score"
+    done < "$RISK_PREV_FILE"
+fi
 if [ -f "$ALERT_NEW_SEEN_FILE" ]; then
     while IFS= read -r key; do
         [[ -n "$key" ]] && NEW_SEEN["$key"]=1
@@ -1536,12 +1719,16 @@ fi
 }
 
 # === Helper Function ===
-# Persist last-run SMART test metadata for a device
+# Persist actual SMART test-start metadata for a device
 save_last_test() {
     local temp_file disk
     temp_file="$(state_temp_file "$SMART_LAST")" || return 1
     for disk in "${!LAST_TEST[@]}"; do
-        printf '%s %s\n' "$disk" "${LAST_TEST[$disk]}" >> "$temp_file"
+        printf '%s %s epoch=%s type=%s\n' \
+            "$disk" \
+            "${LAST_TEST[$disk]}" \
+            "${LAST_TEST_EPOCH[$disk]:-0}" \
+            "${LAST_TEST_KIND[$disk]:-unknown}" >> "$temp_file"
     done
     atomic_commit "$temp_file" "$SMART_LAST"
 }
@@ -2441,13 +2628,9 @@ risk_score_quick() {
 # Launch SMART tests (short/long) as configured
 run_smart_test() {
     local disk=$1
-    if [[ $disk == /dev/sd* ]]; then
-        local pstate
-        pstate=$(hdparm -C "$disk" 2>/dev/null | awk -F: '/state is/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print tolower($2)}')
-        if echo "$pstate" | grep -qi "standby"; then
-            log_info "Spinning up disk $disk (standby -> active) via hdparm -I"
-        fi
-        hdparm -I "$disk" >/dev/null 2>&1 || true
+    if ! prepare_smart_access "$disk"; then
+        retain_previous_smart_snapshot "$disk" "${SATA_POWER_STATE[$disk]:-standby}"
+        return 0
     fi
     local test_kind="short"
     local selftest poh_attr current_poh last_long_hours_diff="" last_long_poh="" threshold_hours=$(( LONG_TEST_MAX_INTERVAL_DAYS * 24 ))
@@ -2575,7 +2758,7 @@ run_smart_test() {
         fi
     fi
     # SMART scheduling: evaluate SMART state & risk once, then decide if long test needed.
-    local state_pre msgs_pre risk_pre schedule_long=0 reasons=()
+    local state_pre msgs_pre risk_pre schedule_long=0 test_due=0 test_started=0 reasons=()
     evaluate_smart "$disk" "pre-test"
     state_pre="${SMART_STATE[$disk]:-OK}"
     msgs_pre="${SMART_MSGS[$disk]:-}"
@@ -2604,10 +2787,11 @@ run_smart_test() {
     if (( risk_pre >= LONG_TEST_RISK_THRESHOLD )) && [[ -z "${last_long_hours_diff:-}" || ${last_long_hours_diff} -ge $risk_age_hours ]]; then schedule_long=1; reasons+=("risk ${risk_pre} >= ${LONG_TEST_RISK_THRESHOLD}"); fi    # Removed explicit SMART_TEST_TYPE override; long tests are scheduled only via risk/critical/interval logic
     if (( schedule_long == 1 )); then
         test_kind="long"
+        test_due=1
         local last_note="no record"
         [[ -n "${last_long_hours_diff:-}" ]] && last_note="${last_long_hours_diff}h"
-        local IFS=','
-        local reason_join="${reasons[*]}"
+        local reason_join
+        reason_join=$(join_by ', ' "${reasons[@]}")
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - LONG test scheduled on $disk (last_long=${last_note}; reasons=${reason_join})"
         LONG_TEST_DECISION+="$disk: long scheduled (last=${last_note}; reasons=${reason_join}; risk=${risk_pre}; state=${state_pre})\n"
         # Alerts only for critical state or risk threshold
@@ -2617,7 +2801,16 @@ run_smart_test() {
             record_alert warning "SMART Scheduling" "Disk $disk long test scheduled (risk ${risk_pre} >= ${LONG_TEST_RISK_THRESHOLD})"
         fi
     else
-        log_smart "$(date '+%Y-%m-%d %H:%M:%S') - SHORT test retained on $disk (risk=${risk_pre} state=${state_pre})"
+        if short_test_is_due "$disk"; then
+            test_due=1
+            log_smart "SHORT test due on $disk (interval=${SHORT_TEST_INTERVAL_DAYS}d, risk=${risk_pre}, state=${state_pre})"
+        elif [[ "${SHORT_TEST_INTERVAL_DAYS:-0}" =~ ^0+$ ]]; then
+            log_smart "Automatic SHORT tests disabled for $disk (SHORT_TEST_INTERVAL_DAYS=0)"
+        else
+            local next_short_date
+            next_short_date=$(short_test_next_date "$disk")
+            log_smart "SHORT test not due on $disk${next_short_date:+; next eligible $next_short_date}"
+        fi
     fi
     # If not scheduled yet but near interval, add to due-soon health alerts list
     if (( schedule_long == 0 )) && [[ -n "${last_long_hours_diff:-}" ]]; then
@@ -2652,21 +2845,36 @@ run_smart_test() {
     if [[ $existing_in_progress -eq 1 ]]; then
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Self-test already in progress on $disk; skipping new start (status: ${exec_status})"
         printf '%s %s in_progress status=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$disk" "$exec_status" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
-    else
+    elif (( test_due == 1 )); then
+        local test_start_output="" test_start_rc=0
         if [[ $disk == /dev/nvme* ]]; then
-            log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Starting NVMe SMART test (-t ${test_kind}) on $disk"
-            smartctl -t "$test_kind" -d nvme "$disk" >/dev/null 2>&1 || true
-            printf '%s %s start type=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$disk" "${test_kind}" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
+            log_smart "Starting NVMe SMART test (-t ${test_kind}) on $disk"
+            test_start_output=$(smartctl -t "$test_kind" -d nvme "$disk" 2>&1)
+            test_start_rc=$?
         else
-            smartctl -t "$test_kind" "$disk" >/dev/null 2>&1 || true
-            printf '%s %s start type=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$disk" "${test_kind}" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
+            log_smart "Starting SATA SMART test (-t ${test_kind}) on $disk"
+            test_start_output=$(smartctl -t "$test_kind" "$disk" 2>&1)
+            test_start_rc=$?
         fi
-        local test_kind_started="${test_kind}"
-        if [[ $test_kind_started == long || $test_kind_started == extended ]]; then
-            LONG_TEST_RUNNING_LONG["$disk"]=1
+
+        if (( test_start_rc == 0 )) ||
+           printf '%s' "$test_start_output" |
+               grep -qiE 'self-test.*(begun|started)|testing has begun|please wait'
+        then
+            test_started=1
+            mark_test_started "$disk" "$test_kind"
+            printf '%s %s start type=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$disk" "${test_kind}" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
+            if [[ $test_kind == long || $test_kind == extended ]]; then
+                LONG_TEST_RUNNING_LONG["$disk"]=1
+            fi
+        else
+            local start_error
+            start_error=$(printf '%s' "$test_start_output" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//' | cut -c1-240)
+            log_warn "SMART test start failed on $disk (type=$test_kind, rc=$test_start_rc): ${start_error:-no output}"
+            record_alert warning "SMART Scheduling" "Disk $disk failed to start $test_kind SMART test"
         fi
     fi
-    if [[ $test_kind == short && $SHORT_TEST_POLL -eq 1 && $existing_in_progress -eq 0 ]]; then
+    if [[ $test_kind == short && $SHORT_TEST_POLL -eq 1 && $test_started -eq 1 ]]; then
         local result
         result=$(poll_short_test_completion "$disk")
         local s sev msg
@@ -2685,13 +2893,15 @@ run_smart_test() {
     else
         if [[ $existing_in_progress -eq 1 ]]; then
             log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Skipping poll (different test still running)"
-        else
+        elif (( test_started == 1 )); then
             sleep 5
         fi
     fi
     # A test can change self-test/capability output. Drop only this run's cache before
     # the post-test read so no pre-test snapshot is accidentally reused.
-    invalidate_smart_cache "$disk"
+    if (( test_started == 1 )); then
+        invalidate_smart_cache "$disk"
+    fi
 
     # Attribute health was evaluated once before scheduling. Short-test completion
     # is classified above, so a second full attribute pass would only duplicate
@@ -2700,7 +2910,6 @@ run_smart_test() {
     if [[ $state == WARNING || $state == CRITICAL ]]; then
         record_alert "$state" "$NOTIFY_TITLE_SMART" "Disk $disk SMART $state: $msgs"
     fi
-    LAST_TEST[$disk]=$(date '+%Y-%m-%d')
     # Persist a compact latest self-test snapshot (even when device self-test log is empty)
     save_selftest_snapshot "$disk"
 }
@@ -2770,6 +2979,11 @@ check_completed_long_tests() {
         [[ -n "$disk" ]] || continue
         # Sanitize disk before smartctl invocations
         if [[ ! "$disk" =~ ^/dev/[A-Za-z0-9]+([p0-9]+)?$ ]]; then continue; fi
+        # Do not wake sleeping rotational devices merely to inspect an old
+        # self-test log. run_smart_test() will retain their previous snapshot.
+        if ! prepare_smart_access "$disk"; then
+            continue
+        fi
         local out model_raw
         if [[ $disk == /dev/nvme* ]]; then
             log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART self-test log read (-l selftest) on $disk"
@@ -3098,6 +3312,7 @@ if (( POH_TREND_ENABLED == 1 )); then
         fi
     fi
     for disk in "${!SMART_STATE[@]}"; do
+        [[ -n "${SMART_DEFERRED[$disk]:-}" ]] && continue
         poh=${CUR_ATTR["$disk|poh"]:-}
         if [[ -n "$poh" && "$poh" =~ ^[0-9]+$ ]]; then
             echo "$today $disk poh=$poh" >> "$POH_HISTORY_FILE"
@@ -3118,6 +3333,7 @@ fi
         fi
     fi
     for disk in "${!SMART_STATE[@]}"; do
+        [[ -n "${SMART_DEFERRED[$disk]:-}" ]] && continue
         # Build compact attribute line: date device attr=value ... (subset of noisy attrs)
         line="$today $disk"
         for key in realloc pending offunc reported_uncorr cmd_timeout realloc_events udma soft_read_err nvme_percent_used unsafe_shutdowns media_errors err_logs pcie_corr pcie_unc therm_t1 therm_t2 warn_temp_time crit_temp_time tbw_bytes poh; do
@@ -5620,6 +5836,7 @@ build_disk_health_summary() {
     local selftest_crit=0 selftest_warn=0
     local poh_hdd=0 poh_ssd=0 poh_nvme=0
     local btrfs_dev_errs=0 xfs_meta_anoms=0 sata_link_down=0 tbw_consumed_warn=0 tbw_consumed_crit=0
+    local deferred_smart_count=${#SMART_DEFERRED[@]}
     for dev in "${!SMART_STATE[@]}"; do
         local st="${SMART_STATE[$dev]:-OK}" msg="${SMART_MSGS[$dev]:-}"
         # Severity tallies
@@ -5661,6 +5878,7 @@ build_disk_health_summary() {
     add_line() { local k="$1"; local v="$2"; if (( ${SHOW_ZERO_COUNTS:-0}==1 )) || (( v>0 )); then lines+=(" - $k: $v"); fi; }
     add_line "Critical" "$crit_count"
     add_line "Warning" "$warn_count"
+    add_line "SMART deferred (standby)" "$deferred_smart_count"
     local parity_invalid=0
     # Only mark invalid when array is idle; suppress during active parity operations
     if [[ "${PARITY_CLEAN_FLAG:-}" == "0" ]]; then
@@ -5717,8 +5935,14 @@ compute_risk_and_lifecycle() {
     for dev in "${!SMART_STATE[@]}"; do
         local st="${SMART_STATE[$dev]:-OK}"
         local msg="${SMART_MSGS[$dev]:-}"
-        local score
-        score="$(risk_score_for_device "$dev" "$st" "$msg")"
+        local score computed_score
+        computed_score="$(risk_score_for_device "$dev" "$st" "$msg")"
+        if [[ -n "${SMART_DEFERRED[$dev]:-}" && "${PREVIOUS_RISK[$dev]:-}" =~ ^[0-9]+$ ]]; then
+            score="${PREVIOUS_RISK[$dev]}"
+            (( computed_score > score )) && score="$computed_score"
+        else
+            score="$computed_score"
+        fi
 
         local poh=0 percent_used=0 life_remain=0
         if [[ $dev == /dev/nvme* ]]; then
@@ -6054,6 +6278,7 @@ tbw_forecast_and_heavy_writers() {
     local today
     today=$(date '+%Y-%m-%d')
     for dev in "${!SMART_STATE[@]}"; do
+        [[ -n "${SMART_DEFERRED[$dev]:-}" ]] && continue
         local tbw=${CUR_ATTR["$dev|tbw_bytes"]:-}
         [[ -n "$tbw" ]] && echo "$today $dev tbw=$tbw" >> "$TBW_HISTORY_FILE"
     done
@@ -6628,23 +6853,18 @@ persist_new_seen() {
 
 persist_risk_scores() {
     local temp_file dev score previous delta
-    local -A previous_risk=()
-
-    if [[ -f "$RISK_PREV_FILE" ]]; then
-        while read -r dev score; do
-            [[ -n "$dev" && "$score" =~ ^[0-9]+$ ]] || continue
-            previous_risk["$dev"]="$score"
-        done < "$RISK_PREV_FILE"
-    fi
 
     temp_file="$(state_temp_file "$RISK_PREV_FILE")" || return 1
 
     for dev in "${!SMART_STATE[@]}"; do
+        previous=${PREVIOUS_RISK["$dev"]:-}
         score="$(risk_score_for_device \
             "$dev" \
             "${SMART_STATE[$dev]}" \
             "${SMART_MSGS[$dev]:-}")"
-        previous=${previous_risk["$dev"]:-}
+        if [[ -n "${SMART_DEFERRED[$dev]:-}" && "$previous" =~ ^[0-9]+$ ]]; then
+            (( previous > score )) && score="$previous"
+        fi
 
         if [[ "$previous" =~ ^[0-9]+$ && "$score" =~ ^[0-9]+$ ]]; then
             delta=$((score - previous))
@@ -6655,6 +6875,7 @@ persist_risk_scores() {
         fi
 
         printf '%s %s\n' "$dev" "$score" >> "$temp_file"
+        PREVIOUS_RISK["$dev"]="$score"
     done
 
     atomic_commit "$temp_file" "$RISK_PREV_FILE"
@@ -6707,6 +6928,15 @@ validate_runtime_dependencies() {
         fi
     done
 
+    if [[ ! "${SHORT_TEST_INTERVAL_DAYS:-}" =~ ^[0-9]+$ ]]; then
+        log "INIT" "ERROR" "SHORT_TEST_INTERVAL_DAYS must be a non-negative integer"
+        return 1
+    fi
+    if [[ ! "${SMART_ALLOW_SPINUP:-}" =~ ^[01]$ ]]; then
+        log "INIT" "ERROR" "SMART_ALLOW_SPINUP must be 0 or 1"
+        return 1
+    fi
+
     return 0
 }
 
@@ -6732,7 +6962,8 @@ main() {
     cache_lsblk_all
     build_mount_device_map
 
-    log "SMART" "INFO" "Collecting SMART health and self-test results"
+    log "SMART" "INFO" \
+        "Collecting SMART health (short-test interval=${SHORT_TEST_INTERVAL_DAYS}d, automatic spin-up=${SMART_ALLOW_SPINUP})"
     collect_smart_health
 
     log "BTRFS" "INFO" "Assessing scrub status"
