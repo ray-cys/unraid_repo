@@ -219,8 +219,6 @@ LOG_MIN_LEVEL="info"
 
 START_TS=$(date +%s)
 
-SAFE_MOVE_LAST_BYTES=0
-
 RENAME_SED_ARGS=()
 
 
@@ -1077,8 +1075,6 @@ safe_move() {
     local dest="$2"
 
     local transfer_bytes
-
-    SAFE_MOVE_LAST_BYTES=0
 
     if [[ ! -d "$src" ]]; then
         log debug "MV: source category missing '$src'"
