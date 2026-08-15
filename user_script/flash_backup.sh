@@ -41,29 +41,39 @@ TEMP_FILE=""
 ###############################################################################
 
 log() {
+
     printf '%s : %s\n' "$(date '+%Y/%m/%d %T')" "$*"
+
 }
 
 syslog() {
+
     local level="$1"
+
     shift
 
     logger \
         -t flash_backup \
         -p "user.${level}" \
         -- "$*"
+
 }
 
 runtime() {
+
     local seconds=$(( $(date +%s) - START_TIME ))
+
     printf '%dh:%dm:%ds' \
         $((seconds / 3600)) \
         $(((seconds % 3600) / 60)) \
         $((seconds % 60))
+
 }
 
 bytes_human() {
+
     local bytes="${1:-0}"
+
     awk -v b="$bytes" '
         BEGIN {
             if (b >= 1099511627776)
@@ -78,9 +88,11 @@ bytes_human() {
                 printf "%d B", b
         }
     '
+
 }
 
 notify() {
+
     local importance="$1"
     local description="$2"
     local message="$3"
@@ -97,33 +109,48 @@ notify() {
         -m "$message" \
         >/dev/null 2>&1 || \
         log "WARNING: Notification command failed"
+
 }
 
 cleanup() {
 
     if [ -n "$MARKER" ]; then
+
         rm -f -- "$MARKER" 2>/dev/null || true
+
     fi
 
     if [ -n "$HELPER_LOG" ]; then
+
         rm -f -- "$HELPER_LOG" 2>/dev/null || true
+
     fi
 
     if [ -n "$TEMP_FILE" ] && [ -f "$TEMP_FILE" ]; then
+
         rm -f -- "$TEMP_FILE" 2>/dev/null || true
+
     fi
+
 }
 
 cleanup_webgui_symlinks() {
 
     [ -d /usr/local/emhttp ] || return 0
+
     while IFS= read -r -d '' link; do
+
         log "Removing WebGUI backup symlink: $link"
+
         if ! rm -f -- "$link"; then
+
             syslog warning \
                 "Unable to remove WebGUI backup symlink: $link"
+
         fi
+
     done < <(
+
         find /usr/local/emhttp \
             -maxdepth 1 \
             -type l \
@@ -133,10 +160,13 @@ cleanup_webgui_symlinks() {
             \) \
             -print0 2>/dev/null
     )
+
 }
 
 verify_zip() {
+
     local file="$1"
+
     [ -f "$file" ] || return 1
     [ -s "$file" ] || return 1
 
@@ -145,8 +175,10 @@ verify_zip() {
     #
 
     if command -v unzip >/dev/null 2>&1; then
+
         unzip -tq "$file" >/dev/null 2>&1
         return $?
+
     fi
 
     #
@@ -156,23 +188,29 @@ verify_zip() {
     local sig
 
     sig=$(head -c 4 "$file" 2>/dev/null || true)
+
     case "$sig" in
         $'PK\003\004'|$'PK\005\006'|$'PK\007\008')
             return 0
             ;;
+
     esac
 
     return 1
+
 }
 
 prune_backups() {
+
     local -a files=()
     local entry
     local count
     local i
 
     while IFS= read -r -d '' entry; do
+
         files+=("${entry#*|}")
+
     done < <(
         find "$BACKUP_DIR" \
             -maxdepth 1 \
@@ -188,16 +226,21 @@ prune_backups() {
     count=${#files[@]}
 
     if (( count <= MAX_BACKUPS )); then
+
         log "Backup retention: ${count}/${MAX_BACKUPS}; nothing to prune"
         return 0
+
     fi
+
     for ((i=MAX_BACKUPS; i<count; i++)); do
 
         log "Deleting old backup: ${files[$i]}"
 
         if ! rm -f -- "${files[$i]}"; then
+        
             syslog warning \
                 "Unable to delete old boot backup: ${files[$i]}"
+
         fi
     done
 }
@@ -209,10 +252,14 @@ prune_backups() {
 exec 9>"$LOCKFILE"
 
 if ! flock -n 9; then
+
     log "Another boot-device backup is already running."
+
     syslog warning \
         "Backup skipped because another instance is running"
+
     exit 1
+
 fi
 
 ###############################################################################
@@ -235,13 +282,18 @@ log "Starting Unraid boot-device backup"
 #
 
 if [ ! -d "$POOL_PATH" ]; then
+
     log "ERROR: Pool path does not exist: $POOL_PATH"
+
     syslog err \
         "Boot backup aborted: pool unavailable: $POOL_PATH"
+
     notify alert \
         "🔴 Backup - POOL UNAVAILABLE" \
         "Destination pool is unavailable."$'\n\n'"Pool: $POOL_PATH"$'\n'"Runtime: $(runtime)"
+
     exit 2
+
 fi
 
 #
@@ -249,20 +301,27 @@ fi
 #
 
 if command -v findmnt >/dev/null 2>&1; then
+
     mount_target=$(
         findmnt -rn -T "$POOL_PATH" -o TARGET 2>/dev/null || true
     )
+
     if [ "$mount_target" != "$POOL_PATH" ]; then
+
         log "ERROR: $POOL_PATH is not an active mount point"
         log "Detected mount target: ${mount_target:-<none>}"
+
         syslog err \
             "Boot backup aborted because $POOL_PATH is not mounted"
+
         notify alert \
             "🔴 Backup - POOL NOT MOUNTED" \
             "$POOL_PATH is not mounted."$'\n\n'"Backup aborted to prevent writing into RAM."$'\n'"Runtime: $(runtime)"
 
         exit 2
+
     fi
+
 fi
 
 #
@@ -270,13 +329,18 @@ fi
 #
 
 if [ ! -x "$HELPER" ]; then
+
     log "ERROR: Native Unraid backup helper not found: $HELPER"
+
     syslog err \
         "Native Unraid boot backup helper missing"
+
     notify alert \
         "🔴 Backup - HELPER MISSING" \
         "Unable to locate:"$'\n'"$HELPER"$'\n\n'"Runtime: $(runtime)"
+
     exit 127
+
 fi
 
 ###############################################################################
@@ -284,15 +348,22 @@ fi
 ###############################################################################
 
 if [ ! -d "$BACKUP_DIR" ]; then
+
     log "Creating backup directory: $BACKUP_DIR"
+
     if ! mkdir -p -- "$BACKUP_DIR"; then
+
         log "ERROR: Unable to create $BACKUP_DIR"
+
         notify alert \
             "🔴 Backup - DIRECTORY ERROR" \
             "Unable to create:"$'\n'"$BACKUP_DIR"$'\n\n'"Runtime: $(runtime)"
+
         exit 3
+
     fi
 fi
+
 chmod 0775 "$BACKUP_DIR" 2>/dev/null || true
 
 #
@@ -302,11 +373,15 @@ chmod 0775 "$BACKUP_DIR" 2>/dev/null || true
 WRITE_TEST="$BACKUP_DIR/.flash_backup_write_test.$$"
 
 if ! touch "$WRITE_TEST" 2>/dev/null; then
+
     log "ERROR: Destination is not writable: $BACKUP_DIR"
+
     notify alert \
         "🔴 Backup - NOT WRITABLE" \
         "Backup destination is not writable:"$'\n'"$BACKUP_DIR"$'\n\n'"Runtime: $(runtime)"
+
     exit 3
+
 fi
 
 rm -f -- "$WRITE_TEST"
@@ -335,12 +410,16 @@ log "Destination free space: $(bytes_human "$AVAILABLE_BYTES")"
 
 MARKER=$(mktemp /tmp/flash_backup_marker.XXXXXX) || {
     log "ERROR: Unable to create backup marker"
+
     exit 4
+
 }
 
 HELPER_LOG=$(mktemp /tmp/flash_backup_helper.XXXXXX) || {
     log "ERROR: Unable to create helper log"
+
     exit 4
+
 }
 
 ###############################################################################
@@ -348,26 +427,35 @@ HELPER_LOG=$(mktemp /tmp/flash_backup_helper.XXXXXX) || {
 ###############################################################################
 
 log "Running native Unraid backup helper"
+
 if "$HELPER" >"$HELPER_LOG" 2>&1; then
+
     log "Native backup helper completed successfully"
+
 else
 
     RC=$?
 
     log "ERROR: Native backup helper exited with code $RC"
+
     while IFS= read -r line; do
+
         log "HELPER: $line"
+
     done < "$HELPER_LOG"
+
     syslog err \
         "Native boot backup helper failed with exit code $RC"
     HELPER_EXCERPT=$(
         tail -n 20 "$HELPER_LOG" 2>/dev/null || true
     )
+
     notify alert \
         "🔴 Backup - FAILED" \
         "Native Unraid backup helper failed."$'\n\n'"Exit code: $RC"$'\n\n'"${HELPER_EXCERPT}"$'\n\n'"Runtime: $(runtime)"
 
     exit "$RC"
+
 fi
 
 ###############################################################################
@@ -439,7 +527,9 @@ if [ -z "$BACKUP_SOURCE" ] || [ ! -f "$BACKUP_SOURCE" ]; then
             log "WARNING: WebGUI symlink could not be resolved to a regular file"
             log "Symlink target: $(readlink "$WEBGUI_LINK" 2>/dev/null || echo '<unknown>')"
         fi
+
     fi
+
 fi
 
 ###############################################################################
@@ -494,6 +584,7 @@ if [ -z "${BACKUP_SOURCE:-}" ] || [ ! -f "${BACKUP_SOURCE:-}" ]; then
         head -n 1 |
         cut -d'|' -f2-
     )
+
 fi
 
 ###############################################################################
@@ -525,8 +616,11 @@ if [ -z "${BACKUP_SOURCE:-}" ] || [ ! -f "$BACKUP_SOURCE" ]; then
     #
 
     while IFS= read -r entry; do
+
         [ -n "$entry" ] || continue
+
         log "WEBGUI BACKUP ENTRY: $entry"
+
     done < <(
         find /usr/local/emhttp \
             -maxdepth 1 \
@@ -559,14 +653,20 @@ SOURCE_SIZE=$(
 
 log "Source size: $(bytes_human "$SOURCE_SIZE")"
 log "Verifying source ZIP archive"
+
 if ! verify_zip "$BACKUP_SOURCE"; then
+
     log "ERROR: Source ZIP verification failed"
+
     syslog err \
         "Boot backup source archive failed ZIP verification: $BACKUP_SOURCE"
+
     notify alert \
         "🔴 Backup - CORRUPT ARCHIVE" \
         "Unraid created a backup archive but ZIP integrity verification failed."$'\n\n'"File: $(basename "$BACKUP_SOURCE")"$'\n'"Size: $(bytes_human "$SOURCE_SIZE")"$'\n'"Runtime: $(runtime)"
+
     exit 6
+
 fi
 
 log "Source ZIP verification passed"
@@ -590,21 +690,28 @@ AVAILABLE_BYTES=$(
 AVAILABLE_BYTES="${AVAILABLE_BYTES:-0}"
 
 if ! [[ "$AVAILABLE_BYTES" =~ ^[0-9]+$ ]]; then
+
     AVAILABLE_BYTES=0
+
 fi
 
 REQUIRED_BYTES=$(( SOURCE_SIZE + 1048576 ))
 
 if (( AVAILABLE_BYTES < REQUIRED_BYTES )); then
+
     log "ERROR: Insufficient destination space"
     log "Required: $(bytes_human "$REQUIRED_BYTES")"
     log "Available: $(bytes_human "$AVAILABLE_BYTES")"
+
     syslog err \
         "Insufficient space for boot backup"
+
     notify alert \
         "🔵 Backup - NO SPACE" \
         "Insufficient destination space."$'\n\n'"Required: $(bytes_human "$REQUIRED_BYTES")"$'\n'"Available: $(bytes_human "$AVAILABLE_BYTES")"$'\n'"Destination: $BACKUP_DIR"$'\n'"Runtime: $(runtime)"
+
     exit 7
+
 fi
 
 ###############################################################################
@@ -625,14 +732,20 @@ TEMP_FILE="$BACKUP_DIR/.${BACKUP_NAME}.tmp.$$"
 
 log "Copying backup to SSD"
 log "Destination: $BACKUP_FILE"
+
 if ! cp -- "$BACKUP_SOURCE" "$TEMP_FILE"; then
+
     log "ERROR: Failed to copy backup to destination"
+
     syslog err \
         "Unable to copy boot backup to $BACKUP_DIR"
+
     notify alert \
         "🔴 Backup - COPY FAILED" \
         "Unable to copy boot backup to:"$'\n'"$BACKUP_DIR"$'\n\n'"Runtime: $(runtime)"
+
     exit 8
+
 fi
 
 ###############################################################################
@@ -644,29 +757,40 @@ DEST_SIZE=$(
 )
 
 if [ "$SOURCE_SIZE" -ne "$DEST_SIZE" ]; then
+
     log "ERROR: Source and destination sizes differ"
     log "Source: $SOURCE_SIZE bytes"
     log "Destination: $DEST_SIZE bytes"
+
     syslog err \
         "Boot backup copy size mismatch"
+
     notify alert \
         "🔴 Backup - SIZE MISMATCH" \
         "Backup copy verification failed."$'\n\n'"Source: $(bytes_human "$SOURCE_SIZE")"$'\n'"Destination: $(bytes_human "$DEST_SIZE")"$'\n'"Runtime: $(runtime)"
+
     exit 9
+
 fi
 
 log "Destination size matches source"
 log "Verifying copied ZIP archive"
 
 if ! verify_zip "$TEMP_FILE"; then
+
     log "ERROR: Destination ZIP verification failed"
+
     syslog err \
         "Copied boot backup failed ZIP verification"
+
     notify alert \
         "🔴 Backup - COPY CORRUPT" \
         "The backup was copied to the SSD but failed ZIP integrity verification."$'\n\n'"Runtime: $(runtime)"
+
     exit 10
+
 fi
+
 log "Copied ZIP verification passed"
 
 ###############################################################################
@@ -678,16 +802,22 @@ log "Copied ZIP verification passed"
 #
 
 if ! mv -f -- "$TEMP_FILE" "$BACKUP_FILE"; then
+
     log "ERROR: Unable to finalize destination archive"
+
     syslog err \
         "Unable to finalize boot backup at destination"
+
     notify alert \
         "🔴 Backup - FINALIZE FAILED" \
         "Backup was copied but could not be finalized."$'\n\n'"Destination: $BACKUP_FILE"$'\n'"Runtime: $(runtime)"
+
     exit 11
+
 fi
 
 TEMP_FILE=""
+
 log "Backup finalized successfully"
 
 ###############################################################################
@@ -719,11 +849,16 @@ chmod 0644 "$BACKUP_FILE" 2>/dev/null || \
 #
 
 if rm -f -- "$BACKUP_SOURCE"; then
+
     log "Removed temporary Unraid source archive: $BACKUP_SOURCE"
+
 else
+
     log "WARNING: Unable to remove source archive: $BACKUP_SOURCE"
+
     syslog warning \
         "Unable to remove temporary boot backup source: $BACKUP_SOURCE"
+
 fi
 
 ###############################################################################
@@ -755,7 +890,9 @@ AVAILABLE_BYTES=$(
 AVAILABLE_BYTES="${AVAILABLE_BYTES:-0}"
 
 if ! [[ "$AVAILABLE_BYTES" =~ ^[0-9]+$ ]]; then
+
     AVAILABLE_BYTES=0
+    
 fi
 
 RUNTIME=$(runtime)
