@@ -3,7 +3,7 @@
 noParity=true
 set -uo pipefail
 
-# Disk Health Monitor for Unraid v2.4
+# Disk Health Monitor for Unraid v2.5
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
@@ -323,6 +323,12 @@ declare -A CMD_TIMEOUT_LAST                       # Map device -> previous comma
 declare -A LONG_TEST_RUNNING_LONG                 # Map device -> 1 if a long/extended self-test is currently in progress
 declare -A RISK_SPIKE_TS                          # Map device -> epoch timestamp of last captured risk spike
 declare -A ALERT_SEEN                             # Exact alert de-duplication within a run
+declare -a FINDING_IDS                            # Ordered canonical finding identifiers
+declare -A FINDING_SEEN                           # Canonical finding de-duplication within a run
+declare -A FINDING_SEVERITY FINDING_CATEGORY      # Finding classification
+declare -A FINDING_SIGNAL FINDING_DEVICE          # Risk signal and normalized base device
+declare -A FINDING_TITLE FINDING_EVIDENCE         # User-facing finding content
+declare -A FINDING_ACTION FINDING_ALERT_TEXT       # Recommended action and rendered alert text
 declare -A SATA_POWER_STATE SMART_DEFERRED         # Cached SATA power state and deferred SMART checks
 declare -A PREVIOUS_RISK                           # Previous persisted risk, retained when a disk stays asleep
 declare -A DEVICE_ID_BY_PATH DEVICE_PATH_BY_ID     # Runtime path <-> stable persistent identity
@@ -789,7 +795,7 @@ retain_previous_smart_snapshot() {
     local disk="$1"
     local power_state="${2:-standby}"
     local previous_state="${PREV_ATTR["$disk|state"]:-OK}"
-    local composite attr value dedup_key message
+    local composite attr value message
 
     case "$previous_state" in
         OK|WARNING|CRITICAL) ;;
@@ -811,15 +817,8 @@ retain_previous_smart_snapshot() {
     done
 
     message="Disk $disk remains ${power_state}; previous SMART state $previous_state retained"
-    dedup_key="${previous_state,,}|$NOTIFY_TITLE_SMART|$message"
-    if [[ "$previous_state" == "CRITICAL" && -z "${ALERT_SEEN[$dedup_key]:-}" ]]; then
-        ALERT_SEEN[$dedup_key]=1
-        ALERT_CRIT+=("$NOTIFY_TITLE_SMART: $message")
-        log_crit "$message"
-    elif [[ "$previous_state" == "WARNING" && -z "${ALERT_SEEN[$dedup_key]:-}" ]]; then
-        ALERT_SEEN[$dedup_key]=1
-        ALERT_WARN+=("$NOTIFY_TITLE_SMART: $message")
-        log_warn "$message"
+    if [[ "$previous_state" == "CRITICAL" || "$previous_state" == "WARNING" ]]; then
+        record_alert "$previous_state" "$NOTIFY_TITLE_SMART" "$message"
     fi
 
     log "SMART" "INFO" "Deferred live SMART collection and self-test for $disk (power state: $power_state)"
@@ -988,36 +987,300 @@ notify_unraid() {
     return 0
 }
 
-# === Helper Function ===
-# Record structured alerts and accumulate for notification severity
-record_alert() {
-    local sev="$1"; shift
-    local title="$1"; shift
-    local body="$1"; shift
-    local normalized_severity="${sev,,}"
-    local dedup_key="$normalized_severity|$title|$body"
+# === Helper Functions ===
+# Classify one finding once. These globals are consumed immediately by
+# record_alert(), avoiding a side-effecting helper inside command substitution.
+classify_finding_metadata() {
+    local title="$1"
+    local body="$2"
+    local lower_title="${title,,}"
+    local lower_body="${body,,}"
 
-    if [[ -n "${ALERT_SEEN[$dedup_key]:-}" ]]; then
-        return 0
-    fi
-    ALERT_SEEN["$dedup_key"]=1
+    FINDING_CLASS_CATEGORY="general"
+    FINDING_CLASS_SIGNAL="advisory"
+    FINDING_CLASS_ACTION="Review the evidence and the related subsystem logs."
 
-    if [[ "$normalized_severity" == "critical" ]]; then
-        ALERT_CRIT+=("$title: $body")
-        log_crit "$title - $body"
-    else
-        ALERT_WARN+=("$title: $body")
-        log_warn "$title - $body"
-    fi
-    # Risk spike capture (store epoch timestamp per device for dynamic long test recommendation)
-    if [[ "$normalized_severity" == "critical" || "$normalized_severity" == "warning" ]]; then
-        # Attempt to extract a device path from body (formats: 'Disk /dev/sdX', 'Disk /dev/nvme0n1')
-        local dev_match
-        dev_match=$(printf '%s' "$body" | grep -Eo '/dev/[A-Za-z0-9]+' | head -n1 || true)
-        if [[ -n "$dev_match" ]]; then
-            RISK_SPIKE_TS["$dev_match"]="$(date +%s)"
+    case "$lower_title|$lower_body" in
+        *"pending sectors"*|*"offline uncorrectable"*|*"reported uncorrectable"*|*"media integrity"*)
+            FINDING_CLASS_CATEGORY="smart"
+            FINDING_CLASS_SIGNAL="smart.media"
+            FINDING_CLASS_ACTION="Back up immediately, run a long SMART test, and plan replacement if the condition remains."
+            ;;
+        *"reallocated"*)
+            FINDING_CLASS_CATEGORY="smart"
+            FINDING_CLASS_SIGNAL="smart.reallocation"
+            FINDING_CLASS_ACTION="Monitor the counter trend and replace the drive if it continues to increase."
+            ;;
+        *"self-test"*)
+            FINDING_CLASS_CATEGORY="smart"
+            FINDING_CLASS_SIGNAL="smart.selftest"
+            FINDING_CLASS_ACTION="Review the self-test log; back up and replace the drive after a failed long test."
+            ;;
+        *"end-to-end errors"*)
+            FINDING_CLASS_CATEGORY="smart"
+            FINDING_CLASS_SIGNAL="smart.end_to_end"
+            FINDING_CLASS_ACTION="Back up the device and inspect both the drive and controller data path."
+            ;;
+        *"soft read error"*)
+            FINDING_CLASS_CATEGORY="smart"
+            FINDING_CLASS_SIGNAL="smart.soft_read"
+            FINDING_CLASS_ACTION="Run a long SMART test and monitor whether the counter continues to rise."
+            ;;
+        *"read-only mode"*)
+            FINDING_CLASS_CATEGORY="smart"
+            FINDING_CLASS_SIGNAL="smart.read_only"
+            FINDING_CLASS_ACTION="Clone or back up the data immediately and replace the NVMe device."
+            ;;
+        *"reliability degraded"*)
+            FINDING_CLASS_CATEGORY="smart"
+            FINDING_CLASS_SIGNAL="smart.reliability"
+            FINDING_CLASS_ACTION="Back up the device and schedule replacement."
+            ;;
+        *"nvme error log"*)
+            FINDING_CLASS_CATEGORY="smart"
+            FINDING_CLASS_SIGNAL="smart.nvme_error_log"
+            FINDING_CLASS_ACTION="Review NVMe logs and firmware, then monitor for continued growth."
+            ;;
+        *"command timeout"*)
+            FINDING_CLASS_CATEGORY="io"
+            FINDING_CLASS_SIGNAL="io.command_timeout"
+            FINDING_CLASS_ACTION="Inspect power, cabling, backplane, and controller logs."
+            ;;
+        *"udma crc"*|*"sata link instability"*)
+            FINDING_CLASS_CATEGORY="io"
+            FINDING_CLASS_SIGNAL="io.sata_link"
+            FINDING_CLASS_ACTION="Reseat or replace the SATA cable and verify the controller/backplane link."
+            ;;
+        *"pcie correctable"*|*"pcie uncorrectable"*)
+            FINDING_CLASS_CATEGORY="io"
+            FINDING_CLASS_SIGNAL="io.pcie_link"
+            FINDING_CLASS_ACTION="Inspect the PCIe slot or backplane, reseat the device, and verify cooling."
+            ;;
+        *"i/o errors unique"*)
+            FINDING_CLASS_CATEGORY="io"
+            FINDING_CLASS_SIGNAL="io.kernel"
+            FINDING_CLASS_ACTION="Inspect cabling, power, controller logs, and the affected device before errors escalate."
+            ;;
+        *"unsafe shutdown"*|*"volatile memory backup"*)
+            FINDING_CLASS_CATEGORY="io"
+            FINDING_CLASS_SIGNAL="io.power"
+            FINDING_CLASS_ACTION="Check UPS, PSU, firmware, and power stability before the counter grows further."
+            ;;
+        temp*|*"temperature"*|*" temp"*|*"thermal"*)
+            FINDING_CLASS_CATEGORY="temperature"
+            FINDING_CLASS_SIGNAL="thermal.exposure"
+            FINDING_CLASS_ACTION="Improve airflow or cooling and reduce sustained I/O until temperature stabilizes."
+            ;;
+        *"tbw"*|*"heavy writer"*)
+            FINDING_CLASS_CATEGORY="endurance"
+            FINDING_CLASS_SIGNAL="endurance.tbw"
+            FINDING_CLASS_ACTION="Reduce write amplification, confirm backups, and plan the device refresh window."
+            ;;
+        *"nvme wear"*|*"available spare"*|*"ssd life remaining"*)
+            FINDING_CLASS_CATEGORY="endurance"
+            FINDING_CLASS_SIGNAL="endurance.wear"
+            FINDING_CLASS_ACTION="Reduce write load and plan replacement before the remaining endurance is exhausted."
+            ;;
+        *"poh age"*|*"load cycle count"*)
+            FINDING_CLASS_CATEGORY="lifecycle"
+            FINDING_CLASS_SIGNAL="lifecycle.age"
+            FINDING_CLASS_ACTION="Keep backups current and plan a proactive refresh based on trend and workload."
+            ;;
+        *"firmware reset"*|*"drive replacement"*)
+            FINDING_CLASS_CATEGORY="lifecycle"
+            FINDING_CLASS_SIGNAL="lifecycle.regression"
+            FINDING_CLASS_ACTION="Verify device identity and firmware, then establish fresh SMART and filesystem baselines."
+            ;;
+        *"btrfs"*)
+            FINDING_CLASS_CATEGORY="filesystem"
+            FINDING_CLASS_SIGNAL="filesystem.btrfs"
+            FINDING_CLASS_ACTION="Run or review a scrub, inspect device health and cabling, and back up before repair."
+            ;;
+        *"xfs"*)
+            FINDING_CLASS_CATEGORY="filesystem"
+            FINDING_CLASS_SIGNAL="filesystem.xfs"
+            FINDING_CLASS_ACTION="Back up first, unmount during maintenance, and run an offline read-only XFS check."
+            ;;
+        *"capacity"*|*"storage warning"*|*"storage critical"*|*"storage validation"*)
+            FINDING_CLASS_CATEGORY="capacity"
+            FINDING_CLASS_SIGNAL="capacity.space"
+            FINDING_CLASS_ACTION="Free space or expand capacity and verify share, cache, and mover settings."
+            ;;
+        *"parity"*)
+            FINDING_CLASS_CATEGORY="parity"
+            FINDING_CLASS_SIGNAL="parity.integrity"
+            FINDING_CLASS_ACTION="Review the parity operation, SMART health, and cabling before a corrective check."
+            ;;
+        *"smart scheduling"*)
+            FINDING_CLASS_CATEGORY="maintenance"
+            FINDING_CLASS_SIGNAL="maintenance.smart_test"
+            FINDING_CLASS_ACTION="Review the scheduled test result on the next run."
+            ;;
+        *"smart"*)
+            FINDING_CLASS_CATEGORY="smart"
+            FINDING_CLASS_SIGNAL="smart.aggregate"
+            FINDING_CLASS_ACTION="Review the device SMART evidence and keep a current backup."
+            ;;
+    esac
+}
+
+finding_code_for_alert() {
+    local title="$1"
+    local body="$2"
+    local code="${title,,}"
+    local discriminator=""
+
+    code="${code//[!a-z0-9]/_}"
+    while [[ "$code" == *__* ]]; do code="${code//__/_}"; done
+    code="${code#_}"
+    code="${code%_}"
+
+    if [[ "$title" == "$NOTIFY_TITLE_SMART" ]]; then
+        if [[ "${body,,}" == *"self-test"* ]]; then
+            discriminator="selftest"
+        elif [[ "${body,,}" == *"deferred"* || "${body,,}" == *"remains standby"* ]]; then
+            discriminator="deferred"
+        else
+            discriminator="aggregate"
         fi
     fi
+
+    case "$title" in
+        "Btrfs Device"|"Btrfs Burst")
+            if [[ "$body" =~ (read_io_errs|write_io_errs|flush_io_errs|corruption_errs|generation_errs) ]]; then
+                discriminator="${BASH_REMATCH[1]}"
+            fi
+            ;;
+        "Firmware Reset")
+            if [[ "$body" == *"Power-On Hours"* ]]; then discriminator="poh"
+            elif [[ "$body" == *"Percentage Used"* || "$body" == *"percent_used"* ]]; then discriminator="wear"
+            fi
+            ;;
+        "XFS Alert")
+            if [[ "$body" =~ Counter[[:space:]]+([A-Za-z0-9_]+) ]]; then
+                discriminator="${BASH_REMATCH[1]}"
+            fi
+            ;;
+        "SMART Trend")
+            discriminator="$(printf '%s' "$body" | cksum | awk '{print $1}')"
+            ;;
+    esac
+
+    FINDING_CODE_RESULT="${code:-finding}${discriminator:+_$discriminator}"
+}
+
+record_finding() {
+    local severity="${1,,}"
+    local category="$2"
+    local signal="$3"
+    local device="$4"
+    local title="$5"
+    local evidence="$6"
+    local action="$7"
+    local code="$8"
+    local scope="global"
+    local mount_ref=""
+    local pool_ref=""
+    local id old_severity requested_severity should_log=0
+
+    [[ "$severity" == "critical" ]] || severity="warning"
+    requested_severity="$severity"
+    if [[ -n "$device" ]]; then
+        device="$(base_device "$device")"
+        scope="device:${device:-unknown}"
+    else
+        mount_ref=$(printf '%s' "$evidence" | grep -Eo '/mnt/[A-Za-z0-9_.-]+' | head -n1 || true)
+        if [[ -n "$mount_ref" ]]; then
+            scope="mount:$mount_ref"
+        elif [[ "$evidence" =~ Pool[[:space:]]+([A-Za-z0-9_.-]+) ]]; then
+            pool_ref="${BASH_REMATCH[1]}"
+            scope="pool:$pool_ref"
+        fi
+    fi
+
+    id="$scope|$code"
+    if [[ -z "${FINDING_SEEN[$id]:-}" ]]; then
+        FINDING_SEEN[$id]=1
+        FINDING_IDS+=("$id")
+        should_log=1
+    fi
+
+    old_severity="${FINDING_SEVERITY[$id]:-}"
+    if [[ "$old_severity" == "critical" && "$requested_severity" != "critical" ]]; then
+        return 0
+    elif [[ "$old_severity" == "warning" && "$severity" == "critical" ]]; then
+        should_log=1
+    fi
+
+    FINDING_SEVERITY[$id]="$severity"
+    FINDING_CATEGORY[$id]="$category"
+    FINDING_SIGNAL[$id]="$signal"
+    FINDING_DEVICE[$id]="$device"
+    FINDING_TITLE[$id]="$title"
+    FINDING_EVIDENCE[$id]="$evidence"
+    FINDING_ACTION[$id]="$action"
+    FINDING_ALERT_TEXT[$id]="$title: $evidence"
+
+    if (( should_log == 1 )); then
+        if [[ "$severity" == "critical" ]]; then
+            log_crit "$title - $evidence"
+        else
+            log_warn "$title - $evidence"
+        fi
+    fi
+
+    if [[ -n "$device" ]]; then
+        RISK_SPIKE_TS[$device]="$(date +%s)"
+    fi
+
+    return 0
+}
+
+# Record one canonical finding. Repeated wording changes for the same device and
+# condition update the evidence instead of adding another risk contribution.
+record_alert() {
+    local severity="$1"
+    local title="$2"
+    local body="$3"
+    local device=""
+
+    device=$(printf '%s' "$body" | grep -Eo '/dev/[A-Za-z0-9]+' | head -n1 || true)
+    classify_finding_metadata "$title" "$body"
+    finding_code_for_alert "$title" "$body"
+    record_finding \
+        "$severity" \
+        "$FINDING_CLASS_CATEGORY" \
+        "$FINDING_CLASS_SIGNAL" \
+        "$device" \
+        "$title" \
+        "$body" \
+        "$FINDING_CLASS_ACTION" \
+        "$FINDING_CODE_RESULT"
+}
+
+# Rebuild the legacy alert arrays from the canonical registry only after every
+# collector has finished. Existing subsystem summaries therefore consume the
+# same de-duplicated severity/evidence set as notification rendering.
+materialize_alerts_from_findings() {
+    local severity id text
+
+    ALERT_WARN=()
+    ALERT_CRIT=()
+    ALERT_SEEN=()
+
+    for severity in critical warning; do
+        for id in "${FINDING_IDS[@]}"; do
+            [[ "${FINDING_SEVERITY[$id]:-}" == "$severity" ]] || continue
+            text="${FINDING_ALERT_TEXT[$id]:-}"
+            [[ -n "$text" ]] || continue
+            ALERT_SEEN[$id]=1
+            if [[ "$severity" == "critical" ]]; then
+                ALERT_CRIT+=("$text")
+            else
+                ALERT_WARN+=("$text")
+            fi
+        done
+    done
 }
 
 # === Helper Function ===
@@ -2177,6 +2440,7 @@ evaluate_smart() {
         # Decode Critical Warning bitfield and append detailed messages
         if [[ $crit_warn -ne 0 ]]; then
             state="CRITICAL"; messages+=("NVMe Critical Warning flags: $crit_warn")
+            record_alert critical "NVMe Critical Warning" "Disk $disk NVMe Critical Warning flags: $crit_warn"
             local cw_dec=""
             if [[ $crit_warn =~ ^0x[0-9A-Fa-f]+$ ]]; then
                 cw_dec=$((16#${crit_warn#0x}))
@@ -2185,20 +2449,25 @@ evaluate_smart() {
             fi
             if (( (cw_dec & 0x02) != 0 )); then
                 messages+=("NVMe thermal threshold exceeded (Critical Warning bit1)")
+                record_alert critical "NVMe Thermal Warning" "Disk $disk NVMe thermal threshold exceeded (Critical Warning bit1)"
             fi
             if (( (cw_dec & 0x01) != 0 )); then
                 # Available spare below threshold (warn)
                 local dup=0; for m in "${messages[@]}"; do [[ $m == *"Available Spare"* ]] && dup=1; done; (( dup==0 )) && messages+=("NVMe available spare below threshold (Critical Warning bit0)")
                 [[ $state == OK ]] && state="WARNING"
+                record_alert warning "NVMe Available Spare" "Disk $disk NVMe available spare below threshold (Critical Warning bit0)"
             fi
             if (( (cw_dec & 0x04) != 0 )); then
                 state="CRITICAL"; messages+=("NVMe reliability degraded (Critical Warning bit2)")
+                record_alert critical "NVMe Reliability" "Disk $disk NVMe reliability degraded (Critical Warning bit2)"
             fi
             if (( (cw_dec & 0x08) != 0 )); then
                 state="CRITICAL"; messages+=("NVMe media in read-only mode (Critical Warning bit3)")
+                record_alert critical "NVMe Read-Only" "Disk $disk NVMe media in read-only mode (Critical Warning bit3)"
             fi
             if (( (cw_dec & 0x10) != 0 )); then
                 [[ $state == OK ]] && state="WARNING"; messages+=("NVMe volatile memory backup failed (Critical Warning bit4)")
+                record_alert warning "NVMe Volatile Memory" "Disk $disk NVMe volatile memory backup failed (Critical Warning bit4)"
             fi
         fi
         # Flag media/data integrity errors and low spare
@@ -2887,77 +3156,131 @@ poll_short_test_completion() {
     return 0
 }
 
-# === Helper Function ===
-# Canonical risk scorer used by scheduling, ranking, persistence, and lifecycle
-# classification. Pass an empty device for message-only provisional scoring.
+# === Helper Functions ===
+# Map a canonical signal to one risk contribution. Severity is used only where
+# the configured weights distinguish warning from critical evidence.
+risk_points_for_signal() {
+    local signal="$1"
+    local severity="$2"
+    local points=0
+
+    case "$signal" in
+        smart.media)             points=$W_UNCORR ;;
+        smart.reallocation)      points=$W_REALLOC ;;
+        smart.selftest)
+            if [[ "$severity" == "critical" ]]; then
+                points=$W_SELFTEST_CRIT
+            else
+                points=$W_SELFTEST_WARN
+            fi
+            ;;
+        smart.end_to_end)        points=$W_E2E ;;
+        smart.soft_read)         points=$W_SOFT_READ ;;
+        smart.read_only)         points=$W_NVME_RO ;;
+        smart.reliability)       points=$W_NVME_REL ;;
+        smart.nvme_error_log)    points=$W_NVME_ERR_LOG ;;
+        io.command_timeout)      points=$W_CMD_TIMEOUT ;;
+        io.sata_link)            points=$W_SATA_LINK_DOWN ;;
+        io.pcie_link)
+            if [[ "$severity" == "critical" ]]; then
+                points=$W_NVME_PCIE_UNC
+            else
+                points=$W_NVME_PCIE_CORR
+            fi
+            ;;
+        io.kernel)
+            if [[ "$severity" == "critical" ]]; then
+                points=$W_UNCORR
+            else
+                points=$W_CMD_TIMEOUT
+            fi
+            ;;
+        io.power)                points=$W_CMD_TIMEOUT ;;
+        thermal.exposure)        points=$W_NVME_TEMP_TIME ;;
+        endurance.tbw)
+            if [[ "$severity" == "critical" ]]; then
+                points=$W_TBW_CONS_CRIT
+            else
+                points=$W_TBW_CONS_WARN
+            fi
+            ;;
+        endurance.wear)          points=$W_NVME_WEAR ;;
+        lifecycle.age)           points=$W_POH_HDD ;;
+        lifecycle.regression)    points=$W_AGE_NEAR ;;
+        filesystem.btrfs)        points=$W_BTRFS_DEV_ERR ;;
+        filesystem.xfs)          points=$W_XFS_META_ERR ;;
+    esac
+
+    printf '%s\n' "$points"
+}
+
+# Canonical scorer used by SMART scheduling, ranking, persistence, and lifecycle
+# classification. Each underlying signal contributes at most once per device,
+# even when several collectors report different evidence for that signal.
 risk_score_for_device() {
     local dev="$1"
-    local st="$2"
-    local msg="$3"
-    local score=0
-
-    case "$st" in
-        CRITICAL) ((score += W_SEV_CRIT));;
-        WARNING)  ((score += W_SEV_WARN));;
-    esac
-    [[ $msg == *"Pending sectors"* ]] && ((score += W_PENDING))
-    [[ $msg == *"Offline Uncorrectable"* || $msg == *"Reported Uncorrectable"* ]] && ((score += W_UNCORR))
-    [[ $msg == *"Reallocated ="* ]] && ((score += W_REALLOC))
-    [[ $msg == *"Reallocated Event Count"* ]] && ((score += W_REALLOC_EVENTS))
-    [[ $msg == *"Command Timeout"* ]] && ((score += W_CMD_TIMEOUT))
-    [[ $msg == *"UDMA CRC Errors"* ]] && ((score += W_CRC))
-    [[ $msg == *"SSD life remaining"* ]] && ((score += W_SSD_LIFE))
-    [[ $msg == *"NVMe wear"* ]] && ((score += W_NVME_WEAR))
-    [[ $msg == *"NVMe error log entries increased"* ]] && ((score += W_NVME_ERR_LOG))
-    [[ $msg == *"NVMe PCIe correctable errors increased"* ]] && ((score += W_NVME_PCIE_CORR))
-    [[ $msg == *"NVMe PCIe uncorrectable errors increased"* ]] && ((score += W_NVME_PCIE_UNC))
-    [[ $msg == *"NVMe thermal transitions T1 increased"* ]] && ((score += W_NVME_THERM_TRANS))
-    [[ $msg == *"NVMe thermal transitions T2 increased"* ]] && ((score += W_NVME_THERM_TRANS))
-    [[ $msg == *"NVMe warning temperature time"* ]] && ((score += W_NVME_TEMP_TIME))
-    [[ $msg == *"NVMe critical temperature time"* ]] && ((score += W_NVME_TEMP_TIME))
-    [[ $msg == *"POH age HDD"* ]] && ((score += W_POH_HDD))
-    [[ $msg == *"POH age SSD"* ]] && ((score += W_POH_SSD))
-    [[ $msg == *"POH age NVMe"* ]] && ((score += W_POH_NVME))
-    [[ $msg == *"Btrfs device errors"* ]] && ((score += W_BTRFS_DEV_ERR))
-    [[ $msg == *"XFS metadata anomalies"* ]] && ((score += W_XFS_META_ERR))
-    [[ $msg == *"SATA link downshift"* ]] && ((score += W_SATA_LINK_DOWN))
-    [[ $msg == *"Self-test critical"* || $msg == *"long self-test CRITICAL"* ]] && ((score += W_SELFTEST_CRIT))
-    [[ $msg == *"Self-test warning"* || $msg == *"short self-test warning"* ]] && ((score += W_SELFTEST_WARN))
-    [[ $msg == *"Temp"* ]] && ((score += W_TEMP))
-    [[ $msg == *"End-to-End Errors"* ]] && ((score += W_E2E))
-    [[ $msg == *"Soft Read Error Rate"* ]] && ((score += W_SOFT_READ))
-    [[ $msg == *"read-only mode"* ]] && ((score += W_NVME_RO))
-    [[ $msg == *"reliability degraded"* ]] && ((score += W_NVME_REL))
+    local state="$2"
+    local _legacy_message="${3:-}"
+    local base_dev=""
+    local score=0 id signal severity points existing
+    local percent_used life_remaining tbw_consumed
+    declare -A SIGNAL_POINTS=()
 
     if [[ -n "$dev" ]]; then
-        local percent_used life_remaining tbw_consumed
+        base_dev="$(base_device "$dev")"
+    fi
 
-        percent_used=${CUR_ATTR["$dev|nvme_percent_used"]:-0}
-        life_remaining=${CUR_ATTR["$dev|life_remain"]:-0}
-        tbw_consumed=${CUR_ATTR["$dev|tbw_consumed_pct"]:-0}
+    case "$state" in
+        CRITICAL) ((score += W_SEV_CRIT)) ;;
+        WARNING)  ((score += W_SEV_WARN)) ;;
+    esac
+
+    if [[ -n "$base_dev" ]]; then
+        for id in "${FINDING_IDS[@]}"; do
+            [[ "${FINDING_DEVICE[$id]:-}" == "$base_dev" ]] || continue
+            signal="${FINDING_SIGNAL[$id]:-advisory}"
+            severity="${FINDING_SEVERITY[$id]:-warning}"
+            points="$(risk_points_for_signal "$signal" "$severity")"
+            [[ "$points" =~ ^[0-9]+$ ]] || points=0
+            existing="${SIGNAL_POINTS[$signal]:-0}"
+            if (( points > existing )); then
+                SIGNAL_POINTS[$signal]=$points
+            fi
+        done
+
+        # Direct attribute fallbacks cover retained/migrated state even when a
+        # device was not awake long enough to emit a fresh finding this run.
+        percent_used=${CUR_ATTR["$base_dev|nvme_percent_used"]:-0}
+        life_remaining=${CUR_ATTR["$base_dev|life_remain"]:-0}
+        tbw_consumed=${CUR_ATTR["$base_dev|tbw_consumed_pct"]:-0}
 
         if [[ "$percent_used" =~ ^[0-9]+$ ]] && (( percent_used >= 90 )); then
-            ((score += W_AGE_NEAR))
+            existing="${SIGNAL_POINTS["endurance.wear"]:-0}"
+            (( W_AGE_NEAR > existing )) && SIGNAL_POINTS["endurance.wear"]=$W_AGE_NEAR
         elif [[ "$life_remaining" =~ ^[0-9]+$ ]] &&
              (( life_remaining > 0 && life_remaining <= 10 ))
         then
-            ((score += W_AGE_NEAR))
+            existing="${SIGNAL_POINTS["endurance.wear"]:-0}"
+            (( W_AGE_NEAR > existing )) && SIGNAL_POINTS["endurance.wear"]=$W_AGE_NEAR
         fi
 
         if [[ "$tbw_consumed" =~ ^[0-9]+$ ]]; then
-            if (( tbw_consumed >= TBW_CONSUMED_CRIT )); then
-                ((score += W_TBW_CONS_CRIT))
-            elif (( tbw_consumed >= TBW_CONSUMED_WARN )); then
-                ((score += W_TBW_CONS_WARN))
+            existing="${SIGNAL_POINTS["endurance.tbw"]:-0}"
+            if (( tbw_consumed >= TBW_CONSUMED_CRIT && W_TBW_CONS_CRIT > existing )); then
+                SIGNAL_POINTS["endurance.tbw"]=$W_TBW_CONS_CRIT
+            elif (( tbw_consumed >= TBW_CONSUMED_WARN && W_TBW_CONS_WARN > existing )); then
+                SIGNAL_POINTS["endurance.tbw"]=$W_TBW_CONS_WARN
             fi
         fi
     fi
 
-    printf '%s\n' "$score"
-}
+    for signal in "${!SIGNAL_POINTS[@]}"; do
+        points="${SIGNAL_POINTS[$signal]:-0}"
+        ((score += points))
+    done
+    (( score > 100 )) && score=100
 
-risk_score_quick() {
-    risk_score_for_device "" "$1" "$2"
+    printf '%s\n' "$score"
 }
 
 # === Helper Function ===
@@ -3097,11 +3420,21 @@ run_smart_test() {
         fi
     fi
     # SMART scheduling: evaluate SMART state & risk once, then decide if long test needed.
-    local state_pre msgs_pre risk_pre schedule_long=0 test_due=0 test_started=0 reasons=()
+    local state_pre msgs_pre risk_pre previous_risk_pre schedule_long=0 test_due=0 test_started=0 reasons=()
     evaluate_smart "$disk" "pre-test"
     state_pre="${SMART_STATE[$disk]:-OK}"
     msgs_pre="${SMART_MSGS[$disk]:-}"
-    risk_pre=$(risk_score_quick "$state_pre" "$msgs_pre")
+    risk_pre=$(risk_score_for_device "$disk" "$state_pre" "$msgs_pre")
+    # The previous value is the last fully finalized canonical score (including
+    # filesystem, I/O, endurance, and trend findings). Keep the higher value so
+    # test scheduling does not ignore a recent non-SMART risk signal merely
+    # because those collectors run later in the current cycle.
+    previous_risk_pre="${PREVIOUS_RISK[$disk]:-}"
+    if [[ "$previous_risk_pre" =~ ^[0-9]+$ ]] &&
+       (( previous_risk_pre > risk_pre ))
+    then
+        risk_pre=$previous_risk_pre
+    fi
     local crit_age_hours=$(( LONG_TEST_CRITICAL_MIN_DAYS * 24 ))
     local risk_age_hours=$(( LONG_TEST_RISK_MIN_DAYS * 24 ))
     # No previous long test record: optionally force initial long only if LONG_TEST_INITIAL_FORCE=1
@@ -4609,9 +4942,16 @@ build_health_alerts() {
         declare -A FR_EVENTS FR_COUNT FR_FRIENDLY FR_MODEL_SUFFIX FR_CRIT
         # Iterate over alerts (critical first) and map to per-device or per-mount actions
         for x in "${ALERT_CRIT[@]}" "${ALERT_WARN[@]}"; do
-            local disk_ref mnt_ref
+            local disk_ref mnt_ref canonical_action="" canonical_title="" finding_id
             disk_ref=$(echo "$x" | grep -o '/dev/[a-zA-Z0-9]*' | head -n1 || true)
             mnt_ref=$(echo "$x" | grep -o '/mnt/[a-zA-Z0-9_-]*' | head -n1 || true)
+            for finding_id in "${FINDING_IDS[@]}"; do
+                if [[ "${FINDING_ALERT_TEXT[$finding_id]:-}" == "$x" ]]; then
+                    canonical_action="${FINDING_ACTION[$finding_id]:-}"
+                    canonical_title="${FINDING_TITLE[$finding_id]:-Finding}"
+                    break
+                fi
+            done
             local friendly="$disk_ref"
             local bdev=""
             if [[ -n "$disk_ref" ]]; then
@@ -4870,6 +5210,13 @@ build_health_alerts() {
                     fi ;;
                 *"I/O errors unique"*)
                     [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: High I/O error frequency; check SATA/NVMe cabling, power stability, controller logs; consider moving data & replacing if persistent.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
+                *)
+                    if [[ -n "$canonical_action" ]]; then
+                        local fallback_target="${display_friendly:-${mnt_ref:-$canonical_title}}"
+                        rec+="- ${fallback_target}${model_suffix}: ${canonical_action}\n"
+                        [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
+                    fi
+                    ;;
             esac
         done
         # Emit aggregated firmware reset guidance lines (after collecting all events)
@@ -4948,7 +5295,7 @@ build_health_alerts() {
             local base; base="$(base_device "$dev")"
             # SMART component (normalize to 0–100)
             local sm_raw sm_norm
-            sm_raw="$(risk_score_quick "$st" "${SMART_MSGS[$dev]:-}")"
+            sm_raw="$(risk_score_for_device "$dev" "$st" "${SMART_MSGS[$dev]:-}")"
             [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
             if (( sm_raw > 100 )); then sm_norm=100; else sm_norm=$sm_raw; fi
             # Apply burst boost (base device scope)
@@ -5066,7 +5413,7 @@ build_health_alerts() {
             # Composite score (SMART + I/O error + capacity)
             local st sm_raw sm_norm uniq err_norm cap_norm=0 arr_slot="" k
             st="${SMART_STATE[$dev]:-OK}"
-            sm_raw="$(risk_score_quick "$st" "${SMART_MSGS[$dev]:-}")"; [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
+            sm_raw="$(risk_score_for_device "$dev" "$st" "${SMART_MSGS[$dev]:-}")"; [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
             sm_norm=$(( sm_raw > 100 ? 100 : sm_raw ))
                         # Burst boost (NVMe wear guidance)
                         local _burst_boost=${BURST_BOOST[$dev]:-${BURST_BOOST[$base_dev]:-0}}
@@ -5157,7 +5504,7 @@ build_health_alerts() {
                 # SMART-based quick risk component + burst boost
                 local st sm_raw sm_norm base_dev
                 st="${SMART_STATE[$dev]:-OK}"
-                sm_raw="$(risk_score_quick "$st" "${SMART_MSGS[$dev]:-}")"; [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
+                sm_raw="$(risk_score_for_device "$dev" "$st" "${SMART_MSGS[$dev]:-}")"; [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
                 sm_norm=$(( sm_raw > 100 ? 100 : sm_raw ))
                 base_dev="$(base_device "$dev")"
                 local _burst_boost=${BURST_BOOST[$dev]:-${BURST_BOOST[$base_dev]:-0}}
@@ -5226,7 +5573,7 @@ build_health_alerts() {
             # Composite score per device
             local st sm_raw sm_norm uniq err_norm cap_norm=0 arr_slot="" k base_dev
             st="${SMART_STATE[$dev]:-OK}"
-            sm_raw="$(risk_score_quick "$st" "${SMART_MSGS[$dev]:-}")"; [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
+            sm_raw="$(risk_score_for_device "$dev" "$st" "${SMART_MSGS[$dev]:-}")"; [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
             sm_norm=$(( sm_raw > 100 ? 100 : sm_raw ))
             base_dev="$(base_device "$dev")"
             # Burst boost (long test guidance)
@@ -5336,11 +5683,11 @@ build_trend_section() {
                     if awk -v r="$rate" -v c="$TEMP_RATE_CRIT_C_PER_DAY" \
                         'BEGIN { exit !(r >= c) }'
                     then
-                        record_alert critical "Temperature Rate" "$(basename "$tdev") rising +${rise}C over ${days}d (~${rate}C/day)"
+                        record_alert critical "Temperature Rate" "Disk $tdev rising +${rise}C over ${days}d (~${rate}C/day)"
                     elif awk -v r="$rate" -v w="$TEMP_RATE_WARN_C_PER_DAY" \
                         'BEGIN { exit !(r >= w) }'
                     then
-                        record_alert warning "Temperature Rate" "$(basename "$tdev") rising +${rise}C over ${days}d (~${rate}C/day)"
+                        record_alert warning "Temperature Rate" "Disk $tdev rising +${rise}C over ${days}d (~${rate}C/day)"
                     fi
                 fi
             fi
@@ -5383,7 +5730,7 @@ build_trend_section() {
                     local st sm_raw sm_norm base_dev uniq err_norm
                     base_dev="$(base_device "$tdev")"
                     st="${SMART_STATE[$tdev]:-${SMART_STATE[$base_dev]:-OK}}"
-                    sm_raw="$(risk_score_quick "$st" "${SMART_MSGS[$tdev]:-${SMART_MSGS[$base_dev]:-}}")"; [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
+                    sm_raw="$(risk_score_for_device "$base_dev" "$st" "${SMART_MSGS[$tdev]:-${SMART_MSGS[$base_dev]:-}}")"; [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
                     sm_norm=$(( sm_raw > 100 ? 100 : sm_raw ))
                                         # Burst boost (temperature rate guidance)
                                         local _burst_boost=${BURST_BOOST[$tdev]:-${BURST_BOOST[$base_dev]:-0}}
@@ -7555,10 +7902,13 @@ persist_risk_scores() {
 
     for dev in "${!SMART_STATE[@]}"; do
         previous=${PREVIOUS_RISK["$dev"]:-}
-        score="$(risk_score_for_device \
-            "$dev" \
-            "${SMART_STATE[$dev]}" \
-            "${SMART_MSGS[$dev]:-}")"
+        score="${RISK_MAP[$dev]:-}"
+        if [[ ! "$score" =~ ^[0-9]+$ ]]; then
+            score="$(risk_score_for_device \
+                "$dev" \
+                "${SMART_STATE[$dev]}" \
+                "${SMART_MSGS[$dev]:-}")"
+        fi
         if [[ -n "${SMART_DEFERRED[$dev]:-}" && "$previous" =~ ^[0-9]+$ ]]; then
             (( previous > score )) && score="$previous"
         fi
@@ -7710,17 +8060,19 @@ main() {
     tbw_forecast_and_heavy_writers
     detect_counter_resets
 
-    log "RISK" "INFO" "Computing canonical risk and lifecycle state"
-    compute_risk_and_lifecycle
-    persist_risk_tier_history
-
-    # Trend analysis can raise alerts, so it must complete before alert rendering.
+    # Trend analysis can raise findings, so it must complete before canonical
+    # risk, lifecycle classification, and alert rendering.
     log "TREND" "INFO" "Compiling trend analytics"
     build_trend_section
 
+    log "RISK" "INFO" "Computing canonical risk and lifecycle state"
+    compute_risk_and_lifecycle
+    materialize_alerts_from_findings
+
     log "REPORT" "INFO" "Finalizing alert and summary sections"
-    build_health_alerts
     build_disk_health_summary
+    persist_risk_tier_history
+    build_health_alerts
     build_subsystem_lines
     build_subject
     compose_notification
