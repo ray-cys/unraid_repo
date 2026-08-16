@@ -9,7 +9,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.10
+# Disk Health Monitor for Unraid v2.11
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
@@ -392,6 +392,7 @@ SYSLOG_CURSOR_PENDING_SIZE=0
 SYSLOG_CURSOR_PENDING_ANCHOR="-"
 SYSLOG_CHUNK_FILE=""
 RUN_MODE="monitor"
+REGRESSION_FIXTURE_COUNT=32
 CONFIG_ERROR_COUNT=0
 CONFIG_WARNING_COUNT=0
 DEPENDENCY_ERROR_COUNT=0
@@ -830,6 +831,13 @@ run_bounded_checked() {
     return "$rc"
 }
 
+smartctl_exit_has_operational_failure() {
+    local rc="${1:-}"
+
+    [[ "$rc" =~ ^[0-9]+$ ]] || return 0
+    (( (rc & 3) != 0 ))
+}
+
 smartctl_bounded() {
     local device="${*: -1}"
     local rc
@@ -838,7 +846,9 @@ smartctl_bounded() {
     rc=$?
     # smartctl uses a bitmask: bits 0/1 are command-line or device-open
     # failures, while higher bits describe actual SMART health findings.
-    if (( rc != 124 && rc != 137 && (rc & 3) != 0 )); then
+    if (( rc != 124 && rc != 137 )) &&
+       smartctl_exit_has_operational_failure "$rc"
+    then
         record_collector_event FAILED "smartctl $device" "command_or_open_failure rc=$rc"
     fi
     return "$rc"
@@ -1447,7 +1457,7 @@ smartctl_cached() {
             rm -f -- "$temp_file" 2>/dev/null || true
             return "$rc"
         fi
-        if (( (rc & 3) != 0 )); then
+        if smartctl_exit_has_operational_failure "$rc"; then
             rm -f -- "$temp_file" 2>/dev/null || true
             return "$rc"
         fi
@@ -1889,7 +1899,13 @@ emit_sorted_finding_ids() {
             severity_rank=1
         fi
         device="${FINDING_DEVICE[$id]:-}"
-        risk="${RISK_MAP[$device]:-0}"
+        risk=0
+        # Global, pool, and mount findings intentionally have no device. Bash
+        # associative arrays reject an empty subscript, so only perform the
+        # lookup for a normalized non-empty device key.
+        if [[ -n "$device" ]]; then
+            risk="${RISK_MAP[$device]:-0}"
+        fi
         [[ "$risk" =~ ^[0-9]+$ ]] || risk=0
         (( risk > 999 )) && risk=999
         category_rank="$(finding_category_rank "${FINDING_CATEGORY[$id]:-general}")"
@@ -1943,6 +1959,311 @@ base_device() {
     else
         echo "$d" | sed -E 's/[0-9]+$//'
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Pure parser helpers
+# ---------------------------------------------------------------------------
+# These helpers accept captured text and emit normalized values only. Normal
+# monitoring and the built-in fixtures therefore exercise the same parsers
+# without requiring the fixture suite to access a live disk or filesystem.
+
+smart_labeled_field_value() {
+    local output="$1"
+    local wanted="$2"
+    local mode="${3:-number}"
+
+    printf '%s\n' "$output" | awk -F: -v wanted="$wanted" -v mode="$mode" '
+        function trim(value) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            return value
+        }
+        function normalize(value) {
+            value=trim(value)
+            gsub(/[[:space:]]+/, " ", value)
+            return tolower(value)
+        }
+        BEGIN { wanted_normalized=normalize(wanted) }
+        {
+            key=$1
+            if (normalize(key) != wanted_normalized) next
+            value=substr($0, index($0, ":") + 1)
+            value=trim(value)
+            if (mode == "text") {
+                print value
+            } else if (mode == "scalar") {
+                split(value, fields, /[[:space:]]+/)
+                scalar=fields[1]
+                gsub(/,|%/, "", scalar)
+                if (scalar ~ /^[0-9]+$/) {
+                    sub(/^0+/, "", scalar)
+                    if (scalar == "") scalar="0"
+                    print scalar
+                } else if (scalar ~ /^0[xX][0-9A-Fa-f]+$/) {
+                    print scalar
+                }
+            } else if (match(value, /[0-9][0-9,]*/)) {
+                number=substr(value, RSTART, RLENGTH)
+                gsub(/,/, "", number)
+                sub(/^0+/, "", number)
+                if (number == "") number="0"
+                print number
+            }
+            exit
+        }
+    '
+}
+
+ata_smart_attribute_value() {
+    local output="$1"
+    local selector="$2"
+    local value_kind="${3:-raw}"
+    local field=10
+
+    [[ "$value_kind" == "normalized" ]] && field=4
+    printf '%s\n' "$output" | awk -v selector="$selector" -v field="$field" '
+        /^[[:space:]]*[0-9]+[[:space:]]/ {
+            id=$1
+            name=$2
+            if (selector ~ /^[0-9]+$/) {
+                if (id != selector) next
+            } else if (name !~ "^(" selector ")$") {
+                next
+            }
+            value=$field
+            gsub(/,/, "", value)
+            if (value ~ /^[0-9]+$/) {
+                sub(/^0+/, "", value)
+                if (value == "") value="0"
+                print value
+            }
+            exit
+        }
+    '
+}
+
+ata_smart_attribute_row_count() {
+    local output="$1"
+
+    printf '%s\n' "$output" | awk \
+        '/^[[:space:]]*[0-9]+[[:space:]]+[A-Za-z0-9_-]+[[:space:]]/ {count++} END {print count+0}'
+}
+
+ata_smart_output_is_complete() {
+    local output="$1"
+    local row_count poh
+
+    row_count=$(ata_smart_attribute_row_count "$output")
+    poh=$(ata_smart_attribute_value "$output" "Power_On_Hours|Power_On_Hours_and_Msec")
+    [[ "$row_count" =~ ^[0-9]+$ ]] && (( row_count >= 5 )) && [[ "$poh" =~ ^[0-9]+$ ]]
+}
+
+nvme_smart_output_is_complete() {
+    local output="$1"
+
+    [[ -n "$(smart_labeled_field_value "$output" "Critical Warning" scalar)" ]] &&
+    [[ -n "$(smart_labeled_field_value "$output" "Temperature" number)" ]] &&
+    [[ -n "$(smart_labeled_field_value "$output" "Available Spare" number)" ]] &&
+    [[ -n "$(smart_labeled_field_value "$output" "Available Spare Threshold" number)" ]] &&
+    [[ -n "$(smart_labeled_field_value "$output" "Percentage Used" number)" ]] &&
+    [[ -n "$(smart_labeled_field_value "$output" "Data Units Written" number)" ]] &&
+    [[ -n "$(smart_labeled_field_value "$output" "Power On Hours" number)" ]] &&
+    [[ -n "$(smart_labeled_field_value "$output" "Unsafe Shutdowns" number)" ]] &&
+    [[ -n "$(smart_labeled_field_value "$output" "Media and Data Integrity Errors" number)" ]] &&
+    [[ -n "$(smart_labeled_field_value "$output" "Error Information Log Entries" number)" ]]
+}
+
+scsi_smart_field_value() {
+    local output="$1"
+    local wanted="$2"
+
+    printf '%s\n' "$output" | awk -v wanted="$wanted" '
+        function canonical(number) {
+            gsub(/,/, "", number)
+            sub(/^0+/, "", number)
+            return (number == "" ? "0" : number)
+        }
+        wanted == "health" && /^SMART Health Status:/ {
+            value=$0
+            sub(/^[^:]*:[[:space:]]*/, "", value)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            print value
+            exit
+        }
+        wanted == "temperature" && /^Current Drive Temperature:/ {
+            value=$0
+            sub(/^[^:]*:[[:space:]]*/, "", value)
+            if (match(value, /[0-9][0-9,]*/))
+                print canonical(substr(value, RSTART, RLENGTH))
+            exit
+        }
+        wanted == "poh" && /Accumulated power on time/ {
+            value=$0
+            sub(/^.*hours:minutes[[:space:]]+/, "", value)
+            split(value, parts, ":")
+            if (parts[1] ~ /^[0-9][0-9,]*$/) print canonical(parts[1])
+            exit
+        }
+        wanted == "grown_defects" && /^Elements in grown defect list:/ {
+            value=$0
+            sub(/^[^:]*:[[:space:]]*/, "", value)
+            if (match(value, /[0-9][0-9,]*/))
+                print canonical(substr(value, RSTART, RLENGTH))
+            exit
+        }
+        wanted == "read_uncorrected" && /^read:/ {
+            value=$NF
+            if (value ~ /^[0-9][0-9,]*$/) print canonical(value)
+            exit
+        }
+        wanted == "write_uncorrected" && /^write:/ {
+            value=$NF
+            if (value ~ /^[0-9][0-9,]*$/) print canonical(value)
+            exit
+        }
+        wanted == "non_medium" && /^Non-medium error count:/ {
+            value=$0
+            sub(/^[^:]*:[[:space:]]*/, "", value)
+            if (match(value, /[0-9][0-9,]*/))
+                print canonical(substr(value, RSTART, RLENGTH))
+            exit
+        }
+    '
+}
+
+scsi_smart_output_is_complete() {
+    local output="$1"
+
+    [[ -n "$(scsi_smart_field_value "$output" health)" ]] &&
+    [[ -n "$(scsi_smart_field_value "$output" temperature)" ]] &&
+    [[ -n "$(scsi_smart_field_value "$output" poh)" ]]
+}
+
+parse_btrfs_device_stats_text() {
+    local text="$1"
+    local line dev key value
+
+    while IFS= read -r line; do
+        dev=""; key=""; value=""
+        if [[ "$line" =~ ^\[([^]]+)\]\.([^[:space:]]+)[[:space:]]+([0-9]+) ]]; then
+            dev="${BASH_REMATCH[1]}"
+            key="${BASH_REMATCH[2]}"
+            value="${BASH_REMATCH[3]}"
+        elif [[ "$line" =~ ^(/dev/[^:[:space:]]+):?[[:space:]]+([^[:space:]]+)[[:space:]]+([0-9]+) ]]; then
+            dev="${BASH_REMATCH[1]}"
+            key="${BASH_REMATCH[2]}"
+            value="${BASH_REMATCH[3]}"
+        fi
+        [[ -n "$dev" && -n "$key" && "$value" =~ ^[0-9]+$ ]] || continue
+        printf '%s\t%s\t%s\n' "$dev" "$key" "$value"
+    done <<< "$text"
+}
+
+xfs_stat_value_from_text() {
+    local text="$1"
+    local wanted="$2"
+
+    printf '%s\n' "$text" | awk -v wanted="$wanted" \
+        '$1 == wanted && $2 ~ /^[0-9]+$/ {print $2; exit}'
+}
+
+syslog_line_is_disk_io_error() {
+    local line="$1"
+
+    [[ "$line" == *"Script aborted"* || "$line" == *"Disk I/O Alert"* ]] && return 1
+    grep -qiE \
+        'I/O error|blk_update_request|end_request|failed command: (READ|WRITE)|hard resetting link|link is slow to respond|exception Emask' \
+        <<< "$line"
+}
+
+extract_syslog_device_paths() {
+    local line="$1"
+
+    printf '%s\n' "$line" |
+        grep -oE 'sd[a-z]+|nvme[0-9]+n[0-9]+' 2>/dev/null |
+        sort -u |
+        sed 's#^#/dev/#' || true
+}
+
+parse_unraid_disk_devices_file() {
+    local source="$1"
+
+    [[ -r "$source" ]] || return 1
+    awk -F= '
+        tolower($1) ~ /^[[:space:]]*device[[:space:]]*$/ {
+            value=$2
+            gsub(/"/, "", value)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            sub(/^\/dev\//, "", value)
+            if (value ~ /^(sd[a-z]+|nvme[0-9]+n[0-9]+)$/) print value
+        }
+    ' "$source"
+}
+
+parse_smart_selftest_output() {
+    local output="$1"
+    local fallback_status="${2:-Self-test log not yet populated}"
+    local line
+
+    line=$(printf '%s\n' "$output" | awk '
+        (($1 == "#" && $2 ~ /^[0-9]+$/) || $1 ~ /^[0-9]+$/) {print; exit}
+    ')
+    if [[ -z "$line" ]]; then
+        printf '0|unknown|%s| |\n' "$fallback_status"
+        return 0
+    fi
+
+    printf '%s\n' "$line" | awk '
+        {
+            if ($1 == "#") {
+                number=$2
+                first=3
+            } else {
+                number=$1
+                first=2
+            }
+            status_start=0
+            percent_at=0
+            for (i=first; i<=NF; i++) {
+                if ($i ~ /^[0-9]+%$/ && percent_at == 0) percent_at=i
+                if (status_start == 0 &&
+                    ($i ~ /^(Completed:?|Aborted:?|Interrupted:?|Cancelled:?|Fatal:?|Electrical:?|Servo:?|Read:?|Write:?|Unknown)$/ ||
+                     ($i == "Self-test" && $(i+1) == "routine"))) status_start=i
+            }
+            if (status_start == 0) status_start=first+2
+            if (status_start > NF) status_start=first
+
+            type=""
+            for (i=first; i<status_start; i++)
+                type=type (type == "" ? "" : " ") $i
+            if (type == "") type="unknown"
+
+            status_end=(percent_at > status_start ? percent_at-1 : NF)
+            status=""
+            for (i=status_start; i<=status_end; i++)
+                status=status (status == "" ? "" : " ") $i
+            if (status == "") status="unknown"
+
+            remaining=(percent_at > 0 ? $(percent_at) : "")
+            lifetime=""
+            if (percent_at > 0) {
+                for (i=percent_at+1; i<=NF; i++) {
+                    if ($i ~ /^[0-9]+$/) {lifetime=$i; break}
+                }
+            }
+            printf "%s|%s|%s|%s|%s\n", number, type, status, lifetime, remaining
+        }
+    '
+}
+
+select_latest_long_selftest_line() {
+    local output="$1"
+    local type_regex="${2:-Extended|Long|Offline}"
+
+    printf '%s\n' "$output" | awk -v type_regex="$type_regex" '
+        $0 ~ type_regex && tolower($0) !~ /short/ &&
+        (($1 == "#" && $2 ~ /^[0-9]+$/) || $1 ~ /^[0-9]+$/) {print; exit}
+    '
 }
 
 # === Helper Function ===
@@ -2280,14 +2601,7 @@ discover_device_inventory() {
             [[ -b "$disk" && -z "${seen[$disk]:-}" ]] || continue
             seen[$disk]=1
             candidates+=("$disk")
-        done < <(
-            awk -F= 'tolower($1)=="device" {
-                value=$2
-                gsub(/"/, "", value)
-                gsub(/^[ \t]+|[ \t]+$/, "", value)
-                if (value != "") print value
-            }' /var/local/emhttp/disks.ini 2>/dev/null
-        )
+        done < <(parse_unraid_disk_devices_file /var/local/emhttp/disks.ini 2>/dev/null)
     fi
 
     # Last-resort discovery for unusual lsblk/controller output.
@@ -2998,6 +3312,135 @@ save_cmd_timeout_last() {
     atomic_commit "$temp_file" "$CMD_TIMEOUT_LAST_FILE"
 }
 
+# Evaluate the health fields emitted by SCSI/SAS smartctl output. This path is
+# intentionally separate from ATA attribute-table parsing because SCSI devices
+# expose labeled counters instead of ATA attribute IDs.
+evaluate_scsi_smart() {
+    local disk="$1"
+    local output="$2"
+    local ctx="${3:-}"
+    local previous_state="${SMART_STATE[$disk]:-}"
+    local previous_messages="${SMART_MSGS[$disk]:-}"
+    local health temperature poh grown_defects read_uncorrected write_uncorrected non_medium
+    local total_uncorrected state="OK" joined="" message
+    local -a messages=()
+
+    health=$(scsi_smart_field_value "$output" health)
+    temperature=$(scsi_smart_field_value "$output" temperature)
+    poh=$(scsi_smart_field_value "$output" poh)
+    grown_defects=$(scsi_smart_field_value "$output" grown_defects)
+    read_uncorrected=$(scsi_smart_field_value "$output" read_uncorrected)
+    write_uncorrected=$(scsi_smart_field_value "$output" write_uncorrected)
+    non_medium=$(scsi_smart_field_value "$output" non_medium)
+    grown_defects=${grown_defects:-0}
+    read_uncorrected=${read_uncorrected:-0}
+    write_uncorrected=${write_uncorrected:-0}
+    non_medium=${non_medium:-0}
+    total_uncorrected=$(( read_uncorrected + write_uncorrected ))
+
+    if ! grep -qiE '^(OK|PASSED)$' <<< "$health"; then
+        state="CRITICAL"
+        messages+=("SAS SMART health status: ${health:-unknown}")
+        record_alert critical "SMART SAS Health" \
+            "Disk $disk SAS SMART health status is ${health:-unknown}"
+    fi
+    if (( total_uncorrected > 0 )); then
+        state="CRITICAL"
+        messages+=("SAS uncorrected read/write errors = $total_uncorrected")
+        record_alert critical "SMART SAS Uncorrected" \
+            "Disk $disk SAS uncorrected read/write errors = $total_uncorrected"
+    fi
+    if (( grown_defects > 0 )); then
+        [[ "$state" == "OK" ]] && state="WARNING"
+        messages+=("SAS grown defect list = $grown_defects")
+        record_alert warning "SMART SAS Grown Defects" \
+            "Disk $disk SAS grown defect list = $grown_defects"
+    fi
+    if (( non_medium > 0 )); then
+        [[ "$state" == "OK" ]] && state="WARNING"
+        messages+=("SAS non-medium errors = $non_medium")
+        record_alert warning "SMART SAS Non-Medium Errors" \
+            "Disk $disk SAS non-medium errors = $non_medium"
+    fi
+    if (( temperature >= HDD_TEMP_CRITICAL )); then
+        state="CRITICAL"
+        messages+=("SAS HDD Temp ${temperature}C >= ${HDD_TEMP_CRITICAL}C")
+        record_alert critical "Temp" \
+            "Disk $disk SAS HDD Temp ${temperature}C >= ${HDD_TEMP_CRITICAL}C"
+    elif (( temperature >= HDD_TEMP_WARNING )); then
+        [[ "$state" == "OK" ]] && state="WARNING"
+        messages+=("SAS HDD Temp ${temperature}C >= ${HDD_TEMP_WARNING}C")
+        record_alert warning "Temp" \
+            "Disk $disk SAS HDD Temp ${temperature}C >= ${HDD_TEMP_WARNING}C"
+    fi
+
+    local poh_warn poh_critical
+    read -r poh_warn poh_critical < <(poh_thresholds_for_device "$disk" "sata" 1)
+    if [[ "$poh_warn" =~ ^[0-9]+$ && "$poh_critical" =~ ^[0-9]+$ ]]; then
+        if (( poh >= poh_critical )); then
+            state="CRITICAL"
+            messages+=("POH age SAS ${poh}h >= ${poh_critical}h")
+            record_alert critical "POH age SAS" \
+                "Disk $disk POH age ${poh}h >= ${poh_critical}h"
+        elif (( poh >= poh_warn )); then
+            [[ "$state" == "OK" ]] && state="WARNING"
+            messages+=("POH age SAS ${poh}h >= ${poh_warn}h")
+            record_alert warning "POH age SAS" \
+                "Disk $disk POH age ${poh}h >= ${poh_warn}h"
+        fi
+    fi
+
+    CUR_ATTR["$disk|realloc"]="$grown_defects"
+    CUR_ATTR["$disk|pending"]=0
+    CUR_ATTR["$disk|offunc"]="$total_uncorrected"
+    CUR_ATTR["$disk|reported_uncorr"]="$total_uncorrected"
+    CUR_ATTR["$disk|cmd_timeout"]=0
+    CUR_ATTR["$disk|realloc_events"]="$grown_defects"
+    CUR_ATTR["$disk|end2end"]=0
+    CUR_ATTR["$disk|soft_read_err"]=0
+    CUR_ATTR["$disk|udma"]=0
+    CUR_ATTR["$disk|lcc"]=0
+    CUR_ATTR["$disk|temp"]="$temperature"
+    CUR_ATTR["$disk|poh"]="$poh"
+
+    local sample_date sample_key sample_record
+    sample_date=$(date '+%Y-%m-%d')
+    sample_key=$(persistent_device_key "$disk")
+    sample_record="$sample_date $sample_key temp=$temperature captured_epoch=$RUN_EPOCH schema=$HISTORY_SCHEMA_VERSION"
+    collector_upsert_daily_history \
+        "$TEMP_HISTORY_FILE" "$sample_date" "$sample_key" "$sample_record" || true
+
+    local selftest_info selftest_class selftest_severity selftest_message
+    selftest_info=$(get_latest_selftest_info "$disk")
+    selftest_class=$(classify_selftest_status "$(printf '%s' "$selftest_info" | awk -F'|' '{print $3}')")
+    selftest_severity=${selftest_class%%|*}
+    selftest_message=${selftest_class#*|}
+    CUR_ATTR["$disk|selftest_status"]="$selftest_severity"
+    CUR_ATTR["$disk|selftest_msg"]="$selftest_message"
+    if [[ "$selftest_severity" == "CRITICAL" ]]; then
+        state="CRITICAL"
+        messages+=("Self-test critical: $selftest_message")
+    elif [[ "$selftest_severity" == "WARNING" && "$state" != "CRITICAL" ]]; then
+        [[ "$state" == "OK" ]] && state="WARNING"
+        messages+=("Self-test warning: $selftest_message")
+    fi
+
+    for message in "${messages[@]}"; do
+        [[ -z "$joined" ]] || joined+="; "
+        joined+="$message"
+    done
+    SMART_STATE["$disk"]="$state"
+    SMART_MSGS["$disk"]="$joined"
+    if [[ "$ctx" != "post-test" || "$previous_state" != "$state" ||
+          "$previous_messages" != "$joined" ]]
+    then
+        log_smart "SMART state${ctx:+ ($ctx)} $disk: $state"
+        for message in "${messages[@]}"; do
+            log_smart "SMART detail $disk: $message"
+        done
+    fi
+}
+
 # === Main Function ===
 # Collect SMART data, classify device health, and raise alerts
 evaluate_smart() {
@@ -3013,42 +3456,47 @@ evaluate_smart() {
         # Query raw NVMe SMART output once and parse key fields
         local nvme_output
         nvme_output=$(get_nvme_raw "$disk")
+        if ! nvme_smart_output_is_complete "$nvme_output"; then
+            record_collector_event FAILED "smartctl $disk" "incomplete_nvme_smart_output"
+            log_warn "Incomplete NVMe SMART output for $disk; retaining the previous device baseline"
+            return 0
+        fi
         local percent_used crit_warn nvme_temp media_errors err_logs unsafe_shutdowns avail_spare avail_spare_thr duw poh
         # Extended statistics (PCIe errors, thermal transitions, temperature time accumulation)
         local nvme_ext pcie_corr pcie_unc therm_t1 therm_t2 warn_temp_time crit_temp_time
         nvme_ext=$(get_nvme_extended_raw "$disk")
         # Parse endurance, age, warnings, error counters, and spares
-        percent_used=$(echo "$nvme_output" | awk -F: '/Percentage Used/ {gsub(/%| /,"",$2); print $2; exit}')
+        percent_used=$(smart_labeled_field_value "$nvme_output" "Percentage Used" number)
         percent_used=${percent_used:-0}
-        poh=$(echo "$nvme_output" | awk -F: '/Power On Hours/ {gsub(/ /,"",$2); print $2; exit}')
+        poh=$(smart_labeled_field_value "$nvme_output" "Power On Hours" number)
         poh=${poh:-0}
-        crit_warn=$(echo "$nvme_output" | awk -F: '/Critical Warning/ {gsub(/ |\t/,"",$2); print $2; exit}')
+        crit_warn=$(smart_labeled_field_value "$nvme_output" "Critical Warning" scalar)
         crit_warn=${crit_warn:-0}
-        media_errors=$(echo "$nvme_output" | awk -F: '/Media and Data Integrity Errors/ {gsub(/ /,"",$2); print $2; exit}')
+        media_errors=$(smart_labeled_field_value "$nvme_output" "Media and Data Integrity Errors" number)
         media_errors=${media_errors:-0}
-        err_logs=$(echo "$nvme_output" | awk -F: '/Error Information Log Entries/ {gsub(/ /,"",$2); print $2; exit}')
+        err_logs=$(smart_labeled_field_value "$nvme_output" "Error Information Log Entries" number)
         err_logs=${err_logs:-0}
-        unsafe_shutdowns=$(echo "$nvme_output" | awk -F: '/Unsafe Shutdowns/ {gsub(/ /,"",$2); print $2; exit}')
+        unsafe_shutdowns=$(smart_labeled_field_value "$nvme_output" "Unsafe Shutdowns" number)
         unsafe_shutdowns=${unsafe_shutdowns:-0}
-        avail_spare=$(echo "$nvme_output" | awk -F: '/Available Spare[^T]/ {gsub(/%| /,"",$2); print $2; exit}')
+        avail_spare=$(smart_labeled_field_value "$nvme_output" "Available Spare" number)
         avail_spare=${avail_spare:-}
-        avail_spare_thr=$(echo "$nvme_output" | awk -F: '/Available Spare Threshold/ {gsub(/%| /,"",$2); print $2; exit}')
+        avail_spare_thr=$(smart_labeled_field_value "$nvme_output" "Available Spare Threshold" number)
         avail_spare_thr=${avail_spare_thr:-}
         # Parse bytes written to estimate TBW, persist, and compare to thresholds
-        duw=$(echo "$nvme_output" | awk -F: '/Data Units Written/ { if (match($2, /[0-9][0-9,]*/)) { v=substr($2,RSTART,RLENGTH); gsub(/,/, "", v); print v } else { print "" } exit }')
+        duw=$(smart_labeled_field_value "$nvme_output" "Data Units Written" number)
         # Parse extended NVMe statistics
-        pcie_corr=$(echo "$nvme_ext" | awk -F: '/PCIe Correctable Error Count/ {gsub(/ /,"",$2); print $2; exit}')
-        pcie_corr=${pcie_corr:-0}
-        pcie_unc=$(echo "$nvme_ext" | awk -F: '/PCIe Uncorrectable Error Count/ {gsub(/ /,"",$2); print $2; exit}')
-        pcie_unc=${pcie_unc:-0}
-        therm_t1=$(echo "$nvme_ext" | awk -F: '/Thermal Management T1 Transitions/ {gsub(/ /,"",$2); print $2; exit}')
-        therm_t1=${therm_t1:-0}
-        therm_t2=$(echo "$nvme_ext" | awk -F: '/Thermal Management T2 Transitions/ {gsub(/ /,"",$2); print $2; exit}')
-        therm_t2=${therm_t2:-0}
-        warn_temp_time=$(echo "$nvme_ext" | awk -F: '/Warning  Comp. Temperature Time/ {gsub(/ /,"",$2); print $2; exit}')
-        warn_temp_time=${warn_temp_time:-0}
-        crit_temp_time=$(echo "$nvme_ext" | awk -F: '/Critical Comp. Temperature Time/ {gsub(/ /,"",$2); print $2; exit}')
-        crit_temp_time=${crit_temp_time:-0}
+        pcie_corr=$(smart_labeled_field_value "$nvme_ext" "PCIe Correctable Error Count" number)
+        pcie_corr=${pcie_corr:-${NVME_LAST_PCIE_CORR[$disk]:-0}}
+        pcie_unc=$(smart_labeled_field_value "$nvme_ext" "PCIe Uncorrectable Error Count" number)
+        pcie_unc=${pcie_unc:-${NVME_LAST_PCIE_UNC[$disk]:-0}}
+        therm_t1=$(smart_labeled_field_value "$nvme_ext" "Thermal Management T1 Transitions" number)
+        therm_t1=${therm_t1:-${NVME_LAST_THERM_T1[$disk]:-0}}
+        therm_t2=$(smart_labeled_field_value "$nvme_ext" "Thermal Management T2 Transitions" number)
+        therm_t2=${therm_t2:-${NVME_LAST_THERM_T2[$disk]:-0}}
+        warn_temp_time=$(smart_labeled_field_value "$nvme_ext" "Warning Comp. Temperature Time" number)
+        warn_temp_time=${warn_temp_time:-${NVME_LAST_WARN_TEMP_TIME[$disk]:-0}}
+        crit_temp_time=$(smart_labeled_field_value "$nvme_ext" "Critical Comp. Temperature Time" number)
+        crit_temp_time=${crit_temp_time:-${NVME_LAST_CRIT_TEMP_TIME[$disk]:-0}}
         if [[ -n "$duw" ]]; then
             local tbw_bytes=$(( duw * 512000 ))
             local tbw_hr
@@ -3062,7 +3510,7 @@ evaluate_smart() {
             fi
         fi
         # Parse temperature and evaluate wear percent thresholds
-        nvme_temp=$(echo "$nvme_output" | awk -F: '/Temperature/ {print $2; exit}' | grep -oE '[0-9]+' | head -n1 || true)
+        nvme_temp=$(smart_labeled_field_value "$nvme_output" "Temperature" number)
         if [[ -n "$nvme_temp" && "$nvme_temp" =~ ^[0-9]+$ ]]; then
             local nvme_temp_date nvme_temp_key nvme_temp_record
             nvme_temp_date=$(date '+%Y-%m-%d')
@@ -3083,8 +3531,8 @@ evaluate_smart() {
             state="CRITICAL"; messages+=("NVMe Critical Warning flags: $crit_warn")
             record_alert critical "NVMe Critical Warning" "Disk $disk NVMe Critical Warning flags: $crit_warn"
             local cw_dec=""
-            if [[ $crit_warn =~ ^0x[0-9A-Fa-f]+$ ]]; then
-                cw_dec=$((16#${crit_warn#0x}))
+            if [[ $crit_warn =~ ^0[xX][0-9A-Fa-f]+$ ]]; then
+                cw_dec=$((16#${crit_warn:2}))
             else
                 cw_dec=$crit_warn
             fi
@@ -3287,8 +3735,23 @@ evaluate_smart() {
         # Query raw SATA SMART attributes and parse key metrics
         local attr realloc pending offunc temp udma reported_uncorr cmd_timeout realloc_events end2end soft_read_err lcc poh
         attr=$(get_sata_raw "$disk")
+        if ! ata_smart_output_is_complete "$attr"; then
+            if scsi_smart_output_is_complete "$attr"; then
+                evaluate_scsi_smart "$disk" "$attr" "$ctx"
+                return 0
+            fi
+            attr=$(smartctl_cached -a "$disk" 2>/dev/null || true)
+            if scsi_smart_output_is_complete "$attr"; then
+                evaluate_scsi_smart "$disk" "$attr" "$ctx"
+                return 0
+            elif ! ata_smart_output_is_complete "$attr"; then
+                record_collector_event FAILED "smartctl $disk" "incomplete_ata_or_scsi_smart_output"
+                log_warn "Incomplete ATA/SCSI SMART output for $disk; retaining the previous device baseline"
+                return 0
+            fi
+        fi
         # Evaluate reallocated sectors thresholds (warn/crit)
-        realloc=$(echo "$attr" | awk '/Reallocated_Sector_Ct/ {print $10; exit}')
+        realloc=$(ata_smart_attribute_value "$attr" "Reallocated_Sector_Ct")
         realloc=${realloc:-0}
         if [[ $realloc -ge $RELOC_CRITICAL ]]; then
             state="CRITICAL"; messages+=("Reallocated = $realloc (>= $RELOC_CRITICAL)")
@@ -3298,26 +3761,26 @@ evaluate_smart() {
             record_alert warning "Reallocated =" "Disk $disk reallocated sectors $realloc >= $RELOC_WARNING"
         fi
         # Evaluate pending/uncorrectable sectors
-        pending=$(echo "$attr" | awk '/Current_Pending_Sector/ {print $10; exit}')
+        pending=$(ata_smart_attribute_value "$attr" "Current_Pending_Sector")
         pending=${pending:-0}
         if [[ $pending -ge $PEND_WARNING ]]; then
             state="CRITICAL"; messages+=("Pending sectors = $pending")
             record_alert critical "Pending sectors" "Disk $disk pending sectors $pending >= $PEND_WARNING"
         fi
-        offunc=$(echo "$attr" | awk '/Offline_Uncorrectable/ {print $10; exit}')
+        offunc=$(ata_smart_attribute_value "$attr" "Offline_Uncorrectable")
         offunc=${offunc:-0}
         if [[ $offunc -gt 0 ]]; then
             state="CRITICAL"; messages+=("Offline Uncorrectable = $offunc")
             record_alert critical "Offline Uncorrectable" "Disk $disk offline uncorrectable $offunc > 0"
         fi
         # Evaluate reported uncorrectable and command timeout counters
-        reported_uncorr=$(echo "$attr" | awk '/Reported_Uncorrectable|Reported_Uncorrect/ {print $10; exit}')
+        reported_uncorr=$(ata_smart_attribute_value "$attr" "Reported_Uncorrectable|Reported_Uncorrect")
         reported_uncorr=${reported_uncorr:-0}
         if [[ $reported_uncorr -ge $REPORTED_UNC_CRIT ]]; then
             state="CRITICAL"; messages+=("Reported Uncorrectable = $reported_uncorr")
             record_alert critical "Reported Uncorrectable" "Disk $disk reported uncorrectable $reported_uncorr >= $REPORTED_UNC_CRIT"
         fi
-        cmd_timeout=$(echo "$attr" | awk '/Command_Timeout/ {print $10; exit}')
+        cmd_timeout=$(ata_smart_attribute_value "$attr" "Command_Timeout")
         cmd_timeout=${cmd_timeout:-0}
         # Absolute threshold evaluation
         if [[ $cmd_timeout -ge $CMD_TIMEOUT_CRIT ]]; then
@@ -3365,7 +3828,7 @@ evaluate_smart() {
             CMD_TIMEOUT_LAST[$disk]=$cmd_timeout
         fi
         # Evaluate reallocated event count, end-to-end and soft read error rate
-        realloc_events=$(echo "$attr" | awk '/Reallocated_Event_Count/ {print $10; exit}')
+        realloc_events=$(ata_smart_attribute_value "$attr" "Reallocated_Event_Count")
         realloc_events=${realloc_events:-0}
         if [[ $realloc_events -ge $REALLOC_EVENT_CRIT ]]; then
             state="CRITICAL"; messages+=("Reallocated Event Count = $realloc_events (>= $REALLOC_EVENT_CRIT)")
@@ -3374,20 +3837,20 @@ evaluate_smart() {
             [[ $state == OK ]] && state="WARNING"; messages+=("Reallocated Event Count = $realloc_events")
             record_alert warning "Reallocated Event Count" "Disk $disk reallocated event count $realloc_events >= $REALLOC_EVENT_WARN"
         fi
-        end2end=$(echo "$attr" | awk '/End_to_End_Error/ {print $10; exit}')
+        end2end=$(ata_smart_attribute_value "$attr" "End_to_End_Error")
         end2end=${end2end:-0}
         if [[ $end2end -ge $END_TO_END_ERR_CRIT ]]; then
             state="CRITICAL"; messages+=("End-to-End Errors = $end2end")
             record_alert critical "End-to-End Errors" "Disk $disk end-to-end errors $end2end >= $END_TO_END_ERR_CRIT"
         fi
-        soft_read_err=$(echo "$attr" | awk '/Soft_Read_Error_Rate/ {print $10; exit}')
+        soft_read_err=$(ata_smart_attribute_value "$attr" "Soft_Read_Error_Rate")
         soft_read_err=${soft_read_err:-}
         if [[ -n "$soft_read_err" && $soft_read_err =~ ^[0-9]+$ && $soft_read_err -ge $SOFT_READ_ERR_WARN && $state != CRITICAL ]]; then
             [[ $state == OK ]] && state="WARNING"; messages+=("Soft Read Error Rate = $soft_read_err (>= $SOFT_READ_ERR_WARN)")
             record_alert warning "Soft Read Error Rate" "Disk $disk soft read error rate $soft_read_err >= $SOFT_READ_ERR_WARN"
         fi
         # Determine device class (HDD/SSD) and evaluate temperature thresholds
-        temp=$(echo "$attr" | awk '/Temperature_Celsius|Airflow_Temperature_Cel/ {print $10; exit}')
+        temp=$(ata_smart_attribute_value "$attr" "Temperature_Celsius|Airflow_Temperature_Cel")
         temp=${temp:-0}
         if [[ -n "$temp" && "$temp" =~ ^[0-9]+$ && "$temp" != 0 ]]; then
             local sata_temp_date sata_temp_key sata_temp_record
@@ -3417,14 +3880,14 @@ evaluate_smart() {
             fi
         fi
         # Check UDMA CRC errors and head parking (Load Cycle Count)
-        udma=$(echo "$attr" | awk '/UDMA_CRC_Error_Count/ {print $10; exit}')
+        udma=$(ata_smart_attribute_value "$attr" "UDMA_CRC_Error_Count")
         udma=${udma:-0}
         if [[ $udma -gt 0 && $state != CRITICAL ]]; then
             [[ $state == OK ]] && state="WARNING"; messages+=("UDMA CRC Errors = $udma")
             record_alert warning "UDMA CRC Errors" "Disk $disk UDMA CRC errors $udma (cabling/power check)"
         fi
         local lcc
-        lcc=$(echo "$attr" | awk '/Load_Cycle_Count/ {print $10; exit}')
+        lcc=$(ata_smart_attribute_value "$attr" "Load_Cycle_Count")
         lcc=${lcc:-}
         if [[ -n "$lcc" ]]; then
             if [[ $lcc -ge $LOAD_CYCLE_CRIT ]]; then
@@ -3437,26 +3900,26 @@ evaluate_smart() {
         fi
         # Evaluate SSD wear indicators (MWI/Wear Leveling) with heuristics and vendor overrides
         local wear_norm mwi_norm life_remain=""
-        wear_norm=$(echo "$attr" | awk '/Wear_Leveling_Count/ {print $4; exit}')
-        mwi_norm=$(echo "$attr" | awk '/Media_Wearout_Indicator/ {print $4; exit}')
+        wear_norm=$(ata_smart_attribute_value "$attr" "Wear_Leveling_Count" normalized)
+        mwi_norm=$(ata_smart_attribute_value "$attr" "Media_Wearout_Indicator" normalized)
         # Compute a local TBW estimate from available SMART fields for heuristic decisions
         # Prefer Total_LBAs_Written (or attribute 241 mapped as LBAs) else convert Host_Writes_GiB or NAND_GB_Written
         local _lbasw _lbaw_241 _hw32mib _host_gib _nand_tlc_gb _nand_slc_gb _tbw_bytes=""
-        _lbasw=$(echo "$attr" | awk '/Total_LBAs_Written/ {print $10; exit}')
-        _lbaw_241=$(echo "$attr" | awk '/^[ ]*241[ ]/ {print $10; exit}')
+        _lbasw=$(ata_smart_attribute_value "$attr" "Total_LBAs_Written")
+        _lbaw_241=$(ata_smart_attribute_value "$attr" "241")
         if [[ -n "$_lbasw" ]]; then _tbw_bytes=$(( _lbasw * 512 ))
         elif [[ -n "$_lbaw_241" ]]; then _tbw_bytes=$(( _lbaw_241 * 512 ))
         fi
         if [[ -z "${_tbw_bytes:-}" ]]; then
-            _host_gib=$(echo "$attr" | awk '/Host_Writes_GiB/ {print $10; exit}')
+            _host_gib=$(ata_smart_attribute_value "$attr" "Host_Writes_GiB")
             if [[ -n "$_host_gib" && "$_host_gib" =~ ^[0-9]+$ ]]; then _tbw_bytes=$(( _host_gib * 1024 * 1024 * 1024 )); fi
         fi
         if [[ -z "${_tbw_bytes:-}" ]]; then
-            _nand_tlc_gb=$(echo "$attr" | awk '/NAND_GB_Written_TLC/ {print $10; exit}')
+            _nand_tlc_gb=$(ata_smart_attribute_value "$attr" "NAND_GB_Written_TLC")
             if [[ -n "$_nand_tlc_gb" && "$_nand_tlc_gb" =~ ^[0-9]+$ ]]; then _tbw_bytes=$(( _nand_tlc_gb * 1024 * 1024 * 1024 )); fi
         fi
         if [[ -z "${_tbw_bytes:-}" ]]; then
-            _nand_slc_gb=$(echo "$attr" | awk '/NAND_GB_Written_SLC/ {print $10; exit}')
+            _nand_slc_gb=$(ata_smart_attribute_value "$attr" "NAND_GB_Written_SLC")
             if [[ -n "$_nand_slc_gb" && "$_nand_slc_gb" =~ ^[0-9]+$ ]]; then _tbw_bytes=$(( _nand_slc_gb * 1024 * 1024 * 1024 )); fi
         fi
         # Prefer MWI normalized when present, but apply heuristics for inverted/ambiguous reports
@@ -3505,7 +3968,7 @@ evaluate_smart() {
             fi
         fi
         # Persist POH and evaluate model-aware age thresholds for SATA (ROTA-aware) + record_alerts
-        poh=$(echo "$attr" | awk '/Power_On_Hours/ {print $10; exit}')
+        poh=$(ata_smart_attribute_value "$attr" "Power_On_Hours|Power_On_Hours_and_Msec")
         poh=${poh:-0}
         CUR_ATTR["$disk|poh"]="$poh"
         if [[ -n "$poh" && "$poh" =~ ^[0-9]+$ ]]; then
@@ -3572,19 +4035,19 @@ evaluate_smart() {
         # Persist commonly used parsed SMART attributes for downstream logic and JSON export
         [[ -n "$life_remain" ]] && CUR_ATTR["$disk|life_remain"]="$life_remain"
         local lbasw hw32mib lbasr tbw_bytes tbw_hr reads_bytes reads_hr
-        lbasw=$(echo "$attr" | awk '/Total_LBAs_Written/ {print $10; exit}')
-        if [[ -z "$lbasw" ]]; then lbasw=$(echo "$attr" | awk '/^[ ]*241[ ]/ {print $10; exit}'); fi
+        lbasw=$(ata_smart_attribute_value "$attr" "Total_LBAs_Written")
+        if [[ -z "$lbasw" ]]; then lbasw=$(ata_smart_attribute_value "$attr" "241"); fi
         if [[ -z "$lbasw" ]]; then
-            hw32mib=$(echo "$attr" | awk '/Host_Writes_32MiB/ {print $10; exit}')
-            if [[ -z "$hw32mib" ]]; then hw32mib=$(echo "$attr" | awk '/^[ ]*246[ ]/ {print $10; exit}'); fi
+            hw32mib=$(ata_smart_attribute_value "$attr" "Host_Writes_32MiB")
+            if [[ -z "$hw32mib" ]]; then hw32mib=$(ata_smart_attribute_value "$attr" "246"); fi
             if [[ -n "$hw32mib" ]]; then
                 tbw_bytes=$(( hw32mib * 32 * 1024 * 1024 ))
             fi
         else
             tbw_bytes=$(( lbasw * 512 ))
         fi
-        lbasr=$(echo "$attr" | awk '/Total_LBAs_Read/ {print $10; exit}')
-        if [[ -z "$lbasr" ]]; then lbasr=$(echo "$attr" | awk '/^[ ]*242[ ]/ {print $10; exit}'); fi
+        lbasr=$(ata_smart_attribute_value "$attr" "Total_LBAs_Read")
+        if [[ -z "$lbasr" ]]; then lbasr=$(ata_smart_attribute_value "$attr" "242"); fi
         if [[ -n "$lbasr" ]]; then reads_bytes=$(( lbasr * 512 )); fi
         # Summarize TBW/Read totals and evaluate TBW thresholds (model-aware or global)
         if [[ -n "${tbw_bytes:-}" ]]; then
@@ -3664,12 +4127,13 @@ get_latest_selftest_info() {
     else
         out=$(get_selftest_live "$disk")
     fi
-    local line
-    # Most recent entry is first after header; support lines starting with '#' token then numeric ID
-    line=$(echo "$out" | awk 'NR>5 && (($1=="#" && $2 ~ /^[0-9]+$/) || $1 ~ /^[0-9]+$/) {print; exit}')
+    local line exec_status=""
+    # Most recent entry is the first row with a numeric test identifier. The
+    # pure parser supports both ATA '# 1' and NVMe/numeric-first layouts.
+    line=$(printf '%s\n' "$out" | awk \
+        '(($1=="#" && $2 ~ /^[0-9]+$/) || $1 ~ /^[0-9]+$/) {print; exit}')
     if [[ -z "$line" ]]; then
         # No entries in self-test log; fall back to execution status from capabilities page
-        local exec_status
         if [[ $disk == /dev/nvme* ]]; then
             log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART capability read (-c) on $disk"
             exec_status=$(get_capabilities_live "$disk" | awk -F: '/Self-test execution status/ {sub(/^ +/,"",$2); print $2; exit}') || true
@@ -3677,20 +4141,8 @@ get_latest_selftest_info() {
             exec_status=$(get_capabilities_live "$disk" | awk -F: '/Self-test execution status/ {sub(/^ +/,"",$2); print $2; exit}') || true
         fi
         exec_status=${exec_status:-"Self-test log not yet populated"}
-        # Return with status in field 3 to allow downstream classification
-        echo "0|unknown|${exec_status}| |"; return
     fi
-    local num type status lifetime remaining
-    num=$(echo "$line" | awk '{if($1=="#"){print $2}else{print $1}}')
-    type=$(echo "$line" | awk '{if($1=="#"){print $3" "$4}else{print $2" "$3}}')
-    remaining=$(echo "$line" | grep -o '[0-9]\+%\?' | head -n1 || true)
-    lifetime=$(echo "$line" | awk '{for(i=1;i<=NF;i++){if($i ~ /hours/){print $(i-1); exit}}}')
-    if [[ -z "$lifetime" ]]; then
-        # Fallback for NVMe rows lacking the word 'hours': choose largest numeric excluding test id and percentage tokens
-        lifetime=$(echo "$line" | awk -v tid="$num" '{maxv=0; for(i=1;i<=NF;i++){if($i ~ /^[0-9]+$/ && $i!=tid && $i!~/^[0-9]+%$/){if($i>maxv) maxv=$i}} if(maxv>0) print maxv}')
-    fi
-    status=$(echo "$line" | sed -E 's/^\s*#?\s*[0-9]+\s+[^ ]+\s+[^ ]+\s+//' | sed -E 's/\s+[0-9]+%.*//' )
-    echo "${num}|${type}|${status}|${lifetime}|${remaining}"
+    parse_smart_selftest_output "$out" "$exec_status"
 }
 
 # === Helper Function ===
@@ -3930,17 +4382,43 @@ run_smart_test() {
         return 0
     fi
     local test_kind="short"
-    local selftest poh_attr current_poh last_long_hours_diff="" last_long_poh="" threshold_hours=$(( LONG_TEST_MAX_INTERVAL_DAYS * 24 ))
+    local selftest poh_attr current_poh initial_smart_output
+    local last_long_hours_diff="" last_long_poh="" threshold_hours=$(( LONG_TEST_MAX_INTERVAL_DAYS * 24 ))
     if [[ $disk == /dev/nvme* ]]; then
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART self-test log read (-l selftest) on $disk"
         selftest=$(smartctl_bounded -l selftest -d nvme "$disk" 2>/dev/null || true)
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART attribute read (-a) on $disk"
-        poh_attr=$(smartctl_bounded -a -d nvme "$disk" 2>/dev/null | awk -F: '/Power On Hours/ {gsub(/ /,"",$2); print $2; exit}')
+        initial_smart_output=$(smartctl_cached -a -d nvme "$disk" 2>/dev/null || true)
+        if ! nvme_smart_output_is_complete "$initial_smart_output"; then
+            record_collector_event FAILED "smartctl $disk" "incomplete_nvme_smart_output"
+            log_warn "Incomplete NVMe SMART output for $disk; skipping replacement detection and test scheduling"
+            return 0
+        fi
+        poh_attr=$(smart_labeled_field_value "$initial_smart_output" "Power On Hours" number)
     else
         selftest=$(smartctl_bounded -l selftest "$disk" 2>/dev/null || true)
-        poh_attr=$(smartctl_bounded -A "$disk" 2>/dev/null | awk '/Power_On_Hours/ {print $10; exit}')
+        initial_smart_output=$(smartctl_cached -A "$disk" 2>/dev/null || true)
+        if ata_smart_output_is_complete "$initial_smart_output"; then
+            poh_attr=$(ata_smart_attribute_value "$initial_smart_output" "Power_On_Hours|Power_On_Hours_and_Msec")
+        else
+            initial_smart_output=$(smartctl_cached -a "$disk" 2>/dev/null || true)
+            if ata_smart_output_is_complete "$initial_smart_output"; then
+                poh_attr=$(ata_smart_attribute_value "$initial_smart_output" "Power_On_Hours|Power_On_Hours_and_Msec")
+            elif scsi_smart_output_is_complete "$initial_smart_output"; then
+                poh_attr=$(scsi_smart_field_value "$initial_smart_output" poh)
+            else
+                record_collector_event FAILED "smartctl $disk" "incomplete_ata_or_scsi_smart_output"
+                log_warn "Incomplete ATA/SCSI SMART output for $disk; skipping replacement detection and test scheduling"
+                return 0
+            fi
+        fi
     fi
-    current_poh=${poh_attr:-0}
+    if [[ ! "$poh_attr" =~ ^[0-9]+$ ]]; then
+        record_collector_event FAILED "smartctl $disk" "missing_power_on_hours"
+        log_warn "SMART Power-On Hours missing for $disk; skipping replacement detection and test scheduling"
+        return 0
+    fi
+    current_poh=$poh_attr
     if collector_device_has_blocking_event smart "$disk"; then
         log_warn "SMART collection incomplete on $disk; skipping replacement detection, evaluation, and test scheduling"
         return 0
@@ -4014,35 +4492,13 @@ run_smart_test() {
         [[ -n "$p" ]] && combined_regex+="${p}|"
     done
     combined_regex=${combined_regex%|}
-    # Support smartctl rows that begin with '#' then numeric ID; robust lifetime extraction
-    last_long_poh=$(echo "$selftest" | awk -v rgx="$combined_regex" '
-        NR>5 && $0 ~ rgx && (($1=="#" && $2 ~ /^[0-9]+$/) || $1 ~ /^[0-9]+$/) {
-            id_field = ($1=="#" ? $2 : $1)
-            lifetime=""
-            # Preferred: numeric immediately preceding a dash (LBA error placeholder)
-            for(i=1;i<=NF;i++){
-                if($i ~ /^[0-9]+$/ && $(i+1) ~ /^-$/){lifetime=$i; break}
-            }
-            if(lifetime==""){
-                maxv=0
-                for(i=1;i<=NF;i++){
-                    if($i ~ /^[0-9]+$/ && $i!=id_field && $i!~/^[0-9]+%$/){ if($i>maxv) maxv=$i }
-                }
-                if(maxv>0) lifetime=maxv
-            }
-            if(lifetime!=""){print lifetime; exit}
-        }
-    ' | head -n1)
-    if [[ -z "$last_long_poh" ]]; then
-        last_long_poh=$(echo "$selftest" | awk '
-            NR>5 && /Extended offline|Long/ && (($1=="#" && $2 ~ /^[0-9]+$/) || $1 ~ /^[0-9]+$/) {
-                id_field = ($1=="#" ? $2 : $1); maxv=0
-                for(i=1;i<=NF;i++){
-                    if($i ~ /^[0-9]+$/ && $i!=id_field && $i!~/^[0-9]+%$/){ if($i>maxv) maxv=$i }
-                }
-                if(maxv>0){print maxv; exit}
-            }
-        ' | head -n1)
+    # Parse the newest non-short long-test row through the same pure parser
+    # exercised by the Phase 11 fixtures.
+    local latest_long_line parsed_long_line
+    latest_long_line=$(select_latest_long_selftest_line "$selftest" "$combined_regex")
+    if [[ -n "$latest_long_line" ]]; then
+        parsed_long_line=$(parse_smart_selftest_output "$latest_long_line")
+        last_long_poh=$(printf '%s' "$parsed_long_line" | awk -F'|' '{print $4}')
     fi
     if [[ -n "$last_long_poh" && $current_poh -gt 0 ]]; then
         # Monotonic guard: ignore regressed lifetime unless drive replacement (current_poh also regressed)
@@ -4339,12 +4795,11 @@ check_completed_long_tests() {
         done
         rgx=${rgx%|}
         local line
-        line=$(echo "$out" | awk -v rgx="$rgx" 'NR>5 && $0 ~ rgx && (($1=="#" && $2 ~ /^[0-9]+$/) || $1 ~ /^[0-9]+$/) {print; exit}')
+        line=$(select_latest_long_selftest_line "$out" "$rgx")
         [[ -z "$line" ]] && continue
-        local id type status
-        id=$(echo "$line" | awk '{for(i=1;i<=NF;i++){if($i ~ /^[0-9]+$/){print $i; break}}}')
-        type=$(echo "$line" | awk -v rgx="$rgx" '{for(i=2;i<=NF;i++){if($i ~ /Extended|Long/){print $i; break}}}')
-        status=$(echo "$line" | sed -E 's/^\s*#?\s*[0-9]+\s+[^ ]+\s+[^ ]+\s+//' | sed -E 's/\s+[0-9]+%.*//' )
+        local id type status lifetime remaining parsed_selftest
+        parsed_selftest=$(parse_smart_selftest_output "$line")
+        IFS='|' read -r id type status lifetime remaining <<< "$parsed_selftest"
         if [[ ${PROCESSED[$disk]:-} == "$id" ]]; then continue; fi
         if echo "$status" | grep -qi 'in progress'; then continue; fi
         local class msg sev
@@ -4357,29 +4812,22 @@ check_completed_long_tests() {
             record_alert critical "$NOTIFY_TITLE_SMART" "Disk $disk long self-test CRITICAL: $msg"
         fi
         printf '%s %s complete type=long id=%s sev=%s msg="%s" captured_epoch=%s schema=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(persistent_device_key "$disk")" "$id" "$sev" "$msg" "$RUN_EPOCH" "$HISTORY_SCHEMA_VERSION" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
-        local lifetime poh current_poh
-        # Broaden lifetime extraction: first try token before 'hours'; else choose largest numeric token after id
-        lifetime=$(echo "$line" | awk '{for(i=1;i<=NF;i++){if($i ~ /hours/){print $(i-1); exit}}}')
-        if [[ -z "$lifetime" ]]; then
-            # Collect numeric tokens excluding the first column (self-test entry index) and percentages
-            local largest=0 tok 
-            while read -r tok; do
-                [[ "$tok" =~ ^[0-9]+$ ]] || continue
-                # Skip numeric test id token
-                [[ "$tok" == "$id" ]] && continue
-                if (( tok > largest )); then largest=$tok; fi
-            done < <(echo "$line" | grep -Eo '[0-9]+' )
-            [[ $largest -gt 0 ]] && lifetime=$largest
-        fi
+        local poh current_poh
         if [[ -n "${lifetime:-}" && "$lifetime" =~ ^[0-9]+$ ]]; then
             local prev_ll=${LONG_LAST_POH["$disk"]:-}
             if [[ -n "$prev_ll" && "$prev_ll" =~ ^[0-9]+$ && $lifetime -lt $prev_ll ]]; then
                 # Need current POH to decide replacement vs regression
-                local cur_poh
+                local cur_poh cur_poh_output
                 if [[ $disk == /dev/nvme* ]]; then
-                    cur_poh=$(smartctl_bounded -a -d nvme "$disk" 2>/dev/null | awk -F: '/Power On Hours/ {gsub(/ /,"",$2); print $2; exit}')
+                    cur_poh_output=$(smartctl_cached -a -d nvme "$disk" 2>/dev/null || true)
+                    cur_poh=$(smart_labeled_field_value "$cur_poh_output" "Power On Hours" number)
                 else
-                    cur_poh=$(smartctl_bounded -A "$disk" 2>/dev/null | awk '/Power_On_Hours/ {print $10; exit}')
+                    cur_poh_output=$(smartctl_cached -A "$disk" 2>/dev/null || true)
+                    cur_poh=$(ata_smart_attribute_value "$cur_poh_output" "Power_On_Hours|Power_On_Hours_and_Msec")
+                    if [[ -z "$cur_poh" ]]; then
+                        cur_poh_output=$(smartctl_cached -a "$disk" 2>/dev/null || true)
+                        cur_poh=$(scsi_smart_field_value "$cur_poh_output" poh)
+                    fi
                 fi
                 if [[ "$cur_poh" =~ ^[0-9]+$ && $cur_poh -ge $prev_ll && $(( prev_ll - lifetime )) -gt 1 ]]; then
                     log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Ignoring regressed long-test POH $lifetime < $prev_ll on $disk (monotonic guard)"
@@ -4394,9 +4842,17 @@ check_completed_long_tests() {
         else
             if [[ $disk == /dev/nvme* ]]; then
                 log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART attribute read (-a) for POH fallback on $disk"
-                poh=$(smartctl_bounded -a -d nvme "$disk" 2>/dev/null | awk -F: '/Power On Hours/ {gsub(/ /,"",$2); print $2; exit}')
+                local poh_output
+                poh_output=$(smartctl_cached -a -d nvme "$disk" 2>/dev/null || true)
+                poh=$(smart_labeled_field_value "$poh_output" "Power On Hours" number)
             else
-                poh=$(smartctl_bounded -A "$disk" 2>/dev/null | awk '/Power_On_Hours/ {print $10; exit}')
+                local poh_output
+                poh_output=$(smartctl_cached -A "$disk" 2>/dev/null || true)
+                poh=$(ata_smart_attribute_value "$poh_output" "Power_On_Hours|Power_On_Hours_and_Msec")
+                if [[ -z "$poh" ]]; then
+                    poh_output=$(smartctl_cached -a "$disk" 2>/dev/null || true)
+                    poh=$(scsi_smart_field_value "$poh_output" poh)
+                fi
             fi
             if [[ -n "${poh:-}" && "$poh" =~ ^[0-9]+$ ]]; then
                 LONG_LAST_POH["$disk"]="$poh"
@@ -5010,12 +5466,8 @@ scan_syslog_disk_errors() {
 
         if [[ -n "$SYSLOG_CHUNK_FILE" && -r "$SYSLOG_CHUNK_FILE" ]]; then
             while IFS= read -r line; do
-                [[ "$line" == *"Script aborted"* || "$line" == *"Disk I/O Alert"* ]] && continue
-                if ! grep -qiE 'I/O error|blk_update_request|end_request|failed command: (READ|WRITE)|hard resetting link|link is slow to respond|exception Emask' <<< "$line"; then
-                    continue
-                fi
-
-                dev_tokens=$(printf '%s\n' "$line" | grep -oE 'sd[a-z]+|nvme[0-9]+n[0-9]+' 2>/dev/null | sort -u || true)
+                syslog_line_is_disk_io_error "$line" || continue
+                dev_tokens=$(extract_syslog_device_paths "$line")
                 [[ -n "$dev_tokens" ]] || continue
                 epoch=$(syslog_timestamp_epoch "$line" "$now_epoch")
                 [[ "$epoch" =~ ^[0-9]+$ ]] || epoch=$now_epoch
@@ -5029,7 +5481,7 @@ scan_syslog_disk_errors() {
 
                 while IFS= read -r tok; do
                     [[ -n "$tok" ]] || continue
-                    dev="/dev/$tok"
+                    dev="$tok"
                     IO_ERROR_RAW_MAP["$dev"]=$(( ${IO_ERROR_RAW_MAP["$dev"]:-0} + 1 ))
                     event_hash="$hash"
                     if (( IO_ERROR_DEDUP_ENABLED == 0 )); then
@@ -7699,19 +8151,8 @@ collect_btrfs_device_stats() {
         stats=$(btrfs_bounded device stats "$m" 2>/dev/null || true)
         [[ -n "$stats" ]] || continue
 
-        while IFS= read -r line; do
-            dev=""; key=""; val=""
-            if [[ "$line" =~ ^\[([^]]+)\]\.([^[:space:]]+)[[:space:]]+([0-9]+) ]]; then
-                dev="${BASH_REMATCH[1]}"
-                key="${BASH_REMATCH[2]}"
-                val="${BASH_REMATCH[3]}"
-            elif [[ "$line" =~ ^(/dev/[^:[:space:]]+):?[[:space:]]+([^[:space:]]+)[[:space:]]+([0-9]+) ]]; then
-                dev="${BASH_REMATCH[1]}"
-                key="${BASH_REMATCH[2]}"
-                val="${BASH_REMATCH[3]}"
-            fi
+        while IFS=$'\t' read -r dev key val; do
             [[ -n "$dev" && -n "$key" && "$val" =~ ^[0-9]+$ ]] || continue
-
             state_key=$(persistent_device_key "$dev")
             printf '%s %s %s\n' "$state_key" "$key" "$val" >> "$snapshot_temp"
             out_has=1
@@ -7794,7 +8235,7 @@ collect_btrfs_device_stats() {
                 (( boost > 100 )) && boost=100
                 BURST_BOOST[$bdev]=$boost
             fi
-        done <<< "$stats"
+        done < <(parse_btrfs_device_stats_text "$stats")
     done
 
     if (( out_has == 1 )); then
@@ -7817,6 +8258,7 @@ collect_xfs_proc_stats() {
     [[ -r "$stat_file" ]] || return 0
 
     local snapshot_temp now_epoch previous_epoch=0 current_boot_id="unknown" previous_boot_id=""
+    local stat_text
     local first second rest token k ex skip val prev delta elapsed_seconds rate_day
     local current_kind current_metric last_kind last_metric ratio absolute_severity
     local alert_due alert_severity burst_boost summary_lines="" final_severity
@@ -7828,6 +8270,7 @@ collect_xfs_proc_stats() {
 
     now_epoch=$(date +%s)
     today=$(date '+%Y-%m-%d')
+    stat_text=$(<"$stat_file")
     [[ -r /proc/sys/kernel/random/boot_id ]] && read -r current_boot_id < /proc/sys/kernel/random/boot_id || true
 
     if (( XFS_PROC_SUPPRESS_DURING_PARITY == 1 && PARITY_ACTIVE == 1 )); then
@@ -7878,7 +8321,7 @@ collect_xfs_proc_stats() {
     printf 'meta schema=2 captured_epoch=%s boot_id=%s\n' "$now_epoch" "$current_boot_id" > "$snapshot_temp"
 
     for k in "${keys[@]}"; do
-        val=$(awk -v key="$k" '$1==key{print $2; exit}' "$stat_file" 2>/dev/null || true)
+        val=$(xfs_stat_value_from_text "$stat_text" "$k")
         [[ "$val" =~ ^[0-9]+$ ]] || continue
         printf '%s %s\n' "$k" "$val" >> "$snapshot_temp"
         ((snapshot_count++)) || true
@@ -8112,7 +8555,7 @@ limit_notification_body() {
 
     if (( LOG_FULL_NOTIFICATION_ON_TRUNCATION == 1 )) && [[ -n "${MASTER_LOG:-}" ]]; then
         {
-            printf '\n===== FULL NOTIFICATION BODY (v2.10) =====\n'
+            printf '\n===== FULL NOTIFICATION BODY (v2.11) =====\n'
             printf '%s\n' "$FULL_NOTIFICATION_BODY"
             printf '===== END FULL NOTIFICATION BODY =====\n'
         } >> "$MASTER_LOG"
@@ -8731,7 +9174,10 @@ validate_runtime_dependencies() {
     DEPENDENCY_WARNING_COUNT=0
 
     if [[ "$mode" == "self-test" ]]; then
-        required_commands=(awk cut date grep mktemp mv rm sed sleep sort timeout wc)
+        required_commands=(
+            awk cut date grep mkdir mktemp mv rm sed sha1sum sleep sort stat
+            timeout tr wc
+        )
     else
         required_commands=(
             awk basename cat cksum cp cut date df dirname dmesg find findmnt
@@ -8806,7 +9252,7 @@ validate_runtime_dependencies() {
 
 print_usage() {
     cat <<'USAGE'
-Disk Health Monitor for Unraid v2.10
+Disk Health Monitor for Unraid v2.11
 
 Usage:
   health_monitoring.sh                 Run normal monitoring
@@ -8862,7 +9308,7 @@ run_diagnostics() {
     local failures=0 warnings=0 config_status=0 dependency_status=0
     local parent device_rows
 
-    printf 'Disk Health Monitor for Unraid v2.10 - read-only diagnostics\n'
+    printf 'Disk Health Monitor for Unraid v2.11 - read-only diagnostics\n'
     printf 'No disk SMART reads, tests, scrubs, state writes, cursor updates, or notifications will occur.\n\n'
 
     if validate_configuration; then
@@ -8885,6 +9331,8 @@ run_diagnostics() {
     diagnostic_result INFO "Kernel" "$(uname -sr 2>/dev/null || printf 'unknown')"
     diagnostic_result INFO "Command deadlines" \
         "SMART=${SMARTCTL_TIMEOUT_SECONDS}s Btrfs=${BTRFS_COMMAND_TIMEOUT_SECONDS}s XFS=${XFS_REPAIR_TIMEOUT_SECONDS}s System=${SYSTEM_COMMAND_TIMEOUT_SECONDS}s Share=${SHARE_SCAN_TIMEOUT_SECONDS}s Notify=${NOTIFICATION_TIMEOUT_SECONDS}s"
+    diagnostic_result INFO "Regression fixtures" \
+        "$REGRESSION_FIXTURE_COUNT isolated read-only fixture(s); no live SMART access"
 
     if [[ -d "$LOG_DIR" ]]; then
         if [[ -w "$LOG_DIR" ]]; then
@@ -8977,8 +9425,9 @@ run_regression_tests() (
     }
     trap '[[ -z "$fixture_dir" || "$fixture_dir" != /tmp/health_monitoring.selftest.* ]] || rm -rf -- "$fixture_dir"' EXIT
 
-    printf 'Disk Health Monitor for Unraid v2.10 - built-in regression tests\n'
-    printf 'Fixtures are isolated under %s and removed automatically.\n\n' "$fixture_dir"
+    printf 'Disk Health Monitor for Unraid v2.11 - built-in regression tests\n'
+    printf '%d fixtures are isolated under %s and removed automatically.\n\n' \
+        "$REGRESSION_FIXTURE_COUNT" "$fixture_dir"
 
     actual=$(safe_state_name '/dev/disk/by-id/ata-Test Drive')
     if [[ "$actual" == "disk_by-id_ata-Test_Drive" ]]; then
@@ -9062,6 +9511,180 @@ run_regression_tests() (
         self_test_result 0 "Bounded syslog line-range extraction"
     fi
 
+    local ata_fixture ata_malformed
+    ata_fixture=$'ID# ATTRIBUTE_NAME FLAG VALUE WORST THRESH TYPE UPDATED WHEN_FAILED RAW_VALUE\n  5 Reallocated_Sector_Ct 0x0033 100 100 010 Pre-fail Always - 7\n  9 Power_On_Hours 0x0032 091 091 000 Old_age Always - 12345\n194 Temperature_Celsius 0x0022 063 050 000 Old_age Always - 37\n197 Current_Pending_Sector 0x0012 100 100 000 Old_age Always - 2\n199 UDMA_CRC_Error_Count 0x003e 200 200 000 Old_age Always - 4\n233 Media_Wearout_Indicator 0x0032 095 095 000 Old_age Always - 5\n241 Total_LBAs_Written 0x0032 099 099 000 Old_age Always - 123456789'
+    actual="$(ata_smart_attribute_value "$ata_fixture" Reallocated_Sector_Ct)|$(ata_smart_attribute_value "$ata_fixture" Current_Pending_Sector)|$(ata_smart_attribute_value "$ata_fixture" Temperature_Celsius)|$(ata_smart_attribute_value "$ata_fixture" Power_On_Hours)|$(ata_smart_attribute_value "$ata_fixture" Media_Wearout_Indicator normalized)|$(ata_smart_attribute_value "$ata_fixture" 241)"
+    if [[ "$actual" == "7|2|37|12345|95|123456789" ]]; then
+        self_test_result 1 "ATA/USB-bridge SMART attribute parser fixtures"
+    else
+        self_test_result 0 "ATA/USB-bridge SMART attribute parser fixtures" "found '$actual'"
+    fi
+
+    ata_malformed=$'  5 Reallocated_Sector_Ct 0x0033 100 100 010 Pre-fail Always - not-a-number\ntruncated attribute row'
+    actual=$(ata_smart_attribute_value "$ata_malformed" Reallocated_Sector_Ct)
+    if [[ -z "$actual" ]] && ! ata_smart_output_is_complete "$ata_malformed"; then
+        self_test_result 1 "ATA malformed attribute rejection"
+    else
+        self_test_result 0 "ATA malformed attribute rejection" "found '$actual'"
+    fi
+
+    local scsi_fixture
+    scsi_fixture=$'SMART Health Status: OK\nCurrent Drive Temperature: 34 C\nAccumulated power on time, hours:minutes 12345:12\nElements in grown defect list: 2\nread: 10 0 0 0 0 0 0\nwrite: 20 0 0 0 0 0 1\nNon-medium error count: 3'
+    actual="$(scsi_smart_field_value "$scsi_fixture" health)|$(scsi_smart_field_value "$scsi_fixture" temperature)|$(scsi_smart_field_value "$scsi_fixture" poh)|$(scsi_smart_field_value "$scsi_fixture" grown_defects)|$(scsi_smart_field_value "$scsi_fixture" read_uncorrected)|$(scsi_smart_field_value "$scsi_fixture" write_uncorrected)|$(scsi_smart_field_value "$scsi_fixture" non_medium)"
+    if [[ "$actual" == "OK|34|12345|2|0|1|3" ]] &&
+       scsi_smart_output_is_complete "$scsi_fixture"
+    then
+        self_test_result 1 "SCSI/SAS SMART parser fixture"
+    else
+        self_test_result 0 "SCSI/SAS SMART parser fixture" "found '$actual'"
+    fi
+
+    local nvme_fixture nvme_ext_fixture
+    nvme_fixture=$'Critical Warning:                   0x04\nTemperature:                        41 Celsius\nAvailable Spare:                    99%\nAvailable Spare Threshold:          10%\nPercentage Used:                    12%\nData Units Written:                 1,234,567 [632 GB]\nPower On Hours:                     12,345\nUnsafe Shutdowns:                   7\nMedia and Data Integrity Errors:    8\nError Information Log Entries:      9'
+    nvme_ext_fixture=$'PCIe Correctable Error Count:        2\nPCIe Uncorrectable Error Count:      1\nThermal Management T1 Transitions:  3\nThermal Management T2 Transitions:  4\nWarning  Comp. Temperature Time:     5\nCritical Comp. Temperature Time:     6'
+    actual="$(smart_labeled_field_value "$nvme_fixture" "Critical Warning" scalar)|$(smart_labeled_field_value "$nvme_fixture" "Percentage Used" number)|$(smart_labeled_field_value "$nvme_fixture" "Power On Hours" number)|$(smart_labeled_field_value "$nvme_fixture" "Data Units Written" number)|$(smart_labeled_field_value "$nvme_fixture" "Available Spare" number)|$(smart_labeled_field_value "$nvme_fixture" "Temperature" number)|$(smart_labeled_field_value "$nvme_ext_fixture" "Warning Comp. Temperature Time" number)"
+    if [[ "$actual" == "0x04|12|12345|1234567|99|41|5" ]] &&
+       nvme_smart_output_is_complete "$nvme_fixture"
+    then
+        self_test_result 1 "NVMe SMART and extended parser fixtures"
+    else
+        self_test_result 0 "NVMe SMART and extended parser fixtures" "found '$actual'"
+    fi
+
+    actual=$(smart_labeled_field_value $'Available Spare Threshold: 10%\ntruncated' "Available Spare" number)
+    if [[ -z "$actual" ]] &&
+       ! nvme_smart_output_is_complete $'Available Spare Threshold: 10%\ntruncated'
+    then
+        self_test_result 1 "NVMe exact-label and truncated-output rejection"
+    else
+        self_test_result 0 "NVMe exact-label and truncated-output rejection" "found '$actual'"
+    fi
+
+    local ata_selftest nvme_selftest failed_selftest parsed_status parsed_class
+    ata_selftest=$'SMART Self-test log structure revision number 1\n# 1 Short offline Completed without error 00% 1234 -\n# 2 Extended offline Completed without error 00% 1200 -'
+    actual=$(parse_smart_selftest_output "$ata_selftest")
+    local latest_long_parsed
+    latest_long_parsed=$(parse_smart_selftest_output "$(select_latest_long_selftest_line "$ata_selftest")")
+    if [[ "$actual" == "1|Short offline|Completed without error|1234|00%" &&
+          "$latest_long_parsed" == "2|Extended offline|Completed without error|1200|00%" ]]
+    then
+        self_test_result 1 "ATA self-test log parser fixture"
+    else
+        self_test_result 0 "ATA self-test log parser fixture" "found '$actual'"
+    fi
+
+    nvme_selftest=$'Self-test Log\n# 2 Short Self-test routine in progress 90% 234 -'
+    failed_selftest=$'# 3 Extended offline Completed: read failure 90% 100 -'
+    actual=$(parse_smart_selftest_output "$nvme_selftest")
+    parsed_status=$(printf '%s' "$actual" | awk -F'|' '{print $3}')
+    parsed_class=$(classify_selftest_status "$parsed_status")
+    if [[ "$actual" == "2|Short|Self-test routine in progress|234|90%" &&
+          "$parsed_class" == INPROGRESS\|* &&
+          "$(classify_selftest_status "$(parse_smart_selftest_output "$failed_selftest" | awk -F'|' '{print $3}')")" == CRITICAL\|* ]]
+    then
+        self_test_result 1 "NVMe and failed self-test classification fixtures"
+    else
+        self_test_result 0 "NVMe and failed self-test classification fixtures" "parsed '$actual' class '$parsed_class'"
+    fi
+
+    local btrfs_fixture
+    btrfs_fixture=$'[/dev/sda1].write_io_errs    3\n/dev/nvme0n1p1: corruption_errs 2\n[/dev/sdb1].read_io_errs -1\nmalformed'
+    actual=$(parse_btrfs_device_stats_text "$btrfs_fixture" | awk -F'\t' '{printf "%s%s:%s:%s", separator, $1, $2, $3; separator="|"}')
+    if [[ "$actual" == "/dev/sda1:write_io_errs:3|/dev/nvme0n1p1:corruption_errs:2" ]]; then
+        self_test_result 1 "Btrfs device-stat format and malformed-row fixtures"
+    else
+        self_test_result 0 "Btrfs device-stat format and malformed-row fixtures" "found '$actual'"
+    fi
+
+    local xfs_fixture
+    xfs_fixture=$'extent_alloc 17 2 3 4\ndir_lookup malformed\nxs_xstrat 23 0 0 0'
+    actual="$(xfs_stat_value_from_text "$xfs_fixture" extent_alloc)|$(xfs_stat_value_from_text "$xfs_fixture" dir_lookup)|$(xfs_stat_value_from_text "$xfs_fixture" xs_xstrat)"
+    if [[ "$actual" == "17||23" ]]; then
+        self_test_result 1 "XFS counter parser fixtures"
+    else
+        self_test_result 0 "XFS counter parser fixtures" "found '$actual'"
+    fi
+
+    local io_fixture ignored_io_fixture
+    io_fixture='Aug 16 12:00:00 kernel: blk_update_request: I/O error, dev sda, sector 8; nvme0n1 reset'
+    ignored_io_fixture='Aug 16 12:00:01 host: Disk I/O Alert for sdb I/O error'
+    actual=$(extract_syslog_device_paths "$io_fixture" | awk '{printf "%s%s", separator, $0; separator="|"}')
+    if syslog_line_is_disk_io_error "$io_fixture" &&
+       ! syslog_line_is_disk_io_error "$ignored_io_fixture" &&
+       [[ "$actual" == "/dev/nvme0n1|/dev/sda" ]]
+    then
+        self_test_result 1 "Syslog I/O classification and device parser fixtures"
+    else
+        self_test_result 0 "Syslog I/O classification and device parser fixtures" "found '$actual'"
+    fi
+
+    local disks_ini_fixture="$fixture_dir/disks.ini"
+    printf '[parity]\ndevice="sda"\n[disk1]\n device = "/dev/sdb"\n[cache]\nDEVICE="nvme0n1"\ndevice="sda1"\n' > "$disks_ini_fixture"
+    actual=$(parse_unraid_disk_devices_file "$disks_ini_fixture" | awk '{printf "%s%s", separator, $0; separator="|"}')
+    if [[ "$actual" == "sda|sdb|nvme0n1" ]]; then
+        self_test_result 1 "Unraid disks.ini device parser fixture"
+    else
+        self_test_result 0 "Unraid disks.ini device parser fixture" "found '$actual'"
+    fi
+
+    local smartctl_rc bitmask_failures=0
+    for smartctl_rc in 0 4 8 16 32 64 128; do
+        smartctl_exit_has_operational_failure "$smartctl_rc" && bitmask_failures=$((bitmask_failures + 1))
+    done
+    for smartctl_rc in 1 2 3 5 6 7; do
+        smartctl_exit_has_operational_failure "$smartctl_rc" || bitmask_failures=$((bitmask_failures + 1))
+    done
+    if (( bitmask_failures == 0 )); then
+        self_test_result 1 "smartctl exit-bitmask operational classification"
+    else
+        self_test_result 0 "smartctl exit-bitmask operational classification" "$bitmask_failures case(s) failed"
+    fi
+
+    DEVICE_ID_BY_PATH=()
+    DEVICE_PATH_BY_ID=()
+    DEVICE_ID_SOURCE=()
+    DEVICE_ID_BY_PATH[/dev/sda]="wwn_fixture"
+    DEVICE_PATH_BY_ID[wwn_fixture]="/dev/sda"
+    local stable_partition_key renamed_partition
+    stable_partition_key=$(persistent_device_key /dev/sda1)
+    DEVICE_ID_BY_PATH=()
+    DEVICE_PATH_BY_ID=()
+    DEVICE_ID_BY_PATH[/dev/sdz]="wwn_fixture"
+    DEVICE_PATH_BY_ID[wwn_fixture]="/dev/sdz"
+    renamed_partition=$(runtime_device_path "$stable_partition_key" 2>/dev/null || true)
+    if [[ "$stable_partition_key" == "wwn_fixture@1" && "$renamed_partition" == "/dev/sdz1" ]]; then
+        self_test_result 1 "Stable identity survives runtime device renaming"
+    else
+        self_test_result 0 "Stable identity survives runtime device renaming" "key=$stable_partition_key path=$renamed_partition"
+    fi
+    DEVICE_ID_BY_PATH=()
+    DEVICE_PATH_BY_ID=()
+    DEVICE_ID_SOURCE=()
+
+    local cursor_source="$fixture_dir/syslog.fixture" cursor_metadata cursor_device cursor_inode cursor_size cursor_anchor
+    RUN_DIR="$fixture_dir/syslog_run"
+    mkdir -p "$RUN_DIR"
+    SYSLOG_CURSOR_STATE_FILE="$fixture_dir/syslog.cursor"
+    IO_ERROR_LOG_FILE="$cursor_source"
+    printf 'old-one\nold-two\n' > "$cursor_source"
+    cursor_metadata=$(stat -c '%d %i %s' -- "$cursor_source")
+    read -r cursor_device cursor_inode cursor_size <<< "$cursor_metadata"
+    cursor_anchor=$(sed -n '2p' "$cursor_source" | sha1sum | awk '{print $1}')
+    printf 'v2 %s %s %s 2 %s %s\n' "$cursor_source" "$cursor_device" "$cursor_inode" "$cursor_size" "$cursor_anchor" > "$SYSLOG_CURSOR_STATE_FILE"
+    printf 'old-three\n' >> "$cursor_source"
+    mv "$cursor_source" "${cursor_source}.1"
+    printf 'new-one\nnew-two\n' > "$cursor_source"
+    if build_new_syslog_chunk; then
+        actual=$(awk '{printf "%s|", $0}' "$SYSLOG_CHUNK_FILE")
+    else
+        actual="build-failed"
+    fi
+    if [[ "$actual" == "old-three|new-one|new-two|" && "$SYSLOG_CURSOR_READY" == "1" ]]; then
+        self_test_result 1 "Persistent syslog cursor rotation recovery fixture"
+    else
+        self_test_result 0 "Persistent syslog cursor rotation recovery fixture" "found '$actual' ready=$SYSLOG_CURSOR_READY"
+    fi
+
     FINDING_IDS=(
         'device:/dev/sdb|capacity_warning'
         'device:/dev/sda|pending_sectors'
@@ -9112,11 +9735,15 @@ run_regression_tests() (
     RISK_MAP['/dev/sdc']=40
     RISK_MAP['/dev/sdb']=20
 
-    actual=$(emit_sorted_finding_ids | awk '{printf "%s%s", separator, $0; separator="|"}')
-    if [[ "$actual" == 'device:/dev/sda|pending_sectors|device:/dev/sda|command_timeout|device:/dev/sdc|selftest_failed|device:/dev/sdb|capacity_warning|mount:/mnt/disk2|storage_warning' ]]; then
+    local risk_sort_stderr="$fixture_dir/risk-sort.stderr"
+    actual=$(emit_sorted_finding_ids 2> "$risk_sort_stderr" | awk '{printf "%s%s", separator, $0; separator="|"}')
+    if [[ "$actual" == 'device:/dev/sda|pending_sectors|device:/dev/sda|command_timeout|device:/dev/sdc|selftest_failed|device:/dev/sdb|capacity_warning|mount:/mnt/disk2|storage_warning' &&
+          ! -s "$risk_sort_stderr" ]]
+    then
         self_test_result 1 "Deterministic structured finding ordering"
     else
-        self_test_result 0 "Deterministic structured finding ordering" "found '$actual'"
+        self_test_result 0 "Deterministic structured finding ordering" \
+            "found '$actual'; stderr=$(tr '\n' ' ' < "$risk_sort_stderr")"
     fi
 
     MOUNT_TO_DEV['/mnt/disk1']='/dev/sda'
@@ -9143,6 +9770,33 @@ run_regression_tests() (
     else
         self_test_result 0 "Structured subsystem severity aggregation" \
             "SMART=$SUBSYSTEM_SMART_STATE Capacity=$SUBSYSTEM_CAPACITY_STATE Per-Mount=$SUBSYSTEM_MOUNT_STATE"
+    fi
+
+    FINDING_IDS=()
+    FINDING_SEEN=()
+    FINDING_SEVERITY=()
+    FINDING_CATEGORY=()
+    FINDING_SIGNAL=()
+    FINDING_DEVICE=()
+    FINDING_SCOPE=()
+    FINDING_TITLE=()
+    FINDING_EVIDENCE=()
+    FINDING_ACTION=()
+    RISK_MAP=()
+    LOG_MIRROR_STDOUT=0
+    record_finding warning monitoring monitoring.timeout "" \
+        "Collector timeout" "Fixture collector exceeded deadline." \
+        "Review the fixture log." "fixture_timeout"
+    finalize_finding_counts
+    build_health_alerts
+    local golden_health_alerts=$'Health Alerts:\n - [WARNING] Monitoring — 1 finding\n   • Collector timeout: Fixture collector exceeded deadline.\n   → Review the fixture log.'
+    if [[ "$HEALTH_ALERTS_SECTION" == "$golden_health_alerts" &&
+          "$FINDING_WARNING_COUNT" == "1" && "$FINDING_CRITICAL_COUNT" == "0" ]]
+    then
+        self_test_result 1 "Golden global notification rendering fixture"
+    else
+        self_test_result 0 "Golden global notification rendering fixture" \
+            "unexpected rendered health-alert block"
     fi
 
     NOTIFY_BODY=""
@@ -9199,6 +9853,21 @@ run_regression_tests() (
         self_test_result 0 "Failed collector baseline preservation" "found '$actual'"
     fi
 
+    local protected_history="$fixture_dir/protected.history"
+    local protected_scalar="$fixture_dir/protected.scalar"
+    printf '2026-08-15 disk_a temp=30 captured_epoch=1 schema=3\n' > "$protected_history"
+    printf 'known-scalar\n' > "$protected_scalar"
+    collector_replace_daily_history "$protected_history" 2026-08-15 \
+        '2026-08-15 disk_a temp=99 captured_epoch=2 schema=3'
+    collector_atomic_write_text "$protected_scalar" $'replacement-scalar\n'
+    if grep -Fq 'temp=30 ' "$protected_history" &&
+       [[ "$(<"$protected_scalar")" == "known-scalar" ]]
+    then
+        self_test_result 1 "Multi-file fault-injection baseline preservation"
+    else
+        self_test_result 0 "Multi-file fault-injection baseline preservation"
+    fi
+
     printf 'smart\tFAILED\tsmartctl /dev/sdaa\trc=2\n' > "$COLLECTOR_EVENT_FILE"
     if ! collector_device_has_blocking_event smart /dev/sda &&
        collector_device_has_blocking_event smart /dev/sdaa
@@ -9247,6 +9916,11 @@ run_regression_tests() (
         self_test_result 0 "Collector status report rendering" "unexpected collector report"
     fi
 
+    if (( SELF_TEST_TOTAL != REGRESSION_FIXTURE_COUNT )); then
+        SELF_TEST_FAILED=$((SELF_TEST_FAILED + 1))
+        printf '[FAIL] Fixture manifest count - expected=%d actual=%d\n' \
+            "$REGRESSION_FIXTURE_COUNT" "$SELF_TEST_TOTAL"
+    fi
     printf '\nSelf-test summary: passed=%d failed=%d total=%d\n' \
         "$SELF_TEST_PASSED" "$SELF_TEST_FAILED" "$SELF_TEST_TOTAL"
     (( SELF_TEST_FAILED == 0 ))
@@ -9322,7 +9996,7 @@ main() {
             return 0
             ;;
         version)
-            printf 'Disk Health Monitor for Unraid v2.10\n'
+            printf 'Disk Health Monitor for Unraid v2.11\n'
             return 0
             ;;
         check-config)
