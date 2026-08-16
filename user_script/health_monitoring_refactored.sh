@@ -9,7 +9,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.11
+# Disk Health Monitor for Unraid v2.11.1
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
@@ -878,6 +878,7 @@ findmnt_bounded() {
     run_bounded "$SYSTEM_COMMAND_TIMEOUT_SECONDS" "findmnt ${*: -1}" findmnt "$@"
 }
 
+# shellcheck disable=SC2120
 dmesg_bounded() {
     run_bounded_checked "$SYSTEM_COMMAND_TIMEOUT_SECONDS" "dmesg" dmesg "$@"
 }
@@ -2658,6 +2659,7 @@ persistent_device_key() {
     [[ "$device" == /dev/* ]] || { printf '%s' "$device"; return 0; }
     base=$(base_device "$device")
     [[ -n "$base" ]] || { printf 'path_%s' "$(safe_state_name "$device")"; return 0; }
+    # shellcheck disable=SC2295
     suffix="${device#$base}"
     identity="${DEVICE_ID_BY_PATH[$base]:-}"
     [[ -n "$identity" ]] || identity="path_$(safe_state_name "$base")"
@@ -2946,6 +2948,7 @@ parity_state() {
 
 # === Main Function ===
 # Discover and summarize parity devices and current parity operation status.
+# shellcheck disable=SC2329
 discover_parity_and_status() {
     # Init output containers (status line, detail section)
     PARITY_STATUS_LINE=""
@@ -4872,6 +4875,7 @@ check_completed_long_tests() {
 
 # === Main Function ===
 # Monitor Btrfs filesystems for scrub status
+# shellcheck disable=SC2329
 monitor_btrfs() {
     # Prune aged persisted status files to avoid indefinite growth
     if [[ -d "$BTRFS_SCRUB_STATE_DIR" && ${BTRFS_SCRUB_STATE_TTL_DAYS:-0} -gt 0 ]]; then
@@ -4980,6 +4984,7 @@ monitor_btrfs() {
 
 # === Main Function ===
 # Monitor XFS filesystems for metadata issues
+# shellcheck disable=SC2329
 monitor_xfs() {
     if [[ ${ENABLE_XFS_CHECK:-0} -eq 1 ]]; then
         log_xfs "$(date '+%Y-%m-%d %H:%M:%S') - XFS checks starting"
@@ -5008,6 +5013,7 @@ monitor_xfs() {
             fi
         fi
         # Scan recent kernel ring buffer for XFS / I/O error patterns referencing mount; raise warning
+        # shellcheck disable=SC2119
         if dmesg_bounded | tail -n 3000 | grep -qiE "$(basename "$mp").*(XFS|I/O error)|XFS ERROR|xfs_repair"; then
             msg="WARNING: Kernel/XFS I/O messages for $mp"
             log_xfs "$(date '+%Y-%m-%d %H:%M:%S') - $msg"
@@ -5020,6 +5026,7 @@ monitor_xfs() {
 
 # === Main Function ===
 # Evaluate array and pool capacity against thresholds
+# shellcheck disable=SC2329
 evaluate_capacity_alerts() {
     if [[ -n "${ARRAY_PERCENT:-}" ]]; then
         # Critical if usage exceeds configured threshold
@@ -5042,6 +5049,7 @@ evaluate_capacity_alerts() {
 
 # === Helper Function ===
 # Evaluate mountpoint usage against defined thresholds
+# shellcheck disable=SC2329
 evaluate_per_mount_thresholds() {
     local candidates=(/mnt/disk* /mnt/cache /mnt/*)
     declare -A seen
@@ -5069,6 +5077,7 @@ evaluate_per_mount_thresholds() {
 
 # === Main Collection Phase ===
 # Run SMART tests, record daily SMART history, and calculate NVMe wear projection.
+# shellcheck disable=SC2329
 collect_smart_health() {
     local -a disks=()
     local disk today tmp poh line key val stored_key
@@ -5243,6 +5252,7 @@ fi
 
 # === Helper Function ===
 # Check btrfs snapshot counts against thresholds.
+# shellcheck disable=SC2329
 check_btrfs_snapshots() {
     local -a mountpoints=()
     local mp
@@ -5286,6 +5296,7 @@ build_new_syslog_chunk() {
     : > "$SYSLOG_CHUNK_FILE" || return 1
 
     if [[ ! -r "$source" ]]; then
+        # shellcheck disable=SC2119
         dmesg_bounded 2>/dev/null | tail -n "$SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES" > "$SYSLOG_CHUNK_FILE" || true
         log "SYSLOG" "WARN" \
             "$source is unavailable; using a non-cursor dmesg fallback"
@@ -5421,6 +5432,7 @@ syslog_timestamp_epoch() {
 
 # Scan only the new syslog chunk, count unique disk I/O events in the configured
 # time window, then atomically advance history and cursor together.
+# shellcheck disable=SC2329
 scan_syslog_disk_errors() {
     (( IO_ERROR_MONITOR_ENABLED == 1 )) || { IO_ERROR_FREQ_SECTION=""; return 0; }
     local had_e=0
@@ -5594,6 +5606,7 @@ trim_outer_blank_lines() {
 
 # === Main Function ===
 # Build array disk list, compute usage per disk, merge SMART severity, and assemble lines
+# shellcheck disable=SC2329
 build_storage_and_disk_lines() {
     ARRAY_MAX_SEV=0; POOLS_MAX_SEV=0
     ARRAY_DISK_LINES=""; POOL_LINES=""
@@ -5938,6 +5951,7 @@ build_storage_and_disk_lines() {
 
 # === Helper Function ===
 # Check for discrepancies between array usage and /mnt/user usage
+# shellcheck disable=SC2329
 validate_storage_metrics() {
     local user_line discrepancy_section=""
     if mountpoint -q /mnt/user; then
@@ -6244,6 +6258,7 @@ build_health_alerts() {
 
 # === Main Function ===
 # Build non-critical trend / advisory analytics section
+# shellcheck disable=SC2329
 build_trend_section() {
     # Minimal ERR trap to log which sub-block failed while compiling trends
     trap 'log_crit "Trend sub-block failed [${CURRENT_TREND_BLOCK:-unknown}] at line ${LINENO}: ${BASH_COMMAND}"' ERR
@@ -7435,6 +7450,7 @@ build_disk_health_summary() {
 
 # === Main Function ===
 # Compute risk scores for disks based on SMART attributes and categorize into lifecycle buckets
+# shellcheck disable=SC2329
 compute_risk_and_lifecycle() {
     (( RISK_SCORING_ENABLED == 1 )) || return 0
     # Derive per-disk risk scores from SMART-derived messages and attributes
@@ -7598,6 +7614,7 @@ persist_risk_tier_history() {
 
 # === Main Function ===
 # Compute share usage breakdown and growth trends
+# shellcheck disable=SC2329
 compute_share_breakdown() {
     # Gate on feature toggle and presence of /mnt/user
     (( SHARE_BREAKDOWN_ENABLED == 1 )) || { return 0; }
@@ -7627,6 +7644,7 @@ compute_share_breakdown() {
 
 # === Main Function ===
 # Track capacity usage history, compute growth trends, estimate days to threshold, export JSON
+# shellcheck disable=SC2329
 capacity_forecast_and_export() {
     # Consolidated math using scaled integers (milli-percent) to reduce multiple awk processes.
     convert_pct_to_milli() { 
@@ -7814,6 +7832,7 @@ capacity_forecast_and_export() {
 
 # === Main Function ===
 # Analyze TBW history to estimate daily write rates and days to threshold
+# shellcheck disable=SC2329
 tbw_forecast_and_heavy_writers() {
     # Forecast days-to-endurance threshold and list heavy writers (normalized by capacity)
     (( ${TBW_TREND_ENABLED:-1} == 1 )) || { return 0; }
@@ -8019,6 +8038,7 @@ tbw_forecast_and_heavy_writers() {
 
 # === Helper Function ===
 # Detect firmware/controller resets by checking for Power-On Hours (POH) drops and NVMe Percentage Used regression
+# shellcheck disable=SC2329
 detect_counter_resets() {
     local events=""
     for dev in "${!SMART_STATE[@]}"; do
@@ -8106,6 +8126,7 @@ last_xfs_history_metric() {
 
 # Collect Btrfs counters without resetting them. Missing baselines and counter
 # regressions establish a new baseline and never become synthetic error deltas.
+# shellcheck disable=SC2329
 collect_btrfs_device_stats() {
     (( ${ENABLE_BTRFS_DEVICE_STATS:-0} == 1 )) || return 0
     local prev_file="$BTRFS_DEV_PREV_FILE"
@@ -8252,6 +8273,7 @@ collect_btrfs_device_stats() {
 
 # === Main Function ===
 # Collect and integrate xfs /proc stats (global deltas)
+# shellcheck disable=SC2329
 collect_xfs_proc_stats() {
     (( ${ENABLE_XFS_PROC_STATS:-0} == 1 )) || return 0
     local stat_file="/proc/fs/xfs/stat" prev_file="$XFS_PROC_PREV_FILE"
@@ -8555,7 +8577,7 @@ limit_notification_body() {
 
     if (( LOG_FULL_NOTIFICATION_ON_TRUNCATION == 1 )) && [[ -n "${MASTER_LOG:-}" ]]; then
         {
-            printf '\n===== FULL NOTIFICATION BODY (v2.11) =====\n'
+            printf '\n===== FULL NOTIFICATION BODY (v2.11.1) =====\n'
             printf '%s\n' "$FULL_NOTIFICATION_BODY"
             printf '===== END FULL NOTIFICATION BODY =====\n'
         } >> "$MASTER_LOG"
@@ -9252,7 +9274,7 @@ validate_runtime_dependencies() {
 
 print_usage() {
     cat <<'USAGE'
-Disk Health Monitor for Unraid v2.11
+Disk Health Monitor for Unraid v2.11.1
 
 Usage:
   health_monitoring.sh                 Run normal monitoring
@@ -9308,7 +9330,7 @@ run_diagnostics() {
     local failures=0 warnings=0 config_status=0 dependency_status=0
     local parent device_rows
 
-    printf 'Disk Health Monitor for Unraid v2.11 - read-only diagnostics\n'
+    printf 'Disk Health Monitor for Unraid v2.11.1 - read-only diagnostics\n'
     printf 'No disk SMART reads, tests, scrubs, state writes, cursor updates, or notifications will occur.\n\n'
 
     if validate_configuration; then
@@ -9425,7 +9447,7 @@ run_regression_tests() (
     }
     trap '[[ -z "$fixture_dir" || "$fixture_dir" != /tmp/health_monitoring.selftest.* ]] || rm -rf -- "$fixture_dir"' EXIT
 
-    printf 'Disk Health Monitor for Unraid v2.11 - built-in regression tests\n'
+    printf 'Disk Health Monitor for Unraid v2.11.1 - built-in regression tests\n'
     printf '%d fixtures are isolated under %s and removed automatically.\n\n' \
         "$REGRESSION_FIXTURE_COUNT" "$fixture_dir"
 
@@ -9799,6 +9821,7 @@ run_regression_tests() (
             "unexpected rendered health-alert block"
     fi
 
+    # shellcheck disable=SC2030
     NOTIFY_BODY=""
     for (( count=1; count<=30; count++ )); do
         NOTIFY_BODY+="line-${count}: 123456789012345678901234567890"
@@ -9885,10 +9908,14 @@ run_regression_tests() (
     COLLECTOR_DETAIL=()
     COLLECTOR_FAILURE_NOTIFICATIONS=0
     COLLECTOR_SLOW_SECONDS=0
+    # Invoked indirectly through run_collector.
+    # shellcheck disable=SC2329
     fixture_deferred_collector() {
         record_collector_event DEFERRED "fixture device" "standby"
         return 0
     }
+    # Invoked indirectly through run_collector.
+    # shellcheck disable=SC2329
     fixture_failed_collector() {
         return 7
     }
@@ -9944,6 +9971,9 @@ collector_step() {
     return 0
 }
 
+# These bundles are callbacks dispatched by run_collector through "$@".
+# Keep SC2329 local so genuinely unreachable functions elsewhere remain visible.
+# shellcheck disable=SC2329
 collect_inventory_phase() {
     cache_lsblk_all
     discover_device_inventory || return 1
@@ -9958,12 +9988,14 @@ collect_inventory_phase() {
     build_mount_device_map
 }
 
+# shellcheck disable=SC2329
 collect_btrfs_filesystem_phase() {
     collector_step "Btrfs scrub status" monitor_btrfs
     collector_step "Btrfs snapshot count" check_btrfs_snapshots
     return 0
 }
 
+# shellcheck disable=SC2329
 collect_capacity_phase() {
     collector_step "Storage utilization" build_storage_and_disk_lines
     collector_step "Capacity thresholds" evaluate_capacity_alerts
@@ -9972,6 +10004,7 @@ collect_capacity_phase() {
     return 0
 }
 
+# shellcheck disable=SC2329
 collect_growth_phase() {
     collector_step "Capacity forecast" capacity_forecast_and_export
     collector_step "Storage validation" validate_storage_metrics
@@ -9979,6 +10012,7 @@ collect_growth_phase() {
     return 0
 }
 
+# shellcheck disable=SC2329
 collect_endurance_phase() {
     collector_step "TBW forecast" tbw_forecast_and_heavy_writers
     collector_step "Counter regression detection" detect_counter_resets
@@ -9996,7 +10030,7 @@ main() {
             return 0
             ;;
         version)
-            printf 'Disk Health Monitor for Unraid v2.11\n'
+            printf 'Disk Health Monitor for Unraid v2.11.1\n'
             return 0
             ;;
         check-config)
@@ -10090,6 +10124,7 @@ main() {
 
     log "NOTIFY" "INFO" \
         "Sending consolidated notification (severity=$FINAL_NOTIFICATION_SEVERITY, critical=$FINDING_CRITICAL_COUNT, warning=$FINDING_WARNING_COUNT)"
+    # shellcheck disable=SC2031
     notify_unraid \
         "${SUBJECT:-Disk Health Summary}" \
         "$NOTIFY_BODY" \
