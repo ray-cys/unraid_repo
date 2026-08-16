@@ -3,7 +3,13 @@
 noParity=true
 set -uo pipefail
 
-# Disk Health Monitor for Unraid v2.6
+if (( BASH_VERSINFO[0] < 4 )); then
+    printf 'health_monitoring.sh requires Bash 4 or newer (found %s).\n' \
+        "${BASH_VERSION:-unknown}" >&2
+    exit 2
+fi
+
+# Disk Health Monitor for Unraid v2.8
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
@@ -48,7 +54,7 @@ STORAGE_DISCREPANCY_SUSTAIN_RUNS=2              # Consecutive runs >= diff befor
 
 # === Filesystem / Device Monitoring Toggles ===
 ENABLE_BTRFS_SCRUB=0                            # Start btrfs scrub vs just parse last status
-FIRST_RUN_FORCE=1                               # Force initial scrub on first run when disabled (0=disable)
+FIRST_RUN_FORCE=0                               # Keep disabled scrubs fully disabled; set 1 only for an intentional baseline
 BTRFS_SCRUB_STATE_TTL_DAYS=90                   # Days to retain scrub state files
 ENABLE_BTRFS_DEVICE_STATS=1                     # Parse btrfs per-device stats and integrate (0=disable)
 BTRFS_TREND_TOP_N=5                             # Top N devices by error delta
@@ -365,9 +371,14 @@ SYSLOG_CURSOR_PENDING_LINES=0
 SYSLOG_CURSOR_PENDING_SIZE=0
 SYSLOG_CURSOR_PENDING_ANCHOR="-"
 SYSLOG_CHUNK_FILE=""
+RUN_MODE="monitor"
+CONFIG_ERROR_COUNT=0
+CONFIG_WARNING_COUNT=0
+DEPENDENCY_ERROR_COUNT=0
+DEPENDENCY_WARNING_COUNT=0
 
 # === Logs Paths ===
-STATE_DIR="$LOG_DIR/state"
+STATE_DIR="${LOG_DIR:-}/state"
 
 # === Categorized Timestamp Logging ===
 log() {
@@ -7702,7 +7713,8 @@ detect_counter_resets() {
             local curr_used=${CUR_ATTR["$dev|nvme_percent_used"]:-}
             if [[ -n "$prev_used" && -n "$curr_used" && "$prev_used" =~ ^[0-9]+$ && "$curr_used" =~ ^[0-9]+$ && $curr_used -lt $prev_used ]]; then
                 local delta=$(( prev_used - curr_used ))
-                if (( delta >= NVME_WEAR_REGRESSION_WARN )); then
+                if (( NVME_WEAR_REGRESSION_WARN > 0 &&
+                      delta >= NVME_WEAR_REGRESSION_WARN )); then
                     events+=" - $(basename "$dev") NVMe percent_used regression: ${prev_used}% -> ${curr_used}% (drop ${delta}%)\n"
                     record_alert warning "Firmware Reset" "Disk $dev NVMe Percentage Used decreased (${prev_used}% -> ${curr_used}%); check firmware or controller resets"
                 fi
@@ -8315,98 +8327,801 @@ persist_all_state() {
 # Validation and orchestration
 # ---------------------------------------------------------------------------
 
-validate_runtime_dependencies() {
-    local command_name setting value
-    local -a required_commands=(
-        awk
-        cksum
-        cp
-        date
-        df
-        dmesg
-        findmnt
-        flock
-        grep
-        lsblk
-        mount
-        mountpoint
-        mktemp
-        readlink
-        sed
-        sha1sum
-        smartctl
-        sort
-        stat
-        tail
-        wc
+configuration_error() {
+    CONFIG_ERROR_COUNT=$((CONFIG_ERROR_COUNT + 1))
+    log "CONFIG" "ERROR" "$*"
+}
+
+configuration_warning() {
+    CONFIG_WARNING_COUNT=$((CONFIG_WARNING_COUNT + 1))
+    log "CONFIG" "WARN" "$*"
+}
+
+configuration_value() {
+    local setting="$1"
+
+    if ! declare -p "$setting" >/dev/null 2>&1; then
+        return 1
+    fi
+    printf '%s' "${!setting}"
+}
+
+validate_boolean_setting() {
+    local setting="$1" value
+
+    value=$(configuration_value "$setting" 2>/dev/null || true)
+    [[ "$value" =~ ^[01]$ ]] ||
+        configuration_error "$setting must be 0 or 1 (found '${value:-unset}')"
+}
+
+validate_nonnegative_integer_setting() {
+    local setting="$1" value
+
+    value=$(configuration_value "$setting" 2>/dev/null || true)
+    [[ "$value" =~ ^[0-9]+$ ]] ||
+        configuration_error "$setting must be a non-negative integer (found '${value:-unset}')"
+}
+
+validate_positive_integer_setting() {
+    local setting="$1" value
+
+    value=$(configuration_value "$setting" 2>/dev/null || true)
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] ||
+        configuration_error "$setting must be a positive integer (found '${value:-unset}')"
+}
+
+validate_nonnegative_number_setting() {
+    local setting="$1" value
+
+    value=$(configuration_value "$setting" 2>/dev/null || true)
+    [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+        configuration_error "$setting must be a non-negative number (found '${value:-unset}')"
+}
+
+validate_positive_number_setting() {
+    local setting="$1" value
+
+    value=$(configuration_value "$setting" 2>/dev/null || true)
+    if [[ ! "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+       ! awk -v value="$value" 'BEGIN { exit !(value > 0) }'
+    then
+        configuration_error "$setting must be a positive number (found '${value:-unset}')"
+    fi
+}
+
+validate_percent_setting() {
+    local setting="$1" value
+
+    value=$(configuration_value "$setting" 2>/dev/null || true)
+    if [[ ! "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+       ! awk -v value="$value" 'BEGIN { exit !(value >= 0 && value <= 100) }'
+    then
+        configuration_error "$setting must be between 0 and 100 (found '${value:-unset}')"
+    fi
+}
+
+validate_ordered_pair() {
+    local lower_setting="$1" upper_setting="$2" lower upper
+
+    lower=$(configuration_value "$lower_setting" 2>/dev/null || true)
+    upper=$(configuration_value "$upper_setting" 2>/dev/null || true)
+    [[ "$lower" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
+    [[ "$upper" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
+    if ! awk -v lower="$lower" -v upper="$upper" \
+        'BEGIN { exit !(lower <= upper) }'
+    then
+        configuration_error \
+            "$lower_setting ($lower) must be less than or equal to $upper_setting ($upper)"
+    fi
+}
+
+validate_absolute_path_setting() {
+    local setting="$1" value
+
+    value=$(configuration_value "$setting" 2>/dev/null || true)
+    if [[ -z "$value" || "$value" != /* || "$value" == "/" ]]; then
+        configuration_error \
+            "$setting must be a non-root absolute path (found '${value:-unset}')"
+    fi
+}
+
+validate_model_rule_block() {
+    local setting="$1" kind="$2" block line line_number=0
+
+    block=$(configuration_value "$setting" 2>/dev/null || true)
+    while IFS= read -r line; do
+        line_number=$((line_number + 1))
+        line="${line%$'\r'}"
+        [[ -z "$line" || "$line" == "\\" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+        local -A fields=()
+        local -a parts=()
+        local part key value grep_status
+        IFS=';' read -r -a parts <<< "$line"
+        for part in "${parts[@]}"; do
+            if [[ "$part" != *:* ]]; then
+                configuration_error "$setting line $line_number has an invalid field: $part"
+                continue
+            fi
+            key="${part%%:*}"
+            value="${part#*:}"
+            case "$kind:$key" in
+                tbw:regex|tbw:per_tb|tbw:cap_min|tbw:cap_max|\
+                poh:type|poh:regex|poh:warn|poh:crit|poh:cap_min|poh:cap_max|\
+                quirk:action|quirk:regex|quirk:cap_min|quirk:cap_max)
+                    ;;
+                *)
+                    configuration_error \
+                        "$setting line $line_number contains unsupported key '$key'"
+                    continue
+                    ;;
+            esac
+            if [[ -n "${fields[$key]+set}" ]]; then
+                configuration_error "$setting line $line_number repeats key '$key'"
+            fi
+            fields[$key]="$value"
+        done
+
+        if [[ -z "${fields[regex]:-}" ]]; then
+            configuration_error "$setting line $line_number requires regex"
+        else
+            printf '' | grep -Eq -- "${fields[regex]}" 2>/dev/null
+            grep_status=$?
+            (( grep_status != 2 )) ||
+                configuration_error "$setting line $line_number has an invalid regex"
+        fi
+
+        for key in cap_min cap_max; do
+            [[ -z "${fields[$key]:-}" ]] && continue
+            [[ "${fields[$key]}" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+                configuration_error "$setting line $line_number has invalid $key"
+        done
+        if [[ "${fields[cap_min]:-}" =~ ^[0-9]+([.][0-9]+)?$ &&
+              "${fields[cap_max]:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+           ! awk -v minimum="${fields[cap_min]}" -v maximum="${fields[cap_max]}" \
+                'BEGIN { exit !(minimum <= maximum) }'
+        then
+            configuration_error "$setting line $line_number has cap_min greater than cap_max"
+        fi
+
+        case "$kind" in
+            tbw)
+                if [[ ! "${fields[per_tb]:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+                   ! awk -v value="${fields[per_tb]:-0}" 'BEGIN { exit !(value > 0) }'
+                then
+                    configuration_error "$setting line $line_number requires positive per_tb"
+                fi
+                ;;
+            poh)
+                case "${fields[type]:-}" in
+                    nvme|sata-ssd|sata-hdd) ;;
+                    *) configuration_error \
+                        "$setting line $line_number requires type nvme, sata-ssd, or sata-hdd" ;;
+                esac
+                for key in warn crit; do
+                    [[ "${fields[$key]:-}" =~ ^[1-9][0-9]*$ ]] ||
+                        configuration_error "$setting line $line_number requires positive $key"
+                done
+                if [[ "${fields[warn]:-}" =~ ^[0-9]+$ &&
+                      "${fields[crit]:-}" =~ ^[0-9]+$ ]] &&
+                   ! awk -v warn="${fields[warn]}" -v crit="${fields[crit]}" \
+                        'BEGIN { exit !(warn <= crit) }'
+                then
+                    configuration_error "$setting line $line_number has warn greater than crit"
+                fi
+                ;;
+            quirk)
+                case "${fields[action]:-}" in
+                    invert_mwi_small) ;;
+                    *) configuration_error \
+                        "$setting line $line_number has unsupported action '${fields[action]:-unset}'" ;;
+                esac
+                ;;
+        esac
+    done <<< "$block"
+}
+
+validate_configuration() {
+    CONFIG_ERROR_COUNT=0
+    CONFIG_WARNING_COUNT=0
+
+    local setting pair excluded_pool
+    local -a boolean_settings=(
+        SMART_ALLOW_SPINUP SHORT_TEST_POLL LONG_TEST_INITIAL_FORCE
+        REPLACEMENT_AUTO_RESET STORAGE_DISCREPANCY_ALERT_ENABLED
+        ENABLE_BTRFS_SCRUB FIRST_RUN_FORCE ENABLE_BTRFS_DEVICE_STATS
+        ENABLE_XFS_CHECK ENABLE_XFS_PROC_STATS XFS_PROC_PER_MOUNT_ALERTS
+        XFS_PROC_REQUIRE_RATIO_FOR_ALERT XFS_PROC_SMART_ANNOTATE_BURST
+        XFS_PROC_SUPPRESS_DURING_PARITY AGE_AWARE_ENABLED
+        SMART_ATTR_TREND_ENABLED ERROR_RATE_TREND_ENABLED
+        SATA_LINK_INSTABILITY_ENABLED BTRFS_DEV_TREND_ENABLED
+        SHARE_BREAKDOWN_ENABLED RISK_SCORING_ENABLED LIFECYCLE_ENABLED
+        POH_TREND_ENABLED TBW_TREND_ENABLED TEMP_RATE_ALERT_ENABLED
+        IO_ERROR_MONITOR_ENABLED IO_ERROR_DEDUP_ENABLED LOG_PRUNE_ENABLED
+        HISTORY_PRUNE_ENABLED LOG_MIRROR_STDOUT SHOW_OK_SUBSYSTEMS
+        SHOW_DISABLED_SUBSYSTEMS VERBOSE_OK SHOW_ZERO_COUNTS
+        WEAR_TREND_ENABLED ENABLE_MODEL_IN_ALERTS
+    )
+    local -a integer_settings=(
+        SHORT_TEST_INTERVAL_DAYS SHORT_TEST_MAX_WAIT SHORT_TEST_POLL_INTERVAL
+        LONG_TEST_ACCEL_FACTOR LONG_TEST_MIN_INTERVAL_DAYS LONG_TEST_MAX_INTERVAL_DAYS
+        LONG_TEST_RISK_LOOKBACK_DAYS LONG_TEST_RISK_THRESHOLD
+        LONG_TEST_CRITICAL_MIN_DAYS LONG_TEST_RISK_MIN_DAYS LONG_TEST_NEAR_WINDOW_DAYS
+        REPLACEMENT_POH_DROP_THRESHOLD_HOURS REPLACEMENT_POH_DROP_THRESHOLD_HOURS_HDD
+        REPLACEMENT_POH_DROP_THRESHOLD_HOURS_SSD REPLACEMENT_POH_DROP_THRESHOLD_HOURS_NVME
+        WARN_THRESHOLD_PERCENT CRITICAL_THRESHOLD_PERCENT THRESHOLD NEAR_THRESHOLD_DELTA
+        STORAGE_DISCREPANCY_SUSTAIN_RUNS BTRFS_SCRUB_STATE_TTL_DAYS
+        BTRFS_TREND_TOP_N BTRFS_TREND_WINDOW_DAYS IO_ERROR_WINDOW_MINUTES
+        IO_ERROR_WARN_THRESHOLD IO_ERROR_CRIT_THRESHOLD
+        SYSLOG_CURSOR_STARTUP_LOOKBACK_LINES SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES
+        NVME_WEAR_REGRESSION_WARN PARITY_SYNC_ERR_WARN PARITY_SYNC_ERR_CRIT
+        POH_RESET_CRIT_THRESHOLD SMART_ATTR_TREND_WINDOW_DAYS SMART_ATTR_TREND_TOP_N
+        SMART_ATTR_TREND_MIN_DELTA ENDURANCE_DAYSLEFT_TOP_N
+        ENDURANCE_DAYSLEFT_ACCEL_FACTOR_PCT ERROR_RATE_TREND_WINDOW_DAYS
+        ERROR_RATE_TREND_TOP_N ERROR_RATE_ACCEL_FACTOR_PCT ERROR_RATE_ACCEL_MIN_DELTA
+        ERROR_RATE_ACCEL_FACTOR_CORRUPTION ERROR_RATE_ACCEL_MIN_DELTA_CORRUPTION
+        ERROR_RATE_ACCEL_FACTOR_GENERATION ERROR_RATE_ACCEL_MIN_DELTA_GENERATION
+        SATA_LINK_INSTABILITY_WINDOW_DAYS SATA_LINK_INSTABILITY_STREAK_WARN
+        SATA_LINK_INSTABILITY_STREAK_CRIT HISTORY_WINDOW_DAYS SHARE_TOP_N
+        HISTORY_SCHEMA_VERSION FORECAST_MIN_SAMPLES FORECAST_HIGH_SAMPLES
+        FORECAST_MAX_GAP_DAYS LOG_MAX_DAYS LOG_MAX_COUNT HISTORY_MAX_DAYS
+        HISTORY_MAX_LINES LIFECYCLE_ALERT_TOP_N RISK_TOP_N RISK_REPLACE RISK_MONITOR
+        ENDURANCE_TREND_WINDOW_DAYS ENDURANCE_TREND_TOP_N ENDURANCE_TREND_MIN_POH_DELTA
+        FORECAST_PRECISION_DECIMALS RELOC_WARNING RELOC_CRITICAL PEND_WARNING
+        SSD_TEMP_WARNING SSD_TEMP_CRITICAL HDD_TEMP_WARNING HDD_TEMP_CRITICAL
+        LOAD_CYCLE_WARN LOAD_CYCLE_CRIT SSD_WEAR_WARN SSD_WEAR_CRIT
+        REPORTED_UNC_CRIT CMD_TIMEOUT_WARN CMD_TIMEOUT_CRIT CMD_TIMEOUT_DELTA_WARN
+        CMD_TIMEOUT_COOLDOWN_DAYS REALLOC_EVENT_WARN REALLOC_EVENT_CRIT
+        END_TO_END_ERR_CRIT SOFT_READ_ERR_WARN NVME_TEMP_WARNING NVME_TEMP_CRITICAL
+        NVME_PERCENT_USED_WARN NVME_PERCENT_USED_CRIT WEAR_TREND_WINDOW_DAYS
+        WEAR_TREND_TOP_N WEAR_DAYS_LEFT_WARN WEAR_DAYS_LEFT_CRIT
+        WRITER_WEEKLY_WARN_PCT WRITER_WEEKLY_CRIT_PCT WRITER_TIER_MODERATE_PCT
+        UNSAFE_SDWN_DELTA_WARN UNSAFE_SDWN_ABSOLUTE_MIN UNSAFE_SDWN_COOLDOWN_DAYS
+        NVME_AVAIL_SPARE_WARN NVME_ERR_LOG_DELTA_WARN NVME_ERR_LOG_DELTA_CRIT
+        NVME_PCIE_CORR_DELTA_WARN NVME_PCIE_CORR_DELTA_CRIT
+        NVME_PCIE_UNC_DELTA_WARN NVME_PCIE_UNC_DELTA_CRIT
+        NVME_THERM_T1_DELTA_WARN NVME_THERM_T2_DELTA_WARN
+        NVME_WARN_TEMP_TIME_DELTA_WARN NVME_CRIT_TEMP_TIME_DELTA_WARN
+        SNAPSHOT_WARN SNAPSHOT_CRIT BTRFS_DEV_ERR_WARN_DELTA BTRFS_DEV_ERR_CRIT_DELTA
+        BTRFS_DEV_CORR_WARN_DELTA BTRFS_DEV_CORR_CRIT_DELTA
+        BTRFS_ERR_BURST_WARN_RATIO BTRFS_ERR_BURST_CRIT_RATIO
+        XFS_PROC_WARN_DELTA XFS_PROC_CRIT_DELTA XFS_ERR_BURST_WARN_RATIO
+        XFS_ERR_BURST_CRIT_RATIO BURST_WARN_BOOST BURST_CRIT_BOOST
+        HDD_POH_WARN_HOURS HDD_POH_CRIT_HOURS SSD_POH_WARN_HOURS SSD_POH_CRIT_HOURS
+        NVME_POH_WARN_HOURS NVME_POH_CRIT_HOURS TBW_DAYS_WARN TBW_DAYS_CRIT
+        TBW_WARN_TB TBW_CONSUMED_WARN TBW_CONSUMED_CRIT
+        W_SEV_CRIT W_SEV_WARN W_PENDING W_UNCORR W_REALLOC W_REALLOC_EVENTS
+        W_CMD_TIMEOUT W_CRC W_SSD_LIFE W_NVME_WEAR W_NVME_ERR_LOG
+        W_NVME_PCIE_CORR W_NVME_PCIE_UNC W_NVME_THERM_TRANS W_NVME_TEMP_TIME
+        W_TEMP W_E2E W_SOFT_READ W_NVME_RO W_NVME_REL W_AGE_NEAR
+        W_POH_HDD W_POH_SSD W_POH_NVME W_BTRFS_DEV_ERR W_XFS_META_ERR
+        W_SATA_LINK_DOWN W_SELFTEST_CRIT W_SELFTEST_WARN W_TBW_CONS_WARN
+        W_TBW_CONS_CRIT
+    )
+    local -a number_settings=(
+        STORAGE_DISCREPANCY_MIN_DIFF ENDURANCE_DAYSLEFT_ACCEL_MIN_DELTA
+        FORECAST_MIN_SPAN_DAYS FORECAST_HIGH_SPAN_DAYS FORECAST_STALE_AFTER_DAYS
+        TEMP_RATE_WARN_C_PER_DAY TEMP_RATE_CRIT_C_PER_DAY TEMP_RATE_MIN_SPAN_DAYS
+        WEAR_STABLE_MIN_RATE
+    )
+    local -a percent_settings=(
+        WARN_THRESHOLD_PERCENT CRITICAL_THRESHOLD_PERCENT THRESHOLD NEAR_THRESHOLD_DELTA
+        LONG_TEST_RISK_THRESHOLD STORAGE_DISCREPANCY_MIN_DIFF
+        SSD_WEAR_WARN SSD_WEAR_CRIT NVME_PERCENT_USED_WARN NVME_PERCENT_USED_CRIT
+        NVME_AVAIL_SPARE_WARN TBW_CONSUMED_WARN TBW_CONSUMED_CRIT
+        RISK_MONITOR RISK_REPLACE
+    )
+    local -a positive_integer_settings=(
+        LONG_TEST_ACCEL_FACTOR IO_ERROR_WINDOW_MINUTES
+        SYSLOG_CURSOR_STARTUP_LOOKBACK_LINES SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES
+        HISTORY_WINDOW_DAYS HISTORY_SCHEMA_VERSION FORECAST_MIN_SAMPLES
+        FORECAST_HIGH_SAMPLES FORECAST_MAX_GAP_DAYS
+    )
+    local -a ordered_pairs=(
+        LONG_TEST_MIN_INTERVAL_DAYS:LONG_TEST_MAX_INTERVAL_DAYS
+        WARN_THRESHOLD_PERCENT:CRITICAL_THRESHOLD_PERCENT
+        IO_ERROR_WARN_THRESHOLD:IO_ERROR_CRIT_THRESHOLD
+        PARITY_SYNC_ERR_WARN:PARITY_SYNC_ERR_CRIT
+        SATA_LINK_INSTABILITY_STREAK_WARN:SATA_LINK_INSTABILITY_STREAK_CRIT
+        FORECAST_MIN_SAMPLES:FORECAST_HIGH_SAMPLES
+        FORECAST_MIN_SPAN_DAYS:FORECAST_HIGH_SPAN_DAYS
+        RISK_MONITOR:RISK_REPLACE
+        TEMP_RATE_WARN_C_PER_DAY:TEMP_RATE_CRIT_C_PER_DAY
+        RELOC_WARNING:RELOC_CRITICAL CMD_TIMEOUT_WARN:CMD_TIMEOUT_CRIT
+        REALLOC_EVENT_WARN:REALLOC_EVENT_CRIT SSD_TEMP_WARNING:SSD_TEMP_CRITICAL
+        HDD_TEMP_WARNING:HDD_TEMP_CRITICAL LOAD_CYCLE_WARN:LOAD_CYCLE_CRIT
+        SSD_WEAR_CRIT:SSD_WEAR_WARN NVME_TEMP_WARNING:NVME_TEMP_CRITICAL
+        NVME_PERCENT_USED_WARN:NVME_PERCENT_USED_CRIT
+        WEAR_DAYS_LEFT_CRIT:WEAR_DAYS_LEFT_WARN
+        WRITER_TIER_MODERATE_PCT:WRITER_WEEKLY_WARN_PCT
+        WRITER_WEEKLY_WARN_PCT:WRITER_WEEKLY_CRIT_PCT
+        NVME_ERR_LOG_DELTA_WARN:NVME_ERR_LOG_DELTA_CRIT
+        NVME_PCIE_CORR_DELTA_WARN:NVME_PCIE_CORR_DELTA_CRIT
+        NVME_PCIE_UNC_DELTA_WARN:NVME_PCIE_UNC_DELTA_CRIT
+        SNAPSHOT_WARN:SNAPSHOT_CRIT BTRFS_DEV_ERR_WARN_DELTA:BTRFS_DEV_ERR_CRIT_DELTA
+        BTRFS_DEV_CORR_WARN_DELTA:BTRFS_DEV_CORR_CRIT_DELTA
+        BTRFS_ERR_BURST_WARN_RATIO:BTRFS_ERR_BURST_CRIT_RATIO
+        XFS_PROC_WARN_DELTA:XFS_PROC_CRIT_DELTA
+        XFS_ERR_BURST_WARN_RATIO:XFS_ERR_BURST_CRIT_RATIO
+        BURST_WARN_BOOST:BURST_CRIT_BOOST HDD_POH_WARN_HOURS:HDD_POH_CRIT_HOURS
+        SSD_POH_WARN_HOURS:SSD_POH_CRIT_HOURS NVME_POH_WARN_HOURS:NVME_POH_CRIT_HOURS
+        TBW_DAYS_CRIT:TBW_DAYS_WARN TBW_CONSUMED_WARN:TBW_CONSUMED_CRIT
     )
 
-    for command_name in "${required_commands[@]}"; do
-        if ! command -v "$command_name" >/dev/null 2>&1; then
-            log "INIT" "ERROR" "Required command is unavailable: $command_name"
-            return 1
+    for setting in "${boolean_settings[@]}"; do
+        validate_boolean_setting "$setting"
+    done
+    for setting in "${integer_settings[@]}"; do
+        validate_nonnegative_integer_setting "$setting"
+    done
+    for setting in "${number_settings[@]}"; do
+        validate_nonnegative_number_setting "$setting"
+    done
+    validate_positive_number_setting DEFAULT_SSD_ENDURANCE_PER_TB
+    for setting in "${percent_settings[@]}"; do
+        validate_percent_setting "$setting"
+    done
+    for setting in "${positive_integer_settings[@]}"; do
+        validate_positive_integer_setting "$setting"
+    done
+    for pair in "${ordered_pairs[@]}"; do
+        validate_ordered_pair "${pair%%:*}" "${pair#*:}"
+    done
+
+    validate_absolute_path_setting LOG_DIR
+    validate_absolute_path_setting LOCK_FILE
+    validate_absolute_path_setting NOTIFY_BIN
+    validate_absolute_path_setting IO_ERROR_LOG_FILE
+
+    [[ -z "${LONG_TEST_DECISION:-}" ]] ||
+        configuration_error "LONG_TEST_DECISION is runtime state and must start empty"
+    for setting in XFS_PROC_KEYS XFS_PROC_KEYS_EXCLUDE; do
+        if [[ "$(configuration_value "$setting" 2>/dev/null || true)" =~ [^A-Za-z0-9_[:space:]-] ]]; then
+            configuration_error \
+                "$setting may contain only XFS key names separated by whitespace"
         fi
     done
 
-    if [[ ! "${SHORT_TEST_INTERVAL_DAYS:-}" =~ ^[0-9]+$ ]]; then
-        log "INIT" "ERROR" "SHORT_TEST_INTERVAL_DAYS must be a non-negative integer"
-        return 1
-    fi
-    if [[ ! "${SMART_ALLOW_SPINUP:-}" =~ ^[01]$ ]]; then
-        log "INIT" "ERROR" "SMART_ALLOW_SPINUP must be 0 or 1"
-        return 1
-    fi
-    if [[ ! "${SYSLOG_CURSOR_STARTUP_LOOKBACK_LINES:-}" =~ ^[1-9][0-9]*$ ]]; then
-        log "INIT" "ERROR" "SYSLOG_CURSOR_STARTUP_LOOKBACK_LINES must be a positive integer"
-        return 1
-    fi
-    if [[ ! "${SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES:-}" =~ ^[1-9][0-9]*$ ]]; then
-        log "INIT" "ERROR" "SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES must be a positive integer"
-        return 1
-    fi
-    for setting in \
-        HISTORY_SCHEMA_VERSION \
-        HISTORY_WINDOW_DAYS \
-        FORECAST_MIN_SAMPLES \
-        FORECAST_HIGH_SAMPLES \
-        FORECAST_MAX_GAP_DAYS
-    do
-        value="${!setting:-}"
-        if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
-            log "INIT" "ERROR" "$setting must be a positive integer"
-            return 1
-        fi
-    done
-    for setting in \
-        FORECAST_MIN_SPAN_DAYS \
-        FORECAST_HIGH_SPAN_DAYS \
-        FORECAST_STALE_AFTER_DAYS
-    do
-        value="${!setting:-}"
-        if [[ ! "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-            log "INIT" "ERROR" "$setting must be a non-negative number"
-            return 1
-        fi
-    done
-    if (( FORECAST_HIGH_SAMPLES < FORECAST_MIN_SAMPLES )); then
-        log "INIT" "ERROR" \
-            "FORECAST_HIGH_SAMPLES must be greater than or equal to FORECAST_MIN_SAMPLES"
-        return 1
-    fi
-    if awk -v high="$FORECAST_HIGH_SPAN_DAYS" -v minimum="$FORECAST_MIN_SPAN_DAYS" \
-        'BEGIN { exit !(high < minimum) }'
+    case "${SHOW_SUBSYSTEMS_BLOCK:-}" in
+        auto|always|never) ;;
+        *) configuration_error \
+            "SHOW_SUBSYSTEMS_BLOCK must be auto, always, or never (found '${SHOW_SUBSYSTEMS_BLOCK:-unset}')" ;;
+    esac
+
+    if [[ "${HISTORY_SCHEMA_VERSION:-}" =~ ^[0-9]+$ ]] &&
+       (( HISTORY_SCHEMA_VERSION != 3 ))
     then
-        log "INIT" "ERROR" \
-            "FORECAST_HIGH_SPAN_DAYS must be greater than or equal to FORECAST_MIN_SPAN_DAYS"
-        return 1
+        configuration_error "HISTORY_SCHEMA_VERSION must remain 3 for this script version"
+    fi
+    if [[ "${FORECAST_PRECISION_DECIMALS:-}" =~ ^[0-9]+$ ]] &&
+       (( FORECAST_PRECISION_DECIMALS > 6 ))
+    then
+        configuration_error "FORECAST_PRECISION_DECIMALS must not exceed 6"
+    fi
+    if [[ "${THRESHOLD:-}" =~ ^[0-9]+$ ]] && (( THRESHOLD == 0 )); then
+        configuration_error "THRESHOLD must be greater than zero"
+    fi
+    if [[ "${SHORT_TEST_POLL:-}" == "1" ]]; then
+        [[ "${SHORT_TEST_MAX_WAIT:-}" =~ ^[1-9][0-9]*$ ]] ||
+            configuration_error "SHORT_TEST_MAX_WAIT must be positive when SHORT_TEST_POLL=1"
+        [[ "${SHORT_TEST_POLL_INTERVAL:-}" =~ ^[1-9][0-9]*$ ]] ||
+            configuration_error "SHORT_TEST_POLL_INTERVAL must be positive when SHORT_TEST_POLL=1"
     fi
 
+    if ! declare -p POOL_EXCLUDES 2>/dev/null | grep -q '^declare -a'; then
+        configuration_error "POOL_EXCLUDES must be an indexed Bash array"
+    else
+        for excluded_pool in "${POOL_EXCLUDES[@]}"; do
+            if [[ -z "$excluded_pool" || "$excluded_pool" == */* ]]; then
+                configuration_error \
+                    "POOL_EXCLUDES entries must be non-empty pool names without '/': '$excluded_pool'"
+            fi
+        done
+    fi
+
+    validate_model_rule_block TBW_MODEL_RULES tbw
+    validate_model_rule_block POH_MODEL_RULES poh
+    validate_model_rule_block QUIRK_MWI_RULES quirk
+
+    if [[ "${ENABLE_BTRFS_SCRUB:-}" == "0" && "${FIRST_RUN_FORCE:-}" == "1" ]]; then
+        configuration_warning \
+            "FIRST_RUN_FORCE=1 may start a one-time baseline Btrfs scrub even though ENABLE_BTRFS_SCRUB=0"
+    fi
+
+    if (( CONFIG_ERROR_COUNT > 0 )); then
+        log "CONFIG" "ERROR" \
+            "Configuration validation failed with $CONFIG_ERROR_COUNT error(s) and $CONFIG_WARNING_COUNT warning(s)"
+        return 1
+    fi
+    log "CONFIG" "INFO" \
+        "Configuration validation passed with $CONFIG_WARNING_COUNT warning(s)"
     return 0
 }
+
+dependency_error() {
+    DEPENDENCY_ERROR_COUNT=$((DEPENDENCY_ERROR_COUNT + 1))
+    log "DEPENDENCY" "ERROR" "$*"
+}
+
+dependency_warning() {
+    DEPENDENCY_WARNING_COUNT=$((DEPENDENCY_WARNING_COUNT + 1))
+    log "DEPENDENCY" "WARN" "$*"
+}
+
+validate_runtime_dependencies() {
+    local mode="${1:-monitor}" command_name
+    local -a required_commands
+
+    DEPENDENCY_ERROR_COUNT=0
+    DEPENDENCY_WARNING_COUNT=0
+
+    if [[ "$mode" == "self-test" ]]; then
+        required_commands=(awk grep mktemp mv rm sed sort wc)
+    else
+        required_commands=(
+            awk basename cat cksum cp cut date df dirname dmesg find findmnt
+            flock grep head lsblk mkdir mktemp mount mountpoint mv readlink rm
+            sed sha1sum sleep smartctl sort stat tail tr wc
+        )
+    fi
+
+    for command_name in "${required_commands[@]}"; do
+        command -v "$command_name" >/dev/null 2>&1 ||
+            dependency_error "Required command is unavailable: $command_name"
+    done
+
+    if [[ "$mode" != "self-test" ]]; then
+        if [[ "${ENABLE_BTRFS_SCRUB:-0}" == "1" ||
+              "${FIRST_RUN_FORCE:-0}" == "1" ||
+              "${ENABLE_BTRFS_DEVICE_STATS:-0}" == "1" ||
+              "${BTRFS_DEV_TREND_ENABLED:-0}" == "1" ]] &&
+           ! command -v btrfs >/dev/null 2>&1
+        then
+            dependency_error "btrfs is required by the enabled Btrfs monitoring settings"
+        fi
+        if [[ "${ENABLE_XFS_CHECK:-0}" == "1" ]] &&
+           ! command -v xfs_repair >/dev/null 2>&1
+        then
+            dependency_error "xfs_repair is required when ENABLE_XFS_CHECK=1"
+        fi
+        command -v hdparm >/dev/null 2>&1 ||
+            dependency_warning "hdparm is unavailable; standby detection will use smartctl -n"
+        if [[ ! -x "$NOTIFY_BIN" ]] && ! command -v logger >/dev/null 2>&1; then
+            dependency_warning \
+                "Neither the Unraid notify helper nor logger is available; notifications cannot be delivered"
+        fi
+
+        if command -v date >/dev/null 2>&1 &&
+           [[ "$(date -d '1970-01-02 00:00:00 UTC' +%s 2>/dev/null || true)" != "86400" ]]
+        then
+            dependency_error "GNU-compatible date -d support is required"
+        fi
+        if command -v stat >/dev/null 2>&1 &&
+           ! stat -c '%d %i %s' / >/dev/null 2>&1
+        then
+            dependency_error "GNU-compatible stat -c support is required"
+        fi
+        if command -v readlink >/dev/null 2>&1 &&
+           [[ "$(readlink -f / 2>/dev/null || true)" != "/" ]]
+        then
+            dependency_error "readlink -f support is required"
+        fi
+        if command -v find >/dev/null 2>&1 &&
+           ! find /tmp -maxdepth 0 -printf '' >/dev/null 2>&1
+        then
+            dependency_error "GNU-compatible find -printf support is required"
+        fi
+    fi
+
+    if (( DEPENDENCY_ERROR_COUNT > 0 )); then
+        log "DEPENDENCY" "ERROR" \
+            "Dependency validation failed with $DEPENDENCY_ERROR_COUNT error(s) and $DEPENDENCY_WARNING_COUNT warning(s)"
+        return 1
+    fi
+    log "DEPENDENCY" "INFO" \
+        "Dependency validation passed with $DEPENDENCY_WARNING_COUNT warning(s)"
+    return 0
+}
+
+print_usage() {
+    cat <<'USAGE'
+Disk Health Monitor for Unraid v2.8
+
+Usage:
+  health_monitoring.sh                 Run normal monitoring
+  health_monitoring.sh --check-config  Validate configuration only
+  health_monitoring.sh --diagnostics   Run read-only environment diagnostics
+  health_monitoring.sh --self-test     Run built-in regression fixtures in /tmp
+  health_monitoring.sh --version       Print the script version
+  health_monitoring.sh --help          Show this help
+
+The three validation modes do not run SMART commands against disks, start
+tests or scrubs, write monitoring state, advance the syslog cursor, send
+notifications, or spin up disks.
+USAGE
+}
+
+parse_arguments() {
+    if (( $# > 1 )); then
+        printf 'Only one mode option may be supplied.\n' >&2
+        return 2
+    fi
+    case "${1:-}" in
+        "")             RUN_MODE="monitor" ;;
+        --check-config) RUN_MODE="check-config" ;;
+        --diagnostics)  RUN_MODE="diagnostics" ;;
+        --self-test)    RUN_MODE="self-test" ;;
+        --version)      RUN_MODE="version" ;;
+        --help|-h)      RUN_MODE="help" ;;
+        *)
+            printf 'Unknown option: %s\n' "$1" >&2
+            print_usage >&2
+            return 2
+            ;;
+    esac
+}
+
+diagnostic_result() {
+    local level="$1" label="$2" detail="$3"
+    printf '[%-4s] %-26s %s\n' "$level" "$label" "$detail"
+}
+
+nearest_existing_parent() {
+    local path="$1" parent
+
+    parent="$path"
+    while [[ ! -e "$parent" && "$parent" != "/" ]]; do
+        parent="$(dirname -- "$parent")"
+    done
+    [[ -d "$parent" ]] || return 1
+    printf '%s\n' "$parent"
+}
+
+run_diagnostics() {
+    local failures=0 warnings=0 config_status=0 dependency_status=0
+    local parent device_rows
+
+    printf 'Disk Health Monitor for Unraid v2.8 - read-only diagnostics\n'
+    printf 'No disk SMART reads, tests, scrubs, state writes, cursor updates, or notifications will occur.\n\n'
+
+    if validate_configuration; then
+        diagnostic_result PASS "Configuration" "valid ($CONFIG_WARNING_COUNT warning(s))"
+    else
+        config_status=1
+        failures=$((failures + 1))
+        diagnostic_result FAIL "Configuration" "$CONFIG_ERROR_COUNT error(s)"
+    fi
+
+    if validate_runtime_dependencies diagnostics; then
+        diagnostic_result PASS "Dependencies" "available ($DEPENDENCY_WARNING_COUNT warning(s))"
+    else
+        dependency_status=1
+        failures=$((failures + 1))
+        diagnostic_result FAIL "Dependencies" "$DEPENDENCY_ERROR_COUNT error(s)"
+    fi
+
+    diagnostic_result INFO "Bash" "$BASH_VERSION"
+    diagnostic_result INFO "Kernel" "$(uname -sr 2>/dev/null || printf 'unknown')"
+
+    if [[ -d "$LOG_DIR" ]]; then
+        if [[ -w "$LOG_DIR" ]]; then
+            diagnostic_result PASS "Log directory" "$LOG_DIR is writable"
+        else
+            failures=$((failures + 1))
+            diagnostic_result FAIL "Log directory" "$LOG_DIR is not writable"
+        fi
+    else
+        parent=$(nearest_existing_parent "$LOG_DIR" 2>/dev/null || true)
+        if [[ -n "$parent" && -w "$parent" ]]; then
+            diagnostic_result PASS "Log directory parent" "$parent can create $LOG_DIR"
+        else
+            failures=$((failures + 1))
+            diagnostic_result FAIL "Log directory parent" "no writable parent for $LOG_DIR"
+        fi
+    fi
+
+    parent=$(nearest_existing_parent "$(dirname -- "$LOCK_FILE")" 2>/dev/null || true)
+    if [[ -n "$parent" && -w "$parent" ]]; then
+        diagnostic_result PASS "Lock directory" "$parent is writable"
+    else
+        failures=$((failures + 1))
+        diagnostic_result FAIL "Lock directory" "no writable parent for $LOCK_FILE"
+    fi
+
+    if [[ -x "$NOTIFY_BIN" ]]; then
+        diagnostic_result PASS "Unraid notification" "$NOTIFY_BIN is executable"
+    elif command -v logger >/dev/null 2>&1; then
+        warnings=$((warnings + 1))
+        diagnostic_result WARN "Unraid notification" "notify helper missing; logger fallback is available"
+    else
+        warnings=$((warnings + 1))
+        diagnostic_result WARN "Unraid notification" "notify helper and logger are unavailable"
+    fi
+
+    if [[ -r "$IO_ERROR_LOG_FILE" ]]; then
+        diagnostic_result PASS "Syslog source" "$IO_ERROR_LOG_FILE is readable"
+    else
+        warnings=$((warnings + 1))
+        diagnostic_result WARN "Syslog source" "$IO_ERROR_LOG_FILE unavailable; dmesg fallback will be used"
+    fi
+
+    if [[ -r /var/local/emhttp/disks.ini && -r /var/local/emhttp/var.ini ]]; then
+        diagnostic_result PASS "Unraid metadata" "disks.ini and var.ini are readable"
+    else
+        warnings=$((warnings + 1))
+        diagnostic_result WARN "Unraid metadata" "one or more /var/local/emhttp metadata files are unavailable"
+    fi
+
+    if mountpoint -q /mnt/user 2>/dev/null; then
+        diagnostic_result PASS "Unraid user share" "/mnt/user is mounted"
+    else
+        warnings=$((warnings + 1))
+        diagnostic_result WARN "Unraid user share" "/mnt/user is not mounted"
+    fi
+
+    device_rows=$(lsblk -b -dn -o NAME,SIZE,ROTA,TYPE 2>/dev/null |
+        awk '$4=="disk" && ($1 ~ /^sd[a-z]+$/ || $1 ~ /^nvme[0-9]+n[0-9]+$/) {count++} END {print count+0}')
+    diagnostic_result INFO "Block-device inventory" "${device_rows:-0} candidate disk(s), read from lsblk only"
+
+    printf '\nDiagnostic summary: failures=%d warnings=%d config_status=%d dependency_status=%d\n' \
+        "$failures" "$((warnings + CONFIG_WARNING_COUNT + DEPENDENCY_WARNING_COUNT))" \
+        "$config_status" "$dependency_status"
+    (( failures == 0 ))
+}
+
+self_test_result() {
+    local passed="$1" name="$2" detail="${3:-}"
+
+    SELF_TEST_TOTAL=$((SELF_TEST_TOTAL + 1))
+    if (( passed == 1 )); then
+        SELF_TEST_PASSED=$((SELF_TEST_PASSED + 1))
+        printf '[PASS] %s\n' "$name"
+    else
+        SELF_TEST_FAILED=$((SELF_TEST_FAILED + 1))
+        printf '[FAIL] %s%s\n' "$name" "${detail:+ - $detail}"
+    fi
+}
+
+run_regression_tests() (
+    local fixture_dir="" history_file source_file chunk_file actual count
+    SELF_TEST_TOTAL=0
+    SELF_TEST_PASSED=0
+    SELF_TEST_FAILED=0
+
+    fixture_dir=$(mktemp -d /tmp/health_monitoring.selftest.XXXXXX) || {
+        printf '[FAIL] Unable to create self-test fixture directory\n'
+        return 1
+    }
+    trap '[[ -z "$fixture_dir" || "$fixture_dir" != /tmp/health_monitoring.selftest.* ]] || rm -rf -- "$fixture_dir"' EXIT
+
+    printf 'Disk Health Monitor for Unraid v2.8 - built-in regression tests\n'
+    printf 'Fixtures are isolated under %s and removed automatically.\n\n' "$fixture_dir"
+
+    actual=$(safe_state_name '/dev/disk/by-id/ata-Test Drive')
+    if [[ "$actual" == "disk_by-id_ata-Test_Drive" ]]; then
+        self_test_result 1 "Stable state filename sanitization"
+    else
+        self_test_result 0 "Stable state filename sanitization" "found '$actual'"
+    fi
+
+    actual=$(history_field_value 'temp=31 captured_epoch=1786800000 schema=3' temp 2>/dev/null || true)
+    if [[ "$actual" == "31" ]]; then
+        self_test_result 1 "Normalized history field parsing"
+    else
+        self_test_result 0 "Normalized history field parsing" "found '$actual'"
+    fi
+
+    actual=$(history_record_epoch '2026-08-16' 'temp=31 captured_epoch=1786800000 schema=3' 2>/dev/null || true)
+    if [[ "$actual" == "1786800000" ]]; then
+        self_test_result 1 "Captured history timestamp parsing"
+    else
+        self_test_result 0 "Captured history timestamp parsing" "found '$actual'"
+    fi
+
+    local confidence_cases=(
+        '2 10 0 1|INSUFFICIENT'
+        '3 2 4 1|STALE'
+        '3 2 0 15|LOW'
+        '3 2 0 1|MEDIUM'
+        '7 7 0 1|HIGH'
+    ) case_data expected
+    local confidence_failures=0
+    for case_data in "${confidence_cases[@]}"; do
+        expected="${case_data#*|}"
+        actual=$(forecast_confidence ${case_data%%|*})
+        [[ "$actual" == "$expected" ]] || confidence_failures=$((confidence_failures + 1))
+    done
+    if (( confidence_failures == 0 )); then
+        self_test_result 1 "Forecast confidence classification"
+    else
+        self_test_result 0 "Forecast confidence classification" "$confidence_failures case(s) failed"
+    fi
+
+    if forecast_confidence_is_actionable MEDIUM &&
+       forecast_confidence_is_actionable HIGH &&
+       ! forecast_confidence_is_actionable LOW
+    then
+        self_test_result 1 "Forecast actionability gate"
+    else
+        self_test_result 0 "Forecast actionability gate"
+    fi
+
+    history_file="$fixture_dir/daily.log"
+    printf 'malformed legacy row\n2026-08-15 disk_a temp=29 captured_epoch=1 schema=3\n' > "$history_file"
+    if atomic_replace_daily_history "$history_file" 2026-08-15 \
+           '2026-08-15 disk_a temp=30 captured_epoch=2 schema=3' \
+           '2026-08-15 disk_b temp=32 captured_epoch=2 schema=3' &&
+       atomic_upsert_daily_history "$history_file" 2026-08-15 disk_a \
+           '2026-08-15 disk_a temp=31 captured_epoch=3 schema=3'
+    then
+        count=$(awk '$1=="2026-08-15" && $2=="disk_a" {count++} END {print count+0}' "$history_file")
+        if [[ "$count" == "1" ]] &&
+           grep -q '^2026-08-15 disk_a temp=31 ' "$history_file" &&
+           ! grep -q '^malformed ' "$history_file"
+        then
+            self_test_result 1 "Atomic daily history replacement and upsert"
+        else
+            self_test_result 0 "Atomic daily history replacement and upsert" "unexpected fixture contents"
+        fi
+    else
+        self_test_result 0 "Atomic daily history replacement and upsert" "helper returned failure"
+    fi
+
+    source_file="$fixture_dir/source.log"
+    chunk_file="$fixture_dir/chunk.log"
+    printf 'one\ntwo\nthree\nfour\n' > "$source_file"
+    : > "$chunk_file"
+    if append_syslog_line_range "$source_file" 2 3 "$chunk_file" &&
+       [[ "$(awk '{printf "%s|", $0}' "$chunk_file")" == "two|three|" ]]
+    then
+        self_test_result 1 "Bounded syslog line-range extraction"
+    else
+        self_test_result 0 "Bounded syslog line-range extraction"
+    fi
+
+    printf '\nSelf-test summary: passed=%d failed=%d total=%d\n' \
+        "$SELF_TEST_PASSED" "$SELF_TEST_FAILED" "$SELF_TEST_TOTAL"
+    (( SELF_TEST_FAILED == 0 ))
+)
 
 
 main() {
     local exit_code
+
+    parse_arguments "$@" || return $?
+    case "$RUN_MODE" in
+        help)
+            print_usage
+            return 0
+            ;;
+        version)
+            printf 'Disk Health Monitor for Unraid v2.8\n'
+            return 0
+            ;;
+        check-config)
+            if validate_configuration; then
+                printf 'Configuration is valid (%d warning(s)).\n' "$CONFIG_WARNING_COUNT"
+                return 0
+            fi
+            return 1
+            ;;
+        diagnostics)
+            run_diagnostics
+            return $?
+            ;;
+        self-test)
+            validate_configuration || return 1
+            validate_runtime_dependencies self-test || return 1
+            run_regression_tests
+            return $?
+            ;;
+    esac
+
+    # Normal monitoring validates everything before acquiring the lock or
+    # creating logs/state. A configuration failure therefore has no persistent
+    # side effects.
+    validate_configuration || return 1
+    validate_runtime_dependencies monitor || return 1
 
     if ! acquire_lock; then
         return 0
@@ -8417,7 +9132,6 @@ main() {
     trap 'handle_signal TERM' TERM
 
     initialize_runtime || return 1
-    validate_runtime_dependencies || return 1
 
     log "RUN" "INFO" "Starting Unraid disk health monitoring"
 
