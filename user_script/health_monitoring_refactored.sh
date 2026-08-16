@@ -9,7 +9,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.8
+# Disk Health Monitor for Unraid v2.9
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
@@ -146,6 +146,9 @@ SHOW_OK_SUBSYSTEMS=0                            # Hide OK subsystems if any WARN
 SHOW_DISABLED_SUBSYSTEMS=0                      # Hide Disabled subsystems in description/body (0=show)
 VERBOSE_OK=1                                    # Show OK lines (0=suppress)
 SHOW_ZERO_COUNTS=0                              # Hide zero-count summary lines (1=show)
+NOTIFY_MAX_BODY_CHARS=12000                     # Maximum notification body length before safe truncation
+NOTIFY_MAX_BODY_LINES=180                       # Maximum notification body lines before safe truncation
+LOG_FULL_NOTIFICATION_ON_TRUNCATION=1           # Preserve the complete body in the run log when shortened
 
 # === Paths / Integration ===
 LOG_DIR="/mnt/user/cloud/logs/disk_health"       # Run logs and persistent state
@@ -303,8 +306,6 @@ action:invert_mwi_small;regex:WD[[:space:]]+Red.*SA500;cap_min:0.48;cap_max:0.52
 
 
 # === Runtime State (do not modify) ===
-ALERT_WARN=()                                     # Accumulator for warning messages
-ALERT_CRIT=()                                     # Accumulator for critical messages
 declare -A SMART_STATE                            # Map device -> OK/WARNING/CRITICAL
 declare -A SMART_MSGS                             # Map device -> aggregated SMART message string
 declare -A MOUNT_TO_DEV                           # Map /mnt/diskX -> /dev/sdX|nvme
@@ -337,13 +338,13 @@ declare -A LONG_TEST_DUE_SOON                     # Map device -> days until nex
 declare -A CMD_TIMEOUT_LAST                       # Map device -> previous command timeout count
 declare -A LONG_TEST_RUNNING_LONG                 # Map device -> 1 if a long/extended self-test is currently in progress
 declare -A RISK_SPIKE_TS                          # Map device -> epoch timestamp of last captured risk spike
-declare -A ALERT_SEEN                             # Exact alert de-duplication within a run
 declare -a FINDING_IDS                            # Ordered canonical finding identifiers
 declare -A FINDING_SEEN                           # Canonical finding de-duplication within a run
 declare -A FINDING_SEVERITY FINDING_CATEGORY      # Finding classification
 declare -A FINDING_SIGNAL FINDING_DEVICE          # Risk signal and normalized base device
+declare -A FINDING_SCOPE                          # Stable device, mount, pool, or global finding scope
 declare -A FINDING_TITLE FINDING_EVIDENCE         # User-facing finding content
-declare -A FINDING_ACTION FINDING_ALERT_TEXT       # Recommended action and rendered alert text
+declare -A FINDING_ACTION                         # Canonical recommended action
 declare -A SATA_POWER_STATE SMART_DEFERRED         # Cached SATA power state and deferred SMART checks
 declare -A PREVIOUS_RISK                           # Previous persisted risk, retained when a disk stays asleep
 declare -A DEVICE_ID_BY_PATH DEVICE_PATH_BY_ID     # Runtime path <-> stable persistent identity
@@ -376,6 +377,18 @@ CONFIG_ERROR_COUNT=0
 CONFIG_WARNING_COUNT=0
 DEPENDENCY_ERROR_COUNT=0
 DEPENDENCY_WARNING_COUNT=0
+FINDING_CRITICAL_COUNT=0
+FINDING_WARNING_COUNT=0
+FULL_NOTIFICATION_BODY=""
+NOTIFICATION_TRUNCATED=0
+SUBSYSTEM_SMART_STATE="OK"
+SUBSYSTEM_BTRFS_STATE="Disabled"
+SUBSYSTEM_XFS_STATE="Disabled"
+SUBSYSTEM_CAPACITY_STATE="OK"
+SUBSYSTEM_MOUNT_STATE="OK"
+SUBSYSTEM_ENDURANCE_STATE="OK"
+SUBSYSTEM_SCHEDULING_STATE="OK"
+SUBSYSTEM_PARITY_STATE="OK"
 
 # === Logs Paths ===
 STATE_DIR="${LOG_DIR:-}/state"
@@ -1115,9 +1128,9 @@ btrfs_df_cached() {
 # === Helper Function ===
 # Send a notification through Unraid's notify script with severity
 notify_unraid() {
-    local title="$1"; shift
-    local body="$1"; shift
-    local sev="${1:-warning}"
+    local title="$1"
+    local body="$2"
+    local sev="${3:-warning}"
     # Map severity to icon
     local icon="normal"
     case "$sev" in
@@ -1125,26 +1138,32 @@ notify_unraid() {
         warning|WARNING) icon="warning" ;;
         *) icon="normal" ;;
     esac
-    local crit_count=${#ALERT_CRIT[@]}
-    local warn_count=${#ALERT_WARN[@]}
-    local sev_word
-    case "$sev" in
-        critical|CRITICAL) sev_word="CRITICAL";;
-        warning|WARNING) sev_word="WARNING";;
-        *) sev_word="OK";;
-    esac
-    # Extract per-subsystem states from summary lines
-    local sm_state bt_state xfs_state cap_state pm_state pr_state
-    sm_state=$(echo "${SUBSYSTEM_LINES:-}" | awk -F': ' '/^SMART:/ {print $2; exit}')
-    bt_state=$(echo "${SUBSYSTEM_LINES:-}" | awk -F': ' '/^Btrfs:/ {print $2; exit}')
-    xfs_state=$(echo "${SUBSYSTEM_LINES:-}" | sed -n 's/^XFS:[ \t]*\(.*\)$/\1/p' | head -n1)
-    cap_state=$(echo "${SUBSYSTEM_LINES:-}" | awk -F': ' '/^Capacity:/ {print $2; exit}')
-    pr_state=$(echo "${SUBSYSTEM_LINES:-}" | awk -F': ' '/^Parity:/ {print $2; exit}')
-    pm_state=$(echo "${SUBSYSTEM_LINES:-}" | awk -F': ' '/^Per-Mount:/ {print $2; exit}')
-    # Build filtered summary string
-    local parts=()
-    add_if() { local k="$1" v="$2"; [[ -z "$v" ]] && return; if [[ "$v" == "Disabled" && ${SHOW_DISABLED_SUBSYSTEMS:-0} -eq 0 ]]; then return; fi; if [[ ${SHOW_OK_SUBSYSTEMS:-0} -eq 0 && "$v" == "OK" ]]; then return; fi; if [[ "$v" == "N/A" ]]; then return; fi; parts+=("$k $v"); }
-    add_if SMART "$sm_state"; add_if Btrfs "$bt_state"; add_if XFS "$xfs_state"; add_if Capacity "$cap_state"; add_if Parity "$pr_state"; add_if Per-Mount "$pm_state"
+    local crit_count="${FINDING_CRITICAL_COUNT:-0}"
+    local warn_count="${FINDING_WARNING_COUNT:-0}"
+    local name state pair
+    local -a parts=()
+    local -a subsystem_pairs=(
+        "SMART|${SUBSYSTEM_SMART_STATE:-OK}"
+        "Btrfs|${SUBSYSTEM_BTRFS_STATE:-Disabled}"
+        "XFS|${SUBSYSTEM_XFS_STATE:-Disabled}"
+        "Capacity|${SUBSYSTEM_CAPACITY_STATE:-OK}"
+        "Per-Mount|${SUBSYSTEM_MOUNT_STATE:-OK}"
+        "Endurance|${SUBSYSTEM_ENDURANCE_STATE:-OK}"
+        "Scheduling|${SUBSYSTEM_SCHEDULING_STATE:-OK}"
+        "Parity|${SUBSYSTEM_PARITY_STATE:-OK}"
+    )
+    for pair in "${subsystem_pairs[@]}"; do
+        name="${pair%%|*}"
+        state="${pair#*|}"
+        [[ -n "$state" && "$state" != "N/A" ]] || continue
+        if [[ "$state" == "Disabled" && ${SHOW_DISABLED_SUBSYSTEMS:-0} -eq 0 ]]; then
+            continue
+        fi
+        if [[ "$state" == "OK" && ${SHOW_OK_SUBSYSTEMS:-0} -eq 0 ]]; then
+            continue
+        fi
+        parts+=("$name $state")
+    done
     local summary_line=""
     if (( ${#parts[@]} > 0 )); then
         summary_line="$(join_by ' | ' "${parts[@]}")"
@@ -1156,7 +1175,7 @@ notify_unraid() {
     body_norm=$(printf "%s\n" "$body" | awk '{sub(/[ \t]+$/, "")} NF{print; blank=0; next} !blank{print ""; blank=1}')
     local rc=0
     if [ -x "$NOTIFY_BIN" ]; then
-        log_info "Sending notification with $icon title '$title'"
+        log_info "Sending notification with $icon title '$title' (critical=$crit_count, warning=$warn_count)"
         "$NOTIFY_BIN" -s "${title:-Disks Health Monitoring}" -d "$summary_line" -m "$body_norm" -i "$icon" || rc=$?
         (( rc != 0 )) && log_warn "Sending notification FAILED - returned non-zero exit $rc; continuing"
     else
@@ -1221,6 +1240,11 @@ classify_finding_metadata() {
             FINDING_CLASS_CATEGORY="smart"
             FINDING_CLASS_SIGNAL="smart.nvme_error_log"
             FINDING_CLASS_ACTION="Review NVMe logs and firmware, then monitor for continued growth."
+            ;;
+        "nvme critical warning|"*)
+            FINDING_CLASS_CATEGORY="smart"
+            FINDING_CLASS_SIGNAL="smart.critical_warning"
+            FINDING_CLASS_ACTION="Back up immediately, decode the warning flags, and plan replacement for persistent critical conditions."
             ;;
         *"command timeout"*)
             FINDING_CLASS_CATEGORY="io"
@@ -1397,10 +1421,10 @@ record_finding() {
     FINDING_CATEGORY[$id]="$category"
     FINDING_SIGNAL[$id]="$signal"
     FINDING_DEVICE[$id]="$device"
+    FINDING_SCOPE[$id]="$scope"
     FINDING_TITLE[$id]="$title"
     FINDING_EVIDENCE[$id]="$evidence"
     FINDING_ACTION[$id]="$action"
-    FINDING_ALERT_TEXT[$id]="$title: $evidence"
 
     if (( should_log == 1 )); then
         if [[ "$severity" == "critical" ]]; then
@@ -1439,28 +1463,61 @@ record_alert() {
         "$FINDING_CODE_RESULT"
 }
 
-# Rebuild the legacy alert arrays from the canonical registry only after every
-# collector has finished. Existing subsystem summaries therefore consume the
-# same de-duplicated severity/evidence set as notification rendering.
-materialize_alerts_from_findings() {
-    local severity id text
+# Return a stable category rank for deterministic report ordering.
+finding_category_rank() {
+    case "$1" in
+        smart)       printf '10\n' ;;
+        io)          printf '20\n' ;;
+        filesystem)  printf '30\n' ;;
+        temperature) printf '40\n' ;;
+        endurance)   printf '50\n' ;;
+        lifecycle)   printf '60\n' ;;
+        capacity)    printf '70\n' ;;
+        parity)      printf '80\n' ;;
+        maintenance) printf '90\n' ;;
+        *)           printf '99\n' ;;
+    esac
+}
 
-    ALERT_WARN=()
-    ALERT_CRIT=()
-    ALERT_SEEN=()
+# Emit canonical finding IDs in deterministic priority order: critical first,
+# then device risk, category, scope, title, and stable ID.
+emit_sorted_finding_ids() {
+    local id severity_rank risk category_rank scope title device
 
-    for severity in critical warning; do
-        for id in "${FINDING_IDS[@]}"; do
-            [[ "${FINDING_SEVERITY[$id]:-}" == "$severity" ]] || continue
-            text="${FINDING_ALERT_TEXT[$id]:-}"
-            [[ -n "$text" ]] || continue
-            ALERT_SEEN[$id]=1
-            if [[ "$severity" == "critical" ]]; then
-                ALERT_CRIT+=("$text")
-            else
-                ALERT_WARN+=("$text")
-            fi
-        done
+    for id in "${FINDING_IDS[@]}"; do
+        if [[ "${FINDING_SEVERITY[$id]:-warning}" == "critical" ]]; then
+            severity_rank=0
+        else
+            severity_rank=1
+        fi
+        device="${FINDING_DEVICE[$id]:-}"
+        risk="${RISK_MAP[$device]:-0}"
+        [[ "$risk" =~ ^[0-9]+$ ]] || risk=0
+        (( risk > 999 )) && risk=999
+        category_rank="$(finding_category_rank "${FINDING_CATEGORY[$id]:-general}")"
+        scope="${FINDING_SCOPE[$id]:-${id%%|*}}"
+        title="${FINDING_TITLE[$id]:-Finding}"
+        printf '%d\t%03d\t%02d\t%s\t%s\t%s\n' \
+            "$severity_rank" "$((999 - risk))" "$category_rank" \
+            "$scope" "$title" "$id"
+    done | LC_ALL=C sort -t $'\t' -k1,1n -k2,2n -k3,3n -k4,4 -k5,5 -k6,6 |
+        cut -f6-
+}
+
+# Finalize canonical finding counts after all collectors and trend producers
+# have completed. Rendering reads finding metadata directly.
+finalize_finding_counts() {
+    local id
+
+    FINDING_CRITICAL_COUNT=0
+    FINDING_WARNING_COUNT=0
+
+    for id in "${FINDING_IDS[@]}"; do
+        if [[ "${FINDING_SEVERITY[$id]:-warning}" == "critical" ]]; then
+            FINDING_CRITICAL_COUNT=$((FINDING_CRITICAL_COUNT + 1))
+        else
+            FINDING_WARNING_COUNT=$((FINDING_WARNING_COUNT + 1))
+        fi
     done
 }
 
@@ -4595,47 +4652,19 @@ scan_syslog_disk_errors() {
             record_alert warning "$NOTIFY_TITLE_DISKIO" "Disk $dev I/O errors unique $uniq_count >= $IO_ERROR_WARN_THRESHOLD (last ${IO_ERROR_WINDOW_MINUTES}m)"
             mark="WARN"
         fi
-        # Composite score per device to prioritize frequency list
-        local st sm_raw sm_norm uniq err_norm cap_norm=0 arr_slot="" k base_dev
-        base_dev="$(base_device "$dev")"
-        st="${SMART_STATE[$dev]:-${SMART_STATE[$base_dev]:-OK}}"
-        sm_raw="$(risk_score_for_device "$base_dev" "$st" "${SMART_MSGS[$dev]:-${SMART_MSGS[$base_dev]:-}}")"; [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
-        sm_norm=$(( sm_raw > 100 ? 100 : sm_raw ))
-                # Apply burst boost if present for this device/base
-                local _burst_boost=${BURST_BOOST[$dev]:-${BURST_BOOST[$base_dev]:-0}}
-                if [[ "$_burst_boost" =~ ^[0-9]+$ && $_burst_boost -gt 0 ]]; then
-                    sm_norm=$(( sm_norm + _burst_boost ))
-                    (( sm_norm > 100 )) && sm_norm=100
-                fi
-        uniq="${IO_ERROR_UNIQUE_MAP[$dev]:-${IO_ERROR_UNIQUE_MAP[$base_dev]:-0}}"; [[ "$uniq" =~ ^[0-9]+$ ]] || uniq=0
-        if (( uniq >= ${IO_ERROR_CRIT_THRESHOLD:-20} )); then err_norm=100
-        elif (( uniq >= ${IO_ERROR_WARN_THRESHOLD:-5} )); then err_norm=65
-        else err_norm=$(awk -v u="$uniq" -v w="${IO_ERROR_WARN_THRESHOLD:-5}" 'BEGIN{ if(w>0) printf "%d", (u*50)/w; else print 0 }'); fi
-        for k in "${!MOUNT_TO_DEV[@]}"; do
-            if [[ "$k" == /mnt/disk* ]]; then
-                local mdev bmdev
-                mdev="${MOUNT_TO_DEV[$k]}"; bmdev="$(base_device "$mdev")"
-                if [[ "$bmdev" == "$base_dev" ]]; then arr_slot="$k"; break; fi
-            fi
-        done
-        if [[ -n "$arr_slot" ]]; then
-            local pct usep warn_t crit_t
-            warn_t="${WARN_THRESHOLD_PERCENT:-96}"; crit_t="${CRITICAL_THRESHOLD_PERCENT:-98}"
-            read -r _sz _u pct _mount < <(df -h --output=size,used,pcent,target "$arr_slot" 2>/dev/null | tail -n1)
-            usep=${pct%%%}
-            if [[ "$usep" =~ ^[0-9]+$ && $crit_t -gt $warn_t ]]; then
-                cap_norm=$(awk -v u="$usep" -v w="$warn_t" -v c="$crit_t" 'BEGIN{ x=u-w; d=c-w; if(d<=0){print 0}else{ if(x<0) x=0; if(x>d) x=d; printf "%d", int((x*100)/d) } }')
-            fi
-        fi
-        local w_cap=20; local w_smart=60; local w_err=20; local total=$(( w_cap + w_smart + w_err )); local comp
-        comp=$(awk -v c="$cap_norm" -v s="$sm_norm" -v e="$err_norm" -v wc="$w_cap" -v ws="$w_smart" -v we="$w_err" -v t="$total" 'BEGIN{ printf "%d", int((wc*c + ws*s + we*e)/t) }')
-        _io_rank+=("$comp"$'\t'"$(basename "$dev")"$'\t'"$raw_count"$'\t'"$uniq_count"$'\t'"${mark}")
+        # Frequency output is ordered by observed severity and counts. Device
+        # risk is calculated once later by the canonical risk pipeline.
+        local frequency_rank=0
+        [[ "$mark" == "WARN" ]] && frequency_rank=1
+        [[ "$mark" == "CRIT" ]] && frequency_rank=2
+        _io_rank+=("$frequency_rank"$'\t'"$uniq_count"$'\t'"$raw_count"$'\t'"$(basename "$dev")"$'\t'"${mark}")
     done
     if (( ${#_io_rank[@]} > 0 )); then
         local sorted_io
-        sorted_io=$(printf "%s\n" "${_io_rank[@]}" | sort -nr -k1,1)
-        while IFS=$'\t' read -r comp_score name raw uniq mark; do
-            lines+=" - ${name} raw=${raw} unique=${uniq}${mark:+ (${mark})} (priority ${comp_score})\n"
+        sorted_io=$(printf "%s\n" "${_io_rank[@]}" |
+            LC_ALL=C sort -t $'\t' -k1,1nr -k2,2nr -k3,3nr -k4,4)
+        while IFS=$'\t' read -r _rank uniq raw name mark; do
+            lines+=" - ${name} raw=${raw} unique=${uniq}${mark:+ (${mark})}\n"
         done <<< "$sorted_io"
         IO_ERROR_FREQ_SECTION="I/O Error Frequency (last ${IO_ERROR_WINDOW_MINUTES}m):\n$lines"
         IO_ERROR_FREQ_SECTION="$(printf "%s\n" "$IO_ERROR_FREQ_SECTION" | trim_outer_blank_lines)"
@@ -5082,785 +5111,255 @@ validate_storage_metrics() {
     fi
 }
 
-# === Main Function ===
-# Summarize subsystem statuses based on collected alerts
-build_subsystem_lines() {
-    local sm=OK bt=OK xfs=OK cap=OK pm=OK end=OK ad=OK pr=OK
-    for a in "${ALERT_CRIT[@]}"; do
-        [[ $a == "$NOTIFY_TITLE_SMART"* ]] && sm=CRITICAL
-        [[ $a == "$NOTIFY_TITLE_BTRFS"* ]] && bt=CRITICAL
-        [[ $a == "$NOTIFY_TITLE_XFS"* ]] && xfs=CRITICAL
-        [[ $a == *Capacity* ]] && cap=CRITICAL
-        [[ $a == Storage\ Critical* ]] && pm=CRITICAL
-        [[ $a == TBW\ Endurance* ]] && end=CRITICAL
-        [[ $a == SMART\ Scheduling* ]] && ad=CRITICAL
-        [[ $a == Parity\ Status:* ]] && pr=CRITICAL
-    done
-    for a in "${ALERT_WARN[@]}"; do
-        [[ $sm != CRITICAL && $a == "$NOTIFY_TITLE_SMART"* ]] && sm=WARNING
-        [[ $bt != CRITICAL && $a == "$NOTIFY_TITLE_BTRFS"* ]] && bt=WARNING
-        [[ $xfs != CRITICAL && $a == "$NOTIFY_TITLE_XFS"* ]] && xfs=WARNING
-        [[ $cap != CRITICAL && $a == *Capacity* ]] && cap=WARNING
-        [[ $pm != CRITICAL && $a == Storage\ Warning* ]] && pm=WARNING
-        [[ $end != CRITICAL && $a == TBW\ Endurance* ]] && end=WARNING
-        [[ $ad != CRITICAL && $a == SMART\ Scheduling* ]] && ad=WARNING
-        [[ $pr != CRITICAL && $a == Parity\ Status:* ]] && pr=WARNING
-    done
-    # Determine Btrfs anomaly counts even if scrub disabled (device errors, unrecoverable, corrected)
-    local btrfs_anom_count=0 btrfs_crit_flag=0 btrfs_warn_flag=0
-    # Scan SMART_MSGS for device-level patterns
-    for msg in "${SMART_MSGS[@]}"; do
-        if [[ $msg == *"Btrfs device errors"* ]]; then btrfs_anom_count=$((btrfs_anom_count+1)); btrfs_warn_flag=1; fi
-    done
-    # Scan recommendation / alert arrays for additional Btrfs patterns
-    for a in "${ALERT_CRIT[@]}"; do
-        if [[ $a == *"scrub corrected="* || $a == *"unrecoverable errors="* || $a == *"Btrfs device errors"* ]]; then
-            btrfs_anom_count=$((btrfs_anom_count+1)); btrfs_crit_flag=1
-        fi
-    done
-    for a in "${ALERT_WARN[@]}"; do
-        if [[ $a == *"scrub corrected="* || $a == *"unrecoverable errors="* || $a == *"Btrfs device errors"* ]]; then
-            btrfs_anom_count=$((btrfs_anom_count+1)); btrfs_warn_flag=1
-        fi
-    done
-    # Elevate bt severity if anomalies present even when scrub disabled
-    if (( btrfs_crit_flag == 1 )) && [[ $bt != CRITICAL ]]; then bt=CRITICAL; fi
-    if (( btrfs_warn_flag == 1 )) && [[ $bt == OK ]]; then bt=WARNING; fi
+# Elevate one global subsystem state without relying on alert wording.
+elevate_subsystem_state() {
+    local variable_name="$1"
+    local severity="${2^^}"
+    local current="${!variable_name:-OK}"
 
-    # Determine XFS display state: enabled if either metadata check OR proc stats enabled
-    local xfs_display
-    if [[ ${ENABLE_XFS_CHECK:-0} -eq 1 || ${ENABLE_XFS_PROC_STATS:-0} -eq 1 ]]; then
-        xfs_display="$xfs"
-    else
-        xfs_display="Disabled"
+    [[ "$severity" == "CRITICAL" ]] || severity="WARNING"
+    if [[ "$current" == "CRITICAL" ]]; then
+        return 0
     fi
-    # Count XFS anomalies/messages for optional inline detail
-    local xfs_anom_count=0
-    for a in "${ALERT_CRIT[@]}" "${ALERT_WARN[@]}"; do
-        if [[ $a == *"XFS metadata anomalies"* ]]; then xfs_anom_count=$((xfs_anom_count+1)); fi
-        if [[ $a == *"XFS metadata issue"* ]]; then xfs_anom_count=$((xfs_anom_count+1)); fi
-        if [[ $a == *"XFS Alert"* ]] && [[ $a == *"Counter "* ]]; then xfs_anom_count=$((xfs_anom_count+1)); fi
-    done
-    if (( xfs_anom_count > 0 )) && [[ $xfs_display != Disabled ]]; then
-        xfs_display+=" (${xfs_anom_count})"
+    if [[ "$severity" == "CRITICAL" || "$current" != "WARNING" ]]; then
+        printf -v "$variable_name" '%s' "$severity"
     fi
-    # Determine Btrfs display: enabled if scrub OR anomalies present
-    local btrfs_display
-    if [[ ${ENABLE_BTRFS_SCRUB:-0} -eq 1 || $btrfs_anom_count -gt 0 ]]; then
-        btrfs_display="$bt"
-    else
-        btrfs_display="Disabled"
-    fi
-    if (( btrfs_anom_count > 0 )) && [[ $btrfs_display != Disabled ]]; then
-        btrfs_display+=" (${btrfs_anom_count})"
-    fi
-    SUBSYSTEM_LINES="SMART: $sm
-Btrfs: $btrfs_display
-XFS:   $xfs_display
-Capacity: $cap
-Per-Mount: $pm
-Endurance: $end
-Scheduling: $ad
-Parity: $pr"
 }
 
-# === Main Function ===
-# Build health alerts based on alert messages
-build_health_alerts() {
-    local rec=""
-    if (( ${#ALERT_WARN[@]} + ${#ALERT_CRIT[@]} > 0 )); then
-        rec+="Health Alerts:\n"
-        declare -A SEEN_REC_DEVICES=()
-        # Track count of distinct critical SMART/NVMe conditions per base device for compound escalation
-        declare -A CRIT_SMART_COUNT=()
-        # Aggregate firmware reset events per device (POH / wear regressions)
-        declare -A FR_EVENTS FR_COUNT FR_FRIENDLY FR_MODEL_SUFFIX FR_CRIT
-        # Iterate over alerts (critical first) and map to per-device or per-mount actions
-        for x in "${ALERT_CRIT[@]}" "${ALERT_WARN[@]}"; do
-            local disk_ref mnt_ref canonical_action="" canonical_title="" finding_id
-            disk_ref=$(echo "$x" | grep -o '/dev/[a-zA-Z0-9]*' | head -n1 || true)
-            mnt_ref=$(echo "$x" | grep -o '/mnt/[a-zA-Z0-9_-]*' | head -n1 || true)
-            for finding_id in "${FINDING_IDS[@]}"; do
-                if [[ "${FINDING_ALERT_TEXT[$finding_id]:-}" == "$x" ]]; then
-                    canonical_action="${FINDING_ACTION[$finding_id]:-}"
-                    canonical_title="${FINDING_TITLE[$finding_id]:-Finding}"
-                    break
-                fi
-            done
-            local friendly="$disk_ref"
-            local bdev=""
-            if [[ -n "$disk_ref" ]]; then
-                bdev="$(base_device "$disk_ref")"
-                local arr_slot="" pool_name=""
-                local k
-                for k in "${!MOUNT_TO_DEV[@]}"; do
-                    if [[ "$k" == /mnt/disk* ]]; then
-                        local mdev
-                        mdev="${MOUNT_TO_DEV[$k]}"
-                        local bmdev
-                        bmdev="$(base_device "$mdev")"
-                        if [[ "$bmdev" == "$bdev" ]]; then arr_slot="$(basename "$k")"; break; fi
-                    fi
-                done
-                if [[ -n "${POOL_MEMBER_MAP[$bdev]:-}" ]]; then pool_name="${POOL_MEMBER_MAP[$bdev]}"; fi
-                if [[ -n "$arr_slot" ]]; then
-                    friendly="$arr_slot:$(basename "$bdev")"
-                elif [[ -n "$pool_name" ]]; then
-                    friendly="${pool_name}:$(basename "$bdev")"
-                else
-                    friendly="$(basename "$bdev")"
-                fi
-            fi
-            local display_friendly="$friendly"
-            if [[ "$friendly" == *:* ]]; then
-                local left="${friendly%%:*}" right="${friendly##*:}"
-                display_friendly="${left} [${right}]"
-            fi
-            # Optional model suffix for health alerts
-            local model_suffix
-            model_suffix="$(model_suffix_for "$bdev")"
-            # Match alert text to specific health alert patterns
-            case "$x" in
-                # Explicit title-based resiliency matches (SATA / Firmware)
-                *"SATA Link Instability:"*)
-                    if [[ -n "$friendly" ]]; then
-                        # Parse streak from body
-                        local streak_val
-                        streak_val=$(echo "$x" | awk -F'streak ' '{print $2}' | awk '{print $1}' | tr -d 'd' 2>/dev/null || true)
-                        [[ "$streak_val" =~ ^[0-9]+$ ]] || streak_val=0
-                        local warn_thr=${SATA_LINK_INSTABILITY_STREAK_WARN:-2}
-                        local crit_thr=${SATA_LINK_INSTABILITY_STREAK_CRIT:-5}
-                        local guidance="Negotiated SATA link speed reduced; reseat/replace cable, test different controller port, verify backplane integrity."
-                        if (( streak_val >= crit_thr )); then
-                            guidance="Persistent critical SATA link downshift streak (${streak_val}d); treat as physical layer degradation: replace cable/backplane, migrate data off if repeats, verify restoration before next parity check."
-                        elif (( streak_val >= warn_thr )); then
-                            guidance="SATA link downshift streak (${streak_val}d); investigate cable/backplane, monitor for escalation to critical threshold."
-                        fi
-                        rec+="- $display_friendly$model_suffix: $guidance\n"
-                        [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    fi ;;
-                *"Firmware Reset:"*)
-                    # Defer aggregation; capture event types per device
-                    if [[ -n "$friendly" && -n "$bdev" ]]; then
-                        local type=""
-                        if [[ $x == *"Power-On Hours dropped"* ]]; then
-                            type="POH regression"
-                            # Determine critical magnitude from drop amount
-                            local drop_val
-                            drop_val=$(echo "$x" | grep -o 'drop [0-9]*h' | awk '{print $2}' | tr -d 'h' 2>/dev/null || true)
-                            [[ "$drop_val" =~ ^[0-9]+$ ]] || drop_val=0
-                            if (( drop_val > ${POH_RESET_CRIT_THRESHOLD:-100} )); then FR_CRIT["$bdev"]=1; fi
-                        elif [[ $x == *"NVMe Percentage Used decreased"* || $x == *"NVMe percent_used regression"* ]]; then
-                            type="wear regression"
-                        else
-                            type="counter regression"
-                        fi
-                        # Append unique type token
-                        if [[ -n "$type" ]]; then
-                            if [[ -z "${FR_EVENTS[$bdev]+set}" ]]; then FR_EVENTS["$bdev"]=""; fi
-                            if [[ " ${FR_EVENTS[$bdev]} " != *" $type "* ]]; then
-                                FR_EVENTS["$bdev"]+=" $type"
-                            fi
-                            FR_COUNT["$bdev"]=$(( ${FR_COUNT["$bdev"]:-0} + 1 ))
-                            FR_FRIENDLY["$bdev"]="$display_friendly"
-                            FR_MODEL_SUFFIX["$bdev"]="$model_suffix"
-                        fi
-                    fi ;;
-                *"Drive Replacement"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Drive replacement detected; verify serial/model match expectation, run long SMART test to establish baseline, and perform parity/scrub verification next cycle.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"Btrfs device errors"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Btrfs device error counters increased; run scrub, inspect cables, consider replacing device if trend continues.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"Btrfs Device"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Btrfs per-device errors rising; run scrub, check SMART for underlying issues, inspect cabling/backplane, and plan replacement if escalation persists.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"XFS metadata anomalies"*)
-                    if [[ -n "$friendly" ]]; then
-                        rec+="- $display_friendly$model_suffix: XFS metadata/stat anomaly, stop array/unmount volume, run 'xfs_repair -n $bdev' (read-only). If output says 'would be modified', back up then run 'xfs_repair $bdev' during maintenance. Also check dmesg and SMART for underlying faults.\n"
-                        [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    fi ;;
-                *"POH age HDD"*)
-                    if echo "$x" | grep -qi 'SMART CRITICAL'; then
-                        [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Critical HDD power-on hours; schedule replacement window and ensure backups are current.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    else
-                        [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Elevated HDD power-on hours; monitor closely and plan refresh.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    fi ;;
-                *"POH age SSD"*)
-                    if echo "$x" | grep -qi 'SMART CRITICAL'; then
-                        [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Critical SSD power-on hours; migrate workloads and replace soon.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    else
-                        [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Elevated SSD power-on hours; plan maintenance window and review TBW/endurance.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    fi ;;
-                *"POH age NVMe"*)
-                    if echo "$x" | grep -qi 'SMART CRITICAL'; then
-                        [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Critical NVMe power-on hours; schedule replacement and validate firmware health.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    else
-                        [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Elevated NVMe power-on hours; plan refresh and monitor performance/SMART.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    fi ;;
-                *"Reallocated Event Count"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Reallocation events logged; monitor trend; consider replacement if increasing.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"Reallocated ="*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Reallocated sectors rising; monitor; replace if trend increases.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"Pending sectors"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Pending sectors; backup; run long test; plan replacement.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"Offline Uncorrectable"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Offline uncorrectable; clone and replace soon.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 && CRIT_SMART_COUNT["$bdev"]=$(( ${CRIT_SMART_COUNT["$bdev"]:-0} + 1 )) ;;
-                *"UDMA CRC Errors"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: CRC errors; reseat/replace SATA cable.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"Temp "*C*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: High temperature; improve cooling / airflow.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"NVMe wear"*)
-                    rec+="- ${display_friendly:-NVMe}$model_suffix: High NVMe wear level; schedule replacement.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"long self-test CRITICAL"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Failed long test; migrate data; replace drive.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 && CRIT_SMART_COUNT["$bdev"]=$(( ${CRIT_SMART_COUNT["$bdev"]:-0} + 1 )) ;;
-                *"short self-test warning"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Short test warning; run a long test.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"unrecoverable errors="*)
-                    [[ -n "$mnt_ref" ]] && rec+="- $mnt_ref (Btrfs): Unrecoverable errors; backup; inspect device(s); rerun scrub.\n" ;;
-                *"scrub corrected="*)
-                    [[ -n "$mnt_ref" ]] && rec+="- $mnt_ref (Btrfs): Corrected errors; monitor; consider more frequent scrubs.\n" ;;
-                *"Parity Sync Errors"*)
-                    if [[ -n "$friendly" ]]; then
-                        rec+="- $display_friendly$model_suffix: Parity sync reported errors; run SMART long tests, inspect cabling/backplane, consider a correcting parity check.\n"
-                        [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    fi ;;
-                *"Btrfs Profile"*)
-                    if [[ -n "$friendly" ]]; then
-                        rec+="- $display_friendly$model_suffix: Btrfs data/metadata profile mismatch; align via 'btrfs balance start -dconvert=raid1 -mconvert=raid1' (use appropriate target).\n"
-                        [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    fi ;;
-                *"Btrfs Unbalanced"*)
-                    if [[ -n "$friendly" ]]; then
-                        rec+="- $display_friendly$model_suffix: Btrfs pool redundancy not configured or insufficient devices; add a second device or convert profiles (e.g., raid1).\n"
-                        [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    fi ;;
-                *"XFS metadata issue"*)
-                    [[ -n "$mnt_ref" ]] && rec+="- $mnt_ref (XFS): Metadata issue; schedule offline xfs_repair; backup first.\n" ;;
-                *"Array usage "*|*"Pools usage "*)
-                    rec+="- Capacity: Cleanup data or plan expansion (usage threshold crossed).\n" ;;
-                *"Storage Warning "*)
-                    [[ -n "$mnt_ref" ]] && rec+="- $mnt_ref: High usage; cleanup or plan expansion.\n" ;;
-                *"Storage Critical "*)
-                    [[ -n "$mnt_ref" ]] && rec+="- $mnt_ref: Critical usage; expand immediately or purge data.\n" ;;
-                *"Reported Uncorrectable"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Uncorrectable errors; backup immediately; plan replacement.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"Command Timeout events"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Command timeouts; inspect cabling/power; monitor closely.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"End-to-End Errors"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Data path integrity errors; replace drive/controller.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"Soft Read Error Rate"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Elevated soft read errors; run long test; monitor trend.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"NVMe reliability degraded"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: NVMe reliability degraded; schedule replacement soon.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 && CRIT_SMART_COUNT["$bdev"]=$(( ${CRIT_SMART_COUNT["$bdev"]:-0} + 1 )) ;;
-                *"NVMe media in read-only mode"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: NVMe is read-only; clone data; replace immediately.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 && CRIT_SMART_COUNT["$bdev"]=$(( ${CRIT_SMART_COUNT["$bdev"]:-0} + 1 )) ;;
-                *"NVMe volatile memory backup failed"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: NVMe volatile memory backup failed; ensure power protection; plan replacement.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"SSD life remaining "*)
-                    if echo "$x" | grep -q "SSD life remaining .*<= ${SSD_WEAR_CRIT}%"; then
-                        [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: SSD life critically low; migrate workloads and replace soon.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    else
-                        [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: SSD life low; reduce writes, monitor, and plan refresh.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    fi ;;
-                *"TBW exceeds model baseline "*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Terabytes written (TBW) exceeds model baseline; reduce write amplification, review heavy writers, and plan replacement if trend continues.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"TBW exceeds "*" TB"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: High total bytes written (TBW); reduce writes and monitor endurance progression.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"NVMe Unsafe Shutdowns increased:"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Unsafe shutdowns increased; check PSU/UPS, power stability, firmware, and cabling/backplane; run long SMART and filesystem checks.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"NVMe Available Spare "*"< threshold"*|*"NVMe Available Spare low:"*|*"NVMe available spare below threshold"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: NVMe available spare below threshold; plan replacement, reduce write load, and improve cooling.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"NVMe thermal threshold exceeded"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: NVMe thermal threshold exceeded; improve airflow/cooling and review workloads.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"NVMe media/data integrity errors"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: NVMe media/data integrity errors; backup immediately and replace.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 && CRIT_SMART_COUNT["$bdev"]=$(( ${CRIT_SMART_COUNT["$bdev"]:-0} + 1 )) ;;
-                *"NVMe error log entries increased"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: NVMe error log growth; review SMART history, update firmware, monitor for escalation, plan replacement if persistent.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"NVMe PCIe uncorrectable errors increased"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: NVMe PCIe UNCORRECTABLE errors; immediate backup; inspect slot/backplane; replace device/controller.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 && CRIT_SMART_COUNT["$bdev"]=$(( ${CRIT_SMART_COUNT["$bdev"]:-0} + 1 )) ;;
-                *"NVMe PCIe correctable errors increased"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Rising NVMe PCIe correctable errors; reseat, improve cooling, monitor for uncorrectables.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"NVMe thermal transitions T2 increased"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: NVMe critical thermal transitions; improve airflow/heatsink and reduce sustained heavy writes.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 && CRIT_SMART_COUNT["$bdev"]=$(( ${CRIT_SMART_COUNT["$bdev"]:-0} + 1 )) ;;
-                *"NVMe thermal transitions T1 increased"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: NVMe warning thermal transitions; optimize cooling before escalation.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"NVMe warning temperature time +"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: NVMe warning temperature exposure rising; enhance airflow and distribute I/O load.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"NVMe critical temperature time +"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: NVMe critical temperature exposure; throttle workloads and schedule replacement if persistent.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 && CRIT_SMART_COUNT["$bdev"]=$(( ${CRIT_SMART_COUNT["$bdev"]:-0} + 1 )) ;;
-                *" snapshot count "*)
-                    [[ -n "$mnt_ref" ]] && rec+="- $mnt_ref: Snapshot count high; prune old snapshots and adjust retention.\n" ;;
-                *"NVMe Critical Warning flags:"*)
-                    if [[ -n "$friendly" ]]; then
-                        local flags_val
-                        flags_val=$(echo "$x" | awk -F'flags:' '{sub(/^ +/,"",$2); print $2}' 2>/dev/null | tr -d ' ')
-                        local bitcount=0 value=0
-                        if [[ -n "$flags_val" ]]; then
-                            if [[ "$flags_val" =~ ^0x[0-9a-fA-F]+$ ]]; then
-                                local hex=${flags_val#0x}
-                                value=$((16#${hex}))
-                            elif [[ "$flags_val" =~ ^[0-9]+$ ]]; then
-                                value=$((flags_val))
-                            fi
-                            local i
-                            for (( i=0; i<8; i++ )); do
-                                if (( (value >> i) & 1 )); then ((bitcount++)); fi
-                            done
-                        fi
-                        if (( bitcount >= 2 )); then
-                            rec+="- $display_friendly$model_suffix: Multiple NVMe critical warning bits set ($flags_val); immediate backup & replacement planning.\n"
-                            [[ -n "$bdev" ]] && CRIT_SMART_COUNT["$bdev"]=$(( ${CRIT_SMART_COUNT["$bdev"]:-0} + 1 ))
-                        else
-                            rec+="- $display_friendly$model_suffix: NVMe critical warning bitfield ($flags_val) set; review specific flagged conditions and plan mitigation.\n"
-                        fi
-                        [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    fi ;;
-                *"SMART Trend:"*)
-                    # One-to-one mapping for SMART Trend record_alert entries
-                    if [[ -n "$friendly" ]]; then
-                        local trend_body
-                        trend_body=$(echo "$x" | sed -E 's/^SMART Trend: //')
-                        rec+="- $display_friendly$model_suffix: SMART trend — ${trend_body}; act per attribute guidance (parity check/long test/backup).\n"
-                        [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    fi ;;
-                *"Kernel/XFS I/O messages"*)
-                    [[ -n "$mnt_ref" ]] && rec+="- $mnt_ref: Kernel/XFS I/O errors; inspect cabling/controller logs and consider offline check if persistent.\n" ;;
-                *"Load Cycle Count = "*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Excessive load cycle count; adjust APM/firmware settings, monitor trend, plan replacement if rising.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *"TBW consumed "*)
-                    if echo "$x" | grep -q "TBW consumed .*>= ${TBW_CONSUMED_CRIT}%"; then
-                        [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: SSD endurance nearly exhausted; migrate workloads and replace soon.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    else
-                        [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: High SSD endurance consumption; reduce writes and plan refresh.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    fi ;;
-                *"TBW Endurance"*)
-                    if echo "$x" | grep -qi 'CRITICAL'; then
-                        [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Terabytes written (TBW) near exhaustion; schedule replacement and migrate workloads.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    else
-                        [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Terabytes written (TBW) forecast low; reduce write amplification and plan refresh.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    fi ;;
-                *"SMART Scheduling"*)
-                    if echo "$x" | grep -qi 'critical'; then
-                        [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Long test scheduled (critical SMART state). Back up data, review SMART attributes, consider accelerated replacement.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    else
-                        [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: Long test scheduled (elevated risk). Monitor next runs, inspect SMART deltas, plan proactive diagnostics.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    fi ;;
-                *"I/O errors unique"*)
-                    [[ -n "$friendly" ]] && rec+="- $display_friendly$model_suffix: High I/O error frequency; check SATA/NVMe cabling, power stability, controller logs; consider moving data & replacing if persistent.\n" && [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1 ;;
-                *)
-                    if [[ -n "$canonical_action" ]]; then
-                        local fallback_target="${display_friendly:-${mnt_ref:-$canonical_title}}"
-                        rec+="- ${fallback_target}${model_suffix}: ${canonical_action}\n"
-                        [[ -n "$bdev" ]] && SEEN_REC_DEVICES["$bdev"]=1
-                    fi
-                    ;;
-            esac
-        done
-        # Emit aggregated firmware reset guidance lines (after collecting all events)
-        local fr_dev
-        for fr_dev in "${!FR_COUNT[@]}"; do
-            local friendly_tag="${FR_FRIENDLY[$fr_dev]:-}" model_suffix="${FR_MODEL_SUFFIX[$fr_dev]:-}" types="${FR_EVENTS[$fr_dev]:-}" cnt="${FR_COUNT[$fr_dev]:-0}"
-            types=${types# }
-            local plural=""; (( cnt > 1 )) && plural="s"
-            local agg_line="Firmware/controller counter regressions detected (${cnt} event${plural}: ${types// /, })"
-            if [[ -n "${FR_CRIT[$fr_dev]:-}" ]]; then
-                agg_line="Multiple / critical firmware or controller counter regressions (${cnt} events: ${types// /, }); immediate firmware check, controller/backplane inspection, and backup before next parity/scrub."
-            fi
-            rec+="- ${friendly_tag}${model_suffix}: ${agg_line}.\n"
-            SEEN_REC_DEVICES["$fr_dev"]=1
-        done
-        # Compound SMART failure escalation: if multiple critical conditions detected on same device
-        for dev_key in "${!CRIT_SMART_COUNT[@]}"; do
-            local cnt=${CRIT_SMART_COUNT[$dev_key]:-0}
-            if (( cnt >= 2 )) && [[ -z "${COMPOUND_EMITTED[$dev_key]:-}" ]]; then
-                rec+="- $(basename "$dev_key") : Multiple critical SMART/NVMe conditions (${cnt}); prioritize immediate backup & replacement planning.\n"
-                COMPOUND_EMITTED[dev_key]=1
-            fi
-        done
-        # Inject NVMe-specific SMART message driven guidance (messages not recorded via record_alert)
-        for dev in "${!SMART_STATE[@]}"; do
-            local st="${SMART_STATE[$dev]:-OK}"
-            [[ $st == OK ]] && continue
-            local raw_msg="${SMART_MSGS[$dev]:-}"
-            [[ -z "$raw_msg" ]] && continue
-            local base
-            base="$(base_device "$dev")"
-            local arr_slot="" pool_name="" k
-            for k in "${!MOUNT_TO_DEV[@]}"; do
-                if [[ "$k" == /mnt/disk* ]]; then
-                    local mdev
-                    mdev="${MOUNT_TO_DEV[$k]}"
-                    local bmdev
-                    bmdev="$(base_device "$mdev")"
-                    if [[ "$bmdev" == "$base" ]]; then arr_slot="$(basename "$k")"; break; fi
-                fi
-            done
-            if [[ -n "${POOL_MEMBER_MAP[$base]:-}" ]]; then pool_name="${POOL_MEMBER_MAP[$base]}"; fi
-            local tag
-            if [[ -n "$arr_slot" ]]; then tag="$arr_slot [$(basename "$base")]"; elif [[ -n "$pool_name" ]]; then tag="$pool_name [$(basename "$base")]"; else tag="$(basename "$base")"; fi
-            local model_suffix
-            model_suffix="$(model_suffix_for "$base")"
-            [[ -n "${SEEN_REC_DEVICES[$base]:-}" ]] && continue
-            if [[ $raw_msg == *"NVMe error log entries increased"* ]]; then
-                rec+=" - $tag$model_suffix: NVMe error log growth; monitor escalation; update firmware; backup & plan replacement if growth persists.\n"; SEEN_REC_DEVICES[$base]=1; continue
-            fi
-            if [[ $raw_msg == *"NVMe PCIe correctable errors increased"* ]]; then
-                rec+=" - $tag$model_suffix: Rising NVMe PCIe correctable errors; inspect slot/backplane, reseat, verify cooling, monitor for uncorrectable events.\n"; SEEN_REC_DEVICES[$base]=1; continue
-            fi
-            if [[ $raw_msg == *"NVMe PCIe uncorrectable errors increased"* ]]; then
-                rec+=" - $tag$model_suffix: NVMe PCIe uncorrectable errors; immediate backup and migrate workload; replace device / inspect controller.\n"; SEEN_REC_DEVICES[$base]=1; continue
-            fi
-            if [[ $raw_msg == *"NVMe thermal transitions T2 increased"* ]]; then
-                rec+=" - $tag$model_suffix: NVMe critical thermal transitions; improve airflow, consider heatsink, reduce sustained heavy writes.\n"; SEEN_REC_DEVICES[$base]=1; continue
-            fi
-            if [[ $raw_msg == *"NVMe thermal transitions T1 increased"* ]]; then
-                rec+=" - $tag$model_suffix: NVMe warning thermal transitions; optimize cooling before escalation.\n"; SEEN_REC_DEVICES[$base]=1; continue
-            fi
-            if [[ $raw_msg == *"NVMe warning temperature time"* ]]; then
-                rec+=" - $tag$model_suffix: Accumulating NVMe time at warning temperature; improve cooling or distribute I/O load.\n"; SEEN_REC_DEVICES[$base]=1; continue
-            fi
-            if [[ $raw_msg == *"NVMe critical temperature time"* ]]; then
-                rec+=" - $tag$model_suffix: NVMe time at critical temperature; throttle workloads and replace if persistent.\n"; SEEN_REC_DEVICES[$base]=1; continue
-            fi
-        done
-        # Compute composite health score per device and prioritize alert ordering
-        local rank_lines=()
-        local dev
-        for dev in "${!SMART_STATE[@]}"; do
-            local st; st="${SMART_STATE[$dev]:-OK}"
-            [[ "$st" == WARNING || "$st" == CRITICAL ]] || continue
-            local base; base="$(base_device "$dev")"
-            # SMART component (normalize to 0–100)
-            local sm_raw sm_norm
-            sm_raw="$(risk_score_for_device "$dev" "$st" "${SMART_MSGS[$dev]:-}")"
-            [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
-            if (( sm_raw > 100 )); then sm_norm=100; else sm_norm=$sm_raw; fi
-            # Apply burst boost (base device scope)
-            local _burst_boost=${BURST_BOOST[$dev]:-${BURST_BOOST[$base]:-0}}
-            if [[ "$_burst_boost" =~ ^[0-9]+$ && $_burst_boost -gt 0 ]]; then
-                sm_norm=$(( sm_norm + _burst_boost ))
-                (( sm_norm > 100 )) && sm_norm=100
-            fi
-            # Error component from I/O unique events (scaled against thresholds)
-            local uniq; uniq="${IO_ERROR_UNIQUE_MAP[$dev]:-${IO_ERROR_UNIQUE_MAP[$base]:-0}}"
-            [[ "$uniq" =~ ^[0-9]+$ ]] || uniq=0
-            local err_norm
-            if (( uniq >= ${IO_ERROR_CRIT_THRESHOLD:-20} )); then err_norm=100
-            elif (( uniq >= ${IO_ERROR_WARN_THRESHOLD:-5} )); then err_norm=65
-            else err_norm=$(awk -v u="$uniq" -v w="${IO_ERROR_WARN_THRESHOLD:-5}" 'BEGIN{ if(w>0) printf "%d", (u*50)/w; else print 0 }'); fi
-            # Capacity pressure per disk mount (percent toward thresholds)
-            local cap_norm=0
-            local arr_slot=""
-            local k
-            for k in "${!MOUNT_TO_DEV[@]}"; do
-                if [[ "$k" == /mnt/disk* ]]; then
-                    local mdev bmdev
-                    mdev="${MOUNT_TO_DEV[$k]}"; bmdev="$(base_device "$mdev")"
-                    if [[ "$bmdev" == "$base" ]]; then arr_slot="$k"; break; fi
-                fi
-            done
-            if [[ -n "$arr_slot" ]]; then
-                local pct usep warn_t crit_t
-                warn_t="${WARN_THRESHOLD_PERCENT:-75}"; crit_t="${CRITICAL_THRESHOLD_PERCENT:-90}"
-                read -r _sz _u pct _mount < <(df -h --output=size,used,pcent,target "$arr_slot" 2>/dev/null | tail -n1)
-                usep=${pct%%%}
-                if [[ "$usep" =~ ^[0-9]+$ && $crit_t -gt $warn_t ]]; then
-                    cap_norm=$(awk -v u="$usep" -v w="$warn_t" -v c="$crit_t" 'BEGIN{ x=u-w; d=c-w; if(d<=0){print 0}else{ if(x<0) x=0; if(x>d) x=d; printf "%d", int((x*100)/d) } }')
-                fi
-            fi
-            # Weighted composite (0–100)
-            local w_cap=20; local w_smart=60; local w_err=20; local total=$(( w_cap + w_smart + w_err )); local comp
-            comp=$(awk -v c="$cap_norm" -v s="$sm_norm" -v e="$err_norm" -v wc="$w_cap" -v ws="$w_smart" -v we="$w_err" -v t="$total" 'BEGIN{ printf "%d", int((wc*c + ws*s + we*e)/t) }')
-            rank_lines+=("$comp"$'\t'"$dev"$'\t'"$base")
-        done
-        # Sort by composite score descending and emit prioritized SMART alerts
-        if (( ${#rank_lines[@]} > 0 )); then
-            local sorted line comp_score s_dev s_base
-            sorted=$(printf "%s\n" "${rank_lines[@]}" | sort -nr -k1,1)
-            while IFS=$'\t' read -r comp_score s_dev s_base; do
-                [[ -n "${SEEN_REC_DEVICES[$s_base]:-}" ]] && continue
-                local st; st="${SMART_STATE[$s_dev]:-OK}"
-                local arr_slot=""; local pool_name=""; local k
-                for k in "${!MOUNT_TO_DEV[@]}"; do
-                    if [[ "$k" == /mnt/disk* ]]; then
-                        local mdev bmdev
-                        mdev="${MOUNT_TO_DEV[$k]}"; bmdev="$(base_device "$mdev")"
-                        if [[ "$bmdev" == "$s_base" ]]; then arr_slot="$(basename "$k")"; break; fi
-                    fi
-                done
-                if [[ -n "${POOL_MEMBER_MAP[$s_base]:-}" ]]; then pool_name="${POOL_MEMBER_MAP[$s_base]}"; fi
-                local tag model_suffix raw_msg inline_msg
-                if [[ -n "$arr_slot" ]]; then tag="$arr_slot [$(basename "$s_base")]"; elif [[ -n "$pool_name" ]]; then tag="$pool_name [$(basename "$s_base")]"; else tag="$(basename "$s_base")"; fi
-                model_suffix="$(model_suffix_for "$s_base")"
-                raw_msg="${SMART_MSGS[$s_dev]:-}"; inline_msg="$(sanitize_smart_for_inline "$raw_msg" 1)"
-                if [[ "$st" == CRITICAL ]]; then
-                    rec+=" - $tag$model_suffix: SMART CRITICAL — ${inline_msg:-review SMART details}; backup immediately and replace. (priority ${comp_score})\n"
-                else
-                    if [[ -n "${LONG_TEST_RUNNING_LONG[$s_dev]:-}" ]]; then
-                        rec+=" - $tag$model_suffix: SMART WARNING — ${inline_msg:-review SMART details}; long SMART test currently in progress; monitor results before planning replacement. (priority ${comp_score})\n"
-                    else
-                        rec+=" - $tag$model_suffix: SMART WARNING — ${inline_msg:-review SMART details}; run a long SMART test, monitor, and plan replacement if it worsens. (priority ${comp_score})\n"
-                    fi
-                fi
-                SEEN_REC_DEVICES["$s_base"]=1
-            done <<< "$sorted"
-        fi
-    fi
-    # If parity operation is active (non-idle), prefer in-progress guidance and suppress invalid
-    local _act_lc="" _pos_cf="${PARITY_POS:-}" _size_cf="${PARITY_SIZE:-}" _rem_cf="${PARITY_REM:-}" _spk_cf="${PARITY_SPEED_K:-}"
-    if [[ -n "${PARITY_ACTION:-}" ]]; then _act_lc=$(printf "%s" "${PARITY_ACTION}" | awk '{print tolower($1)}'); fi
-    if [[ -n "${_act_lc}" && "${_act_lc}" != "idle" ]]; then
-        local _active_cf=0
-        if [[ "$_spk_cf" =~ ^[0-9]+$ && $((10#$_spk_cf)) -gt 0 ]]; then _active_cf=1
-        elif [[ "$_rem_cf" =~ ^[0-9]+$ && $((10#$_rem_cf)) -gt 0 ]]; then _active_cf=1
-        elif [[ "$_pos_cf" =~ ^[0-9]+$ && "$_size_cf" =~ ^[0-9]+$ && $((10#$_pos_cf)) -gt 0 && $((10#$_pos_cf)) -lt $((10#$_size_cf)) ]]; then _active_cf=1
-        fi
-        if (( _active_cf == 1 )); then
-            local _corr_lbl; _corr_lbl=$([[ "${PARITY_CORR:-}" == "1" ]] && echo "correcting" || echo "non-correcting")
-            rec+=" - Parity: in progress (${_corr_lbl}); capacity forecast and write metrics may be skewed; defer interpretation and re-check after completion.\n"
-        fi
+subsystem_display_state() {
+    local state="$1"
+    local count="${2:-0}"
+
+    if (( count > 0 )) && [[ "$state" != "Disabled" ]]; then
+        printf '%s (%d)' "$state" "$count"
     else
-        if [[ "${PARITY_CLEAN_FLAG:-1}" == "0" ]]; then
-            rec+=" - Parity: invalid; run non-correcting parity check first (investigate recent SMART pending/reallocated/uncorrectable deltas), then correcting if errors found.\n"
-        fi
+        printf '%s' "$state"
     fi
-    HEALTH_ALERTS_SECTION="$rec"
-    if [[ -n "${HEALTH_ALERTS_SECTION:-}" ]]; then
-        HEALTH_ALERTS_SECTION="$(printf "%s\n" "$HEALTH_ALERTS_SECTION" | trim_outer_blank_lines)"
+}
+
+# Summarize subsystem status directly from canonical finding metadata.
+build_subsystem_lines() {
+    local id category signal severity scope state
+    local btrfs_count=0 xfs_count=0
+
+    SUBSYSTEM_SMART_STATE="OK"
+    if (( ENABLE_BTRFS_SCRUB == 1 || ENABLE_BTRFS_DEVICE_STATS == 1 || BTRFS_DEV_TREND_ENABLED == 1 )); then
+        SUBSYSTEM_BTRFS_STATE="OK"
     else
-        # Provide a default informational message when no health alerts were generated
-        HEALTH_ALERTS_SECTION="Health Alerts:\n - None detected; all monitored disks and filesystems nominal."
+        SUBSYSTEM_BTRFS_STATE="Disabled"
     fi
-    # Integrate NVMe wear projection guidance (warn/critical only) if arrays populated
-    if declare -p NVME_WEAR_DAYS_LEFT &>/dev/null && declare -p NVME_WEAR_RATE &>/dev/null; then
-        local guid_added=0
-        local dev dl rate
-        local _wear_rank=()
-        local warn_thr="${WEAR_DAYS_LEFT_WARN:-0}"
-        local crit_thr="${WEAR_DAYS_LEFT_CRIT:-0}"
-        for dev in "${!NVME_WEAR_DAYS_LEFT[@]}"; do
-            forecast_confidence_is_actionable \
-                "${NVME_WEAR_CONFIDENCE[$dev]:-INSUFFICIENT}" || continue
-            dl=${NVME_WEAR_DAYS_LEFT[$dev]}
-            rate=${NVME_WEAR_RATE[$dev]:-0}
-            [[ "$dl" =~ ^[0-9]+$ ]] || continue  # skip INF stable devices (exclude from alerts section)
-            local base model_suffix
-            base="$(basename "$dev")"
-            model_suffix="$(model_suffix_for "$(base_device "$dev")")"
-            local base_dev
-            base_dev="$(base_device "$dev")"
-            # Composite score (SMART + I/O error + capacity)
-            local st sm_raw sm_norm uniq err_norm cap_norm=0 arr_slot="" k
-            st="${SMART_STATE[$dev]:-OK}"
-            sm_raw="$(risk_score_for_device "$dev" "$st" "${SMART_MSGS[$dev]:-}")"; [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
-            sm_norm=$(( sm_raw > 100 ? 100 : sm_raw ))
-                        # Burst boost (NVMe wear guidance)
-                        local _burst_boost=${BURST_BOOST[$dev]:-${BURST_BOOST[$base_dev]:-0}}
-                        if [[ "$_burst_boost" =~ ^[0-9]+$ && $_burst_boost -gt 0 ]]; then
-                            sm_norm=$(( sm_norm + _burst_boost ))
-                            (( sm_norm > 100 )) && sm_norm=100
-                        fi
-            uniq="${IO_ERROR_UNIQUE_MAP[$dev]:-${IO_ERROR_UNIQUE_MAP[$base_dev]:-0}}"; [[ "$uniq" =~ ^[0-9]+$ ]] || uniq=0
-            if (( uniq >= ${IO_ERROR_CRIT_THRESHOLD:-20} )); then err_norm=100
-            elif (( uniq >= ${IO_ERROR_WARN_THRESHOLD:-5} )); then err_norm=65
-            else err_norm=$(awk -v u="$uniq" -v w="${IO_ERROR_WARN_THRESHOLD:-5}" 'BEGIN{ if(w>0) printf "%d", (u*50)/w; else print 0 }'); fi
-            for k in "${!MOUNT_TO_DEV[@]}"; do
-                if [[ "$k" == /mnt/disk* ]]; then
-                    local mdev bmdev
-                    mdev="${MOUNT_TO_DEV[$k]}"; bmdev="$(base_device "$mdev")"
-                    if [[ "$bmdev" == "$base_dev" ]]; then arr_slot="$k"; break; fi
+    if (( ENABLE_XFS_CHECK == 1 || ENABLE_XFS_PROC_STATS == 1 )); then
+        SUBSYSTEM_XFS_STATE="OK"
+    else
+        SUBSYSTEM_XFS_STATE="Disabled"
+    fi
+    SUBSYSTEM_CAPACITY_STATE="OK"
+    SUBSYSTEM_MOUNT_STATE="OK"
+    SUBSYSTEM_ENDURANCE_STATE="OK"
+    SUBSYSTEM_SCHEDULING_STATE="OK"
+    SUBSYSTEM_PARITY_STATE="OK"
+
+    # Retained SMART state for a sleeping disk remains reportable even when it
+    # did not emit a fresh finding during this run.
+    for state in "${SMART_STATE[@]}"; do
+        case "$state" in
+            CRITICAL) elevate_subsystem_state SUBSYSTEM_SMART_STATE critical ;;
+            WARNING)  elevate_subsystem_state SUBSYSTEM_SMART_STATE warning ;;
+        esac
+    done
+
+    for id in "${FINDING_IDS[@]}"; do
+        category="${FINDING_CATEGORY[$id]:-general}"
+        signal="${FINDING_SIGNAL[$id]:-advisory}"
+        severity="${FINDING_SEVERITY[$id]:-warning}"
+        scope="${FINDING_SCOPE[$id]:-${id%%|*}}"
+
+        case "$signal" in
+            filesystem.btrfs)
+                btrfs_count=$((btrfs_count + 1))
+                elevate_subsystem_state SUBSYSTEM_BTRFS_STATE "$severity"
+                ;;
+            filesystem.xfs)
+                xfs_count=$((xfs_count + 1))
+                elevate_subsystem_state SUBSYSTEM_XFS_STATE "$severity"
+                ;;
+            parity.*)
+                elevate_subsystem_state SUBSYSTEM_PARITY_STATE "$severity"
+                ;;
+            maintenance.*)
+                elevate_subsystem_state SUBSYSTEM_SCHEDULING_STATE "$severity"
+                ;;
+            endurance.*)
+                elevate_subsystem_state SUBSYSTEM_ENDURANCE_STATE "$severity"
+                ;;
+            capacity.*)
+                if [[ "$scope" == mount:* ]]; then
+                    elevate_subsystem_state SUBSYSTEM_MOUNT_STATE "$severity"
+                else
+                    elevate_subsystem_state SUBSYSTEM_CAPACITY_STATE "$severity"
                 fi
-            done
-            if [[ -n "$arr_slot" ]]; then
-                local pct usep warn_t crit_t
-                warn_t="${WARN_THRESHOLD_PERCENT:-96}"; crit_t="${CRITICAL_THRESHOLD_PERCENT:-98}"
-                read -r _sz _u pct _mount < <(df -h --output=size,used,pcent,target "$arr_slot" 2>/dev/null | tail -n1)
-                usep=${pct%%%}
-                if [[ "$usep" =~ ^[0-9]+$ && $crit_t -gt $warn_t ]]; then
-                    cap_norm=$(awk -v u="$usep" -v w="$warn_t" -v c="$crit_thr" 'BEGIN{ x=u-w; d=c-w; if(d<=0){print 0}else{ if(x<0) x=0; if(x>d) x=d; printf "%d", int((x*100)/d) } }')
-                fi
-            fi
-            local w_cap=20; local w_smart=60; local w_err=20; local total=$(( w_cap + w_smart + w_err )); local comp
-            comp=$(awk -v c="$cap_norm" -v s="$sm_norm" -v e="$err_norm" -v wc="$w_cap" -v ws="$w_smart" -v we="$w_err" -v t="$total" 'BEGIN{ printf "%d", int((wc*c + ws*s + we*e)/t) }')
-            if (( crit_thr>0 && dl <= crit_thr )); then
-                _wear_rank+=("$comp"$'\t'"${base}${model_suffix}"$'\t'"CRIT"$'\t'"${dl}"$'\t'"${crit_thr}"$'\t'"${rate}")
-                guid_added=1
-            elif (( warn_thr>0 && dl <= warn_thr )); then
-                _wear_rank+=("$comp"$'\t'"${base}${model_suffix}"$'\t'"WARN"$'\t'"${dl}"$'\t'"${warn_thr}"$'\t'"${rate}")
-                guid_added=1
+                ;;
+            *)
+                case "$category" in
+                    smart|io|temperature|lifecycle)
+                        elevate_subsystem_state SUBSYSTEM_SMART_STATE "$severity"
+                        ;;
+                esac
+                ;;
+        esac
+    done
+
+    SUBSYSTEM_LINES="SMART: ${SUBSYSTEM_SMART_STATE}
+Btrfs: $(subsystem_display_state "$SUBSYSTEM_BTRFS_STATE" "$btrfs_count")
+XFS:   $(subsystem_display_state "$SUBSYSTEM_XFS_STATE" "$xfs_count")
+Capacity: ${SUBSYSTEM_CAPACITY_STATE}
+Per-Mount: ${SUBSYSTEM_MOUNT_STATE}
+Endurance: ${SUBSYSTEM_ENDURANCE_STATE}
+Scheduling: ${SUBSYSTEM_SCHEDULING_STATE}
+Parity: ${SUBSYSTEM_PARITY_STATE}"
+}
+
+# Set FINDING_TARGET_LABEL_RESULT for one canonical finding without encoding
+# display labels back into the finding itself.
+set_finding_target_label() {
+    local id="$1"
+    local scope="${FINDING_SCOPE[$id]:-${id%%|*}}"
+    local device="${FINDING_DEVICE[$id]:-}"
+    local category="${FINDING_CATEGORY[$id]:-general}"
+    local base_device_path="" array_slot="" pool_name="" mount_path=""
+    local mapped_mount mapped_device mapped_base model_suffix=""
+
+    FINDING_TARGET_LABEL_RESULT="System"
+    if [[ -n "$device" ]]; then
+        base_device_path="$(base_device "$device")"
+        for mapped_mount in "${!MOUNT_TO_DEV[@]}"; do
+            [[ "$mapped_mount" == /mnt/disk* ]] || continue
+            mapped_device="${MOUNT_TO_DEV[$mapped_mount]:-}"
+            mapped_base="$(base_device "$mapped_device")"
+            if [[ "$mapped_base" == "$base_device_path" ]]; then
+                array_slot="$(basename "$mapped_mount")"
+                break
             fi
         done
-        if (( ${#_wear_rank[@]} > 0 )); then
-            local sorted_w
-            sorted_w=$(printf "%s\n" "${_wear_rank[@]}" | sort -nr -k1,1)
-            while read -r _ln; do
-                local _ltab
-                _ltab=$(printf "%s" "$_ln" | sed -E 's/\\t/\t/g')
-                IFS=$'\t' read -r comp_score tag sev dl thr rate <<< "$_ltab"
-                if [[ "$sev" == "CRIT" ]]; then
-                    HEALTH_ALERTS_SECTION+="\n - ${tag}: NVMe wear projected depletion ${dl}d <= ${thr}d; backup & replace scheduling now (rate ${rate}%/d). (priority ${comp_score})"
-                else
-                    HEALTH_ALERTS_SECTION+="\n - ${tag}: NVMe wear projected depletion ${dl}d <= ${thr}d; plan replacement window (rate ${rate}%/d). (priority ${comp_score})"
-                fi
-            done <<< "$sorted_w"
-        fi
-        # Optionally show soonest depletion if no individual entries added but projections exist
-        if (( guid_added==0 )) && (( warn_thr>0 || crit_thr>0 )); then
-            # Compute soonest numeric dl among devices for contextual monitoring
-            local min_dl=999999
-            local min_dev=""
-            local min_rate=""
-            for dev in "${!NVME_WEAR_DAYS_LEFT[@]}"; do
-                forecast_confidence_is_actionable \
-                    "${NVME_WEAR_CONFIDENCE[$dev]:-INSUFFICIENT}" || continue
-                dl=${NVME_WEAR_DAYS_LEFT[$dev]} ; [[ "$dl" =~ ^[0-9]+$ ]] || continue
-                if (( dl < min_dl )); then min_dl=$dl; min_dev="$dev"; min_rate=${NVME_WEAR_RATE[$dev]:-0}; fi
-            done
-            if (( min_dl < 999999 )); then
-                local base model_suffix
-                base="$(basename "$min_dev")"
-                model_suffix="$(model_suffix_for "$(base_device "$min_dev")")"
-                HEALTH_ALERTS_SECTION+="\n - ${base}${model_suffix}: NVMe wear projection earliest depletion ~${min_dl}d (rate ${min_rate}%/d); monitor trend."
-            fi
-        fi
-    fi
-    # Add heavy writer guidance (tiers) based on weekly percent arrays, ranked by composite priority
-    if declare -p WRITER_WEEKLY_PCT &>/dev/null && declare -p WRITER_TIER &>/dev/null; then
-        local dev w tier
-        local _hw_rank=()
-        for dev in "${!WRITER_WEEKLY_PCT[@]}"; do
-            w=${WRITER_WEEKLY_PCT[$dev]:-0}
-            tier=${WRITER_TIER[$dev]:-}
-            # Only consider Heavy tier (warning/critical)
-            if [[ "$tier" == "H" ]]; then
-                # Normalize writer intensity (0-100)
-                local writer_norm
-                if awk -v ww="$w" -v c="$WRITER_WEEKLY_CRIT_PCT" 'BEGIN{exit (ww>=c)?0:1}'; then
-                    writer_norm=100
-                elif awk -v ww="$w" -v wthr="$WRITER_WEEKLY_WARN_PCT" 'BEGIN{exit (ww>=wthr)?0:1}'; then
-                    writer_norm=65
-                else
-                    writer_norm=$(awk -v ww="$w" -v wthr="$WRITER_WEEKLY_WARN_PCT" 'BEGIN{ if(wthr>0) printf "%d", int((ww*50)/wthr); else print 0 }')
-                fi
-                # SMART-based quick risk component + burst boost
-                local st sm_raw sm_norm base_dev
-                st="${SMART_STATE[$dev]:-OK}"
-                sm_raw="$(risk_score_for_device "$dev" "$st" "${SMART_MSGS[$dev]:-}")"; [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
-                sm_norm=$(( sm_raw > 100 ? 100 : sm_raw ))
-                base_dev="$(base_device "$dev")"
-                local _burst_boost=${BURST_BOOST[$dev]:-${BURST_BOOST[$base_dev]:-0}}
-                if [[ "$_burst_boost" =~ ^[0-9]+$ && $_burst_boost -gt 0 ]]; then
-                    sm_norm=$(( sm_norm + _burst_boost ))
-                    (( sm_norm > 100 )) && sm_norm=100
-                fi
-                # I/O error unique event component
-                local uniq err_norm
-                uniq="${IO_ERROR_UNIQUE_MAP[$dev]:-${IO_ERROR_UNIQUE_MAP[$base_dev]:-0}}"; [[ "$uniq" =~ ^[0-9]+$ ]] || uniq=0
-                if (( uniq >= ${IO_ERROR_CRIT_THRESHOLD:-20} )); then err_norm=100
-                elif (( uniq >= ${IO_ERROR_WARN_THRESHOLD:-5} )); then err_norm=65
-                else err_norm=$(awk -v u="$uniq" -v w="${IO_ERROR_WARN_THRESHOLD:-5}" 'BEGIN{ if(w>0) printf "%d", int((u*50)/w); else print 0 }'); fi
-                # Composite score (writer weighted)
-                local comp
-                comp=$(awk -v wn="$writer_norm" -v s="$sm_norm" -v e="$err_norm" 'BEGIN{ printf "%d", int((2*wn + s + e)/4) }')
-                local tag model_suffix
-                tag="$(basename "$dev")"; model_suffix="$(model_suffix_for "$base_dev")"
-                _hw_rank+=("$comp"$'\t'"${tag}${model_suffix}"$'\t'"$w")
-            fi
-        done
-        if (( ${#_hw_rank[@]} > 0 )); then
-            local sorted_hw
-            sorted_hw=$(printf "%s\n" "${_hw_rank[@]}" | sort -nr -k1,1)
-            while read -r _ln; do
-                local _ltab
-                _ltab=$(printf "%s" "$_ln" | sed -E 's/\\t/\t/g')
-                IFS=$'\t' read -r comp_score tag ww <<< "$_ltab"
-                if awk -v ww="$ww" -v c="$WRITER_WEEKLY_CRIT_PCT" 'BEGIN{exit (ww>=c)?0:1}'; then
-                    HEALTH_ALERTS_SECTION+="\n - ${tag}: Extremely heavy write rate ~$(awk -v w=\""$ww"\" 'BEGIN{printf "%.2f", w}')% cap/week; redistribute workloads, review logging, expect accelerated wear. (priority ${comp_score})"
-                else
-                    HEALTH_ALERTS_SECTION+="\n - ${tag}: Heavy write rate ~$(awk -v w=\""$ww"\" 'BEGIN{printf "%.2f", w}')% cap/week; monitor and consider moving high-churn data to lower-tier media. (priority ${comp_score})"
-                fi
-            done <<< "$sorted_hw"
+        pool_name="${POOL_MEMBER_MAP[$base_device_path]:-}"
+        if [[ -n "$array_slot" ]]; then
+            FINDING_TARGET_LABEL_RESULT="$array_slot [$(basename "$base_device_path")]"
+        elif [[ -n "$pool_name" ]]; then
+            FINDING_TARGET_LABEL_RESULT="$pool_name [$(basename "$base_device_path")]"
         else
-            # Optional single monitoring line for top writer if no heavy thresholds crossed
-            local top_dev="" top_w=0
-            for dev in "${!WRITER_WEEKLY_PCT[@]}"; do
-                w=${WRITER_WEEKLY_PCT[$dev]:-0}
-                if awk -v w="$w" -v tw="$top_w" 'BEGIN{exit (w>tw)?0:1}'; then top_w=$w; top_dev=$dev; fi
-            done
-            if [[ -n "$top_dev" ]]; then
-                local base model_suffix
-                base="$(basename "$top_dev")"; model_suffix="$(model_suffix_for "$(base_device "$top_dev")")"
-                HEALTH_ALERTS_SECTION+="\n - ${base}${model_suffix}: Top writer ~$(awk -v w="$top_w" 'BEGIN{printf "%.2f", w}')% cap/week; currently below heavy thresholds."
-            fi
+            FINDING_TARGET_LABEL_RESULT="$(basename "$base_device_path")"
         fi
+        model_suffix="$(model_suffix_for "$base_device_path")"
+        FINDING_TARGET_LABEL_RESULT+="$model_suffix"
+        return 0
     fi
-    # Dynamic long SMART test scheduling guidance (accelerated after recent risk spike)
-    if declare -p RISK_SPIKE_TS &>/dev/null; then
-        local accel_factor base_days lookback min_days now_ts
-        accel_factor=${LONG_TEST_ACCEL_FACTOR:-2}
-        base_days=${LONG_TEST_MAX_INTERVAL_DAYS:-90}
-        lookback=${LONG_TEST_RISK_LOOKBACK_DAYS:-14}
-        min_days=${LONG_TEST_MIN_INTERVAL_DAYS:-30}
-        now_ts=$(date +%s)
-        local _lt_rank=()
-        local dev
-        for dev in "${!RISK_SPIKE_TS[@]}"; do
-            local spike_ts age_days
-            spike_ts=${RISK_SPIKE_TS[$dev]:-0}
-            [[ $spike_ts =~ ^[0-9]+$ ]] || continue
-            age_days=$(( (now_ts - spike_ts) / 86400 ))
-            (( age_days < 0 )) && continue
-            (( age_days <= lookback )) || continue
-            # Composite score per device
-            local st sm_raw sm_norm uniq err_norm cap_norm=0 arr_slot="" k base_dev
-            st="${SMART_STATE[$dev]:-OK}"
-            sm_raw="$(risk_score_for_device "$dev" "$st" "${SMART_MSGS[$dev]:-}")"; [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
-            sm_norm=$(( sm_raw > 100 ? 100 : sm_raw ))
-            base_dev="$(base_device "$dev")"
-            # Burst boost (long test guidance)
-            local _burst_boost=${BURST_BOOST[$dev]:-${BURST_BOOST[$base_dev]:-0}}
-                        if [[ "$_burst_boost" =~ ^[0-9]+$ && $_burst_boost -gt 0 ]]; then
-                            sm_norm=$(( sm_norm + _burst_boost ))
-                            (( sm_norm > 100 )) && sm_norm=100
-                        fi
-            # base_dev already set above
-            uniq="${IO_ERROR_UNIQUE_MAP[$dev]:-${IO_ERROR_UNIQUE_MAP[$base_dev]:-0}}"; [[ "$uniq" =~ ^[0-9]+$ ]] || uniq=0
-            if (( uniq >= ${IO_ERROR_CRIT_THRESHOLD:-20} )); then err_norm=100
-            elif (( uniq >= ${IO_ERROR_WARN_THRESHOLD:-5} )); then err_norm=65
-            else err_norm=$(awk -v u="$uniq" -v w="${IO_ERROR_WARN_THRESHOLD:-5}" 'BEGIN{ if(w>0) printf "%d", (u*50)/w; else print 0 }'); fi
-            for k in "${!MOUNT_TO_DEV[@]}"; do
-                if [[ "$k" == /mnt/disk* ]]; then
-                    local mdev bmdev
-                    mdev="${MOUNT_TO_DEV[$k]}"; bmdev="$(base_device "$mdev")"
-                    if [[ "$bmdev" == "$base_dev" ]]; then arr_slot="$k"; break; fi
-                fi
-            done
-            if [[ -n "$arr_slot" ]]; then
-                local pct usep warn_t crit_t
-                warn_t="${WARN_THRESHOLD_PERCENT:-96}"; crit_t="${CRITICAL_THRESHOLD_PERCENT:-98}"
-                read -r _sz _u pct _mount < <(df -h --output=size,used,pcent,target "$arr_slot" 2>/dev/null | tail -n1)
-                usep=${pct%%%}
-                if [[ "$usep" =~ ^[0-9]+$ && $crit_t -gt $warn_t ]]; then
-                    cap_norm=$(awk -v u="$usep" -v w="$warn_t" -v c="$crit_t" 'BEGIN{ x=u-w; d=c-w; if(d<=0){print 0}else{ if(x<0) x=0; if(x>d) x=d; printf "%d", int((x*100)/d) } }')
-                fi
-            fi
-            local w_cap=20; local w_smart=60; local w_err=20; local total=$(( w_cap + w_smart + w_err )); local comp
-            comp=$(awk -v c="$cap_norm" -v s="$sm_norm" -v e="$err_norm" -v wc="$w_cap" -v ws="$w_smart" -v we="$w_err" -v t="$total" 'BEGIN{ printf "%d", int((wc*c + ws*s + we*e)/t) }')
-            local accel_days recommend_date base_short model_suffix
-            accel_days=$(( base_days / accel_factor )); (( accel_days < min_days )) && accel_days=$min_days
-            recommend_date=$(date -d "+${accel_days} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
-            base_short="$(basename "$dev")"; model_suffix="$(model_suffix_for "$(base_device "$dev")")"
-            _lt_rank+=("$comp"$'\t'"${base_short}${model_suffix}"$'\t'"${recommend_date}"$'\t'"${age_days}"$'\t'"${accel_days}")
-        done
-        if (( ${#_lt_rank[@]} > 0 )); then
-            local sorted_lt
-            sorted_lt=$(printf "%s\n" "${_lt_rank[@]}" | sort -nr -k1,1)
-            while read -r _ln; do
-                local _ltab
-                _ltab=$(printf "%s" "$_ln" | sed -E 's/\\t/\t/g')
-                IFS=$'\t' read -r comp_score tag rec_date age_days accel_days <<< "$_ltab"
-                HEALTH_ALERTS_SECTION+="\n - ${tag}: Accelerate next long SMART test to ${rec_date} (risk spike ${age_days}d ago; interval ~${accel_days}d vs base ${base_days}d). (priority ${comp_score})"
-            done <<< "$sorted_lt"
+
+    case "$scope" in
+        mount:*)
+            mount_path="${scope#mount:}"
+            FINDING_TARGET_LABEL_RESULT="$mount_path"
+            ;;
+        pool:*)
+            FINDING_TARGET_LABEL_RESULT="Pool ${scope#pool:}"
+            ;;
+        *)
+            case "$category" in
+                smart)       FINDING_TARGET_LABEL_RESULT="SMART" ;;
+                io)          FINDING_TARGET_LABEL_RESULT="Disk I/O" ;;
+                filesystem)  FINDING_TARGET_LABEL_RESULT="Filesystems" ;;
+                temperature) FINDING_TARGET_LABEL_RESULT="Temperature" ;;
+                endurance)   FINDING_TARGET_LABEL_RESULT="Endurance" ;;
+                lifecycle)   FINDING_TARGET_LABEL_RESULT="Lifecycle" ;;
+                capacity)    FINDING_TARGET_LABEL_RESULT="Capacity" ;;
+                parity)      FINDING_TARGET_LABEL_RESULT="Parity" ;;
+                maintenance) FINDING_TARGET_LABEL_RESULT="SMART scheduling" ;;
+            esac
+            ;;
+    esac
+}
+
+# Build the actionable section exclusively from canonical finding metadata.
+# Findings are grouped by stable scope and each recommendation is emitted once
+# per group, eliminating legacy text matching and duplicate priority formulas.
+build_health_alerts() {
+    local id scope category group_key severity target count risk evidence action device action_key
+    local group_ids rec="Health Alerts:" risk_text=""
+    declare -a group_keys=()
+    declare -A group_seen=() group_findings=() group_count=() group_severity=()
+    declare -A action_seen=()
+
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        scope="${FINDING_SCOPE[$id]:-${id%%|*}}"
+        category="${FINDING_CATEGORY[$id]:-general}"
+        if [[ "$scope" == "global" ]]; then
+            group_key="global:$category"
+        else
+            group_key="$scope"
         fi
+        if [[ -z "${group_seen[$group_key]:-}" ]]; then
+            group_seen[$group_key]=1
+            group_keys+=("$group_key")
+            group_count[$group_key]=0
+            group_severity[$group_key]="warning"
+        fi
+        group_findings[$group_key]+="$id"$'\n'
+        group_count[$group_key]=$(( ${group_count[$group_key]:-0} + 1 ))
+        if [[ "${FINDING_SEVERITY[$id]:-warning}" == "critical" ]]; then
+            group_severity[$group_key]="critical"
+        fi
+    done < <(emit_sorted_finding_ids)
+
+    if (( ${#group_keys[@]} == 0 )); then
+        HEALTH_ALERTS_SECTION="$rec
+ - None detected; all monitored disks and filesystems nominal."
+        return 0
     fi
+
+    for group_key in "${group_keys[@]}"; do
+        group_ids="${group_findings[$group_key]:-}"
+        id="${group_ids%%$'\n'*}"
+        [[ -n "$id" ]] || continue
+        set_finding_target_label "$id"
+        target="$FINDING_TARGET_LABEL_RESULT"
+        severity="${group_severity[$group_key]:-warning}"
+        count="${group_count[$group_key]:-1}"
+        risk_text=""
+        device="${FINDING_DEVICE[$id]:-}"
+        if [[ -n "$device" ]]; then
+            risk="${RISK_MAP[$device]:-0}"
+            [[ "$risk" =~ ^[0-9]+$ ]] || risk=0
+            risk_text=" — risk $risk"
+        fi
+
+        rec+=$'\n'
+        rec+=" - [${severity^^}] $target${risk_text} — $count finding"
+        (( count == 1 )) || rec+="s"
+
+        while IFS= read -r id; do
+            [[ -n "$id" ]] || continue
+            evidence="${FINDING_EVIDENCE[$id]:-No evidence supplied}"
+            evidence="${evidence//$'\n'/ }"
+            evidence="${evidence//\\n/ }"
+            rec+=$'\n'
+            rec+="   • ${FINDING_TITLE[$id]:-Finding}: $evidence"
+        done <<< "$group_ids"
+
+        while IFS= read -r id; do
+            [[ -n "$id" ]] || continue
+            action="${FINDING_ACTION[$id]:-Review the related subsystem logs.}"
+            action="${action//$'\n'/ }"
+            action_key="$group_key|$action"
+            if [[ -n "${action_seen[$action_key]:-}" ]]; then
+                continue
+            fi
+            action_seen[$action_key]=1
+            rec+=$'\n'
+            rec+="   → $action"
+        done <<< "$group_ids"
+    done
+
+    HEALTH_ALERTS_SECTION="$(printf '%s\n' "$rec" | trim_outer_blank_lines)"
 }
 
 # === Main Function ===
@@ -5972,73 +5471,6 @@ build_trend_section() {
                 fi
             fi
         done
-        # Build ranked temperature rate guidance lines (composite priority)
-        if (( TEMP_RATE_ALERT_ENABLED == 1 )); then
-            local _tr_rank=()
-            for tdev in "${!TT_CNT[@]}"; do
-                # Recompute rise/rate/days for ranking using cached TT_* maps
-                local rise rate days
-                rise=$(( ${TT_LAST[$tdev]:-0} - ${TT_FIRST[$tdev]:-0} ))
-                days=0
-                if [[ -n "${TT_FIRST_TS[$tdev]}" && -n "${TT_LAST_TS[$tdev]}" ]]; then
-                    local span
-                    span=$(( ${TT_LAST_TS[$tdev]} - ${TT_FIRST_TS[$tdev]} ))
-                    if (( span > 0 )); then
-                        days=$(awk -v s="$span" 'BEGIN{printf "%.2f", s/86400.0}')
-                        rate=$(awk -v r="$rise" -v d="$days" 'BEGIN{ if(d>0) printf "%.2f", r/d; else print "0.0" }')
-                    else
-                        rate="0.0"
-                    fi
-                else
-                    rate="0.0"
-                fi
-                [[ "$days" == "0.00" ]] && continue
-                forecast_confidence_is_actionable \
-                    "${TEMP_RATE_CONFIDENCE[$tdev]:-INSUFFICIENT}" || continue
-                # Only include warn/crit
-                if awk -v r="$rate" -v w="$TEMP_RATE_WARN_C_PER_DAY" \
-                    'BEGIN { exit !(r >= w) }'
-                then
-                    # Normalize rate severity (0-100)
-                    local rate_norm
-                    if awk -v r="$rate" -v c="$TEMP_RATE_CRIT_C_PER_DAY" \
-                        'BEGIN { exit !(r >= c) }'
-                    then
-                        rate_norm=100
-                    else
-                        rate_norm=$(awk -v r="$rate" -v w="$TEMP_RATE_WARN_C_PER_DAY" 'BEGIN{ if(w>0) printf "%d", int((r*65)/w); else print 0 }')
-                    fi
-                    # SMART + I/O error components
-                    local st sm_raw sm_norm base_dev uniq err_norm
-                    base_dev="$(base_device "$tdev")"
-                    st="${SMART_STATE[$tdev]:-${SMART_STATE[$base_dev]:-OK}}"
-                    sm_raw="$(risk_score_for_device "$base_dev" "$st" "${SMART_MSGS[$tdev]:-${SMART_MSGS[$base_dev]:-}}")"; [[ "$sm_raw" =~ ^[0-9]+$ ]] || sm_raw=0
-                    sm_norm=$(( sm_raw > 100 ? 100 : sm_raw ))
-                                        # Burst boost (temperature rate guidance)
-                                        local _burst_boost=${BURST_BOOST[$tdev]:-${BURST_BOOST[$base_dev]:-0}}
-                                        if [[ "$_burst_boost" =~ ^[0-9]+$ && $_burst_boost -gt 0 ]]; then
-                                            sm_norm=$(( sm_norm + _burst_boost ))
-                                            (( sm_norm > 100 )) && sm_norm=100
-                                        fi
-                    uniq="${IO_ERROR_UNIQUE_MAP[$tdev]:-${IO_ERROR_UNIQUE_MAP[$base_dev]:-0}}"; [[ "$uniq" =~ ^[0-9]+$ ]] || uniq=0
-                    if (( uniq >= ${IO_ERROR_CRIT_THRESHOLD:-20} )); then err_norm=100
-                    elif (( uniq >= ${IO_ERROR_WARN_THRESHOLD:-5} )); then err_norm=65
-                    else err_norm=$(awk -v u="$uniq" -v w="${IO_ERROR_WARN_THRESHOLD:-5}" 'BEGIN{ if(w>0) printf "%d", int((u*50)/w); else print 0 }'); fi
-                    # Composite score (rate weighted)
-                    local comp tag model_suffix
-                    comp=$(awk -v rn="$rate_norm" -v s="$sm_norm" -v e="$err_norm" 'BEGIN{ printf "%d", int((2*rn + s + e)/4) }')
-                    tag="$(basename "$tdev")"; model_suffix="$(model_suffix_for "$base_dev")"
-                    _tr_rank+=("$comp"$'\t'"${tag}${model_suffix}"$'\t'"${rise}"$'\t'"${days}"$'\t'"${rate}")
-                fi
-            done
-            if (( ${#_tr_rank[@]} > 0 )); then
-                local sorted_tr
-                sorted_tr=$(printf "%s\n" "${_tr_rank[@]}" | sort -nr -k1,1)
-                while IFS=$'\t' read -r comp_score tag rise days rate; do
-                    : # Structured Temperature Rate alert is rendered by build_health_alerts().
-                done <<< "$sorted_tr"
-            fi
-        fi
         local -a temp_confidence_items=()
         for tdev in "${!TEMP_RATE_CONFIDENCE[@]}"; do
             case "${TEMP_RATE_CONFIDENCE[$tdev]:-INSUFFICIENT}" in
@@ -7018,7 +6450,13 @@ build_trend_section() {
 # === Helper Function ===
 # Build notification subject line
 build_subject() {
-    SUBJECT="Disks Health"
+    if (( FINDING_CRITICAL_COUNT > 0 )); then
+        SUBJECT="Disks Health — CRITICAL (${FINDING_CRITICAL_COUNT})"
+    elif (( FINDING_WARNING_COUNT > 0 )); then
+        SUBJECT="Disks Health — WARNING (${FINDING_WARNING_COUNT})"
+    else
+        SUBJECT="Disks Health — OK"
+    fi
 }
 
 # === Main Function ===
@@ -8158,23 +7596,33 @@ add_notification_section() {
 
 append_subsystem_subject_suffix() {
     local degraded_list=""
+    local pair name state
+    local -a subsystem_pairs=(
+        "SMART|${SUBSYSTEM_SMART_STATE:-OK}"
+        "Btrfs|${SUBSYSTEM_BTRFS_STATE:-Disabled}"
+        "XFS|${SUBSYSTEM_XFS_STATE:-Disabled}"
+        "Capacity|${SUBSYSTEM_CAPACITY_STATE:-OK}"
+        "Per-Mount|${SUBSYSTEM_MOUNT_STATE:-OK}"
+        "Endurance|${SUBSYSTEM_ENDURANCE_STATE:-OK}"
+        "Scheduling|${SUBSYSTEM_SCHEDULING_STATE:-OK}"
+        "Parity|${SUBSYSTEM_PARITY_STATE:-OK}"
+    )
 
     case "${SHOW_SUBSYSTEMS_BLOCK:-auto}" in
         never)
             return 0
             ;;
         always|auto)
-            while IFS= read -r name; do
-                [[ -n "$name" ]] || continue
+            for pair in "${subsystem_pairs[@]}"; do
+                name="${pair%%|*}"
+                state="${pair#*|}"
+                [[ "$state" == "WARNING" || "$state" == "CRITICAL" ]] || continue
                 if [[ -z "$degraded_list" ]]; then
                     degraded_list="$name"
                 else
                     degraded_list+=", $name"
                 fi
-            done < <(
-                printf '%s\n' "${SUBSYSTEM_LINES:-}" |
-                    awk -F: '/: (WARNING|CRITICAL)$/ {print $1}'
-            )
+            done
 
             if [[ -n "$degraded_list" ]]; then
                 SUBJECT="${SUBJECT:-Disks Health} — Subsystems degraded: $degraded_list"
@@ -8186,8 +7634,65 @@ append_subsystem_subject_suffix() {
 }
 
 
+limit_notification_body() {
+    local max_chars="${NOTIFY_MAX_BODY_CHARS:-12000}"
+    local max_lines="${NOTIFY_MAX_BODY_LINES:-180}"
+    local full_chars full_lines notice content_char_limit content_line_limit
+    local line limited="" separator_chars candidate_chars line_number=0
+
+    FULL_NOTIFICATION_BODY="$NOTIFY_BODY"
+    NOTIFICATION_TRUNCATED=0
+    full_chars=${#FULL_NOTIFICATION_BODY}
+    full_lines=$(printf '%s\n' "$FULL_NOTIFICATION_BODY" | awk 'END {print NR+0}')
+    if (( full_chars <= max_chars && full_lines <= max_lines )); then
+        return 0
+    fi
+
+    NOTIFICATION_TRUNCATED=1
+    if (( LOG_FULL_NOTIFICATION_ON_TRUNCATION == 1 )) && [[ -n "${MASTER_LOG:-}" ]]; then
+        notice="[Report shortened: complete ${full_lines}-line report saved in ${MASTER_LOG}.]"
+    else
+        notice="[Report shortened: increase the notification limits to include more detail.]"
+    fi
+    content_char_limit=$((max_chars - ${#notice} - 1))
+    content_line_limit=$((max_lines - 1))
+    (( content_char_limit > 0 )) || content_char_limit=1
+    (( content_line_limit > 0 )) || content_line_limit=1
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line_number=$((line_number + 1))
+        (( line_number <= content_line_limit )) || break
+        if [[ -n "$limited" ]]; then separator_chars=1; else separator_chars=0; fi
+        candidate_chars=$(( ${#limited} + separator_chars + ${#line} ))
+        if (( candidate_chars > content_char_limit )); then
+            if [[ -z "$limited" ]]; then
+                limited="${line:0:content_char_limit}"
+            fi
+            break
+        fi
+        [[ -z "$limited" ]] || limited+=$'\n'
+        limited+="$line"
+    done <<< "$FULL_NOTIFICATION_BODY"
+
+    NOTIFY_BODY="${limited}${limited:+$'\n'}${notice}"
+
+    if (( LOG_FULL_NOTIFICATION_ON_TRUNCATION == 1 )) && [[ -n "${MASTER_LOG:-}" ]]; then
+        {
+            printf '\n===== FULL NOTIFICATION BODY (v2.9) =====\n'
+            printf '%s\n' "$FULL_NOTIFICATION_BODY"
+            printf '===== END FULL NOTIFICATION BODY =====\n'
+        } >> "$MASTER_LOG"
+        log "REPORT" "WARN" \
+            "Notification shortened from ${full_chars} characters/${full_lines} lines; full body retained in $MASTER_LOG"
+    else
+        log "REPORT" "WARN" \
+            "Notification shortened from ${full_chars} characters/${full_lines} lines"
+    fi
+}
+
+
 compose_notification() {
-    local array_section pool_section tail_sections=""
+    local array_section pool_section
     local index
 
     append_subsystem_subject_suffix
@@ -8199,33 +7704,33 @@ compose_notification() {
     fi
 
     NOTIFY_SECTIONS=()
+    add_notification_section "${STORAGE_TOP_LINES:-}"
+    # Actionable findings are deliberately placed before verbose per-device
+    # details so they remain visible if the body reaches its configured limit.
+    add_notification_section "${HEALTH_ALERTS_SECTION:-}"
+    add_notification_section "${DISK_HEALTH_SUMMARY:-}"
     add_notification_section "$array_section"
     add_notification_section "$pool_section"
-    add_notification_section "${DISK_HEALTH_SUMMARY:-}"
     add_notification_section "${STORAGE_VALIDATION_SECTION:-}"
-    add_notification_section "${HEALTH_ALERTS_SECTION:-}"
     add_notification_section "${TREND_SECTION:-}"
 
+    NOTIFY_BODY=""
     for index in "${!NOTIFY_SECTIONS[@]}"; do
         if (( index > 0 )); then
-            tail_sections+=$'\n\n'
+            NOTIFY_BODY+=$'\n\n'
         fi
-        tail_sections+="${NOTIFY_SECTIONS[$index]}"
+        NOTIFY_BODY+="${NOTIFY_SECTIONS[$index]}"
     done
 
-    NOTIFY_BODY="${STORAGE_TOP_LINES:-}"
-    if [[ -n "$tail_sections" ]]; then
-        NOTIFY_BODY+=$'\n\n'
-        NOTIFY_BODY+="$tail_sections"
-    fi
-
-    if (( ${#ALERT_CRIT[@]} > 0 )); then
+    if (( FINDING_CRITICAL_COUNT > 0 )); then
         FINAL_NOTIFICATION_SEVERITY="critical"
-    elif (( ${#ALERT_WARN[@]} > 0 )); then
+    elif (( FINDING_WARNING_COUNT > 0 )); then
         FINAL_NOTIFICATION_SEVERITY="warning"
     else
         FINAL_NOTIFICATION_SEVERITY="normal"
     fi
+
+    limit_notification_body
 }
 
 
@@ -8541,6 +8046,7 @@ validate_configuration() {
         HISTORY_PRUNE_ENABLED LOG_MIRROR_STDOUT SHOW_OK_SUBSYSTEMS
         SHOW_DISABLED_SUBSYSTEMS VERBOSE_OK SHOW_ZERO_COUNTS
         WEAR_TREND_ENABLED ENABLE_MODEL_IN_ALERTS
+        LOG_FULL_NOTIFICATION_ON_TRUNCATION
     )
     local -a integer_settings=(
         SHORT_TEST_INTERVAL_DAYS SHORT_TEST_MAX_WAIT SHORT_TEST_POLL_INTERVAL
@@ -8596,7 +8102,7 @@ validate_configuration() {
         W_TEMP W_E2E W_SOFT_READ W_NVME_RO W_NVME_REL W_AGE_NEAR
         W_POH_HDD W_POH_SSD W_POH_NVME W_BTRFS_DEV_ERR W_XFS_META_ERR
         W_SATA_LINK_DOWN W_SELFTEST_CRIT W_SELFTEST_WARN W_TBW_CONS_WARN
-        W_TBW_CONS_CRIT
+        W_TBW_CONS_CRIT NOTIFY_MAX_BODY_CHARS NOTIFY_MAX_BODY_LINES
     )
     local -a number_settings=(
         STORAGE_DISCREPANCY_MIN_DIFF ENDURANCE_DAYSLEFT_ACCEL_MIN_DELTA
@@ -8616,6 +8122,7 @@ validate_configuration() {
         SYSLOG_CURSOR_STARTUP_LOOKBACK_LINES SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES
         HISTORY_WINDOW_DAYS HISTORY_SCHEMA_VERSION FORECAST_MIN_SAMPLES
         FORECAST_HIGH_SAMPLES FORECAST_MAX_GAP_DAYS
+        NOTIFY_MAX_BODY_CHARS NOTIFY_MAX_BODY_LINES
     )
     local -a ordered_pairs=(
         LONG_TEST_MIN_INTERVAL_DAYS:LONG_TEST_MAX_INTERVAL_DAYS
@@ -8701,6 +8208,16 @@ validate_configuration() {
     if [[ "${THRESHOLD:-}" =~ ^[0-9]+$ ]] && (( THRESHOLD == 0 )); then
         configuration_error "THRESHOLD must be greater than zero"
     fi
+    if [[ "${NOTIFY_MAX_BODY_CHARS:-}" =~ ^[0-9]+$ ]] &&
+       (( NOTIFY_MAX_BODY_CHARS < 512 ))
+    then
+        configuration_error "NOTIFY_MAX_BODY_CHARS must be at least 512"
+    fi
+    if [[ "${NOTIFY_MAX_BODY_LINES:-}" =~ ^[0-9]+$ ]] &&
+       (( NOTIFY_MAX_BODY_LINES < 20 ))
+    then
+        configuration_error "NOTIFY_MAX_BODY_LINES must be at least 20"
+    fi
     if [[ "${SHORT_TEST_POLL:-}" == "1" ]]; then
         [[ "${SHORT_TEST_MAX_WAIT:-}" =~ ^[1-9][0-9]*$ ]] ||
             configuration_error "SHORT_TEST_MAX_WAIT must be positive when SHORT_TEST_POLL=1"
@@ -8756,7 +8273,7 @@ validate_runtime_dependencies() {
     DEPENDENCY_WARNING_COUNT=0
 
     if [[ "$mode" == "self-test" ]]; then
-        required_commands=(awk grep mktemp mv rm sed sort wc)
+        required_commands=(awk cut date grep mktemp mv rm sed sort wc)
     else
         required_commands=(
             awk basename cat cksum cp cut date df dirname dmesg find findmnt
@@ -8825,7 +8342,7 @@ validate_runtime_dependencies() {
 
 print_usage() {
     cat <<'USAGE'
-Disk Health Monitor for Unraid v2.8
+Disk Health Monitor for Unraid v2.9
 
 Usage:
   health_monitoring.sh                 Run normal monitoring
@@ -8881,7 +8398,7 @@ run_diagnostics() {
     local failures=0 warnings=0 config_status=0 dependency_status=0
     local parent device_rows
 
-    printf 'Disk Health Monitor for Unraid v2.8 - read-only diagnostics\n'
+    printf 'Disk Health Monitor for Unraid v2.9 - read-only diagnostics\n'
     printf 'No disk SMART reads, tests, scrubs, state writes, cursor updates, or notifications will occur.\n\n'
 
     if validate_configuration; then
@@ -8994,7 +8511,7 @@ run_regression_tests() (
     }
     trap '[[ -z "$fixture_dir" || "$fixture_dir" != /tmp/health_monitoring.selftest.* ]] || rm -rf -- "$fixture_dir"' EXIT
 
-    printf 'Disk Health Monitor for Unraid v2.8 - built-in regression tests\n'
+    printf 'Disk Health Monitor for Unraid v2.9 - built-in regression tests\n'
     printf 'Fixtures are isolated under %s and removed automatically.\n\n' "$fixture_dir"
 
     actual=$(safe_state_name '/dev/disk/by-id/ata-Test Drive')
@@ -9079,6 +8596,113 @@ run_regression_tests() (
         self_test_result 0 "Bounded syslog line-range extraction"
     fi
 
+    FINDING_IDS=(
+        'device:/dev/sdb|capacity_warning'
+        'device:/dev/sda|pending_sectors'
+        'device:/dev/sdc|selftest_failed'
+        'device:/dev/sda|command_timeout'
+        'mount:/mnt/disk2|storage_warning'
+    )
+    FINDING_SEVERITY=()
+    FINDING_CATEGORY=()
+    FINDING_SIGNAL=()
+    FINDING_DEVICE=()
+    FINDING_SCOPE=()
+    FINDING_TITLE=()
+    FINDING_EVIDENCE=()
+    FINDING_ACTION=()
+    RISK_MAP=()
+    MOUNT_TO_DEV=()
+    POOL_MEMBER_MAP=()
+
+    local test_id
+    for test_id in "${FINDING_IDS[@]}"; do
+        FINDING_SEVERITY[$test_id]="warning"
+        FINDING_CATEGORY[$test_id]="capacity"
+        FINDING_SIGNAL[$test_id]="capacity.space"
+        FINDING_SCOPE[$test_id]="${test_id%%|*}"
+        FINDING_TITLE[$test_id]="Capacity"
+        FINDING_EVIDENCE[$test_id]="Fixture evidence for $test_id"
+        FINDING_ACTION[$test_id]="Review capacity."
+    done
+    FINDING_DEVICE['device:/dev/sdb|capacity_warning']='/dev/sdb'
+    FINDING_DEVICE['device:/dev/sda|pending_sectors']='/dev/sda'
+    FINDING_DEVICE['device:/dev/sdc|selftest_failed']='/dev/sdc'
+    FINDING_DEVICE['device:/dev/sda|command_timeout']='/dev/sda'
+    FINDING_SEVERITY['device:/dev/sda|pending_sectors']='critical'
+    FINDING_SEVERITY['device:/dev/sdc|selftest_failed']='critical'
+    FINDING_SEVERITY['device:/dev/sda|command_timeout']='critical'
+    FINDING_CATEGORY['device:/dev/sda|pending_sectors']='smart'
+    FINDING_CATEGORY['device:/dev/sdc|selftest_failed']='smart'
+    FINDING_CATEGORY['device:/dev/sda|command_timeout']='io'
+    FINDING_SIGNAL['device:/dev/sda|pending_sectors']='smart.media'
+    FINDING_SIGNAL['device:/dev/sdc|selftest_failed']='smart.selftest'
+    FINDING_SIGNAL['device:/dev/sda|command_timeout']='io.command_timeout'
+    FINDING_TITLE['device:/dev/sda|pending_sectors']='Pending sectors'
+    FINDING_TITLE['device:/dev/sda|command_timeout']='Command timeout'
+    FINDING_ACTION['device:/dev/sda|pending_sectors']='Inspect now.'
+    FINDING_ACTION['device:/dev/sda|command_timeout']='Inspect now.'
+    RISK_MAP['/dev/sda']=90
+    RISK_MAP['/dev/sdc']=40
+    RISK_MAP['/dev/sdb']=20
+
+    actual=$(emit_sorted_finding_ids | awk '{printf "%s%s", separator, $0; separator="|"}')
+    if [[ "$actual" == 'device:/dev/sda|pending_sectors|device:/dev/sda|command_timeout|device:/dev/sdc|selftest_failed|device:/dev/sdb|capacity_warning|mount:/mnt/disk2|storage_warning' ]]; then
+        self_test_result 1 "Deterministic structured finding ordering"
+    else
+        self_test_result 0 "Deterministic structured finding ordering" "found '$actual'"
+    fi
+
+    MOUNT_TO_DEV['/mnt/disk1']='/dev/sda'
+    ENABLE_MODEL_IN_ALERTS=0
+    finalize_finding_counts
+    build_health_alerts
+    count=$(printf '%s\n' "$HEALTH_ALERTS_SECTION" | grep -F -c '→ Inspect now.' || true)
+    if (( FINDING_CRITICAL_COUNT == 3 && FINDING_WARNING_COUNT == 2 )) &&
+       [[ "$count" == "1" ]] &&
+       printf '%s\n' "$HEALTH_ALERTS_SECTION" |
+           grep -Fq -- '- [CRITICAL] disk1 [sda] — risk 90 — 2 findings'
+    then
+        self_test_result 1 "Grouped finding rendering and action de-duplication"
+    else
+        self_test_result 0 "Grouped finding rendering and action de-duplication" "unexpected structured report"
+    fi
+
+    build_subsystem_lines
+    if [[ "$SUBSYSTEM_SMART_STATE" == "CRITICAL" &&
+          "$SUBSYSTEM_CAPACITY_STATE" == "WARNING" &&
+          "$SUBSYSTEM_MOUNT_STATE" == "WARNING" ]]
+    then
+        self_test_result 1 "Structured subsystem severity aggregation"
+    else
+        self_test_result 0 "Structured subsystem severity aggregation" \
+            "SMART=$SUBSYSTEM_SMART_STATE Capacity=$SUBSYSTEM_CAPACITY_STATE Per-Mount=$SUBSYSTEM_MOUNT_STATE"
+    fi
+
+    NOTIFY_BODY=""
+    for (( count=1; count<=30; count++ )); do
+        NOTIFY_BODY+="line-${count}: 123456789012345678901234567890"
+        (( count == 30 )) || NOTIFY_BODY+=$'\n'
+    done
+    MASTER_LOG="$fixture_dir/notification.log"
+    : > "$MASTER_LOG"
+    NOTIFY_MAX_BODY_CHARS=512
+    NOTIFY_MAX_BODY_LINES=20
+    LOG_FULL_NOTIFICATION_ON_TRUNCATION=1
+    LOG_MIRROR_STDOUT=0
+    limit_notification_body
+    actual=${#NOTIFY_BODY}
+    count=$(printf '%s\n' "$NOTIFY_BODY" | awk 'END {print NR+0}')
+    if (( NOTIFICATION_TRUNCATED == 1 && actual <= 512 && count <= 20 )) &&
+       grep -Fq 'line-30:' "$MASTER_LOG" &&
+       [[ "$NOTIFY_BODY" == *'[Report shortened:'* ]]
+    then
+        self_test_result 1 "Bounded notification with complete log preservation"
+    else
+        self_test_result 0 "Bounded notification with complete log preservation" \
+            "truncated=$NOTIFICATION_TRUNCATED chars=$actual lines=$count"
+    fi
+
     printf '\nSelf-test summary: passed=%d failed=%d total=%d\n' \
         "$SELF_TEST_PASSED" "$SELF_TEST_FAILED" "$SELF_TEST_TOTAL"
     (( SELF_TEST_FAILED == 0 ))
@@ -9095,7 +8719,7 @@ main() {
             return 0
             ;;
         version)
-            printf 'Disk Health Monitor for Unraid v2.8\n'
+            printf 'Disk Health Monitor for Unraid v2.9\n'
             return 0
             ;;
         check-config)
@@ -9184,7 +8808,7 @@ main() {
 
     log "RISK" "INFO" "Computing canonical risk and lifecycle state"
     compute_risk_and_lifecycle
-    materialize_alerts_from_findings
+    finalize_finding_counts
 
     log "REPORT" "INFO" "Finalizing alert and summary sections"
     build_disk_health_summary
@@ -9195,7 +8819,7 @@ main() {
     compose_notification
 
     log "NOTIFY" "INFO" \
-        "Sending consolidated notification (severity=$FINAL_NOTIFICATION_SEVERITY, critical=${#ALERT_CRIT[@]}, warning=${#ALERT_WARN[@]})"
+        "Sending consolidated notification (severity=$FINAL_NOTIFICATION_SEVERITY, critical=$FINDING_CRITICAL_COUNT, warning=$FINDING_WARNING_COUNT)"
     notify_unraid \
         "${SUBJECT:-Disk Health Summary}" \
         "$NOTIFY_BODY" \
