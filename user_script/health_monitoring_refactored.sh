@@ -9,7 +9,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.9
+# Disk Health Monitor for Unraid v2.10
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
@@ -149,6 +149,18 @@ SHOW_ZERO_COUNTS=0                              # Hide zero-count summary lines 
 NOTIFY_MAX_BODY_CHARS=12000                     # Maximum notification body length before safe truncation
 NOTIFY_MAX_BODY_LINES=180                       # Maximum notification body lines before safe truncation
 LOG_FULL_NOTIFICATION_ON_TRUNCATION=1           # Preserve the complete body in the run log when shortened
+
+# === Execution Safety / Collector Isolation ===
+SMARTCTL_TIMEOUT_SECONDS=45                     # Maximum wall time for one smartctl command
+BTRFS_COMMAND_TIMEOUT_SECONDS=60                # Maximum wall time for one btrfs command
+XFS_REPAIR_TIMEOUT_SECONDS=300                  # Maximum wall time for one read-only xfs_repair command
+SYSTEM_COMMAND_TIMEOUT_SECONDS=30               # Maximum wall time for df/findmnt/dmesg commands
+SHARE_SCAN_TIMEOUT_SECONDS=300                  # Maximum wall time for one per-share du scan
+NOTIFICATION_TIMEOUT_SECONDS=30                 # Maximum wall time for notify/logger delivery
+COMMAND_KILL_GRACE_SECONDS=5                    # Grace period before forcibly killing a timed-out command
+COLLECTOR_SLOW_SECONDS=300                      # Log a collector as slow after this duration (0=disable)
+COLLECTOR_FAILURE_NOTIFICATIONS=1               # Add a warning finding when a collector times out/fails
+SHOW_COLLECTOR_STATUS="auto"                    # Collector report policy (auto|always|never)
 
 # === Paths / Integration ===
 LOG_DIR="/mnt/user/cloud/logs/disk_health"       # Run logs and persistent state
@@ -353,6 +365,9 @@ declare -a DISCOVERED_DISKS                        # Ordered SMART-capable base-
 declare -A RISK_MAP AGE_CLASS                     # Canonical risk results and lifecycle annotations
 declare -a NOTIFY_SECTIONS                        # Final notification sections
 declare -a TBW_EVAL_MESSAGES                      # Output from direct TBW evaluation
+declare -a COLLECTOR_ORDER                        # Deterministic collector report order
+declare -A COLLECTOR_LABEL COLLECTOR_STATUS       # Collector label and final status
+declare -A COLLECTOR_DURATION COLLECTOR_DETAIL    # Collector timing and event summary
 TBW_EVAL_STATE="OK"
 
 RUN_STAMP=""
@@ -360,6 +375,10 @@ RUN_EPOCH=0
 MASTER_LOG=""
 RUN_DIR=""
 SMART_CACHE_DIR=""
+COLLECTOR_EVENT_FILE=""
+CURRENT_COLLECTOR="runtime"
+LAST_COLLECTOR_RC=0
+COLLECTOR_STATUS_SECTION=""
 CLEANUP_DONE=0
 PARITY_STATE_LOADED=0
 PARITY_ACTIVE=0
@@ -389,6 +408,7 @@ SUBSYSTEM_MOUNT_STATE="OK"
 SUBSYSTEM_ENDURANCE_STATE="OK"
 SUBSYSTEM_SCHEDULING_STATE="OK"
 SUBSYSTEM_PARITY_STATE="OK"
+SUBSYSTEM_MONITORING_STATE="OK"
 
 # === Logs Paths ===
 STATE_DIR="${LOG_DIR:-}/state"
@@ -671,6 +691,349 @@ atomic_upsert_daily_history() {
     atomic_commit "$temp_file" "$target"
 }
 
+# ---------------------------------------------------------------------------
+# Bounded commands, collector isolation, and persistence gates
+# ---------------------------------------------------------------------------
+
+record_collector_event() {
+    local kind="$1"
+    local label="${2:-command}"
+    local detail="${3:-}"
+    local collector="${CURRENT_COLLECTOR:-runtime}"
+
+    [[ -n "${COLLECTOR_EVENT_FILE:-}" ]] || return 0
+    label="${label//$'\t'/ }"
+    label="${label//$'\n'/ }"
+    detail="${detail//$'\t'/ }"
+    detail="${detail//$'\n'/ }"
+    printf '%s\t%s\t%s\t%s\n' "$collector" "$kind" "$label" "$detail" \
+        >> "$COLLECTOR_EVENT_FILE" 2>/dev/null || true
+}
+
+collector_event_count() {
+    local collector="$1"
+    local kind="$2"
+
+    [[ -r "${COLLECTOR_EVENT_FILE:-}" ]] || {
+        printf '0\n'
+        return 0
+    }
+    awk -F '\t' -v collector="$collector" -v kind="$kind" \
+        '$1 == collector && $2 == kind {count++} END {print count+0}' \
+        "$COLLECTOR_EVENT_FILE"
+}
+
+collector_has_blocking_event() {
+    local collector="${1:-${CURRENT_COLLECTOR:-runtime}}"
+
+    [[ -r "${COLLECTOR_EVENT_FILE:-}" ]] || return 1
+    awk -F '\t' -v collector="$collector" '
+        $1 == collector && ($2 == "TIMEOUT" || $2 == "FAILED") {found=1; exit}
+        END {exit !found}
+    ' "$COLLECTOR_EVENT_FILE"
+}
+
+collector_device_has_blocking_event() {
+    local collector="$1"
+    local device="$2"
+
+    [[ -r "${COLLECTOR_EVENT_FILE:-}" ]] || return 1
+    awk -F '\t' -v collector="$collector" -v device="$device" '
+        $1 == collector && ($2 == "TIMEOUT" || $2 == "FAILED") &&
+        ($3 == "smartctl " device || $3 == "SMART " device) {
+            found=1
+            exit
+        }
+        END {exit !found}
+    ' "$COLLECTOR_EVENT_FILE"
+}
+
+collector_current_state_writable() {
+    ! collector_has_blocking_event "${CURRENT_COLLECTOR:-runtime}"
+}
+
+# Do not replace a known-good baseline after a command timeout/failure in the
+# collector currently producing it.
+collector_atomic_commit() {
+    local temp_file="$1"
+    local target="$2"
+
+    if ! collector_current_state_writable; then
+        rm -f -- "$temp_file" 2>/dev/null || true
+        log "STATE" "WARN" \
+            "Preserved existing state after ${CURRENT_COLLECTOR:-runtime} collector failure: $target"
+        return 0
+    fi
+    atomic_commit "$temp_file" "$target"
+}
+
+collector_atomic_write_text() {
+    local target="$1"
+    local value="$2"
+
+    if ! collector_current_state_writable; then
+        log "STATE" "WARN" \
+            "Skipped state update after ${CURRENT_COLLECTOR:-runtime} collector failure: $target"
+        return 0
+    fi
+    atomic_write_text "$target" "$value"
+}
+
+collector_replace_daily_history() {
+    if ! collector_current_state_writable; then
+        log "HISTORY" "WARN" \
+            "Skipped history replacement after ${CURRENT_COLLECTOR:-runtime} collector failure: $1"
+        return 0
+    fi
+    atomic_replace_daily_history "$@"
+}
+
+collector_upsert_daily_history() {
+    if ! collector_current_state_writable; then
+        log "HISTORY" "WARN" \
+            "Skipped history upsert after ${CURRENT_COLLECTOR:-runtime} collector failure: $1"
+        return 0
+    fi
+    atomic_upsert_daily_history "$@"
+}
+
+# GNU timeout returns 124 for an elapsed deadline. The command's ordinary exit
+# status remains available to callers so health tools such as smartctl and
+# xfs_repair can retain their native result semantics.
+run_bounded() {
+    local timeout_seconds="$1"
+    local label="$2"
+    shift 2
+    local rc
+
+    timeout --signal=TERM \
+        --kill-after="${COMMAND_KILL_GRACE_SECONDS}s" \
+        "${timeout_seconds}s" "$@"
+    rc=$?
+    if (( rc == 124 || rc == 137 )); then
+        record_collector_event TIMEOUT "$label" "deadline=${timeout_seconds}s rc=$rc"
+    fi
+    return "$rc"
+}
+
+run_bounded_checked() {
+    local timeout_seconds="$1"
+    local label="$2"
+    shift 2
+    local rc
+
+    run_bounded "$timeout_seconds" "$label" "$@"
+    rc=$?
+    if (( rc != 0 && rc != 124 && rc != 137 )); then
+        record_collector_event FAILED "$label" "rc=$rc"
+    fi
+    return "$rc"
+}
+
+smartctl_bounded() {
+    local device="${*: -1}"
+    local rc
+
+    run_bounded "$SMARTCTL_TIMEOUT_SECONDS" "smartctl $device" smartctl "$@"
+    rc=$?
+    # smartctl uses a bitmask: bits 0/1 are command-line or device-open
+    # failures, while higher bits describe actual SMART health findings.
+    if (( rc != 124 && rc != 137 && (rc & 3) != 0 )); then
+        record_collector_event FAILED "smartctl $device" "command_or_open_failure rc=$rc"
+    fi
+    return "$rc"
+}
+
+smartctl_bounded_optional() {
+    run_bounded "$SMARTCTL_TIMEOUT_SECONDS" "smartctl ${*: -1}" smartctl "$@"
+}
+
+btrfs_bounded() {
+    run_bounded_checked "$BTRFS_COMMAND_TIMEOUT_SECONDS" "btrfs $*" btrfs "$@"
+}
+
+btrfs_bounded_optional() {
+    run_bounded "$BTRFS_COMMAND_TIMEOUT_SECONDS" "btrfs $*" btrfs "$@"
+}
+
+xfs_repair_bounded() {
+    run_bounded "$XFS_REPAIR_TIMEOUT_SECONDS" "xfs_repair ${*: -1}" xfs_repair "$@"
+}
+
+df_bounded() {
+    run_bounded_checked "$SYSTEM_COMMAND_TIMEOUT_SECONDS" "df ${*: -1}" df "$@"
+}
+
+findmnt_bounded() {
+    run_bounded "$SYSTEM_COMMAND_TIMEOUT_SECONDS" "findmnt ${*: -1}" findmnt "$@"
+}
+
+dmesg_bounded() {
+    run_bounded_checked "$SYSTEM_COMMAND_TIMEOUT_SECONDS" "dmesg" dmesg "$@"
+}
+
+lsblk_bounded() {
+    run_bounded_checked "$SYSTEM_COMMAND_TIMEOUT_SECONDS" "lsblk ${*: -1}" lsblk "$@"
+}
+
+hdparm_bounded() {
+    run_bounded "$SYSTEM_COMMAND_TIMEOUT_SECONDS" "hdparm ${*: -1}" hdparm "$@"
+}
+
+du_bounded() {
+    run_bounded_checked "$SHARE_SCAN_TIMEOUT_SECONDS" "du ${*: -1}" du "$@"
+}
+
+collector_status_is_safe() {
+    case "${COLLECTOR_STATUS[$1]:-NOT_RUN}" in
+        OK|DEFERRED) return 0 ;;
+        *)           return 1 ;;
+    esac
+}
+
+all_collectors_state_safe() {
+    local collector
+
+    for collector in "${COLLECTOR_ORDER[@]}"; do
+        case "${COLLECTOR_STATUS[$collector]:-NOT_RUN}" in
+            TIMED_OUT|FAILED) return 1 ;;
+        esac
+    done
+    return 0
+}
+
+run_collector() {
+    local collector="$1"
+    local label="$2"
+    shift 2
+    local start_epoch end_epoch duration rc=0 status detail=""
+    local timeout_count failure_count deferred_count slow=0 existing
+
+    existing="${COLLECTOR_LABEL[$collector]:-}"
+    if [[ -z "$existing" ]]; then
+        COLLECTOR_ORDER+=("$collector")
+    fi
+    COLLECTOR_LABEL[$collector]="$label"
+    CURRENT_COLLECTOR="$collector"
+    start_epoch=$(date +%s)
+
+    if "$@"; then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    end_epoch=$(date +%s)
+    duration=$((end_epoch - start_epoch))
+    (( duration < 0 )) && duration=0
+    timeout_count=$(collector_event_count "$collector" TIMEOUT)
+    failure_count=$(collector_event_count "$collector" FAILED)
+    deferred_count=$(collector_event_count "$collector" DEFERRED)
+
+    if (( timeout_count > 0 )); then
+        status="TIMED_OUT"
+    elif (( rc != 0 || failure_count > 0 )); then
+        status="FAILED"
+    elif (( deferred_count > 0 )); then
+        status="DEFERRED"
+    else
+        status="OK"
+    fi
+
+    (( timeout_count > 0 )) && detail+="timeouts=$timeout_count"
+    if (( failure_count > 0 )); then
+        [[ -z "$detail" ]] || detail+=", "
+        detail+="failures=$failure_count"
+    fi
+    if (( deferred_count > 0 )); then
+        [[ -z "$detail" ]] || detail+=", "
+        detail+="deferred=$deferred_count"
+    fi
+    if (( rc != 0 )); then
+        [[ -z "$detail" ]] || detail+=", "
+        detail+="rc=$rc"
+    fi
+    if (( COLLECTOR_SLOW_SECONDS > 0 && duration >= COLLECTOR_SLOW_SECONDS )); then
+        slow=1
+        [[ -z "$detail" ]] || detail+=", "
+        detail+="slow>=${COLLECTOR_SLOW_SECONDS}s"
+    fi
+
+    COLLECTOR_STATUS[$collector]="$status"
+    COLLECTOR_DURATION[$collector]="$duration"
+    COLLECTOR_DETAIL[$collector]="$detail"
+    LAST_COLLECTOR_RC=$rc
+    CURRENT_COLLECTOR="runtime"
+
+    if [[ "$status" == "TIMED_OUT" || "$status" == "FAILED" || $slow -eq 1 ]]; then
+        log "COLLECTOR" "WARN" \
+            "$label completed status=$status duration=${duration}s${detail:+ ($detail)}"
+    else
+        log "COLLECTOR" "INFO" \
+            "$label completed status=$status duration=${duration}s${detail:+ ($detail)}"
+    fi
+
+    if (( COLLECTOR_FAILURE_NOTIFICATIONS == 1 )); then
+        case "$status" in
+            TIMED_OUT)
+                record_finding warning monitoring monitoring.timeout "" \
+                    "Collector timeout" \
+                    "$label exceeded one or more command deadlines; affected baselines were preserved." \
+                    "Review the run log, device responsiveness, controller health, and configured timeout before retrying." \
+                    "collector_${collector}_timeout"
+                ;;
+            FAILED)
+                record_finding warning monitoring monitoring.failure "" \
+                    "Collector failure" \
+                    "$label failed or returned incomplete data; affected baselines were preserved." \
+                    "Review the run log and correct the collector dependency or input before retrying." \
+                    "collector_${collector}_failure"
+                ;;
+        esac
+    fi
+
+    return 0
+}
+
+build_collector_status_section() {
+    local collector status duration detail total_duration=0
+    local ok_count=0 deferred_count=0 timeout_count=0 failed_count=0
+    local include_all=0 include_row=0 rows=""
+
+    COLLECTOR_STATUS_SECTION=""
+    [[ "${SHOW_COLLECTOR_STATUS:-auto}" == "never" ]] && return 0
+    [[ "${SHOW_COLLECTOR_STATUS:-auto}" == "always" ]] && include_all=1
+
+    for collector in "${COLLECTOR_ORDER[@]}"; do
+        status="${COLLECTOR_STATUS[$collector]:-NOT_RUN}"
+        duration="${COLLECTOR_DURATION[$collector]:-0}"
+        detail="${COLLECTOR_DETAIL[$collector]:-}"
+        [[ "$duration" =~ ^[0-9]+$ ]] || duration=0
+        total_duration=$((total_duration + duration))
+        case "$status" in
+            OK)        ok_count=$((ok_count + 1)) ;;
+            DEFERRED)  deferred_count=$((deferred_count + 1)) ;;
+            TIMED_OUT) timeout_count=$((timeout_count + 1)) ;;
+            *)         failed_count=$((failed_count + 1)) ;;
+        esac
+        include_row=$include_all
+        [[ "$status" != "OK" || "$detail" == *slow* ]] && include_row=1
+        if (( include_row == 1 )); then
+            rows+=" - ${COLLECTOR_LABEL[$collector]:-$collector}: $status (${duration}s${detail:+; $detail})\n"
+        fi
+    done
+
+    if (( include_all == 0 && deferred_count == 0 && timeout_count == 0 && failed_count == 0 )) &&
+       [[ -z "$rows" ]]
+    then
+        return 0
+    fi
+    COLLECTOR_STATUS_SECTION="Collector Status:
+ - Summary: OK=$ok_count Deferred=$deferred_count Timed-out=$timeout_count Failed=$failed_count Total=${total_duration}s
+${rows%\\n}"
+    COLLECTOR_STATUS_SECTION="$(printf '%s\n' "$COLLECTOR_STATUS_SECTION" | trim_outer_blank_lines)"
+}
+
 # Classify forecast evidence. RESET is supplied by callers when a monotonic
 # endurance counter regresses and STALE when the newest sample is too old.
 forecast_confidence() {
@@ -747,6 +1110,8 @@ initialize_runtime() {
     }
     SMART_CACHE_DIR="$RUN_DIR/smartctl"
     ensure_dir "$SMART_CACHE_DIR" || return 1
+    COLLECTOR_EVENT_FILE="$RUN_DIR/collector_events.tsv"
+    : > "$COLLECTOR_EVENT_FILE" || return 1
 
     # Remove cache files produced by older versions; this version never reuses
     # SMART output across runs.
@@ -904,17 +1269,17 @@ declare LSBLK_ALL_CACHE=""
 declare -A BTRFS_DF_CACHE_DATA BTRFS_DF_CACHE_META
 cache_lsblk_all() {
     if [[ -z "$LSBLK_ALL_CACHE" ]]; then
-        LSBLK_ALL_CACHE="$(lsblk -b -dn -o NAME,SIZE,ROTA,TYPE 2>/dev/null || true)"
+        LSBLK_ALL_CACHE="$(lsblk_bounded -b -dn -o NAME,SIZE,ROTA,TYPE 2>/dev/null || true)"
     fi
 }
 lsblk_size_cached() {
     local dev="$1" source="$LSBLK_ALL_CACHE"
-    [[ -n "$source" ]] || source="$(lsblk -b -dn -o NAME,SIZE,ROTA,TYPE 2>/dev/null || true)"
+    [[ -n "$source" ]] || source="$(lsblk_bounded -b -dn -o NAME,SIZE,ROTA,TYPE 2>/dev/null || true)"
     awk -v d="${dev##*/}" '$1==d{print $2; exit}' <<<"$source"
 }
 lsblk_rota_cached() {
     local dev="$1" source="$LSBLK_ALL_CACHE"
-    [[ -n "$source" ]] || source="$(lsblk -b -dn -o NAME,SIZE,ROTA,TYPE 2>/dev/null || true)"
+    [[ -n "$source" ]] || source="$(lsblk_bounded -b -dn -o NAME,SIZE,ROTA,TYPE 2>/dev/null || true)"
     awk -v d="${dev##*/}" '$1==d{print $3; exit}' <<<"$source"
 }
 
@@ -928,7 +1293,7 @@ refresh_sata_power_state() {
     [[ -n "${SATA_POWER_STATE[$disk]:-}" ]] && return 0
 
     if command -v hdparm >/dev/null 2>&1; then
-        state=$(hdparm -C "$disk" 2>/dev/null |
+        state=$(hdparm_bounded -C "$disk" 2>/dev/null |
             awk -F: '/state is/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print tolower($2); exit}')
     fi
 
@@ -939,7 +1304,7 @@ refresh_sata_power_state() {
 
     # smartctl -n exits before normal SMART access when a rotational device is
     # sleeping. This is a fallback for controllers not supported by hdparm.
-    probe=$(smartctl -n standby -i "$disk" 2>&1 || true)
+    probe=$(smartctl_bounded_optional -n standby -i "$disk" 2>&1 || true)
     if printf '%s' "$probe" | grep -qiE 'device is in (standby|sleep)|standby mode|sleep mode'; then
         SATA_POWER_STATE[$disk]="standby"
         return 0
@@ -975,7 +1340,7 @@ prepare_smart_access() {
             fi
             log "SMART" "INFO" "Wake-up permitted for $disk (power state: $state)"
             if command -v hdparm >/dev/null 2>&1; then
-                hdparm -I "$disk" >/dev/null 2>&1 || true
+                hdparm_bounded -I "$disk" >/dev/null 2>&1 || true
             fi
             SATA_POWER_STATE[$disk]="active"
             return 0
@@ -1016,6 +1381,7 @@ retain_previous_smart_snapshot() {
     fi
 
     log "SMART" "INFO" "Deferred live SMART collection and self-test for $disk (power state: $power_state)"
+    record_collector_event DEFERRED "SMART $disk" "power_state=$power_state"
 }
 
 short_test_is_due() {
@@ -1063,7 +1429,7 @@ mark_test_started() {
 }
 
 smartctl_cached() {
-    local key cache_file temp_file device_arg device_key
+    local key cache_file temp_file device_arg device_key rc=0
 
     key="$(printf '%s\0' "$@" | cksum | awk '{print $1 "_" $2}')"
     device_arg="${!#}"
@@ -1072,7 +1438,24 @@ smartctl_cached() {
 
     if [[ ! -f "$cache_file" ]]; then
         temp_file="$(mktemp "$SMART_CACHE_DIR/.smartctl.XXXXXX")" || return 1
-        smartctl "$@" > "$temp_file" 2>&1 || true
+        if smartctl_bounded "$@" > "$temp_file" 2>&1; then
+            rc=0
+        else
+            rc=$?
+        fi
+        if (( rc == 124 || rc == 137 )); then
+            rm -f -- "$temp_file" 2>/dev/null || true
+            return "$rc"
+        fi
+        if (( (rc & 3) != 0 )); then
+            rm -f -- "$temp_file" 2>/dev/null || true
+            return "$rc"
+        fi
+        if [[ ! -s "$temp_file" && $rc -ne 0 ]]; then
+            record_collector_event FAILED "smartctl $device_arg" "empty_output rc=$rc"
+            rm -f -- "$temp_file" 2>/dev/null || true
+            return "$rc"
+        fi
         mv -f -- "$temp_file" "$cache_file" || {
             rm -f -- "$temp_file" 2>/dev/null || true
             return 1
@@ -1100,26 +1483,26 @@ get_selftest_live() {
     local disk="$1"
     if [[ ! "$disk" =~ ^/dev/[A-Za-z0-9]+([p0-9]+)?$ ]]; then printf ""; return; fi
     if [[ $disk == /dev/nvme* ]]; then
-        smartctl -l selftest -d nvme "$disk" 2>/dev/null || true
+        smartctl_bounded -l selftest -d nvme "$disk" 2>/dev/null || true
     else
-        smartctl -l selftest "$disk" 2>/dev/null || true
+        smartctl_bounded -l selftest "$disk" 2>/dev/null || true
     fi
 }
 get_capabilities_live() {
     local disk="$1"
     if [[ ! "$disk" =~ ^/dev/[A-Za-z0-9]+([p0-9]+)?$ ]]; then printf ""; return; fi
     if [[ $disk == /dev/nvme* ]]; then
-        smartctl -c -d nvme "$disk" 2>/dev/null || true
+        smartctl_bounded -c -d nvme "$disk" 2>/dev/null || true
     else
-        smartctl -c "$disk" 2>/dev/null || true
+        smartctl_bounded -c "$disk" 2>/dev/null || true
     fi
 }
 btrfs_df_cached() {
     # Cache raw 'btrfs filesystem df' (pretty first, fallback) per mount
     local m="$1"; local key="$m"; if [[ -n "${BTRFS_DF_CACHE_DATA[$key]:-}" || -n "${BTRFS_DF_CACHE_META[$key]:-}" ]]; then return 0; fi
     local out_p out
-    out_p=$(btrfs filesystem df -p "$m" 2>/dev/null || true)
-    if [[ -n "$out_p" ]]; then out="$out_p"; else out=$(btrfs filesystem df "$m" 2>/dev/null || true); fi
+    out_p=$(btrfs_bounded_optional filesystem df -p "$m" 2>/dev/null || true)
+    if [[ -n "$out_p" ]]; then out="$out_p"; else out=$(btrfs_bounded filesystem df "$m" 2>/dev/null || true); fi
     BTRFS_DF_CACHE_DATA[$key]=$(printf "%s" "$out" | awk -F',' '/Data/ {gsub(/ /,"",$2); print $2; exit}')
     BTRFS_DF_CACHE_META[$key]=$(printf "%s" "$out" | awk -F',' '/Metadata/ {gsub(/ /,"",$2); print $2; exit}')
     BTRFS_DF_CACHE_DATA[$key]="${BTRFS_DF_CACHE_DATA[$key]:-UNKNOWN}"; BTRFS_DF_CACHE_META[$key]="${BTRFS_DF_CACHE_META[$key]:-UNKNOWN}"
@@ -1151,6 +1534,7 @@ notify_unraid() {
         "Endurance|${SUBSYSTEM_ENDURANCE_STATE:-OK}"
         "Scheduling|${SUBSYSTEM_SCHEDULING_STATE:-OK}"
         "Parity|${SUBSYSTEM_PARITY_STATE:-OK}"
+        "Monitoring|${SUBSYSTEM_MONITORING_STATE:-OK}"
     )
     for pair in "${subsystem_pairs[@]}"; do
         name="${pair%%|*}"
@@ -1176,13 +1560,26 @@ notify_unraid() {
     local rc=0
     if [ -x "$NOTIFY_BIN" ]; then
         log_info "Sending notification with $icon title '$title' (critical=$crit_count, warning=$warn_count)"
-        "$NOTIFY_BIN" -s "${title:-Disks Health Monitoring}" -d "$summary_line" -m "$body_norm" -i "$icon" || rc=$?
+        run_bounded_checked "$NOTIFICATION_TIMEOUT_SECONDS" \
+            "Unraid notification helper" \
+            "$NOTIFY_BIN" -s "${title:-Disks Health Monitoring}" \
+            -d "$summary_line" -m "$body_norm" -i "$icon" || rc=$?
         (( rc != 0 )) && log_warn "Sending notification FAILED - returned non-zero exit $rc; continuing"
     else
         # Syslog fallback when notify binary missing
         log_warn "Sending notification FAILED - notify binary missing, using syslog fallback"
-        logger -t "Disks Health Monitoring" "${title:-Disks Health Monitoring}: $summary_line"
-        logger -t "Disks Health Monitoring" "$body_norm"
+        if command -v logger >/dev/null 2>&1; then
+            run_bounded_checked "$NOTIFICATION_TIMEOUT_SECONDS" \
+                "Syslog notification summary" logger -t "Disks Health Monitoring" \
+                "${title:-Disks Health Monitoring}: $summary_line" || rc=$?
+            run_bounded_checked "$NOTIFICATION_TIMEOUT_SECONDS" \
+                "Syslog notification body" logger -t "Disks Health Monitoring" \
+                "$body_norm" || rc=$?
+            (( rc != 0 )) && log_warn \
+                "Syslog notification fallback FAILED - returned non-zero exit $rc; continuing"
+        else
+            log_warn "Syslog notification fallback unavailable; logger is missing"
+        fi
     fi
     return 0
 }
@@ -1475,6 +1872,7 @@ finding_category_rank() {
         capacity)    printf '70\n' ;;
         parity)      printf '80\n' ;;
         maintenance) printf '90\n' ;;
+        monitoring)  printf '95\n' ;;
         *)           printf '99\n' ;;
     esac
 }
@@ -1814,8 +2212,8 @@ register_device_identity() {
     [[ -b "$disk" ]] || return 1
     [[ -n "${DEVICE_ID_BY_PATH[$disk]:-}" ]] && return 0
 
-    wwn=$(lsblk -dn -o WWN "$disk" 2>/dev/null | awk '{$1=$1; print; exit}')
-    serial=$(lsblk -dn -o SERIAL "$disk" 2>/dev/null | awk '{$1=$1; print; exit}')
+    wwn=$(lsblk_bounded -dn -o WWN "$disk" 2>/dev/null | awk '{$1=$1; print; exit}')
+    serial=$(lsblk_bounded -dn -o SERIAL "$disk" 2>/dev/null | awk '{$1=$1; print; exit}')
     by_id=$(best_by_id_for_device "$disk")
 
     component=$(safe_state_name "$wwn")
@@ -1902,7 +2300,7 @@ discover_device_inventory() {
         candidates+=("$disk")
     done
 
-    boot_src=$(findmnt -n -o SOURCE /boot 2>/dev/null || true)
+    boot_src=$(findmnt_bounded -n -o SOURCE /boot 2>/dev/null || true)
     if [[ -n "$boot_src" ]]; then
         boot_src=$(readlink -f -- "$boot_src" 2>/dev/null || printf '%s' "$boot_src")
     fi
@@ -1928,7 +2326,7 @@ discover_device_inventory() {
         source="${DEVICE_ID_SOURCE[$identity]}"
         printf '%s %s source=%s\n' "$identity" "$disk" "$source" >> "$temp_file"
     done
-    atomic_commit "$temp_file" "$DEVICE_ID_MAP_FILE" || return 1
+    collector_atomic_commit "$temp_file" "$DEVICE_ID_MAP_FILE" || return 1
     DEVICE_INVENTORY_READY=1
 
     if (( ${#DISCOVERED_DISKS[@]} == 0 )); then
@@ -2051,7 +2449,7 @@ migrate_device_identity_histories() {
         done
 
         if (( migration_failed == 0 )); then
-            atomic_commit "$temp_file" "$file" || migration_failed=1
+            collector_atomic_commit "$temp_file" "$file" || migration_failed=1
         else
             rm -f -- "$temp_file" "${temp_file}.next" 2>/dev/null || true
             break
@@ -2086,7 +2484,7 @@ migrate_device_identity_histories() {
         return 1
     fi
 
-    atomic_write_text "$DEVICE_ID_SCHEMA_FILE" $'2\n' || return 1
+    collector_atomic_write_text "$DEVICE_ID_SCHEMA_FILE" $'2\n' || return 1
     log "STATE" "INFO" "Stable identity history migration completed"
 }
 
@@ -2365,7 +2763,7 @@ discover_parity_and_status() {
         if [[ -n "$errs" ]]; then PARITY_DETAILS_SECTION+=" - Errors: ${errs}\n"; fi
         # Persist current position snapshot for next run speed/ETA calculation
         if [[ -n "$pos" ]]; then
-            atomic_write_text "$progress_file" "$pos $curr_ts" || true
+            collector_atomic_write_text "$progress_file" "$pos $curr_ts" || true
         fi
         # Parity sync error alerts. Use thresholds if defined.
         if [[ -n "$errs" && "$errs" =~ ^[0-9]+$ ]] && (( is_active == 1 )); then
@@ -2411,7 +2809,7 @@ smart_device_for_mount() {
     local dev="${MOUNT_TO_DEV[$mp]:-}"
     if [[ -n "$dev" && -b "$dev" ]]; then echo "$dev"; return 0; fi
     local src
-    src=$(findmnt -n -o SOURCE "$mp" 2>/dev/null || true)
+    src=$(findmnt_bounded -n -o SOURCE "$mp" 2>/dev/null || true)
     echo "$src"
 }
 
@@ -2670,7 +3068,7 @@ evaluate_smart() {
             nvme_temp_date=$(date '+%Y-%m-%d')
             nvme_temp_key=$(persistent_device_key "$disk")
             nvme_temp_record="$nvme_temp_date $nvme_temp_key temp=$nvme_temp captured_epoch=$RUN_EPOCH schema=$HISTORY_SCHEMA_VERSION"
-            atomic_upsert_daily_history \
+            collector_upsert_daily_history \
                 "$TEMP_HISTORY_FILE" "$nvme_temp_date" "$nvme_temp_key" "$nvme_temp_record" || true
         fi
         if [[ $percent_used -ge $NVME_PERCENT_USED_CRIT ]]; then
@@ -2827,7 +3225,7 @@ evaluate_smart() {
             record_alert warning "NVMe Unsafe Shutdowns" "Disk $disk NVMe Unsafe Shutdowns increased: ${prev_uns} -> ${unsafe_shutdowns}"
             # Persist last warning timestamp for cooldown
             if (( UNSAFE_SDWN_COOLDOWN_DAYS > 0 )); then
-                atomic_write_text "$warn_file" "$(date +%s)" || true
+                collector_atomic_write_text "$warn_file" "$(date +%s)" || true
             fi
         fi
         NVME_LAST_UNSAFE[$disk]=$unsafe_shutdowns
@@ -2959,7 +3357,7 @@ evaluate_smart() {
                         messages+=("Command Timeout increased: ${prev_ct} -> ${cmd_timeout} (+${delta})")
                         record_alert warning "Command Timeout events" "Disk $disk command timeout increased ${prev_ct}->${cmd_timeout} (+${delta})"
                         if [[ $CMD_TIMEOUT_COOLDOWN_DAYS -gt 0 ]]; then
-                            atomic_write_text "$warn_file" "$(date +%s)" || true
+                            collector_atomic_write_text "$warn_file" "$(date +%s)" || true
                         fi
                     fi
                 fi
@@ -2996,7 +3394,7 @@ evaluate_smart() {
             sata_temp_date=$(date '+%Y-%m-%d')
             sata_temp_key=$(persistent_device_key "$disk")
             sata_temp_record="$sata_temp_date $sata_temp_key temp=$temp captured_epoch=$RUN_EPOCH schema=$HISTORY_SCHEMA_VERSION"
-            atomic_upsert_daily_history \
+            collector_upsert_daily_history \
                 "$TEMP_HISTORY_FILE" "$sata_temp_date" "$sata_temp_key" "$sata_temp_record" || true
         fi
         local bdv
@@ -3165,7 +3563,7 @@ evaluate_smart() {
                         today=$(date '+%Y-%m-%d')
                         sata_link_key=$(persistent_device_key "$disk")
                         sata_link_record="$today $sata_link_key max=$max_speed current=$current_speed captured_epoch=$RUN_EPOCH schema=$HISTORY_SCHEMA_VERSION"
-                        atomic_upsert_daily_history \
+                        collector_upsert_daily_history \
                             "$SATA_LINK_HISTORY_FILE" "$today" "$sata_link_key" "$sata_link_record" || true
                     fi
                 fi
@@ -3353,7 +3751,7 @@ save_selftest_snapshot() {
         rm -f -- "$temp_file" 2>/dev/null || true
         return 1
     }
-    atomic_commit "$temp_file" "$target"
+    collector_atomic_commit "$temp_file" "$target"
 }
 
 # === Helper Function ===
@@ -3366,9 +3764,9 @@ poll_short_test_completion() {
         local exec_status
         if [[ $disk == /dev/nvme* ]]; then
             log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART capability read (-c) on $disk"
-            exec_status=$(smartctl -c -d nvme "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
+            exec_status=$(smartctl_bounded -c -d nvme "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
         else
-            exec_status=$(smartctl -c "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
+            exec_status=$(smartctl_bounded -c "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
         fi
         if echo "$exec_status" | grep -qi 'in progress'; then
             sleep $SHORT_TEST_POLL_INTERVAL
@@ -3535,14 +3933,18 @@ run_smart_test() {
     local selftest poh_attr current_poh last_long_hours_diff="" last_long_poh="" threshold_hours=$(( LONG_TEST_MAX_INTERVAL_DAYS * 24 ))
     if [[ $disk == /dev/nvme* ]]; then
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART self-test log read (-l selftest) on $disk"
-        selftest=$(smartctl -l selftest -d nvme "$disk" 2>/dev/null || true)
+        selftest=$(smartctl_bounded -l selftest -d nvme "$disk" 2>/dev/null || true)
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART attribute read (-a) on $disk"
-        poh_attr=$(smartctl -a -d nvme "$disk" 2>/dev/null | awk -F: '/Power On Hours/ {gsub(/ /,"",$2); print $2; exit}')
+        poh_attr=$(smartctl_bounded -a -d nvme "$disk" 2>/dev/null | awk -F: '/Power On Hours/ {gsub(/ /,"",$2); print $2; exit}')
     else
-        selftest=$(smartctl -l selftest "$disk" 2>/dev/null || true)
-        poh_attr=$(smartctl -A "$disk" 2>/dev/null | awk '/Power_On_Hours/ {print $10; exit}')
+        selftest=$(smartctl_bounded -l selftest "$disk" 2>/dev/null || true)
+        poh_attr=$(smartctl_bounded -A "$disk" 2>/dev/null | awk '/Power_On_Hours/ {print $10; exit}')
     fi
     current_poh=${poh_attr:-0}
+    if collector_device_has_blocking_event smart "$disk"; then
+        log_warn "SMART collection incomplete on $disk; skipping replacement detection, evaluation, and test scheduling"
+        return 0
+    fi
     # Automatic replacement detection/reset: if current POH is much lower than persisted last-long POH
     if (( REPLACEMENT_AUTO_RESET == 1 )); then
         local persisted_ll=${LONG_LAST_POH["$disk"]:-}
@@ -3580,7 +3982,7 @@ run_smart_test() {
                         awk -v dev="$disk" -v stable="$processed_state_key" \
                             '$1 != dev && $1 != stable' \
                             "$SMART_LONG_STATE_FILE" > "$processed_temp" 2>/dev/null || true
-                        atomic_commit "$processed_temp" "$SMART_LONG_STATE_FILE" || true
+                        collector_atomic_commit "$processed_temp" "$SMART_LONG_STATE_FILE" || true
                     fi
                 fi
                 # Mark a hint variable for later scheduling block
@@ -3591,10 +3993,10 @@ run_smart_test() {
     # Determine model/vendor and apply hardcoded pattern expansion
     local model_raw=""
     if [[ $disk == /dev/nvme* ]]; then
-        model_raw=$(smartctl -i -d nvme "$disk" 2>/dev/null | awk -F: '/^Model Number/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
+        model_raw=$(smartctl_bounded -i -d nvme "$disk" 2>/dev/null | awk -F: '/^Model Number/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
     else
-        model_raw=$(smartctl -i "$disk" 2>/dev/null | awk -F: '/Device Model/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
-        [[ -z "$model_raw" ]] && model_raw=$(smartctl -i "$disk" 2>/dev/null | awk -F: '/Model Family/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
+        model_raw=$(smartctl_bounded -i "$disk" 2>/dev/null | awk -F: '/Device Model/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
+        [[ -z "$model_raw" ]] && model_raw=$(smartctl_bounded -i "$disk" 2>/dev/null | awk -F: '/Model Family/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
     fi
     # Include generic "Extended" to cover NVMe long tests as well as SATA variants
     local patterns=("Extended" "Extended offline" "Extended self-test" "Long")
@@ -3666,6 +4068,10 @@ run_smart_test() {
     # SMART scheduling: evaluate SMART state & risk once, then decide if long test needed.
     local state_pre msgs_pre risk_pre previous_risk_pre schedule_long=0 test_due=0 test_started=0 reasons=()
     evaluate_smart "$disk" "pre-test"
+    if collector_device_has_blocking_event smart "$disk"; then
+        log_warn "SMART evaluation incomplete on $disk; skipping SMART test scheduling"
+        return 0
+    fi
     state_pre="${SMART_STATE[$disk]:-OK}"
     msgs_pre="${SMART_MSGS[$disk]:-}"
     risk_pre=$(risk_score_for_device "$disk" "$state_pre" "$msgs_pre")
@@ -3742,9 +4148,13 @@ run_smart_test() {
     local exec_status existing_in_progress=0
     if [[ $disk == /dev/nvme* ]]; then
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART capability read (-c) on $disk"
-        exec_status=$(smartctl -c -d nvme "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
+        exec_status=$(smartctl_bounded -c -d nvme "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
     else
-        exec_status=$(smartctl -c "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
+        exec_status=$(smartctl_bounded -c "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
+    fi
+    if collector_device_has_blocking_event smart "$disk"; then
+        log_warn "SMART capability read incomplete on $disk; skipping SMART test start"
+        return 0
     fi
     if echo "$exec_status" | grep -qi 'in progress'; then
         existing_in_progress=1
@@ -3765,11 +4175,11 @@ run_smart_test() {
         local test_start_output="" test_start_rc=0
         if [[ $disk == /dev/nvme* ]]; then
             log_smart "Starting NVMe SMART test (-t ${test_kind}) on $disk"
-            test_start_output=$(smartctl -t "$test_kind" -d nvme "$disk" 2>&1)
+            test_start_output=$(smartctl_bounded -t "$test_kind" -d nvme "$disk" 2>&1)
             test_start_rc=$?
         else
             log_smart "Starting SATA SMART test (-t ${test_kind}) on $disk"
-            test_start_output=$(smartctl -t "$test_kind" "$disk" 2>&1)
+            test_start_output=$(smartctl_bounded -t "$test_kind" "$disk" 2>&1)
             test_start_rc=$?
         fi
 
@@ -3906,12 +4316,12 @@ check_completed_long_tests() {
         local out model_raw
         if [[ $disk == /dev/nvme* ]]; then
             log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART self-test log read (-l selftest) on $disk"
-            out=$(smartctl -l selftest -d nvme "$disk" 2>/dev/null || true)
-            model_raw=$(smartctl -i -d nvme "$disk" 2>/dev/null | awk -F: '/^Model Number/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
+            out=$(smartctl_bounded -l selftest -d nvme "$disk" 2>/dev/null || true)
+            model_raw=$(smartctl_bounded -i -d nvme "$disk" 2>/dev/null | awk -F: '/^Model Number/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
         else
-            out=$(smartctl -l selftest "$disk" 2>/dev/null || true)
-            model_raw=$(smartctl -i "$disk" 2>/dev/null | awk -F: '/Device Model/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
-            [[ -z "$model_raw" ]] && model_raw=$(smartctl -i "$disk" 2>/dev/null | awk -F: '/Model Family/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
+            out=$(smartctl_bounded -l selftest "$disk" 2>/dev/null || true)
+            model_raw=$(smartctl_bounded -i "$disk" 2>/dev/null | awk -F: '/Device Model/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
+            [[ -z "$model_raw" ]] && model_raw=$(smartctl_bounded -i "$disk" 2>/dev/null | awk -F: '/Model Family/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
         fi
         # Build unified long-test pattern list (include generic "Extended" for NVMe devices)
         local patterns=("Extended" "Extended offline" "Extended self-test" "Long" "Extended-Offline" "Long offline" "Offline")
@@ -3967,9 +4377,9 @@ check_completed_long_tests() {
                 # Need current POH to decide replacement vs regression
                 local cur_poh
                 if [[ $disk == /dev/nvme* ]]; then
-                    cur_poh=$(smartctl -a -d nvme "$disk" 2>/dev/null | awk -F: '/Power On Hours/ {gsub(/ /,"",$2); print $2; exit}')
+                    cur_poh=$(smartctl_bounded -a -d nvme "$disk" 2>/dev/null | awk -F: '/Power On Hours/ {gsub(/ /,"",$2); print $2; exit}')
                 else
-                    cur_poh=$(smartctl -A "$disk" 2>/dev/null | awk '/Power_On_Hours/ {print $10; exit}')
+                    cur_poh=$(smartctl_bounded -A "$disk" 2>/dev/null | awk '/Power_On_Hours/ {print $10; exit}')
                 fi
                 if [[ "$cur_poh" =~ ^[0-9]+$ && $cur_poh -ge $prev_ll && $(( prev_ll - lifetime )) -gt 1 ]]; then
                     log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Ignoring regressed long-test POH $lifetime < $prev_ll on $disk (monotonic guard)"
@@ -3984,9 +4394,9 @@ check_completed_long_tests() {
         else
             if [[ $disk == /dev/nvme* ]]; then
                 log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART attribute read (-a) for POH fallback on $disk"
-                poh=$(smartctl -a -d nvme "$disk" 2>/dev/null | awk -F: '/Power On Hours/ {gsub(/ /,"",$2); print $2; exit}')
+                poh=$(smartctl_bounded -a -d nvme "$disk" 2>/dev/null | awk -F: '/Power On Hours/ {gsub(/ /,"",$2); print $2; exit}')
             else
-                poh=$(smartctl -A "$disk" 2>/dev/null | awk '/Power_On_Hours/ {print $10; exit}')
+                poh=$(smartctl_bounded -A "$disk" 2>/dev/null | awk '/Power_On_Hours/ {print $10; exit}')
             fi
             if [[ -n "${poh:-}" && "$poh" =~ ^[0-9]+$ ]]; then
                 LONG_LAST_POH["$disk"]="$poh"
@@ -4001,7 +4411,7 @@ check_completed_long_tests() {
         state_key=$(persistent_device_key "$disk")
         printf '%s %s\n' "$state_key" "${PROCESSED[$disk]}" >> "$temp_file"
     done
-    atomic_commit "$temp_file" "$SMART_LONG_STATE_FILE" || true
+    collector_atomic_commit "$temp_file" "$SMART_LONG_STATE_FILE" || true
 }
 
 # === Main Function ===
@@ -4040,14 +4450,14 @@ monitor_btrfs() {
         data_raid=${data_raid:-UNKNOWN}
         meta_raid=${meta_raid:-UNKNOWN}
         local initial_status
-        initial_status=$(btrfs scrub status "$m" 2>/dev/null || true)
+        initial_status=$(btrfs_bounded scrub status "$m" 2>/dev/null || true)
         if [[ ${ENABLE_BTRFS_SCRUB:-0} -eq 1 ]]; then
             if echo "$initial_status" | grep -qi 'running'; then
                 log_btrfs "Scrub already running on $m (Data: $data_raid Meta: $meta_raid)"
             else
                 log_btrfs "Starting async scrub on $m (Data: $data_raid Meta: $meta_raid)"
                 local _scrub_out
-                _scrub_out=$(btrfs scrub start "$m" 2>&1 || true)
+                _scrub_out=$(btrfs_bounded scrub start "$m" 2>&1 || true)
                 while IFS= read -r _ln; do [[ -n "$_ln" ]] && log_btrfs "$m scrub start: $_ln"; done <<< "$_scrub_out"
             fi
         else
@@ -4056,13 +4466,13 @@ monitor_btrfs() {
                 if echo "$initial_status" | grep -qi 'no stats available'; then
                     log_btrfs "Force baseline scrub (first-run) on $m (Data: $data_raid Meta: $meta_raid)"
                     local _scrub_force
-                    _scrub_force=$(btrfs scrub start "$m" 2>&1 || true)
+                    _scrub_force=$(btrfs_bounded scrub start "$m" 2>&1 || true)
                     while IFS= read -r _ln; do [[ -n "$_ln" ]] && log_btrfs "$m scrub start (forced baseline): $_ln"; done <<< "$_scrub_force"
                 fi
             fi
         fi
         local status corrected uncorrectable msg
-        status=$(btrfs scrub status "$m" 2>/dev/null || true)
+        status=$(btrfs_bounded scrub status "$m" 2>/dev/null || true)
         # If kernel has no recorded stats (e.g., post-reboot), load our persisted last status for this mount
         if echo "$status" | grep -qi "no stats available"; then
             if [[ -s "$file" ]]; then
@@ -4086,7 +4496,7 @@ monitor_btrfs() {
                     printf "Saved: %s\n" "$(date '+%Y-%m-%d %H:%M:%S')"
                     printf "%s" "$status"
                 } > "$status_temp" 2>/dev/null || true
-                atomic_commit "$status_temp" "$file" || true
+                collector_atomic_commit "$status_temp" "$file" || true
             fi
         fi
         # If status indicates no stats available, add explicit synthetic summary for clarity
@@ -4129,9 +4539,9 @@ monitor_xfs() {
         # Optional offline repair (-n) metadata inspection for corruption indicators
         if [[ ${ENABLE_XFS_CHECK:-0} -eq 1 ]]; then
             local dev xfs_out msg
-            dev=$(findmnt -n -o SOURCE --target "$mp" 2>/dev/null || true)
+            dev=$(findmnt_bounded -n -o SOURCE --target "$mp" 2>/dev/null || true)
             if [[ -n "$dev" ]]; then
-                xfs_out=$(xfs_repair -n "$dev" 2>&1 || true)
+                xfs_out=$(xfs_repair_bounded -n "$dev" 2>&1 || true)
                 log_xfs "$xfs_out"
                 # Flag critical if tool output signals error/corruption/fatal conditions
                 if echo "$xfs_out" | grep -qiE "error|corrupt|fatal"; then
@@ -4142,7 +4552,7 @@ monitor_xfs() {
             fi
         fi
         # Scan recent kernel ring buffer for XFS / I/O error patterns referencing mount; raise warning
-        if dmesg | tail -n 3000 | grep -qiE "$(basename "$mp").*(XFS|I/O error)|XFS ERROR|xfs_repair"; then
+        if dmesg_bounded | tail -n 3000 | grep -qiE "$(basename "$mp").*(XFS|I/O error)|XFS ERROR|xfs_repair"; then
             msg="WARNING: Kernel/XFS I/O messages for $mp"
             log_xfs "$(date '+%Y-%m-%d %H:%M:%S') - $msg"
             record_alert warning "$NOTIFY_TITLE_XFS" "$msg"
@@ -4190,7 +4600,7 @@ evaluate_per_mount_thresholds() {
     for mp in "${uniq[@]}"; do
         mountpoint -q "$mp" || continue
         local sz used pct mount
-        read -r sz used pct mount < <(df -h --output=size,used,pcent,target "$mp" 2>/dev/null | tail -n1) || continue
+        read -r sz used pct mount < <(df_bounded -h --output=size,used,pcent,target "$mp" 2>/dev/null | tail -n1) || continue
         local usep=${pct%%%}
         [[ -n "$usep" ]] || continue
         if [[ $usep -ge $CRITICAL_THRESHOLD_PERCENT ]]; then
@@ -4214,6 +4624,14 @@ collect_smart_health() {
     for disk in "${disks[@]}"; do
         [[ -n "$disk" ]] || continue
         run_smart_test "$disk"
+        if collector_device_has_blocking_event smart "$disk"; then
+            for tmp in "${!CUR_ATTR[@]}"; do
+                [[ "$tmp" == "$disk|"* ]] && unset 'CUR_ATTR[$tmp]'
+            done
+            retain_previous_smart_snapshot "$disk" "collection-unavailable"
+            log "SMART" "WARN" \
+                "Live SMART data was incomplete for $disk; retained its previous known baseline"
+        fi
     done
     log_smart "SMART tests completed"
     augment_messages_with_deltas
@@ -4229,7 +4647,7 @@ if (( POH_TREND_ENABLED == 1 )); then
             poh_records+=("$today $(persistent_device_key "$disk") poh=$poh captured_epoch=$RUN_EPOCH schema=$HISTORY_SCHEMA_VERSION")
         fi
     done
-    atomic_replace_daily_history "$POH_HISTORY_FILE" "$today" "${poh_records[@]}" ||
+    collector_replace_daily_history "$POH_HISTORY_FILE" "$today" "${poh_records[@]}" ||
         log_warn "Unable to atomically update POH history"
 fi
  # Persist daily SMART attribute snapshot (once per day)
@@ -4247,7 +4665,7 @@ fi
         line+=" captured_epoch=$RUN_EPOCH schema=$HISTORY_SCHEMA_VERSION"
         smart_attr_records+=("$line")
     done
-    atomic_replace_daily_history "$SMART_ATTR_HISTORY_FILE" "$today" "${smart_attr_records[@]}" ||
+    collector_replace_daily_history "$SMART_ATTR_HISTORY_FILE" "$today" "${smart_attr_records[@]}" ||
         log_warn "Unable to atomically update SMART attribute history"
  fi
      # NVMe wear projection (percent_used -> depletion ETA)
@@ -4375,7 +4793,7 @@ check_btrfs_snapshots() {
     mapfile -t mountpoints < <(mount | awk '$5=="btrfs" {print $3}')
     for mp in "${mountpoints[@]}"; do
         local list cnt
-        list=$(btrfs subvolume list "$mp" 2>/dev/null || true)
+        list=$(btrfs_bounded subvolume list "$mp" 2>/dev/null || true)
         [[ -z "$list" ]] && continue
         cnt=$(printf "%s\n" "$list" | grep -Eio '(^|/)[@.]?snapshots?(/|$)|(^|/)snapshot[^/]*' | wc -l || true)
         if (( cnt >= SNAPSHOT_CRIT )); then
@@ -4412,7 +4830,7 @@ build_new_syslog_chunk() {
     : > "$SYSLOG_CHUNK_FILE" || return 1
 
     if [[ ! -r "$source" ]]; then
-        dmesg 2>/dev/null | tail -n "$SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES" > "$SYSLOG_CHUNK_FILE" || true
+        dmesg_bounded 2>/dev/null | tail -n "$SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES" > "$SYSLOG_CHUNK_FILE" || true
         log "SYSLOG" "WARN" \
             "$source is unavailable; using a non-cursor dmesg fallback"
         return 0
@@ -4524,7 +4942,7 @@ build_new_syslog_chunk() {
 
 commit_syslog_cursor() {
     (( SYSLOG_CURSOR_READY == 1 )) || return 0
-    atomic_write_text "$SYSLOG_CURSOR_STATE_FILE" \
+    collector_atomic_write_text "$SYSLOG_CURSOR_STATE_FILE" \
         "v2 $SYSLOG_CURSOR_PENDING_PATH $SYSLOG_CURSOR_PENDING_DEVICE $SYSLOG_CURSOR_PENDING_INODE $SYSLOG_CURSOR_PENDING_LINES $SYSLOG_CURSOR_PENDING_SIZE $SYSLOG_CURSOR_PENDING_ANCHOR"$'\n'
 }
 
@@ -4630,7 +5048,7 @@ scan_syslog_disk_errors() {
             done < "$SYSLOG_CHUNK_FILE"
         fi
 
-        if atomic_commit "$new_hist" "$IO_ERROR_HISTORY_FILE"; then
+        if collector_atomic_commit "$new_hist" "$IO_ERROR_HISTORY_FILE"; then
             history_committed=1
         fi
     fi
@@ -4672,6 +5090,7 @@ scan_syslog_disk_errors() {
         IO_ERROR_FREQ_SECTION=""
     fi
     (( had_e == 1 )) && set -e
+    return 0
 }
 
 # === Notification Builder ===
@@ -4735,7 +5154,7 @@ build_storage_and_disk_lines() {
     # For each array disk: parse df usage, compute percent and capacity, combine with SMART severity, and collect reasons
     for d in "${arr[@]}"; do
         local sz u pct mount
-        read -r sz u pct mount < <(df -B1 --output=size,used,pcent,target "$d" 2>/dev/null | tail -n1) || continue
+        read -r sz u pct mount < <(df_bounded -B1 --output=size,used,pcent,target "$d" 2>/dev/null | tail -n1) || continue
         sz=${sz:-0}; u=${u:-0}
         arr_size=$((arr_size + sz)); arr_used=$((arr_used + u))
         local pct_local
@@ -4855,7 +5274,7 @@ build_storage_and_disk_lines() {
         local name fstype raid_str="" devlist=""
         name=$(basename "$p")
         local sz u pct mount
-        read -r sz u pct mount < <(df -B1 --output=size,used,pcent,target "$p" 2>/dev/null | tail -n1) || continue
+        read -r sz u pct mount < <(df_bounded -B1 --output=size,used,pcent,target "$p" 2>/dev/null | tail -n1) || continue
         sz=${sz:-0}; u=${u:-0}
         pools_size=$((pools_size + sz)); pools_used=$((pools_used + u))
         local pct
@@ -4864,7 +5283,7 @@ build_storage_and_disk_lines() {
         if (( $(awk "BEGIN{print ($pct >= $CRITICAL_THRESHOLD_PERCENT)}") )); then usage_sev=2
         elif (( $(awk "BEGIN{print ($pct >= $WARN_THRESHOLD_PERCENT)}") )); then usage_sev=1
         fi
-        fstype=$(findmnt -n -o FSTYPE "$p" 2>/dev/null || true)
+        fstype=$(findmnt_bounded -n -o FSTYPE "$p" 2>/dev/null || true)
         if [[ "$fstype" == "btrfs" ]]; then
             local prof_data prof_meta raid_parts=()
             btrfs_df_cached "$p"
@@ -4885,8 +5304,8 @@ build_storage_and_disk_lines() {
                     raid_str="(${raid_parts[*]})"
                 fi
             fi
-            devlist=$(btrfs filesystem show "$p" 2>/dev/null | awk '/devid/ && /path/ {for(i=1;i<=NF;i++){if($i=="path"){print $(i+1)}}}');
-            [[ -z "$devlist" ]] && devlist=$(btrfs filesystem show "$p" 2>/dev/null | awk '/devid/ {print $NF}')
+            devlist=$(btrfs_bounded filesystem show "$p" 2>/dev/null | awk '/devid/ && /path/ {for(i=1;i<=NF;i++){if($i=="path"){print $(i+1)}}}');
+            [[ -z "$devlist" ]] && devlist=$(btrfs_bounded filesystem show "$p" 2>/dev/null | awk '/devid/ {print $NF}')
                     # Btrfs profile mismatch / unbalanced detection
                     if [[ -n "$prof_data" && -n "$prof_meta" ]]; then
                         local pd_norm pm_norm
@@ -4910,7 +5329,7 @@ build_storage_and_disk_lines() {
                         fi
                     fi
         else
-            devlist=$(findmnt -n -o SOURCE "$p" 2>/dev/null || true)
+            devlist=$(findmnt_bounded -n -o SOURCE "$p" 2>/dev/null || true)
             raid_str="(SINGLE)"
         fi
         # Evaluate member device SMART statuses for pool
@@ -4980,12 +5399,12 @@ build_storage_and_disk_lines() {
     local -a disk_capacity_records=()
     for d in "${arr[@]}"; do
         local sz u pct mount disk_name
-        read -r sz u pct mount < <(df -B1 --output=size,used,pcent,target "$d" 2>/dev/null | tail -n1) || continue
+        read -r sz u pct mount < <(df_bounded -B1 --output=size,used,pcent,target "$d" 2>/dev/null | tail -n1) || continue
         disk_name=$(basename "$d")
         [[ "$sz" =~ ^[0-9]+$ && "$u" =~ ^[0-9]+$ ]] || continue
         disk_capacity_records+=("$today $disk_name used=$u size=$sz captured_epoch=$RUN_EPOCH schema=$HISTORY_SCHEMA_VERSION")
     done
-    atomic_replace_daily_history \
+    collector_replace_daily_history \
         "$DISK_CAP_HISTORY_FILE" "$today" "${disk_capacity_records[@]}" ||
         log_warn "Unable to atomically update per-disk capacity history"
     # Bump group severities based on capacity thresholds (array/pools)
@@ -5070,7 +5489,7 @@ build_storage_and_disk_lines() {
 validate_storage_metrics() {
     local user_line discrepancy_section=""
     if mountpoint -q /mnt/user; then
-        user_line=$(df -B1 /mnt/user 2>/dev/null | awk 'NR==2')
+        user_line=$(df_bounded -B1 /mnt/user 2>/dev/null | awk 'NR==2')
         local user_sz
         user_sz=$(echo "$user_line" | awk '{print $2}')
         local user_used
@@ -5092,7 +5511,7 @@ validate_storage_metrics() {
                             [[ ! "$streak" =~ ^[0-9]+$ ]] && streak=0
                         fi
                         streak=$(( streak + 1 ))
-                        atomic_write_text "$STORAGE_DISCREPANCY_STATE_FILE" \
+                        collector_atomic_write_text "$STORAGE_DISCREPANCY_STATE_FILE" \
                             "${streak} ${diff}"$'\n' || true
                         if (( streak >= ${STORAGE_DISCREPANCY_SUSTAIN_RUNS:-2} )); then
                             record_alert warning "Storage Validation" "Storage discrepancy diff=${diff}% (array ${ARRAY_PERCENT:-0}% vs /mnt/user ${user_pct_calc}%) — investigate share settings (Cache, Include/Exclude), mover status, recent deletions."
@@ -5100,7 +5519,7 @@ validate_storage_metrics() {
                     fi
                 else
                     # Reset streak when below threshold
-                    atomic_write_text "$STORAGE_DISCREPANCY_STATE_FILE" $'0 0\n' || true
+                    collector_atomic_write_text "$STORAGE_DISCREPANCY_STATE_FILE" $'0 0\n' || true
                 fi
             fi
         fi
@@ -5158,6 +5577,13 @@ build_subsystem_lines() {
     SUBSYSTEM_ENDURANCE_STATE="OK"
     SUBSYSTEM_SCHEDULING_STATE="OK"
     SUBSYSTEM_PARITY_STATE="OK"
+    SUBSYSTEM_MONITORING_STATE="OK"
+    for state in "${COLLECTOR_STATUS[@]}"; do
+        if [[ "$state" == "TIMED_OUT" || "$state" == "FAILED" ]]; then
+            SUBSYSTEM_MONITORING_STATE="WARNING"
+            break
+        fi
+    done
 
     # Retained SMART state for a sleeping disk remains reportable even when it
     # did not emit a fresh finding during this run.
@@ -5216,7 +5642,8 @@ Capacity: ${SUBSYSTEM_CAPACITY_STATE}
 Per-Mount: ${SUBSYSTEM_MOUNT_STATE}
 Endurance: ${SUBSYSTEM_ENDURANCE_STATE}
 Scheduling: ${SUBSYSTEM_SCHEDULING_STATE}
-Parity: ${SUBSYSTEM_PARITY_STATE}"
+Parity: ${SUBSYSTEM_PARITY_STATE}
+Monitoring: ${SUBSYSTEM_MONITORING_STATE}"
 }
 
 # Set FINDING_TARGET_LABEL_RESULT for one canonical finding without encoding
@@ -5273,6 +5700,7 @@ set_finding_target_label() {
                 capacity)    FINDING_TARGET_LABEL_RESULT="Capacity" ;;
                 parity)      FINDING_TARGET_LABEL_RESULT="Parity" ;;
                 maintenance) FINDING_TARGET_LABEL_RESULT="SMART scheduling" ;;
+                monitoring)  FINDING_TARGET_LABEL_RESULT="Monitoring" ;;
             esac
             ;;
     esac
@@ -6510,7 +6938,7 @@ build_disk_health_summary() {
     add_line() { local k="$1"; local v="$2"; if (( ${SHOW_ZERO_COUNTS:-0}==1 )) || (( v>0 )); then lines+=(" - $k: $v"); fi; }
     add_line "Critical" "$crit_count"
     add_line "Warning" "$warn_count"
-    add_line "SMART deferred (standby)" "$deferred_smart_count"
+    add_line "SMART deferred/unavailable" "$deferred_smart_count"
     local parity_invalid=0
     # Only mark invalid when array is idle; suppress during active parity operations
     if [[ "${PARITY_CLEAN_FLAG:-}" == "0" ]]; then
@@ -6655,6 +7083,11 @@ compute_risk_and_lifecycle() {
 # Append today's risk tier counts to history file
 persist_risk_tier_history() {
     (( RISK_SCORING_ENABLED == 1 )) || return 0
+    if ! all_collectors_state_safe; then
+        log "STATE" "WARN" \
+            "Preserved risk-tier history because one or more collectors were incomplete"
+        return 0
+    fi
     local today
     today=$(date '+%Y-%m-%d')
     local crit
@@ -6729,12 +7162,12 @@ compute_share_breakdown() {
     # Measure current share sizes and replace today's history snapshot.
     for path in "${shares[@]}"; do
         name=$(basename "$path")
-        bytes=$(du -sb "$path" 2>/dev/null | awk '{print $1}')
+        bytes=$(du_bounded -sb "$path" 2>/dev/null | awk '{print $1}')
         bytes=${bytes:-0}
         [[ "$bytes" =~ ^[0-9]+$ ]] || continue
         share_records+=("$today $name bytes=$bytes captured_epoch=$RUN_EPOCH schema=$HISTORY_SCHEMA_VERSION")
     done
-    atomic_replace_daily_history \
+    collector_replace_daily_history \
         "$SHARE_USAGE_HISTORY_FILE" "$today" "${share_records[@]}" ||
         log_warn "Unable to atomically update share-usage history"
     return 0
@@ -6781,7 +7214,7 @@ capacity_forecast_and_export() {
     # same-day sample instead of weighting that day multiple times.
     local capacity_record
     capacity_record="$now_date scope=capacity array=$array_pct pools=$pools_pct arr_bu=$arr_bu arr_bs=$arr_bs pool_bu=$pool_bu pool_bs=$pool_bs captured_epoch=$RUN_EPOCH schema=$HISTORY_SCHEMA_VERSION"
-    atomic_replace_daily_history "$CAPACITY_HISTORY_FILE" "$now_date" "$capacity_record" ||
+    collector_replace_daily_history "$CAPACITY_HISTORY_FILE" "$now_date" "$capacity_record" ||
         log_warn "Unable to atomically update capacity history"
     local arr_prev=() pool_prev=() dates=()
     local lines
@@ -6946,7 +7379,7 @@ tbw_forecast_and_heavy_writers() {
             tbw_records+=("$today $(persistent_device_key "$dev") tbw=$tbw captured_epoch=$RUN_EPOCH schema=$HISTORY_SCHEMA_VERSION")
         fi
     done
-    atomic_replace_daily_history "$TBW_HISTORY_FILE" "$today" "${tbw_records[@]}" ||
+    collector_replace_daily_history "$TBW_HISTORY_FILE" "$today" "${tbw_records[@]}" ||
         log_warn "Unable to atomically update TBW history"
     local win=$HISTORY_WINDOW_DAYS
     # Compute per-device daily TBW deltas over window and estimate days to threshold
@@ -6957,9 +7390,9 @@ tbw_forecast_and_heavy_writers() {
     if [[ -z "$lines" ]]; then
         # Clear today's derived snapshots as well; otherwise a manually
         # cleared or unavailable TBW history could leave stale same-day data.
-        atomic_replace_daily_history "$HEAVY_WRITER_HISTORY_FILE" "$today" ||
+        collector_replace_daily_history "$HEAVY_WRITER_HISTORY_FILE" "$today" ||
             log_warn "Unable to clear today's heavy-writer history"
-        atomic_replace_daily_history "$TBW_DAYSLEFT_HISTORY_FILE" "$today" ||
+        collector_replace_daily_history "$TBW_DAYSLEFT_HISTORY_FILE" "$today" ||
             log_warn "Unable to clear today's TBW days-left history"
         return 0
     fi
@@ -7102,7 +7535,7 @@ tbw_forecast_and_heavy_writers() {
             heavy_writer_records+=("$today $(persistent_device_key "$dev") norm=$pct daily=$daily confidence=${TBW_FORECAST_CONFIDENCE[$dev]:-INSUFFICIENT} captured_epoch=$RUN_EPOCH schema=$HISTORY_SCHEMA_VERSION")
         done < <(printf "%s\n" "$sorted")
     fi
-    atomic_replace_daily_history \
+    collector_replace_daily_history \
         "$HEAVY_WRITER_HISTORY_FILE" "$today" "${heavy_writer_records[@]}" ||
         log_warn "Unable to atomically update heavy-writer history"
     # Generate TBW endurance alerts
@@ -7126,7 +7559,7 @@ tbw_forecast_and_heavy_writers() {
             [[ -n "$dl" ]] || continue
             tbw_daysleft_records+=("$today $(persistent_device_key "$dev") days_left=$dl confidence=${TBW_FORECAST_CONFIDENCE[$dev]:-INSUFFICIENT} captured_epoch=$RUN_EPOCH schema=$HISTORY_SCHEMA_VERSION")
         done
-        atomic_replace_daily_history \
+        collector_replace_daily_history \
             "$TBW_DAYSLEFT_HISTORY_FILE" "$today" "${tbw_daysleft_records[@]}" ||
             log_warn "Unable to atomically update TBW days-left history"
     fi
@@ -7263,7 +7696,7 @@ collect_btrfs_device_stats() {
 
     for m in "${mounts[@]}"; do
         # Never pass -z: the monitor must preserve filesystem diagnostic evidence.
-        stats=$(btrfs device stats "$m" 2>/dev/null || true)
+        stats=$(btrfs_bounded device stats "$m" 2>/dev/null || true)
         [[ -n "$stats" ]] || continue
 
         while IFS= read -r line; do
@@ -7365,7 +7798,7 @@ collect_btrfs_device_stats() {
     done
 
     if (( out_has == 1 )); then
-        atomic_commit "$snapshot_temp" "$prev_file" || true
+        collector_atomic_commit "$snapshot_temp" "$prev_file" || true
     else
         rm -f -- "$snapshot_temp" 2>/dev/null || true
     fi
@@ -7517,7 +7950,7 @@ collect_xfs_proc_stats() {
 
         if (( burst_boost > 0 && XFS_PROC_SMART_ANNOTATE_BURST == 1 && suppress == 0 )); then
             for m in "${xfs_mounts_arr[@]}"; do
-                src=$(findmnt -n -o SOURCE "$m" 2>/dev/null || true)
+                src=$(findmnt_bounded -n -o SOURCE "$m" 2>/dev/null || true)
                 [[ -n "$src" ]] || continue
                 bdev=$(base_device "$src")
                 [[ -n "$bdev" ]] || continue
@@ -7531,7 +7964,7 @@ collect_xfs_proc_stats() {
     done
 
     if (( snapshot_count > 0 )); then
-        atomic_commit "$snapshot_temp" "$prev_file" || true
+        collector_atomic_commit "$snapshot_temp" "$prev_file" || true
     else
         rm -f -- "$snapshot_temp" 2>/dev/null || true
     fi
@@ -7551,7 +7984,7 @@ collect_xfs_proc_stats() {
         [[ $had_crit -eq 1 ]] && final_severity="critical" || final_severity="warning"
         if (( XFS_PROC_PER_MOUNT_ALERTS == 1 )); then
             for m in "${xfs_mounts_arr[@]}"; do
-                src=$(findmnt -n -o SOURCE "$m" 2>/dev/null || true)
+                src=$(findmnt_bounded -n -o SOURCE "$m" 2>/dev/null || true)
                 [[ -n "$src" ]] || continue
                 bdev=$(base_device "$src")
                 record_alert "$final_severity" "$NOTIFY_TITLE_XFS" "$message (${bdev:-unknown}, mount: $m)"
@@ -7606,6 +8039,7 @@ append_subsystem_subject_suffix() {
         "Endurance|${SUBSYSTEM_ENDURANCE_STATE:-OK}"
         "Scheduling|${SUBSYSTEM_SCHEDULING_STATE:-OK}"
         "Parity|${SUBSYSTEM_PARITY_STATE:-OK}"
+        "Monitoring|${SUBSYSTEM_MONITORING_STATE:-OK}"
     )
 
     case "${SHOW_SUBSYSTEMS_BLOCK:-auto}" in
@@ -7678,7 +8112,7 @@ limit_notification_body() {
 
     if (( LOG_FULL_NOTIFICATION_ON_TRUNCATION == 1 )) && [[ -n "${MASTER_LOG:-}" ]]; then
         {
-            printf '\n===== FULL NOTIFICATION BODY (v2.9) =====\n'
+            printf '\n===== FULL NOTIFICATION BODY (v2.10) =====\n'
             printf '%s\n' "$FULL_NOTIFICATION_BODY"
             printf '===== END FULL NOTIFICATION BODY =====\n'
         } >> "$MASTER_LOG"
@@ -7708,6 +8142,7 @@ compose_notification() {
     # Actionable findings are deliberately placed before verbose per-device
     # details so they remain visible if the body reaches its configured limit.
     add_notification_section "${HEALTH_ALERTS_SECTION:-}"
+    add_notification_section "${COLLECTOR_STATUS_SECTION:-}"
     add_notification_section "${DISK_HEALTH_SUMMARY:-}"
     add_notification_section "$array_section"
     add_notification_section "$pool_section"
@@ -7817,14 +8252,24 @@ persist_risk_scores() {
 persist_all_state() {
     log "STATE" "INFO" "Persisting runtime state"
 
-    save_nvme_state || true
-    save_long_last_poh || true
-    save_cmd_timeout_last || true
+    if collector_status_is_safe smart; then
+        save_nvme_state || true
+        save_long_last_poh || true
+        save_cmd_timeout_last || true
+        save_last_test || true
+        persist_current_attrs || true
+    else
+        log "STATE" "WARN" \
+            "Preserved SMART/NVMe baselines because the SMART collector was incomplete"
+    fi
     save_risk_spikes || true
-    save_last_test || true
-    persist_current_attrs || true
     persist_new_seen || true
-    persist_risk_scores || true
+    if all_collectors_state_safe; then
+        persist_risk_scores || true
+    else
+        log "STATE" "WARN" \
+            "Preserved prior risk scores because one or more collectors were incomplete"
+    fi
 }
 
 
@@ -8046,7 +8491,7 @@ validate_configuration() {
         HISTORY_PRUNE_ENABLED LOG_MIRROR_STDOUT SHOW_OK_SUBSYSTEMS
         SHOW_DISABLED_SUBSYSTEMS VERBOSE_OK SHOW_ZERO_COUNTS
         WEAR_TREND_ENABLED ENABLE_MODEL_IN_ALERTS
-        LOG_FULL_NOTIFICATION_ON_TRUNCATION
+        LOG_FULL_NOTIFICATION_ON_TRUNCATION COLLECTOR_FAILURE_NOTIFICATIONS
     )
     local -a integer_settings=(
         SHORT_TEST_INTERVAL_DAYS SHORT_TEST_MAX_WAIT SHORT_TEST_POLL_INTERVAL
@@ -8103,6 +8548,10 @@ validate_configuration() {
         W_POH_HDD W_POH_SSD W_POH_NVME W_BTRFS_DEV_ERR W_XFS_META_ERR
         W_SATA_LINK_DOWN W_SELFTEST_CRIT W_SELFTEST_WARN W_TBW_CONS_WARN
         W_TBW_CONS_CRIT NOTIFY_MAX_BODY_CHARS NOTIFY_MAX_BODY_LINES
+        SMARTCTL_TIMEOUT_SECONDS BTRFS_COMMAND_TIMEOUT_SECONDS
+        XFS_REPAIR_TIMEOUT_SECONDS SYSTEM_COMMAND_TIMEOUT_SECONDS
+        SHARE_SCAN_TIMEOUT_SECONDS NOTIFICATION_TIMEOUT_SECONDS
+        COMMAND_KILL_GRACE_SECONDS COLLECTOR_SLOW_SECONDS
     )
     local -a number_settings=(
         STORAGE_DISCREPANCY_MIN_DIFF ENDURANCE_DAYSLEFT_ACCEL_MIN_DELTA
@@ -8123,6 +8572,9 @@ validate_configuration() {
         HISTORY_WINDOW_DAYS HISTORY_SCHEMA_VERSION FORECAST_MIN_SAMPLES
         FORECAST_HIGH_SAMPLES FORECAST_MAX_GAP_DAYS
         NOTIFY_MAX_BODY_CHARS NOTIFY_MAX_BODY_LINES
+        SMARTCTL_TIMEOUT_SECONDS BTRFS_COMMAND_TIMEOUT_SECONDS
+        XFS_REPAIR_TIMEOUT_SECONDS SYSTEM_COMMAND_TIMEOUT_SECONDS
+        SHARE_SCAN_TIMEOUT_SECONDS NOTIFICATION_TIMEOUT_SECONDS COMMAND_KILL_GRACE_SECONDS
     )
     local -a ordered_pairs=(
         LONG_TEST_MIN_INTERVAL_DAYS:LONG_TEST_MAX_INTERVAL_DAYS
@@ -8193,6 +8645,12 @@ validate_configuration() {
         auto|always|never) ;;
         *) configuration_error \
             "SHOW_SUBSYSTEMS_BLOCK must be auto, always, or never (found '${SHOW_SUBSYSTEMS_BLOCK:-unset}')" ;;
+    esac
+
+    case "${SHOW_COLLECTOR_STATUS:-}" in
+        auto|always|never) ;;
+        *) configuration_error \
+            "SHOW_COLLECTOR_STATUS must be auto, always, or never (found '${SHOW_COLLECTOR_STATUS:-unset}')" ;;
     esac
 
     if [[ "${HISTORY_SCHEMA_VERSION:-}" =~ ^[0-9]+$ ]] &&
@@ -8273,12 +8731,12 @@ validate_runtime_dependencies() {
     DEPENDENCY_WARNING_COUNT=0
 
     if [[ "$mode" == "self-test" ]]; then
-        required_commands=(awk cut date grep mktemp mv rm sed sort wc)
+        required_commands=(awk cut date grep mktemp mv rm sed sleep sort timeout wc)
     else
         required_commands=(
             awk basename cat cksum cp cut date df dirname dmesg find findmnt
             flock grep head lsblk mkdir mktemp mount mountpoint mv readlink rm
-            sed sha1sum sleep smartctl sort stat tail tr wc
+            sed sha1sum sleep smartctl sort stat tail timeout tr wc
         )
     fi
 
@@ -8286,6 +8744,12 @@ validate_runtime_dependencies() {
         command -v "$command_name" >/dev/null 2>&1 ||
             dependency_error "Required command is unavailable: $command_name"
     done
+
+    if command -v timeout >/dev/null 2>&1 &&
+       ! timeout --signal=TERM --kill-after=1s 1s sleep 0 >/dev/null 2>&1
+    then
+        dependency_error "GNU-compatible timeout with --kill-after support is required"
+    fi
 
     if [[ "$mode" != "self-test" ]]; then
         if [[ "${ENABLE_BTRFS_SCRUB:-0}" == "1" ||
@@ -8342,7 +8806,7 @@ validate_runtime_dependencies() {
 
 print_usage() {
     cat <<'USAGE'
-Disk Health Monitor for Unraid v2.9
+Disk Health Monitor for Unraid v2.10
 
 Usage:
   health_monitoring.sh                 Run normal monitoring
@@ -8398,7 +8862,7 @@ run_diagnostics() {
     local failures=0 warnings=0 config_status=0 dependency_status=0
     local parent device_rows
 
-    printf 'Disk Health Monitor for Unraid v2.9 - read-only diagnostics\n'
+    printf 'Disk Health Monitor for Unraid v2.10 - read-only diagnostics\n'
     printf 'No disk SMART reads, tests, scrubs, state writes, cursor updates, or notifications will occur.\n\n'
 
     if validate_configuration; then
@@ -8419,6 +8883,8 @@ run_diagnostics() {
 
     diagnostic_result INFO "Bash" "$BASH_VERSION"
     diagnostic_result INFO "Kernel" "$(uname -sr 2>/dev/null || printf 'unknown')"
+    diagnostic_result INFO "Command deadlines" \
+        "SMART=${SMARTCTL_TIMEOUT_SECONDS}s Btrfs=${BTRFS_COMMAND_TIMEOUT_SECONDS}s XFS=${XFS_REPAIR_TIMEOUT_SECONDS}s System=${SYSTEM_COMMAND_TIMEOUT_SECONDS}s Share=${SHARE_SCAN_TIMEOUT_SECONDS}s Notify=${NOTIFICATION_TIMEOUT_SECONDS}s"
 
     if [[ -d "$LOG_DIR" ]]; then
         if [[ -w "$LOG_DIR" ]]; then
@@ -8476,7 +8942,7 @@ run_diagnostics() {
         diagnostic_result WARN "Unraid user share" "/mnt/user is not mounted"
     fi
 
-    device_rows=$(lsblk -b -dn -o NAME,SIZE,ROTA,TYPE 2>/dev/null |
+    device_rows=$(lsblk_bounded -b -dn -o NAME,SIZE,ROTA,TYPE 2>/dev/null |
         awk '$4=="disk" && ($1 ~ /^sd[a-z]+$/ || $1 ~ /^nvme[0-9]+n[0-9]+$/) {count++} END {print count+0}')
     diagnostic_result INFO "Block-device inventory" "${device_rows:-0} candidate disk(s), read from lsblk only"
 
@@ -8511,7 +8977,7 @@ run_regression_tests() (
     }
     trap '[[ -z "$fixture_dir" || "$fixture_dir" != /tmp/health_monitoring.selftest.* ]] || rm -rf -- "$fixture_dir"' EXIT
 
-    printf 'Disk Health Monitor for Unraid v2.9 - built-in regression tests\n'
+    printf 'Disk Health Monitor for Unraid v2.10 - built-in regression tests\n'
     printf 'Fixtures are isolated under %s and removed automatically.\n\n' "$fixture_dir"
 
     actual=$(safe_state_name '/dev/disk/by-id/ata-Test Drive')
@@ -8703,10 +9169,147 @@ run_regression_tests() (
             "truncated=$NOTIFICATION_TRUNCATED chars=$actual lines=$count"
     fi
 
+    COLLECTOR_EVENT_FILE="$fixture_dir/collector_events.tsv"
+    : > "$COLLECTOR_EVENT_FILE"
+    CURRENT_COLLECTOR="timeout_fixture"
+    COMMAND_KILL_GRACE_SECONDS=1
+    local timeout_rc=0
+    if run_bounded 1 "intentional timeout fixture" sleep 2; then
+        timeout_rc=0
+    else
+        timeout_rc=$?
+    fi
+    actual=$(collector_event_count timeout_fixture TIMEOUT)
+    if [[ "$timeout_rc" == "124" && "$actual" == "1" ]]; then
+        self_test_result 1 "Bounded command timeout classification"
+    else
+        self_test_result 0 "Bounded command timeout classification" \
+            "rc=$timeout_rc timeout_events=$actual"
+    fi
+
+    local protected_state="$fixture_dir/protected.state" protected_temp
+    printf 'known-good\n' > "$protected_state"
+    protected_temp="$(state_temp_file "$protected_state")"
+    printf 'incomplete-replacement\n' > "$protected_temp"
+    collector_atomic_commit "$protected_temp" "$protected_state"
+    actual=$(<"$protected_state")
+    if [[ "$actual" == "known-good" && ! -e "$protected_temp" ]]; then
+        self_test_result 1 "Failed collector baseline preservation"
+    else
+        self_test_result 0 "Failed collector baseline preservation" "found '$actual'"
+    fi
+
+    printf 'smart\tFAILED\tsmartctl /dev/sdaa\trc=2\n' > "$COLLECTOR_EVENT_FILE"
+    if ! collector_device_has_blocking_event smart /dev/sda &&
+       collector_device_has_blocking_event smart /dev/sdaa
+    then
+        self_test_result 1 "Exact per-device collector failure isolation"
+    else
+        self_test_result 0 "Exact per-device collector failure isolation"
+    fi
+
+    : > "$COLLECTOR_EVENT_FILE"
+    COLLECTOR_ORDER=()
+    COLLECTOR_LABEL=()
+    COLLECTOR_STATUS=()
+    COLLECTOR_DURATION=()
+    COLLECTOR_DETAIL=()
+    COLLECTOR_FAILURE_NOTIFICATIONS=0
+    COLLECTOR_SLOW_SECONDS=0
+    fixture_deferred_collector() {
+        record_collector_event DEFERRED "fixture device" "standby"
+        return 0
+    }
+    fixture_failed_collector() {
+        return 7
+    }
+    run_collector deferred_fixture "Deferred fixture" fixture_deferred_collector
+    run_collector failed_fixture "Failed fixture" fixture_failed_collector
+    if [[ "${COLLECTOR_STATUS[deferred_fixture]:-}" == "DEFERRED" &&
+          "${COLLECTOR_STATUS[failed_fixture]:-}" == "FAILED" &&
+          "$LAST_COLLECTOR_RC" == "7" ]]
+    then
+        self_test_result 1 "Collector deferred and failed status aggregation"
+    else
+        self_test_result 0 "Collector deferred and failed status aggregation" \
+            "deferred=${COLLECTOR_STATUS[deferred_fixture]:-unset} failed=${COLLECTOR_STATUS[failed_fixture]:-unset} rc=$LAST_COLLECTOR_RC"
+    fi
+
+    SHOW_COLLECTOR_STATUS="always"
+    build_collector_status_section
+    if [[ "$COLLECTOR_STATUS_SECTION" == *'Deferred fixture: DEFERRED'* &&
+          "$COLLECTOR_STATUS_SECTION" == *'Failed fixture: FAILED'* &&
+          "$COLLECTOR_STATUS_SECTION" == *'Deferred=1'* &&
+          "$COLLECTOR_STATUS_SECTION" == *'Failed=1'* ]]
+    then
+        self_test_result 1 "Collector status report rendering"
+    else
+        self_test_result 0 "Collector status report rendering" "unexpected collector report"
+    fi
+
     printf '\nSelf-test summary: passed=%d failed=%d total=%d\n' \
         "$SELF_TEST_PASSED" "$SELF_TEST_FAILED" "$SELF_TEST_TOTAL"
     (( SELF_TEST_FAILED == 0 ))
 )
+
+
+# Collector bundles keep dependencies and persistence gates aligned while
+# allowing the orchestrator to continue after non-fatal subsystem failures.
+collector_step() {
+    local label="$1"
+    shift
+    local rc
+
+    if "$@"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    (( rc == 0 )) && return 0
+    record_collector_event FAILED "$label" "collector_step_rc=$rc"
+    return 0
+}
+
+collect_inventory_phase() {
+    cache_lsblk_all
+    discover_device_inventory || return 1
+    if collector_current_state_writable; then
+        migrate_device_identity_histories || true
+    else
+        log "STATE" "WARN" \
+            "Deferred stable-identity migration because inventory collection was incomplete"
+    fi
+    load_persistent_state
+    parity_state || true
+    build_mount_device_map
+}
+
+collect_btrfs_filesystem_phase() {
+    collector_step "Btrfs scrub status" monitor_btrfs
+    collector_step "Btrfs snapshot count" check_btrfs_snapshots
+    return 0
+}
+
+collect_capacity_phase() {
+    collector_step "Storage utilization" build_storage_and_disk_lines
+    collector_step "Capacity thresholds" evaluate_capacity_alerts
+    collector_step "Per-mount thresholds" evaluate_per_mount_thresholds
+    collector_step "Parity status" discover_parity_and_status
+    return 0
+}
+
+collect_growth_phase() {
+    collector_step "Capacity forecast" capacity_forecast_and_export
+    collector_step "Storage validation" validate_storage_metrics
+    collector_step "Share breakdown" compute_share_breakdown
+    return 0
+}
+
+collect_endurance_phase() {
+    collector_step "TBW forecast" tbw_forecast_and_heavy_writers
+    collector_step "Counter regression detection" detect_counter_resets
+    return 0
+}
 
 
 main() {
@@ -8719,7 +9322,7 @@ main() {
             return 0
             ;;
         version)
-            printf 'Disk Health Monitor for Unraid v2.9\n'
+            printf 'Disk Health Monitor for Unraid v2.10\n'
             return 0
             ;;
         check-config)
@@ -8759,56 +9362,49 @@ main() {
 
     log "RUN" "INFO" "Starting Unraid disk health monitoring"
 
-    cache_lsblk_all
-    discover_device_inventory || return 1
-    migrate_device_identity_histories || true
-    load_persistent_state
-    parity_state || true
-    build_mount_device_map
+    run_collector inventory "Device inventory" collect_inventory_phase
+    if (( LAST_COLLECTOR_RC != 0 || DEVICE_INVENTORY_READY != 1 )); then
+        log "RUN" "ERROR" "Device inventory is unavailable; monitoring cannot continue safely"
+        return 1
+    fi
 
     log "SMART" "INFO" \
         "Collecting SMART health (short-test interval=${SHORT_TEST_INTERVAL_DAYS}d, automatic spin-up=${SMART_ALLOW_SPINUP})"
-    collect_smart_health
+    run_collector smart "SMART/NVMe health" collector_step "SMART/NVMe collection" collect_smart_health
 
     log "BTRFS" "INFO" "Assessing scrub status"
-    monitor_btrfs
-    check_btrfs_snapshots
+    run_collector btrfs_filesystem "Btrfs scrub and snapshots" collect_btrfs_filesystem_phase
 
     log "XFS" "INFO" "Assessing filesystem metadata health"
-    monitor_xfs
+    run_collector xfs_metadata "XFS metadata" collector_step "XFS metadata checks" monitor_xfs
 
     log "CAPACITY" "INFO" "Collecting array, pool, and disk utilization"
-    build_storage_and_disk_lines
-    evaluate_capacity_alerts
-    evaluate_per_mount_thresholds
-    discover_parity_and_status
+    run_collector capacity "Capacity and parity" collect_capacity_phase
 
     log "BTRFS" "INFO" "Collecting non-destructive device statistics"
-    collect_btrfs_device_stats
+    run_collector btrfs_devices "Btrfs device counters" collector_step "Btrfs device counters" collect_btrfs_device_stats
 
     log "XFS" "INFO" "Collecting XFS activity counters"
-    collect_xfs_proc_stats
+    run_collector xfs_counters "XFS activity counters" collector_step "XFS activity counters" collect_xfs_proc_stats
 
     log "IO" "INFO" "Scanning syslog once for disk I/O errors"
-    scan_syslog_disk_errors
+    run_collector syslog_io "Syslog I/O scan" collector_step "Syslog I/O scan" scan_syslog_disk_errors
 
     log "CAPACITY" "INFO" "Updating growth forecasts and validation"
-    capacity_forecast_and_export
-    validate_storage_metrics
-    compute_share_breakdown
+    run_collector growth "Capacity and share trends" collect_growth_phase
 
     log "ENDURANCE" "INFO" "Updating TBW and heavy-writer forecasts"
-    tbw_forecast_and_heavy_writers
-    detect_counter_resets
+    run_collector endurance "Endurance forecasts" collect_endurance_phase
 
     # Trend analysis can raise findings, so it must complete before canonical
     # risk, lifecycle classification, and alert rendering.
     log "TREND" "INFO" "Compiling trend analytics"
-    build_trend_section
+    run_collector trends "Trend analytics" collector_step "Trend analytics" build_trend_section
 
     log "RISK" "INFO" "Computing canonical risk and lifecycle state"
-    compute_risk_and_lifecycle
+    run_collector risk "Risk and lifecycle" collector_step "Risk and lifecycle" compute_risk_and_lifecycle
     finalize_finding_counts
+    build_collector_status_section
 
     log "REPORT" "INFO" "Finalizing alert and summary sections"
     build_disk_health_summary
