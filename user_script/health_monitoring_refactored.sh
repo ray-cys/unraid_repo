@@ -3,7 +3,7 @@
 noParity=true
 set -uo pipefail
 
-# Disk Health Monitor for Unraid v2.2
+# Disk Health Monitor for Unraid v2.4
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
@@ -65,6 +65,8 @@ IO_ERROR_LOG_FILE="/var/log/syslog"             # Syslog path fallback to dmesg
 IO_ERROR_WINDOW_MINUTES=60                      # Time window (minutes) for de-dup/frequency
 IO_ERROR_WARN_THRESHOLD=5                       # Unique error events >= warning
 IO_ERROR_CRIT_THRESHOLD=20                      # Unique error events >= critical
+SYSLOG_CURSOR_STARTUP_LOOKBACK_LINES=100         # First cursor run: inspect only the most recent N lines
+SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES=2000       # Recovery scan when the previous rotated file cannot be found
 
 # === Trends & Alerts: Toggles ===
 AGE_AWARE_ENABLED=1                             # Annotate near-endurance devices (0=disable)
@@ -339,6 +341,14 @@ CLEANUP_DONE=0
 PARITY_STATE_LOADED=0
 PARITY_ACTIVE=0
 DEVICE_INVENTORY_READY=0
+SYSLOG_CURSOR_READY=0
+SYSLOG_CURSOR_PENDING_PATH=""
+SYSLOG_CURSOR_PENDING_DEVICE=""
+SYSLOG_CURSOR_PENDING_INODE=""
+SYSLOG_CURSOR_PENDING_LINES=0
+SYSLOG_CURSOR_PENDING_SIZE=0
+SYSLOG_CURSOR_PENDING_ANCHOR="-"
+SYSLOG_CHUNK_FILE=""
 
 # === Logs Paths ===
 STATE_DIR="$LOG_DIR/state"
@@ -391,6 +401,8 @@ CMD_TIMEOUT_STATE_DIR="$STATE_DIR/cmd_timeout"                      # Per-disk c
 UNSAFE_SDWN_STATE_DIR="$STATE_DIR/unsafe_shutdown"                  # Per-NVMe unsafe shutdown cooldown files
 BTRFS_SCRUB_STATE_DIR="$STATE_DIR/btrfs_scrub_status"               # Per-pool scrub status (in-progress vs last)
 XFS_PROC_PREV_FILE="$STATE_DIR/xfs_proc_stats_prev.log"             # Previous XFS /proc snapshot (delta anomaly detection)
+BTRFS_DEV_PREV_FILE="$STATE_DIR/btrfs_device_stats.prev"            # Previous Btrfs per-device counters and capture metadata
+SYSLOG_CURSOR_STATE_FILE="$STATE_DIR/syslog_cursor.state"            # Persistent inode/line cursor for incremental syslog reads
 STORAGE_DISCREPANCY_STATE_FILE="$STATE_DIR/storage_discrepancy_streak.log"  # Storage discrepancy streak counter
 RISK_SPIKE_FILE="$STATE_DIR/risk_spikes.log"                        # Persisted risk spike timestamps (accelerated scheduling)
 DEVICE_ID_MAP_FILE="$STATE_DIR/device_identity_map.log"             # Stable ID to current /dev path inventory
@@ -414,7 +426,7 @@ RISK_SCORES_HISTORY_FILE="$STATE_DIR/risk_scores_history.log"       # Historical
 TEMP_HISTORY_FILE="$STATE_DIR/temp_history.log"                     # Temperature samples (rate & exposure)
 SELFTEST_HISTORY_FILE="$STATE_DIR/selftest_events.log"              # SMART self-test lifecycle history (frequency/volatility)
 STATE_FILES_ALERT_RUNTIME=(
-    "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$NVME_STATE_FILE" "$PREV_ATTR_FILE" "$ALERT_NEW_SEEN_FILE" "$RISK_PREV_FILE" "$CMD_TIMEOUT_LAST_FILE" "$XFS_PROC_PREV_FILE" "$STORAGE_DISCREPANCY_STATE_FILE" "$RISK_SPIKE_FILE" "$REPLACEMENT_EVENTS_FILE" "$SATA_LINK_HISTORY_FILE"
+    "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$NVME_STATE_FILE" "$PREV_ATTR_FILE" "$ALERT_NEW_SEEN_FILE" "$RISK_PREV_FILE" "$CMD_TIMEOUT_LAST_FILE" "$XFS_PROC_PREV_FILE" "$BTRFS_DEV_PREV_FILE" "$SYSLOG_CURSOR_STATE_FILE" "$STORAGE_DISCREPANCY_STATE_FILE" "$RISK_SPIKE_FILE" "$REPLACEMENT_EVENTS_FILE" "$SATA_LINK_HISTORY_FILE"
 )
 STATE_FILES_TREND_HISTORY=(
     "$CAPACITY_HISTORY_FILE" "$DISK_CAP_HISTORY_FILE" "$SHARE_USAGE_HISTORY_FILE" "$HEAVY_WRITER_HISTORY_FILE" "$RISK_TIER_HISTORY_FILE" "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE" "$XFS_PROC_HISTORY_FILE" "$POH_HISTORY_FILE" "$TBW_HISTORY_FILE" "$TBW_DAYSLEFT_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$RISK_SCORES_HISTORY_FILE" "$TEMP_HISTORY_FILE" "$SELFTEST_HISTORY_FILE"
@@ -659,7 +671,7 @@ prune_history_files() {
     today=$(date '+%Y-%m-%d')
     if (( max_days > 0 )); then cutoff=$(date -d "-${max_days} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d'); fi
     local files=(
-        "$CAPACITY_HISTORY_FILE" "$DISK_CAP_HISTORY_FILE" "$SHARE_USAGE_HISTORY_FILE" "$HEAVY_WRITER_HISTORY_FILE" "$RISK_TIER_HISTORY_FILE" "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE" "$XFS_PROC_HISTORY_FILE" "$XFS_PROC_PREV_FILE" "$POH_HISTORY_FILE" "$TBW_DAYSLEFT_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$RISK_SCORES_HISTORY_FILE" "$TEMP_HISTORY_FILE" "$TBW_HISTORY_FILE" "$SELFTEST_HISTORY_FILE" "$SATA_LINK_HISTORY_FILE"
+        "$CAPACITY_HISTORY_FILE" "$DISK_CAP_HISTORY_FILE" "$SHARE_USAGE_HISTORY_FILE" "$HEAVY_WRITER_HISTORY_FILE" "$RISK_TIER_HISTORY_FILE" "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE" "$XFS_PROC_HISTORY_FILE" "$POH_HISTORY_FILE" "$TBW_DAYSLEFT_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$RISK_SCORES_HISTORY_FILE" "$TEMP_HISTORY_FILE" "$TBW_HISTORY_FILE" "$SELFTEST_HISTORY_FILE" "$SATA_LINK_HISTORY_FILE"
     )
     local f
     for f in "${files[@]}"; do
@@ -1493,7 +1505,7 @@ migrate_device_identity_histories() {
         "$HEAVY_WRITER_HISTORY_FILE"
         "$TBW_DAYSLEFT_HISTORY_FILE"
         "$BTRFS_DEV_HIST_FILE"
-        "$STATE_DIR/btrfs_device_stats.prev"
+        "$BTRFS_DEV_PREV_FILE"
         "$IO_ERROR_HISTORY_FILE"
     )
 
@@ -3755,27 +3767,190 @@ check_btrfs_snapshots() {
     done
 }
 
-# === Helper Function ===
-# Scan syslog/dmesg for disk I/O errors, count unique occurrences per device over time window.
+# Append a fixed, inclusive line range without reading lines appended after the
+# metadata snapshot. Called directly so write failures propagate to the cursor
+# builder instead of being hidden by command substitution.
+append_syslog_line_range() {
+    local source="$1" start_line="$2" end_line="$3" target="$4"
+
+    (( start_line <= end_line )) || return 0
+    sed -n "${start_line},${end_line}p" "$source" >> "$target"
+}
+
+# Build the exact syslog chunk for this run and stage the cursor metadata that
+# may be committed only after the I/O history update succeeds.
+build_new_syslog_chunk() {
+    local source="$IO_ERROR_LOG_FILE"
+    local metadata current_device current_inode current_size current_lines current_anchor="-"
+    local schema="" previous_path="" previous_device="" previous_inode=""
+    local previous_lines=0 previous_size=0 previous_anchor="-" start_line reason
+    local rotated rotated_metadata rotated_device rotated_inode rotated_size rotated_lines
+    local recovered=0 anchor_matches=0 observed_anchor=""
+    local verify_metadata verify_device verify_inode verify_size chunk_lines
+
+    SYSLOG_CURSOR_READY=0
+    SYSLOG_CHUNK_FILE="$RUN_DIR/syslog.incremental.log"
+    : > "$SYSLOG_CHUNK_FILE" || return 1
+
+    if [[ ! -r "$source" ]]; then
+        dmesg 2>/dev/null | tail -n "$SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES" > "$SYSLOG_CHUNK_FILE" || true
+        log "SYSLOG" "WARN" \
+            "$source is unavailable; using a non-cursor dmesg fallback"
+        return 0
+    fi
+
+    metadata=$(stat -c '%d %i %s' -- "$source" 2>/dev/null) || return 1
+    read -r current_device current_inode current_size <<< "$metadata"
+    current_lines=$(wc -l < "$source" 2>/dev/null || echo 0)
+    current_lines=${current_lines//[[:space:]]/}
+    [[ "$current_device" =~ ^[0-9]+$ && "$current_inode" =~ ^[0-9]+$ ]] || return 1
+    [[ "$current_size" =~ ^[0-9]+$ && "$current_lines" =~ ^[0-9]+$ ]] || return 1
+    if (( current_lines > 0 )); then
+        current_anchor=$(sed -n "${current_lines}p" "$source" 2>/dev/null | sha1sum | awk '{print $1}')
+        [[ -n "$current_anchor" ]] || current_anchor="-"
+    fi
+
+    if [[ -s "$SYSLOG_CURSOR_STATE_FILE" ]]; then
+        read -r schema previous_path previous_device previous_inode previous_lines previous_size previous_anchor \
+            < "$SYSLOG_CURSOR_STATE_FILE" || true
+    fi
+    if [[ "$schema" != "v2" || ! "$previous_device" =~ ^[0-9]+$ ||
+          ! "$previous_inode" =~ ^[0-9]+$ || ! "$previous_lines" =~ ^[0-9]+$ ||
+          ! "$previous_size" =~ ^[0-9]+$ || -z "$previous_anchor" ]]; then
+        schema=""
+        previous_lines=0
+        previous_size=0
+        previous_anchor="-"
+    fi
+
+    if [[ -n "$schema" && "$previous_path" == "$source" &&
+          "$previous_device" == "$current_device" && "$previous_inode" == "$current_inode" &&
+          "$current_lines" -ge "$previous_lines" && "$current_size" -ge "$previous_size" ]]; then
+        if (( previous_lines == 0 )) || [[ "$previous_anchor" == "-" ]]; then
+            anchor_matches=1
+        else
+            observed_anchor=$(sed -n "${previous_lines}p" "$source" 2>/dev/null | sha1sum | awk '{print $1}')
+            [[ "$observed_anchor" == "$previous_anchor" ]] && anchor_matches=1
+        fi
+    fi
+
+    if [[ -z "$schema" ]]; then
+        if (( current_lines > SYSLOG_CURSOR_STARTUP_LOOKBACK_LINES )); then
+            start_line=$(( current_lines - SYSLOG_CURSOR_STARTUP_LOOKBACK_LINES + 1 ))
+        else
+            start_line=1
+        fi
+        append_syslog_line_range "$source" "$start_line" "$current_lines" "$SYSLOG_CHUNK_FILE" || return 1
+        reason="initial lookback"
+    elif (( anchor_matches == 1 )); then
+        start_line=$(( previous_lines + 1 ))
+        append_syslog_line_range "$source" "$start_line" "$current_lines" "$SYSLOG_CHUNK_FILE" || return 1
+        reason="cursor continuation"
+    else
+        for rotated in "${source}.1" "${source}.0"; do
+            [[ -r "$rotated" ]] || continue
+            rotated_metadata=$(stat -c '%d %i %s' -- "$rotated" 2>/dev/null) || continue
+            read -r rotated_device rotated_inode rotated_size <<< "$rotated_metadata"
+            [[ "$rotated_device" == "$previous_device" && "$rotated_inode" == "$previous_inode" ]] || continue
+            rotated_lines=$(wc -l < "$rotated" 2>/dev/null || echo 0)
+            rotated_lines=${rotated_lines//[[:space:]]/}
+            [[ "$rotated_lines" =~ ^[0-9]+$ ]] || continue
+            if (( previous_lines > 0 )) && [[ "$previous_anchor" != "-" ]]; then
+                observed_anchor=$(sed -n "${previous_lines}p" "$rotated" 2>/dev/null | sha1sum | awk '{print $1}')
+                [[ "$observed_anchor" == "$previous_anchor" ]] || continue
+            fi
+            append_syslog_line_range "$rotated" "$(( previous_lines + 1 ))" "$rotated_lines" "$SYSLOG_CHUNK_FILE" || return 1
+            append_syslog_line_range "$source" 1 "$current_lines" "$SYSLOG_CHUNK_FILE" || return 1
+            recovered=1
+            reason="rotation recovery via ${rotated}"
+            break
+        done
+
+        if (( recovered == 0 )); then
+            if (( current_lines > SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES )); then
+                start_line=$(( current_lines - SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES + 1 ))
+            else
+                start_line=1
+            fi
+            append_syslog_line_range "$source" "$start_line" "$current_lines" "$SYSLOG_CHUNK_FILE" || return 1
+            reason="rotation/truncation fallback"
+            log "SYSLOG" "WARN" \
+                "Previous syslog inode was unavailable; scanning the last ${SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES} line(s)"
+        fi
+    fi
+
+    # Do not advance a cursor captured across a concurrent rotation. The chunk
+    # remains safe to process because event hashes are de-duplicated; the next
+    # run will retry from the last committed cursor.
+    verify_metadata=$(stat -c '%d %i %s' -- "$source" 2>/dev/null || true)
+    read -r verify_device verify_inode verify_size <<< "$verify_metadata"
+    if [[ "$verify_device" != "$current_device" || "$verify_inode" != "$current_inode" ]]; then
+        log "SYSLOG" "WARN" "Syslog rotated while its incremental chunk was being built; cursor advancement deferred"
+        return 0
+    fi
+
+    SYSLOG_CURSOR_PENDING_PATH="$source"
+    SYSLOG_CURSOR_PENDING_DEVICE="$current_device"
+    SYSLOG_CURSOR_PENDING_INODE="$current_inode"
+    SYSLOG_CURSOR_PENDING_LINES="$current_lines"
+    SYSLOG_CURSOR_PENDING_SIZE="$current_size"
+    SYSLOG_CURSOR_PENDING_ANCHOR="$current_anchor"
+    SYSLOG_CURSOR_READY=1
+
+    chunk_lines=$(wc -l < "$SYSLOG_CHUNK_FILE" 2>/dev/null || echo 0)
+    chunk_lines=${chunk_lines//[[:space:]]/}
+    log "SYSLOG" "INFO" \
+        "Prepared ${chunk_lines:-0} new line(s) using ${reason}"
+}
+
+commit_syslog_cursor() {
+    (( SYSLOG_CURSOR_READY == 1 )) || return 0
+    atomic_write_text "$SYSLOG_CURSOR_STATE_FILE" \
+        "v2 $SYSLOG_CURSOR_PENDING_PATH $SYSLOG_CURSOR_PENDING_DEVICE $SYSLOG_CURSOR_PENDING_INODE $SYSLOG_CURSOR_PENDING_LINES $SYSLOG_CURSOR_PENDING_SIZE $SYSLOG_CURSOR_PENDING_ANCHOR"$'\n'
+}
+
+syslog_timestamp_epoch() {
+    local line="$1" now_epoch="$2"
+    local timestamp year epoch
+
+    timestamp=$(printf '%s\n' "$line" | awk '{print $1" "$2" "$3}')
+    if [[ "$timestamp" =~ ^[A-Z][a-z]{2}\ [0-9]{1,2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+        year=$(date '+%Y')
+        epoch=$(date -d "$timestamp $year" +%s 2>/dev/null || echo "$now_epoch")
+        if (( epoch > now_epoch + 86400 )); then
+            epoch=$(date -d "$timestamp $(( year - 1 ))" +%s 2>/dev/null || echo "$now_epoch")
+        fi
+        printf '%s' "$epoch"
+    else
+        printf '%s' "$now_epoch"
+    fi
+}
+
+# Scan only the new syslog chunk, count unique disk I/O events in the configured
+# time window, then atomically advance history and cursor together.
 scan_syslog_disk_errors() {
     (( IO_ERROR_MONITOR_ENABLED == 1 )) || { IO_ERROR_FREQ_SECTION=""; return 0; }
     local had_e=0
     case $- in *e*) had_e=1; set +e;; esac
     local window_sec=$(( IO_ERROR_WINDOW_MINUTES * 60 ))
-    local now_epoch
+    local now_epoch cutoff stored_key dev key new_hist history_committed=0
+    local line tok dev_tokens ts epoch hash event_hash normalized_line
     now_epoch=$(date +%s)
-    local cutoff=$(( now_epoch - window_sec ))
-    local log_src stored_key
-    if [[ -f "$IO_ERROR_LOG_FILE" ]]; then
-        log_src=$(tail -n 20000 "$IO_ERROR_LOG_FILE" 2>/dev/null || true)
-    else
-        log_src=$(dmesg 2>/dev/null | tail -n 20000 || true)
+    cutoff=$(( now_epoch - window_sec ))
+
+    IO_ERROR_RAW_MAP=()
+    IO_ERROR_UNIQUE_MAP=()
+    declare -A HASH_SEEN NEW_IO_EVENT_MAP
+
+    if ! build_new_syslog_chunk; then
+        log "SYSLOG" "WARN" "Unable to build the incremental syslog chunk; cursor was not advanced"
+        SYSLOG_CHUNK_FILE=""
     fi
-    declare -A HASH_SEEN
+
     if [[ -f "$IO_ERROR_HISTORY_FILE" ]]; then
         while read -r ts stored_key hash; do
             dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
-            [[ -z "$ts" || -z "$dev" || -z "$hash" ]] && continue
+            [[ -z "$ts" || -z "$dev" || -z "$hash" || ! "$ts" =~ ^[0-9]+$ ]] && continue
             if (( ts >= cutoff )); then
                 if [[ -z "${HASH_SEEN["$dev|$hash"]:-}" ]]; then
                     IO_ERROR_UNIQUE_MAP["$dev"]=$(( ${IO_ERROR_UNIQUE_MAP["$dev"]:-0} + 1 ))
@@ -3784,59 +3959,69 @@ scan_syslog_disk_errors() {
             fi
         done < "$IO_ERROR_HISTORY_FILE"
     fi
-    local new_hist
-    new_hist="$(state_temp_file "$IO_ERROR_HISTORY_FILE")" || {
-        log_warn "Unable to create I/O error history temporary file"
-        new_hist=""
-    }
-    for key in "${!HASH_SEEN[@]}"; do
-        if [[ -n "$new_hist" ]]; then
-            local ts="${HASH_SEEN[$key]}" dv="${key%%|*}" h="${key#*|}"
-            printf "%s %s %s\n" "$ts" "$(persistent_device_key "$dv")" "$h" >> "$new_hist"
-        fi
-    done
-    while read -r line; do
-        [[ "$line" == *"Script aborted"* ]] && continue
-        [[ "$line" == *"Disk I/O Alert"* ]] && continue
-        if ! grep -qiE 'I/O error|blk_update_request|end_request|failed command: (READ|WRITE)|hard resetting link|link is slow to respond|exception Emask' <<< "$line"; then
-            continue
-        fi
-        local devices=()
-        local dev_tokens
-        dev_tokens=$(echo "$line" | grep -oE 'sd[a-z]|nvme[0-9]+n[0-9]+' 2>/dev/null || true)
-        for tok in $dev_tokens; do
-            [[ -n "$tok" ]] && devices+=("/dev/$tok")
+
+    new_hist="$(state_temp_file "$IO_ERROR_HISTORY_FILE")" || new_hist=""
+    if [[ -z "$new_hist" ]]; then
+        log "SYSLOG" "WARN" "Unable to create I/O history staging file; cursor was not advanced"
+    else
+        for key in "${!HASH_SEEN[@]}"; do
+            ts="${HASH_SEEN[$key]}"
+            dev="${key%%|*}"
+            hash="${key#*|}"
+            printf '%s %s %s\n' "$ts" "$(persistent_device_key "$dev")" "$hash" >> "$new_hist"
         done
-        (( ${#devices[@]} == 0 )) && continue
-        local ts_part epoch
-        ts_part=$(echo "$line" | awk '{print $1" "$2" "$3}')
-        if [[ "$ts_part" =~ ^[A-Z][a-z]{2}\ [0-9]{1,2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
-            epoch=$(date -d "$ts_part $(date '+%Y')" +%s 2>/dev/null || echo "$now_epoch")
-        else
-            epoch=$now_epoch
+
+        if [[ -n "$SYSLOG_CHUNK_FILE" && -r "$SYSLOG_CHUNK_FILE" ]]; then
+            while IFS= read -r line; do
+                [[ "$line" == *"Script aborted"* || "$line" == *"Disk I/O Alert"* ]] && continue
+                if ! grep -qiE 'I/O error|blk_update_request|end_request|failed command: (READ|WRITE)|hard resetting link|link is slow to respond|exception Emask' <<< "$line"; then
+                    continue
+                fi
+
+                dev_tokens=$(printf '%s\n' "$line" | grep -oE 'sd[a-z]+|nvme[0-9]+n[0-9]+' 2>/dev/null | sort -u || true)
+                [[ -n "$dev_tokens" ]] || continue
+                epoch=$(syslog_timestamp_epoch "$line" "$now_epoch")
+                [[ "$epoch" =~ ^[0-9]+$ ]] || epoch=$now_epoch
+                (( epoch >= cutoff )) || continue
+
+                normalized_line=$(
+                    printf '%s' "$line" |
+                        sed -E 's/^[A-Z][a-z]{2}[[:space:]]+[0-9]{1,2}[[:space:]]+[0-9:]{8}[[:space:]]+//'
+                )
+                hash=$(printf '%s' "$normalized_line" | sha1sum | awk '{print $1}')
+
+                while IFS= read -r tok; do
+                    [[ -n "$tok" ]] || continue
+                    dev="/dev/$tok"
+                    IO_ERROR_RAW_MAP["$dev"]=$(( ${IO_ERROR_RAW_MAP["$dev"]:-0} + 1 ))
+                    event_hash="$hash"
+                    if (( IO_ERROR_DEDUP_ENABLED == 0 )); then
+                        event_hash="${hash}_${epoch}_${IO_ERROR_RAW_MAP[$dev]}"
+                    fi
+                    if (( IO_ERROR_DEDUP_ENABLED == 1 )) && [[ -n "${HASH_SEEN["$dev|$event_hash"]:-}" ]]; then
+                        continue
+                    fi
+                    if [[ -z "${HASH_SEEN["$dev|$event_hash"]:-}" ]]; then
+                        IO_ERROR_UNIQUE_MAP["$dev"]=$(( ${IO_ERROR_UNIQUE_MAP["$dev"]:-0} + 1 ))
+                    fi
+                    HASH_SEEN["$dev|$event_hash"]=$epoch
+                    NEW_IO_EVENT_MAP["$dev"]=1
+                    printf '%s %s %s\n' "$epoch" "$(persistent_device_key "$dev")" "$event_hash" >> "$new_hist"
+                done <<< "$dev_tokens"
+            done < "$SYSLOG_CHUNK_FILE"
         fi
-        (( epoch >= cutoff )) || continue
-        local hash normalized_line
-        normalized_line="$(
-            printf '%s' "$line" |
-                sed -E 's/^[A-Z][a-z]{2}[[:space:]]+[0-9]{1,2}[[:space:]]+[0-9:]{8}[[:space:]]+//'
-        )"
-        hash=$(printf '%s' "$normalized_line" | sha1sum | awk '{print $1}')
-        for dev in "${devices[@]}"; do
-            IO_ERROR_RAW_MAP["$dev"]=$(( ${IO_ERROR_RAW_MAP["$dev"]:-0} + 1 ))
-            if (( IO_ERROR_DEDUP_ENABLED == 1 )) && [[ -n "${HASH_SEEN["$dev|$hash"]:-}" ]]; then
-                continue
-            fi
-            HASH_SEEN["$dev|$hash"]=$epoch
-            [[ -n "$new_hist" ]] && printf "%s %s %s\n" "$epoch" "$(persistent_device_key "$dev")" "$hash" >> "$new_hist"
-            IO_ERROR_UNIQUE_MAP["$dev"]=$(( ${IO_ERROR_UNIQUE_MAP["$dev"]:-0} + 1 ))
-        done
-    done < <(printf "%s\n" "$log_src")
-    if [[ -n "$new_hist" ]]; then
-        atomic_commit "$new_hist" "$IO_ERROR_HISTORY_FILE" || true
+
+        if atomic_commit "$new_hist" "$IO_ERROR_HISTORY_FILE"; then
+            history_committed=1
+        fi
     fi
+
+    if (( history_committed == 1 )); then
+        commit_syslog_cursor || log "SYSLOG" "WARN" "I/O history was saved but the syslog cursor could not be committed"
+    fi
+
     local dev _io_rank=() lines=""
-    for dev in "${!IO_ERROR_RAW_MAP[@]}"; do
+    for dev in "${!NEW_IO_EVENT_MAP[@]}"; do
         local raw_count uniq_count mark
         raw_count=${IO_ERROR_RAW_MAP[$dev]:-0}
         uniq_count=${IO_ERROR_UNIQUE_MAP[$dev]:-0}
@@ -5494,16 +5679,24 @@ build_trend_section() {
         if [[ -n "$btrfs_lines" ]]; then
             while read -r dt rest; do
                 [[ -z "$dt" || "$dt" < "$cutoff_err" ]] && continue
-                local key mount delta dev stored_key
+                local key mount delta rate_metric event dev stored_key
                 key=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^key=/){sub(/key=/,"",$i); print $i; break}}}')
                 mount=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^mount=/){sub(/mount=/,"",$i); print $i; break}}}')
                 delta=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^delta=/){sub(/delta=/,"",$i); print $i; break}}}')
+                rate_metric=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^rate_day=/){sub(/rate_day=/,"",$i); print $i; break}}}')
+                event=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^event=/){sub(/event=/,"",$i); print $i; break}}}')
                 stored_key=$(echo "$rest" | awk '{print $1}')
                 dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
-                [[ -z "$dev" || -z "$delta" || -z "$key" ]] && continue
-                [[ "$delta" =~ ^[0-9]+$ ]] || continue
-                BSEQ["$dev|$key"]+="${dt}:${delta} "
-                [[ -n "$mount" ]] && MSEQ["$mount|$key"]+="${dt}:${delta} "
+                [[ -z "$dev" || -z "$key" ]] && continue
+                if [[ "$event" == "reset" ]]; then
+                    unset "BSEQ[$dev|$key]"
+                    [[ -n "$mount" ]] && unset "MSEQ[$mount|$key]"
+                    continue
+                fi
+                [[ -z "$dev" || -z "$delta" || -z "$key" || -z "$rate_metric" ]] && continue
+                [[ "$delta" =~ ^[0-9]+$ && "$rate_metric" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
+                BSEQ["$dev|$key"]+="${dt}:${rate_metric} "
+                [[ -n "$mount" ]] && MSEQ["$mount|$key"]+="${dt}:${rate_metric} "
             done < <(printf "%s\n" "$btrfs_lines")
         fi
         local b_rank=() m_rank=()
@@ -5521,7 +5714,7 @@ build_trend_section() {
             local w_sum=0 w_tot=0 idx
             for idx in $(seq 0 $(( ${#deltas[@]} - 2 ))); do
                 local dd=${deltas[$idx]} d_dt=${deltas_dates[$idx]}
-                [[ "$dd" =~ ^[0-9]+$ ]] || continue
+                [[ "$dd" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
                 local d_epoch; d_epoch=$(date -d "$d_dt" +%s 2>/dev/null || echo "$now_epoch_err")
                 local age_days; age_days=$(( (now_epoch_err - d_epoch)/86400 ))
                 (( age_days < 0 )) && age_days=0
@@ -5556,7 +5749,7 @@ build_trend_section() {
             local w_sum=0 w_tot=0 idx
             for idx in $(seq 0 $(( ${#deltas[@]} - 2 ))); do
                 local dd=${deltas[$idx]} d_dt=${deltas_dates[$idx]}
-                [[ "$dd" =~ ^[0-9]+$ ]] || continue
+                [[ "$dd" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
                 local d_epoch; d_epoch=$(date -d "$d_dt" +%s 2>/dev/null || echo "$now_epoch_err")
                 local age_days; age_days=$(( (now_epoch_err - d_epoch)/86400 ))
                 (( age_days < 0 )) && age_days=0
@@ -5584,12 +5777,18 @@ build_trend_section() {
         if [[ -n "$xfs_lines" ]]; then
             while read -r dt rest; do
                 [[ -z "$dt" || "$dt" < "$cutoff_err" ]] && continue
-                local key delta
+                local key delta rate_metric event
                 key=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^key=/){sub(/key=/,"",$i); print $i; break}}}')
                 delta=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^delta=/){sub(/delta=/,"",$i); print $i; break}}}')
-                [[ -z "$key" || -z "$delta" ]] && continue
-                [[ "$delta" =~ ^[0-9]+$ ]] || continue
-                XSEQ["$key"]+="${dt}:${delta} "
+                rate_metric=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^rate_day=/){sub(/rate_day=/,"",$i); print $i; break}}}')
+                event=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^event=/){sub(/event=/,"",$i); print $i; break}}}')
+                if [[ "$event" == "reset" ]]; then
+                    [[ -n "$key" ]] && unset "XSEQ[$key]"
+                    continue
+                fi
+                [[ -z "$key" || -z "$delta" || -z "$rate_metric" ]] && continue
+                [[ "$delta" =~ ^[0-9]+$ && "$rate_metric" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
+                XSEQ["$key"]+="${dt}:${rate_metric} "
             done < <(printf "%s\n" "$xfs_lines")
         fi
         local x_rank=()
@@ -5606,7 +5805,7 @@ build_trend_section() {
             local w_sum=0 w_tot=0 idx
             for idx in $(seq 0 $(( ${#deltas[@]} - 2 ))); do
                 local dd=${deltas[$idx]} d_dt=${deltas_dates[$idx]}
-                [[ "$dd" =~ ^[0-9]+$ ]] || continue
+                [[ "$dd" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
                 local d_epoch; d_epoch=$(date -d "$d_dt" +%s 2>/dev/null || echo "$now_epoch_err")
                 local age_days; age_days=$(( (now_epoch_err - d_epoch)/86400 ))
                 (( age_days < 0 )) && age_days=0
@@ -6801,281 +7000,402 @@ detect_counter_resets() {
     return 0
 }
 
-# === Main Function ===
-# Collect and integrate btrfs per-device stats
+# Normalize a counter delta to a per-day rate when capture timing is known.
+counter_rate_per_day() {
+    local delta="$1" elapsed_seconds="$2"
+    (( elapsed_seconds > 0 )) || return 1
+    awk -v delta="$delta" -v elapsed="$elapsed_seconds" \
+        'BEGIN { printf "%.6f", (delta * 86400.0) / elapsed }'
+}
+
+last_btrfs_history_metric() {
+    local stable_key="$1" legacy_path="$2" wanted_key="$3"
+    [[ -f "$BTRFS_DEV_HIST_FILE" ]] || return 0
+    awk -v stable="$stable_key" -v legacy="$legacy_path" -v wanted="$wanted_key" '
+        $2 != stable && $2 != legacy { next }
+        {
+            matched = 0
+            reset = 0
+            delta = ""
+            rate = ""
+            for (i = 3; i <= NF; i++) {
+                if ($i == "key=" wanted) matched = 1
+                if ($i == "event=reset") reset = 1
+                if ($i ~ /^delta=/) { delta=$i; sub(/^delta=/, "", delta) }
+                if ($i ~ /^rate_day=/) { rate=$i; sub(/^rate_day=/, "", rate) }
+            }
+            if (!matched) next
+            if (reset) { print "reset", 0; next }
+            if (delta !~ /^[0-9]+$/) next
+            if (rate ~ /^[0-9]+([.][0-9]+)?$/ && rate > 0) print "rate", rate
+            else print "delta", delta
+        }
+    ' "$BTRFS_DEV_HIST_FILE" 2>/dev/null | tail -n 1
+}
+
+last_xfs_history_metric() {
+    local wanted_key="$1"
+    [[ -f "$XFS_PROC_HISTORY_FILE" ]] || return 0
+    awk -v wanted="$wanted_key" '
+        {
+            matched = 0
+            reset = 0
+            delta = ""
+            rate = ""
+            for (i = 2; i <= NF; i++) {
+                if ($i == "key=" wanted) matched = 1
+                if ($i == "event=reset") reset = 1
+                if ($i ~ /^delta=/) { delta=$i; sub(/^delta=/, "", delta) }
+                if ($i ~ /^rate_day=/) { rate=$i; sub(/^rate_day=/, "", rate) }
+            }
+            if (!matched) next
+            if (reset) { print "reset", 0; next }
+            if (delta !~ /^[0-9]+$/) next
+            if (rate ~ /^[0-9]+([.][0-9]+)?$/ && rate > 0) print "rate", rate
+            else print "delta", delta
+        }
+    ' "$XFS_PROC_HISTORY_FILE" 2>/dev/null | tail -n 1
+}
+
+# Collect Btrfs counters without resetting them. Missing baselines and counter
+# regressions establish a new baseline and never become synthetic error deltas.
 collect_btrfs_device_stats() {
-    # Snapshot per-device btrfs error counters; compute deltas vs previous run; raise alerts and record history
     (( ${ENABLE_BTRFS_DEVICE_STATS:-0} == 1 )) || return 0
-    local prev_file="$STATE_DIR/btrfs_device_stats.prev"
-    local snapshot_temp today stored_key state_key dev
-    declare -A PREV_STAT
-    # Load previous counters for delta computation
+    local prev_file="$BTRFS_DEV_PREV_FILE"
+    local snapshot_temp now_epoch previous_epoch=0 current_boot_id="unknown"
+    local stored_key state_key dev key val line token m stats prev delta elapsed_seconds
+    local rate_day current_kind current_metric last_kind last_metric ratio=0
+    local absolute_severity alert_severity alert_title alert_message boost bdev
+    local out_has=0 baseline_count=0 reset_count=0 delta_count=0
+    local today
+    local -a mounts=()
+    declare -A PREV_STAT PREV_PRESENT
+
+    now_epoch=$(date +%s)
+    [[ -r /proc/sys/kernel/random/boot_id ]] && read -r current_boot_id < /proc/sys/kernel/random/boot_id || true
+
     if [[ -f "$prev_file" ]]; then
-        while read -r stored_key key val; do
+        while read -r stored_key key val line; do
+            if [[ "$stored_key" == "meta" ]]; then
+                for token in "$key" "$val" $line; do
+                    [[ "$token" == captured_epoch=* ]] && previous_epoch="${token#*=}"
+                done
+                continue
+            fi
             dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
-            [[ -z "$dev" || -z "$key" || -z "$val" ]] && continue
+            [[ -n "$dev" && -n "$key" && "$val" =~ ^[0-9]+$ ]] || continue
             PREV_STAT["$dev|$key"]="$val"
+            PREV_PRESENT["$dev|$key"]=1
         done < "$prev_file"
     fi
-    # Enumerate btrfs mountpoints
-    local -a mounts=()
-    local m
+    [[ "$previous_epoch" =~ ^[0-9]+$ ]] || previous_epoch=0
+    elapsed_seconds=$(( now_epoch - previous_epoch ))
+    (( elapsed_seconds > 0 )) || elapsed_seconds=0
+
     mapfile -t mounts < <(mount | awk '/ btrfs /{print $3}')
     (( ${#mounts[@]} > 0 )) || return 0
-    local out_has=0
+
     snapshot_temp="$(state_temp_file "$prev_file")" || return 0
+    printf 'meta schema=2 captured_epoch=%s boot_id=%s\n' "$now_epoch" "$current_boot_id" > "$snapshot_temp"
+    today=$(date '+%Y-%m-%d')
+
     for m in "${mounts[@]}"; do
-        local stats
-        # Never pass -z here: this monitor needs monotonic counters for deltas and
-        # must not reset the filesystem's diagnostic evidence.
+        # Never pass -z: the monitor must preserve filesystem diagnostic evidence.
         stats=$(btrfs device stats "$m" 2>/dev/null || true)
-        [[ -z "$stats" ]] && continue
-        while read -r line; do
-            [[ -z "$line" ]] && continue
-            local dev="" key="" val=""
+        [[ -n "$stats" ]] || continue
+
+        while IFS= read -r line; do
+            dev=""; key=""; val=""
             if [[ "$line" =~ ^\[([^]]+)\]\.([^[:space:]]+)[[:space:]]+([0-9]+) ]]; then
-                # Standard output: [/dev/sda1].write_io_errs  0
                 dev="${BASH_REMATCH[1]}"
                 key="${BASH_REMATCH[2]}"
                 val="${BASH_REMATCH[3]}"
             elif [[ "$line" =~ ^(/dev/[^:[:space:]]+):?[[:space:]]+([^[:space:]]+)[[:space:]]+([0-9]+) ]]; then
-                # Compatibility with older/alternate three-column output.
                 dev="${BASH_REMATCH[1]}"
                 key="${BASH_REMATCH[2]}"
                 val="${BASH_REMATCH[3]}"
             fi
+            [[ -n "$dev" && -n "$key" && "$val" =~ ^[0-9]+$ ]] || continue
 
-            if [[ -n "$dev" ]]; then
-                [[ -z "$dev" || -z "$key" || -z "$val" ]] && continue
-                # Persist the counter under the physical disk identity (plus
-                # partition suffix), while all runtime maps continue to use
-                # the current kernel device path.
-                state_key=$(persistent_device_key "$dev")
-                printf '%s %s %s\n' "$state_key" "$key" "$val" >> "$snapshot_temp"
-                out_has=1
-                if [[ "$val" =~ ^[0-9]+$ ]]; then
-                        local prev
-                        local delta
-                        prev=${PREV_STAT["$dev|$key"]:-0}
-                        delta=$(( val - prev ))
-                    if (( delta > 0 )); then
-                        local sev
-                        sev="warning"
-                        # Severity mapping: escalate for corruption/generation and large I/O deltas
-                        case "$key" in
-                            corruption_errs|generation_errs)
-                                if (( delta >= BTRFS_DEV_CORR_CRIT_DELTA )); then
-                                    sev="critical"
-                                elif (( delta >= BTRFS_DEV_CORR_WARN_DELTA )); then
-                                    sev="warning"
-                                else
-                                    # Below warn threshold -> skip alert for these keys
-                                    continue
-                                fi;;
-                            read_io_errs|write_io_errs|flush_io_errs)
-                                if (( delta >= BTRFS_DEV_ERR_CRIT_DELTA )); then sev="critical"; elif (( delta >= BTRFS_DEV_ERR_WARN_DELTA )); then sev="warning"; fi;;
-                        esac
-                        # Burst detection: compare current delta with previous recorded delta for same key
-                        local last_delta ratio
-                        last_delta=0
-                        if [[ -f "$BTRFS_DEV_HIST_FILE" ]]; then
-                            last_delta=$(
-                                awk -v stable="$state_key" -v legacy="$dev" -v wanted="$key" '
-                                    $2 != stable && $2 != legacy { next }
-                                    {
-                                        matched = 0
-                                        value = ""
-                                        for (i = 3; i <= NF; i++) {
-                                            if ($i == "key=" wanted) matched = 1
-                                            if ($i ~ /^delta=/) {
-                                                value = $i
-                                                sub(/^delta=/, "", value)
-                                            }
-                                        }
-                                        if (matched && value ~ /^[0-9]+$/) print value
-                                    }
-                                ' "$BTRFS_DEV_HIST_FILE" 2>/dev/null |
-                                    tail -n 1 || true
-                            )
-                            [[ -n "$last_delta" && "$last_delta" =~ ^[0-9]+$ ]] || last_delta=0
-                        fi
-                        if (( last_delta > 0 )); then
-                            ratio=$(awk -v d="$delta" -v l="$last_delta" 'BEGIN{ if(l>0) printf "%d", int(d/l); else print 0 }')
-                            if (( ratio >= BTRFS_ERR_BURST_CRIT_RATIO )); then
-                                record_alert critical "Btrfs Burst" "Device $dev $key burst delta $delta (x${ratio} vs last $last_delta) on mount $m"
-                                local bdev_burst; bdev_burst=$(base_device "$dev")
-                                [[ -z "${SMART_STATE[$bdev_burst]:-}" ]] && SMART_STATE[$bdev_burst]="OK"
-                                SMART_MSGS[$bdev_burst]="${SMART_MSGS[$bdev_burst]:-} Btrfs burst: $key x${ratio}"
-                                local cur_boost=${BURST_BOOST[$bdev_burst]:-0}; cur_boost=$(( cur_boost + BURST_CRIT_BOOST )); (( cur_boost > 100 )) && cur_boost=100; BURST_BOOST[$bdev_burst]=$cur_boost
-                            elif (( ratio >= BTRFS_ERR_BURST_WARN_RATIO )); then
-                                record_alert warning "Btrfs Burst" "Device $dev $key elevated delta $delta (x${ratio} vs last $last_delta) on mount $m"
-                                local bdev_burst; bdev_burst=$(base_device "$dev")
-                                [[ -z "${SMART_STATE[$bdev_burst]:-}" ]] && SMART_STATE[$bdev_burst]="OK"
-                                SMART_MSGS[$bdev_burst]="${SMART_MSGS[$bdev_burst]:-} Btrfs burst: $key x${ratio}"
-                                local cur_boost=${BURST_BOOST[$bdev_burst]:-0}; cur_boost=$(( cur_boost + BURST_WARN_BOOST )); (( cur_boost > 100 )) && cur_boost=100; BURST_BOOST[$bdev_burst]=$cur_boost
-                            else
-                                record_alert "$sev" "Btrfs Device" "Device $dev $key +$delta (now $val) on mount $m"
-                            fi
-                        else
-                            record_alert "$sev" "Btrfs Device" "Device $dev $key +$delta (now $val) on mount $m"
-                        fi
-                        # Persist delta to time-series history
-                        local today
-                        today=$(date '+%Y-%m-%d')
-                        echo "$today $(persistent_device_key "$dev") mount=$m key=$key delta=$delta value=$val" >> "$BTRFS_DEV_HIST_FILE"
-                        # Attach message to base block device SMART messages for summary sections
-                        local bdev
-                        bdev=$(base_device "$dev")
-                        [[ -z "${SMART_STATE[$bdev]:-}" ]] && SMART_STATE[$bdev]="OK"
-                        SMART_MSGS[$bdev]="${SMART_MSGS[$bdev]:-} Btrfs device errors: $key +$delta" 
+            state_key=$(persistent_device_key "$dev")
+            printf '%s %s %s\n' "$state_key" "$key" "$val" >> "$snapshot_temp"
+            out_has=1
+
+            if [[ -z "${PREV_PRESENT["$dev|$key"]:-}" ]]; then
+                ((baseline_count++)) || true
+                continue
+            fi
+
+            prev=${PREV_STAT["$dev|$key"]}
+            if (( val < prev )); then
+                ((reset_count++)) || true
+                printf '%s %s mount=%s key=%s event=reset previous=%s value=%s\n' \
+                    "$today" "$state_key" "$m" "$key" "$prev" "$val" >> "$BTRFS_DEV_HIST_FILE"
+                continue
+            fi
+
+            delta=$(( val - prev ))
+            (( delta > 0 )) || continue
+            ((delta_count++)) || true
+            rate_day=$(counter_rate_per_day "$delta" "$elapsed_seconds" 2>/dev/null || true)
+            if [[ -n "$rate_day" ]]; then
+                current_kind="rate"
+                current_metric="$rate_day"
+            else
+                current_kind="delta"
+                current_metric="$delta"
+            fi
+
+            last_kind=""; last_metric=""; ratio=0
+            read -r last_kind last_metric < <(last_btrfs_history_metric "$state_key" "$dev" "$key") || true
+            if [[ "$last_kind" == "$current_kind" && "$last_metric" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+                ratio=$(awk -v current="$current_metric" -v previous="$last_metric" \
+                    'BEGIN { if (previous > 0) printf "%d", int(current / previous); else print 0 }')
+            fi
+
+            printf '%s %s mount=%s key=%s delta=%s value=%s elapsed_sec=%s%s\n' \
+                "$today" "$state_key" "$m" "$key" "$delta" "$val" "$elapsed_seconds" \
+                "${rate_day:+ rate_day=$rate_day}" >> "$BTRFS_DEV_HIST_FILE"
+
+            absolute_severity=""
+            case "$key" in
+                corruption_errs|generation_errs)
+                    if (( delta >= BTRFS_DEV_CORR_CRIT_DELTA )); then absolute_severity="critical"
+                    elif (( delta >= BTRFS_DEV_CORR_WARN_DELTA )); then absolute_severity="warning"
                     fi
-                fi
+                    ;;
+                read_io_errs|write_io_errs|flush_io_errs)
+                    if (( delta >= BTRFS_DEV_ERR_CRIT_DELTA )); then absolute_severity="critical"
+                    elif (( delta >= BTRFS_DEV_ERR_WARN_DELTA )); then absolute_severity="warning"
+                    fi
+                    ;;
+            esac
+
+            alert_severity="$absolute_severity"
+            alert_title="Btrfs Device"
+            alert_message="Device $dev $key +$delta (now $val) on mount $m"
+            boost=0
+            if (( ratio >= BTRFS_ERR_BURST_CRIT_RATIO )); then
+                alert_severity="critical"
+                alert_title="Btrfs Burst"
+                alert_message="Device $dev $key rate burst x${ratio} (+$delta) on mount $m"
+                boost=$BURST_CRIT_BOOST
+            elif (( ratio >= BTRFS_ERR_BURST_WARN_RATIO )); then
+                [[ "$alert_severity" == "critical" ]] || alert_severity="warning"
+                alert_title="Btrfs Burst"
+                alert_message="Device $dev $key rate elevated x${ratio} (+$delta) on mount $m"
+                boost=$BURST_WARN_BOOST
+            fi
+
+            [[ -n "$alert_severity" ]] || continue
+            record_alert "$alert_severity" "$alert_title" "$alert_message"
+            bdev=$(base_device "$dev")
+            [[ -n "$bdev" ]] || continue
+            [[ -n "${SMART_STATE[$bdev]:-}" ]] || SMART_STATE[$bdev]="OK"
+            SMART_MSGS[$bdev]="${SMART_MSGS[$bdev]:-} Btrfs device errors: $key +$delta"
+            if (( boost > 0 )); then
+                boost=$(( ${BURST_BOOST[$bdev]:-0} + boost ))
+                (( boost > 100 )) && boost=100
+                BURST_BOOST[$bdev]=$boost
             fi
         done <<< "$stats"
     done
-    # Commit snapshot if we captured data; otherwise discard temp
+
     if (( out_has == 1 )); then
         atomic_commit "$snapshot_temp" "$prev_file" || true
     else
-        rm -f "$snapshot_temp" 2>/dev/null || true
+        rm -f -- "$snapshot_temp" 2>/dev/null || true
     fi
+    (( baseline_count > 0 )) && log "BTRFS" "INFO" \
+        "Established $baseline_count new counter baseline(s) without alerting"
+    (( reset_count > 0 )) && log "BTRFS" "WARN" \
+        "Detected $reset_count counter reset(s); affected counters were re-baselined"
+    log "BTRFS" "INFO" "Recorded $delta_count positive counter delta(s)"
 }
 
 # === Main Function ===
 # Collect and integrate xfs /proc stats (global deltas)
 collect_xfs_proc_stats() {
-    # Capture select global XFS counters; compute deltas to detect anomalous spikes signalling metadata pressure
     (( ${ENABLE_XFS_PROC_STATS:-0} == 1 )) || return 0
-    local stat_file="/proc/fs/xfs/stat"
+    local stat_file="/proc/fs/xfs/stat" prev_file="$XFS_PROC_PREV_FILE"
     [[ -r "$stat_file" ]] || return 0
-    local prev_file="$XFS_PROC_PREV_FILE"
-    local snapshot_temp
-    # Optionally suppress alerting during parity operations (still capture history/snapshot)
-    local suppress=0
-    if (( XFS_PROC_SUPPRESS_DURING_PARITY == 1 )); then
-        # Use the single parity snapshot captured by main() for this run.
-        if (( PARITY_ACTIVE == 1 )); then
-            suppress=1
-            log_xfs "$(date '+%Y-%m-%d %H:%M:%S') - Suppressing XFS proc alerts (parity action: ${PARITY_ACTION})"
-        fi
+
+    local snapshot_temp now_epoch previous_epoch=0 current_boot_id="unknown" previous_boot_id=""
+    local first second rest token k ex skip val prev delta elapsed_seconds rate_day
+    local current_kind current_metric last_kind last_metric ratio absolute_severity
+    local alert_due alert_severity burst_boost summary_lines="" final_severity
+    local m src bdev boost message today
+    local suppress=0 baseline_all=0 snapshot_count=0 baseline_count=0 reset_count=0 delta_count=0
+    local had_any=0 had_crit=0
+    local -a keys=() filtered=() xfs_mounts_arr=()
+    declare -A PREV_XFS PREV_XFS_PRESENT
+
+    now_epoch=$(date +%s)
+    today=$(date '+%Y-%m-%d')
+    [[ -r /proc/sys/kernel/random/boot_id ]] && read -r current_boot_id < /proc/sys/kernel/random/boot_id || true
+
+    if (( XFS_PROC_SUPPRESS_DURING_PARITY == 1 && PARITY_ACTIVE == 1 )); then
+        suppress=1
+        log "XFS" "INFO" "Suppressing XFS proc alerts during parity action ${PARITY_ACTION:-unknown}"
     fi
-    declare -A PREV_XFS
-    # Load previous snapshot for delta computation
+
     if [[ -f "$prev_file" ]]; then
-        while read -r key val; do
-            [[ -z "$key" || -z "$val" ]] && continue
-            PREV_XFS["$key"]="$val"
+        while read -r first second rest; do
+            if [[ "$first" == "meta" ]]; then
+                for token in "$second" $rest; do
+                    [[ "$token" == captured_epoch=* ]] && previous_epoch="${token#*=}"
+                    [[ "$token" == boot_id=* ]] && previous_boot_id="${token#*=}"
+                done
+                continue
+            fi
+            [[ -n "$first" && "$second" =~ ^[0-9]+$ ]] || continue
+            PREV_XFS["$first"]="$second"
+            PREV_XFS_PRESENT["$first"]=1
         done < "$prev_file"
     fi
-    snapshot_temp="$(state_temp_file "$prev_file")" || return 0
-    local had_any=0 had_crit=0
-    local summary_lines=""
-    # Resolve keys to inspect: use configured list or defaults, then apply excludes
-    local keys=()
+    [[ "$previous_epoch" =~ ^[0-9]+$ ]] || previous_epoch=0
+    elapsed_seconds=$(( now_epoch - previous_epoch ))
+    (( elapsed_seconds > 0 )) || elapsed_seconds=0
+
+    if [[ -z "$previous_boot_id" || "$previous_boot_id" != "$current_boot_id" ]]; then
+        baseline_all=1
+    fi
+
     if [[ -n "$XFS_PROC_KEYS" ]]; then
         read -r -a keys <<< "$XFS_PROC_KEYS"
     else
         keys=(extent_alloc dir_lookup dir_create xs_xstrat delalloc flush)
     fi
     if [[ -n "$XFS_PROC_KEYS_EXCLUDE" ]]; then
-        local filtered=() k ex
         for k in "${keys[@]}"; do
-            local skip=0
-            for ex in $XFS_PROC_KEYS_EXCLUDE; do [[ "$k" == "$ex" ]] && { skip=1; break; }; done
-            (( skip==0 )) && filtered+=("$k")
+            skip=0
+            for ex in $XFS_PROC_KEYS_EXCLUDE; do
+                [[ "$k" == "$ex" ]] && { skip=1; break; }
+            done
+            (( skip == 0 )) && filtered+=("$k")
         done
         keys=("${filtered[@]}")
     fi
-    # Snapshot XFS mountpoints once for reuse
-    local -a xfs_mounts_arr=()
+
     mapfile -t xfs_mounts_arr < <(mount | awk '/ xfs /{print $3}')
+    snapshot_temp="$(state_temp_file "$prev_file")" || return 0
+    printf 'meta schema=2 captured_epoch=%s boot_id=%s\n' "$now_epoch" "$current_boot_id" > "$snapshot_temp"
+
     for k in "${keys[@]}"; do
-        local val
         val=$(awk -v key="$k" '$1==key{print $2; exit}' "$stat_file" 2>/dev/null || true)
-        [[ -z "$val" || ! "$val" =~ ^[0-9]+$ ]] && continue
-        echo "$k $val" >> "$snapshot_temp"
-        local prev
-        local delta
-        prev=${PREV_XFS["$k"]:-0}
+        [[ "$val" =~ ^[0-9]+$ ]] || continue
+        printf '%s %s\n' "$k" "$val" >> "$snapshot_temp"
+        ((snapshot_count++)) || true
+
+        if (( baseline_all == 1 )) || [[ -z "${PREV_XFS_PRESENT[$k]:-}" ]]; then
+            ((baseline_count++)) || true
+            continue
+        fi
+
+        prev=${PREV_XFS[$k]}
+        if (( val < prev )); then
+            ((reset_count++)) || true
+            printf '%s key=%s event=reset previous=%s value=%s boot_id=%s\n' \
+                "$today" "$k" "$prev" "$val" "$current_boot_id" >> "$XFS_PROC_HISTORY_FILE"
+            continue
+        fi
+
         delta=$(( val - prev ))
-        if (( delta > 0 )); then
-            local sev last_delta ratio
-            sev="warning"
-            # Retrieve previous delta for burst ratio (parse last history line with key)
-            last_delta=0
-            if [[ -f "$XFS_PROC_HISTORY_FILE" ]]; then
-                local hist_line
-                hist_line=$(grep -E " key=$k " "$XFS_PROC_HISTORY_FILE" 2>/dev/null || true)
-                last_delta=$(echo "$hist_line" | tail -n1 | awk '{for(i=1;i<=NF;i++){ if($i ~ /^delta=/){sub(/delta=/,"",$i); print $i; break } }}' 2>/dev/null || true)
-                [[ -n "$last_delta" && "$last_delta" =~ ^[0-9]+$ ]] || last_delta=0
-            fi
-            # Apply standard delta thresholds first
-            if (( delta >= XFS_PROC_CRIT_DELTA )); then sev="critical"; elif (( delta >= XFS_PROC_WARN_DELTA )); then sev="warning"; else sev="skip"; fi
-            # Compute burst ratio if prior delta present
-            if (( last_delta > 0 )); then
-                ratio=$(awk -v d="$delta" -v l="$last_delta" 'BEGIN{ if(l>0) printf "%d", int(d/l); else print 0 }')
-                if (( ratio >= XFS_ERR_BURST_CRIT_RATIO )); then
-                    sev="critical"; had_crit=1; had_any=1
-                    summary_lines+="$k burst +$delta (x${ratio} vs $last_delta); "
-                    if (( XFS_PROC_SMART_ANNOTATE_BURST == 1 && suppress == 0 )); then
-                        local bdev_burst
-                        for m in "${xfs_mounts_arr[@]}"; do
-                            local src; src=$(findmnt -n -o SOURCE "$m" 2>/dev/null || true); [[ -z "$src" ]] && continue
-                            bdev_burst=$(base_device "$src")
-                            [[ -z "${SMART_STATE[$bdev_burst]:-}" ]] && SMART_STATE[$bdev_burst]="OK"
-                            SMART_MSGS[$bdev_burst]="${SMART_MSGS[$bdev_burst]:-} XFS burst: $k x${ratio}"
-                            local cur_boost=${BURST_BOOST[$bdev_burst]:-0}; cur_boost=$(( cur_boost + BURST_CRIT_BOOST )); (( cur_boost > 100 )) && cur_boost=100; BURST_BOOST[$bdev_burst]=$cur_boost
-                        done
-                    fi
-                elif (( ratio >= XFS_ERR_BURST_WARN_RATIO )); then
-                    [[ "$sev" == "skip" ]] && sev="warning"
-                    had_any=1
-                    summary_lines+="$k elevated +$delta (x${ratio} vs $last_delta); "
-                    if (( XFS_PROC_SMART_ANNOTATE_BURST == 1 && suppress == 0 )); then
-                        local bdev_burst
-                        for m in "${xfs_mounts_arr[@]}"; do
-                            local src; src=$(findmnt -n -o SOURCE "$m" 2>/dev/null || true); [[ -z "$src" ]] && continue
-                            bdev_burst=$(base_device "$src")
-                            [[ -z "${SMART_STATE[$bdev_burst]:-}" ]] && SMART_STATE[$bdev_burst]="OK"
-                            SMART_MSGS[$bdev_burst]="${SMART_MSGS[$bdev_burst]:-} XFS burst: $k x${ratio}"
-                            local cur_boost=${BURST_BOOST[$bdev_burst]:-0}; cur_boost=$(( cur_boost + BURST_WARN_BOOST )); (( cur_boost > 100 )) && cur_boost=100; BURST_BOOST[$bdev_burst]=$cur_boost
-                        done
-                    fi
-                elif [[ "$sev" != "skip" ]]; then
-                    if (( XFS_PROC_REQUIRE_RATIO_FOR_ALERT == 0 )); then
-                        had_any=1; [[ "$sev" == "critical" ]] && had_crit=1
-                        summary_lines+="$k +$delta; "
-                    fi
-                fi
-            else
-                if [[ "$sev" != "skip" ]]; then
-                    if (( XFS_PROC_REQUIRE_RATIO_FOR_ALERT == 0 )); then
-                        had_any=1; [[ "$sev" == "critical" ]] && had_crit=1
-                        summary_lines+="$k +$delta; "
-                    fi
-                fi
-            fi
-            # Persist delta to history with delta field for future burst comparisons
-            local today; today=$(date '+%Y-%m-%d')
-            echo "$today key=$k delta=$delta value=$val" >> "$XFS_PROC_HISTORY_FILE"
+        (( delta > 0 )) || continue
+        ((delta_count++)) || true
+        rate_day=$(counter_rate_per_day "$delta" "$elapsed_seconds" 2>/dev/null || true)
+        if [[ -n "$rate_day" ]]; then
+            current_kind="rate"
+            current_metric="$rate_day"
+        else
+            current_kind="delta"
+            current_metric="$delta"
+        fi
+
+        last_kind=""; last_metric=""; ratio=0
+        read -r last_kind last_metric < <(last_xfs_history_metric "$k") || true
+        if [[ "$last_kind" == "$current_kind" && "$last_metric" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            ratio=$(awk -v current="$current_metric" -v previous="$last_metric" \
+                'BEGIN { if (previous > 0) printf "%d", int(current / previous); else print 0 }')
+        fi
+
+        printf '%s key=%s delta=%s value=%s elapsed_sec=%s%s\n' \
+            "$today" "$k" "$delta" "$val" "$elapsed_seconds" \
+            "${rate_day:+ rate_day=$rate_day}" >> "$XFS_PROC_HISTORY_FILE"
+
+        absolute_severity=""
+        if (( delta >= XFS_PROC_CRIT_DELTA )); then absolute_severity="critical"
+        elif (( delta >= XFS_PROC_WARN_DELTA )); then absolute_severity="warning"
+        fi
+
+        alert_due=0
+        alert_severity="$absolute_severity"
+        burst_boost=0
+        message="$k +$delta"
+        if (( ratio >= XFS_ERR_BURST_CRIT_RATIO )); then
+            alert_due=1
+            alert_severity="critical"
+            burst_boost=$BURST_CRIT_BOOST
+            message="$k rate burst +$delta (x${ratio})"
+        elif (( ratio >= XFS_ERR_BURST_WARN_RATIO )); then
+            alert_due=1
+            [[ "$alert_severity" == "critical" ]] || alert_severity="warning"
+            burst_boost=$BURST_WARN_BOOST
+            message="$k rate elevated +$delta (x${ratio})"
+        elif [[ -n "$absolute_severity" ]] && (( XFS_PROC_REQUIRE_RATIO_FOR_ALERT == 0 )); then
+            alert_due=1
+        fi
+
+        (( alert_due == 1 )) || continue
+        had_any=1
+        [[ "$alert_severity" == "critical" ]] && had_crit=1
+        summary_lines+="$message; "
+
+        if (( burst_boost > 0 && XFS_PROC_SMART_ANNOTATE_BURST == 1 && suppress == 0 )); then
+            for m in "${xfs_mounts_arr[@]}"; do
+                src=$(findmnt -n -o SOURCE "$m" 2>/dev/null || true)
+                [[ -n "$src" ]] || continue
+                bdev=$(base_device "$src")
+                [[ -n "$bdev" ]] || continue
+                [[ -n "${SMART_STATE[$bdev]:-}" ]] || SMART_STATE[$bdev]="OK"
+                SMART_MSGS[$bdev]="${SMART_MSGS[$bdev]:-} XFS burst: $k x${ratio}"
+                boost=$(( ${BURST_BOOST[$bdev]:-0} + burst_boost ))
+                (( boost > 100 )) && boost=100
+                BURST_BOOST[$bdev]=$boost
+            done
         fi
     done
-    # Emit alert(s): prefer single global alert unless explicitly configured for per-mount
+
+    if (( snapshot_count > 0 )); then
+        atomic_commit "$snapshot_temp" "$prev_file" || true
+    else
+        rm -f -- "$snapshot_temp" 2>/dev/null || true
+    fi
+
+    if (( baseline_all == 1 && baseline_count > 0 )); then
+        log "XFS" "INFO" \
+            "Established a boot-aware XFS baseline for $baseline_count counter(s) without alerting"
+    elif (( baseline_count > 0 )); then
+        log "XFS" "INFO" "Established $baseline_count new XFS counter baseline(s) without alerting"
+    fi
+    (( reset_count > 0 )) && log "XFS" "WARN" \
+        "Detected $reset_count XFS counter reset(s); affected counters were re-baselined"
+    log "XFS" "INFO" "Recorded $delta_count positive XFS counter delta(s)"
+
     if (( had_any == 1 && suppress == 0 )); then
-        local msg="XFS metadata activity spike: ${summary_lines%%; }"
+        message="XFS metadata activity spike: ${summary_lines%%; }"
+        [[ $had_crit -eq 1 ]] && final_severity="critical" || final_severity="warning"
         if (( XFS_PROC_PER_MOUNT_ALERTS == 1 )); then
             for m in "${xfs_mounts_arr[@]}"; do
-                local src; src=$(findmnt -n -o SOURCE "$m" 2>/dev/null || true); [[ -z "$src" ]] && continue
-                local bdev; bdev=$(base_device "$src")
-                [[ -z "${SMART_STATE[$bdev]:-}" ]] && SMART_STATE[$bdev]="OK"
-                record_alert "$([[ $had_crit -eq 1 ]] && echo critical || echo warning)" "$NOTIFY_TITLE_XFS" "$msg ($bdev, mount: $m)"
+                src=$(findmnt -n -o SOURCE "$m" 2>/dev/null || true)
+                [[ -n "$src" ]] || continue
+                bdev=$(base_device "$src")
+                record_alert "$final_severity" "$NOTIFY_TITLE_XFS" "$message (${bdev:-unknown}, mount: $m)"
             done
         else
-            record_alert "$([[ $had_crit -eq 1 ]] && echo critical || echo warning)" "$NOTIFY_TITLE_XFS" "$msg"
+            record_alert "$final_severity" "$NOTIFY_TITLE_XFS" "$message"
         fi
     fi
-    # Persist new snapshot for next run delta computation
-    atomic_commit "$snapshot_temp" "$prev_file" || true
 }
 
 # ---------------------------------------------------------------------------
@@ -7286,6 +7606,7 @@ validate_runtime_dependencies() {
         cp
         date
         df
+        dmesg
         findmnt
         flock
         grep
@@ -7298,7 +7619,9 @@ validate_runtime_dependencies() {
         sha1sum
         smartctl
         sort
+        stat
         tail
+        wc
     )
 
     for command_name in "${required_commands[@]}"; do
@@ -7314,6 +7637,14 @@ validate_runtime_dependencies() {
     fi
     if [[ ! "${SMART_ALLOW_SPINUP:-}" =~ ^[01]$ ]]; then
         log "INIT" "ERROR" "SMART_ALLOW_SPINUP must be 0 or 1"
+        return 1
+    fi
+    if [[ ! "${SYSLOG_CURSOR_STARTUP_LOOKBACK_LINES:-}" =~ ^[1-9][0-9]*$ ]]; then
+        log "INIT" "ERROR" "SYSLOG_CURSOR_STARTUP_LOOKBACK_LINES must be a positive integer"
+        return 1
+    fi
+    if [[ ! "${SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES:-}" =~ ^[1-9][0-9]*$ ]]; then
+        log "INIT" "ERROR" "SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES must be a positive integer"
         return 1
     fi
 
