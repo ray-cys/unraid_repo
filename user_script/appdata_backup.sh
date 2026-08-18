@@ -10,16 +10,17 @@
 #
 # Appdata workflow:
 #
-#   1. Validate source/destination and available space
-#   2. Record currently-running Docker containers
-#   3. Stop selected running containers
-#   4. Compress each top-level appdata directory
-#   5. Verify every archive
-#   6. Promote the .partial backup only when the entire appdata backup succeeds
-#   7. Restart only containers that were running before the backup
-#   8. Optionally mirror additional shares with rsync
-#   9. Prune old successful backups/logs
-#  10. Send one consolidated Unraid notification
+#   1. Validate source/destination
+#   2. Prune old backups to reserve space for the new backup
+#   3. Validate available destination space
+#   4. Record currently-running Docker containers
+#   5. Stop selected running containers
+#   6. Compress each top-level appdata directory
+#   7. Verify every archive
+#   8. Promote the .partial backup only when the entire appdata backup succeeds
+#   9. Restart only containers that were running before the backup
+#  10. Optionally mirror additional shares with rsync
+#  11. Prune logs and send one consolidated Unraid notification
 #
 #
 # SAFETY
@@ -28,7 +29,9 @@
 # - A failed container stop aborts the appdata backup.
 # - An EXIT/signal trap attempts to restart containers if the script exits
 #   unexpectedly after stopping them.
-# - Existing successful backups are pruned only AFTER a new backup succeeds.
+# - Old backups are pruned before backup creation so the destination has room.
+#   With MAX_BACKUPS=1, this creates a period with no successful backup at the
+#   destination if the new backup subsequently fails.
 # - New backups remain ".partial" until all archives pass verification.
 # - Individual archives are written to ".tmp" first and promoted only after
 #   gzip/tar integrity checks pass.
@@ -85,8 +88,8 @@ SKIP_APPDATA_DIRS=(
 
 # Number of VERIFIED successful backup directories to retain.
 #
-# The previous successful backup is not removed until the replacement backup
-# has completed successfully.
+# Before a new backup starts, successful backups are reduced to
+# MAX_BACKUPS - 1 so the new backup has a retention slot available.
 #
 MAX_BACKUPS=1
 
@@ -715,6 +718,7 @@ prune_logs() {
 
 
 prune_successful_backups() {
+    local keep_count="${1:-$MAX_BACKUPS}"
     local -a backups=()
     local removed=0
 
@@ -732,18 +736,26 @@ prune_successful_backups() {
             cut -f2-
     )
 
-    while [ "${#backups[@]}" -gt "$MAX_BACKUPS" ]; do
-        rm -rf -- "${backups[0]}"
+    while [ "${#backups[@]}" -gt "$keep_count" ]; do
+        if ! rm -rf -- "${backups[0]}"; then
+            log "CLEANUP" "ERROR" \
+                "Unable to remove old successful backup: ${backups[0]}"
+            return 1
+        fi
+
         backups=("${backups[@]:1}")
         removed=$((removed + 1))
     done
 
     log "CLEANUP" "INFO" \
-        "Successful-backup retention removed ${removed} old backup(s)"
+        "Successful-backup retention (keep=${keep_count}) removed ${removed} old backup(s)"
+
+    return 0
 }
 
 
 prune_partial_backups() {
+    local keep_count="${1:-$MAX_PARTIAL_BACKUPS}"
     local -a partials=()
     local removed=0
 
@@ -760,8 +772,13 @@ prune_partial_backups() {
             cut -f2-
     )
 
-    while [ "${#partials[@]}" -gt "$MAX_PARTIAL_BACKUPS" ]; do
-        rm -rf -- "${partials[0]}"
+    while [ "${#partials[@]}" -gt "$keep_count" ]; do
+        if ! rm -rf -- "${partials[0]}"; then
+            log "CLEANUP" "ERROR" \
+                "Unable to remove old partial backup: ${partials[0]}"
+            return 1
+        fi
+
         partials=("${partials[@]:1}")
         removed=$((removed + 1))
     done
@@ -770,6 +787,8 @@ prune_partial_backups() {
         log "CLEANUP" "INFO" \
             "Partial-backup retention removed ${removed} old partial backup(s)"
     fi
+
+    return 0
 }
 
 
@@ -1159,8 +1178,8 @@ run_appdata_backup() {
             log "BACKUP" "INFO" \
                 "Appdata backup verified and finalized: $FINAL_DIR"
 
-            # Important: old successful backups are pruned only AFTER this
-            # replacement has completed successfully.
+            # Enforce the normal post-backup retention count. Pre-backup
+            # cleanup should already have reserved one slot.
             prune_successful_backups
 
             return 0
@@ -1581,8 +1600,9 @@ main() {
         "Destination: $DEST_DIR"
 
     # Keep log retention independent from successful-backup retention.
+    # Backup pruning is deferred until configuration and source validation
+    # have succeeded.
     prune_logs
-    prune_partial_backups
 
 
     # -----------------------------------------------------------------------
@@ -1609,6 +1629,24 @@ ${LOG_FILE}"
             "No eligible appdata directories were found.
 Source:
 ${SRC_DIR}"
+
+        return 1
+    fi
+
+    # Reserve space for the backup before assessing destination capacity.
+    # Old partials are incomplete and are never allowed to compete with a new
+    # run. Successful backups are reduced to MAX_BACKUPS - 1 so that the new
+    # verified backup will bring the total back to MAX_BACKUPS.
+    if ! prune_partial_backups 0 ||
+       ! prune_successful_backups "$((MAX_BACKUPS - 1))"
+    then
+        notify_unraid \
+            "alert" \
+            "Backup FAILED - Cleanup" \
+            "Unable to remove an old backup before starting the new backup.
+Destination: ${DEST_DIR}
+See log:
+${LOG_FILE}"
 
         return 1
     fi
