@@ -48,7 +48,7 @@ MIN_AGE_HOURS=24
 
 # Must be outside MOVIES_DIR and TV_DIR. Quarantine is intentionally not
 # removed automatically; inspect it and apply your own retention policy.
-QUARANTINE_DIR="/mnt/user/metadata_cleanup_quarantine"
+QUARANTINE_DIR="/mnt/user/media/bin"
 
 # ---------------------------------------------------------------------------
 # Logging
