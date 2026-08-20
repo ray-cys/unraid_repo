@@ -805,7 +805,7 @@ discover_target_containers() {
 
     if ! docker_output="$(docker ps --format '{{.Names}}' 2>/dev/null)"; then
         log "DOCKER" "WARN" \
-            "docker ps failed; assuming Docker service has no running containers"
+            "Docker ps failed; Assuming Docker service has no running containers"
         return 0
     fi
 
@@ -1045,7 +1045,7 @@ compress_directory() {
             >>"$error_file"
 
         log "DOCKER" "INFO" \
-            "[${name}] compression attempt ${attempt}/${RETRIES}"
+            "[${name}] Compression attempt ${attempt}/${RETRIES}"
 
         if "${PRIORITY_PREFIX[@]}" \
                 tar \
@@ -1062,7 +1062,7 @@ compress_directory() {
             if verify_archive "$archive_tmp" "$error_file"; then
                 if mv -f -- "$archive_tmp" "$archive"; then
                     log "VERIFY" "INFO" \
-                        "[${name}] archive passed gzip and tar verification"
+                        "[${name}] Archive passed gzip and tar verification"
                     return 0
                 fi
 
@@ -1070,11 +1070,11 @@ compress_directory() {
                     >>"$error_file"
             else
                 log "VERIFY" "ERROR" \
-                    "[${name}] archive verification failed on attempt ${attempt}"
+                    "[${name}] Archive verification failed on attempt ${attempt}"
             fi
         else
             log "DOCKER" "ERROR" \
-                "[${name}] compression pipeline failed on attempt ${attempt}"
+                "[${name}] Compression pipeline failed on attempt ${attempt}"
         fi
 
         rm -f -- "$archive_tmp"
@@ -1121,13 +1121,13 @@ run_appdata_backup() {
             APPDATA_REPORT+="[SKIPPED] [${name}] User exclusion"$'\n'
 
             log "DOCKER" "INFO" \
-                "[${name}] skipped due to SKIP_APPDATA_DIRS"
+                "[${name}] Skipped due to SKIP_APPDATA_DIRS"
 
             continue
         fi
 
         log "DOCKER" "INFO" \
-            "[${name}] creating archive"
+            "[${name}] Creating archive"
 
         if compress_directory "$name"; then
             archive="${WORK_DIR}/${name}.tar.gz"
@@ -1140,7 +1140,7 @@ run_appdata_backup() {
             APPDATA_REPORT+="[OK] [${name}] ${archive_human}"$'\n'
 
             log "DOCKER" "INFO" \
-                "[${name}] backup complete: ${archive_human}"
+                "[${name}] Backup complete: ${archive_human}"
 
             if [ "$KEEP_TEMP_ERR" != "true" ]; then
                 rm -f -- "${WORK_DIR}/${name}.err"
@@ -1167,7 +1167,7 @@ run_appdata_backup() {
             fi
 
             log "DOCKER" "ERROR" \
-                "[${name}] backup failed after ${RETRIES} attempt(s)"
+                "[${name}] Backup failed after ${RETRIES} attempt(s)"
         fi
     done
 
@@ -1325,7 +1325,7 @@ run_shares_backup() {
             SHARES_REPORT+="[SKIPPED] ${share_name}: source missing"$'\n'
 
             log "SHARES" "WARN" \
-                "[${share_name}] source missing: $share_src"
+                "[${share_name}] Source missing: $share_src"
 
             continue
         fi
@@ -1333,10 +1333,10 @@ run_shares_backup() {
         if ! ensure_dir "$share_dest"; then
             SHARES_FAILED=$((SHARES_FAILED + 1))
 
-            SHARES_REPORT+="[FAILED] ${share_name}: unable to create destination"$'\n'
+            SHARES_REPORT+="[FAILED] ${share_name}: Unable to create destination"$'\n'
 
             log "SHARES" "ERROR" \
-                "[${share_name}] unable to create destination: $share_dest"
+                "[${share_name}] Unable to create destination: $share_dest"
 
             continue
         fi
@@ -1357,10 +1357,10 @@ run_shares_backup() {
                 excludes+=("--exclude-from=${share_excludes_file}")
 
                 log "SHARES" "INFO" \
-                    "[${share_name}] using exclude file: $share_excludes_file"
+                    "[${share_name}] Using exclude file: $share_excludes_file"
             else
                 log "SHARES" "WARN" \
-                    "[${share_name}] exclude file missing and will be ignored: $share_excludes_file"
+                    "[${share_name}] Exclude file missing and will be ignored: $share_excludes_file"
             fi
         fi
 
@@ -1378,7 +1378,7 @@ run_shares_backup() {
         printf -v command_string '%q ' "${rsync_command[@]}"
 
         log "SHARES" "INFO" \
-            "[${share_name}] running: ${command_string}"
+            "[${share_name}] Running: ${command_string}"
 
         "${rsync_command[@]}" >"$tmp_log" 2>&1
         status=$?
@@ -1398,7 +1398,7 @@ run_shares_backup() {
             SHARES_REPORT+="[FAILED] ${share_name}: ${status_description}"$'\n'
 
             log "SHARES" "ERROR" \
-                "[${share_name}] rsync failed: ${status_description}"
+                "[${share_name}] Rsync failed: ${status_description}"
 
             rm -f -- "$tmp_log"
             continue
@@ -1434,7 +1434,7 @@ run_shares_backup() {
         human_tx="$(bytes_to_human "$total_tx_bytes")"
         human_sent="$(bytes_to_human "$bytes_sent")"
 
-        SHARES_REPORT+="[OK] ${share_name}: transferred ${human_tx}, files ${files_tx}, deleted ${deleted_count}, sent ${human_sent}"$'\n'
+        SHARES_REPORT+="[OK] ${share_name}: Transferred ${human_tx}, files ${files_tx}, deleted ${deleted_count}, sent ${human_sent}"$'\n'
 
         rm -f -- "$tmp_log"
     done
