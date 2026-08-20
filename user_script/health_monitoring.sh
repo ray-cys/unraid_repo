@@ -4,7 +4,7 @@ noParity=true
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.14"
+readonly SCRIPT_VERSION="2.14.1"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -15,21 +15,21 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.14
+# Disk Health Monitor for Unraid v2.14.1
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
 #
-# Phase 14 adds delivery-aware notification lifecycle tracking, bounded retries,
-# reminder cooldowns, recovery notices, and safe notification test/dry-run modes.
+# v2.14.1 completes the deferred Phase 12 configuration, migration/rollback,
+# and secure lock/path work before the Phase 15 production soak test.
 ################################################################################
 # ---------------- Configuration ----------------
 # Disks health script settings. Tuned for performance and reliability.
 ################################################################################
 
-# Phase 12 introduces an explicit built-in-default layer. External
-# configuration loading is intentionally deferred; these remain the sole
-# effective settings until that later work is enabled.
+# Built-in defaults remain the complete fallback configuration. After all
+# functions are defined, a protected state-directory file may override this
+# allowlisted setting layer before validation and execution.
 load_builtin_defaults() {
 
 # === SMART Test Scheduling ===
@@ -185,7 +185,7 @@ SHOW_COLLECTOR_STATUS="auto"                    # Collector report policy (auto|
 
 # === Paths / Integration ===
 LOG_DIR="/mnt/user/cloud/logs/disk_health"       # Run logs and persistent state
-LOCK_FILE="/tmp/health_monitoring.lock"          # Non-blocking single-instance lock
+LOCK_FILE="/run/health_monitoring.lock"          # Root-controlled non-blocking single-instance lock
 NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
 
 # === Temperature Trend / Rate Thresholds (Global) ===
@@ -341,9 +341,29 @@ action:invert_mwi_small;regex:WD[[:space:]]+Red.*SA500;cap_min:0.48;cap_max:0.52
 
 load_builtin_defaults
 
+# Derive the allowlist directly from assignments in load_builtin_defaults().
+# This avoids a second setting list and remains stable even if the caller's
+# environment already contains a variable with the same name as a setting.
+declare -a EXTERNAL_CONFIG_KEYS=()
+declare -A EXTERNAL_CONFIG_ALLOWED=()
+while IFS= read -r _variable_name; do
+    EXTERNAL_CONFIG_KEYS+=("$_variable_name")
+    EXTERNAL_CONFIG_ALLOWED[$_variable_name]=1
+done < <(declare -f load_builtin_defaults | awk '
+    {
+        line=$0
+        sub(/^[[:space:]]*/, "", line)
+        if (line ~ /^[A-Z][A-Z0-9_]*=/) {
+            sub(/=.*/, "", line)
+            print line
+        }
+    }
+')
+unset _variable_name
+
 # Persisted-format versions are implementation constants rather than
 # user-adjustable settings.
-readonly STATE_SCHEMA_VERSION=1
+readonly STATE_SCHEMA_VERSION=2
 readonly HISTORY_SCHEMA_VERSION=3
 readonly DEVICE_ID_SCHEMA_VERSION=2
 readonly STATE_SCHEMA_FORMAT="health-monitoring-state"
@@ -402,7 +422,9 @@ declare -A COLLECTOR_LABEL COLLECTOR_STATUS       # Collector label and final st
 declare -A COLLECTOR_DURATION COLLECTOR_DETAIL    # Collector timing and event summary
 declare -A NOTIFY_PREV_SEVERITY NOTIFY_PREV_FINGERPRINT NOTIFY_PREV_LABEL
 declare -A NOTIFY_CURRENT_SEVERITY NOTIFY_CURRENT_FINGERPRINT NOTIFY_CURRENT_LABEL
+declare -A EXTERNAL_CONFIG_VALUES
 declare -a NOTIFY_PREV_IDS
+declare -a EXTERNAL_CONFIG_OVERRIDE_KEYS
 TBW_EVAL_STATE="OK"
 
 RUN_STAMP=""
@@ -427,7 +449,8 @@ SYSLOG_CURSOR_PENDING_SIZE=0
 SYSLOG_CURSOR_PENDING_ANCHOR="-"
 SYSLOG_CHUNK_FILE=""
 RUN_MODE="monitor"
-REGRESSION_FIXTURE_COUNT=58
+ROLLBACK_BACKUP_ID=""
+REGRESSION_FIXTURE_COUNT=69
 CONFIG_ERROR_COUNT=0
 CONFIG_WARNING_COUNT=0
 DEPENDENCY_ERROR_COUNT=0
@@ -450,6 +473,12 @@ NOTIFICATION_RECOVERY_SECTION=""
 NOTIFICATION_JOURNAL_COMMIT_ALLOWED=0
 NOTIFICATION_DELIVERY_ATTEMPTS=0
 NOTIFICATION_DELIVERY_RC=0
+EXTERNAL_CONFIG_STATUS="NOT_LOADED"
+EXTERNAL_CONFIG_DETAIL=""
+EXTERNAL_CONFIG_OVERRIDE_COUNT=0
+EXTERNAL_CONFIG_LOAD_FAILED=0
+STATE_BACKUP_PATH_RESULT=""
+STATE_BACKUP_SNAPSHOT_RESULT=""
 SUBSYSTEM_SMART_STATE="OK"
 SUBSYSTEM_BTRFS_STATE="Disabled"
 SUBSYSTEM_XFS_STATE="Disabled"
@@ -462,6 +491,8 @@ SUBSYSTEM_MONITORING_STATE="OK"
 
 # === Logs Paths ===
 STATE_DIR="${LOG_DIR:-}/state"
+EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+STATE_BACKUP_DIR="$STATE_DIR/backups"
 
 # === Categorized Timestamp Logging ===
 log() {
@@ -606,13 +637,95 @@ validate_symlink_free_path() {
     return 0
 }
 
+validate_secure_owned_directory() {
+    local path="$1" owner mode permissions
+
+    validate_symlink_free_path "$path" || return 1
+    if [[ ! -d "$path" ]]; then
+        PATH_VALIDATION_REASON="directory is missing"
+        return 1
+    fi
+    owner="$(stat -c '%u' "$path" 2>/dev/null)" || {
+        PATH_VALIDATION_REASON="cannot read directory ownership"
+        return 1
+    }
+    if [[ "$owner" != "$EUID" ]]; then
+        PATH_VALIDATION_REASON="directory owner uid $owner does not match runtime uid $EUID"
+        return 1
+    fi
+    mode="$(stat -c '%a' "$path" 2>/dev/null)" || {
+        PATH_VALIDATION_REASON="cannot read directory permissions"
+        return 1
+    }
+    if [[ ! "$mode" =~ ^[0-7]{3,4}$ ]]; then
+        PATH_VALIDATION_REASON="cannot parse directory permissions"
+        return 1
+    fi
+    permissions=$((8#$mode))
+    if (( (permissions & 0022) != 0 )); then
+        PATH_VALIDATION_REASON="directory is writable by group or others (mode $mode)"
+        return 1
+    fi
+    return 0
+}
+
+validate_secure_owned_file() {
+    local path="$1" owner mode links permissions
+
+    validate_symlink_free_path "$path" || return 1
+    if [[ ! -f "$path" ]]; then
+        PATH_VALIDATION_REASON="target is not a regular file"
+        return 1
+    fi
+    owner="$(stat -c '%u' "$path" 2>/dev/null)" || {
+        PATH_VALIDATION_REASON="cannot read file ownership"
+        return 1
+    }
+    if [[ "$owner" != "$EUID" ]]; then
+        PATH_VALIDATION_REASON="file owner uid $owner does not match runtime uid $EUID"
+        return 1
+    fi
+    links="$(stat -c '%h' "$path" 2>/dev/null)" || {
+        PATH_VALIDATION_REASON="cannot read file link count"
+        return 1
+    }
+    if [[ "$links" != "1" ]]; then
+        PATH_VALIDATION_REASON="file has $links hard links"
+        return 1
+    fi
+    mode="$(stat -c '%a' "$path" 2>/dev/null)" || {
+        PATH_VALIDATION_REASON="cannot read file permissions"
+        return 1
+    }
+    if [[ ! "$mode" =~ ^[0-7]{3,4}$ ]]; then
+        PATH_VALIDATION_REASON="cannot parse file permissions"
+        return 1
+    fi
+    permissions=$((8#$mode))
+    if (( (permissions & 0077) != 0 )); then
+        PATH_VALIDATION_REASON="file is accessible by group or others (mode $mode)"
+        return 1
+    fi
+    return 0
+}
+
 validate_managed_file_target() {
-    local target="$1" parent
+    local target="$1" parent links
 
     validate_symlink_free_path "$target" || return 1
     if [[ -e "$target" && ! -f "$target" ]]; then
         PATH_VALIDATION_REASON="existing target is not a regular file"
         return 1
+    fi
+    if [[ -f "$target" ]]; then
+        links="$(stat -c '%h' "$target" 2>/dev/null)" || {
+            PATH_VALIDATION_REASON="cannot read existing target link count"
+            return 1
+        }
+        if [[ "$links" != "1" ]]; then
+            PATH_VALIDATION_REASON="existing target has $links hard links"
+            return 1
+        fi
     fi
     parent="${target%/*}"
     [[ -n "$parent" ]] || parent="/"
@@ -676,10 +789,11 @@ validate_managed_state_paths() {
     local path
     local -a directories=(
         "$STATE_DIR" "$SMART_SELFTEST_DIR" "$UNSAFE_SDWN_STATE_DIR"
-        "$BTRFS_SCRUB_STATE_DIR" "$CMD_TIMEOUT_STATE_DIR"
+        "$BTRFS_SCRUB_STATE_DIR" "$CMD_TIMEOUT_STATE_DIR" "$STATE_BACKUP_DIR"
     )
     local -a files=(
         "$STATE_SCHEMA_MANIFEST_FILE" "$DEVICE_ID_MAP_FILE" "$DEVICE_ID_SCHEMA_FILE"
+        "$EXTERNAL_CONFIG_FILE"
         "${STATE_FILES_ALERT_RUNTIME[@]}" "${STATE_FILES_TREND_HISTORY[@]}"
     )
 
@@ -706,6 +820,7 @@ harden_managed_state_permissions() {
     local path
     local -a files=(
         "$STATE_SCHEMA_MANIFEST_FILE" "$DEVICE_ID_MAP_FILE" "$DEVICE_ID_SCHEMA_FILE"
+        "$EXTERNAL_CONFIG_FILE"
         "${STATE_FILES_ALERT_RUNTIME[@]}" "${STATE_FILES_TREND_HISTORY[@]}"
     )
 
@@ -717,6 +832,214 @@ harden_managed_state_permissions() {
         }
     done
     return 0
+}
+
+external_config_log() {
+    local level="$1"
+    shift
+    printf '%s [CONFIG][%s] %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" >&2
+}
+
+trim_external_config_field() {
+    local value="$1"
+
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    TRIMMED_EXTERNAL_CONFIG_FIELD="$value"
+}
+
+validate_external_pool_excludes() {
+    local raw="$1" item
+    local -a items=()
+
+    EXTERNAL_POOL_EXCLUDES=()
+    [[ -n "$raw" ]] || return 0
+    IFS=',' read -r -a items <<< "$raw"
+    for item in "${items[@]}"; do
+        trim_external_config_field "$item"
+        item="$TRIMMED_EXTERNAL_CONFIG_FIELD"
+        if [[ -z "$item" || "$item" == */* ]]; then
+            return 1
+        fi
+        EXTERNAL_POOL_EXCLUDES+=("$item")
+    done
+    return 0
+}
+
+# Parse KEY=VALUE records as data. The file is never sourced, so command
+# substitutions, shell metacharacters, and executable statements stay inert.
+load_external_configuration() {
+    local line key value first last parent
+    local line_number=0 errors=0
+    local -a parsed_keys=()
+    local -A parsed_values=() seen=()
+
+    EXTERNAL_CONFIG_STATUS="ABSENT"
+    EXTERNAL_CONFIG_DETAIL="using built-in defaults"
+    EXTERNAL_CONFIG_OVERRIDE_COUNT=0
+    EXTERNAL_CONFIG_OVERRIDE_KEYS=()
+    EXTERNAL_CONFIG_VALUES=()
+    EXTERNAL_CONFIG_LOAD_FAILED=0
+
+    if [[ ! -e "$EXTERNAL_CONFIG_FILE" && ! -L "$EXTERNAL_CONFIG_FILE" ]]; then
+        return 0
+    fi
+    parent="${EXTERNAL_CONFIG_FILE%/*}"
+    if ! validate_secure_owned_directory "$parent"; then
+        EXTERNAL_CONFIG_STATUS="UNSAFE"
+        EXTERNAL_CONFIG_DETAIL="$PATH_VALIDATION_REASON"
+        EXTERNAL_CONFIG_LOAD_FAILED=1
+        external_config_log ERROR \
+            "Refusing external configuration: $EXTERNAL_CONFIG_DETAIL"
+        return 1
+    fi
+    if ! validate_secure_owned_file "$EXTERNAL_CONFIG_FILE"; then
+        EXTERNAL_CONFIG_STATUS="UNSAFE"
+        EXTERNAL_CONFIG_DETAIL="$PATH_VALIDATION_REASON"
+        EXTERNAL_CONFIG_LOAD_FAILED=1
+        external_config_log ERROR \
+            "Refusing external configuration: $EXTERNAL_CONFIG_DETAIL"
+        return 1
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line_number=$((line_number + 1))
+        line="${line%$'\r'}"
+        trim_external_config_field "$line"
+        line="$TRIMMED_EXTERNAL_CONFIG_FIELD"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+
+        if [[ "$line" != *=* ]]; then
+            external_config_log ERROR \
+                "$EXTERNAL_CONFIG_FILE:$line_number requires KEY=VALUE"
+            errors=$((errors + 1))
+            continue
+        fi
+        key="${line%%=*}"
+        value="${line#*=}"
+        trim_external_config_field "$key"
+        key="$TRIMMED_EXTERNAL_CONFIG_FIELD"
+        trim_external_config_field "$value"
+        value="$TRIMMED_EXTERNAL_CONFIG_FIELD"
+
+        if [[ ! "$key" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
+            external_config_log ERROR \
+                "$EXTERNAL_CONFIG_FILE:$line_number contains invalid setting name '$key'"
+            errors=$((errors + 1))
+            continue
+        fi
+        if [[ -z "${EXTERNAL_CONFIG_ALLOWED[$key]+present}" ]]; then
+            external_config_log ERROR \
+                "$EXTERNAL_CONFIG_FILE:$line_number contains unknown setting '$key'"
+            errors=$((errors + 1))
+            continue
+        fi
+        case "$key" in
+            LOG_DIR|LOCK_FILE)
+                external_config_log ERROR \
+                    "$EXTERNAL_CONFIG_FILE:$line_number cannot override bootstrap setting $key"
+                errors=$((errors + 1))
+                continue
+                ;;
+        esac
+        if [[ -n "${seen[$key]+present}" ]]; then
+            external_config_log ERROR \
+                "$EXTERNAL_CONFIG_FILE:$line_number repeats setting $key"
+            errors=$((errors + 1))
+            continue
+        fi
+
+        first="${value:0:1}"
+        last="${value: -1}"
+        if [[ "$first" == "'" || "$first" == '"' ]]; then
+            if (( ${#value} < 2 )) || [[ "$last" != "$first" ]]; then
+                external_config_log ERROR \
+                    "$EXTERNAL_CONFIG_FILE:$line_number has unmatched quotes"
+                errors=$((errors + 1))
+                continue
+            fi
+            value="${value:1:${#value}-2}"
+        elif [[ "$last" == "'" || "$last" == '"' ]]; then
+            external_config_log ERROR \
+                "$EXTERNAL_CONFIG_FILE:$line_number has unmatched quotes"
+            errors=$((errors + 1))
+            continue
+        fi
+        if [[ "$value" =~ [[:cntrl:]] ]]; then
+            external_config_log ERROR \
+                "$EXTERNAL_CONFIG_FILE:$line_number contains control characters"
+            errors=$((errors + 1))
+            continue
+        fi
+        if [[ "$key" == "POOL_EXCLUDES" ]] &&
+           ! validate_external_pool_excludes "$value"
+        then
+            external_config_log ERROR \
+                "$EXTERNAL_CONFIG_FILE:$line_number has invalid comma-separated pool names"
+            errors=$((errors + 1))
+            continue
+        fi
+
+        seen[$key]=1
+        parsed_keys+=("$key")
+        parsed_values[$key]="$value"
+    done < "$EXTERNAL_CONFIG_FILE"
+
+    if (( errors > 0 )); then
+        EXTERNAL_CONFIG_STATUS="INVALID"
+        EXTERNAL_CONFIG_DETAIL="$errors parse error(s); no overrides applied"
+        EXTERNAL_CONFIG_LOAD_FAILED=1
+        return 1
+    fi
+
+    for key in "${parsed_keys[@]}"; do
+        value="${parsed_values[$key]}"
+        if [[ "$key" == "POOL_EXCLUDES" ]]; then
+            validate_external_pool_excludes "$value" || return 1
+            POOL_EXCLUDES=("${EXTERNAL_POOL_EXCLUDES[@]}")
+        else
+            printf -v "$key" '%s' "$value"
+        fi
+        EXTERNAL_CONFIG_VALUES[$key]="$value"
+        EXTERNAL_CONFIG_OVERRIDE_KEYS+=("$key")
+    done
+    EXTERNAL_CONFIG_OVERRIDE_COUNT="${#EXTERNAL_CONFIG_OVERRIDE_KEYS[@]}"
+    EXTERNAL_CONFIG_STATUS="LOADED"
+    EXTERNAL_CONFIG_DETAIL="$EXTERNAL_CONFIG_OVERRIDE_COUNT override(s) from $EXTERNAL_CONFIG_FILE"
+    external_config_log INFO "$EXTERNAL_CONFIG_DETAIL"
+    return 0
+}
+
+ensure_external_config_template() {
+    local content
+
+    [[ ! -e "$EXTERNAL_CONFIG_FILE" && ! -L "$EXTERNAL_CONFIG_FILE" ]] || return 0
+    content="# Disk Health Monitor v${SCRIPT_VERSION} external overrides
+# Location is fixed inside STATE_DIR so the configuration shares state path,
+# permission, migration-backup, and rollback protection.
+#
+# Syntax: one KEY=VALUE per line. This file is parsed as data, not sourced.
+# LOG_DIR and LOCK_FILE are bootstrap settings and cannot be overridden here.
+# POOL_EXCLUDES uses comma-separated pool names.
+#
+# Examples (remove the leading '# ' to enable):
+# SMART_ALLOW_SPINUP=0
+# SHORT_TEST_INTERVAL_DAYS=7
+# ENABLE_BTRFS_SCRUB=0
+# ENABLE_XFS_CHECK=0
+# WARN_THRESHOLD_PERCENT=96
+# CRITICAL_THRESHOLD_PERCENT=98
+# NOTIFICATION_WARNING_REMINDER_HOURS=24
+# NOTIFICATION_CRITICAL_REMINDER_HOURS=6
+# NOTIFICATION_OK_REMINDER_HOURS=168
+# NOTIFICATION_DRY_RUN=0
+# POOL_EXCLUDES=ramtmp,user0
+"
+    atomic_write_text "$EXTERNAL_CONFIG_FILE" "$content" || return 1
+    chmod 600 -- "$EXTERNAL_CONFIG_FILE" || return 1
+    log "CONFIG" "INFO" \
+        "Created external configuration template: $EXTERNAL_CONFIG_FILE"
 }
 
 safe_state_name() {
@@ -929,8 +1252,267 @@ current_identity_schema() {
     printf '%s\n' "$identity_schema"
 }
 
+state_directory_has_payload() {
+    local entry
+
+    while IFS= read -r -d '' entry; do
+        [[ "$entry" == "$STATE_BACKUP_DIR" ]] && continue
+        [[ -d "$entry" ]] &&
+            ! find "$entry" -mindepth 1 -print -quit 2>/dev/null | grep -q . &&
+            continue
+        return 0
+    done < <(find "$STATE_DIR" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    return 1
+}
+
+backup_metadata_value() {
+    local metadata_file="$1" wanted="$2"
+
+    [[ -r "$metadata_file" && -f "$metadata_file" && ! -L "$metadata_file" ]] || return 1
+    awk -F= -v wanted="$wanted" '
+        $1 == wanted {
+            count++
+            value=substr($0, length($1) + 2)
+        }
+        END {
+            if (count == 1) {
+                print value
+                exit 0
+            }
+            exit 1
+        }
+    ' "$metadata_file"
+}
+
+validate_state_backup_id() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$ ]]
+}
+
+create_state_backup() {
+    local reason="$1" source_state="$2" source_history="$3" source_identity="$4"
+    local stamp backup_id temp_dir final_dir snapshot_dir entry metadata
+
+    STATE_BACKUP_RESULT_ID=""
+    [[ "$reason" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+    ensure_private_dir "$STATE_BACKUP_DIR" || return 1
+    validate_secure_owned_directory "$STATE_BACKUP_DIR" || {
+        log "STATE" "ERROR" \
+            "Unsafe backup directory $STATE_BACKUP_DIR: $PATH_VALIDATION_REASON"
+        return 1
+    }
+    if find "$STATE_DIR" -path "$STATE_BACKUP_DIR" -prune -o \
+        \( ! -type f ! -type d \) -print -quit |
+       grep -q .
+    then
+        log "STATE" "ERROR" \
+            "Refusing to back up state containing links or unsupported file types"
+        return 1
+    fi
+    if find "$STATE_DIR" -path "$STATE_BACKUP_DIR" -prune -o \
+        -type f -links +1 -print -quit | grep -q .
+    then
+        log "STATE" "ERROR" "Refusing to back up hard-linked state files"
+        return 1
+    fi
+
+    stamp="$(date '+%Y%m%d_%H%M%S')"
+    backup_id="${reason}-${stamp}-$$"
+    validate_state_backup_id "$backup_id" || return 1
+    final_dir="$STATE_BACKUP_DIR/$backup_id"
+    [[ ! -e "$final_dir" && ! -L "$final_dir" ]] || return 1
+    temp_dir="$(mktemp -d "$STATE_BACKUP_DIR/.backup.XXXXXX")" || return 1
+    chmod 700 -- "$temp_dir" || {
+        rm -rf -- "$temp_dir" 2>/dev/null || true
+        return 1
+    }
+    snapshot_dir="$temp_dir/state"
+    mkdir -p -- "$snapshot_dir" || {
+        rm -rf -- "$temp_dir" 2>/dev/null || true
+        return 1
+    }
+    chmod 700 -- "$snapshot_dir" || true
+
+    while IFS= read -r -d '' entry; do
+        [[ "$entry" == "$STATE_BACKUP_DIR" ]] && continue
+        if ! cp -a -- "$entry" "$snapshot_dir/"; then
+            rm -rf -- "$temp_dir" 2>/dev/null || true
+            log "STATE" "ERROR" "Unable to copy state into backup $backup_id"
+            return 1
+        fi
+    done < <(find "$STATE_DIR" -mindepth 1 -maxdepth 1 -print0)
+
+    metadata="$temp_dir/backup.meta"
+    if ! printf \
+        'format=health-monitoring-state-backup\nbackup_schema=1\nreason=%s\ncreated_epoch=%s\nsource_state_schema=%s\nsource_history_schema=%s\nsource_identity_schema=%s\nwriter_version=%s\n' \
+        "$reason" "$(date +%s)" "$source_state" "$source_history" \
+        "$source_identity" "$SCRIPT_VERSION" > "$metadata"
+    then
+        rm -rf -- "$temp_dir" 2>/dev/null || true
+        return 1
+    fi
+    chmod 600 -- "$metadata" || true
+    if ! mv -- "$temp_dir" "$final_dir"; then
+        rm -rf -- "$temp_dir" 2>/dev/null || true
+        return 1
+    fi
+    STATE_BACKUP_RESULT_ID="$backup_id"
+    log "STATE" "INFO" "Created state backup $backup_id"
+    return 0
+}
+
+list_state_backups() {
+    local backup_path backup_id metadata reason created source_schema found=0
+
+    printf 'State backup directory: %s\n' "$STATE_BACKUP_DIR"
+    if [[ ! -d "$STATE_BACKUP_DIR" ]]; then
+        printf 'No state backups found.\n'
+        return 0
+    fi
+    while IFS= read -r backup_path; do
+        [[ -n "$backup_path" ]] || continue
+        backup_id="${backup_path##*/}"
+        metadata="$backup_path/backup.meta"
+        reason="$(backup_metadata_value "$metadata" reason 2>/dev/null || printf 'unknown')"
+        created="$(backup_metadata_value "$metadata" created_epoch 2>/dev/null || printf 'unknown')"
+        source_schema="$(backup_metadata_value "$metadata" source_state_schema 2>/dev/null || printf 'unknown')"
+        printf '%s\treason=%s\tcreated_epoch=%s\tsource_state_schema=%s\n' \
+            "$backup_id" "$reason" "$created" "$source_schema"
+        found=1
+    done < <(find "$STATE_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d \
+        ! -name '.*' -print 2>/dev/null | LC_ALL=C sort)
+    (( found == 1 )) || printf 'No state backups found.\n'
+}
+
+validate_state_backup_contents() {
+    local backup_id="$1" backup_dir snapshot_dir metadata format backup_schema
+
+    STATE_BACKUP_PATH_RESULT=""
+    STATE_BACKUP_SNAPSHOT_RESULT=""
+    validate_state_backup_id "$backup_id" || {
+        log "STATE" "ERROR" "Invalid state backup ID: $backup_id"
+        return 1
+    }
+    backup_dir="$STATE_BACKUP_DIR/$backup_id"
+    snapshot_dir="$backup_dir/state"
+    metadata="$backup_dir/backup.meta"
+    validate_secure_owned_directory "$backup_dir" || {
+        log "STATE" "ERROR" "Unsafe state backup $backup_id: $PATH_VALIDATION_REASON"
+        return 1
+    }
+    validate_secure_owned_directory "$snapshot_dir" || {
+        log "STATE" "ERROR" "Unsafe backup snapshot $backup_id: $PATH_VALIDATION_REASON"
+        return 1
+    }
+    validate_secure_owned_file "$metadata" || {
+        log "STATE" "ERROR" "Unsafe backup metadata $backup_id: $PATH_VALIDATION_REASON"
+        return 1
+    }
+    format="$(backup_metadata_value "$metadata" format 2>/dev/null || true)"
+    backup_schema="$(backup_metadata_value "$metadata" backup_schema 2>/dev/null || true)"
+    if [[ "$format" != "health-monitoring-state-backup" || "$backup_schema" != "1" ]]; then
+        log "STATE" "ERROR" "State backup metadata is incompatible: $backup_id"
+        return 1
+    fi
+    if find "$snapshot_dir" \( ! -type f ! -type d \) -print -quit | grep -q .; then
+        log "STATE" "ERROR" \
+            "State backup contains links or unsupported file types: $backup_id"
+        return 1
+    fi
+    if find "$snapshot_dir" -type f -links +1 -print -quit | grep -q .; then
+        log "STATE" "ERROR" "State backup contains hard-linked files: $backup_id"
+        return 1
+    fi
+    STATE_BACKUP_PATH_RESULT="$backup_dir"
+    STATE_BACKUP_SNAPSHOT_RESULT="$snapshot_dir"
+    return 0
+}
+
+restore_state_backup_contents() {
+    local backup_id="$1" snapshot_dir entry target
+
+    validate_state_backup_contents "$backup_id" || return 1
+    snapshot_dir="$STATE_BACKUP_SNAPSHOT_RESULT"
+
+    # A rollback is explicit and runs under the process lock. Preserve the
+    # backup directory itself while replacing the backed-up state payload.
+    while IFS= read -r -d '' entry; do
+        [[ "$entry" == "$STATE_BACKUP_DIR" ]] && continue
+        target="$entry"
+        validate_symlink_free_path "$target" || return 1
+        if [[ -d "$target" ]]; then
+            rm -rf -- "$target" || return 1
+        else
+            rm -f -- "$target" || return 1
+        fi
+    done < <(find "$STATE_DIR" -mindepth 1 -maxdepth 1 -print0)
+
+    while IFS= read -r -d '' entry; do
+        cp -a -- "$entry" "$STATE_DIR/" || return 1
+    done < <(find "$snapshot_dir" -mindepth 1 -maxdepth 1 -print0)
+    find "$STATE_DIR" -path "$STATE_BACKUP_DIR" -prune -o -type d -exec chmod 700 -- {} +
+    find "$STATE_DIR" -path "$STATE_BACKUP_DIR" -prune -o -type f -exec chmod 600 -- {} +
+    return 0
+}
+
+rollback_state_backup() {
+    local backup_id="$1" current_state=0 current_history=0 current_identity=0
+    local guard_id
+
+    validate_state_backup_id "$backup_id" || {
+        log "STATE" "ERROR" "Invalid state backup ID: $backup_id"
+        return 1
+    }
+    ensure_private_dir "$STATE_DIR" || return 1
+    ensure_private_dir "$STATE_BACKUP_DIR" || return 1
+    validate_state_backup_contents "$backup_id" || return 1
+    current_state="$(state_manifest_value "$STATE_SCHEMA_MANIFEST_FILE" state_schema 2>/dev/null || printf '0')"
+    current_history="$(state_manifest_value "$STATE_SCHEMA_MANIFEST_FILE" history_schema 2>/dev/null || printf '0')"
+    current_identity="$(state_manifest_value "$STATE_SCHEMA_MANIFEST_FILE" identity_schema 2>/dev/null || printf '0')"
+    create_state_backup \
+        "pre-rollback" "$current_state" "$current_history" "$current_identity" || return 1
+    guard_id="$STATE_BACKUP_RESULT_ID"
+    if ! restore_state_backup_contents "$backup_id"; then
+        log "STATE" "ERROR" \
+            "Rollback failed; current-state safety backup is $guard_id"
+        return 1
+    fi
+    log "STATE" "INFO" \
+        "Restored state backup $backup_id (pre-rollback safety backup: $guard_id)"
+    printf 'State rollback completed: %s\n' "$backup_id"
+    printf 'Pre-rollback safety backup: %s\n' "$guard_id"
+    printf 'Do not run v%s normally if you intend to restore an older script version.\n' \
+        "$SCRIPT_VERSION"
+    return 0
+}
+
+migrate_state_schema() {
+    local from_state="$1" from_history="$2" from_identity="$3"
+    local backup_id
+
+    if [[ "$from_state" != "1" || "$from_history" != "$HISTORY_SCHEMA_VERSION" ||
+          ! "$from_identity" =~ ^[0-9]+$ ||
+          "$from_identity" -gt "$DEVICE_ID_SCHEMA_VERSION" ]]
+    then
+        log "STATE" "ERROR" \
+            "No safe migration path from state=$from_state history=$from_history identity=$from_identity"
+        return 1
+    fi
+    create_state_backup \
+        "migration-v${from_state}-to-v${STATE_SCHEMA_VERSION}" \
+        "$from_state" "$from_history" "$from_identity" || return 1
+    backup_id="$STATE_BACKUP_RESULT_ID"
+    if ! write_state_schema_manifest "$from_identity"; then
+        log "STATE" "ERROR" \
+            "State migration manifest update failed; original backup is $backup_id"
+        return 1
+    fi
+    log "STATE" "INFO" \
+        "Migrated state schema v$from_state to v$STATE_SCHEMA_VERSION (rollback backup: $backup_id)"
+    return 0
+}
+
 ensure_state_schema_manifest() {
-    local rc identity_schema manifest_identity
+    local rc identity_schema manifest_identity state_schema history_schema
 
     if inspect_state_schema_manifest; then
         identity_schema=$(current_identity_schema)
@@ -958,14 +1540,20 @@ ensure_state_schema_manifest() {
                     "Device identity schema $identity_schema is newer than supported $DEVICE_ID_SCHEMA_VERSION"
                 return 1
             fi
+            if state_directory_has_payload; then
+                create_state_backup \
+                    "adoption-to-v${STATE_SCHEMA_VERSION}" 0 \
+                    "$HISTORY_SCHEMA_VERSION" "$identity_schema" || return 1
+            fi
             write_state_schema_manifest "$identity_schema" || return 1
             log "STATE" "INFO" \
                 "Registered existing state as schema $STATE_SCHEMA_VERSION (history=$HISTORY_SCHEMA_VERSION identity=$identity_schema)"
             ;;
         40)
-            log "STATE" "ERROR" \
-                "Legacy state requires a migration not included in this release: $STATE_SCHEMA_DETAIL"
-            return 1
+            state_schema="$(state_manifest_value "$STATE_SCHEMA_MANIFEST_FILE" state_schema 2>/dev/null || true)"
+            history_schema="$(state_manifest_value "$STATE_SCHEMA_MANIFEST_FILE" history_schema 2>/dev/null || true)"
+            identity_schema="$(state_manifest_value "$STATE_SCHEMA_MANIFEST_FILE" identity_schema 2>/dev/null || true)"
+            migrate_state_schema "$state_schema" "$history_schema" "$identity_schema" || return 1
             ;;
         *)
             log "STATE" "ERROR" \
@@ -977,7 +1565,7 @@ ensure_state_schema_manifest() {
 }
 
 print_state_schema_status() {
-    local rc=0
+    local rc=0 backup_count=0
 
     if inspect_state_schema_manifest; then
         rc=0
@@ -989,6 +1577,13 @@ print_state_schema_status() {
     printf 'State schema detail: %s\n' "$STATE_SCHEMA_DETAIL"
     printf 'Supported schemas: state=%s history=%s identity=%s\n' \
         "$STATE_SCHEMA_VERSION" "$HISTORY_SCHEMA_VERSION" "$DEVICE_ID_SCHEMA_VERSION"
+    printf 'External configuration: %s (%s)\n' \
+        "$EXTERNAL_CONFIG_FILE" "$EXTERNAL_CONFIG_STATUS"
+    if [[ -d "$STATE_BACKUP_DIR" ]]; then
+        backup_count="$(find "$STATE_BACKUP_DIR" -mindepth 1 -maxdepth 1 \
+            -type d ! -name '.*' -print 2>/dev/null | awk 'END {print NR+0}')"
+    fi
+    printf 'State rollback backups: %s\n' "$backup_count"
     case "$rc" in
         0|10) return 0 ;;
         *)    return 1 ;;
@@ -1486,13 +2081,33 @@ forecast_confidence_is_actionable() {
 }
 
 acquire_lock() {
+    local parent
+
     if ! command -v flock >/dev/null 2>&1; then
         printf '%s [LOCK][ERROR] flock is unavailable\n' \
             "$(date '+%Y-%m-%d %H:%M:%S')" >&2
         return 1
     fi
 
-    exec 9>"$LOCK_FILE"
+    parent="${LOCK_FILE%/*}"
+    [[ -n "$parent" ]] || parent="/"
+    if ! validate_secure_owned_directory "$parent"; then
+        printf '%s [LOCK][ERROR] Unsafe lock directory %s: %s\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "$parent" \
+            "$PATH_VALIDATION_REASON" >&2
+        return 1
+    fi
+    if [[ ! -e "$LOCK_FILE" && ! -L "$LOCK_FILE" ]]; then
+        secure_create_file "$LOCK_FILE" || return 1
+    fi
+    if ! validate_secure_owned_file "$LOCK_FILE"; then
+        printf '%s [LOCK][ERROR] Unsafe lock file %s: %s\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "$LOCK_FILE" \
+            "$PATH_VALIDATION_REASON" >&2
+        return 1
+    fi
+
+    exec 9<>"$LOCK_FILE"
 
     if ! flock -n 9; then
         printf '%s [LOCK][INFO] Another health_monitoring.sh run is active; exiting (lock: %s)\n' \
@@ -1508,7 +2123,8 @@ initialize_runtime() {
     local state_file
 
     ensure_dir "$LOG_DIR" || return 1
-    ensure_dir "$STATE_DIR" || return 1
+    ensure_private_dir "$STATE_DIR" || return 1
+    ensure_private_dir "$STATE_BACKUP_DIR" || return 1
     validate_managed_state_paths || return 1
     # Inspect/adopt the manifest before changing existing state permissions or
     # creating state subdirectories. Future or malformed schemas therefore
@@ -1522,6 +2138,7 @@ initialize_runtime() {
     ensure_private_dir "$CMD_TIMEOUT_STATE_DIR" || return 1
     validate_managed_state_paths || return 1
     harden_managed_state_permissions || return 1
+    ensure_external_config_template || return 1
 
     RUN_EPOCH="$(date +%s)"
     RUN_STAMP="$(date '+%Y-%m-%d_%H%M%S')"
@@ -6554,6 +7171,10 @@ build_subsystem_lines() {
                     elevate_subsystem_state SUBSYSTEM_CAPACITY_STATE "$severity"
                 fi
                 ;;
+            40)
+                diagnostic_result INFO "State schema" \
+                    "legacy; next monitoring run will back up and migrate: $STATE_SCHEMA_DETAIL"
+                ;;
             *)
                 case "$category" in
                     smart|io|temperature|lifecycle)
@@ -10062,6 +10683,11 @@ validate_configuration() {
         NOTIFICATION_RETRY_INITIAL_DELAY_SECONDS:NOTIFICATION_RETRY_MAX_DELAY_SECONDS
     )
 
+    if (( EXTERNAL_CONFIG_LOAD_FAILED == 1 )); then
+        configuration_error \
+            "External configuration is $EXTERNAL_CONFIG_STATUS: $EXTERNAL_CONFIG_DETAIL"
+    fi
+
     for setting in "${boolean_settings[@]}"; do
         validate_boolean_setting "$setting"
     done
@@ -10188,12 +10814,18 @@ validate_runtime_dependencies() {
     case "$mode" in
         self-test)
             required_commands=(
-                awk chmod cut date grep mkdir mktemp mv rm sed sha1sum sleep
-                sort stat timeout tr wc
+                awk chmod cp cut date find flock grep ln mkdir mktemp mv rm sed
+                sha1sum sleep sort stat timeout tr wc
             )
             ;;
         notification-test)
-            required_commands=(awk date flock grep sed sleep timeout)
+            required_commands=(awk chmod date flock grep sed sleep stat timeout)
+            ;;
+        state-admin)
+            required_commands=(
+                awk chmod cp date find flock grep mkdir mktemp mv rm sed sort
+                stat wc
+            )
             ;;
         *)
             required_commands=(
@@ -10278,6 +10910,9 @@ Usage:
   health_monitoring.sh                 Run normal monitoring
   health_monitoring.sh --check-config  Validate configuration only
   health_monitoring.sh --state-status  Inspect state-schema compatibility
+  health_monitoring.sh --state-backups List migration and rollback backups
+  health_monitoring.sh --rollback-state BACKUP_ID
+                                       Restore one explicit state backup and exit
   health_monitoring.sh --diagnostics   Run read-only environment diagnostics
   health_monitoring.sh --self-test     Run built-in regression fixtures in /tmp
   health_monitoring.sh --test-notification
@@ -10287,33 +10922,71 @@ Usage:
   health_monitoring.sh --version       Print the script version
   health_monitoring.sh --help          Show this help
 
-The configuration, state-status, diagnostics, and self-test modes do not run
-SMART commands against disks, start tests or scrubs, write monitoring state,
+The configuration, state-status, state-backups, diagnostics, and self-test
+modes do not run SMART commands against disks, start tests or scrubs, write monitoring state,
 advance the syslog cursor, send notifications, or spin up disks. The explicit
 notification test sends only its fixed test message. Notification dry-run is a
 normal monitoring run: only external delivery and notification-journal updates
-are skipped.
+are skipped. Rollback-state changes only the protected state directory after
+creating a pre-rollback safety backup; it never runs monitoring.
 USAGE
 }
 
 parse_arguments() {
-    if (( $# > 1 )); then
-        printf 'Only one mode option may be supplied.\n' >&2
+    if (( $# > 2 )); then
+        printf 'Too many arguments.\n' >&2
         return 2
     fi
     case "${1:-}" in
-        "")             RUN_MODE="monitor" ;;
-        --check-config) RUN_MODE="check-config" ;;
-        --state-status) RUN_MODE="state-status" ;;
-        --diagnostics)  RUN_MODE="diagnostics" ;;
-        --self-test)    RUN_MODE="self-test" ;;
-        --test-notification) RUN_MODE="test-notification" ;;
+        "")
+            (( $# == 0 )) || return 2
+            RUN_MODE="monitor"
+            ;;
+        --check-config)
+            (( $# == 1 )) || return 2
+            RUN_MODE="check-config"
+            ;;
+        --state-status)
+            (( $# == 1 )) || return 2
+            RUN_MODE="state-status"
+            ;;
+        --state-backups)
+            (( $# == 1 )) || return 2
+            RUN_MODE="state-backups"
+            ;;
+        --rollback-state)
+            if (( $# != 2 )); then
+                printf '%s requires one BACKUP_ID.\n' "$1" >&2
+                return 2
+            fi
+            RUN_MODE="rollback-state"
+            ROLLBACK_BACKUP_ID="$2"
+            ;;
+        --diagnostics)
+            (( $# == 1 )) || return 2
+            RUN_MODE="diagnostics"
+            ;;
+        --self-test)
+            (( $# == 1 )) || return 2
+            RUN_MODE="self-test"
+            ;;
+        --test-notification)
+            (( $# == 1 )) || return 2
+            RUN_MODE="test-notification"
+            ;;
         --notification-dry-run)
+            (( $# == 1 )) || return 2
             RUN_MODE="monitor"
             NOTIFICATION_DRY_RUN=1
             ;;
-        --version)      RUN_MODE="version" ;;
-        --help|-h)      RUN_MODE="help" ;;
+        --version)
+            (( $# == 1 )) || return 2
+            RUN_MODE="version"
+            ;;
+        --help|-h)
+            (( $# == 1 )) || return 2
+            RUN_MODE="help"
+            ;;
         *)
             printf 'Unknown option: %s\n' "$1" >&2
             print_usage >&2
@@ -10403,13 +11076,29 @@ run_diagnostics() {
         fi
     fi
 
-    parent=$(nearest_existing_parent "$(dirname -- "$LOCK_FILE")" 2>/dev/null || true)
-    if [[ -n "$parent" && -w "$parent" ]]; then
-        diagnostic_result PASS "Lock directory" "$parent is writable"
+    parent="${LOCK_FILE%/*}"
+    if validate_secure_owned_directory "$parent" &&
+       { [[ ! -e "$LOCK_FILE" && ! -L "$LOCK_FILE" ]] ||
+         validate_secure_owned_file "$LOCK_FILE"; }
+    then
+        diagnostic_result PASS "Secure lock path" "$LOCK_FILE"
     else
         failures=$((failures + 1))
-        diagnostic_result FAIL "Lock directory" "no writable parent for $LOCK_FILE"
+        diagnostic_result FAIL "Secure lock path" "$PATH_VALIDATION_REASON"
     fi
+
+    case "$EXTERNAL_CONFIG_STATUS" in
+        LOADED)
+            diagnostic_result PASS "External configuration" "$EXTERNAL_CONFIG_DETAIL"
+            ;;
+        ABSENT)
+            diagnostic_result INFO "External configuration" \
+                "$EXTERNAL_CONFIG_FILE will be created on the next monitoring run"
+            ;;
+        *)
+            diagnostic_result FAIL "External configuration" "$EXTERNAL_CONFIG_DETAIL"
+            ;;
+    esac
 
     if [[ -x "$NOTIFY_BIN" ]]; then
         diagnostic_result PASS "Unraid notification" "$NOTIFY_BIN is executable"
@@ -10491,8 +11180,8 @@ run_regression_tests() (
     fi
 
     if declare -F load_builtin_defaults >/dev/null 2>&1 &&
-       [[ "$SCRIPT_VERSION" == "2.14" &&
-          "$STATE_SCHEMA_VERSION" == "1" &&
+       [[ "$SCRIPT_VERSION" == "2.14.1" &&
+          "$STATE_SCHEMA_VERSION" == "2" &&
           "$HISTORY_SCHEMA_VERSION" == "3" &&
           "$DEVICE_ID_SCHEMA_VERSION" == "2" &&
           "$SMART_ALLOW_SPINUP" == "0" ]]
@@ -10528,7 +11217,7 @@ run_regression_tests() (
     local schema_dir="$fixture_dir/schema" current_manifest future_manifest malformed_manifest
     mkdir -p "$schema_dir"
     current_manifest="$schema_dir/current.manifest"
-    printf 'format=%s\nstate_schema=1\nhistory_schema=3\nidentity_schema=2\nwriter_version=%s\nupdated_epoch=1\n' \
+    printf 'format=%s\nstate_schema=2\nhistory_schema=3\nidentity_schema=2\nwriter_version=%s\nupdated_epoch=1\n' \
         "$STATE_SCHEMA_FORMAT" "$SCRIPT_VERSION" > "$current_manifest"
     if inspect_state_schema_manifest "$current_manifest" &&
        [[ "$STATE_SCHEMA_STATUS" == "CURRENT" &&
@@ -10541,7 +11230,7 @@ run_regression_tests() (
     fi
 
     future_manifest="$schema_dir/future.manifest"
-    printf 'format=%s\nstate_schema=2\nhistory_schema=3\nidentity_schema=2\nwriter_version=future\nupdated_epoch=1\n' \
+    printf 'format=%s\nstate_schema=3\nhistory_schema=3\nidentity_schema=2\nwriter_version=future\nupdated_epoch=1\n' \
         "$STATE_SCHEMA_FORMAT" > "$future_manifest"
     local future_rc=0
     if inspect_state_schema_manifest "$future_manifest"; then
@@ -10596,6 +11285,215 @@ run_regression_tests() (
     else
         self_test_result 0 "Atomic write rejects symbolic-link targets"
     fi
+
+    if [[ -n "${EXTERNAL_CONFIG_ALLOWED[SMART_ALLOW_SPINUP]+present}" &&
+          -n "${EXTERNAL_CONFIG_ALLOWED[POOL_EXCLUDES]+present}" &&
+          -n "${EXTERNAL_CONFIG_ALLOWED[LOG_DIR]+present}" &&
+          -z "${EXTERNAL_CONFIG_ALLOWED[SCRIPT_VERSION]+present}" ]]
+    then
+        self_test_result 1 "Derived external-configuration setting allowlist"
+    else
+        self_test_result 0 "Derived external-configuration setting allowlist"
+    fi
+
+    local config_fixture_dir="$fixture_dir/external-config" inert_config_value
+    mkdir -p "$config_fixture_dir"
+    chmod 700 "$config_fixture_dir"
+    # These fixture-only mutations are isolated by run_regression_tests().
+    # shellcheck disable=SC2030
+    EXTERNAL_CONFIG_FILE="$config_fixture_dir/health_monitoring.conf"
+    printf '%s\n' \
+        'SMART_ALLOW_SPINUP=1' \
+        'WARN_THRESHOLD_PERCENT=95' \
+        'SHOW_COLLECTOR_STATUS="always"' \
+        'POOL_EXCLUDES=ramtmp, user0' > "$EXTERNAL_CONFIG_FILE"
+    # This is deliberately inert parser input, not a command to expand here.
+    # shellcheck disable=SC2016
+    printf -v inert_config_value '$(touch %s/executed)' "$config_fixture_dir"
+    printf 'XFS_PROC_KEYS=%s\n' "$inert_config_value" >> "$EXTERNAL_CONFIG_FILE"
+    chmod 600 "$EXTERNAL_CONFIG_FILE"
+    # shellcheck disable=SC2030
+    SMART_ALLOW_SPINUP=0
+    WARN_THRESHOLD_PERCENT=96
+    SHOW_COLLECTOR_STATUS="auto"
+    POOL_EXCLUDES=(original)
+    if load_external_configuration &&
+       [[ "$EXTERNAL_CONFIG_STATUS" == "LOADED" &&
+          "$EXTERNAL_CONFIG_OVERRIDE_COUNT" == "5" &&
+          "$SMART_ALLOW_SPINUP" == "1" &&
+          "$WARN_THRESHOLD_PERCENT" == "95" &&
+          "$SHOW_COLLECTOR_STATUS" == "always" &&
+          "${POOL_EXCLUDES[*]}" == "ramtmp user0" &&
+          "$XFS_PROC_KEYS" == "$inert_config_value" &&
+          ! -e "$config_fixture_dir/executed" ]]
+    then
+        self_test_result 1 "Transactional external configuration overrides"
+    else
+        self_test_result 0 "Transactional external configuration overrides" \
+            "$EXTERNAL_CONFIG_STATUS: $EXTERNAL_CONFIG_DETAIL"
+    fi
+
+    printf '%s\n' \
+        'SMART_ALLOW_SPINUP=0' \
+        'LOG_DIR=/tmp/redirected' \
+        'UNKNOWN_PHASE12_SETTING=1' > "$EXTERNAL_CONFIG_FILE"
+    chmod 600 "$EXTERNAL_CONFIG_FILE"
+    SMART_ALLOW_SPINUP=1
+    if ! load_external_configuration &&
+       [[ "$EXTERNAL_CONFIG_STATUS" == "INVALID" &&
+          "$SMART_ALLOW_SPINUP" == "1" &&
+          "$EXTERNAL_CONFIG_OVERRIDE_COUNT" == "0" ]]
+    then
+        self_test_result 1 "Invalid configuration rejects all partial overrides"
+    else
+        self_test_result 0 "Invalid configuration rejects all partial overrides" \
+            "$EXTERNAL_CONFIG_STATUS: spinup=$SMART_ALLOW_SPINUP"
+    fi
+
+    printf '%s\n' 'SMART_ALLOW_SPINUP=0' > "$EXTERNAL_CONFIG_FILE"
+    chmod 644 "$EXTERNAL_CONFIG_FILE"
+    if ! load_external_configuration &&
+       [[ "$EXTERNAL_CONFIG_STATUS" == "UNSAFE" &&
+          "$EXTERNAL_CONFIG_DETAIL" == *"accessible by group or others"* ]]
+    then
+        self_test_result 1 "Insecure external configuration permission rejection"
+    else
+        self_test_result 0 "Insecure external configuration permission rejection" \
+            "$EXTERNAL_CONFIG_STATUS: $EXTERNAL_CONFIG_DETAIL"
+    fi
+
+    EXTERNAL_CONFIG_FILE="$config_fixture_dir/generated.conf"
+    if ensure_external_config_template &&
+       [[ -f "$EXTERNAL_CONFIG_FILE" && ! -L "$EXTERNAL_CONFIG_FILE" &&
+          "$(stat -c '%a' "$EXTERNAL_CONFIG_FILE")" == "600" ]] &&
+       grep -Fq 'parsed as data, not sourced' "$EXTERNAL_CONFIG_FILE" &&
+       grep -Fq '# POOL_EXCLUDES=ramtmp,user0' "$EXTERNAL_CONFIG_FILE"
+    then
+        self_test_result 1 "Protected state-directory configuration template"
+    else
+        self_test_result 0 "Protected state-directory configuration template"
+    fi
+
+    local hardlink_source="$config_fixture_dir/hardlink-source"
+    local hardlink_alias="$config_fixture_dir/hardlink-alias"
+    printf 'fixture\n' > "$hardlink_source"
+    chmod 600 "$hardlink_source"
+    ln "$hardlink_source" "$hardlink_alias"
+    if ! validate_secure_owned_file "$hardlink_source" &&
+       [[ "$PATH_VALIDATION_REASON" == *"hard links"* ]]
+    then
+        self_test_result 1 "Managed-file hard-link rejection"
+    else
+        self_test_result 0 "Managed-file hard-link rejection" \
+            "$PATH_VALIDATION_REASON"
+    fi
+
+    local lock_fixture_dir="$fixture_dir/secure-lock"
+    local lock_fixture_passed=0
+    mkdir -p "$lock_fixture_dir"
+    chmod 700 "$lock_fixture_dir"
+    LOCK_FILE="$lock_fixture_dir/health_monitoring.lock"
+    if acquire_lock; then
+        if ! flock -n "$LOCK_FILE" true 2>/dev/null; then
+            lock_fixture_passed=1
+        fi
+        flock -u 9 || true
+        exec 9>&-
+    fi
+    if (( lock_fixture_passed == 1 )) &&
+       [[ "$(stat -c '%a' "$LOCK_FILE")" == "600" ]]
+    then
+        self_test_result 1 "Secure lock creation and contention"
+    else
+        self_test_result 0 "Secure lock creation and contention"
+    fi
+
+    local migration_dir="$fixture_dir/state-migration"
+    local migration_backup_id backup_output backup_count
+    STATE_DIR="$migration_dir/state"
+    STATE_BACKUP_DIR="$STATE_DIR/backups"
+    EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+    STATE_SCHEMA_MANIFEST_FILE="$STATE_DIR/state_schema.manifest"
+    DEVICE_ID_SCHEMA_FILE="$STATE_DIR/device_identity_schema.version"
+    mkdir -p "$STATE_BACKUP_DIR"
+    chmod 700 "$STATE_DIR" "$STATE_BACKUP_DIR"
+    printf 'known-v1-state\n' > "$STATE_DIR/known.state"
+    chmod 600 "$STATE_DIR/known.state"
+    printf '%s\n' "$DEVICE_ID_SCHEMA_VERSION" > "$DEVICE_ID_SCHEMA_FILE"
+    chmod 600 "$DEVICE_ID_SCHEMA_FILE"
+    printf 'format=%s\nstate_schema=1\nhistory_schema=3\nidentity_schema=2\nwriter_version=2.14\nupdated_epoch=1\n' \
+        "$STATE_SCHEMA_FORMAT" > "$STATE_SCHEMA_MANIFEST_FILE"
+    chmod 600 "$STATE_SCHEMA_MANIFEST_FILE"
+    RUN_EPOCH=1787200000
+    if ensure_state_schema_manifest; then
+        migration_backup_id="$STATE_BACKUP_RESULT_ID"
+    else
+        migration_backup_id=""
+    fi
+    if validate_state_backup_id "$migration_backup_id" &&
+       [[ "$(state_manifest_value "$STATE_SCHEMA_MANIFEST_FILE" state_schema)" == "2" &&
+          "$(<"$STATE_BACKUP_DIR/$migration_backup_id/state/known.state")" == \
+          "known-v1-state" ]]
+    then
+        self_test_result 1 "Schema-v1 migration with pre-migration backup"
+    else
+        self_test_result 0 "Schema-v1 migration with pre-migration backup" \
+            "backup=$migration_backup_id status=$STATE_SCHEMA_STATUS"
+    fi
+
+    backup_output="$(list_state_backups)"
+    if [[ "$backup_output" == *"$migration_backup_id"* &&
+          "$backup_output" == *"reason=migration-v1-to-v2"* &&
+          "$(backup_metadata_value \
+              "$STATE_BACKUP_DIR/$migration_backup_id/backup.meta" \
+              source_state_schema)" == "1" ]]
+    then
+        self_test_result 1 "State backup metadata and deterministic listing"
+    else
+        self_test_result 0 "State backup metadata and deterministic listing"
+    fi
+
+    printf 'modified-v2-state\n' > "$STATE_DIR/known.state"
+    printf 'SMART_ALLOW_SPINUP=1\n' > "$EXTERNAL_CONFIG_FILE"
+    chmod 600 "$EXTERNAL_CONFIG_FILE"
+    if rollback_state_backup "$migration_backup_id" > "$migration_dir/rollback.out" &&
+       [[ "$(<"$STATE_DIR/known.state")" == "known-v1-state" &&
+          "$(state_manifest_value "$STATE_SCHEMA_MANIFEST_FILE" state_schema)" == "1" &&
+          ! -e "$EXTERNAL_CONFIG_FILE" ]]
+    then
+        backup_count="$(find "$STATE_BACKUP_DIR" -mindepth 1 -maxdepth 1 \
+            -type d ! -name '.*' -print | awk 'END {print NR+0}')"
+        if [[ "$backup_count" == "2" ]]; then
+            self_test_result 1 "Explicit rollback with pre-rollback safety backup"
+        else
+            self_test_result 0 "Explicit rollback with pre-rollback safety backup" \
+                "backup_count=$backup_count"
+        fi
+    else
+        self_test_result 0 "Explicit rollback with pre-rollback safety backup"
+    fi
+
+    backup_count="$(find "$STATE_BACKUP_DIR" -mindepth 1 -maxdepth 1 \
+        -type d ! -name '.*' -print | awk 'END {print NR+0}')"
+    if ! rollback_state_backup '../invalid' >/dev/null 2>&1 &&
+       ! rollback_state_backup 'missing-valid-backup' >/dev/null 2>&1 &&
+       [[ "$(find "$STATE_BACKUP_DIR" -mindepth 1 -maxdepth 1 \
+           -type d ! -name '.*' -print | awk 'END {print NR+0}')" == "$backup_count" ]]
+    then
+        self_test_result 1 "Rollback invalid/missing backup rejection without side effects"
+    else
+        self_test_result 0 "Rollback invalid/missing backup rejection without side effects"
+    fi
+
+    SMART_ALLOW_SPINUP=0
+    WARN_THRESHOLD_PERCENT=96
+    SHOW_COLLECTOR_STATUS="auto"
+    POOL_EXCLUDES=(ramtmp user0)
+    XFS_PROC_KEYS=""
+    EXTERNAL_CONFIG_LOAD_FAILED=0
+    # shellcheck disable=SC2030
+    EXTERNAL_CONFIG_STATUS="ABSENT"
+    EXTERNAL_CONFIG_DETAIL="using built-in defaults"
 
     actual=$(history_field_value 'temp=31 captured_epoch=1786800000 schema=3' temp 2>/dev/null || true)
     if [[ "$actual" == "31" ]]; then
@@ -11609,6 +12507,11 @@ main() {
         check-config)
             if validate_configuration; then
                 printf 'Configuration is valid (%d warning(s)).\n' "$CONFIG_WARNING_COUNT"
+                # Fixture mutations occur only inside the self-test subshell.
+                # shellcheck disable=SC2031
+                printf 'External configuration: %s (%s; %d override(s))\n' \
+                    "$EXTERNAL_CONFIG_FILE" "$EXTERNAL_CONFIG_STATUS" \
+                    "$EXTERNAL_CONFIG_OVERRIDE_COUNT"
                 return 0
             fi
             return 1
@@ -11616,6 +12519,17 @@ main() {
         state-status)
             validate_configuration || return 1
             print_state_schema_status
+            return $?
+            ;;
+        state-backups)
+            validate_runtime_dependencies state-admin || return 1
+            list_state_backups
+            return $?
+            ;;
+        rollback-state)
+            validate_runtime_dependencies state-admin || return 1
+            acquire_lock || return 1
+            rollback_state_backup "$ROLLBACK_BACKUP_ID"
             return $?
             ;;
         diagnostics)
@@ -11658,6 +12572,8 @@ main() {
         return 1
     fi
 
+    # Fixture mutations occur only inside the self-test subshell.
+    # shellcheck disable=SC2031
     log "SMART" "INFO" \
         "Collecting SMART health (short-test interval=${SHORT_TEST_INTERVAL_DAYS}d, automatic spin-up=${SMART_ALLOW_SPINUP})"
     run_collector smart "SMART/NVMe health" collector_step "SMART/NVMe collection" collect_smart_health
@@ -11726,4 +12642,5 @@ main() {
 }
 
 
+load_external_configuration || true
 main "$@"
