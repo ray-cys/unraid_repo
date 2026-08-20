@@ -4,7 +4,7 @@ noParity=true
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.14.1"
+readonly SCRIPT_VERSION="2.14.2"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -15,13 +15,13 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.14.1
+# Disk Health Monitor for Unraid v2.14.2
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
 #
-# v2.14.1 completes the deferred Phase 12 configuration, migration/rollback,
-# and secure lock/path work before the Phase 15 production soak test.
+# v2.14.2 makes trend notifications self-explanatory, filters invalid forecast
+# evidence, and retains raw diagnostic detail in the categorized run log.
 ################################################################################
 # ---------------- Configuration ----------------
 # Disks health script settings. Tuned for performance and reliability.
@@ -151,6 +151,8 @@ RISK_MONITOR=50                                 # Score >= goes to Monitor bucke
 ENDURANCE_TREND_WINDOW_DAYS=7                   # Window (days) for endurance & aging trend
 ENDURANCE_TREND_TOP_N=5                         # Top N devices to display per trend
 ENDURANCE_TREND_MIN_POH_DELTA=24                # Min POH hour delta to include device
+POH_TREND_MAX_RATE_HOURS_PER_DAY=24.5           # Reject physically impossible POH rates above this tolerance
+TREND_FORECAST_MAX_DISPLAY_DAYS=36500           # Above this, describe endurance activity as negligible
 
 # === Display / Notification Preferences ===
 FORECAST_PRECISION_DECIMALS=3                   # Decimals to show for daily percent growth
@@ -450,7 +452,7 @@ SYSLOG_CURSOR_PENDING_ANCHOR="-"
 SYSLOG_CHUNK_FILE=""
 RUN_MODE="monitor"
 ROLLBACK_BACKUP_ID=""
-REGRESSION_FIXTURE_COUNT=69
+REGRESSION_FIXTURE_COUNT=78
 CONFIG_ERROR_COUNT=0
 CONFIG_WARNING_COUNT=0
 DEPENDENCY_ERROR_COUNT=0
@@ -526,6 +528,16 @@ log_crit()  { log "HEALTH" "CRIT" "$*"; }
 log_smart() { log "SMART"  "INFO" "$*"; }
 log_btrfs() { log "BTRFS"  "INFO" "$*"; }
 log_xfs()   { log "XFS"    "INFO" "$*"; }
+
+log_master_only() {
+    local category="$1" level="$2"
+    shift 2
+
+    [[ -n "$MASTER_LOG" ]] || return 0
+    printf '%s [%s][%s] %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$category" "$level" "$*" \
+        >> "$MASTER_LOG" 2>/dev/null || true
+}
 
 # === State Files ===
 # --- Alerting & Runtime (immediate health evaluation, deltas, cooldowns, recent events) ---
@@ -1068,24 +1080,6 @@ join_by() {
     printf '%s' "$output"
 }
 
-
-format_bytes_short() {
-    local bytes="${1:-0}"
-
-    if [[ "$bytes" =~ ^[0-9]+$ ]]; then
-        awk -v value="$bytes" 'BEGIN {
-            if (value >= 1000000000) {
-                printf "%.1fG", value / 1000000000
-            } else if (value >= 1000000) {
-                printf "%dM", int(value / 1000000)
-            } else {
-                printf "%dK", int(value / 1000)
-            }
-        }'
-    else
-        printf '0K'
-    fi
-}
 
 state_temp_file() {
     local target="$1"
@@ -6318,10 +6312,12 @@ fi
                     rate=${NVME_WEAR_RATE[$dev]:-0}
                     local wear_confidence="${NVME_WEAR_CONFIDENCE[$dev]:-INSUFFICIENT}"
                     if [[ "$dl" =~ ^[0-9]+$ ]] && forecast_confidence_is_actionable "$wear_confidence"; then
+                        local wear_confidence_text
+                        wear_confidence_text=$(forecast_confidence_description "$wear_confidence")
                         if (( crit_thr>0 && dl <= crit_thr )); then
-                            record_alert critical "NVMe Wear Projection" "Disk $dev projected depletion ${dl}d <= ${crit_thr}d (rate ${rate}%/d; confidence=$wear_confidence)"
+                            record_alert critical "NVMe Wear Projection" "Disk $dev projected depletion ${dl} days <= ${crit_thr} days (rate ${rate} percentage points/day; ${wear_confidence_text})"
                         elif (( warn_thr>0 && dl <= warn_thr )); then
-                            record_alert warning "NVMe Wear Projection" "Disk $dev projected depletion ${dl}d <= ${warn_thr}d (rate ${rate}%/d; confidence=$wear_confidence)"
+                            record_alert warning "NVMe Wear Projection" "Disk $dev projected depletion ${dl} days <= ${warn_thr} days (rate ${rate} percentage points/day; ${wear_confidence_text})"
                         fi
                     fi
                 done
@@ -7637,6 +7633,7 @@ process_notification_delivery() {
 # by risk evaluation and final rendering. Each stage otherwise owns its local
 # parsing state and can fail independently.
 declare -a TREND_LINE_ITEMS=()
+declare -a TREND_DIAGNOSTIC_ITEMS=()
 declare -A TREND_HISTORY_CACHE=()
 TREND_CACHE_RESULT=""
 TREND_ROW_DEVICE_KEY=""
@@ -7663,6 +7660,79 @@ trend_add_line() {
         TREND_LINE_ITEMS+=("${tag}: ${content}")
     fi
     return 0
+}
+
+trend_add_diagnostic() {
+    local label="$1" content="$2"
+
+    [[ -n "$content" ]] && TREND_DIAGNOSTIC_ITEMS+=("$label: $content")
+    return 0
+}
+
+trend_log_diagnostics() {
+    local item
+
+    for item in "${TREND_DIAGNOSTIC_ITEMS[@]}"; do
+        log_master_only "TREND" "INFO" "Diagnostic $item"
+    done
+    return 0
+}
+
+forecast_confidence_description() {
+    case "${1:-INSUFFICIENT}" in
+        HIGH)         printf 'high forecast confidence' ;;
+        MEDIUM)       printf 'medium forecast confidence' ;;
+        LOW)          printf 'low forecast confidence' ;;
+        STALE)        printf 'stale history' ;;
+        RESET)        printf 'counter reset detected; forecast rebuilding' ;;
+        *)            printf 'insufficient history' ;;
+    esac
+}
+
+format_bytes_per_day() {
+    local bytes="${1:-0}"
+
+    if [[ "$bytes" =~ ^[0-9]+$ ]]; then
+        printf '%s/day' "$(human_readable "$bytes")"
+    else
+        printf 'unknown/day'
+    fi
+}
+
+smart_growth_description() {
+    local compact="$1" device token value
+    local -a tokens=() descriptions=()
+
+    IFS=$' \t' read -r -a tokens <<< "$compact"
+    (( ${#tokens[@]} > 0 )) || return 0
+    device="${tokens[0]}"
+    for token in "${tokens[@]:1}"; do
+        case "$token" in
+            HVW) descriptions+=("high write volume") ;;
+            W+*)
+                value="${token#W+}"
+                value="${value%\%}"
+                descriptions+=("wear used increased by ${value} percentage points")
+                ;;
+            US) descriptions+=("unsafe-shutdown counter increased") ;;
+            PCIE) descriptions+=("PCIe correctable-error counter increased") ;;
+            MEDIA) descriptions+=("media-error counter increased") ;;
+            T1) descriptions+=("thermal-management level-1 transitions increased") ;;
+            T2) descriptions+=("thermal-management level-2 transitions increased") ;;
+            WT+*)
+                value="${token#WT+}"
+                descriptions+=("warning-temperature exposure increased by $value")
+                ;;
+            CT+*)
+                value="${token#CT+}"
+                descriptions+=("critical-temperature exposure increased by $value")
+                ;;
+            NR) descriptions+=("near rated endurance") ;;
+            *) descriptions+=("SMART change $token") ;;
+        esac
+    done
+    (( ${#descriptions[@]} > 0 )) || return 0
+    printf '%s: %s' "$device" "$(join_by ', ' "${descriptions[@]}")"
 }
 
 # Copy a bounded history tail once per run. Trend stages share the cached file
@@ -8012,33 +8082,57 @@ analyze_temperature_trends() {
             temp_confidence=$(forecast_confidence \
                 "${TT_CNT[$tdev]:-0}" "$days" "$temp_latest_age" "$temp_max_gap_days")
             TEMP_RATE_CONFIDENCE[$tdev]="$temp_confidence"
+            trend_add_diagnostic "temperature trend" \
+                "device=$(basename "$tdev") samples=${TT_CNT[$tdev]:-0} span_days=$days rise_c=$rise rate_c_per_day=$rate latest_age_days=$temp_latest_age maximum_gap_days=$temp_max_gap_days confidence=$temp_confidence"
             if (( TEMP_RATE_ALERT_ENABLED == 1 )) && [[ -n "$rate" && "$days" != "0.00" ]] &&
                forecast_confidence_is_actionable "$temp_confidence"
             then
                 if awk -v d="$days" -v min="$TEMP_RATE_MIN_SPAN_DAYS" \
                     'BEGIN { exit !(d >= min) }'
                 then
+                    local temp_confidence_text
+                    temp_confidence_text=$(forecast_confidence_description "$temp_confidence")
                     if awk -v r="$rate" -v c="$TEMP_RATE_CRIT_C_PER_DAY" \
                         'BEGIN { exit !(r >= c) }'
                     then
-                        record_alert critical "Temperature Rate" "Disk $tdev rising +${rise}C over ${days}d (~${rate}C/day; confidence=$temp_confidence)"
+                        record_alert critical "Temperature Rate" "Disk $tdev rose ${rise}°C over ${days} days (~${rate}°C/day; ${temp_confidence_text})"
                     elif awk -v r="$rate" -v w="$TEMP_RATE_WARN_C_PER_DAY" \
                         'BEGIN { exit !(r >= w) }'
                     then
-                        record_alert warning "Temperature Rate" "Disk $tdev rising +${rise}C over ${days}d (~${rate}C/day; confidence=$temp_confidence)"
+                        record_alert warning "Temperature Rate" "Disk $tdev rose ${rise}°C over ${days} days (~${rate}°C/day; ${temp_confidence_text})"
                     fi
                 fi
             fi
         done
-        local -a temp_confidence_items=()
+        local -a temp_stale=() temp_insufficient=() temp_low=() temp_reset=()
         for tdev in "${!TEMP_RATE_CONFIDENCE[@]}"; do
             case "${TEMP_RATE_CONFIDENCE[$tdev]:-INSUFFICIENT}" in
                 HIGH|MEDIUM) ;;
-                *) temp_confidence_items+=("$(basename "$tdev")=${TEMP_RATE_CONFIDENCE[$tdev]:-INSUFFICIENT}") ;;
+                STALE) temp_stale+=("$(basename "$tdev")") ;;
+                LOW) temp_low+=("$(basename "$tdev")") ;;
+                RESET) temp_reset+=("$(basename "$tdev")") ;;
+                *) temp_insufficient+=("$(basename "$tdev")") ;;
             esac
         done
-        if (( ${#temp_confidence_items[@]} > 0 )); then
-            TEMP_FORECAST_CONFIDENCE_LINE="$(join_by ' | ' "${temp_confidence_items[@]}")"
+        (( ${#temp_stale[@]} == 0 )) ||
+            mapfile -t temp_stale < <(printf '%s\n' "${temp_stale[@]}" | LC_ALL=C sort -u)
+        (( ${#temp_insufficient[@]} == 0 )) ||
+            mapfile -t temp_insufficient < <(printf '%s\n' "${temp_insufficient[@]}" | LC_ALL=C sort -u)
+        (( ${#temp_low[@]} == 0 )) ||
+            mapfile -t temp_low < <(printf '%s\n' "${temp_low[@]}" | LC_ALL=C sort -u)
+        (( ${#temp_reset[@]} == 0 )) ||
+            mapfile -t temp_reset < <(printf '%s\n' "${temp_reset[@]}" | LC_ALL=C sort -u)
+        local -a temp_quality_parts=()
+        (( ${#temp_stale[@]} == 0 )) ||
+            temp_quality_parts+=("${#temp_stale[@]} disk(s) have stale samples ($(join_by ', ' "${temp_stale[@]}")); this may be expected while disks are sleeping")
+        (( ${#temp_insufficient[@]} == 0 )) ||
+            temp_quality_parts+=("${#temp_insufficient[@]} disk(s) need more samples ($(join_by ', ' "${temp_insufficient[@]}"))")
+        (( ${#temp_low[@]} == 0 )) ||
+            temp_quality_parts+=("${#temp_low[@]} disk(s) have widely spaced samples ($(join_by ', ' "${temp_low[@]}"))")
+        (( ${#temp_reset[@]} == 0 )) ||
+            temp_quality_parts+=("${#temp_reset[@]} disk(s) have reset history ($(join_by ', ' "${temp_reset[@]}"))")
+        if (( ${#temp_quality_parts[@]} > 0 )); then
+            TEMP_FORECAST_CONFIDENCE_LINE="$(join_by '; ' "${temp_quality_parts[@]}"); no temperature-rate alert was evaluated from this evidence"
         fi
     fi
     return 0
@@ -8159,41 +8253,72 @@ analyze_endurance_trends() {
            prepare_trend_history_cache power-on-hours "$POH_HISTORY_FILE" 50000
         then
                 local poh_cache="$TREND_CACHE_RESULT"
-                declare -A poh_first_dt poh_first_v poh_last_dt poh_last_v
-                local dt stored_key rest v
+                declare -A poh_first_epoch poh_first_v poh_last_epoch poh_last_v
+                local dt stored_key rest v poh_epoch
                 while read -r dt stored_key rest; do
                     v=$(history_field_value "$rest" poh 2>/dev/null || true)
                     [[ "$v" =~ ^[0-9]+$ ]] || continue
                     dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
                     [[ -z "$dev" || -z "$v" ]] && continue
-                    if [[ -z "${poh_first_dt[$dev]:-}" || "$dt" < "${poh_first_dt[$dev]}" ]]; then poh_first_dt[$dev]="$dt"; poh_first_v[$dev]="$v"; fi
-                    if [[ -z "${poh_last_dt[$dev]:-}" || "$dt" > "${poh_last_dt[$dev]}" || "$dt" == "${poh_last_dt[$dev]}" ]]; then poh_last_dt[$dev]="$dt"; poh_last_v[$dev]="$v"; fi
+                    poh_epoch=$(history_record_epoch "$dt" "$rest" 2>/dev/null || true)
+                    [[ "$poh_epoch" =~ ^[0-9]+$ ]] || continue
+                    if [[ -z "${poh_first_epoch[$dev]:-}" ]] ||
+                       (( poh_epoch < poh_first_epoch[$dev] ))
+                    then
+                        poh_first_epoch[$dev]="$poh_epoch"
+                        poh_first_v[$dev]="$v"
+                    fi
+                    if [[ -z "${poh_last_epoch[$dev]:-}" ]] ||
+                       (( poh_epoch >= poh_last_epoch[$dev] ))
+                    then
+                        poh_last_epoch[$dev]="$poh_epoch"
+                        poh_last_v[$dev]="$v"
+                    fi
                 done < <(stream_trend_history_window "$poh_cache" "$cutoff_end")
-                local poh_rank=()
+                local poh_rank=() poh_invalid_items=()
                 for dev in "${!poh_last_v[@]}"; do
                     local start=${poh_first_v[$dev]:-0} end=${poh_last_v[$dev]:-0}
                     if [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && $end -gt $start ]]; then
                         local delta=$(( end - start ))
                         if (( delta >= ENDURANCE_TREND_MIN_POH_DELTA )); then
-                            poh_rank+=("$delta $dev $start $end")
+                            local elapsed_seconds=$(( ${poh_last_epoch[$dev]:-0} - ${poh_first_epoch[$dev]:-0} ))
+                            (( elapsed_seconds > 0 )) || continue
+                            local span_days rate
+                            span_days=$(awk -v seconds="$elapsed_seconds" \
+                                'BEGIN { printf "%.2f", seconds/86400.0 }')
+                            rate=$(awk -v dlt="$delta" -v seconds="$elapsed_seconds" \
+                                'BEGIN { printf "%.2f", dlt/(seconds/86400.0) }')
+                            if awk -v rate="$rate" -v maximum="$POH_TREND_MAX_RATE_HOURS_PER_DAY" \
+                                'BEGIN { exit !(rate > maximum) }'
+                            then
+                                poh_invalid_items+=("$(basename "$dev") ${rate} hours/day")
+                                trend_add_diagnostic "power-on-hour sample rejected" \
+                                    "device=$(basename "$dev") delta=${delta}h span=${span_days}d rate=${rate}h/day"
+                                continue
+                            fi
+                            trend_add_diagnostic "power-on-hour trend" \
+                                "device=$(basename "$dev") delta_hours=$delta span_days=$span_days rate_hours_per_day=$rate"
+                            poh_rank+=("$delta $dev $span_days $rate")
                         fi
                     fi
                 done
+                if (( ${#poh_invalid_items[@]} > 0 )); then
+                    mapfile -t poh_invalid_items < <(
+                        printf '%s\n' "${poh_invalid_items[@]}" | LC_ALL=C sort -u
+                    )
+                    POH_INVALID_LINE="$(join_by ' | ' "${poh_invalid_items[@]}")"
+                fi
                 if (( ${#poh_rank[@]} > 0 )); then
                     local sorted
-                    sorted=$(printf "%s\n" "${poh_rank[@]}" | sort -nr -k1,1 | head -n ${ENDURANCE_TREND_TOP_N:-5})
+                    sorted=$(printf "%s\n" "${poh_rank[@]}" | sort -nr -k1,1 -k2,2 | head -n ${ENDURANCE_TREND_TOP_N:-5})
                     # Build compact POH growth line with rate per day
                     {
                         local _s="" _cnt=0
-                        while read -r delta dev start end; do
+                        while read -r delta dev span_days rate; do
                             [[ -z "$dev" ]] && continue
-                            local days_interval=$(( ( $(date -d "${poh_last_dt[$dev]}" +%s 2>/dev/null || date +%s) - $(date -d "${poh_first_dt[$dev]}" +%s 2>/dev/null || date +%s) ) / 86400 ))
-                            (( days_interval<=0 )) && days_interval=1
-                            local rate
-                            rate=$(awk -v dlt="$delta" -v dd="$days_interval" 'BEGIN{printf "%.2f", dlt/dd}')
                             local base tag model_suffix
                             base="$(base_device "$dev")"; tag="$(basename "$base")"; model_suffix="$(model_suffix_for "$base")"
-                            _s+="${tag}${model_suffix} +${delta}h r=${rate}h/d; "
+                            _s+="${tag}${model_suffix} accumulated ${delta} power-on hours over ${span_days} days (${rate} hours/day); "
                             (( ++_cnt >= ${ENDURANCE_TREND_TOP_N:-5} )) && break
                         done < <(printf "%s\n" "$sorted")
                         POH_GROWTH_LINE="${_s%'; '}"
@@ -8206,15 +8331,17 @@ analyze_endurance_trends() {
         then
                 local dl_cache="$TREND_CACHE_RESULT"
                 local accel_factor=${ENDURANCE_DAYSLEFT_ACCEL_FACTOR_PCT:-50} accel_min=${ENDURANCE_DAYSLEFT_ACCEL_MIN_DELTA:-0.5}
-                declare -A dl_first_dt dl_first_v dl_last_dt dl_last_v dl_seq
-                local dt stored_key rest v
+                declare -A dl_first_dt dl_first_v dl_last_dt dl_last_v dl_last_confidence dl_seq
+                local dt stored_key rest v confidence
                 while read -r dt stored_key rest; do
                     v=$(history_field_value "$rest" days_left 2>/dev/null || true)
                     [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
                     dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
                     [[ -z "$dev" || -z "$v" ]] && continue
+                    confidence=$(history_field_value "$rest" confidence 2>/dev/null || true)
+                    confidence=${confidence:-INSUFFICIENT}
                     if [[ -z "${dl_first_dt[$dev]:-}" || "$dt" < "${dl_first_dt[$dev]}" ]]; then dl_first_dt[$dev]="$dt"; dl_first_v[$dev]="$v"; fi
-                    if [[ -z "${dl_last_dt[$dev]:-}" || "$dt" > "${dl_last_dt[$dev]}" || "$dt" == "${dl_last_dt[$dev]}" ]]; then dl_last_dt[$dev]="$dt"; dl_last_v[$dev]="$v"; fi
+                    if [[ -z "${dl_last_dt[$dev]:-}" || "$dt" > "${dl_last_dt[$dev]}" || "$dt" == "${dl_last_dt[$dev]}" ]]; then dl_last_dt[$dev]="$dt"; dl_last_v[$dev]="$v"; dl_last_confidence[$dev]="$confidence"; fi
                     dl_seq[$dev]+="${dt}:${v} "
                 done < <(stream_trend_history_window "$dl_cache" "$cutoff_end")
                 local dl_rank=()
@@ -8224,6 +8351,12 @@ analyze_endurance_trends() {
                         local rota
                         rota=$(lsblk_rota_cached "$dev" 2>/dev/null || echo 1)
                         [[ "$rota" != "0" ]] && continue
+                    fi
+                    confidence="${dl_last_confidence[$dev]:-INSUFFICIENT}"
+                    if ! forecast_confidence_is_actionable "$confidence"; then
+                        trend_add_diagnostic "endurance trajectory suppressed" \
+                            "device=$(basename "$dev") confidence=$confidence"
+                        continue
                     fi
                     local start=${dl_first_v[$dev]:-0} end=${dl_last_v[$dev]:-0}
                     if [[ "$start" =~ ^[0-9]+(\.[0-9]+)?$ && "$end" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
@@ -8244,16 +8377,23 @@ analyze_endurance_trends() {
                         rate=$(awk -v sh="$shrink" -v d="$days_interval" 'BEGIN{printf "%.3f", sh/d}')
                         local abs_rate
                         abs_rate=$(awk -v r="$rate" 'BEGIN{printf "%.3f", (r<0)? -r : r}')
-                        dl_rank+=("$abs_rate $dev $start $end $shrink $rate $accel_flag")
+                        trend_add_diagnostic "endurance trajectory" \
+                            "device=$(basename "$dev") start_days=$start end_days=$end change_days=$shrink rate_forecast_days_per_day=$rate span_days=$days_interval confidence=$confidence accelerated=${accel_flag:-no}"
+                        dl_rank+=("$abs_rate $dev $start $end $shrink $rate $days_interval $confidence $accel_flag")
                     fi
                 done
                 if (( ${#dl_rank[@]} > 0 )); then
                     local sorted
-                    sorted=$(printf "%s\n" "${dl_rank[@]}" | sort -nr -k1,1 | head -n ${ENDURANCE_DAYSLEFT_TOP_N:-5})
+                    sorted=$(printf "%s\n" "${dl_rank[@]}" | sort -nr -k1,1 -k2,2 | head -n ${ENDURANCE_DAYSLEFT_TOP_N:-5})
                     {
                         local _s="" _cnt=0
-                        while read -r abs_rate dev start end shrink rate accel; do
-                            _s+="$(basename "$dev") ${shrink}d r=${rate}d/d${accel:+,$accel}; "
+                        while read -r abs_rate dev start end shrink rate days_interval confidence accel; do
+                            local shrink_abs confidence_text acceleration_text=""
+                            shrink_abs=$(awk -v value="$shrink" \
+                                'BEGIN { printf "%.1f", (value < 0) ? -value : value }')
+                            confidence_text=$(forecast_confidence_description "$confidence")
+                            [[ "$accel" == "ACCEL" ]] && acceleration_text="; decline is accelerating"
+                            _s+="$(basename "$dev") endurance estimate shortened by ${shrink_abs} days over ${days_interval} days (${confidence_text}${acceleration_text}); "
                             (( ++_cnt >= 5 )) && break
                         done < <(printf "%s\n" "$sorted")
                         DL_SHRINK_LINE="${_s%'; '}"
@@ -8418,19 +8558,34 @@ render_trend_section() {
     CURRENT_TREND_BLOCK="trend-one-liners"
     {
         TREND_LINE_ITEMS=()
+        local -a _forecast_rebuilding=() _forecast_unavailable=()
         # Capacity forecast
         CURRENT_TREND_BLOCK="TL: capacity-forecast"
         if [[ -n "${ARR_GROWTH_STR:-}" || -n "${POOL_GROWTH_STR:-}" || -n "${ARR_DAYS_TO_THRESHOLD:-}" || -n "${POOL_DAYS_TO_THRESHOLD:-}" ]]; then
-            local _cf_a _cf_p _cf_suffix=""
+            local _cf_a _cf_p _cf_suffix="" _cf_confidence
             if (( ${ARR_HISTORY_COUNT:-0} < 2 )); then
-                _cf_a="array history<2 samples"
+                _cf_a="Array forecast needs at least two samples"
+            elif [[ "${ARR_DAYS_TO_THRESHOLD:-N/A}" == "∞" ]]; then
+                _cf_a="Array usage is stable or decreasing; it is not projected to reach ${THRESHOLD}%"
+            elif [[ "${ARR_DAYS_TO_THRESHOLD:-N/A}" == "N/A" ]]; then
+                _cf_a="Array forecast is unavailable"
             else
-                _cf_a="array ${ARR_DAYS_TO_THRESHOLD:-N/A}d→${THRESHOLD}% (${ARR_GROWTH_STR:-N/A}/d; confidence=${ARR_FORECAST_CONFIDENCE:-INSUFFICIENT})"
+                local _cf_growth="${ARR_GROWTH_STR:-N/A}"
+                _cf_growth="${_cf_growth%\%}"
+                _cf_confidence=$(forecast_confidence_description "${ARR_FORECAST_CONFIDENCE:-INSUFFICIENT}")
+                _cf_a="Array usage is growing by ${_cf_growth} percentage points/day; estimated ${ARR_DAYS_TO_THRESHOLD} days to reach ${THRESHOLD}% (${_cf_confidence})"
             fi
             if (( ${POOL_HISTORY_COUNT:-0} < 2 )); then
-                _cf_p="pools history<2 samples"
+                _cf_p="Pool forecast needs at least two samples"
+            elif [[ "${POOL_DAYS_TO_THRESHOLD:-N/A}" == "∞" ]]; then
+                _cf_p="Pool usage is stable or decreasing; it is not projected to reach ${THRESHOLD}%"
+            elif [[ "${POOL_DAYS_TO_THRESHOLD:-N/A}" == "N/A" ]]; then
+                _cf_p="Pool forecast is unavailable"
             else
-                _cf_p="pools ${POOL_DAYS_TO_THRESHOLD:-N/A}d→${THRESHOLD}% (${POOL_GROWTH_STR:-N/A}/d; confidence=${POOL_FORECAST_CONFIDENCE:-INSUFFICIENT})"
+                local _cf_growth="${POOL_GROWTH_STR:-N/A}"
+                _cf_growth="${_cf_growth%\%}"
+                _cf_confidence=$(forecast_confidence_description "${POOL_FORECAST_CONFIDENCE:-INSUFFICIENT}")
+                _cf_p="Pool usage is growing by ${_cf_growth} percentage points/day; estimated ${POOL_DAYS_TO_THRESHOLD} days to reach ${THRESHOLD}% (${_cf_confidence})"
             fi
             # Annotate CF only when parity is truly in progress to indicate potential skew
             if [[ -n "${PARITY_ACTION:-}" ]]; then
@@ -8438,15 +8593,17 @@ render_trend_section() {
                 _act=$(printf "%s" "${PARITY_ACTION}" | awk '{print tolower($1)}')
                 _pos="${PARITY_POS:-}"; _size="${PARITY_SIZE:-}"; _rem="${PARITY_REM:-}"; _spk="${PARITY_SPEED_K:-}"
                 if [[ -n "$_act" && "$_act" != "idle" ]]; then
-                    if [[ "$_spk" =~ ^[0-9]+$ && $((10#$_spk)) -gt 0 ]]; then _cf_suffix=" (parity in progress; forecast may be skewed)"
-                    elif [[ "$_rem" =~ ^[0-9]+$ && $((10#$_rem)) -gt 0 ]]; then _cf_suffix=" (parity in progress; forecast may be skewed)"
-                    elif [[ "$_pos" =~ ^[0-9]+$ && "$_size" =~ ^[0-9]+$ && $((10#$_pos)) -gt 0 && $((10#$_pos)) -lt $((10#$_size)) ]]; then _cf_suffix=" (parity in progress; forecast may be skewed)"
+                        if [[ "$_spk" =~ ^[0-9]+$ && $((10#$_spk)) -gt 0 ]]; then _cf_suffix="; parity is in progress, so estimates may be temporarily skewed"
+                    elif [[ "$_rem" =~ ^[0-9]+$ && $((10#$_rem)) -gt 0 ]]; then _cf_suffix="; parity is in progress, so estimates may be temporarily skewed"
+                    elif [[ "$_pos" =~ ^[0-9]+$ && "$_size" =~ ^[0-9]+$ && $((10#$_pos)) -gt 0 && $((10#$_pos)) -lt $((10#$_size)) ]]; then _cf_suffix="; parity is in progress, so estimates may be temporarily skewed"
                     fi
                 fi
             fi
-            trend_add_line "CF" "${_cf_a}; ${_cf_p}${_cf_suffix}"
+            trend_add_diagnostic "capacity forecast" \
+                "array=${ARR_DAYS_TO_THRESHOLD:-N/A}d@${ARR_GROWTH_STR:-N/A}/day confidence=${ARR_FORECAST_CONFIDENCE:-INSUFFICIENT}; pools=${POOL_DAYS_TO_THRESHOLD:-N/A}d@${POOL_GROWTH_STR:-N/A}/day confidence=${POOL_FORECAST_CONFIDENCE:-INSUFFICIENT}"
+            trend_add_line "Capacity forecast" "${_cf_a}. ${_cf_p}${_cf_suffix}."
         fi
-        trend_add_line "TEMP-Q" "${TEMP_FORECAST_CONFIDENCE_LINE:-}"
+        trend_add_line "Temperature history" "${TEMP_FORECAST_CONFIDENCE_LINE:-}"
         # Disk growth (top 5)
         CURRENT_TREND_BLOCK="TL: disk-growth"
         if (( ${DISK_GROWTH_ENABLED:-1} == 1 )) &&
@@ -8478,15 +8635,24 @@ render_trend_section() {
                 done
                 # Build growth and shrink lists independently then merge into single line
                 local _items_growth=() _items_shrink=()
+                declare -A _displayed_disk_direction=()
                 if (( ${#_rank[@]} > 0 )); then
                     local _sorted_g
-                    _sorted_g=$(printf "%s\n" "${_rank[@]}" | sort -nr -k1,1 | head -n 5)
+                    _sorted_g=$(printf "%s\n" "${_rank[@]}" | sort -nr -k1,1 -k2,2 | head -n 5)
                     while read -r pd disk sz; do
                         [[ -z "$pd" || -z "$disk" ]] && continue
                         disk=${disk//\"/}
-                        local rate pct
-                        rate=$(format_bytes_short "$pd")
-                        if (( sz>0 )); then pct=$(awk -v pd="$pd" -v sz="$sz" 'BEGIN{printf "%.2f", (pd/sz)*100}'); _items_growth+=("🔺${disk} +${rate} (${pct}%)"); else _items_growth+=("🔺${disk} +${rate}"); fi
+                        [[ -z "${_displayed_disk_direction[$disk]:-}" ]] || continue
+                        local rate pct=""
+                        rate=$(format_bytes_per_day "$pd")
+                        _displayed_disk_direction[$disk]="increase"
+                        if (( sz>0 )); then
+                            pct=$(awk -v pd="$pd" -v sz="$sz" 'BEGIN{printf "%.2f", (pd/sz)*100}')
+                            _items_growth+=("${disk} increased by an average of ${rate} (${pct}% of capacity/day)")
+                        else
+                            _items_growth+=("${disk} increased by an average of ${rate}")
+                        fi
+                        trend_add_diagnostic "disk usage" "device=$disk direction=increase bytes_per_day=$pd capacity_percent_per_day=${pct:-unknown}"
                     done < <(printf "%s\n" "$_sorted_g")
                 fi
                 local _shrink_rank=()
@@ -8501,18 +8667,26 @@ render_trend_section() {
                 done
                 if (( ${#_shrink_rank[@]} > 0 )); then
                     local _sorted_s
-                    _sorted_s=$(printf "%s\n" "${_shrink_rank[@]}" | sort -nr -k1,1 | head -n 5)
+                    _sorted_s=$(printf "%s\n" "${_shrink_rank[@]}" | sort -nr -k1,1 -k2,2 | head -n 5)
                     while read -r pd disk sz; do
                         [[ -z "$pd" || -z "$disk" ]] && continue
                         disk=${disk//\"/}
-                        local rate pct
-                        rate=$(format_bytes_short "$pd")
-                        if (( sz>0 )); then pct=$(awk -v pd="$pd" -v sz="$sz" 'BEGIN{printf "%.2f", (pd/sz)*100}'); _items_shrink+=("🔻${disk} -${rate} (${pct}%)"); else _items_shrink+=("🔻${disk} -${rate}"); fi
+                        [[ -z "${_displayed_disk_direction[$disk]:-}" ]] || continue
+                        local rate pct=""
+                        rate=$(format_bytes_per_day "$pd")
+                        _displayed_disk_direction[$disk]="decrease"
+                        if (( sz>0 )); then
+                            pct=$(awk -v pd="$pd" -v sz="$sz" 'BEGIN{printf "%.2f", (pd/sz)*100}')
+                            _items_shrink+=("${disk} decreased by an average of ${rate} (${pct}% of capacity/day)")
+                        else
+                            _items_shrink+=("${disk} decreased by an average of ${rate}")
+                        fi
+                        trend_add_diagnostic "disk usage" "device=$disk direction=decrease bytes_per_day=$pd capacity_percent_per_day=${pct:-unknown}"
                     done < <(printf "%s\n" "$_sorted_s")
                 fi
                 if (( ${#_items_growth[@]} + ${#_items_shrink[@]} > 0 )); then
                     local _combined=("${_items_growth[@]}" "${_items_shrink[@]}")
-                    trend_add_line "DISK↑" "$(join_by ' | ' "${_combined[@]}")"
+                    trend_add_line "Disk usage change" "$(join_by '; ' "${_combined[@]}")"
                 fi
         fi
         # Share growth (top N)
@@ -8547,11 +8721,12 @@ render_trend_section() {
                 local _share_growth_items=() _share_shrink_items=()
                 if (( ${#_gr[@]} > 0 )); then
                     local _sorted_gs
-                    _sorted_gs=$(printf "%s\n" "${_gr[@]}" | sort -nr -k1,1 | head -n "${SHARE_TOP_N}")
+                    _sorted_gs=$(printf "%s\n" "${_gr[@]}" | sort -nr -k1,1 -k2,2 | head -n "${SHARE_TOP_N}")
                     while read -r pd s; do
                         [[ -z "$s" ]] && continue
-                        local rate; rate=$(format_bytes_short "$pd")
-                        _share_growth_items+=("🔺${s} +${rate}")
+                        local rate; rate=$(format_bytes_per_day "$pd")
+                        _share_growth_items+=("${s} increased by an average of ${rate}")
+                        trend_add_diagnostic "share usage" "share=$s direction=increase bytes_per_day=$pd"
                     done < <(printf "%s\n" "$_sorted_gs")
                 fi
                 local _shrink_share=()
@@ -8566,79 +8741,72 @@ render_trend_section() {
                 done
                 if (( ${#_shrink_share[@]} > 0 )); then
                     local _sorted_ss
-                    _sorted_ss=$(printf "%s\n" "${_shrink_share[@]}" | sort -nr -k1,1 | head -n "${SHARE_TOP_N}")
+                    _sorted_ss=$(printf "%s\n" "${_shrink_share[@]}" | sort -nr -k1,1 -k2,2 | head -n "${SHARE_TOP_N}")
                     while read -r pd s; do
                         [[ -z "$s" ]] && continue
-                        local rate; rate=$(format_bytes_short "$pd")
-                        _share_shrink_items+=("🔻${s} -${rate}")
+                        local rate; rate=$(format_bytes_per_day "$pd")
+                        _share_shrink_items+=("${s} decreased by an average of ${rate}")
+                        trend_add_diagnostic "share usage" "share=$s direction=decrease bytes_per_day=$pd"
                     done < <(printf "%s\n" "$_sorted_ss")
                 fi
                 if (( ${#_share_growth_items[@]} + ${#_share_shrink_items[@]} > 0 )); then
                     local _combined_share=("${_share_growth_items[@]}" "${_share_shrink_items[@]}")
-                    trend_add_line "SHARE↑" "$(join_by ' | ' "${_combined_share[@]}")"
+                    trend_add_line "Share usage change" "$(join_by '; ' "${_combined_share[@]}")"
                 fi
         fi
-        # NVMe/SATA SSD wear rate (TBW-derived percent/day)
-        CURRENT_TREND_BLOCK="TL: wear-rate"
-        if declare -p TBW_DAILY >/dev/null 2>&1; then
-            local wear_items=()
-            for dev in "${!TBW_DAILY[@]}"; do
-                forecast_confidence_is_actionable \
-                    "${TBW_FORECAST_CONFIDENCE[$dev]:-INSUFFICIENT}" || continue
-                local is_ssd=0
-                if [[ "$dev" == /dev/nvme* ]]; then is_ssd=1; else
-                    local rota; rota=$(lsblk_rota_cached "$dev" 2>/dev/null || echo 1)
-                    [[ "$rota" == "0" ]] && is_ssd=1
-                fi
-                (( is_ssd == 0 )) && continue
-                local model cap_tb tbw_thresh_tb
-                model=$(get_device_model "$dev")
-                cap_tb=$(get_device_capacity_tb "$dev")
-                tbw_thresh_tb=$(tbw_threshold_tb_for_device "$model" "$cap_tb")
-                [[ -z "$tbw_thresh_tb" ]] && continue
-                if ! [[ "$tbw_thresh_tb" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then continue; fi
-                local daily_bytes total_bytes rate_pct_day_raw rate_pct_day_disp
-                daily_bytes=${TBW_DAILY[$dev]:-0}
-                total_bytes=$(awk -v t="$tbw_thresh_tb" 'BEGIN{printf "%d", int(t * 1000*1000*1000*1000)}')
-                if (( daily_bytes > 0 && total_bytes > 0 )); then
-                    rate_pct_day_raw=$(awk -v d="$daily_bytes" -v t="$total_bytes" 'BEGIN{printf "%.8f", (d/t)*100.0}')
-                    rate_pct_day_disp=$(awk -v r="$rate_pct_day_raw" 'BEGIN{printf "%.4f", r}')
-                    if awk -v r="$rate_pct_day_raw" -v d="$rate_pct_day_disp" 'BEGIN{exit (r>0 && d==0)?0:1}'; then
-                        rate_pct_day_disp="~0.0001"
-                    fi
-                    local used_pct label_dev
-                    used_pct=${CUR_ATTR["$dev|nvme_percent_used"]:-}
-                    label_dev=$(basename "$dev")
-                    if [[ -n "$used_pct" && "$used_pct" =~ ^[0-9]+$ ]] && awk -v r="$rate_pct_day_raw" 'BEGIN{exit (r>0)?0:1}'; then
-                        local remaining
-                        remaining=$(awk -v u="$used_pct" -v r="$rate_pct_day_raw" 'BEGIN{printf "%.1f", (100.0 - u)/r}')
-                        wear_items+=("${label_dev} ${remaining/.*}d r=${rate_pct_day_disp}%/d")
-                    else
-                        wear_items+=("${label_dev} ∞ r=${rate_pct_day_disp}%/d")
-                    fi
-                fi
-            done
-            if (( ${#wear_items[@]} > 0 )); then
-                trend_add_line "WEAR" "$(join_by ' | ' "${wear_items[@]}")"
-            fi
-        fi
+        # TBW-derived wear evidence is rendered once in the endurance and
+        # write-intensity lines below. The NVMe percentage-used projection is
+        # kept separate so two different calculations never share one label.
         # Maintenance: long SMART tests due soon
         CURRENT_TREND_BLOCK="TL: maintenance"
         if declare -p LONG_TEST_DUE_SOON &>/dev/null; then
             local _near=() _k _d
-            for _k in "${!LONG_TEST_DUE_SOON[@]}"; do _d=${LONG_TEST_DUE_SOON[$_k]}; _near+=("$(basename "$_k")(${_d}d)"); done
-            if (( ${#_near[@]} > 0 )); then trend_add_line "MTN" "${_near[*]}"; fi
+            for _k in "${!LONG_TEST_DUE_SOON[@]}"; do
+                _d=${LONG_TEST_DUE_SOON[$_k]}
+                _near+=("$(basename "$_k") is due in ${_d} days")
+            done
+            if (( ${#_near[@]} > 0 )); then
+                trend_add_line "SMART maintenance" "$(join_by '; ' "${_near[@]}")"
+            fi
         fi
-        # TBW trend (forecast days-left) and heavy writers compact
+        # TBW trend (forecast days-left) and capacity-normalized write intensity.
         CURRENT_TREND_BLOCK="TL: tbw-trend"
         if (( ${TBW_TREND_ENABLED:-0} == 1 )) && declare -p TBW_DAYS_LEFT &>/dev/null; then
-            local _tbw=""
+            local -a _tbw_rank=() _tbw_items=()
             for dev in "${!TBW_DAYS_LEFT[@]}"; do
                 local dl=${TBW_DAYS_LEFT[$dev]} daily=${TBW_DAILY[$dev]:-0}
-                local rate; rate=$(format_bytes_short "$daily")
-                _tbw+="🔺$(basename "$dev") ${rate} → ${dl}d [${TBW_FORECAST_CONFIDENCE[$dev]:-INSUFFICIENT}] | "
+                local confidence=${TBW_FORECAST_CONFIDENCE[$dev]:-INSUFFICIENT}
+                trend_add_diagnostic "TBW endurance" \
+                    "device=$(basename "$dev") bytes_per_day=$daily days_left=$dl confidence=$confidence"
+                if ! forecast_confidence_is_actionable "$confidence"; then
+                    case "$confidence" in
+                        RESET) _forecast_rebuilding+=("$(basename "$dev") endurance counter reset") ;;
+                        STALE) _forecast_unavailable+=("$(basename "$dev") endurance history is stale") ;;
+                        *) _forecast_unavailable+=("$(basename "$dev") needs more endurance samples") ;;
+                    esac
+                    continue
+                fi
+                _tbw_rank+=("$daily $dev $dl $confidence")
             done
-            _tbw=${_tbw%" | "}; [[ -n "$_tbw" ]] && trend_add_line "TBW" "$_tbw"
+            if (( ${#_tbw_rank[@]} > 0 )); then
+                local _tbw_sorted
+                _tbw_sorted=$(printf '%s\n' "${_tbw_rank[@]}" | sort -nr -k1,1 -k2,2)
+                while read -r daily dev dl confidence; do
+                    local rate confidence_text
+                    rate=$(format_bytes_per_day "$daily")
+                    confidence_text=$(forecast_confidence_description "$confidence")
+                    if [[ "$dl" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+                       awk -v days="$dl" -v maximum="$TREND_FORECAST_MAX_DISPLAY_DAYS" \
+                           'BEGIN { exit !(days > maximum) }'
+                    then
+                        _tbw_items+=("$(basename "$dev") writes are negligible at ${rate}; no meaningful endurance date")
+                    else
+                        _tbw_items+=("$(basename "$dev") averaged ${rate}; estimated endurance is ${dl} days (${confidence_text})")
+                    fi
+                done < <(printf '%s\n' "$_tbw_sorted")
+            fi
+            (( ${#_tbw_items[@]} == 0 )) ||
+                trend_add_line "SSD endurance forecast" "$(join_by '; ' "${_tbw_items[@]}")"
             if declare -p TBW_DAILY &>/dev/null; then
                 local _hr=() ; for dev in "${!TBW_DAILY[@]}"; do
                     forecast_confidence_is_actionable \
@@ -8653,66 +8821,94 @@ render_trend_section() {
                 done
                 if (( ${#_hr[@]} > 0 )); then
                     local _sorted _s=""
-                    _sorted=$(printf "%s\n" "${_hr[@]}" | sort -nr -k1,1 | head -n 5)
+                    _sorted=$(printf "%s\n" "${_hr[@]}" | sort -nr -k1,1 -k2,2 | head -n 5)
                     # Global writer classification arrays for guidance and alerts
                     declare -A WRITER_WEEKLY_PCT WRITER_TIER
                     while read -r pct dev daily cap_tb; do
-                        local rate; rate=$(format_bytes_short "$daily")
+                        local rate; rate=$(format_bytes_per_day "$daily")
                         # pct is daily % of capacity; derive weekly percent
                         local weekly_pct; weekly_pct=$(awk -v d="$pct" 'BEGIN{printf "%.6f", d*7}')
                         WRITER_WEEKLY_PCT[$dev]="$weekly_pct"
                         # Determine tier
-                        local tier="" w="$weekly_pct"
+                        local tier="" tier_text="" w="$weekly_pct"
                         if awk -v w="$w" -v c="$WRITER_WEEKLY_CRIT_PCT" 'BEGIN{exit (w>=c)?0:1}'; then
-                            tier="H"; record_alert critical "Heavy Writer" "Disk $dev weekly write ~$(awk -v w="$w" 'BEGIN{printf "%.2f", w}')% cap/week >= ${WRITER_WEEKLY_CRIT_PCT}%"
+                            tier="H"; tier_text="high write rate"
+                            record_alert critical "Heavy Writer" "Disk $dev weekly write ~$(awk -v w="$w" 'BEGIN{printf "%.2f", w}')% cap/week >= ${WRITER_WEEKLY_CRIT_PCT}%"
                         elif awk -v w="$w" -v wthr="$WRITER_WEEKLY_WARN_PCT" 'BEGIN{exit (w>=wthr)?0:1}'; then
-                            tier="H"; record_alert warning "Heavy Writer" "Disk $dev weekly write ~$(awk -v w="$w" 'BEGIN{printf "%.2f", w}')% cap/week >= ${WRITER_WEEKLY_WARN_PCT}%"
+                            tier="H"; tier_text="high write rate"
+                            record_alert warning "Heavy Writer" "Disk $dev weekly write ~$(awk -v w="$w" 'BEGIN{printf "%.2f", w}')% cap/week >= ${WRITER_WEEKLY_WARN_PCT}%"
                         elif awk -v w="$w" -v m="$WRITER_TIER_MODERATE_PCT" 'BEGIN{exit (w>=m)?0:1}'; then
-                            tier="M"
+                            tier="M"; tier_text="moderate write rate"
                         else
-                            tier="L"
+                            tier="L"; tier_text="light write rate"
                         fi
                         WRITER_TIER[$dev]="$tier"
-                        _s+="🔺$(basename "$dev") $(printf '%.3f' "$pct")% cap (${rate}) | "
+                        _s+="$(basename "$dev") ${rate} ($(printf '%.3f' "$pct")% of capacity/day; ${tier_text}) | "
+                        trend_add_diagnostic "write intensity" \
+                            "device=$(basename "$dev") bytes_per_day=$daily capacity_percent_per_day=$pct weekly_percent=$weekly_pct tier=$tier"
                     done < <(printf "%s\n" "$_sorted")
-                    _s=${_s%" | "}; trend_add_line "WRITERS" "$_s"
+                    _s=${_s%" | "}; trend_add_line "Write intensity" "$_s"
                 fi
             fi
         fi
         # NVMe wear depletion projection line (percent_used slope)
         CURRENT_TREND_BLOCK="TL: wear-depletion"
         if (( ${WEAR_TREND_ENABLED:-0} == 1 )) && declare -p NVME_WEAR_DAYS_LEFT &>/dev/null; then
-            local _wear_items=() dev
+            local _wear_rank=() _wear_items=() dev
             for dev in "${!NVME_WEAR_DAYS_LEFT[@]}"; do
                 local dl=${NVME_WEAR_DAYS_LEFT[$dev]} rate=${NVME_WEAR_RATE[$dev]:-0}
-                local dl_fmt
-                if [[ "$dl" == INF ]]; then dl_fmt="∞"; else dl_fmt="${dl}d"; fi
-                _wear_items+=("$(basename "$dev") ${dl_fmt} r=$(printf '%.4f' "$rate")%/d [${NVME_WEAR_CONFIDENCE[$dev]:-INSUFFICIENT}]")
+                local confidence=${NVME_WEAR_CONFIDENCE[$dev]:-INSUFFICIENT}
+                trend_add_diagnostic "NVMe wear" \
+                    "device=$(basename "$dev") days_left=$dl rate_percent_per_day=$rate confidence=$confidence"
+                if ! forecast_confidence_is_actionable "$confidence"; then
+                    case "$confidence" in
+                        RESET) _forecast_rebuilding+=("$(basename "$dev") wear counter reset") ;;
+                        STALE) _forecast_unavailable+=("$(basename "$dev") wear history is stale") ;;
+                        *) _forecast_unavailable+=("$(basename "$dev") needs more wear samples") ;;
+                    esac
+                    continue
+                fi
+                local sort_days="$dl"
+                [[ "$sort_days" =~ ^[0-9]+$ ]] || sort_days=999999999
+                _wear_rank+=("$sort_days $dev $dl $rate $confidence")
             done
-            if (( ${#_wear_items[@]} > 0 )); then
-                # Order by shortest days-left (INF last)
-                local _rank=() item
-                for item in "${_wear_items[@]}"; do
-                    local dlv
-                    dlv=$(echo "$item" | awk '{print $2}' | sed 's/d$//; s/∞/999999/')
-                    _rank+=("$dlv $item")
-                done
-                local _sorted
-                _sorted=$(printf "%s\n" "${_rank[@]}" | sort -n -k1,1 | awk '{ $1=""; sub(/^ /,""); print }' | head -n ${WEAR_TREND_TOP_N})
-                local _line=""
-                while read -r ln; do [[ -n "$ln" ]] && _line+="$ln | "; done < <(printf "%s\n" "$_sorted")
-                _line="${_line% | }"
-                [[ -n "$_line" ]] && trend_add_line "WEAR" "$_line"
+            if (( ${#_wear_rank[@]} > 0 )); then
+                local _wear_sorted
+                _wear_sorted=$(printf '%s\n' "${_wear_rank[@]}" | sort -n -k1,1 -k2,2 | head -n "$WEAR_TREND_TOP_N")
+                while read -r _ dev dl rate confidence; do
+                    local confidence_text
+                    confidence_text=$(forecast_confidence_description "$confidence")
+                    if [[ "$dl" == "INF" ]]; then
+                        _wear_items+=("$(basename "$dev") wear is stable at the current sampling resolution (${confidence_text})")
+                    elif [[ "$dl" =~ ^[0-9]+$ ]] &&
+                         (( dl > TREND_FORECAST_MAX_DISPLAY_DAYS ))
+                    then
+                        _wear_items+=("$(basename "$dev") wear rate is too low for a meaningful depletion date (${confidence_text})")
+                    elif [[ "$dl" =~ ^[0-9]+$ ]]; then
+                        _wear_items+=("$(basename "$dev") is projected to reach 100% wear in ${dl} days at $(printf '%.4f' "$rate") percentage points/day (${confidence_text})")
+                    else
+                        _forecast_unavailable+=("$(basename "$dev") has a malformed wear forecast")
+                    fi
+                done < <(printf '%s\n' "$_wear_sorted")
+                trend_add_line "NVMe wear projection" "$(join_by '; ' "${_wear_items[@]}")"
             fi
         fi
+        (( ${#_forecast_rebuilding[@]} == 0 )) ||
+            mapfile -t _forecast_rebuilding < <(printf '%s\n' "${_forecast_rebuilding[@]}" | LC_ALL=C sort -u)
+        (( ${#_forecast_unavailable[@]} == 0 )) ||
+            mapfile -t _forecast_unavailable < <(printf '%s\n' "${_forecast_unavailable[@]}" | LC_ALL=C sort -u)
+        (( ${#_forecast_rebuilding[@]} == 0 )) ||
+            trend_add_line "Forecast rebuilding" "$(join_by '; ' "${_forecast_rebuilding[@]}")"
+        (( ${#_forecast_unavailable[@]} == 0 )) ||
+            trend_add_line "Forecast unavailable" "$(join_by '; ' "${_forecast_unavailable[@]}")"
         # Lifecycle
         CURRENT_TREND_BLOCK="TL: lifecycle"
         {
             local rcnt=0 mcnt=0 rshow="" mshow="" life_line="" top=${LIFECYCLE_ALERT_TOP_N}
             if declare -p REPLACE_LIST &>/dev/null || declare -p MONITOR_LIST &>/dev/null; then
                 [[ -n "${REPLACE_LIST[*]:-}" ]] && rcnt=${#REPLACE_LIST[@]} ; [[ -n "${MONITOR_LIST[*]:-}" ]] && mcnt=${#MONITOR_LIST[@]}
-                if (( rcnt > 0 )); then rshow="Replace(${rcnt})=$(printf '%s' "${REPLACE_LIST[*]:0:top}")"; fi
-                if (( mcnt > 0 )); then mshow="Monitor(${mcnt})=$(printf '%s' "${MONITOR_LIST[*]:0:top}")"; fi
+                if (( rcnt > 0 )); then rshow="${rcnt} drive(s) require replacement planning: $(printf '%s' "${REPLACE_LIST[*]:0:top}")"; fi
+                if (( mcnt > 0 )); then mshow="${mcnt} drive(s) require monitoring: $(printf '%s' "${MONITOR_LIST[*]:0:top}")"; fi
             fi
             if [[ -z "$rshow$mshow" ]] && [[ -f "$RISK_TIER_HISTORY_FILE" ]]; then
                 # Fallback to most recent history line containing device lists
@@ -8727,18 +8923,18 @@ render_trend_section() {
                         IFS=',' read -r -a _ra <<< "$repl"
                         rcnt=${#_ra[@]}
                         local _slice_r; _slice_r=$(printf '%s ' "${_ra[@]:0:top}" | awk 'NF')
-                        rshow="Replace(${rcnt})=${_slice_r% }"
+                        rshow="${rcnt} drive(s) require replacement planning: ${_slice_r% }"
                     fi
                     if [[ -n "$mon" ]]; then
                         IFS=',' read -r -a _ma <<< "$mon"
                         mcnt=${#_ma[@]}
                         local _slice_m; _slice_m=$(printf '%s ' "${_ma[@]:0:top}" | awk 'NF')
-                        mshow="Monitor(${mcnt})=${_slice_m% }"
+                        mshow="${mcnt} drive(s) require monitoring: ${_slice_m% }"
                     fi
                 fi
             fi
             life_line="${rshow}${rshow:+; }${mshow}"
-            [[ -n "$life_line" ]] && trend_add_line "LIFE" "$life_line"
+            [[ -n "$life_line" ]] && trend_add_line "Lifecycle" "$life_line"
         }
         # POH growth (aging rate)
         CURRENT_TREND_BLOCK="TL: POH-growth"
@@ -8748,9 +8944,13 @@ render_trend_section() {
             for _ppart in "${_poh_parts[@]}"; do
                 _ppart=$(echo "$_ppart" | awk 'NF')
                 [[ -z "$_ppart" ]] && continue
-                if [[ "$_ppart" =~ -[0-9] ]]; then _poh_items+=("$_ppart"); else _poh_items+=("🔺$_ppart"); fi
+                _poh_items+=("$_ppart")
             done
-            [[ ${#_poh_items[@]} -gt 0 ]] && trend_add_line "POH↑" "$(join_by ' | ' "${_poh_items[@]}")"
+            [[ ${#_poh_items[@]} -gt 0 ]] && trend_add_line "Power-on-hour history" "$(join_by '; ' "${_poh_items[@]}")"
+        fi
+        if [[ -n "${POH_INVALID_LINE:-}" ]]; then
+            trend_add_line "Power-on-hour data quality" \
+                "Ignored physically impossible rates above ${POH_TREND_MAX_RATE_HOURS_PER_DAY} hours/day: ${POH_INVALID_LINE}; these samples were excluded from ranking"
         fi
         # POH Age : show top-N highest POH with class
         CURRENT_TREND_BLOCK="TL: POH-age"
@@ -8773,59 +8973,72 @@ render_trend_section() {
                 while read -r poh dev cls; do
                     local suffix="${poh}h"
                     if [[ -n "$cls" && "$cls" != "age" ]]; then
-                        _line+="$(basename "$dev") ${suffix} (${cls}); "
+                        _line+="$(basename "$dev") has ${suffix} power-on hours (${cls}); "
                     else
-                        _line+="$(basename "$dev") ${suffix}; "
+                        _line+="$(basename "$dev") has ${suffix} power-on hours; "
                     fi
                 done < <(printf "%s\n" "$_sorted")
                 _line="${_line%'; '}"
-                [[ -n "$_line" ]] && trend_add_line "AGE↑" "$_line"
+                [[ -n "$_line" ]] && trend_add_line "Drive age" "$_line"
             fi
         fi
         # Smart growth and early warnings compact summaries
         CURRENT_TREND_BLOCK="TL: SMART-growth"
         if [[ -n "${SMART_GROWTH_LINE:-}" ]]; then
-            local _items=() _part
+            local _part description
+            local -a _items=() _parts=()
             IFS=';' read -r -a _parts <<< "${SMART_GROWTH_LINE}" || true
             for _part in "${_parts[@]}"; do
                 _part=$(echo "$_part" | awk 'NF')
                 [[ -z "$_part" ]] && continue
-                if [[ "$_part" =~ -[0-9] ]]; then _items+=("$_part"); else _items+=("🔺$_part"); fi
+                description=$(smart_growth_description "$_part")
+                [[ -n "$description" ]] && _items+=("$description")
+                trend_add_diagnostic "SMART attribute growth" "$_part"
             done
-            [[ ${#_items[@]} -gt 0 ]] && trend_add_line "SMART↑" "$(join_by ' | ' "${_items[@]}")"
+            [[ ${#_items[@]} -gt 0 ]] && trend_add_line "SMART attribute changes" "$(join_by '; ' "${_items[@]}")"
         fi
         CURRENT_TREND_BLOCK="TL: DL-shrink"
         if [[ -n "${DL_SHRINK_LINE:-}" ]]; then
-            local _dl_items=() _dpart
+            local _dl_items=() _dl_parts=() _dpart
             IFS=';' read -r -a _dl_parts <<< "${DL_SHRINK_LINE}" || true
             for _dpart in "${_dl_parts[@]}"; do
                 _dpart=$(echo "$_dpart" | awk 'NF')
                 [[ -z "$_dpart" ]] && continue
-                if [[ "$_dpart" =~ -[0-9] ]]; then _dl_items+=("$_dpart"); else _dl_items+=("🔺$_dpart"); fi
+                _dl_items+=("$_dpart")
             done
-            [[ ${#_dl_items[@]} -gt 0 ]] && trend_add_line "DL🔻" "$(join_by ' | ' "${_dl_items[@]}")"
+            [[ ${#_dl_items[@]} -gt 0 ]] && trend_add_line "Endurance trajectory" "$(join_by '; ' "${_dl_items[@]}")"
         fi
         CURRENT_TREND_BLOCK="TL: early-err"
         if [[ -n "${EARLY_ERR_LINE:-}" ]]; then
-            local _err_items=() _epart
+            local _err_items=() _err_parts=() _epart
             IFS=';' read -r -a _err_parts <<< "${EARLY_ERR_LINE}" || true
             for _epart in "${_err_parts[@]}"; do
                 _epart=$(echo "$_epart" | awk 'NF')
                 [[ -z "$_epart" ]] && continue
-                if [[ "$_epart" =~ -[0-9] ]]; then _err_items+=("$_epart"); else _err_items+=("🔺$_epart"); fi
+                _epart="${_epart//BtrfsDev:/Btrfs device}"
+                _epart="${_epart//BtrfsMnt:/Btrfs mount}"
+                _epart="${_epart//write_io_errs/write I\/O errors}"
+                _epart="${_epart//read_io_errs/read I\/O errors}"
+                _epart="${_epart//flush_io_errs/flush I\/O errors}"
+                _epart="${_epart//corruption_errs/corruption errors}"
+                _epart="${_epart//generation_errs/generation errors}"
+                _err_items+=("$_epart")
+                trend_add_diagnostic "filesystem error acceleration" "$_epart"
             done
-            [[ ${#_err_items[@]} -gt 0 ]] && trend_add_line "ERR↑" "$(join_by ' | ' "${_err_items[@]}")"
+            [[ ${#_err_items[@]} -gt 0 ]] && trend_add_line "Filesystem error acceleration" "$(join_by '; ' "${_err_items[@]}")"
         fi
         CURRENT_TREND_BLOCK="TL: btrfs-sum"
         if [[ -n "${BTRFS_SUM_LINE:-}" ]]; then
-            local _b_items=() _bpart
+            local _b_items=() _b_parts=() _bpart
             IFS=';' read -r -a _b_parts <<< "${BTRFS_SUM_LINE}" || true
             for _bpart in "${_b_parts[@]}"; do
                 _bpart=$(echo "$_bpart" | awk 'NF')
                 [[ -z "$_bpart" ]] && continue
-                _b_items+=("🔺$_bpart")
+                local _b_device="${_bpart%%:+*}" _b_count="${_bpart##*:+}"
+                _b_items+=("${_b_device} recorded ${_b_count} new device error(s)")
+                trend_add_diagnostic "Btrfs cumulative errors" "device=${_b_device} new_errors=${_b_count}"
             done
-            [[ ${#_b_items[@]} -gt 0 ]] && trend_add_line "BTRFSΣ" "$(join_by ' | ' "${_b_items[@]}")"
+            [[ ${#_b_items[@]} -gt 0 ]] && trend_add_line "Btrfs device errors" "$(join_by '; ' "${_b_items[@]}")"
         fi
         # SATA link instability (events + streak), also raises alerts here
         CURRENT_TREND_BLOCK="TL: sata-link"
@@ -8877,18 +9090,21 @@ render_trend_section() {
                     local _sorted _s="" _limit=5 _cnt=0
                     _sorted=$(printf "%s\n" "${_items[@]}" | sort -nr -k1,1 -k2,2)
                     while read -r streak count dev mx cur sev; do
-                        _s+="$(basename "$dev") ev=${count} st=${streak} ${mx}->${cur}${sev:+ ($sev)}; "
+                        _s+="$(basename "$dev") had ${count} link-downshift event(s), including a ${streak}-day streak; negotiated speed ${mx} to ${cur} Gb/s${sev:+ ($sev)}; "
+                        trend_add_diagnostic "SATA link" \
+                            "device=$(basename "$dev") events=$count streak_days=$streak maximum_gbps=$mx current_gbps=$cur severity=${sev:-none}"
                         (( ++_cnt >= _limit )) && break
                     done < <(printf "%s\n" "$_sorted")
-                    _s="${_s%'; '}"; _s="${_s//; / | }"; trend_add_line "SATA" "$_s"
+                    _s="${_s%'; '}"; trend_add_line "SATA link stability" "$_s"
                 fi
         fi
         if (( ${#TREND_LINE_ITEMS[@]} > 0 )); then
-            TREND_SECTION="Trend Analysis:\n$(printf "%s\n" "${TREND_LINE_ITEMS[@]}")"
+            TREND_SECTION="Trend Summary:\n$(printf "%s\n" "${TREND_LINE_ITEMS[@]}")"
             TREND_SECTION="$(printf "%s\n" "$TREND_SECTION" | trim_outer_blank_lines)"
         else
             TREND_SECTION=""
         fi
+        trend_log_diagnostics
     }
     return 0
 }
@@ -8904,8 +9120,10 @@ build_trend_section() {
     BTRFS_SUM_LINE=""
     SMART_GROWTH_LINE=""
     POH_GROWTH_LINE=""
+    POH_INVALID_LINE=""
     TREND_SECTION=""
     TREND_LINE_ITEMS=()
+    TREND_DIAGNOSTIC_ITEMS=()
     TREND_HISTORY_CACHE=()
 
     run_trend_stage "temperature" analyze_temperature_trends
@@ -9600,9 +9818,13 @@ tbw_forecast_and_heavy_writers() {
         local status=${TBW_STATUS_MAP[$dev]:-OK}
         local confidence=${TBW_FORECAST_CONFIDENCE[$dev]:-INSUFFICIENT}
         if [[ "$status" == "CRITICAL" ]] && forecast_confidence_is_actionable "$confidence"; then
-            record_alert critical "TBW Endurance" "Disk $dev TBW forecast CRITICAL: ${days_left}d remaining (<${TBW_DAYS_CRIT}d; confidence=$confidence)"
+            local confidence_text
+            confidence_text=$(forecast_confidence_description "$confidence")
+            record_alert critical "TBW Endurance" "Disk $dev endurance forecast is critical: ${days_left} days remaining (<${TBW_DAYS_CRIT} days; ${confidence_text})"
         elif [[ "$status" == "WARNING" ]] && forecast_confidence_is_actionable "$confidence"; then
-            record_alert warning "TBW Endurance" "Disk $dev TBW forecast WARNING: ${days_left}d remaining (<${TBW_DAYS_WARN}d; confidence=$confidence)"
+            local confidence_text
+            confidence_text=$(forecast_confidence_description "$confidence")
+            record_alert warning "TBW Endurance" "Disk $dev endurance forecast is warning: ${days_left} days remaining (<${TBW_DAYS_WARN} days; ${confidence_text})"
         fi
         done
     fi
@@ -10589,6 +10811,7 @@ validate_configuration() {
         FORECAST_MAX_GAP_DAYS LOG_MAX_DAYS LOG_MAX_COUNT HISTORY_MAX_DAYS
         HISTORY_MAX_LINES LIFECYCLE_ALERT_TOP_N RISK_TOP_N RISK_REPLACE RISK_MONITOR
         ENDURANCE_TREND_WINDOW_DAYS ENDURANCE_TREND_TOP_N ENDURANCE_TREND_MIN_POH_DELTA
+        TREND_FORECAST_MAX_DISPLAY_DAYS
         FORECAST_PRECISION_DECIMALS RELOC_WARNING RELOC_CRITICAL PEND_WARNING
         SSD_TEMP_WARNING SSD_TEMP_CRITICAL HDD_TEMP_WARNING HDD_TEMP_CRITICAL
         LOAD_CYCLE_WARN LOAD_CYCLE_CRIT SSD_WEAR_WARN SSD_WEAR_CRIT
@@ -10631,7 +10854,7 @@ validate_configuration() {
         STORAGE_DISCREPANCY_MIN_DIFF ENDURANCE_DAYSLEFT_ACCEL_MIN_DELTA
         FORECAST_MIN_SPAN_DAYS FORECAST_HIGH_SPAN_DAYS FORECAST_STALE_AFTER_DAYS
         TEMP_RATE_WARN_C_PER_DAY TEMP_RATE_CRIT_C_PER_DAY TEMP_RATE_MIN_SPAN_DAYS
-        WEAR_STABLE_MIN_RATE
+        WEAR_STABLE_MIN_RATE POH_TREND_MAX_RATE_HOURS_PER_DAY
     )
     local -a percent_settings=(
         WARN_THRESHOLD_PERCENT CRITICAL_THRESHOLD_PERCENT THRESHOLD NEAR_THRESHOLD_DELTA
@@ -10645,6 +10868,7 @@ validate_configuration() {
         SYSLOG_CURSOR_STARTUP_LOOKBACK_LINES SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES
         HISTORY_WINDOW_DAYS HISTORY_SCHEMA_VERSION FORECAST_MIN_SAMPLES
         FORECAST_HIGH_SAMPLES FORECAST_MAX_GAP_DAYS
+        TREND_FORECAST_MAX_DISPLAY_DAYS
         NOTIFY_MAX_BODY_CHARS NOTIFY_MAX_BODY_LINES
         SMARTCTL_TIMEOUT_SECONDS BTRFS_COMMAND_TIMEOUT_SECONDS
         XFS_REPAIR_TIMEOUT_SECONDS SYSTEM_COMMAND_TIMEOUT_SECONDS
@@ -10698,6 +10922,7 @@ validate_configuration() {
         validate_nonnegative_number_setting "$setting"
     done
     validate_positive_number_setting DEFAULT_SSD_ENDURANCE_PER_TB
+    validate_positive_number_setting POH_TREND_MAX_RATE_HOURS_PER_DAY
     for setting in "${percent_settings[@]}"; do
         validate_percent_setting "$setting"
     done
@@ -11180,7 +11405,7 @@ run_regression_tests() (
     fi
 
     if declare -F load_builtin_defaults >/dev/null 2>&1 &&
-       [[ "$SCRIPT_VERSION" == "2.14.1" &&
+       [[ "$SCRIPT_VERSION" == "2.14.2" &&
           "$STATE_SCHEMA_VERSION" == "2" &&
           "$HISTORY_SCHEMA_VERSION" == "3" &&
           "$DEVICE_ID_SCHEMA_VERSION" == "2" &&
@@ -11539,6 +11764,111 @@ run_regression_tests() (
         self_test_result 0 "Forecast actionability gate"
     fi
 
+    actual="$(forecast_confidence_description HIGH)|$(forecast_confidence_description MEDIUM)|$(forecast_confidence_description RESET)"
+    if [[ "$actual" == \
+          'high forecast confidence|medium forecast confidence|counter reset detected; forecast rebuilding' ]]
+    then
+        self_test_result 1 "Human-readable forecast confidence descriptions"
+    else
+        self_test_result 0 "Human-readable forecast confidence descriptions" \
+            "found '$actual'"
+    fi
+
+    actual="$(format_bytes_per_day 1230000000)"
+    if [[ "$actual" == '1.23 GB/day' ]]; then
+        self_test_result 1 "Explicit daily byte-rate units"
+    else
+        self_test_result 0 "Explicit daily byte-rate units" "found '$actual'"
+    fi
+
+    actual=$(smart_growth_description 'nvme0n1 W+2.00% PCIE US WT+300s')
+    if [[ "$actual" == \
+          'nvme0n1: wear used increased by 2.00 percentage points, PCIe correctable-error counter increased, unsafe-shutdown counter increased, warning-temperature exposure increased by 300s' ]]
+    then
+        self_test_result 1 "Expanded SMART trend vocabulary"
+    else
+        self_test_result 0 "Expanded SMART trend vocabulary" "found '$actual'"
+    fi
+
+    local temperature_quality_history="$fixture_dir/temperature-quality.log"
+    local temperature_quality_run="$fixture_dir/temperature-quality-run"
+    local stale_date_one stale_date_two stale_date_three stale_epoch
+    stale_date_one=$(date -d '-8 days' '+%Y-%m-%d')
+    stale_date_two=$(date -d '-7 days' '+%Y-%m-%d')
+    stale_date_three=$(date -d '-6 days' '+%Y-%m-%d')
+    stale_epoch=$(date -d "$stale_date_three 12:00:00" +%s)
+    printf '%s\n' \
+        "$stale_date_one temp_fixture temp=30 captured_epoch=$(date -d "$stale_date_one 12:00:00" +%s) schema=3" \
+        "$stale_date_two temp_fixture temp=31 captured_epoch=$(date -d "$stale_date_two 12:00:00" +%s) schema=3" \
+        "$stale_date_three temp_fixture temp=32 captured_epoch=$stale_epoch schema=3" \
+        > "$temperature_quality_history"
+    mkdir -p "$temperature_quality_run"
+    DEVICE_ID_BY_PATH=()
+    DEVICE_PATH_BY_ID=()
+    DEVICE_ID_BY_PATH[/dev/sdy]="temp_fixture"
+    DEVICE_PATH_BY_ID[temp_fixture]="/dev/sdy"
+    TEMP_HISTORY_FILE="$temperature_quality_history"
+    RUN_DIR="$temperature_quality_run"
+    RUN_EPOCH=$(date +%s)
+    TREND_HISTORY_CACHE=()
+    TEMP_RATE_ALERT_ENABLED=0
+    TEMP_FORECAST_CONFIDENCE_LINE=""
+    analyze_temperature_trends
+    if [[ "$TEMP_FORECAST_CONFIDENCE_LINE" == \
+          '1 disk(s) have stale samples (sdy); this may be expected while disks are sleeping; no temperature-rate alert was evaluated from this evidence' ]]
+    then
+        self_test_result 1 "Human-readable stale temperature explanation"
+    else
+        self_test_result 0 "Human-readable stale temperature explanation" \
+            "found '$TEMP_FORECAST_CONFIDENCE_LINE'"
+    fi
+    DEVICE_ID_BY_PATH=()
+    DEVICE_PATH_BY_ID=()
+
+    local poh_quality_history="$fixture_dir/poh-quality.log"
+    local poh_quality_run="$fixture_dir/poh-quality-run"
+    local poh_first_epoch poh_last_epoch poh_first_date poh_last_date
+    poh_last_epoch=$(date +%s)
+    poh_first_epoch=$((poh_last_epoch - 3*86400))
+    poh_first_date=$(date -d "@$poh_first_epoch" '+%Y-%m-%d')
+    poh_last_date=$(date -d "@$poh_last_epoch" '+%Y-%m-%d')
+    printf '%s\n' \
+        "$poh_first_date poh_valid poh=1000 captured_epoch=$poh_first_epoch schema=3" \
+        "$poh_last_date poh_valid poh=1072 captured_epoch=$poh_last_epoch schema=3" \
+        "$poh_first_date poh_invalid poh=1000 captured_epoch=$poh_first_epoch schema=3" \
+        "$poh_last_date poh_invalid poh=1300 captured_epoch=$poh_last_epoch schema=3" \
+        > "$poh_quality_history"
+    mkdir -p "$poh_quality_run"
+    DEVICE_ID_BY_PATH[/dev/sdx]="poh_valid"
+    DEVICE_PATH_BY_ID[poh_valid]="/dev/sdx"
+    DEVICE_ID_BY_PATH[/dev/sdy]="poh_invalid"
+    DEVICE_PATH_BY_ID[poh_invalid]="/dev/sdy"
+    POH_HISTORY_FILE="$poh_quality_history"
+    RUN_DIR="$poh_quality_run"
+    RUN_EPOCH="$poh_last_epoch"
+    TREND_HISTORY_CACHE=()
+    POH_TREND_ENABLED=1
+    TBW_TREND_ENABLED=0
+    POH_GROWTH_LINE=""
+    POH_INVALID_LINE=""
+    analyze_endurance_trends
+    if [[ "$POH_GROWTH_LINE" == \
+          'sdx accumulated 72 power-on hours over 3.00 days (24.00 hours/day)' ]]
+    then
+        self_test_result 1 "Capture-time-normalized power-on-hour trend"
+    else
+        self_test_result 0 "Capture-time-normalized power-on-hour trend" \
+            "found '$POH_GROWTH_LINE'"
+    fi
+    if [[ "$POH_INVALID_LINE" == 'sdy 100.00 hours/day' ]]; then
+        self_test_result 1 "Physically impossible power-on-hour rate rejection"
+    else
+        self_test_result 0 "Physically impossible power-on-hour rate rejection" \
+            "found '$POH_INVALID_LINE'"
+    fi
+    DEVICE_ID_BY_PATH=()
+    DEVICE_PATH_BY_ID=()
+
     local trend_history="$fixture_dir/trend-history.log"
     printf '%s\n' \
         'corrupted row' \
@@ -11669,9 +11999,9 @@ run_regression_tests() (
 
     local days_left_trend_history="$fixture_dir/days-left-trend-history.log"
     printf '%s\n' \
-        "$trend_date_last nvme_fixture days_left=84" \
-        "$trend_date_first nvme_fixture days_left=100" \
-        "$trend_date_middle nvme_fixture days_left=96" > "$days_left_trend_history"
+        "$trend_date_last nvme_fixture days_left=84 confidence=HIGH" \
+        "$trend_date_first nvme_fixture days_left=100 confidence=HIGH" \
+        "$trend_date_middle nvme_fixture days_left=96 confidence=HIGH" > "$days_left_trend_history"
     DEVICE_ID_BY_PATH[/dev/nvme9n1]="nvme_fixture"
     DEVICE_PATH_BY_ID[nvme_fixture]="/dev/nvme9n1"
     POH_TREND_ENABLED=0
@@ -11684,12 +12014,31 @@ run_regression_tests() (
     DL_SHRINK_LINE=""
     analyze_endurance_trends
     if [[ "$DL_SHRINK_LINE" == \
-          'nvme9n1 -16.000d r=-3.200d/d,ACCEL' ]]
+          'nvme9n1 endurance estimate shortened by 16.0 days over 5 days (high forecast confidence; decline is accelerating)' ]]
     then
-        self_test_result 1 "End-to-end days-left acceleration rendering"
+        self_test_result 1 "Human-readable days-left acceleration rendering"
     else
-        self_test_result 0 "End-to-end days-left acceleration rendering" \
+        self_test_result 0 "Human-readable days-left acceleration rendering" \
             "found '$DL_SHRINK_LINE'"
+    fi
+    printf '%s\n' \
+        "$trend_date_last nvme_fixture days_left=84 confidence=RESET" \
+        "$trend_date_first nvme_fixture days_left=100 confidence=HIGH" \
+        "$trend_date_middle nvme_fixture days_left=96 confidence=HIGH" > "$days_left_trend_history"
+    RUN_DIR="$fixture_dir/endurance-reset-run"
+    mkdir -p "$RUN_DIR"
+    TREND_HISTORY_CACHE=()
+    DL_SHRINK_LINE=""
+    TREND_DIAGNOSTIC_ITEMS=()
+    analyze_endurance_trends
+    if [[ -z "$DL_SHRINK_LINE" &&
+          "${TREND_DIAGNOSTIC_ITEMS[*]:-}" == \
+              *'endurance trajectory suppressed: device=nvme9n1 confidence=RESET'* ]]
+    then
+        self_test_result 1 "Reset endurance forecast excluded from notification ranking"
+    else
+        self_test_result 0 "Reset endurance forecast excluded from notification ranking" \
+            "line='$DL_SHRINK_LINE' diagnostics='${TREND_DIAGNOSTIC_ITEMS[*]:-}'"
     fi
     DEVICE_ID_BY_PATH=()
     DEVICE_PATH_BY_ID=()
@@ -12388,6 +12737,75 @@ run_regression_tests() (
         self_test_result 1 "Collector status report rendering"
     else
         self_test_result 0 "Collector status report rendering" "unexpected collector report"
+    fi
+
+    local trend_render_log="$fixture_dir/trend-render.log"
+    MASTER_LOG="$trend_render_log"
+    LOG_MIRROR_STDOUT=0
+    RUN_DIR="$fixture_dir/trend-render-run"
+    mkdir -p "$RUN_DIR"
+    ARR_HISTORY_COUNT=7
+    POOL_HISTORY_COUNT=7
+    ARR_DAYS_TO_THRESHOLD="∞"
+    POOL_DAYS_TO_THRESHOLD=257
+    ARR_GROWTH_STR="0%"
+    POOL_GROWTH_STR="0.247%"
+    ARR_FORECAST_CONFIDENCE=HIGH
+    POOL_FORECAST_CONFIDENCE=HIGH
+    PARITY_ACTION="idle"
+    TEMP_FORECAST_CONFIDENCE_LINE="1 disk(s) have stale samples (sda); this may be expected while disks are sleeping; no temperature-rate alert was evaluated from this evidence"
+    DISK_GROWTH_ENABLED=0
+    SHARE_BREAKDOWN_ENABLED=0
+    LONG_TEST_DUE_SOON=()
+    TBW_TREND_ENABLED=1
+    TBW_DAYS_LEFT=([/dev/nvme0n1]=500 [/dev/nvme1n1]=2000000)
+    TBW_DAILY=([/dev/nvme0n1]=1000000000 [/dev/nvme1n1]=75000)
+    TBW_FORECAST_CONFIDENCE=([/dev/nvme0n1]=HIGH [/dev/nvme1n1]=HIGH)
+    LSBLK_ALL_CACHE=$'nvme0n1 1000000000000 0 disk\nnvme1n1 1000000000000 0 disk'
+    WEAR_TREND_ENABLED=1
+    declare -g -A NVME_WEAR_CONFIDENCE
+    NVME_WEAR_DAYS_LEFT=([/dev/nvme0n1]=INF [/dev/nvme2n1]=INF)
+    NVME_WEAR_RATE=([/dev/nvme0n1]=0 [/dev/nvme2n1]=0)
+    NVME_WEAR_CONFIDENCE=([/dev/nvme0n1]=HIGH [/dev/nvme2n1]=RESET)
+    RISK_TIER_HISTORY_FILE="$fixture_dir/no-risk-history.log"
+    REPLACE_LIST=()
+    MONITOR_LIST=()
+    AGE_AWARE_ENABLED=0
+    POH_GROWTH_LINE=""
+    POH_INVALID_LINE=""
+    SMART_GROWTH_LINE=""
+    DL_SHRINK_LINE=""
+    EARLY_ERR_LINE=""
+    BTRFS_SUM_LINE=""
+    SATA_LINK_INSTABILITY_ENABLED=0
+    TREND_LINE_ITEMS=()
+    TREND_DIAGNOSTIC_ITEMS=()
+    TREND_HISTORY_CACHE=()
+    render_trend_section
+    if [[ "$TREND_SECTION" == *'Trend Summary:'* &&
+          "$TREND_SECTION" == *'Capacity forecast: Array usage is stable or decreasing; it is not projected to reach 90%.'* &&
+          "$TREND_SECTION" == *'Pool usage is growing by 0.247 percentage points/day; estimated 257 days to reach 90% (high forecast confidence).'* &&
+          "$TREND_SECTION" == *'SSD endurance forecast: nvme0n1 averaged 1.00 GB/day; estimated endurance is 500 days (high forecast confidence); nvme1n1 writes are negligible at 75.00 KB/day; no meaningful endurance date'* &&
+          "$TREND_SECTION" == *'NVMe wear projection: nvme0n1 wear is stable at the current sampling resolution (high forecast confidence)'* &&
+          "$TREND_SECTION" == *'Forecast rebuilding: nvme2n1 wear counter reset'* &&
+          "$TREND_SECTION" != *'CF:'* && "$TREND_SECTION" != *'TEMP-Q:'* &&
+          "$TREND_SECTION" != *'TBW:'* && "$TREND_SECTION" != *'WEAR:'* ]]
+    then
+        self_test_result 1 "Human-readable trend notification rendering"
+    else
+        self_test_result 0 "Human-readable trend notification rendering" \
+            "found '$TREND_SECTION'"
+    fi
+    if grep -Fq \
+           'Diagnostic TBW endurance: device=nvme0n1 bytes_per_day=1000000000 days_left=500 confidence=HIGH' \
+           "$trend_render_log" &&
+       grep -Fq \
+           'Diagnostic NVMe wear: device=nvme2n1 days_left=INF rate_percent_per_day=0 confidence=RESET' \
+           "$trend_render_log"
+    then
+        self_test_result 1 "Raw trend diagnostics retained in run log"
+    else
+        self_test_result 0 "Raw trend diagnostics retained in run log"
     fi
 
     if (( SELF_TEST_TOTAL != REGRESSION_FIXTURE_COUNT )); then
