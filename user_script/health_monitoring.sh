@@ -2,6 +2,12 @@
 # shellcheck disable=SC2034,SC2155
 noParity=true
 set -uo pipefail
+umask 077
+
+readonly SCRIPT_VERSION="2.12"
+readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+PATH="$TRUSTED_PATH"
+export PATH
 
 if (( BASH_VERSINFO[0] < 4 )); then
     printf 'health_monitoring.sh requires Bash 4 or newer (found %s).\n' \
@@ -9,7 +15,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.11.1
+# Disk Health Monitor for Unraid v2.12
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
@@ -17,6 +23,11 @@ fi
 # ---------------- Configuration ----------------
 # Disks health script settings. Tuned for performance and reliability.
 ################################################################################
+
+# Phase 12 introduces an explicit built-in-default layer. External
+# configuration loading is intentionally deferred; these remain the sole
+# effective settings until that later work is enabled.
+load_builtin_defaults() {
 
 # === SMART Test Scheduling ===
 SHORT_TEST_INTERVAL_DAYS=7                      # Run automatic short tests no more often than this (0=disable)
@@ -115,7 +126,6 @@ SATA_LINK_INSTABILITY_STREAK_CRIT=5             # Consecutive days with downshif
 # === Export / History / Logging ===
 HISTORY_WINDOW_DAYS=14                          # Days considered for usage growth trends
 SHARE_TOP_N=5                                   # Top N shares by size/growth
-HISTORY_SCHEMA_VERSION=3                       # Normalized history row schema written by this version
 FORECAST_MIN_SAMPLES=3                         # Minimum distinct daily samples for an actionable forecast
 FORECAST_MIN_SPAN_DAYS=2                       # Minimum elapsed days for an actionable forecast
 FORECAST_HIGH_SAMPLES=7                        # Samples required for HIGH confidence
@@ -316,6 +326,17 @@ QUIRK_MWI_RULES='\
 action:invert_mwi_small;regex:WD[[:space:]]+Red.*SA500;cap_min:0.48;cap_max:0.52
 '
 
+}
+
+load_builtin_defaults
+
+# Persisted-format versions are implementation constants rather than
+# user-adjustable settings.
+readonly STATE_SCHEMA_VERSION=1
+readonly HISTORY_SCHEMA_VERSION=3
+readonly DEVICE_ID_SCHEMA_VERSION=2
+readonly STATE_SCHEMA_FORMAT="health-monitoring-state"
+
 
 # === Runtime State (do not modify) ===
 declare -A SMART_STATE                            # Map device -> OK/WARNING/CRITICAL
@@ -392,7 +413,7 @@ SYSLOG_CURSOR_PENDING_SIZE=0
 SYSLOG_CURSOR_PENDING_ANCHOR="-"
 SYSLOG_CHUNK_FILE=""
 RUN_MODE="monitor"
-REGRESSION_FIXTURE_COUNT=32
+REGRESSION_FIXTURE_COUNT=40
 CONFIG_ERROR_COUNT=0
 CONFIG_WARNING_COUNT=0
 DEPENDENCY_ERROR_COUNT=0
@@ -468,6 +489,7 @@ STORAGE_DISCREPANCY_STATE_FILE="$STATE_DIR/storage_discrepancy_streak.log"  # St
 RISK_SPIKE_FILE="$STATE_DIR/risk_spikes.log"                        # Persisted risk spike timestamps (accelerated scheduling)
 DEVICE_ID_MAP_FILE="$STATE_DIR/device_identity_map.log"             # Stable ID to current /dev path inventory
 DEVICE_ID_SCHEMA_FILE="$STATE_DIR/device_identity_schema.version"   # One-time /dev history migration marker
+STATE_SCHEMA_MANIFEST_FILE="$STATE_DIR/state_schema.manifest"       # Coordinated persisted-format versions
 REPLACEMENT_EVENTS_FILE="$STATE_DIR/replacement_events.log"         # Drive replacement lifecycle events (alerts context)
 SATA_LINK_HISTORY_FILE="$STATE_DIR/sata_link_downshift_history.log" # SATA link instability events (alert context)
 # --- Trend / Historical Analytics (longer-term forecasting, prioritization, trajectory) ---
@@ -505,10 +527,167 @@ ENABLE_MODEL_IN_ALERTS=0                                    # If 1, append disk 
 # Runtime, locking, cleanup, and atomic state helpers
 # ---------------------------------------------------------------------------
 
+PATH_VALIDATION_REASON=""
+
+validate_secure_absolute_path() {
+    local path="${1:-}" remainder component
+
+    PATH_VALIDATION_REASON=""
+    if [[ -z "$path" || "$path" != /* || "$path" == "/" ]]; then
+        PATH_VALIDATION_REASON="must be a non-root absolute path"
+        return 1
+    fi
+    if [[ "$path" =~ [[:cntrl:]] ]]; then
+        PATH_VALIDATION_REASON="contains control characters"
+        return 1
+    fi
+    if [[ "$path" == *"//"* ]]; then
+        PATH_VALIDATION_REASON="contains an empty path component"
+        return 1
+    fi
+
+    remainder="${path#/}"
+    while [[ -n "$remainder" ]]; do
+        component="${remainder%%/*}"
+        if [[ "$component" == "." || "$component" == ".." ]]; then
+            PATH_VALIDATION_REASON="contains a dot traversal component"
+            return 1
+        fi
+        [[ "$remainder" == */* ]] || break
+        remainder="${remainder#*/}"
+    done
+    return 0
+}
+
+validate_symlink_free_path() {
+    local path="$1" remainder component current=""
+
+    validate_secure_absolute_path "$path" || return 1
+    remainder="${path#/}"
+    while [[ -n "$remainder" ]]; do
+        component="${remainder%%/*}"
+        current+="/$component"
+        if [[ -L "$current" ]]; then
+            PATH_VALIDATION_REASON="contains symbolic-link component $current"
+            return 1
+        fi
+        [[ "$remainder" == */* ]] || break
+        remainder="${remainder#*/}"
+    done
+    return 0
+}
+
+validate_managed_file_target() {
+    local target="$1" parent
+
+    validate_symlink_free_path "$target" || return 1
+    if [[ -e "$target" && ! -f "$target" ]]; then
+        PATH_VALIDATION_REASON="existing target is not a regular file"
+        return 1
+    fi
+    parent="${target%/*}"
+    [[ -n "$parent" ]] || parent="/"
+    if [[ ! -d "$parent" || -L "$parent" ]]; then
+        PATH_VALIDATION_REASON="parent directory is missing or unsafe"
+        return 1
+    fi
+    return 0
+}
+
 ensure_dir() {
     local path="$1"
 
-    [[ -d "$path" ]] || mkdir -p -- "$path"
+    validate_symlink_free_path "$path" || {
+        log "PATH" "ERROR" "Unsafe directory path $path: $PATH_VALIDATION_REASON"
+        return 1
+    }
+    if [[ -e "$path" && ! -d "$path" ]]; then
+        log "PATH" "ERROR" "Directory target is not a directory: $path"
+        return 1
+    fi
+    [[ -d "$path" ]] || mkdir -p -- "$path" || return 1
+    validate_symlink_free_path "$path" || {
+        log "PATH" "ERROR" "Directory became unsafe after creation $path: $PATH_VALIDATION_REASON"
+        return 1
+    }
+}
+
+ensure_private_dir() {
+    local path="$1"
+
+    ensure_dir "$path" || return 1
+    chmod 700 -- "$path" 2>/dev/null || {
+        log "PATH" "ERROR" "Unable to restrict directory permissions: $path"
+        return 1
+    }
+}
+
+secure_create_file() {
+    local target="$1"
+
+    validate_managed_file_target "$target" || {
+        log "PATH" "ERROR" "Unsafe file target $target: $PATH_VALIDATION_REASON"
+        return 1
+    }
+    if [[ -e "$target" || -L "$target" ]]; then
+        log "PATH" "ERROR" "Refusing to overwrite existing file: $target"
+        return 1
+    fi
+    if ! (set -o noclobber; : > "$target") 2>/dev/null; then
+        log "PATH" "ERROR" "Unable to create file exclusively: $target"
+        return 1
+    fi
+    chmod 600 -- "$target" 2>/dev/null || {
+        rm -f -- "$target" 2>/dev/null || true
+        return 1
+    }
+}
+
+validate_managed_state_paths() {
+    local path
+    local -a directories=(
+        "$STATE_DIR" "$SMART_SELFTEST_DIR" "$UNSAFE_SDWN_STATE_DIR"
+        "$BTRFS_SCRUB_STATE_DIR" "$CMD_TIMEOUT_STATE_DIR"
+    )
+    local -a files=(
+        "$STATE_SCHEMA_MANIFEST_FILE" "$DEVICE_ID_MAP_FILE" "$DEVICE_ID_SCHEMA_FILE"
+        "${STATE_FILES_ALERT_RUNTIME[@]}" "${STATE_FILES_TREND_HISTORY[@]}"
+    )
+
+    for path in "${directories[@]}"; do
+        validate_symlink_free_path "$path" || {
+            log "PATH" "ERROR" "Unsafe managed directory $path: $PATH_VALIDATION_REASON"
+            return 1
+        }
+        [[ ! -e "$path" || -d "$path" ]] || {
+            log "PATH" "ERROR" "Managed directory target has the wrong type: $path"
+            return 1
+        }
+    done
+    for path in "${files[@]}"; do
+        validate_managed_file_target "$path" || {
+            log "PATH" "ERROR" "Unsafe managed state file $path: $PATH_VALIDATION_REASON"
+            return 1
+        }
+    done
+    return 0
+}
+
+harden_managed_state_permissions() {
+    local path
+    local -a files=(
+        "$STATE_SCHEMA_MANIFEST_FILE" "$DEVICE_ID_MAP_FILE" "$DEVICE_ID_SCHEMA_FILE"
+        "${STATE_FILES_ALERT_RUNTIME[@]}" "${STATE_FILES_TREND_HISTORY[@]}"
+    )
+
+    for path in "${files[@]}"; do
+        [[ -e "$path" ]] || continue
+        chmod 600 -- "$path" 2>/dev/null || {
+            log "PATH" "ERROR" "Unable to restrict state-file permissions: $path"
+            return 1
+        }
+    done
+    return 0
 }
 
 safe_state_name() {
@@ -559,12 +738,34 @@ format_bytes_short() {
 state_temp_file() {
     local target="$1"
 
+    validate_managed_file_target "$target" || {
+        log "PATH" "WARN" "Unsafe atomic-write target $target: $PATH_VALIDATION_REASON"
+        return 1
+    }
     mktemp "${target}.tmp.XXXXXX"
 }
 
 atomic_commit() {
     local temp_file="$1"
     local target="$2"
+    local temp_parent target_parent
+
+    validate_managed_file_target "$target" || {
+        rm -f -- "$temp_file" 2>/dev/null || true
+        log "STATE" "WARN" "Refused unsafe atomic target $target: $PATH_VALIDATION_REASON"
+        return 1
+    }
+    if [[ ! -f "$temp_file" || -L "$temp_file" ]]; then
+        log "STATE" "WARN" "Atomic source is not a regular temporary file: $temp_file"
+        return 1
+    fi
+    temp_parent="${temp_file%/*}"
+    target_parent="${target%/*}"
+    if [[ "$temp_parent" != "$target_parent" ]]; then
+        rm -f -- "$temp_file" 2>/dev/null || true
+        log "STATE" "WARN" "Atomic source and target are not in the same directory: $target"
+        return 1
+    fi
 
     if ! mv -f -- "$temp_file" "$target"; then
         rm -f -- "$temp_file" 2>/dev/null || true
@@ -592,6 +793,177 @@ atomic_write_text() {
     fi
 
     atomic_commit "$temp_file" "$target"
+}
+
+state_manifest_value() {
+    local manifest="$1"
+    local wanted="$2"
+
+    [[ -r "$manifest" && -f "$manifest" && ! -L "$manifest" ]] || return 1
+    awk -F= -v wanted="$wanted" '
+        $1 == wanted {
+            count++
+            value=substr($0, length($1) + 2)
+        }
+        END {
+            if (count == 1) {
+                print value
+                exit 0
+            }
+            exit 1
+        }
+    ' "$manifest"
+}
+
+write_state_schema_manifest() {
+    local identity_schema="${1:-0}"
+    local updated_epoch="${RUN_EPOCH:-0}"
+    local content
+
+    [[ "$identity_schema" =~ ^[0-9]+$ ]] || identity_schema=0
+    (( updated_epoch > 0 )) || updated_epoch=$(date +%s)
+    printf -v content \
+        'format=%s\nstate_schema=%s\nhistory_schema=%s\nidentity_schema=%s\nwriter_version=%s\nupdated_epoch=%s\n' \
+        "$STATE_SCHEMA_FORMAT" \
+        "$STATE_SCHEMA_VERSION" \
+        "$HISTORY_SCHEMA_VERSION" \
+        "$identity_schema" \
+        "$SCRIPT_VERSION" \
+        "$updated_epoch"
+    atomic_write_text "$STATE_SCHEMA_MANIFEST_FILE" "$content"
+}
+
+inspect_state_schema_manifest() {
+    local manifest="${1:-$STATE_SCHEMA_MANIFEST_FILE}"
+    local format state_schema history_schema identity_schema
+
+    STATE_SCHEMA_STATUS="UNKNOWN"
+    STATE_SCHEMA_DETAIL=""
+
+    if [[ ! -e "$manifest" && ! -L "$manifest" ]]; then
+        STATE_SCHEMA_STATUS="UNINITIALIZED"
+        STATE_SCHEMA_DETAIL="state manifest is absent"
+        return 10
+    fi
+    if ! validate_managed_file_target "$manifest"; then
+        STATE_SCHEMA_STATUS="UNSAFE"
+        STATE_SCHEMA_DETAIL="$PATH_VALIDATION_REASON"
+        return 20
+    fi
+
+    format=$(state_manifest_value "$manifest" format 2>/dev/null || true)
+    state_schema=$(state_manifest_value "$manifest" state_schema 2>/dev/null || true)
+    history_schema=$(state_manifest_value "$manifest" history_schema 2>/dev/null || true)
+    identity_schema=$(state_manifest_value "$manifest" identity_schema 2>/dev/null || true)
+
+    if [[ "$format" != "$STATE_SCHEMA_FORMAT" ||
+          ! "$state_schema" =~ ^[0-9]+$ ||
+          ! "$history_schema" =~ ^[0-9]+$ ||
+          ! "$identity_schema" =~ ^[0-9]+$ ]]
+    then
+        STATE_SCHEMA_STATUS="INVALID"
+        STATE_SCHEMA_DETAIL="manifest is malformed, incomplete, or has duplicate keys"
+        return 20
+    fi
+
+    if (( state_schema > STATE_SCHEMA_VERSION ||
+          history_schema > HISTORY_SCHEMA_VERSION ||
+          identity_schema > DEVICE_ID_SCHEMA_VERSION ))
+    then
+        STATE_SCHEMA_STATUS="FUTURE"
+        STATE_SCHEMA_DETAIL="found state=$state_schema history=$history_schema identity=$identity_schema; supported state=$STATE_SCHEMA_VERSION history=$HISTORY_SCHEMA_VERSION identity=$DEVICE_ID_SCHEMA_VERSION"
+        return 30
+    fi
+
+    if (( state_schema < STATE_SCHEMA_VERSION ||
+          history_schema < HISTORY_SCHEMA_VERSION ))
+    then
+        STATE_SCHEMA_STATUS="LEGACY"
+        STATE_SCHEMA_DETAIL="found state=$state_schema history=$history_schema identity=$identity_schema"
+        return 40
+    fi
+
+    STATE_SCHEMA_STATUS="CURRENT"
+    STATE_SCHEMA_DETAIL="state=$state_schema history=$history_schema identity=$identity_schema"
+    return 0
+}
+
+current_identity_schema() {
+    local identity_schema=0
+
+    if [[ -r "$DEVICE_ID_SCHEMA_FILE" && -f "$DEVICE_ID_SCHEMA_FILE" &&
+          ! -L "$DEVICE_ID_SCHEMA_FILE" ]]
+    then
+        read -r identity_schema < "$DEVICE_ID_SCHEMA_FILE" || identity_schema=0
+    fi
+    [[ "$identity_schema" =~ ^[0-9]+$ ]] || identity_schema=0
+    printf '%s\n' "$identity_schema"
+}
+
+ensure_state_schema_manifest() {
+    local rc identity_schema manifest_identity
+
+    if inspect_state_schema_manifest; then
+        identity_schema=$(current_identity_schema)
+        if (( identity_schema > DEVICE_ID_SCHEMA_VERSION )); then
+            log "STATE" "ERROR" \
+                "Device identity schema $identity_schema is newer than supported $DEVICE_ID_SCHEMA_VERSION"
+            return 1
+        fi
+        manifest_identity=$(state_manifest_value "$STATE_SCHEMA_MANIFEST_FILE" identity_schema 2>/dev/null || printf '0')
+        if [[ "$manifest_identity" != "$identity_schema" ]]; then
+            write_state_schema_manifest "$identity_schema" || return 1
+            log "STATE" "INFO" \
+                "Reconciled state manifest identity schema to $identity_schema"
+        fi
+        return 0
+    else
+        rc=$?
+    fi
+
+    case "$rc" in
+        10)
+            identity_schema=$(current_identity_schema)
+            if (( identity_schema > DEVICE_ID_SCHEMA_VERSION )); then
+                log "STATE" "ERROR" \
+                    "Device identity schema $identity_schema is newer than supported $DEVICE_ID_SCHEMA_VERSION"
+                return 1
+            fi
+            write_state_schema_manifest "$identity_schema" || return 1
+            log "STATE" "INFO" \
+                "Registered existing state as schema $STATE_SCHEMA_VERSION (history=$HISTORY_SCHEMA_VERSION identity=$identity_schema)"
+            ;;
+        40)
+            log "STATE" "ERROR" \
+                "Legacy state requires a migration not included in this release: $STATE_SCHEMA_DETAIL"
+            return 1
+            ;;
+        *)
+            log "STATE" "ERROR" \
+                "Refusing incompatible state manifest ($STATE_SCHEMA_STATUS): $STATE_SCHEMA_DETAIL"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+print_state_schema_status() {
+    local rc=0
+
+    if inspect_state_schema_manifest; then
+        rc=0
+    else
+        rc=$?
+    fi
+    printf 'State directory: %s\n' "$STATE_DIR"
+    printf 'State schema status: %s\n' "$STATE_SCHEMA_STATUS"
+    printf 'State schema detail: %s\n' "$STATE_SCHEMA_DETAIL"
+    printf 'Supported schemas: state=%s history=%s identity=%s\n' \
+        "$STATE_SCHEMA_VERSION" "$HISTORY_SCHEMA_VERSION" "$DEVICE_ID_SCHEMA_VERSION"
+    case "$rc" in
+        0|10) return 0 ;;
+        *)    return 1 ;;
+    esac
 }
 
 # Return a record timestamp. Schema-v3 rows carry captured_epoch; legacy rows
@@ -1102,27 +1474,36 @@ acquire_lock() {
 initialize_runtime() {
     local state_file
 
-    umask 077
     ensure_dir "$LOG_DIR" || return 1
     ensure_dir "$STATE_DIR" || return 1
-    ensure_dir "$SMART_SELFTEST_DIR" || return 1
-    ensure_dir "$UNSAFE_SDWN_STATE_DIR" || return 1
-    ensure_dir "$BTRFS_SCRUB_STATE_DIR" || return 1
-    ensure_dir "$CMD_TIMEOUT_STATE_DIR" || return 1
+    validate_managed_state_paths || return 1
+    # Inspect/adopt the manifest before changing existing state permissions or
+    # creating state subdirectories. Future or malformed schemas therefore
+    # fail without partially initializing this version's layout.
+    ensure_state_schema_manifest || return 1
+
+    ensure_private_dir "$STATE_DIR" || return 1
+    ensure_private_dir "$SMART_SELFTEST_DIR" || return 1
+    ensure_private_dir "$UNSAFE_SDWN_STATE_DIR" || return 1
+    ensure_private_dir "$BTRFS_SCRUB_STATE_DIR" || return 1
+    ensure_private_dir "$CMD_TIMEOUT_STATE_DIR" || return 1
+    validate_managed_state_paths || return 1
+    harden_managed_state_permissions || return 1
 
     RUN_EPOCH="$(date +%s)"
     RUN_STAMP="$(date '+%Y-%m-%d_%H%M%S')"
-    MASTER_LOG="$LOG_DIR/disk_health_$RUN_STAMP.log"
-    : > "$MASTER_LOG" || return 1
+    MASTER_LOG="$LOG_DIR/disk_health_${RUN_STAMP}_$$.log"
+    secure_create_file "$MASTER_LOG" || return 1
 
     RUN_DIR="$(mktemp -d /tmp/health_monitoring.XXXXXX)" || {
         log "INIT" "ERROR" "Unable to create run workspace"
         return 1
     }
+    chmod 700 -- "$RUN_DIR" 2>/dev/null || return 1
     SMART_CACHE_DIR="$RUN_DIR/smartctl"
-    ensure_dir "$SMART_CACHE_DIR" || return 1
+    ensure_private_dir "$SMART_CACHE_DIR" || return 1
     COLLECTOR_EVENT_FILE="$RUN_DIR/collector_events.tsv"
-    : > "$COLLECTOR_EVENT_FILE" || return 1
+    secure_create_file "$COLLECTOR_EVENT_FILE" || return 1
 
     # Remove cache files produced by older versions; this version never reuses
     # SMART output across runs.
@@ -2725,7 +3106,7 @@ migrate_device_identity_histories() {
     )
 
     [[ -r "$DEVICE_ID_SCHEMA_FILE" ]] && read -r current_version < "$DEVICE_ID_SCHEMA_FILE" || true
-    [[ "$current_version" == "2" ]] && return 0
+    [[ "$current_version" == "$DEVICE_ID_SCHEMA_VERSION" ]] && return 0
 
     if (( ${#DISCOVERED_DISKS[@]} == 0 )); then
         log "STATE" "WARN" \
@@ -2733,7 +3114,8 @@ migrate_device_identity_histories() {
         return 1
     fi
 
-    log "STATE" "INFO" "Migrating persisted device references to stable identity schema v2"
+    log "STATE" "INFO" \
+        "Migrating persisted device references to stable identity schema v$DEVICE_ID_SCHEMA_VERSION"
 
     for file in "${files[@]}"; do
         [[ -s "$file" ]] || continue
@@ -2800,7 +3182,9 @@ migrate_device_identity_histories() {
         return 1
     fi
 
-    collector_atomic_write_text "$DEVICE_ID_SCHEMA_FILE" $'2\n' || return 1
+    collector_atomic_write_text \
+        "$DEVICE_ID_SCHEMA_FILE" "${DEVICE_ID_SCHEMA_VERSION}"$'\n' || return 1
+    write_state_schema_manifest "$DEVICE_ID_SCHEMA_VERSION" || return 1
     log "STATE" "INFO" "Stable identity history migration completed"
 }
 
@@ -8577,7 +8961,7 @@ limit_notification_body() {
 
     if (( LOG_FULL_NOTIFICATION_ON_TRUNCATION == 1 )) && [[ -n "${MASTER_LOG:-}" ]]; then
         {
-            printf '\n===== FULL NOTIFICATION BODY (v2.11.1) =====\n'
+            printf '\n===== FULL NOTIFICATION BODY (v%s) =====\n' "$SCRIPT_VERSION"
             printf '%s\n' "$FULL_NOTIFICATION_BODY"
             printf '===== END FULL NOTIFICATION BODY =====\n'
         } >> "$MASTER_LOG"
@@ -8834,9 +9218,29 @@ validate_absolute_path_setting() {
     local setting="$1" value
 
     value=$(configuration_value "$setting" 2>/dev/null || true)
-    if [[ -z "$value" || "$value" != /* || "$value" == "/" ]]; then
-        configuration_error \
-            "$setting must be a non-root absolute path (found '${value:-unset}')"
+    if ! validate_secure_absolute_path "$value"; then
+        configuration_error "$setting $PATH_VALIDATION_REASON (found '${value:-unset}')"
+        return 0
+    fi
+    if [[ -L "$value" ]]; then
+        configuration_error "$setting must not be a symbolic link"
+        return 0
+    fi
+
+    case "$setting" in
+        LOG_DIR)
+            if [[ -e "$value" && ! -d "$value" ]]; then
+                configuration_error "$setting must identify a directory"
+            fi
+            ;;
+        LOCK_FILE|NOTIFY_BIN|IO_ERROR_LOG_FILE)
+            if [[ -e "$value" && ! -f "$value" ]]; then
+                configuration_error "$setting must identify a regular file"
+            fi
+            ;;
+    esac
+    if [[ "$setting" == "LOG_DIR" && "$value" == */ ]]; then
+        configuration_error "$setting must not end with a slash"
     fi
 }
 
@@ -9273,18 +9677,18 @@ validate_runtime_dependencies() {
 }
 
 print_usage() {
+    printf 'Disk Health Monitor for Unraid v%s\n\n' "$SCRIPT_VERSION"
     cat <<'USAGE'
-Disk Health Monitor for Unraid v2.11.1
-
 Usage:
   health_monitoring.sh                 Run normal monitoring
   health_monitoring.sh --check-config  Validate configuration only
+  health_monitoring.sh --state-status  Inspect state-schema compatibility
   health_monitoring.sh --diagnostics   Run read-only environment diagnostics
   health_monitoring.sh --self-test     Run built-in regression fixtures in /tmp
   health_monitoring.sh --version       Print the script version
   health_monitoring.sh --help          Show this help
 
-The three validation modes do not run SMART commands against disks, start
+The four validation modes do not run SMART commands against disks, start
 tests or scrubs, write monitoring state, advance the syslog cursor, send
 notifications, or spin up disks.
 USAGE
@@ -9298,6 +9702,7 @@ parse_arguments() {
     case "${1:-}" in
         "")             RUN_MODE="monitor" ;;
         --check-config) RUN_MODE="check-config" ;;
+        --state-status) RUN_MODE="state-status" ;;
         --diagnostics)  RUN_MODE="diagnostics" ;;
         --self-test)    RUN_MODE="self-test" ;;
         --version)      RUN_MODE="version" ;;
@@ -9327,10 +9732,11 @@ nearest_existing_parent() {
 }
 
 run_diagnostics() {
-    local failures=0 warnings=0 config_status=0 dependency_status=0
+    local failures=0 warnings=0 config_status=0 dependency_status=0 state_status=0
     local parent device_rows
 
-    printf 'Disk Health Monitor for Unraid v2.11.1 - read-only diagnostics\n'
+    printf 'Disk Health Monitor for Unraid v%s - read-only diagnostics\n' \
+        "$SCRIPT_VERSION"
     printf 'No disk SMART reads, tests, scrubs, state writes, cursor updates, or notifications will occur.\n\n'
 
     if validate_configuration; then
@@ -9355,6 +9761,23 @@ run_diagnostics() {
         "SMART=${SMARTCTL_TIMEOUT_SECONDS}s Btrfs=${BTRFS_COMMAND_TIMEOUT_SECONDS}s XFS=${XFS_REPAIR_TIMEOUT_SECONDS}s System=${SYSTEM_COMMAND_TIMEOUT_SECONDS}s Share=${SHARE_SCAN_TIMEOUT_SECONDS}s Notify=${NOTIFICATION_TIMEOUT_SECONDS}s"
     diagnostic_result INFO "Regression fixtures" \
         "$REGRESSION_FIXTURE_COUNT isolated read-only fixture(s); no live SMART access"
+
+    if inspect_state_schema_manifest; then
+        diagnostic_result PASS "State schema" "$STATE_SCHEMA_DETAIL"
+    else
+        state_status=$?
+        case "$state_status" in
+            10)
+                diagnostic_result INFO "State schema" \
+                    "uninitialized; v2.12 will register existing state on the first monitoring run"
+                ;;
+            *)
+                failures=$((failures + 1))
+                diagnostic_result FAIL "State schema" \
+                    "$STATE_SCHEMA_STATUS: $STATE_SCHEMA_DETAIL"
+                ;;
+        esac
+    fi
 
     if [[ -d "$LOG_DIR" ]]; then
         if [[ -w "$LOG_DIR" ]]; then
@@ -9447,7 +9870,8 @@ run_regression_tests() (
     }
     trap '[[ -z "$fixture_dir" || "$fixture_dir" != /tmp/health_monitoring.selftest.* ]] || rm -rf -- "$fixture_dir"' EXIT
 
-    printf 'Disk Health Monitor for Unraid v2.11.1 - built-in regression tests\n'
+    printf 'Disk Health Monitor for Unraid v%s - built-in regression tests\n' \
+        "$SCRIPT_VERSION"
     printf '%d fixtures are isolated under %s and removed automatically.\n\n' \
         "$REGRESSION_FIXTURE_COUNT" "$fixture_dir"
 
@@ -9456,6 +9880,113 @@ run_regression_tests() (
         self_test_result 1 "Stable state filename sanitization"
     else
         self_test_result 0 "Stable state filename sanitization" "found '$actual'"
+    fi
+
+    if declare -F load_builtin_defaults >/dev/null 2>&1 &&
+       [[ "$SCRIPT_VERSION" == "2.12" &&
+          "$STATE_SCHEMA_VERSION" == "1" &&
+          "$HISTORY_SCHEMA_VERSION" == "3" &&
+          "$DEVICE_ID_SCHEMA_VERSION" == "2" &&
+          "$SMART_ALLOW_SPINUP" == "0" ]]
+    then
+        self_test_result 1 "Built-in defaults and schema constants"
+    else
+        self_test_result 0 "Built-in defaults and schema constants"
+    fi
+
+    if validate_secure_absolute_path "$fixture_dir/safe/state" &&
+       ! validate_secure_absolute_path '/tmp/../etc/state' &&
+       ! validate_secure_absolute_path '/tmp//state' &&
+       ! validate_secure_absolute_path $'/tmp/state\nunsafe'
+    then
+        self_test_result 1 "Secure absolute-path lexical validation"
+    else
+        self_test_result 0 "Secure absolute-path lexical validation" \
+            "$PATH_VALIDATION_REASON"
+    fi
+
+    local path_real="$fixture_dir/path-real" path_link="$fixture_dir/path-link"
+    mkdir -p "$path_real"
+    ln -s "$path_real" "$path_link"
+    if validate_symlink_free_path "$path_real/state" &&
+       ! validate_symlink_free_path "$path_link/state"
+    then
+        self_test_result 1 "Symbolic-link path component rejection"
+    else
+        self_test_result 0 "Symbolic-link path component rejection" \
+            "$PATH_VALIDATION_REASON"
+    fi
+
+    local schema_dir="$fixture_dir/schema" current_manifest future_manifest malformed_manifest
+    mkdir -p "$schema_dir"
+    current_manifest="$schema_dir/current.manifest"
+    printf 'format=%s\nstate_schema=1\nhistory_schema=3\nidentity_schema=2\nwriter_version=2.12\nupdated_epoch=1\n' \
+        "$STATE_SCHEMA_FORMAT" > "$current_manifest"
+    if inspect_state_schema_manifest "$current_manifest" &&
+       [[ "$STATE_SCHEMA_STATUS" == "CURRENT" &&
+          "$(state_manifest_value "$current_manifest" identity_schema)" == "2" ]]
+    then
+        self_test_result 1 "Current state-schema manifest parsing"
+    else
+        self_test_result 0 "Current state-schema manifest parsing" \
+            "$STATE_SCHEMA_STATUS: $STATE_SCHEMA_DETAIL"
+    fi
+
+    future_manifest="$schema_dir/future.manifest"
+    printf 'format=%s\nstate_schema=2\nhistory_schema=3\nidentity_schema=2\nwriter_version=future\nupdated_epoch=1\n' \
+        "$STATE_SCHEMA_FORMAT" > "$future_manifest"
+    local future_rc=0
+    if inspect_state_schema_manifest "$future_manifest"; then
+        future_rc=0
+    else
+        future_rc=$?
+    fi
+    if [[ "$future_rc" == "30" && "$STATE_SCHEMA_STATUS" == "FUTURE" ]]; then
+        self_test_result 1 "Future state-schema refusal"
+    else
+        self_test_result 0 "Future state-schema refusal" \
+            "rc=$future_rc status=$STATE_SCHEMA_STATUS"
+    fi
+
+    malformed_manifest="$schema_dir/malformed.manifest"
+    printf 'format=%s\nstate_schema=1\nstate_schema=1\nhistory_schema=3\nidentity_schema=2\n' \
+        "$STATE_SCHEMA_FORMAT" > "$malformed_manifest"
+    local malformed_rc=0
+    if inspect_state_schema_manifest "$malformed_manifest"; then
+        malformed_rc=0
+    else
+        malformed_rc=$?
+    fi
+    if [[ "$malformed_rc" == "20" && "$STATE_SCHEMA_STATUS" == "INVALID" ]]; then
+        self_test_result 1 "Malformed state-schema manifest rejection"
+    else
+        self_test_result 0 "Malformed state-schema manifest rejection" \
+            "rc=$malformed_rc status=$STATE_SCHEMA_STATUS"
+    fi
+
+    STATE_SCHEMA_MANIFEST_FILE="$schema_dir/generated.manifest"
+    DEVICE_ID_SCHEMA_FILE="$schema_dir/device_identity_schema.version"
+    printf '%s\n' "$DEVICE_ID_SCHEMA_VERSION" > "$DEVICE_ID_SCHEMA_FILE"
+    if ensure_state_schema_manifest &&
+       inspect_state_schema_manifest "$STATE_SCHEMA_MANIFEST_FILE" &&
+       [[ "$(state_manifest_value "$STATE_SCHEMA_MANIFEST_FILE" identity_schema)" == \
+          "$DEVICE_ID_SCHEMA_VERSION" ]]
+    then
+        self_test_result 1 "Atomic state-schema manifest initialization"
+    else
+        self_test_result 0 "Atomic state-schema manifest initialization" \
+            "$STATE_SCHEMA_STATUS: $STATE_SCHEMA_DETAIL"
+    fi
+
+    local atomic_victim="$schema_dir/victim.state" atomic_link="$schema_dir/link.state"
+    printf 'known-good\n' > "$atomic_victim"
+    ln -s "$atomic_victim" "$atomic_link"
+    if ! atomic_write_text "$atomic_link" $'replacement\n' &&
+       [[ "$(<"$atomic_victim")" == "known-good" ]]
+    then
+        self_test_result 1 "Atomic write rejects symbolic-link targets"
+    else
+        self_test_result 0 "Atomic write rejects symbolic-link targets"
     fi
 
     actual=$(history_field_value 'temp=31 captured_epoch=1786800000 schema=3' temp 2>/dev/null || true)
@@ -9480,9 +10011,11 @@ run_regression_tests() (
         '7 7 0 1|HIGH'
     ) case_data expected
     local confidence_failures=0
+    local -a confidence_args=()
     for case_data in "${confidence_cases[@]}"; do
         expected="${case_data#*|}"
-        actual=$(forecast_confidence ${case_data%%|*})
+        read -r -a confidence_args <<< "${case_data%%|*}"
+        actual=$(forecast_confidence "${confidence_args[@]}")
         [[ "$actual" == "$expected" ]] || confidence_failures=$((confidence_failures + 1))
     done
     if (( confidence_failures == 0 )); then
@@ -10030,7 +10563,7 @@ main() {
             return 0
             ;;
         version)
-            printf 'Disk Health Monitor for Unraid v2.11.1\n'
+            printf 'Disk Health Monitor for Unraid v%s\n' "$SCRIPT_VERSION"
             return 0
             ;;
         check-config)
@@ -10039,6 +10572,11 @@ main() {
                 return 0
             fi
             return 1
+            ;;
+        state-status)
+            validate_configuration || return 1
+            print_state_schema_status
+            return $?
             ;;
         diagnostics)
             run_diagnostics
