@@ -4,7 +4,7 @@ noParity=true
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.14.2"
+readonly SCRIPT_VERSION="2.14.3"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -15,13 +15,15 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.14.2
+# Disk Health Monitor for Unraid v2.14.3
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
 #
-# v2.14.2 makes trend notifications self-explanatory, filters invalid forecast
-# evidence, and retains raw diagnostic detail in the categorized run log.
+# v2.14.3 reconciles the Phase 1-11 refactored lineage with the Phase 12-14
+# production script. The active script already contained the complete earlier
+# lineage, so this release retires the obsolete duplicate without restoring
+# superseded code.
 ################################################################################
 # ---------------- Configuration ----------------
 # Disks health script settings. Tuned for performance and reliability.
@@ -11405,7 +11407,7 @@ run_regression_tests() (
     fi
 
     if declare -F load_builtin_defaults >/dev/null 2>&1 &&
-       [[ "$SCRIPT_VERSION" == "2.14.2" &&
+       [[ "$SCRIPT_VERSION" == "2.14.3" &&
           "$STATE_SCHEMA_VERSION" == "2" &&
           "$HISTORY_SCHEMA_VERSION" == "3" &&
           "$DEVICE_ID_SCHEMA_VERSION" == "2" &&
