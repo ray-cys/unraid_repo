@@ -4,7 +4,7 @@ noParity=true
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.12"
+readonly SCRIPT_VERSION="2.13"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -15,10 +15,13 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.12
+# Disk Health Monitor for Unraid v2.13
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
+#
+# Phase 13 separates trend analysis into bounded stages, normalizes history
+# input, shares per-run history snapshots, and centralizes acceleration math.
 ################################################################################
 # ---------------- Configuration ----------------
 # Disks health script settings. Tuned for performance and reliability.
@@ -413,7 +416,7 @@ SYSLOG_CURSOR_PENDING_SIZE=0
 SYSLOG_CURSOR_PENDING_ANCHOR="-"
 SYSLOG_CHUNK_FILE=""
 RUN_MODE="monitor"
-REGRESSION_FIXTURE_COUNT=40
+REGRESSION_FIXTURE_COUNT=49
 CONFIG_ERROR_COUNT=0
 CONFIG_WARNING_COUNT=0
 DEPENDENCY_ERROR_COUNT=0
@@ -972,8 +975,10 @@ history_record_epoch() {
     local date_field="$1"
     local record="${2:-}"
     local token epoch=""
+    local -a tokens=()
 
-    for token in $record; do
+    IFS=$' \t' read -r -a tokens <<< "$record"
+    for token in "${tokens[@]}"; do
         if [[ "$token" == captured_epoch=* ]]; then
             epoch="${token#*=}"
             break
@@ -990,8 +995,10 @@ history_field_value() {
     local record="$1"
     local wanted="$2"
     local token
+    local -a tokens=()
 
-    for token in $record; do
+    IFS=$' \t' read -r -a tokens <<< "$record"
+    for token in "${tokens[@]}"; do
         if [[ "$token" == "$wanted="* ]]; then
             printf '%s\n' "${token#*=}"
             return 0
@@ -6640,23 +6647,308 @@ build_health_alerts() {
     HEALTH_ALERTS_SECTION="$(printf '%s\n' "$rec" | trim_outer_blank_lines)"
 }
 
-# === Main Function ===
-# Build non-critical trend / advisory analytics section
-# shellcheck disable=SC2329
-build_trend_section() {
-    # Minimal ERR trap to log which sub-block failed while compiling trends
-    trap 'log_crit "Trend sub-block failed [${CURRENT_TREND_BLOCK:-unknown}] at line ${LINENO}: ${BASH_COMMAND}"' ERR
-    CURRENT_TREND_BLOCK="init"
-    declare -g TEMP_FORECAST_CONFIDENCE_LINE
+# Trend stages intentionally communicate through the structured globals used
+# by risk evaluation and final rendering. Each stage otherwise owns its local
+# parsing state and can fail independently.
+declare -a TREND_LINE_ITEMS=()
+declare -A TREND_HISTORY_CACHE=()
+TREND_CACHE_RESULT=""
+TREND_ROW_DEVICE_KEY=""
+TREND_ROW_MOUNT=""
+TREND_ROW_KEY=""
+TREND_ROW_DELTA=""
+TREND_ROW_RATE_DAY=""
+TREND_ROW_EVENT=""
+TREND_ACCEL_LAST=""
+TREND_ACCEL_AVERAGE=""
+TREND_ACCEL_RATIO=""
+TREND_ACCEL_SAMPLES=0
+TREND_ACCEL_FACTOR=0
+TREND_ACCEL_MINIMUM=0
+TREND_DEPLETION_LAST_RATE=""
+TREND_DEPLETION_AVERAGE_RATE=""
+TREND_DEPLETION_RATIO=""
+TREND_DEPLETION_SAMPLES=0
+
+trend_add_line() {
+    local tag="$1" content="$2"
+
+    if [[ -n "$content" ]]; then
+        TREND_LINE_ITEMS+=("${tag}: ${content}")
+    fi
+    return 0
+}
+
+# Copy a bounded history tail once per run. Trend stages share the cached file
+# instead of repeatedly reading the same persistent history into shell strings.
+prepare_trend_history_cache() {
+    local tag="$1" source="$2" maximum_lines="$3"
+    local cache_dir cache_file temp_file cached
+
+    TREND_CACHE_RESULT=""
+    cached="${TREND_HISTORY_CACHE[$tag]:-}"
+    if [[ -n "$cached" && -r "$cached" && -f "$cached" && ! -L "$cached" ]]; then
+        TREND_CACHE_RESULT="$cached"
+        return 0
+    fi
+    [[ "$maximum_lines" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ -r "$source" && -f "$source" && ! -L "$source" ]] || return 1
+
+    cache_dir="$RUN_DIR/trend_cache"
+    ensure_private_dir "$cache_dir" || return 1
+    cache_file="$cache_dir/$(safe_state_name "$tag").log"
+    temp_file=$(mktemp "${cache_file}.tmp.XXXXXX") || return 1
+    chmod 600 -- "$temp_file" 2>/dev/null || {
+        rm -f -- "$temp_file" 2>/dev/null || true
+        return 1
+    }
+    if ! tail -n "$maximum_lines" -- "$source" > "$temp_file" 2>/dev/null; then
+        rm -f -- "$temp_file" 2>/dev/null || true
+        return 1
+    fi
+    if ! mv -f -- "$temp_file" "$cache_file"; then
+        rm -f -- "$temp_file" 2>/dev/null || true
+        return 1
+    fi
+
+    TREND_HISTORY_CACHE[$tag]="$cache_file"
+    TREND_CACHE_RESULT="$cache_file"
+    return 0
+}
+
+# Emit only well-formed dated history rows in the requested window. Sorting
+# makes first/last analysis deterministic when legacy rows are out of order.
+stream_trend_history_window() {
+    local source="$1" cutoff="$2"
+
+    awk -v cutoff="$cutoff" '
+        $1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ &&
+        $1 >= cutoff && NF >= 2 { print }
+    ' "$source" 2>/dev/null | LC_ALL=C sort -s -k1,1
+}
+
+# Decode the common Btrfs trend-history row without spawning one parser for
+# every field. Results are returned through globals because command
+# substitution would discard side effects in a subshell.
+parse_btrfs_trend_row() {
+    local record="$1" token name value
+    local -a tokens=()
+
+    TREND_ROW_DEVICE_KEY=""
+    TREND_ROW_MOUNT=""
+    TREND_ROW_KEY=""
+    TREND_ROW_DELTA=""
+    TREND_ROW_RATE_DAY=""
+    TREND_ROW_EVENT=""
+    IFS=$' \t' read -r -a tokens <<< "$record"
+    for token in "${tokens[@]}"; do
+        if [[ "$token" != *=* && -z "$TREND_ROW_DEVICE_KEY" ]]; then
+            TREND_ROW_DEVICE_KEY="$token"
+            continue
+        fi
+        [[ "$token" == *=* ]] || continue
+        name="${token%%=*}"
+        value="${token#*=}"
+        case "$name" in
+            mount)    TREND_ROW_MOUNT="$value" ;;
+            key)      TREND_ROW_KEY="$value" ;;
+            delta)    TREND_ROW_DELTA="$value" ;;
+            rate_day) TREND_ROW_RATE_DAY="$value" ;;
+            event)    TREND_ROW_EVENT="$value" ;;
+        esac
+    done
+    [[ -n "$TREND_ROW_DEVICE_KEY" && -n "$TREND_ROW_KEY" ]]
+}
+
+parse_xfs_trend_row() {
+    local record="$1" token name value
+    local -a tokens=()
+
+    TREND_ROW_KEY=""
+    TREND_ROW_DELTA=""
+    TREND_ROW_RATE_DAY=""
+    TREND_ROW_EVENT=""
+    IFS=$' \t' read -r -a tokens <<< "$record"
+    for token in "${tokens[@]}"; do
+        [[ "$token" == *=* ]] || continue
+        name="${token%%=*}"
+        value="${token#*=}"
+        case "$name" in
+            key)      TREND_ROW_KEY="$value" ;;
+            delta)    TREND_ROW_DELTA="$value" ;;
+            rate_day) TREND_ROW_RATE_DAY="$value" ;;
+            event)    TREND_ROW_EVENT="$value" ;;
+        esac
+    done
+    [[ -n "$TREND_ROW_KEY" ]]
+}
+
+set_error_acceleration_thresholds() {
+    local key="$1" default_factor="$2" default_minimum="$3"
+
+    TREND_ACCEL_FACTOR="$default_factor"
+    TREND_ACCEL_MINIMUM="$default_minimum"
+    case "$key" in
+        corruption_errs)
+            TREND_ACCEL_FACTOR=${ERROR_RATE_ACCEL_FACTOR_CORRUPTION:-$default_factor}
+            TREND_ACCEL_MINIMUM=${ERROR_RATE_ACCEL_MIN_DELTA_CORRUPTION:-$default_minimum}
+            ;;
+        generation_errs)
+            TREND_ACCEL_FACTOR=${ERROR_RATE_ACCEL_FACTOR_GENERATION:-$default_factor}
+            TREND_ACCEL_MINIMUM=${ERROR_RATE_ACCEL_MIN_DELTA_GENERATION:-$default_minimum}
+            ;;
+    esac
+}
+
+# Compare the newest rate with an exponentially weighted average of prior
+# intervals. Duplicate dates are collapsed and reset events are handled by the
+# row collectors before this helper is called.
+evaluate_weighted_acceleration() {
+    local sequence="$1" factor="$2" minimum="$3" now_epoch="$4" decay_days="${5:-7}"
+    local sample sample_date sample_rate index prior_epoch age_days weight
+    local weighted_sum=0 weighted_total=0
+    local -a dates=() sequence_items=()
+    declare -A rate_by_date=()
+
+    TREND_ACCEL_LAST=""
+    TREND_ACCEL_AVERAGE=""
+    TREND_ACCEL_RATIO=""
+    TREND_ACCEL_SAMPLES=0
+    [[ "$factor" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    [[ "$minimum" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    [[ "$now_epoch" =~ ^[0-9]+$ ]] || return 1
+    [[ "$decay_days" =~ ^[1-9][0-9]*$ ]] || decay_days=7
+
+    IFS=$' \t' read -r -a sequence_items <<< "$sequence"
+    for sample in "${sequence_items[@]}"; do
+        sample_date="${sample%%:*}"
+        sample_rate="${sample#*:}"
+        [[ "$sample_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
+        [[ "$sample_rate" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
+        rate_by_date[$sample_date]="$sample_rate"
+    done
+    (( ${#rate_by_date[@]} > 0 )) || return 1
+    mapfile -t dates < <(printf '%s\n' "${!rate_by_date[@]}" | LC_ALL=C sort)
+    TREND_ACCEL_SAMPLES=${#dates[@]}
+    (( TREND_ACCEL_SAMPLES >= 3 )) || return 1
+
+    TREND_ACCEL_LAST="${rate_by_date[${dates[$((TREND_ACCEL_SAMPLES - 1))]}]}"
+    for ((index=1; index<TREND_ACCEL_SAMPLES-1; index++)); do
+        sample_date="${dates[$index]}"
+        sample_rate="${rate_by_date[$sample_date]}"
+        prior_epoch=$(date -d "$sample_date" +%s 2>/dev/null || printf '%s' "$now_epoch")
+        age_days=$(( (now_epoch - prior_epoch) / 86400 ))
+        (( age_days < 0 )) && age_days=0
+        weight=$(awk -v age="$age_days" -v decay="$decay_days" \
+            'BEGIN { printf "%.6f", exp(-age/decay) }')
+        weighted_sum=$(awk -v sum="$weighted_sum" -v rate="$sample_rate" -v weight="$weight" \
+            'BEGIN { printf "%.6f", sum + rate*weight }')
+        weighted_total=$(awk -v total="$weighted_total" -v weight="$weight" \
+            'BEGIN { printf "%.6f", total + weight }')
+    done
+    TREND_ACCEL_AVERAGE=$(awk -v sum="$weighted_sum" -v total="$weighted_total" \
+        'BEGIN { if (total > 0) printf "%.3f", sum/total; else print "0" }')
+    TREND_ACCEL_RATIO=$(awk -v latest="$TREND_ACCEL_LAST" -v average="$TREND_ACCEL_AVERAGE" \
+        'BEGIN { if (average > 0) printf "%.2f", latest/average; else print "0" }')
+
+    awk -v latest="$TREND_ACCEL_LAST" -v average="$TREND_ACCEL_AVERAGE" \
+        -v factor="$factor" -v minimum="$minimum" \
+        'BEGIN { exit !(latest >= minimum && average > 0 && latest >= average*(1+factor/100)) }'
+}
+
+# Evaluate a decreasing days-left series using depletion per elapsed calendar
+# day. This avoids treating gaps in collection as one-day spikes.
+evaluate_depletion_acceleration() {
+    local sequence="$1" factor="$2" minimum="$3"
+    local sample sample_date sample_value index previous_epoch current_epoch elapsed_days
+    local previous_value current_value rate sum=0 count=0
+    local -a dates=() sequence_items=() depletion_rates=()
+    declare -A value_by_date=()
+
+    TREND_DEPLETION_LAST_RATE=""
+    TREND_DEPLETION_AVERAGE_RATE=""
+    TREND_DEPLETION_RATIO=""
+    TREND_DEPLETION_SAMPLES=0
+    [[ "$factor" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    [[ "$minimum" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+
+    IFS=$' \t' read -r -a sequence_items <<< "$sequence"
+    for sample in "${sequence_items[@]}"; do
+        sample_date="${sample%%:*}"
+        sample_value="${sample#*:}"
+        [[ "$sample_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
+        [[ "$sample_value" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
+        value_by_date[$sample_date]="$sample_value"
+    done
+    (( ${#value_by_date[@]} > 0 )) || return 1
+    mapfile -t dates < <(printf '%s\n' "${!value_by_date[@]}" | LC_ALL=C sort)
+    TREND_DEPLETION_SAMPLES=${#dates[@]}
+    (( TREND_DEPLETION_SAMPLES >= 3 )) || return 1
+
+    for ((index=1; index<TREND_DEPLETION_SAMPLES; index++)); do
+        previous_epoch=$(date -d "${dates[$((index - 1))]}" +%s 2>/dev/null || true)
+        current_epoch=$(date -d "${dates[$index]}" +%s 2>/dev/null || true)
+        [[ "$previous_epoch" =~ ^[0-9]+$ && "$current_epoch" =~ ^[0-9]+$ ]] || continue
+        elapsed_days=$(( (current_epoch - previous_epoch) / 86400 ))
+        (( elapsed_days > 0 )) || continue
+        previous_value="${value_by_date[${dates[$((index - 1))]}]}"
+        current_value="${value_by_date[${dates[$index]}]}"
+        rate=$(awk -v previous="$previous_value" -v current="$current_value" \
+            -v days="$elapsed_days" \
+            'BEGIN { printf "%.6f", (previous-current)/days }')
+        depletion_rates+=("$rate")
+    done
+    (( ${#depletion_rates[@]} >= 2 )) || return 1
+
+    TREND_DEPLETION_LAST_RATE="${depletion_rates[-1]}"
+    for rate in "${depletion_rates[@]:0:${#depletion_rates[@]}-1}"; do
+        if awk -v value="$rate" 'BEGIN { exit !(value > 0) }'; then
+            sum=$(awk -v sum="$sum" -v value="$rate" \
+                'BEGIN { printf "%.6f", sum+value }')
+            count=$((count + 1))
+        fi
+    done
+    (( count > 0 )) || return 1
+    TREND_DEPLETION_AVERAGE_RATE=$(awk -v sum="$sum" -v count="$count" \
+        'BEGIN { printf "%.6f", sum/count }')
+    TREND_DEPLETION_RATIO=$(awk -v latest="$TREND_DEPLETION_LAST_RATE" \
+        -v average="$TREND_DEPLETION_AVERAGE_RATE" \
+        'BEGIN { if (average > 0) printf "%.2f", latest/average; else print "0" }')
+
+    awk -v latest="$TREND_DEPLETION_LAST_RATE" \
+        -v average="$TREND_DEPLETION_AVERAGE_RATE" \
+        -v factor="$factor" -v minimum="$minimum" \
+        'BEGIN { exit !(latest >= minimum && average > 0 && latest >= average*(1+factor/100)) }'
+}
+
+run_trend_stage() {
+    local label="$1"
+    shift
+    local rc
+
+    CURRENT_TREND_BLOCK="$label"
+    "$@"
+    rc=$?
+    if (( rc != 0 )); then
+        log "TREND" "WARN" "Trend stage failed: $label (rc=$rc)"
+        record_collector_event FAILED "Trend $label" "rc=$rc"
+    fi
+    return 0
+}
+
+analyze_temperature_trends() {
+    local dev
+
     TEMP_FORECAST_CONFIDENCE_LINE=""
     # Temperature Evolution subsection
     CURRENT_TREND_BLOCK="temperature"
-    if [[ -f "${TEMP_HISTORY_FILE}" ]]; then
+    if prepare_trend_history_cache temperatures "$TEMP_HISTORY_FILE" 50000; then
         local temp_win=${TEMP_TREND_WINDOW_DAYS:-14} stored_key rest dt
+        local temp_cache="$TREND_CACHE_RESULT"
         local now_ts
         now_ts=$(date +%s)
         local cut_ts=$(( now_ts - temp_win*86400 ))
-        declare -A TT_MIN TT_MAX TT_SUM TT_CNT TT_FIRST TT_LAST TT_FIRST_TS TT_LAST_TS TT_MAX_GAP_SECONDS
+        declare -A TT_CNT TT_FIRST TT_LAST TT_FIRST_TS TT_LAST_TS TT_MAX_GAP_SECONDS
         declare -A TEMP_SAMPLE_VALUE TEMP_SAMPLE_EPOCH TEMP_DEVICE_SEEN TEMP_SEQUENCE
         TEMP_RATE_CONFIDENCE=()
         while read -r dt stored_key rest; do
@@ -6674,10 +6966,15 @@ build_trend_section() {
             [[ "$ts" =~ ^[0-9]+$ ]] || continue
             (( ts >= cut_ts )) || continue
             temp_sample_key="$dev|$dt"
+            if [[ -n "${TEMP_SAMPLE_EPOCH[$temp_sample_key]:-}" ]] &&
+               (( ts < TEMP_SAMPLE_EPOCH[$temp_sample_key] ))
+            then
+                continue
+            fi
             TEMP_SAMPLE_VALUE[$temp_sample_key]="$tmp"
             TEMP_SAMPLE_EPOCH[$temp_sample_key]="$ts"
             TEMP_DEVICE_SEEN[$dev]=1
-        done < "${TEMP_HISTORY_FILE}"
+        done < "$temp_cache"
 
         local temp_sample
         for temp_sample in "${!TEMP_SAMPLE_VALUE[@]}"; do
@@ -6697,9 +6994,6 @@ build_trend_section() {
                     gap_seconds=$(( sample_ts - previous_ts ))
                     (( gap_seconds > max_gap_seconds )) && max_gap_seconds=$gap_seconds
                 fi
-                if [[ -z "${TT_MIN[$temp_dev]:-}" || ${TT_MIN[$temp_dev]} -gt $sample_temp ]]; then TT_MIN[$temp_dev]="$sample_temp"; fi
-                if [[ -z "${TT_MAX[$temp_dev]:-}" || ${TT_MAX[$temp_dev]} -lt $sample_temp ]]; then TT_MAX[$temp_dev]="$sample_temp"; fi
-                TT_SUM[$temp_dev]=$(( ${TT_SUM[$temp_dev]:-0} + sample_temp ))
                 TT_CNT[$temp_dev]=$(( ${TT_CNT[$temp_dev]:-0} + 1 ))
                 TT_LAST[$temp_dev]="$sample_temp"
                 TT_LAST_TS[$temp_dev]="$sample_ts"
@@ -6761,9 +7055,12 @@ build_trend_section() {
             TEMP_FORECAST_CONFIDENCE_LINE="$(join_by ' | ' "${temp_confidence_items[@]}")"
         fi
     fi
-    # Trend-derived early warnings (growth acceleration, thermal exposure, heavy writers, endurance)
-    declare -g DL_SHRINK_LINE EARLY_ERR_LINE BTRFS_SUM_LINE SMART_GROWTH_LINE POH_GROWTH_LINE
-    DL_SHRINK_LINE=""; EARLY_ERR_LINE=""; BTRFS_SUM_LINE=""; SMART_GROWTH_LINE=""; POH_GROWTH_LINE=""
+    return 0
+}
+
+analyze_smart_attribute_trends() {
+    local dev token k v a d
+
     # SMART attribute growth trend computation
     CURRENT_TREND_BLOCK="smart-attr-trend"
     if (( SMART_ATTR_TREND_ENABLED == 1 )); then
@@ -6772,33 +7069,27 @@ build_trend_section() {
         local cutoff_attr
         cutoff_attr=$(date -d "-${win_attr} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
         declare -A first_line_attr last_line_attr first_dt_attr last_dt_attr
-        if [[ -f "$SMART_ATTR_HISTORY_FILE" ]]; then
-            local lines_attr
-            lines_attr=$(tail -n 50000 "$SMART_ATTR_HISTORY_FILE" 2>/dev/null || true)
-            if [[ -n "$lines_attr" ]]; then
-                local tmp_attr
-                tmp_attr=$(mktemp) || { log_warn "mktemp failed; skipping SMART attribute trend block"; tmp_attr=""; }
-                if [[ -n "$tmp_attr" ]]; then
-                    printf "%s\n" "$lines_attr" | awk -v c="$cutoff_attr" '$1>=c' > "$tmp_attr"
+        if prepare_trend_history_cache smart-attributes "$SMART_ATTR_HISTORY_FILE" 50000; then
+                local smart_attr_cache="$TREND_CACHE_RESULT"
                 local stored_key
                 while read -r dt stored_key rest; do
                     dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
                     [[ -z "$dt" || -z "$dev" ]] && continue
                     if [[ -z "${first_dt_attr[$dev]:-}" || "$dt" < "${first_dt_attr[$dev]}" ]]; then first_dt_attr[$dev]="$dt"; first_line_attr[$dev]="$rest"; fi
-                    if [[ -z "${last_dt_attr[$dev]:-}" || "$dt" > "${last_dt_attr[$dev]}" ]]; then last_dt_attr[$dev]="$dt"; last_line_attr[$dev]="$rest"; fi
-                done < "$tmp_attr"
-                rm -f "$tmp_attr"
-                else
-                    # Without tmp, skip SMART attribute trend computation
-                    :
-                fi
+                    if [[ -z "${last_dt_attr[$dev]:-}" || "$dt" > "${last_dt_attr[$dev]}" || "$dt" == "${last_dt_attr[$dev]}" ]]; then last_dt_attr[$dev]="$dt"; last_line_attr[$dev]="$rest"; fi
+                done < <(stream_trend_history_window "$smart_attr_cache" "$cutoff_attr")
                 local min_delta_attr=${SMART_ATTR_TREND_MIN_DELTA:-1}
                 local attrs_attr=(realloc pending reported_uncorr offunc cmd_timeout realloc_events udma soft_read_err nvme_percent_used unsafe_shutdowns media_errors err_logs pcie_corr pcie_unc therm_t1 therm_t2 warn_temp_time crit_temp_time tbw_bytes)
                 for dev in "${!last_line_attr[@]}"; do
                     local f="${first_line_attr[$dev]}" l="${last_line_attr[$dev]}"
+                    local -a first_tokens=() last_tokens=()
                     declare -A fv_attr lv_attr
-                    for token in $f; do k=${token%%=*}; v=${token#*=}; fv_attr[$k]="$v"; done
-                    for token in $l; do k=${token%%=*}; v=${token#*=}; lv_attr[$k]="$v"; done
+                    fv_attr=()
+                    lv_attr=()
+                    IFS=$' \t' read -r -a first_tokens <<< "$f"
+                    IFS=$' \t' read -r -a last_tokens <<< "$l"
+                    for token in "${first_tokens[@]}"; do k=${token%%=*}; v=${token#*=}; fv_attr[$k]="$v"; done
+                    for token in "${last_tokens[@]}"; do k=${token%%=*}; v=${token#*=}; lv_attr[$k]="$v"; done
                     local show_attr=0 hv_writer_flag=0 pcie_corr_low_flag=0 wear_delta=0 tbw_delta=0 media_growth_flag=0 warn_temp_delta=0 crit_temp_delta=0 therm_warn=0 therm_crit=0 unsafe_low=0
                     for a in "${attrs_attr[@]}"; do
                         local sv=${fv_attr[$a]:-} ev=${lv_attr[$a]:-}
@@ -6863,9 +7154,14 @@ build_trend_section() {
                     done < <(printf "%s\n" "$sorted")
                     SMART_GROWTH_LINE="${line%'; '}"
                 fi
-            fi
         fi
     fi
+    return 0
+}
+
+analyze_endurance_trends() {
+    local dev
+
     # Endurance aging + TBW days-left shrink & acceleration (ranking)
     CURRENT_TREND_BLOCK="endurance-trend"
     if (( ${POH_TREND_ENABLED:-0} == 1 || ${TBW_TREND_ENABLED:-0} == 1 )); then
@@ -6873,26 +7169,20 @@ build_trend_section() {
         local cutoff_end
         cutoff_end=$(date -d "-${win_end} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
         # --- POH Aging Ranking ---
-        if (( POH_TREND_ENABLED == 1 )) && [[ -f "$POH_HISTORY_FILE" ]]; then
-            local poh_lines tmp_poh
-            poh_lines=$(
-                (tail -n 50000 "$POH_HISTORY_FILE" 2>/dev/null || true) |
-                    awk -v c="$cutoff_end" '$1>=c'
-            )
-            if [[ -n "$poh_lines" ]]; then
-                tmp_poh=$(mktemp) || { log_warn "mktemp failed; skipping POH trend block"; tmp_poh=""; }
-                if [[ -n "$tmp_poh" ]]; then
-                    printf "%s\n" "$poh_lines" | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="poh") v=a[2]} if(d!="" && v!=""){print $1,d,v}}' > "$tmp_poh"
+        if (( POH_TREND_ENABLED == 1 )) &&
+           prepare_trend_history_cache power-on-hours "$POH_HISTORY_FILE" 50000
+        then
+                local poh_cache="$TREND_CACHE_RESULT"
                 declare -A poh_first_dt poh_first_v poh_last_dt poh_last_v
-                local stored_key
-                while read -r dt stored_key v; do
+                local dt stored_key rest v
+                while read -r dt stored_key rest; do
+                    v=$(history_field_value "$rest" poh 2>/dev/null || true)
+                    [[ "$v" =~ ^[0-9]+$ ]] || continue
                     dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
                     [[ -z "$dev" || -z "$v" ]] && continue
                     if [[ -z "${poh_first_dt[$dev]:-}" || "$dt" < "${poh_first_dt[$dev]}" ]]; then poh_first_dt[$dev]="$dt"; poh_first_v[$dev]="$v"; fi
-                    if [[ -z "${poh_last_dt[$dev]:-}" || "$dt" > "${poh_last_dt[$dev]}" ]]; then poh_last_dt[$dev]="$dt"; poh_last_v[$dev]="$v"; fi
-                done < "$tmp_poh"
-                rm -f "$tmp_poh"
-                fi
+                    if [[ -z "${poh_last_dt[$dev]:-}" || "$dt" > "${poh_last_dt[$dev]}" || "$dt" == "${poh_last_dt[$dev]}" ]]; then poh_last_dt[$dev]="$dt"; poh_last_v[$dev]="$v"; fi
+                done < <(stream_trend_history_window "$poh_cache" "$cutoff_end")
                 local poh_rank=()
                 for dev in "${!poh_last_v[@]}"; do
                     local start=${poh_first_v[$dev]:-0} end=${poh_last_v[$dev]:-0}
@@ -6923,30 +7213,24 @@ build_trend_section() {
                         POH_GROWTH_LINE="${_s%'; '}"
                     }
                 fi
-            fi
         fi
         # --- TBW Days-Left Shrink & Acceleration ---
-        if (( ${TBW_TREND_ENABLED:-0} == 1 )) && [[ -f "$TBW_DAYSLEFT_HISTORY_FILE" ]]; then
-            local dl_lines tmp_dl accel_factor=${ENDURANCE_DAYSLEFT_ACCEL_FACTOR_PCT:-50} accel_min=${ENDURANCE_DAYSLEFT_ACCEL_MIN_DELTA:-0.5}
-            dl_lines=$(
-                (tail -n 50000 "$TBW_DAYSLEFT_HISTORY_FILE" 2>/dev/null || true) |
-                    awk -v c="$cutoff_end" '$1>=c'
-            )
-            if [[ -n "$dl_lines" ]]; then
-                tmp_dl=$(mktemp) || { log_warn "mktemp failed; skipping TBW days-left trend block"; tmp_dl=""; }
-                if [[ -n "$tmp_dl" ]]; then
-                    printf "%s\n" "$dl_lines" | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="days_left") v=a[2]} if(d!="" && v!=""){print $1,d,v}}' > "$tmp_dl"
+        if (( ${TBW_TREND_ENABLED:-0} == 1 )) &&
+           prepare_trend_history_cache tbw-days-left "$TBW_DAYSLEFT_HISTORY_FILE" 50000
+        then
+                local dl_cache="$TREND_CACHE_RESULT"
+                local accel_factor=${ENDURANCE_DAYSLEFT_ACCEL_FACTOR_PCT:-50} accel_min=${ENDURANCE_DAYSLEFT_ACCEL_MIN_DELTA:-0.5}
                 declare -A dl_first_dt dl_first_v dl_last_dt dl_last_v dl_seq
-                local stored_key
-                while read -r dt stored_key v; do
+                local dt stored_key rest v
+                while read -r dt stored_key rest; do
+                    v=$(history_field_value "$rest" days_left 2>/dev/null || true)
+                    [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
                     dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
                     [[ -z "$dev" || -z "$v" ]] && continue
                     if [[ -z "${dl_first_dt[$dev]:-}" || "$dt" < "${dl_first_dt[$dev]}" ]]; then dl_first_dt[$dev]="$dt"; dl_first_v[$dev]="$v"; fi
-                    if [[ -z "${dl_last_dt[$dev]:-}" || "$dt" > "${dl_last_dt[$dev]}" ]]; then dl_last_dt[$dev]="$dt"; dl_last_v[$dev]="$v"; fi
+                    if [[ -z "${dl_last_dt[$dev]:-}" || "$dt" > "${dl_last_dt[$dev]}" || "$dt" == "${dl_last_dt[$dev]}" ]]; then dl_last_dt[$dev]="$dt"; dl_last_v[$dev]="$v"; fi
                     dl_seq[$dev]+="${dt}:${v} "
-                done < "$tmp_dl"
-                rm -f "$tmp_dl"
-                fi
+                done < <(stream_trend_history_window "$dl_cache" "$cutoff_end")
                 local dl_rank=()
                 for dev in "${!dl_last_v[@]}"; do
                     # Restrict to SSD/NVMe (ROTA=0 or nvme path)
@@ -6960,37 +7244,14 @@ build_trend_section() {
                         local shrink
                         shrink=$(awk -v s="$start" -v e="$end" 'BEGIN{printf "%.3f", e-s}')
                         awk -v sh="$shrink" 'BEGIN{exit (sh<0)?0:1}' || continue
-                        # Build daily deltas for acceleration check
-                        local entries=() seq_sorted last_dt="" last_v="" prev_v="" prev_dt=""
-                        read -r -a entries <<< "${dl_seq[$dev]}"
-                        seq_sorted=$(printf "%s\n" "${entries[@]}" | awk -F: '{print $1,$2}' | sort -k1,1)
-                        local daily_deltas=() dt_cur v_cur
-                        while read -r dt_cur v_cur; do
-                            if [[ -n "$prev_dt" && "$prev_v" =~ ^[0-9]+(\.[0-9]+)?$ && "$v_cur" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-                                local dlt
-                                dlt=$(awk -v p="$prev_v" -v c="$v_cur" 'BEGIN{printf "%.3f", c-p}')
-                                daily_deltas+=("$dlt")
-                            fi
-                            prev_dt="$dt_cur"; prev_v="$v_cur"; last_dt="$dt_cur"; last_v="$v_cur"
-                        done < <(printf "%s\n" "$seq_sorted")
                         local accel_flag=""
-                        if (( ${#daily_deltas[@]} > 1 )); then
-                            local last_delta=${daily_deltas[-1]} sum=0 cnt=0 d
-                            for d in "${daily_deltas[@]:0:${#daily_deltas[@]}-1}"; do
-                                if awk -v x="$d" 'BEGIN{exit (x<0)?0:1}'; then
-                                    sum=$(awk -v s="$sum" -v x="$d" 'BEGIN{printf "%.3f", s + x}')
-                                    ((++cnt))
-                                fi
-                            done
-                            if (( cnt > 0 )) && awk -v ld="$last_delta" -v mn="$accel_min" 'BEGIN{exit (ld<=-mn)?0:1}'; then
-                                local avg
-                                avg=$(awk -v s="$sum" -v c="$cnt" 'BEGIN{printf "%.3f", s/c}')
-                                if awk -v ld="$last_delta" -v avg="$avg" -v pct="$accel_factor" 'BEGIN{exit (avg!=0 && ( (ld/avg) <= ( -1 - pct/100 ) ))?0:1}'; then
-                                    accel_flag="ACCEL"
-                                fi
-                            fi
+                        if evaluate_depletion_acceleration \
+                            "${dl_seq[$dev]}" "$accel_factor" "$accel_min"
+                        then
+                            accel_flag="ACCEL"
                         fi
                         # Rate per day
+                        local last_dt="${dl_last_dt[$dev]}"
                         local days_interval=$(( ( $(date -d "$last_dt" +%s 2>/dev/null || date +%s) - $(date -d "${dl_first_dt[$dev]}" +%s 2>/dev/null || date +%s) ) / 86400 ))
                         (( days_interval<=0 )) && days_interval=1
                         local rate
@@ -7012,238 +7273,165 @@ build_trend_section() {
                         DL_SHRINK_LINE="${_s%'; '}"
                     }
                 fi
-            fi
         fi
     fi
+    return 0
+}
+
+analyze_error_rate_trends() {
+    local dk mk key dev mount dt rest
+
     # Btrfs/XFS error rate acceleration summary (top-N)
     CURRENT_TREND_BLOCK="fs-error-accel"
     if (( ERROR_RATE_TREND_ENABLED == 1 )); then
         local win_err=${ERROR_RATE_TREND_WINDOW_DAYS:-7} cutoff_err accel_factor_err=${ERROR_RATE_ACCEL_FACTOR_PCT:-100} accel_min_err=${ERROR_RATE_ACCEL_MIN_DELTA:-2} top_err=${ERROR_RATE_TREND_TOP_N:-5}
         local decay_days=7  # Error aging decay constant for acceleration weighting (e^{-age/decay_days})
-        local now_epoch_err; now_epoch_err=$(date +%s)
+        local now_epoch_err=${RUN_EPOCH:-0}
+        (( now_epoch_err > 0 )) || now_epoch_err=$(date +%s)
         cutoff_err=$(date -d "-${win_err} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
+
         # Btrfs device/mount sequences
-        local btrfs_lines
-        [[ -f "$BTRFS_DEV_HIST_FILE" ]] && btrfs_lines=$(tail -n 50000 "$BTRFS_DEV_HIST_FILE" 2>/dev/null || true) || btrfs_lines=""
         declare -A BSEQ MSEQ
-        if [[ -n "$btrfs_lines" ]]; then
+        if prepare_trend_history_cache btrfs-errors "$BTRFS_DEV_HIST_FILE" 50000; then
+            local btrfs_cache="$TREND_CACHE_RESULT"
             while read -r dt rest; do
-                [[ -z "$dt" || "$dt" < "$cutoff_err" ]] && continue
-                local key mount delta rate_metric event dev stored_key
-                key=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^key=/){sub(/key=/,"",$i); print $i; break}}}')
-                mount=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^mount=/){sub(/mount=/,"",$i); print $i; break}}}')
-                delta=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^delta=/){sub(/delta=/,"",$i); print $i; break}}}')
-                rate_metric=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^rate_day=/){sub(/rate_day=/,"",$i); print $i; break}}}')
-                event=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^event=/){sub(/event=/,"",$i); print $i; break}}}')
-                stored_key=$(echo "$rest" | awk '{print $1}')
-                dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
-                [[ -z "$dev" || -z "$key" ]] && continue
-                if [[ "$event" == "reset" ]]; then
+                parse_btrfs_trend_row "$rest" || continue
+                dev=$(runtime_device_path "$TREND_ROW_DEVICE_KEY" 2>/dev/null || true)
+                key="$TREND_ROW_KEY"
+                mount="$TREND_ROW_MOUNT"
+                [[ -n "$dev" ]] || continue
+                if [[ "$TREND_ROW_EVENT" == "reset" ]]; then
                     unset "BSEQ[$dev|$key]"
                     [[ -n "$mount" ]] && unset "MSEQ[$mount|$key]"
                     continue
                 fi
-                [[ -z "$dev" || -z "$delta" || -z "$key" || -z "$rate_metric" ]] && continue
-                [[ "$delta" =~ ^[0-9]+$ && "$rate_metric" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
-                BSEQ["$dev|$key"]+="${dt}:${rate_metric} "
-                [[ -n "$mount" ]] && MSEQ["$mount|$key"]+="${dt}:${rate_metric} "
-            done < <(printf "%s\n" "$btrfs_lines")
+                [[ "$TREND_ROW_DELTA" =~ ^[0-9]+$ ]] || continue
+                [[ "$TREND_ROW_RATE_DAY" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
+                BSEQ["$dev|$key"]+="${dt}:${TREND_ROW_RATE_DAY} "
+                [[ -n "$mount" ]] && MSEQ["$mount|$key"]+="${dt}:${TREND_ROW_RATE_DAY} "
+            done < <(stream_trend_history_window "$btrfs_cache" "$cutoff_err")
         fi
+
         local b_rank=() m_rank=()
         for dk in "${!BSEQ[@]}"; do
-            local seq=() ; read -r -a seq <<< "${BSEQ[$dk]}"; (( ${#seq[@]} < 2 )) && continue
-            local sorted_seq prev_dt="" last_delta="" deltas=() deltas_dates=()
-            sorted_seq=$(printf "%s\n" "${seq[@]}" | awk -F: '{print $1,$2}' | sort -k1,1)
-            while read -r dt d; do
-                [[ -z "$dt" || -z "$d" ]] && continue
-                if [[ -n "$prev_dt" ]]; then deltas+=("$d"); deltas_dates+=("$dt"); fi
-                prev_dt="$dt"; last_delta="$d"
-            done < <(printf "%s\n" "$sorted_seq")
-            (( ${#deltas[@]} < 2 )) && continue
-            # Weighted aging average excluding latest delta (use exp(-age/decay_days))
-            local w_sum=0 w_tot=0 idx
-            for idx in $(seq 0 $(( ${#deltas[@]} - 2 ))); do
-                local dd=${deltas[$idx]} d_dt=${deltas_dates[$idx]}
-                [[ "$dd" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
-                local d_epoch; d_epoch=$(date -d "$d_dt" +%s 2>/dev/null || echo "$now_epoch_err")
-                local age_days; age_days=$(( (now_epoch_err - d_epoch)/86400 ))
-                (( age_days < 0 )) && age_days=0
-                local weight; weight=$(awk -v a="$age_days" -v dec="$decay_days" 'BEGIN{ if(dec<=0) dec=7; printf "%.6f", exp(-a/dec) }')
-                w_sum=$(awk -v ws="$w_sum" -v dd="$dd" -v w="$weight" 'BEGIN{ printf "%.6f", ws + dd*w }')
-                w_tot=$(awk -v wt="$w_tot" -v w="$weight" 'BEGIN{ printf "%.6f", wt + w }')
-            done
-            local avg; avg=$(awk -v s="$w_sum" -v t="$w_tot" 'BEGIN{ if(t>0) printf "%.3f", s/t; else print 0 }')
-            local dev=${dk%%|*} key=${dk##*|} f_key="$accel_factor_err" m_key="$accel_min_err"
-            case "$key" in
-                corruption_errs)
-                    f_key=${ERROR_RATE_ACCEL_FACTOR_CORRUPTION:-$accel_factor_err}; m_key=${ERROR_RATE_ACCEL_MIN_DELTA_CORRUPTION:-$accel_min_err} ;;
-                generation_errs)
-                    f_key=${ERROR_RATE_ACCEL_FACTOR_GENERATION:-$accel_factor_err}; m_key=${ERROR_RATE_ACCEL_MIN_DELTA_GENERATION:-$accel_min_err} ;;
-            esac
-            if awk -v l="$last_delta" -v a="$avg" -v f="$f_key" -v m="$m_key" 'BEGIN{exit (l>=m && a>0 && l>=a*(1+f/100))?0:1}'; then
-                local ratio
-                ratio=$(awk -v l="$last_delta" -v a="$avg" 'BEGIN{if(a>0)printf "%.2f", l/a; else print 0}')
-                b_rank+=("$last_delta $dev $key $last_delta $avg $ratio")
+            dev=${dk%%|*}
+            key=${dk##*|}
+            set_error_acceleration_thresholds "$key" "$accel_factor_err" "$accel_min_err"
+            if evaluate_weighted_acceleration "${BSEQ[$dk]}" \
+                "$TREND_ACCEL_FACTOR" "$TREND_ACCEL_MINIMUM" "$now_epoch_err" "$decay_days"
+            then
+                b_rank+=("$TREND_ACCEL_LAST $dev $key $TREND_ACCEL_RATIO")
             fi
         done
         for mk in "${!MSEQ[@]}"; do
-            local seq=() ; read -r -a seq <<< "${MSEQ[$mk]}"; (( ${#seq[@]} < 2 )) && continue
-            local sorted_seq prev_dt="" last_delta="" deltas=() deltas_dates=()
-            sorted_seq=$(printf "%s\n" "${seq[@]}" | awk -F: '{print $1,$2}' | sort -k1,1)
-            while read -r dt d; do
-                [[ -z "$dt" || -z "$d" ]] && continue
-                if [[ -n "$prev_dt" ]]; then deltas+=("$d"); deltas_dates+=("$dt"); fi
-                prev_dt="$dt"; last_delta="$d"
-            done < <(printf "%s\n" "$sorted_seq")
-            (( ${#deltas[@]} < 2 )) && continue
-            local w_sum=0 w_tot=0 idx
-            for idx in $(seq 0 $(( ${#deltas[@]} - 2 ))); do
-                local dd=${deltas[$idx]} d_dt=${deltas_dates[$idx]}
-                [[ "$dd" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
-                local d_epoch; d_epoch=$(date -d "$d_dt" +%s 2>/dev/null || echo "$now_epoch_err")
-                local age_days; age_days=$(( (now_epoch_err - d_epoch)/86400 ))
-                (( age_days < 0 )) && age_days=0
-                local weight; weight=$(awk -v a="$age_days" -v dec="$decay_days" 'BEGIN{ if(dec<=0) dec=7; printf "%.6f", exp(-a/dec) }')
-                w_sum=$(awk -v ws="$w_sum" -v dd="$dd" -v w="$weight" 'BEGIN{ printf "%.6f", ws + dd*w }')
-                w_tot=$(awk -v wt="$w_tot" -v w="$weight" 'BEGIN{ printf "%.6f", wt + w }')
-            done
-            local avg; avg=$(awk -v s="$w_sum" -v t="$w_tot" 'BEGIN{ if(t>0) printf "%.3f", s/t; else print 0 }')
-            local mount=${mk%%|*} key=${mk##*|} f_key="$accel_factor_err" m_key="$accel_min_err"
-            case "$key" in
-                corruption_errs)
-                    f_key=${ERROR_RATE_ACCEL_FACTOR_CORRUPTION:-$accel_factor_err}; m_key=${ERROR_RATE_ACCEL_MIN_DELTA_CORRUPTION:-$accel_min_err} ;;
-                generation_errs)
-                    f_key=${ERROR_RATE_ACCEL_FACTOR_GENERATION:-$accel_factor_err}; m_key=${ERROR_RATE_ACCEL_MIN_DELTA_GENERATION:-$accel_min_err} ;;
-            esac
-            if awk -v l="$last_delta" -v a="$avg" -v f="$f_key" -v m="$m_key" 'BEGIN{exit (l>=m && a>0 && l>=a*(1+f/100))?0:1}'; then
-                local ratio
-                ratio=$(awk -v l="$last_delta" -v a="$avg" 'BEGIN{if(a>0)printf "%.2f", l/a; else print 0}')
-                m_rank+=("$last_delta $mount $key $last_delta $avg $ratio")
+            mount=${mk%%|*}
+            key=${mk##*|}
+            set_error_acceleration_thresholds "$key" "$accel_factor_err" "$accel_min_err"
+            if evaluate_weighted_acceleration "${MSEQ[$mk]}" \
+                "$TREND_ACCEL_FACTOR" "$TREND_ACCEL_MINIMUM" "$now_epoch_err" "$decay_days"
+            then
+                m_rank+=("$TREND_ACCEL_LAST $mount $key $TREND_ACCEL_RATIO")
             fi
         done
-        local xfs_lines
-        [[ -f "$XFS_PROC_HISTORY_FILE" ]] && xfs_lines=$(tail -n 20000 "$XFS_PROC_HISTORY_FILE" 2>/dev/null || true) || xfs_lines=""
+
         declare -A XSEQ
-        if [[ -n "$xfs_lines" ]]; then
+        if prepare_trend_history_cache xfs-errors "$XFS_PROC_HISTORY_FILE" 20000; then
+            local xfs_cache="$TREND_CACHE_RESULT"
             while read -r dt rest; do
-                [[ -z "$dt" || "$dt" < "$cutoff_err" ]] && continue
-                local key delta rate_metric event
-                key=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^key=/){sub(/key=/,"",$i); print $i; break}}}')
-                delta=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^delta=/){sub(/delta=/,"",$i); print $i; break}}}')
-                rate_metric=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^rate_day=/){sub(/rate_day=/,"",$i); print $i; break}}}')
-                event=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^event=/){sub(/event=/,"",$i); print $i; break}}}')
-                if [[ "$event" == "reset" ]]; then
+                parse_xfs_trend_row "$rest" || continue
+                key="$TREND_ROW_KEY"
+                if [[ "$TREND_ROW_EVENT" == "reset" ]]; then
                     [[ -n "$key" ]] && unset "XSEQ[$key]"
                     continue
                 fi
-                [[ -z "$key" || -z "$delta" || -z "$rate_metric" ]] && continue
-                [[ "$delta" =~ ^[0-9]+$ && "$rate_metric" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
-                XSEQ["$key"]+="${dt}:${rate_metric} "
-            done < <(printf "%s\n" "$xfs_lines")
+                [[ "$TREND_ROW_DELTA" =~ ^[0-9]+$ ]] || continue
+                [[ "$TREND_ROW_RATE_DAY" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
+                XSEQ["$key"]+="${dt}:${TREND_ROW_RATE_DAY} "
+            done < <(stream_trend_history_window "$xfs_cache" "$cutoff_err")
         fi
+
         local x_rank=()
         for key in "${!XSEQ[@]}"; do
-            local seq=() ; read -r -a seq <<< "${XSEQ[$key]}"; (( ${#seq[@]} < 2 )) && continue
-            local sorted_seq prev_dt="" last_delta="" deltas=() deltas_dates=()
-            sorted_seq=$(printf "%s\n" "${seq[@]}" | awk -F: '{print $1,$2}' | sort -k1,1)
-            while read -r dt d; do
-                [[ -z "$dt" || -z "$d" ]] && continue
-                if [[ -n "$prev_dt" ]]; then deltas+=("$d"); deltas_dates+=("$dt"); fi
-                prev_dt="$dt"; last_delta="$d"
-            done < <(printf "%s\n" "$sorted_seq")
-            (( ${#deltas[@]} < 2 )) && continue
-            local w_sum=0 w_tot=0 idx
-            for idx in $(seq 0 $(( ${#deltas[@]} - 2 ))); do
-                local dd=${deltas[$idx]} d_dt=${deltas_dates[$idx]}
-                [[ "$dd" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
-                local d_epoch; d_epoch=$(date -d "$d_dt" +%s 2>/dev/null || echo "$now_epoch_err")
-                local age_days; age_days=$(( (now_epoch_err - d_epoch)/86400 ))
-                (( age_days < 0 )) && age_days=0
-                local weight; weight=$(awk -v a="$age_days" -v dec="$decay_days" 'BEGIN{ if(dec<=0) dec=7; printf "%.6f", exp(-a/dec) }')
-                w_sum=$(awk -v ws="$w_sum" -v dd="$dd" -v w="$weight" 'BEGIN{ printf "%.6f", ws + dd*w }')
-                w_tot=$(awk -v wt="$w_tot" -v w="$weight" 'BEGIN{ printf "%.6f", wt + w }')
-            done
-            local avg; avg=$(awk -v s="$w_sum" -v t="$w_tot" 'BEGIN{ if(t>0) printf "%.3f", s/t; else print 0 }')
-            if awk -v l="$last_delta" -v a="$avg" -v f="$accel_factor_err" -v m="$accel_min_err" 'BEGIN{exit (l>=m && a>0 && l>=a*(1+f/100))?0:1}'; then
-                local ratio
-                ratio=$(awk -v l="$last_delta" -v a="$avg" 'BEGIN{if(a>0)printf "%.2f", l/a; else print 0}')
-                x_rank+=("$last_delta $key $last_delta $avg $ratio")
+            if evaluate_weighted_acceleration "${XSEQ[$key]}" \
+                "$accel_factor_err" "$accel_min_err" "$now_epoch_err" "$decay_days"
+            then
+                x_rank+=("$TREND_ACCEL_LAST $key $TREND_ACCEL_RATIO")
             fi
         done
+
         if (( ${#b_rank[@]} + ${#m_rank[@]} + ${#x_rank[@]} > 0 )); then
             local part_b="" part_m="" part_x=""
             if (( ${#b_rank[@]} > 0 )); then
                 local sorted_b; sorted_b=$(printf "%s\n" "${b_rank[@]}" | sort -nr -k1,1 | head -n "$top_err")
-                while read -r _ dev key _ _ ratio; do
+                while read -r _ dev key ratio; do
                     part_b+="$(basename "$dev"):$key x$ratio, "
                 done < <(printf "%s\n" "$sorted_b")
-                part_b=${part_b%%, }
+                part_b=${part_b%, }
             fi
             if (( ${#m_rank[@]} > 0 )); then
                 local sorted_m; sorted_m=$(printf "%s\n" "${m_rank[@]}" | sort -nr -k1,1 | head -n "$top_err")
-                while read -r _ mount key _ _ ratio; do
+                while read -r _ mount key ratio; do
                     part_m+="${mount}:$key x$ratio, "
                 done < <(printf "%s\n" "$sorted_m")
-                part_m=${part_m%%, }
+                part_m=${part_m%, }
             fi
             if (( ${#x_rank[@]} > 0 )); then
                 local sorted_x; sorted_x=$(printf "%s\n" "${x_rank[@]}" | sort -nr -k1,1 | head -n "$top_err")
-                while read -r _ key _ _ ratio; do
+                while read -r _ key ratio; do
                     part_x+="${key} x$ratio, "
                 done < <(printf "%s\n" "$sorted_x")
-                part_x=${part_x%%, }
+                part_x=${part_x%, }
             fi
             EARLY_ERR_LINE="${part_b:+BtrfsDev: ${part_b}; }${part_m:+BtrfsMnt: ${part_m}; }${part_x:+XFS: ${part_x}}"
             EARLY_ERR_LINE="${EARLY_ERR_LINE%%; }"
         fi
     fi
+    return 0
+}
+
+analyze_btrfs_cumulative_trends() {
+    local d dt rest dev key
+
     # Btrfs cumulative device/mount/key totals
     CURRENT_TREND_BLOCK="btrfs-cumulative"
-    if (( BTRFS_DEV_TREND_ENABLED == 1 )); then
+    if (( BTRFS_DEV_TREND_ENABLED == 1 )) &&
+       prepare_trend_history_cache btrfs-errors "$BTRFS_DEV_HIST_FILE" 50000
+    then
         local win_bt=${BTRFS_TREND_WINDOW_DAYS:-7} cutoff_bt
+        local btrfs_cache="$TREND_CACHE_RESULT"
         cutoff_bt=$(date -d "-${win_bt} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
-        if [[ -f "$BTRFS_DEV_HIST_FILE" ]]; then
-            local lines_bt
-            lines_bt=$(tail -n 50000 "$BTRFS_DEV_HIST_FILE" 2>/dev/null || true)
-            if [[ -n "$lines_bt" ]]; then
-                declare -A SUM_KEY DEV_SUM SUM_MOUNT_KEY MOUNT_SUM KEY_SUM
-                while read -r dt rest; do
-                    [[ -z "$dt" || "$dt" < "$cutoff_bt" ]] && continue
-                    local dev stored_key mount key delta
-                    stored_key=$(echo "$rest" | awk '{print $1}')
-                    dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
-                    key=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^key=/){sub(/key=/,"",$i); print $i; break}}}')
-                    mount=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^mount=/){sub(/mount=/,"",$i); print $i; break}}}')
-                    delta=$(echo "$rest" | awk '{for(i=1;i<=NF;i++){if($i ~ /^delta=/){sub(/delta=/,"",$i); print $i; break}}}')
-                    [[ -z "$dev" || -z "$key" || -z "$delta" ]] && continue
-                    [[ "$delta" =~ ^[0-9]+$ ]] || continue
-                    (( delta == 0 )) && continue
-                    SUM_KEY["$dev|$key"]=$(( ${SUM_KEY["$dev|$key"]:-0} + delta ))
-                    DEV_SUM["$dev"]=$(( ${DEV_SUM["$dev"]:-0} + delta ))
-                    [[ -n "$mount" ]] && {
-                        SUM_MOUNT_KEY["$mount|$key"]=$(( ${SUM_MOUNT_KEY["$mount|$key"]:-0} + delta ))
-                        MOUNT_SUM["$mount"]=$(( ${MOUNT_SUM["$mount"]:-0} + delta ))
-                    }
-                    KEY_SUM["$key"]=$(( ${KEY_SUM["$key"]:-0} + delta ))
-                done < <(printf "%s\n" "$lines_bt")
-                if (( ${#DEV_SUM[@]} > 0 )); then
-                    if (( ${#DEV_SUM[@]} > 0 )); then
-                        local ranked_bt line=""; ranked_bt=$(for d in "${!DEV_SUM[@]}"; do echo "${DEV_SUM[$d]} $d"; done | sort -nr -k1,1 | head -n ${BTRFS_TREND_TOP_N:-5})
-                        while read -r total dev; do
-                            [[ -z "$dev" ]] && continue
-                            line+="$(basename "$dev"):+$total; "
-                        done < <(printf "%s\n" "$ranked_bt")
-                        BTRFS_SUM_LINE="${line%'; '}"
-                    fi
-                fi
-            fi
+        declare -A DEV_SUM
+        while read -r dt rest; do
+            parse_btrfs_trend_row "$rest" || continue
+            [[ "$TREND_ROW_EVENT" != "reset" ]] || continue
+            [[ "$TREND_ROW_DELTA" =~ ^[0-9]+$ ]] || continue
+            (( TREND_ROW_DELTA > 0 )) || continue
+            dev=$(runtime_device_path "$TREND_ROW_DEVICE_KEY" 2>/dev/null || true)
+            key="$TREND_ROW_KEY"
+            [[ -n "$dev" && -n "$key" ]] || continue
+            DEV_SUM["$dev"]=$(( ${DEV_SUM["$dev"]:-0} + TREND_ROW_DELTA ))
+        done < <(stream_trend_history_window "$btrfs_cache" "$cutoff_bt")
+
+        if (( ${#DEV_SUM[@]} > 0 )); then
+            local ranked_bt line=""
+            ranked_bt=$(for d in "${!DEV_SUM[@]}"; do
+                printf '%s %s\n' "${DEV_SUM[$d]}" "$d"
+            done | sort -nr -k1,1 -k2,2 | head -n "${BTRFS_TREND_TOP_N:-5}")
+            while read -r total dev; do
+                [[ -n "$dev" ]] || continue
+                line+="$(basename "$dev"):+$total; "
+            done < <(printf '%s\n' "$ranked_bt")
+            BTRFS_SUM_LINE="${line%'; '}"
         fi
     fi
+    return 0
+}
+
+render_trend_section() {
     # Build compact one-liner Trend output with key metrics
     CURRENT_TREND_BLOCK="trend-one-liners"
     {
-        declare -a _TL=()
-        _add_line() { local tag="$1" text="$2"; [[ -n "$text" ]] && _TL+=("${tag}: ${text}"); }
+        TREND_LINE_ITEMS=()
         # Capacity forecast
         CURRENT_TREND_BLOCK="TL: capacity-forecast"
         if [[ -n "${ARR_GROWTH_STR:-}" || -n "${POOL_GROWTH_STR:-}" || -n "${ARR_DAYS_TO_THRESHOLD:-}" || -n "${POOL_DAYS_TO_THRESHOLD:-}" ]]; then
@@ -7270,28 +7458,28 @@ build_trend_section() {
                     fi
                 fi
             fi
-            _add_line "CF" "${_cf_a}; ${_cf_p}${_cf_suffix}"
+            trend_add_line "CF" "${_cf_a}; ${_cf_p}${_cf_suffix}"
         fi
-        _add_line "TEMP-Q" "${TEMP_FORECAST_CONFIDENCE_LINE:-}"
+        trend_add_line "TEMP-Q" "${TEMP_FORECAST_CONFIDENCE_LINE:-}"
         # Disk growth (top 5)
         CURRENT_TREND_BLOCK="TL: disk-growth"
-        if (( ${DISK_GROWTH_ENABLED:-1} == 1 )) && [[ -f "${DISK_CAP_HISTORY_FILE}" ]]; then
-            local _win_dg _lines_dg _cutoff_dg _tmp_dg
+        if (( ${DISK_GROWTH_ENABLED:-1} == 1 )) &&
+           prepare_trend_history_cache disk-capacity "$DISK_CAP_HISTORY_FILE" 20000
+        then
+            local _win_dg _cutoff_dg
+            local disk_capacity_cache="$TREND_CACHE_RESULT"
             _win_dg=$HISTORY_WINDOW_DAYS
-            _lines_dg=$(tail -n 20000 "$DISK_CAP_HISTORY_FILE" 2>/dev/null || true)
-            if [[ -n "$_lines_dg" ]]; then
-                _cutoff_dg=$(date -d "-${_win_dg} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
-                _tmp_dg=$(mktemp) || { log_warn "mktemp failed; skipping disk growth block"; _tmp_dg=""; }
-                if [[ -n "$_tmp_dg" ]]; then
-                    printf "%s\n" "$_lines_dg" | awk -v c="$_cutoff_dg" '$1>=c{print}' | awk '{d=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="used") used=a[2]; if(a[1]=="size") sz=a[2]} if(used!="" && sz!=""){print $1,d,used,sz}}' > "$_tmp_dg"
+            _cutoff_dg=$(date -d "-${_win_dg} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
                     declare -A _DG_FDT _DG_FU _DG_LDT _DG_LU _DG_SZ
-                    while read -r dt disk used sz; do
+                    local dt disk rest used sz
+                    while read -r dt disk rest; do
+                        used=$(history_field_value "$rest" used 2>/dev/null || true)
+                        sz=$(history_field_value "$rest" size 2>/dev/null || true)
+                        [[ "$used" =~ ^[0-9]+$ && "$sz" =~ ^[0-9]+$ ]] || continue
                         _DG_SZ[$disk]="$sz"
                         if [[ -z "${_DG_FDT[$disk]:-}" || "$dt" < "${_DG_FDT[$disk]}" ]]; then _DG_FDT[$disk]="$dt"; _DG_FU[$disk]="$used"; fi
-                        if [[ -z "${_DG_LDT[$disk]:-}" || "$dt" > "${_DG_LDT[$disk]}" ]]; then _DG_LDT[$disk]="$dt"; _DG_LU[$disk]="$used"; fi
-                    done < "$_tmp_dg"
-                    rm -f "$_tmp_dg"
-                fi
+                        if [[ -z "${_DG_LDT[$disk]:-}" || "$dt" > "${_DG_LDT[$disk]}" || "$dt" == "${_DG_LDT[$disk]}" ]]; then _DG_LDT[$disk]="$dt"; _DG_LU[$disk]="$used"; fi
+                    done < <(stream_trend_history_window "$disk_capacity_cache" "$_cutoff_dg")
                 local _rank=()
                 for disk in "${!_DG_LU[@]}"; do
                     local fu=${_DG_FU[$disk]:-0} lu=${_DG_LU[$disk]:-0} sz=${_DG_SZ[$disk]:-0}
@@ -7303,7 +7491,6 @@ build_trend_section() {
                     fi
                 done
                 # Build growth and shrink lists independently then merge into single line
-                format_rate_dg() { local b="$1"; if (( b >= 1000000000 )); then awk -v v="$b" 'BEGIN{printf "%.1fG", v/1000000000}'; elif (( b >= 1000000 )); then awk -v v="$b" 'BEGIN{printf "%dM", int(v/1000000)}'; else awk -v v="$b" 'BEGIN{printf "%dK", int(v/1000)}'; fi; }
                 local _items_growth=() _items_shrink=()
                 if (( ${#_rank[@]} > 0 )); then
                     local _sorted_g
@@ -7312,7 +7499,7 @@ build_trend_section() {
                         [[ -z "$pd" || -z "$disk" ]] && continue
                         disk=${disk//\"/}
                         local rate pct
-                        rate=$(format_rate_dg "$pd")
+                        rate=$(format_bytes_short "$pd")
                         if (( sz>0 )); then pct=$(awk -v pd="$pd" -v sz="$sz" 'BEGIN{printf "%.2f", (pd/sz)*100}'); _items_growth+=("🔺${disk} +${rate} (${pct}%)"); else _items_growth+=("🔺${disk} +${rate}"); fi
                     done < <(printf "%s\n" "$_sorted_g")
                 fi
@@ -7333,35 +7520,33 @@ build_trend_section() {
                         [[ -z "$pd" || -z "$disk" ]] && continue
                         disk=${disk//\"/}
                         local rate pct
-                        rate=$(format_rate_dg "$pd")
+                        rate=$(format_bytes_short "$pd")
                         if (( sz>0 )); then pct=$(awk -v pd="$pd" -v sz="$sz" 'BEGIN{printf "%.2f", (pd/sz)*100}'); _items_shrink+=("🔻${disk} -${rate} (${pct}%)"); else _items_shrink+=("🔻${disk} -${rate}"); fi
                     done < <(printf "%s\n" "$_sorted_s")
                 fi
                 if (( ${#_items_growth[@]} + ${#_items_shrink[@]} > 0 )); then
                     local _combined=("${_items_growth[@]}" "${_items_shrink[@]}")
-                    _add_line "DISK↑" "$(join_by ' | ' "${_combined[@]}")"
+                    trend_add_line "DISK↑" "$(join_by ' | ' "${_combined[@]}")"
                 fi
-            fi
         fi
         # Share growth (top N)
         CURRENT_TREND_BLOCK="TL: share-growth"
-        if (( ${SHARE_BREAKDOWN_ENABLED:-0} == 1 )) && [[ -f "${SHARE_USAGE_HISTORY_FILE}" ]]; then
-            local _win_s _cut_s _lines_s _tmp_s
+        if (( ${SHARE_BREAKDOWN_ENABLED:-0} == 1 )) &&
+           prepare_trend_history_cache share-usage "$SHARE_USAGE_HISTORY_FILE" 50000
+        then
+            local _win_s _cut_s
+            local share_usage_cache="$TREND_CACHE_RESULT"
             _win_s=$HISTORY_WINDOW_DAYS
             _cut_s=$(date -d "-${_win_s} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
-            _lines_s=$(tail -n 50000 "${SHARE_USAGE_HISTORY_FILE}" 2>/dev/null || true)
-            if [[ -n "$_lines_s" ]]; then
-                _tmp_s=$(mktemp) || { log_warn "mktemp failed; skipping share growth block"; _tmp_s=""; }
-                if [[ -n "$_tmp_s" ]]; then
-                    printf "%s\n" "$_lines_s" | awk -v c="$_cut_s" '$1>=c{print}' | awk '{s=$2; for(i=3;i<=NF;i++){split($i,a,"="); if(a[1]=="bytes") b=a[2]} if(s!="" && b!=""){print $1,s,b}}' > "$_tmp_s"
                 # Predeclare arrays to avoid nounset when data is sparse
                 declare -A _SFDT _SFB _SLDT _SLB
-                while read -r dt s b; do
+                local dt s rest b
+                while read -r dt s rest; do
+                    b=$(history_field_value "$rest" bytes 2>/dev/null || true)
+                    [[ "$b" =~ ^[0-9]+$ ]] || continue
                     if [[ -z "${_SFDT[$s]:-}" || "$dt" < "${_SFDT[$s]}" ]]; then _SFDT[$s]="$dt"; _SFB[$s]="$b"; fi
-                    if [[ -z "${_SLDT[$s]:-}" || "$dt" > "${_SLDT[$s]}" ]]; then _SLDT[$s]="$dt"; _SLB[$s]="$b"; fi
-                done < "$_tmp_s"
-                rm -f "$_tmp_s"
-                fi
+                    if [[ -z "${_SLDT[$s]:-}" || "$dt" > "${_SLDT[$s]}" || "$dt" == "${_SLDT[$s]}" ]]; then _SLDT[$s]="$dt"; _SLB[$s]="$b"; fi
+                done < <(stream_trend_history_window "$share_usage_cache" "$_cut_s")
                 local _gr=()
                 for s in "${!_SLB[@]}"; do
                     local fu=${_SFB[$s]:-0} lu=${_SLB[$s]:-0}
@@ -7373,14 +7558,13 @@ build_trend_section() {
                     fi
                 done
                 # Share growth and shrink
-                _share_rate_fmt() { local b="$1"; if (( b >= 1000000000 )); then awk -v v="$b" 'BEGIN{printf "%.1fG", v/1000000000}'; elif (( b >= 1000000 )); then awk -v v="$b" 'BEGIN{printf "%dM", int(v/1000000)}'; else awk -v v="$b" 'BEGIN{printf "%dK", int(v/1000)}'; fi; }
                 local _share_growth_items=() _share_shrink_items=()
                 if (( ${#_gr[@]} > 0 )); then
                     local _sorted_gs
                     _sorted_gs=$(printf "%s\n" "${_gr[@]}" | sort -nr -k1,1 | head -n "${SHARE_TOP_N}")
                     while read -r pd s; do
                         [[ -z "$s" ]] && continue
-                        local rate; rate=$(_share_rate_fmt "$pd")
+                        local rate; rate=$(format_bytes_short "$pd")
                         _share_growth_items+=("🔺${s} +${rate}")
                     done < <(printf "%s\n" "$_sorted_gs")
                 fi
@@ -7399,15 +7583,14 @@ build_trend_section() {
                     _sorted_ss=$(printf "%s\n" "${_shrink_share[@]}" | sort -nr -k1,1 | head -n "${SHARE_TOP_N}")
                     while read -r pd s; do
                         [[ -z "$s" ]] && continue
-                        local rate; rate=$(_share_rate_fmt "$pd")
+                        local rate; rate=$(format_bytes_short "$pd")
                         _share_shrink_items+=("🔻${s} -${rate}")
                     done < <(printf "%s\n" "$_sorted_ss")
                 fi
                 if (( ${#_share_growth_items[@]} + ${#_share_shrink_items[@]} > 0 )); then
                     local _combined_share=("${_share_growth_items[@]}" "${_share_shrink_items[@]}")
-                    _add_line "SHARE↑" "$(join_by ' | ' "${_combined_share[@]}")"
+                    trend_add_line "SHARE↑" "$(join_by ' | ' "${_combined_share[@]}")"
                 fi
-            fi
         fi
         # NVMe/SATA SSD wear rate (TBW-derived percent/day)
         CURRENT_TREND_BLOCK="TL: wear-rate"
@@ -7437,7 +7620,7 @@ build_trend_section() {
                     if awk -v r="$rate_pct_day_raw" -v d="$rate_pct_day_disp" 'BEGIN{exit (r>0 && d==0)?0:1}'; then
                         rate_pct_day_disp="~0.0001"
                     fi
-                    local used_pct days_left label_dev
+                    local used_pct label_dev
                     used_pct=${CUR_ATTR["$dev|nvme_percent_used"]:-}
                     label_dev=$(basename "$dev")
                     if [[ -n "$used_pct" && "$used_pct" =~ ^[0-9]+$ ]] && awk -v r="$rate_pct_day_raw" 'BEGIN{exit (r>0)?0:1}'; then
@@ -7450,7 +7633,7 @@ build_trend_section() {
                 fi
             done
             if (( ${#wear_items[@]} > 0 )); then
-                _add_line "WEAR" "$(join_by ' | ' "${wear_items[@]}")"
+                trend_add_line "WEAR" "$(join_by ' | ' "${wear_items[@]}")"
             fi
         fi
         # Maintenance: long SMART tests due soon
@@ -7458,18 +7641,18 @@ build_trend_section() {
         if declare -p LONG_TEST_DUE_SOON &>/dev/null; then
             local _near=() _k _d
             for _k in "${!LONG_TEST_DUE_SOON[@]}"; do _d=${LONG_TEST_DUE_SOON[$_k]}; _near+=("$(basename "$_k")(${_d}d)"); done
-            if (( ${#_near[@]} > 0 )); then _add_line "MTN" "${_near[*]}"; fi
+            if (( ${#_near[@]} > 0 )); then trend_add_line "MTN" "${_near[*]}"; fi
         fi
         # TBW trend (forecast days-left) and heavy writers compact
         CURRENT_TREND_BLOCK="TL: tbw-trend"
         if (( ${TBW_TREND_ENABLED:-0} == 1 )) && declare -p TBW_DAYS_LEFT &>/dev/null; then
-            local _tbw="" _writers=""
+            local _tbw=""
             for dev in "${!TBW_DAYS_LEFT[@]}"; do
                 local dl=${TBW_DAYS_LEFT[$dev]} daily=${TBW_DAILY[$dev]:-0}
                 local rate; rate=$(format_bytes_short "$daily")
                 _tbw+="🔺$(basename "$dev") ${rate} → ${dl}d [${TBW_FORECAST_CONFIDENCE[$dev]:-INSUFFICIENT}] | "
             done
-            _tbw=${_tbw%" | "}; [[ -n "$_tbw" ]] && _add_line "TBW" "$_tbw"
+            _tbw=${_tbw%" | "}; [[ -n "$_tbw" ]] && trend_add_line "TBW" "$_tbw"
             if declare -p TBW_DAILY &>/dev/null; then
                 local _hr=() ; for dev in "${!TBW_DAILY[@]}"; do
                     forecast_confidence_is_actionable \
@@ -7506,7 +7689,7 @@ build_trend_section() {
                         WRITER_TIER[$dev]="$tier"
                         _s+="🔺$(basename "$dev") $(printf '%.3f' "$pct")% cap (${rate}) | "
                     done < <(printf "%s\n" "$_sorted")
-                    _s=${_s%" | "}; _add_line "WRITERS" "$_s"
+                    _s=${_s%" | "}; trend_add_line "WRITERS" "$_s"
                 fi
             fi
         fi
@@ -7533,7 +7716,7 @@ build_trend_section() {
                 local _line=""
                 while read -r ln; do [[ -n "$ln" ]] && _line+="$ln | "; done < <(printf "%s\n" "$_sorted")
                 _line="${_line% | }"
-                [[ -n "$_line" ]] && _add_line "WEAR" "$_line"
+                [[ -n "$_line" ]] && trend_add_line "WEAR" "$_line"
             fi
         fi
         # Lifecycle
@@ -7569,7 +7752,7 @@ build_trend_section() {
                 fi
             fi
             life_line="${rshow}${rshow:+; }${mshow}"
-            [[ -n "$life_line" ]] && _add_line "LIFE" "$life_line"
+            [[ -n "$life_line" ]] && trend_add_line "LIFE" "$life_line"
         }
         # POH growth (aging rate)
         CURRENT_TREND_BLOCK="TL: POH-growth"
@@ -7581,7 +7764,7 @@ build_trend_section() {
                 [[ -z "$_ppart" ]] && continue
                 if [[ "$_ppart" =~ -[0-9] ]]; then _poh_items+=("$_ppart"); else _poh_items+=("🔺$_ppart"); fi
             done
-            [[ ${#_poh_items[@]} -gt 0 ]] && _add_line "POH↑" "$(join_by ' | ' "${_poh_items[@]}")"
+            [[ ${#_poh_items[@]} -gt 0 ]] && trend_add_line "POH↑" "$(join_by ' | ' "${_poh_items[@]}")"
         fi
         # POH Age : show top-N highest POH with class
         CURRENT_TREND_BLOCK="TL: POH-age"
@@ -7610,7 +7793,7 @@ build_trend_section() {
                     fi
                 done < <(printf "%s\n" "$_sorted")
                 _line="${_line%'; '}"
-                [[ -n "$_line" ]] && _add_line "AGE↑" "$_line"
+                [[ -n "$_line" ]] && trend_add_line "AGE↑" "$_line"
             fi
         fi
         # Smart growth and early warnings compact summaries
@@ -7623,7 +7806,7 @@ build_trend_section() {
                 [[ -z "$_part" ]] && continue
                 if [[ "$_part" =~ -[0-9] ]]; then _items+=("$_part"); else _items+=("🔺$_part"); fi
             done
-            [[ ${#_items[@]} -gt 0 ]] && _add_line "SMART↑" "$(join_by ' | ' "${_items[@]}")"
+            [[ ${#_items[@]} -gt 0 ]] && trend_add_line "SMART↑" "$(join_by ' | ' "${_items[@]}")"
         fi
         CURRENT_TREND_BLOCK="TL: DL-shrink"
         if [[ -n "${DL_SHRINK_LINE:-}" ]]; then
@@ -7634,7 +7817,7 @@ build_trend_section() {
                 [[ -z "$_dpart" ]] && continue
                 if [[ "$_dpart" =~ -[0-9] ]]; then _dl_items+=("$_dpart"); else _dl_items+=("🔺$_dpart"); fi
             done
-            [[ ${#_dl_items[@]} -gt 0 ]] && _add_line "DL🔻" "$(join_by ' | ' "${_dl_items[@]}")"
+            [[ ${#_dl_items[@]} -gt 0 ]] && trend_add_line "DL🔻" "$(join_by ' | ' "${_dl_items[@]}")"
         fi
         CURRENT_TREND_BLOCK="TL: early-err"
         if [[ -n "${EARLY_ERR_LINE:-}" ]]; then
@@ -7645,7 +7828,7 @@ build_trend_section() {
                 [[ -z "$_epart" ]] && continue
                 if [[ "$_epart" =~ -[0-9] ]]; then _err_items+=("$_epart"); else _err_items+=("🔺$_epart"); fi
             done
-            [[ ${#_err_items[@]} -gt 0 ]] && _add_line "ERR↑" "$(join_by ' | ' "${_err_items[@]}")"
+            [[ ${#_err_items[@]} -gt 0 ]] && trend_add_line "ERR↑" "$(join_by ' | ' "${_err_items[@]}")"
         fi
         CURRENT_TREND_BLOCK="TL: btrfs-sum"
         if [[ -n "${BTRFS_SUM_LINE:-}" ]]; then
@@ -7656,29 +7839,29 @@ build_trend_section() {
                 [[ -z "$_bpart" ]] && continue
                 _b_items+=("🔺$_bpart")
             done
-            [[ ${#_b_items[@]} -gt 0 ]] && _add_line "BTRFSΣ" "$(join_by ' | ' "${_b_items[@]}")"
+            [[ ${#_b_items[@]} -gt 0 ]] && trend_add_line "BTRFSΣ" "$(join_by ' | ' "${_b_items[@]}")"
         fi
         # SATA link instability (events + streak), also raises alerts here
         CURRENT_TREND_BLOCK="TL: sata-link"
-        if (( ${SATA_LINK_INSTABILITY_ENABLED:-0} == 1 )) && [[ -f "${SATA_LINK_HISTORY_FILE}" ]]; then
+        if (( ${SATA_LINK_INSTABILITY_ENABLED:-0} == 1 )) &&
+           prepare_trend_history_cache sata-links "$SATA_LINK_HISTORY_FILE" 20000
+        then
             local _win_sat=${SATA_LINK_INSTABILITY_WINDOW_DAYS:-14}
             local _cut_sat
+            local sata_link_cache="$TREND_CACHE_RESULT"
             _cut_sat=$(date -d "-${_win_sat} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
-            local _lines_sat
-            _lines_sat=$(tail -n 20000 "${SATA_LINK_HISTORY_FILE}" 2>/dev/null || true)
-            if [[ -n "$_lines_sat" ]]; then
                 declare -A _DEV_DATES _DEV_LAST_MAX _DEV_LAST_CURR
                 local stored_key
                 while read -r dt stored_key rest; do
                     dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
-                    [[ -z "$dt" || -z "$dev" || "$dt" < "$_cut_sat" ]] && continue
+                    [[ -n "$dev" ]] || continue
                     _DEV_DATES["$dev"]+="$dt "
                     local mx cur
-                    mx=$(echo "$rest" | awk -F'[ =]' '{for(i=1;i<=NF;i++){if($i ~ /^max=/){print $(i+1); break}}}')
-                    cur=$(echo "$rest" | awk -F'[ =]' '{for(i=1;i<=NF;i++){if($i ~ /^current=/){print $(i+1); break}}}')
+                    mx=$(history_field_value "$rest" max 2>/dev/null || true)
+                    cur=$(history_field_value "$rest" current 2>/dev/null || true)
                     [[ -n "$mx" ]] && _DEV_LAST_MAX["$dev"]="$mx"
                     [[ -n "$cur" ]] && _DEV_LAST_CURR["$dev"]="$cur"
-                done < <(printf "%s\n" "$_lines_sat")
+                done < <(stream_trend_history_window "$sata_link_cache" "$_cut_sat")
                 local _items=()
                 for dev in "${!_DEV_DATES[@]}"; do
                     local -a dates=()
@@ -7711,19 +7894,43 @@ build_trend_section() {
                         _s+="$(basename "$dev") ev=${count} st=${streak} ${mx}->${cur}${sev:+ ($sev)}; "
                         (( ++_cnt >= _limit )) && break
                     done < <(printf "%s\n" "$_sorted")
-                    _s="${_s%'; '}"; _s="${_s//; / | }"; _add_line "SATA" "$_s"
+                    _s="${_s%'; '}"; _s="${_s//; / | }"; trend_add_line "SATA" "$_s"
                 fi
-            fi
         fi
-        if (( ${#_TL[@]} > 0 )); then
-            TREND_SECTION="Trend Analysis:\n$(printf "%s\n" "${_TL[@]}")"
+        if (( ${#TREND_LINE_ITEMS[@]} > 0 )); then
+            TREND_SECTION="Trend Analysis:\n$(printf "%s\n" "${TREND_LINE_ITEMS[@]}")"
             TREND_SECTION="$(printf "%s\n" "$TREND_SECTION" | trim_outer_blank_lines)"
         else
             TREND_SECTION=""
         fi
     }
-    # Clear local trap before returning
+    return 0
+}
+
+# shellcheck disable=SC2329  # Invoked by the main monitoring pipeline.
+build_trend_section() {
+    trap 'log_crit "Trend analysis failed in block: ${CURRENT_TREND_BLOCK:-unknown}"' ERR
+
+    CURRENT_TREND_BLOCK="initialization"
+    TEMP_FORECAST_CONFIDENCE_LINE=""
+    DL_SHRINK_LINE=""
+    EARLY_ERR_LINE=""
+    BTRFS_SUM_LINE=""
+    SMART_GROWTH_LINE=""
+    POH_GROWTH_LINE=""
+    TREND_SECTION=""
+    TREND_LINE_ITEMS=()
+    TREND_HISTORY_CACHE=()
+
+    run_trend_stage "temperature" analyze_temperature_trends
+    run_trend_stage "SMART attributes" analyze_smart_attribute_trends
+    run_trend_stage "endurance" analyze_endurance_trends
+    run_trend_stage "filesystem error rates" analyze_error_rate_trends
+    run_trend_stage "Btrfs cumulative errors" analyze_btrfs_cumulative_trends
+    run_trend_stage "rendering" render_trend_section
+
     trap - ERR
+    return 0
 }
 
 # === Helper Function ===
@@ -9769,7 +9976,7 @@ run_diagnostics() {
         case "$state_status" in
             10)
                 diagnostic_result INFO "State schema" \
-                    "uninitialized; v2.12 will register existing state on the first monitoring run"
+                    "uninitialized; v${SCRIPT_VERSION} will register existing state on the first monitoring run"
                 ;;
             *)
                 failures=$((failures + 1))
@@ -9883,7 +10090,7 @@ run_regression_tests() (
     fi
 
     if declare -F load_builtin_defaults >/dev/null 2>&1 &&
-       [[ "$SCRIPT_VERSION" == "2.12" &&
+       [[ "$SCRIPT_VERSION" == "2.13" &&
           "$STATE_SCHEMA_VERSION" == "1" &&
           "$HISTORY_SCHEMA_VERSION" == "3" &&
           "$DEVICE_ID_SCHEMA_VERSION" == "2" &&
@@ -9920,8 +10127,8 @@ run_regression_tests() (
     local schema_dir="$fixture_dir/schema" current_manifest future_manifest malformed_manifest
     mkdir -p "$schema_dir"
     current_manifest="$schema_dir/current.manifest"
-    printf 'format=%s\nstate_schema=1\nhistory_schema=3\nidentity_schema=2\nwriter_version=2.12\nupdated_epoch=1\n' \
-        "$STATE_SCHEMA_FORMAT" > "$current_manifest"
+    printf 'format=%s\nstate_schema=1\nhistory_schema=3\nidentity_schema=2\nwriter_version=%s\nupdated_epoch=1\n' \
+        "$STATE_SCHEMA_FORMAT" "$SCRIPT_VERSION" > "$current_manifest"
     if inspect_state_schema_manifest "$current_manifest" &&
        [[ "$STATE_SCHEMA_STATUS" == "CURRENT" &&
           "$(state_manifest_value "$current_manifest" identity_schema)" == "2" ]]
@@ -10031,6 +10238,187 @@ run_regression_tests() (
         self_test_result 1 "Forecast actionability gate"
     else
         self_test_result 0 "Forecast actionability gate"
+    fi
+
+    local trend_history="$fixture_dir/trend-history.log"
+    printf '%s\n' \
+        'corrupted row' \
+        '2026-08-18 disk_a value=8' \
+        '2026-08-14 disk_a value=1' \
+        '2026-08-16 disk_a value=2' \
+        'not-a-date disk_a value=9' > "$trend_history"
+    actual=$(stream_trend_history_window "$trend_history" 2026-08-15 |
+        awk '{printf "%s%s", separator, $0; separator="|"}')
+    TREND_LINE_ITEMS=()
+    if [[ "$actual" == \
+          '2026-08-16 disk_a value=2|2026-08-18 disk_a value=8' ]] &&
+       trend_add_line EMPTY "" && (( ${#TREND_LINE_ITEMS[@]} == 0 ))
+    then
+        self_test_result 1 "Normalized bounded trend-history streaming"
+    else
+        self_test_result 0 "Normalized bounded trend-history streaming" "found '$actual'"
+    fi
+
+    parse_btrfs_trend_row \
+        'disk_wwn mount=/mnt/cache key=write_io_errs delta=4 rate_day=2.5 event=growth'
+    actual="$TREND_ROW_DEVICE_KEY|$TREND_ROW_MOUNT|$TREND_ROW_KEY|$TREND_ROW_DELTA|$TREND_ROW_RATE_DAY|$TREND_ROW_EVENT"
+    parse_btrfs_trend_row \
+        'disk_wwn mount=/mnt/cache key=write_io_errs event=reset'
+    if [[ "$actual" == \
+          'disk_wwn|/mnt/cache|write_io_errs|4|2.5|growth' &&
+          -z "$TREND_ROW_DELTA" && -z "$TREND_ROW_RATE_DAY" &&
+          "$TREND_ROW_EVENT" == "reset" ]]
+    then
+        self_test_result 1 "Btrfs trend-row decoding and reset isolation"
+    else
+        self_test_result 0 "Btrfs trend-row decoding and reset isolation" "found '$actual'"
+    fi
+
+    parse_xfs_trend_row 'key=extent_alloc delta=7 rate_day=3.5 event=growth'
+    actual="$TREND_ROW_KEY|$TREND_ROW_DELTA|$TREND_ROW_RATE_DAY|$TREND_ROW_EVENT"
+    parse_xfs_trend_row 'key=extent_alloc event=reset corrupted'
+    if [[ "$actual" == 'extent_alloc|7|3.5|growth' &&
+          -z "$TREND_ROW_DELTA" && -z "$TREND_ROW_RATE_DAY" &&
+          "$TREND_ROW_EVENT" == "reset" ]]
+    then
+        self_test_result 1 "XFS trend-row decoding and corrupted-field isolation"
+    else
+        self_test_result 0 "XFS trend-row decoding and corrupted-field isolation" "found '$actual'"
+    fi
+
+    local trend_now
+    trend_now=$(date -d '2026-08-20 00:00:00' +%s)
+    if evaluate_weighted_acceleration \
+           '2026-08-20:6 2026-08-15:1 2026-08-17:2 2026-08-17:2 malformed' \
+           100 2 "$trend_now" 7 &&
+       [[ "$TREND_ACCEL_SAMPLES" == "3" && "$TREND_ACCEL_RATIO" == "3.00" ]]
+    then
+        self_test_result 1 "Weighted acceleration with sparse and duplicate dates"
+    else
+        self_test_result 0 "Weighted acceleration with sparse and duplicate dates" \
+            "samples=$TREND_ACCEL_SAMPLES ratio=$TREND_ACCEL_RATIO"
+    fi
+
+    if ! evaluate_weighted_acceleration \
+           '2026-08-15:1 2026-08-17:2 2026-08-20:3' \
+           100 2 "$trend_now" 7 &&
+       [[ "$TREND_ACCEL_SAMPLES" == "3" && "$TREND_ACCEL_RATIO" == "1.50" ]] &&
+       ! evaluate_weighted_acceleration \
+           '2026-08-15:1 corrupted 2026-08-17:not-numeric 2026-08-20:2' \
+           100 2 "$trend_now" 7 &&
+       [[ "$TREND_ACCEL_SAMPLES" == "2" ]]
+    then
+        self_test_result 1 "Stable and corrupted acceleration-series rejection"
+    else
+        self_test_result 0 "Stable and corrupted acceleration-series rejection" \
+            "samples=$TREND_ACCEL_SAMPLES ratio=$TREND_ACCEL_RATIO"
+    fi
+
+    if evaluate_depletion_acceleration \
+           '2026-08-20:84 2026-08-15:100 2026-08-17:96 2026-08-17:96 corrupted' \
+           50 0.5 &&
+       [[ "$TREND_DEPLETION_SAMPLES" == "3" &&
+          "$TREND_DEPLETION_LAST_RATE" == "4.000000" &&
+          "$TREND_DEPLETION_AVERAGE_RATE" == "2.000000" &&
+          "$TREND_DEPLETION_RATIO" == "2.00" ]]
+    then
+        self_test_result 1 "Calendar-normalized days-left acceleration"
+    else
+        self_test_result 0 "Calendar-normalized days-left acceleration" \
+            "samples=$TREND_DEPLETION_SAMPLES latest=$TREND_DEPLETION_LAST_RATE average=$TREND_DEPLETION_AVERAGE_RATE ratio=$TREND_DEPLETION_RATIO"
+    fi
+
+    local btrfs_trend_history="$fixture_dir/btrfs-trend-history.log"
+    local trend_date_first trend_date_middle trend_date_last
+    trend_date_first=$(date -d '-5 days' '+%Y-%m-%d')
+    trend_date_middle=$(date -d '-3 days' '+%Y-%m-%d')
+    trend_date_last=$(date '+%Y-%m-%d')
+    printf '%s\n' \
+        "$trend_date_last disk_wwn mount=/mnt/cache key=write_io_errs delta=6 rate_day=6 event=growth" \
+        "$trend_date_first disk_wwn mount=/mnt/cache key=write_io_errs delta=1 rate_day=1 event=growth" \
+        "$trend_date_middle disk_wwn mount=/mnt/cache key=write_io_errs delta=2 rate_day=2 event=growth" \
+        'corrupted Btrfs trend row' > "$btrfs_trend_history"
+    DEVICE_ID_BY_PATH=()
+    DEVICE_PATH_BY_ID=()
+    DEVICE_ID_BY_PATH[/dev/sdz]="disk_wwn"
+    DEVICE_PATH_BY_ID[disk_wwn]="/dev/sdz"
+    BTRFS_DEV_HIST_FILE="$btrfs_trend_history"
+    XFS_PROC_HISTORY_FILE="$fixture_dir/missing-xfs-trend-history.log"
+    ERROR_RATE_TREND_ENABLED=1
+    BTRFS_DEV_TREND_ENABLED=1
+    ERROR_RATE_TREND_WINDOW_DAYS=7
+    BTRFS_TREND_WINDOW_DAYS=7
+    RUN_EPOCH=$(date +%s)
+    RUN_DIR="$fixture_dir/trend-analysis-run"
+    mkdir -p "$RUN_DIR"
+    TREND_HISTORY_CACHE=()
+    EARLY_ERR_LINE=""
+    BTRFS_SUM_LINE=""
+    analyze_error_rate_trends
+    analyze_btrfs_cumulative_trends
+    if [[ "$EARLY_ERR_LINE" == *'BtrfsDev: sdz:write_io_errs x3.00'* &&
+          "$EARLY_ERR_LINE" == *'BtrfsMnt: /mnt/cache:write_io_errs x3.00'* &&
+          "$BTRFS_SUM_LINE" == 'sdz:+9' ]]
+    then
+        self_test_result 1 "End-to-end Btrfs acceleration and cumulative trends"
+    else
+        self_test_result 0 "End-to-end Btrfs acceleration and cumulative trends" \
+            "rate='$EARLY_ERR_LINE' cumulative='$BTRFS_SUM_LINE'"
+    fi
+    DEVICE_ID_BY_PATH=()
+    DEVICE_PATH_BY_ID=()
+
+    local days_left_trend_history="$fixture_dir/days-left-trend-history.log"
+    printf '%s\n' \
+        "$trend_date_last nvme_fixture days_left=84" \
+        "$trend_date_first nvme_fixture days_left=100" \
+        "$trend_date_middle nvme_fixture days_left=96" > "$days_left_trend_history"
+    DEVICE_ID_BY_PATH[/dev/nvme9n1]="nvme_fixture"
+    DEVICE_PATH_BY_ID[nvme_fixture]="/dev/nvme9n1"
+    POH_TREND_ENABLED=0
+    TBW_TREND_ENABLED=1
+    ENDURANCE_TREND_WINDOW_DAYS=7
+    TBW_DAYSLEFT_HISTORY_FILE="$days_left_trend_history"
+    RUN_DIR="$fixture_dir/endurance-analysis-run"
+    mkdir -p "$RUN_DIR"
+    TREND_HISTORY_CACHE=()
+    DL_SHRINK_LINE=""
+    analyze_endurance_trends
+    if [[ "$DL_SHRINK_LINE" == \
+          'nvme9n1 -16.000d r=-3.200d/d,ACCEL' ]]
+    then
+        self_test_result 1 "End-to-end days-left acceleration rendering"
+    else
+        self_test_result 0 "End-to-end days-left acceleration rendering" \
+            "found '$DL_SHRINK_LINE'"
+    fi
+    DEVICE_ID_BY_PATH=()
+    DEVICE_PATH_BY_ID=()
+
+    local trend_cache_source="$fixture_dir/trend-cache-source.log"
+    RUN_DIR="$fixture_dir/trend-run"
+    mkdir -p "$RUN_DIR"
+    TREND_HISTORY_CACHE=()
+    printf '2026-08-16 disk_a value=1\n' > "$trend_cache_source"
+    local cached_before cached_after cached_refresh
+    if prepare_trend_history_cache fixture-cache "$trend_cache_source" 100; then
+        cached_before=$(wc -l < "$TREND_CACHE_RESULT")
+    else
+        cached_before=0
+    fi
+    printf '2026-08-17 disk_a value=2\n' >> "$trend_cache_source"
+    prepare_trend_history_cache fixture-cache "$trend_cache_source" 100 || true
+    cached_after=$(wc -l < "$TREND_CACHE_RESULT")
+    TREND_HISTORY_CACHE=()
+    prepare_trend_history_cache fixture-cache "$trend_cache_source" 100 || true
+    cached_refresh=$(wc -l < "$TREND_CACHE_RESULT")
+    if [[ "$cached_before" == "1" && "$cached_after" == "1" &&
+          "$cached_refresh" == "2" ]]
+    then
+        self_test_result 1 "Single-read per-run trend-history cache"
+    else
+        self_test_result 0 "Single-read per-run trend-history cache" \
+            "before=$cached_before cached=$cached_after refresh=$cached_refresh"
     fi
 
     history_file="$fixture_dir/daily.log"
