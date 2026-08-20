@@ -4,7 +4,7 @@ noParity=true
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.14.3"
+readonly SCRIPT_VERSION="2.15"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -15,15 +15,15 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.14.3
+# Disk Health Monitor for Unraid v2.15
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
 #
-# v2.14.3 reconciles the Phase 1-11 refactored lineage with the Phase 12-14
-# production script. The active script already contained the complete earlier
-# lineage, so this release retires the obsolete duplicate without restoring
-# superseded code.
+# v2.15 adds bounded, atomic soak-test evidence for every monitoring run and a
+# read-only readiness report. It observes existing collector, standby, parity,
+# syslog-cursor, and notification behavior without adding disk reads or changing
+# health, scheduling, or delivery decisions.
 ################################################################################
 # ---------------- Configuration ----------------
 # Disks health script settings. Tuned for performance and reliability.
@@ -186,6 +186,19 @@ COMMAND_KILL_GRACE_SECONDS=5                    # Grace period before forcibly k
 COLLECTOR_SLOW_SECONDS=300                      # Log a collector as slow after this duration (0=disable)
 COLLECTOR_FAILURE_NOTIFICATIONS=1               # Add a warning finding when a collector times out/fails
 SHOW_COLLECTOR_STATUS="auto"                    # Collector report policy (auto|always|never)
+
+# === Phase 15 Soak Evidence ===
+SOAK_TELEMETRY_ENABLED=1                       # Persist one bounded observation after each normal monitoring run
+SOAK_MIN_RUNS=14                               # Minimum valid runs required before readiness can be reached
+SOAK_MIN_DAYS=14                               # Minimum elapsed observation span in days
+SOAK_RETENTION_DAYS=90                         # Retain evidence no older than this many days
+SOAK_MAX_RECORDS=500                           # Hard maximum retained observation records
+SOAK_REQUIRE_REBOOT=1                          # Require evidence from at least two boot IDs
+SOAK_REQUIRE_STANDBY=1                         # Require at least one safely deferred standby disk
+SOAK_REQUIRE_SYSLOG_ROTATION=1                 # Require rotation recovery/fallback evidence
+SOAK_REQUIRE_NOTIFICATION_DELIVERY=1           # Require at least one confirmed notification delivery
+SOAK_REQUIRE_NOTIFICATION_SUPPRESSION=1        # Require at least one lifecycle-suppressed notification
+SOAK_REQUIRE_PARITY=0                          # Optionally require a run observed during parity activity
 
 # === Paths / Integration ===
 LOG_DIR="/mnt/user/cloud/logs/disk_health"       # Run logs and persistent state
@@ -452,9 +465,10 @@ SYSLOG_CURSOR_PENDING_LINES=0
 SYSLOG_CURSOR_PENDING_SIZE=0
 SYSLOG_CURSOR_PENDING_ANCHOR="-"
 SYSLOG_CHUNK_FILE=""
+SYSLOG_CURSOR_MODE="not_run"
 RUN_MODE="monitor"
 ROLLBACK_BACKUP_ID=""
-REGRESSION_FIXTURE_COUNT=78
+REGRESSION_FIXTURE_COUNT=84
 CONFIG_ERROR_COUNT=0
 CONFIG_WARNING_COUNT=0
 DEPENDENCY_ERROR_COUNT=0
@@ -477,6 +491,27 @@ NOTIFICATION_RECOVERY_SECTION=""
 NOTIFICATION_JOURNAL_COMMIT_ALLOWED=0
 NOTIFICATION_DELIVERY_ATTEMPTS=0
 NOTIFICATION_DELIVERY_RC=0
+NOTIFICATION_PHASE_REACHED=0
+SOAK_RUN_STARTED=0
+SOAK_ANALYSIS_STATUS="COLLECTING"
+SOAK_ANALYSIS_DETAIL="no observations"
+SOAK_ANALYSIS_VALID_RUNS=0
+SOAK_ANALYSIS_INVALID_RUNS=0
+SOAK_ANALYSIS_CLEAN_RUNS=0
+SOAK_ANALYSIS_ATTENTION_RUNS=0
+SOAK_ANALYSIS_SPAN_DAYS=0
+SOAK_ANALYSIS_BOOT_COUNT=0
+SOAK_ANALYSIS_REBOOT_OBSERVED=0
+SOAK_ANALYSIS_STANDBY_RUNS=0
+SOAK_ANALYSIS_PARITY_RUNS=0
+SOAK_ANALYSIS_SYSLOG_ROTATION_RUNS=0
+SOAK_ANALYSIS_NOTIFICATION_DELIVERED=0
+SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED=0
+SOAK_ANALYSIS_NOTIFICATION_FAILED=0
+SOAK_ANALYSIS_SLOW_COLLECTORS=0
+SOAK_ANALYSIS_MAX_DURATION=0
+SOAK_ANALYSIS_AVG_DURATION=0
+SOAK_ANALYSIS_MISSING=""
 EXTERNAL_CONFIG_STATUS="NOT_LOADED"
 EXTERNAL_CONFIG_DETAIL=""
 EXTERNAL_CONFIG_OVERRIDE_COUNT=0
@@ -566,6 +601,7 @@ STATE_SCHEMA_MANIFEST_FILE="$STATE_DIR/state_schema.manifest"       # Coordinate
 REPLACEMENT_EVENTS_FILE="$STATE_DIR/replacement_events.log"         # Drive replacement lifecycle events (alerts context)
 SATA_LINK_HISTORY_FILE="$STATE_DIR/sata_link_downshift_history.log" # SATA link instability events (alert context)
 NOTIFICATION_JOURNAL_FILE="$STATE_DIR/notification_lifecycle.state" # Last successfully delivered canonical finding set
+SOAK_RUN_HISTORY_FILE="$STATE_DIR/soak_runs.tsv"                    # Phase 15 atomic run-level soak evidence
 # --- Trend / Historical Analytics (longer-term forecasting, prioritization, trajectory) ---
 CAPACITY_HISTORY_FILE="$STATE_DIR/capacity_history.log"             # Array & pool capacity history (growth forecast)
 DISK_CAP_HISTORY_FILE="$STATE_DIR/disk_cap_history.log"             # Per-disk capacity history (slot pressure)
@@ -583,7 +619,7 @@ RISK_SCORES_HISTORY_FILE="$STATE_DIR/risk_scores_history.log"       # Historical
 TEMP_HISTORY_FILE="$STATE_DIR/temp_history.log"                     # Temperature samples (rate & exposure)
 SELFTEST_HISTORY_FILE="$STATE_DIR/selftest_events.log"              # SMART self-test lifecycle history (frequency/volatility)
 STATE_FILES_ALERT_RUNTIME=(
-    "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$NVME_STATE_FILE" "$PREV_ATTR_FILE" "$ALERT_NEW_SEEN_FILE" "$RISK_PREV_FILE" "$CMD_TIMEOUT_LAST_FILE" "$XFS_PROC_PREV_FILE" "$BTRFS_DEV_PREV_FILE" "$SYSLOG_CURSOR_STATE_FILE" "$STORAGE_DISCREPANCY_STATE_FILE" "$RISK_SPIKE_FILE" "$REPLACEMENT_EVENTS_FILE" "$SATA_LINK_HISTORY_FILE" "$NOTIFICATION_JOURNAL_FILE"
+    "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$NVME_STATE_FILE" "$PREV_ATTR_FILE" "$ALERT_NEW_SEEN_FILE" "$RISK_PREV_FILE" "$CMD_TIMEOUT_LAST_FILE" "$XFS_PROC_PREV_FILE" "$BTRFS_DEV_PREV_FILE" "$SYSLOG_CURSOR_STATE_FILE" "$STORAGE_DISCREPANCY_STATE_FILE" "$RISK_SPIKE_FILE" "$REPLACEMENT_EVENTS_FILE" "$SATA_LINK_HISTORY_FILE" "$NOTIFICATION_JOURNAL_FILE" "$SOAK_RUN_HISTORY_FILE"
 )
 STATE_FILES_TREND_HISTORY=(
     "$CAPACITY_HISTORY_FILE" "$DISK_CAP_HISTORY_FILE" "$SHARE_USAGE_HISTORY_FILE" "$HEAVY_WRITER_HISTORY_FILE" "$RISK_TIER_HISTORY_FILE" "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE" "$XFS_PROC_HISTORY_FILE" "$POH_HISTORY_FILE" "$TBW_HISTORY_FILE" "$TBW_DAYSLEFT_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$RISK_SCORES_HISTORY_FILE" "$TEMP_HISTORY_FILE" "$SELFTEST_HISTORY_FILE"
@@ -1048,6 +1084,10 @@ ensure_external_config_template() {
 # NOTIFICATION_CRITICAL_REMINDER_HOURS=6
 # NOTIFICATION_OK_REMINDER_HOURS=168
 # NOTIFICATION_DRY_RUN=0
+# SOAK_TELEMETRY_ENABLED=1
+# SOAK_MIN_RUNS=14
+# SOAK_MIN_DAYS=14
+# SOAK_REQUIRE_PARITY=0
 # POOL_EXCLUDES=ramtmp,user0
 "
     atomic_write_text "$EXTERNAL_CONFIG_FILE" "$content" || return 1
@@ -2169,6 +2209,7 @@ initialize_runtime() {
         atomic_write_text "$STORAGE_DISCREPANCY_STATE_FILE" $'0 0\n' || true
     fi
 
+    SOAK_RUN_STARTED=1
     log "INIT" "INFO" "Runtime initialized (state: $STATE_DIR)"
 }
 
@@ -2179,6 +2220,11 @@ cleanup() {
         return 0
     fi
     CLEANUP_DONE=1
+
+    if (( SOAK_RUN_STARTED == 1 && SOAK_TELEMETRY_ENABLED == 1 )); then
+        persist_soak_observation "$exit_code" ||
+            log "SOAK" "WARN" "Unable to persist this run's soak observation"
+    fi
 
     if [[ -n "$RUN_DIR" && -d "$RUN_DIR" ]]; then
         rm -rf -- "$RUN_DIR" 2>/dev/null || true
@@ -2198,6 +2244,409 @@ handle_signal() {
     [[ "$signal_name" == "INT" ]] && exit_code=130
     log "RUN" "WARN" "Received $signal_name; stopping"
     exit "$exit_code"
+}
+
+
+# ---------------------------------------------------------------------------
+# Phase 15 soak evidence
+# ---------------------------------------------------------------------------
+
+soak_record_is_valid() {
+    (( $# == 24 )) || return 1
+    local schema="$1" start_epoch="$2" end_epoch="$3" duration="$4"
+    local exit_status="$5" boot_id="$6" ok_count="$7" deferred_count="$8"
+    local timeout_count="$9" failed_count="${10}" slow_count="${11}"
+    local collector_seconds="${12}" critical_count="${13}" warning_count="${14}"
+    local decision="${15}" outcome="${16}" notification_rc="${17}"
+    local notification_attempts="${18}" parity_active="${19}"
+    local standby_count="${20}" syslog_mode="${21}" device_count="${22}"
+    local log_file="${23}" writer_version="${24}" value
+
+    [[ "$schema" == "v1" ]] || return 1
+    for value in \
+        "$start_epoch" "$end_epoch" "$duration" "$exit_status" \
+        "$ok_count" "$deferred_count" "$timeout_count" "$failed_count" \
+        "$slow_count" "$collector_seconds" "$critical_count" "$warning_count" \
+        "$notification_rc" "$notification_attempts" "$parity_active" \
+        "$standby_count" "$device_count"
+    do
+        [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    done
+    (( end_epoch >= start_epoch )) || return 1
+    (( parity_active == 0 || parity_active == 1 )) || return 1
+    [[ "$boot_id" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    [[ "$decision" =~ ^(SEND|SUPPRESS|not_evaluated)$ ]] || return 1
+    [[ "$outcome" =~ ^(delivered|failed|suppressed|dry_run|not_evaluated)$ ]] || return 1
+    [[ "$syslog_mode" =~ ^(not_run|initial_lookback|cursor_continuation|rotation_recovery|rotation_fallback|concurrent_rotation|dmesg_fallback)$ ]] || return 1
+    [[ "$log_file" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+    [[ "$writer_version" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
+}
+
+set_soak_notification_outcome() {
+    SOAK_NOTIFICATION_DECISION_RESULT="not_evaluated"
+    SOAK_NOTIFICATION_OUTCOME_RESULT="not_evaluated"
+
+    (( NOTIFICATION_PHASE_REACHED == 1 )) || return 0
+    SOAK_NOTIFICATION_DECISION_RESULT="$NOTIFICATION_DECISION"
+    if [[ "$NOTIFICATION_DECISION" == "SUPPRESS" ]]; then
+        SOAK_NOTIFICATION_OUTCOME_RESULT="suppressed"
+    elif (( NOTIFICATION_DRY_RUN == 1 )); then
+        SOAK_NOTIFICATION_OUTCOME_RESULT="dry_run"
+    elif (( NOTIFICATION_DELIVERY_ATTEMPTS > 0 && NOTIFICATION_DELIVERY_RC == 0 )); then
+        SOAK_NOTIFICATION_OUTCOME_RESULT="delivered"
+    else
+        SOAK_NOTIFICATION_OUTCOME_RESULT="failed"
+    fi
+}
+
+persist_soak_observation() {
+    local exit_status="${1:-1}" end_epoch duration boot_id="unknown"
+    local collector ok_count=0 deferred_count=0 timeout_count=0 failed_count=0
+    local slow_count=0 collector_seconds=0 collector_duration collector_detail
+    local standby_count=0 device_count=0 notification_rc notification_attempts
+    local parity_active=0 syslog_mode log_file temp_file filtered_file line_count
+    local existing_line_count=0 retained_line_count=0
+    local cutoff_epoch=0
+
+    (( SOAK_TELEMETRY_ENABLED == 1 && SOAK_RUN_STARTED == 1 )) || return 0
+    [[ "$RUN_EPOCH" =~ ^[0-9]+$ && "$exit_status" =~ ^[0-9]+$ ]] || return 1
+
+    end_epoch=$(date +%s)
+    [[ "$end_epoch" =~ ^[0-9]+$ ]] || return 1
+    duration=$((end_epoch - RUN_EPOCH))
+    (( duration >= 0 )) || duration=0
+    if [[ -r /proc/sys/kernel/random/boot_id ]]; then
+        read -r boot_id < /proc/sys/kernel/random/boot_id || boot_id="unknown"
+    fi
+    [[ "$boot_id" =~ ^[A-Za-z0-9._-]+$ ]] || boot_id="unknown"
+
+    for collector in "${COLLECTOR_ORDER[@]}"; do
+        collector_duration="${COLLECTOR_DURATION[$collector]:-0}"
+        collector_detail="${COLLECTOR_DETAIL[$collector]:-}"
+        [[ "$collector_duration" =~ ^[0-9]+$ ]] || collector_duration=0
+        collector_seconds=$((collector_seconds + collector_duration))
+        [[ "$collector_detail" == *slow* ]] && slow_count=$((slow_count + 1))
+        case "${COLLECTOR_STATUS[$collector]:-FAILED}" in
+            OK)        ok_count=$((ok_count + 1)) ;;
+            DEFERRED)  deferred_count=$((deferred_count + 1)) ;;
+            TIMED_OUT) timeout_count=$((timeout_count + 1)) ;;
+            *)         failed_count=$((failed_count + 1)) ;;
+        esac
+    done
+
+    standby_count="${#SMART_DEFERRED[@]}"
+    device_count="${#DISCOVERED_DISKS[@]}"
+    (( PARITY_ACTIVE == 1 )) && parity_active=1
+    syslog_mode="${SYSLOG_CURSOR_MODE:-not_run}"
+    case "$syslog_mode" in
+        not_run|initial_lookback|cursor_continuation|rotation_recovery|rotation_fallback|concurrent_rotation|dmesg_fallback) ;;
+        *) syslog_mode="not_run" ;;
+    esac
+    set_soak_notification_outcome
+    notification_rc="${NOTIFICATION_DELIVERY_RC:-1}"
+    notification_attempts="${NOTIFICATION_DELIVERY_ATTEMPTS:-0}"
+    [[ "$notification_rc" =~ ^[0-9]+$ ]] || notification_rc=1
+    [[ "$notification_attempts" =~ ^[0-9]+$ ]] || notification_attempts=0
+    log_file="${MASTER_LOG##*/}"
+    [[ "$log_file" =~ ^[A-Za-z0-9._-]+$ ]] || log_file="unknown.log"
+
+    temp_file="$(state_temp_file "$SOAK_RUN_HISTORY_FILE")" || return 1
+    if [[ -s "$SOAK_RUN_HISTORY_FILE" ]]; then
+        existing_line_count=$(wc -l < "$SOAK_RUN_HISTORY_FILE" 2>/dev/null || echo 0)
+        existing_line_count=${existing_line_count//[[:space:]]/}
+        awk -F '\t' '
+            function uint(value) { return value ~ /^(0|[1-9][0-9]*)$/ }
+            NF == 24 && $1 == "v1" &&
+            uint($2) && uint($3) && uint($4) && uint($5) &&
+            $6 ~ /^[A-Za-z0-9._-]+$/ &&
+            uint($7) && uint($8) && uint($9) && uint($10) &&
+            uint($11) && uint($12) && uint($13) && uint($14) &&
+            $15 ~ /^(SEND|SUPPRESS|not_evaluated)$/ &&
+            $16 ~ /^(delivered|failed|suppressed|dry_run|not_evaluated)$/ &&
+            uint($17) && uint($18) && $19 ~ /^[01]$/ && uint($20) &&
+            $21 ~ /^(not_run|initial_lookback|cursor_continuation|rotation_recovery|rotation_fallback|concurrent_rotation|dmesg_fallback)$/ &&
+            uint($22) && $23 ~ /^[A-Za-z0-9._-]+$/ &&
+            $24 ~ /^[0-9]+([.][0-9]+)*$/ && $3 >= $2
+        ' "$SOAK_RUN_HISTORY_FILE" > "$temp_file" || {
+            rm -f -- "$temp_file" 2>/dev/null || true
+            return 1
+        }
+        retained_line_count=$(wc -l < "$temp_file" 2>/dev/null || echo 0)
+        retained_line_count=${retained_line_count//[[:space:]]/}
+        if (( existing_line_count > retained_line_count )); then
+            log "SOAK" "WARN" \
+                "Discarded $((existing_line_count - retained_line_count)) malformed soak evidence record(s) before appending this run"
+        fi
+    else
+        : > "$temp_file" || return 1
+    fi
+
+    printf 'v1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$RUN_EPOCH" "$end_epoch" "$duration" "$exit_status" "$boot_id" \
+        "$ok_count" "$deferred_count" "$timeout_count" "$failed_count" \
+        "$slow_count" "$collector_seconds" "$FINDING_CRITICAL_COUNT" \
+        "$FINDING_WARNING_COUNT" "$SOAK_NOTIFICATION_DECISION_RESULT" \
+        "$SOAK_NOTIFICATION_OUTCOME_RESULT" "$notification_rc" \
+        "$notification_attempts" "$parity_active" "$standby_count" \
+        "$syslog_mode" "$device_count" "$log_file" "$SCRIPT_VERSION" \
+        >> "$temp_file" || {
+            rm -f -- "$temp_file" 2>/dev/null || true
+            return 1
+        }
+
+    if (( SOAK_RETENTION_DAYS > 0 )); then
+        cutoff_epoch=$((end_epoch - SOAK_RETENTION_DAYS * 86400))
+        (( cutoff_epoch >= 0 )) || cutoff_epoch=0
+        filtered_file="$(state_temp_file "$SOAK_RUN_HISTORY_FILE")" || {
+            rm -f -- "$temp_file" 2>/dev/null || true
+            return 1
+        }
+        awk -F '\t' -v cutoff="$cutoff_epoch" '$2 >= cutoff' \
+            "$temp_file" > "$filtered_file" || {
+                rm -f -- "$temp_file" "$filtered_file" 2>/dev/null || true
+                return 1
+            }
+        mv -f -- "$filtered_file" "$temp_file" || {
+            rm -f -- "$temp_file" "$filtered_file" 2>/dev/null || true
+            return 1
+        }
+    fi
+
+    line_count=$(wc -l < "$temp_file" 2>/dev/null || echo 0)
+    line_count=${line_count//[[:space:]]/}
+    if (( line_count > SOAK_MAX_RECORDS )); then
+        filtered_file="$(state_temp_file "$SOAK_RUN_HISTORY_FILE")" || {
+            rm -f -- "$temp_file" 2>/dev/null || true
+            return 1
+        }
+        tail -n "$SOAK_MAX_RECORDS" "$temp_file" > "$filtered_file" || {
+            rm -f -- "$temp_file" "$filtered_file" 2>/dev/null || true
+            return 1
+        }
+        mv -f -- "$filtered_file" "$temp_file" || {
+            rm -f -- "$temp_file" "$filtered_file" 2>/dev/null || true
+            return 1
+        }
+    fi
+
+    atomic_commit "$temp_file" "$SOAK_RUN_HISTORY_FILE" || return 1
+    log "SOAK" "INFO" \
+        "Recorded run duration=${duration}s exit=$exit_status collectors=OK:$ok_count/DEFERRED:$deferred_count/TIMED_OUT:$timeout_count/FAILED:$failed_count notification=$SOAK_NOTIFICATION_OUTCOME_RESULT"
+}
+
+soak_add_missing_requirement() {
+    local requirement="$1"
+
+    if [[ -n "$SOAK_ANALYSIS_MISSING" ]]; then
+        SOAK_ANALYSIS_MISSING+=", $requirement"
+    else
+        SOAK_ANALYSIS_MISSING="$requirement"
+    fi
+}
+
+analyze_soak_history() {
+    local line start_epoch end_epoch duration exit_status boot_id ok_count
+    local deferred_count timeout_count failed_count slow_count collector_seconds
+    local critical_count warning_count decision outcome notification_rc
+    local notification_attempts parity_active standby_count syslog_mode
+    local device_count log_file writer_version run_attention first_epoch=0 last_epoch=0
+    local duration_total=0 boot
+    local -a fields=()
+    local -A boot_seen=()
+
+    SOAK_ANALYSIS_STATUS="COLLECTING"
+    SOAK_ANALYSIS_DETAIL="no observations"
+    SOAK_ANALYSIS_VALID_RUNS=0
+    SOAK_ANALYSIS_INVALID_RUNS=0
+    SOAK_ANALYSIS_CLEAN_RUNS=0
+    SOAK_ANALYSIS_ATTENTION_RUNS=0
+    SOAK_ANALYSIS_SPAN_DAYS=0
+    SOAK_ANALYSIS_BOOT_COUNT=0
+    SOAK_ANALYSIS_REBOOT_OBSERVED=0
+    SOAK_ANALYSIS_STANDBY_RUNS=0
+    SOAK_ANALYSIS_PARITY_RUNS=0
+    SOAK_ANALYSIS_SYSLOG_ROTATION_RUNS=0
+    SOAK_ANALYSIS_NOTIFICATION_DELIVERED=0
+    SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED=0
+    SOAK_ANALYSIS_NOTIFICATION_FAILED=0
+    SOAK_ANALYSIS_SLOW_COLLECTORS=0
+    SOAK_ANALYSIS_MAX_DURATION=0
+    SOAK_ANALYSIS_AVG_DURATION=0
+    SOAK_ANALYSIS_MISSING=""
+
+    if (( SOAK_TELEMETRY_ENABLED == 0 )); then
+        SOAK_ANALYSIS_STATUS="DISABLED"
+        SOAK_ANALYSIS_DETAIL="SOAK_TELEMETRY_ENABLED=0"
+        return 0
+    fi
+    if [[ ! -e "$SOAK_RUN_HISTORY_FILE" && ! -L "$SOAK_RUN_HISTORY_FILE" ]]; then
+        SOAK_ANALYSIS_DETAIL="no monitoring observations recorded yet"
+        return 0
+    fi
+    if ! validate_secure_owned_file "$SOAK_RUN_HISTORY_FILE"; then
+        SOAK_ANALYSIS_STATUS="ATTENTION"
+        SOAK_ANALYSIS_DETAIL="unsafe evidence file: $PATH_VALIDATION_REASON"
+        return 1
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        IFS=$'\t' read -r -a fields <<< "$line"
+        if ! soak_record_is_valid "${fields[@]}"; then
+            SOAK_ANALYSIS_INVALID_RUNS=$((SOAK_ANALYSIS_INVALID_RUNS + 1))
+            continue
+        fi
+        start_epoch="${fields[1]}"
+        end_epoch="${fields[2]}"
+        duration="${fields[3]}"
+        exit_status="${fields[4]}"
+        boot_id="${fields[5]}"
+        ok_count="${fields[6]}"
+        deferred_count="${fields[7]}"
+        timeout_count="${fields[8]}"
+        failed_count="${fields[9]}"
+        slow_count="${fields[10]}"
+        collector_seconds="${fields[11]}"
+        critical_count="${fields[12]}"
+        warning_count="${fields[13]}"
+        decision="${fields[14]}"
+        outcome="${fields[15]}"
+        notification_rc="${fields[16]}"
+        notification_attempts="${fields[17]}"
+        parity_active="${fields[18]}"
+        standby_count="${fields[19]}"
+        syslog_mode="${fields[20]}"
+        device_count="${fields[21]}"
+        log_file="${fields[22]}"
+        writer_version="${fields[23]}"
+
+        # These fields are intentionally decoded even when the readiness model
+        # does not yet consume them, so schema drift cannot pass unnoticed.
+        : "$ok_count" "$deferred_count" "$collector_seconds" \
+            "$critical_count" "$warning_count" "$decision" "$notification_rc" \
+            "$notification_attempts" "$device_count" "$log_file" "$writer_version"
+
+        SOAK_ANALYSIS_VALID_RUNS=$((SOAK_ANALYSIS_VALID_RUNS + 1))
+        (( first_epoch == 0 || start_epoch < first_epoch )) && first_epoch="$start_epoch"
+        (( end_epoch > last_epoch )) && last_epoch="$end_epoch"
+        duration_total=$((duration_total + duration))
+        (( duration > SOAK_ANALYSIS_MAX_DURATION )) && SOAK_ANALYSIS_MAX_DURATION="$duration"
+        [[ "$boot_id" == "unknown" ]] || boot_seen[$boot_id]=1
+        SOAK_ANALYSIS_SLOW_COLLECTORS=$((SOAK_ANALYSIS_SLOW_COLLECTORS + slow_count))
+        (( standby_count > 0 )) && SOAK_ANALYSIS_STANDBY_RUNS=$((SOAK_ANALYSIS_STANDBY_RUNS + 1))
+        (( parity_active == 1 )) && SOAK_ANALYSIS_PARITY_RUNS=$((SOAK_ANALYSIS_PARITY_RUNS + 1))
+        case "$syslog_mode" in
+            rotation_recovery|rotation_fallback|concurrent_rotation)
+                SOAK_ANALYSIS_SYSLOG_ROTATION_RUNS=$((SOAK_ANALYSIS_SYSLOG_ROTATION_RUNS + 1)) ;;
+        esac
+        case "$outcome" in
+            delivered)  SOAK_ANALYSIS_NOTIFICATION_DELIVERED=$((SOAK_ANALYSIS_NOTIFICATION_DELIVERED + 1)) ;;
+            suppressed) SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED=$((SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED + 1)) ;;
+            failed)     SOAK_ANALYSIS_NOTIFICATION_FAILED=$((SOAK_ANALYSIS_NOTIFICATION_FAILED + 1)) ;;
+        esac
+
+        run_attention=0
+        (( exit_status != 0 || timeout_count > 0 || failed_count > 0 )) && run_attention=1
+        [[ "$outcome" == "failed" ]] && run_attention=1
+        if (( run_attention == 1 )); then
+            SOAK_ANALYSIS_ATTENTION_RUNS=$((SOAK_ANALYSIS_ATTENTION_RUNS + 1))
+        else
+            SOAK_ANALYSIS_CLEAN_RUNS=$((SOAK_ANALYSIS_CLEAN_RUNS + 1))
+        fi
+    done < "$SOAK_RUN_HISTORY_FILE"
+
+    for boot in "${!boot_seen[@]}"; do
+        SOAK_ANALYSIS_BOOT_COUNT=$((SOAK_ANALYSIS_BOOT_COUNT + 1))
+    done
+    (( SOAK_ANALYSIS_BOOT_COUNT >= 2 )) && SOAK_ANALYSIS_REBOOT_OBSERVED=1
+    if (( SOAK_ANALYSIS_VALID_RUNS > 0 )); then
+        SOAK_ANALYSIS_SPAN_DAYS=$(( (last_epoch - first_epoch) / 86400 ))
+        (( SOAK_ANALYSIS_SPAN_DAYS >= 0 )) || SOAK_ANALYSIS_SPAN_DAYS=0
+        SOAK_ANALYSIS_AVG_DURATION=$((duration_total / SOAK_ANALYSIS_VALID_RUNS))
+    fi
+
+    (( SOAK_ANALYSIS_VALID_RUNS >= SOAK_MIN_RUNS )) ||
+        soak_add_missing_requirement "runs ${SOAK_ANALYSIS_VALID_RUNS}/${SOAK_MIN_RUNS}"
+    (( SOAK_ANALYSIS_SPAN_DAYS >= SOAK_MIN_DAYS )) ||
+        soak_add_missing_requirement "span ${SOAK_ANALYSIS_SPAN_DAYS}/${SOAK_MIN_DAYS}d"
+    (( SOAK_REQUIRE_REBOOT == 0 || SOAK_ANALYSIS_REBOOT_OBSERVED == 1 )) ||
+        soak_add_missing_requirement "reboot"
+    (( SOAK_REQUIRE_STANDBY == 0 || SOAK_ANALYSIS_STANDBY_RUNS > 0 )) ||
+        soak_add_missing_requirement "standby deferral"
+    (( SOAK_REQUIRE_SYSLOG_ROTATION == 0 || SOAK_ANALYSIS_SYSLOG_ROTATION_RUNS > 0 )) ||
+        soak_add_missing_requirement "syslog rotation"
+    (( SOAK_REQUIRE_NOTIFICATION_DELIVERY == 0 || SOAK_ANALYSIS_NOTIFICATION_DELIVERED > 0 )) ||
+        soak_add_missing_requirement "notification delivery"
+    (( SOAK_REQUIRE_NOTIFICATION_SUPPRESSION == 0 || SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED > 0 )) ||
+        soak_add_missing_requirement "notification suppression"
+    (( SOAK_REQUIRE_PARITY == 0 || SOAK_ANALYSIS_PARITY_RUNS > 0 )) ||
+        soak_add_missing_requirement "parity activity"
+
+    if (( SOAK_ANALYSIS_INVALID_RUNS > 0 || SOAK_ANALYSIS_ATTENTION_RUNS > 0 )); then
+        SOAK_ANALYSIS_STATUS="ATTENTION"
+        SOAK_ANALYSIS_DETAIL="${SOAK_ANALYSIS_ATTENTION_RUNS} run(s) failed/incomplete; ${SOAK_ANALYSIS_INVALID_RUNS} malformed record(s)"
+    elif [[ -n "$SOAK_ANALYSIS_MISSING" ]]; then
+        SOAK_ANALYSIS_STATUS="COLLECTING"
+        SOAK_ANALYSIS_DETAIL="waiting for $SOAK_ANALYSIS_MISSING"
+    else
+        SOAK_ANALYSIS_STATUS="READY"
+        SOAK_ANALYSIS_DETAIL="all configured soak requirements satisfied"
+    fi
+    return 0
+}
+
+soak_requirement_label() {
+    local required="$1" observed="$2"
+
+    if (( required == 0 )); then
+        printf 'optional; observed=%s' "$observed"
+    elif (( observed > 0 )); then
+        printf 'PASS; observed=%s' "$observed"
+    else
+        printf 'WAITING; observed=0'
+    fi
+}
+
+print_soak_status() {
+    local analysis_rc=0
+
+    analyze_soak_history || analysis_rc=$?
+
+    printf 'Disk Health Monitor for Unraid v%s - Phase 15 soak status\n' "$SCRIPT_VERSION"
+    printf 'Evidence file: %s\n' "$SOAK_RUN_HISTORY_FILE"
+    printf 'Readiness: %s — %s\n\n' "$SOAK_ANALYSIS_STATUS" "$SOAK_ANALYSIS_DETAIL"
+    printf 'Progress: valid=%d required=%d span=%dd required=%dd malformed=%d\n' \
+        "$SOAK_ANALYSIS_VALID_RUNS" "$SOAK_MIN_RUNS" \
+        "$SOAK_ANALYSIS_SPAN_DAYS" "$SOAK_MIN_DAYS" \
+        "$SOAK_ANALYSIS_INVALID_RUNS"
+    printf 'Stability: clean=%d attention=%d slow_collectors=%d\n' \
+        "$SOAK_ANALYSIS_CLEAN_RUNS" "$SOAK_ANALYSIS_ATTENTION_RUNS" \
+        "$SOAK_ANALYSIS_SLOW_COLLECTORS"
+    printf 'Runtime: average=%ds maximum=%ds\n' \
+        "$SOAK_ANALYSIS_AVG_DURATION" "$SOAK_ANALYSIS_MAX_DURATION"
+    printf 'Coverage:\n'
+    printf ' - Reboot: %s (boot IDs=%d)\n' \
+        "$(soak_requirement_label "$SOAK_REQUIRE_REBOOT" "$SOAK_ANALYSIS_REBOOT_OBSERVED")" \
+        "$SOAK_ANALYSIS_BOOT_COUNT"
+    printf ' - Standby deferral: %s (runs=%d)\n' \
+        "$(soak_requirement_label "$SOAK_REQUIRE_STANDBY" "$SOAK_ANALYSIS_STANDBY_RUNS")" \
+        "$SOAK_ANALYSIS_STANDBY_RUNS"
+    printf ' - Syslog rotation: %s (runs=%d)\n' \
+        "$(soak_requirement_label "$SOAK_REQUIRE_SYSLOG_ROTATION" "$SOAK_ANALYSIS_SYSLOG_ROTATION_RUNS")" \
+        "$SOAK_ANALYSIS_SYSLOG_ROTATION_RUNS"
+    printf ' - Notification delivery: %s (runs=%d)\n' \
+        "$(soak_requirement_label "$SOAK_REQUIRE_NOTIFICATION_DELIVERY" "$SOAK_ANALYSIS_NOTIFICATION_DELIVERED")" \
+        "$SOAK_ANALYSIS_NOTIFICATION_DELIVERED"
+    printf ' - Notification suppression: %s (runs=%d)\n' \
+        "$(soak_requirement_label "$SOAK_REQUIRE_NOTIFICATION_SUPPRESSION" "$SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED")" \
+        "$SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED"
+    printf ' - Parity activity: %s (runs=%d)\n' \
+        "$(soak_requirement_label "$SOAK_REQUIRE_PARITY" "$SOAK_ANALYSIS_PARITY_RUNS")" \
+        "$SOAK_ANALYSIS_PARITY_RUNS"
+    printf 'Notifications: delivered=%d suppressed=%d failed=%d\n' \
+        "$SOAK_ANALYSIS_NOTIFICATION_DELIVERED" \
+        "$SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED" \
+        "$SOAK_ANALYSIS_NOTIFICATION_FAILED"
+    return "$analysis_rc"
 }
 
 
@@ -6370,6 +6819,7 @@ build_new_syslog_chunk() {
     local verify_metadata verify_device verify_inode verify_size chunk_lines
 
     SYSLOG_CURSOR_READY=0
+    SYSLOG_CURSOR_MODE="not_run"
     SYSLOG_CHUNK_FILE="$RUN_DIR/syslog.incremental.log"
     : > "$SYSLOG_CHUNK_FILE" || return 1
 
@@ -6378,6 +6828,7 @@ build_new_syslog_chunk() {
         dmesg_bounded 2>/dev/null | tail -n "$SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES" > "$SYSLOG_CHUNK_FILE" || true
         log "SYSLOG" "WARN" \
             "$source is unavailable; using a non-cursor dmesg fallback"
+        SYSLOG_CURSOR_MODE="dmesg_fallback"
         return 0
     fi
 
@@ -6424,10 +6875,12 @@ build_new_syslog_chunk() {
         fi
         append_syslog_line_range "$source" "$start_line" "$current_lines" "$SYSLOG_CHUNK_FILE" || return 1
         reason="initial lookback"
+        SYSLOG_CURSOR_MODE="initial_lookback"
     elif (( anchor_matches == 1 )); then
         start_line=$(( previous_lines + 1 ))
         append_syslog_line_range "$source" "$start_line" "$current_lines" "$SYSLOG_CHUNK_FILE" || return 1
         reason="cursor continuation"
+        SYSLOG_CURSOR_MODE="cursor_continuation"
     else
         for rotated in "${source}.1" "${source}.0"; do
             [[ -r "$rotated" ]] || continue
@@ -6445,6 +6898,7 @@ build_new_syslog_chunk() {
             append_syslog_line_range "$source" 1 "$current_lines" "$SYSLOG_CHUNK_FILE" || return 1
             recovered=1
             reason="rotation recovery via ${rotated}"
+            SYSLOG_CURSOR_MODE="rotation_recovery"
             break
         done
 
@@ -6456,6 +6910,7 @@ build_new_syslog_chunk() {
             fi
             append_syslog_line_range "$source" "$start_line" "$current_lines" "$SYSLOG_CHUNK_FILE" || return 1
             reason="rotation/truncation fallback"
+            SYSLOG_CURSOR_MODE="rotation_fallback"
             log "SYSLOG" "WARN" \
                 "Previous syslog inode was unavailable; scanning the last ${SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES} line(s)"
         fi
@@ -6467,6 +6922,7 @@ build_new_syslog_chunk() {
     verify_metadata=$(stat -c '%d %i %s' -- "$source" 2>/dev/null || true)
     read -r verify_device verify_inode verify_size <<< "$verify_metadata"
     if [[ "$verify_device" != "$current_device" || "$verify_inode" != "$current_inode" ]]; then
+        SYSLOG_CURSOR_MODE="concurrent_rotation"
         log "SYSLOG" "WARN" "Syslog rotated while its incremental chunk was being built; cursor advancement deferred"
         return 0
     fi
@@ -7492,6 +7948,7 @@ prepare_notification_lifecycle() {
     local id now interval_hours safe_state=0
     local recovery_rows=""
 
+    NOTIFICATION_PHASE_REACHED=1
     NOTIFICATION_DECISION="SUPPRESS"
     NOTIFICATION_REASON="unchanged state within reminder cooldown"
     NOTIFICATION_NEW_COUNT=0
@@ -10787,6 +11244,9 @@ validate_configuration() {
         WEAR_TREND_ENABLED ENABLE_MODEL_IN_ALERTS
         LOG_FULL_NOTIFICATION_ON_TRUNCATION COLLECTOR_FAILURE_NOTIFICATIONS
         NOTIFICATION_LIFECYCLE_ENABLED NOTIFICATION_DRY_RUN
+        SOAK_TELEMETRY_ENABLED SOAK_REQUIRE_REBOOT SOAK_REQUIRE_STANDBY
+        SOAK_REQUIRE_SYSLOG_ROTATION SOAK_REQUIRE_NOTIFICATION_DELIVERY
+        SOAK_REQUIRE_NOTIFICATION_SUPPRESSION SOAK_REQUIRE_PARITY
     )
     local -a integer_settings=(
         SHORT_TEST_INTERVAL_DAYS SHORT_TEST_MAX_WAIT SHORT_TEST_POLL_INTERVAL
@@ -10851,6 +11311,7 @@ validate_configuration() {
         NOTIFICATION_WARNING_REMINDER_HOURS NOTIFICATION_CRITICAL_REMINDER_HOURS
         NOTIFICATION_OK_REMINDER_HOURS NOTIFICATION_MAX_ATTEMPTS
         NOTIFICATION_RETRY_INITIAL_DELAY_SECONDS NOTIFICATION_RETRY_MAX_DELAY_SECONDS
+        SOAK_MIN_RUNS SOAK_MIN_DAYS SOAK_RETENTION_DAYS SOAK_MAX_RECORDS
     )
     local -a number_settings=(
         STORAGE_DISCREPANCY_MIN_DIFF ENDURANCE_DAYSLEFT_ACCEL_MIN_DELTA
@@ -10876,6 +11337,7 @@ validate_configuration() {
         XFS_REPAIR_TIMEOUT_SECONDS SYSTEM_COMMAND_TIMEOUT_SECONDS
         SHARE_SCAN_TIMEOUT_SECONDS NOTIFICATION_TIMEOUT_SECONDS COMMAND_KILL_GRACE_SECONDS
         NOTIFICATION_MAX_ATTEMPTS
+        SOAK_MIN_RUNS SOAK_RETENTION_DAYS SOAK_MAX_RECORDS
     )
     local -a ordered_pairs=(
         LONG_TEST_MIN_INTERVAL_DAYS:LONG_TEST_MAX_INTERVAL_DAYS
@@ -10989,6 +11451,20 @@ validate_configuration() {
             configuration_error "SHORT_TEST_MAX_WAIT must be positive when SHORT_TEST_POLL=1"
         [[ "${SHORT_TEST_POLL_INTERVAL:-}" =~ ^[1-9][0-9]*$ ]] ||
             configuration_error "SHORT_TEST_POLL_INTERVAL must be positive when SHORT_TEST_POLL=1"
+    fi
+    if [[ "${SOAK_MIN_RUNS:-}" =~ ^[0-9]+$ &&
+          "${SOAK_MAX_RECORDS:-}" =~ ^[0-9]+$ ]] &&
+       (( SOAK_MIN_RUNS > SOAK_MAX_RECORDS ))
+    then
+        configuration_error \
+            "SOAK_MIN_RUNS must not exceed SOAK_MAX_RECORDS"
+    fi
+    if [[ "${SOAK_MIN_DAYS:-}" =~ ^[0-9]+$ &&
+          "${SOAK_RETENTION_DAYS:-}" =~ ^[0-9]+$ ]] &&
+       (( SOAK_MIN_DAYS > SOAK_RETENTION_DAYS ))
+    then
+        configuration_error \
+            "SOAK_MIN_DAYS must not exceed SOAK_RETENTION_DAYS"
     fi
 
     if ! declare -p POOL_EXCLUDES 2>/dev/null | grep -q '^declare -a'; then
@@ -11141,6 +11617,7 @@ Usage:
   health_monitoring.sh --rollback-state BACKUP_ID
                                        Restore one explicit state backup and exit
   health_monitoring.sh --diagnostics   Run read-only environment diagnostics
+  health_monitoring.sh --soak-status   Show Phase 15 soak progress and readiness
   health_monitoring.sh --self-test     Run built-in regression fixtures in /tmp
   health_monitoring.sh --test-notification
                                        Send one notification without monitoring or state changes
@@ -11149,7 +11626,7 @@ Usage:
   health_monitoring.sh --version       Print the script version
   health_monitoring.sh --help          Show this help
 
-The configuration, state-status, state-backups, diagnostics, and self-test
+The configuration, state-status, state-backups, diagnostics, soak-status, and self-test
 modes do not run SMART commands against disks, start tests or scrubs, write monitoring state,
 advance the syslog cursor, send notifications, or spin up disks. The explicit
 notification test sends only its fixed test message. Notification dry-run is a
@@ -11192,6 +11669,10 @@ parse_arguments() {
         --diagnostics)
             (( $# == 1 )) || return 2
             RUN_MODE="diagnostics"
+            ;;
+        --soak-status)
+            (( $# == 1 )) || return 2
+            RUN_MODE="soak-status"
             ;;
         --self-test)
             (( $# == 1 )) || return 2
@@ -11268,6 +11749,25 @@ run_diagnostics() {
         "SMART=${SMARTCTL_TIMEOUT_SECONDS}s Btrfs=${BTRFS_COMMAND_TIMEOUT_SECONDS}s XFS=${XFS_REPAIR_TIMEOUT_SECONDS}s System=${SYSTEM_COMMAND_TIMEOUT_SECONDS}s Share=${SHARE_SCAN_TIMEOUT_SECONDS}s Notify=${NOTIFICATION_TIMEOUT_SECONDS}s"
     diagnostic_result INFO "Regression fixtures" \
         "$REGRESSION_FIXTURE_COUNT isolated read-only fixture(s); no live SMART access"
+
+    if analyze_soak_history; then
+        case "$SOAK_ANALYSIS_STATUS" in
+            READY)
+                diagnostic_result PASS "Phase 15 soak" \
+                    "$SOAK_ANALYSIS_VALID_RUNS run(s), ${SOAK_ANALYSIS_SPAN_DAYS}d; ready"
+                ;;
+            ATTENTION)
+                warnings=$((warnings + 1))
+                diagnostic_result WARN "Phase 15 soak" "$SOAK_ANALYSIS_DETAIL"
+                ;;
+            *)
+                diagnostic_result INFO "Phase 15 soak" "$SOAK_ANALYSIS_DETAIL"
+                ;;
+        esac
+    else
+        failures=$((failures + 1))
+        diagnostic_result FAIL "Phase 15 soak" "$SOAK_ANALYSIS_DETAIL"
+    fi
 
     if inspect_state_schema_manifest; then
         diagnostic_result PASS "State schema" "$STATE_SCHEMA_DETAIL"
@@ -11407,11 +11907,12 @@ run_regression_tests() (
     fi
 
     if declare -F load_builtin_defaults >/dev/null 2>&1 &&
-       [[ "$SCRIPT_VERSION" == "2.14.3" &&
+       [[ "$SCRIPT_VERSION" == "2.15" &&
           "$STATE_SCHEMA_VERSION" == "2" &&
           "$HISTORY_SCHEMA_VERSION" == "3" &&
           "$DEVICE_ID_SCHEMA_VERSION" == "2" &&
-          "$SMART_ALLOW_SPINUP" == "0" ]]
+          "$SMART_ALLOW_SPINUP" == "0" &&
+          "$SOAK_TELEMETRY_ENABLED" == "1" ]]
     then
         self_test_result 1 "Built-in defaults and schema constants"
     else
@@ -11514,6 +12015,7 @@ run_regression_tests() (
     fi
 
     if [[ -n "${EXTERNAL_CONFIG_ALLOWED[SMART_ALLOW_SPINUP]+present}" &&
+          -n "${EXTERNAL_CONFIG_ALLOWED[SOAK_MIN_RUNS]+present}" &&
           -n "${EXTERNAL_CONFIG_ALLOWED[POOL_EXCLUDES]+present}" &&
           -n "${EXTERNAL_CONFIG_ALLOWED[LOG_DIR]+present}" &&
           -z "${EXTERNAL_CONFIG_ALLOWED[SCRIPT_VERSION]+present}" ]]
@@ -11533,6 +12035,7 @@ run_regression_tests() (
         'SMART_ALLOW_SPINUP=1' \
         'WARN_THRESHOLD_PERCENT=95' \
         'SHOW_COLLECTOR_STATUS="always"' \
+        'SOAK_MIN_RUNS=20' \
         'POOL_EXCLUDES=ramtmp, user0' > "$EXTERNAL_CONFIG_FILE"
     # This is deliberately inert parser input, not a command to expand here.
     # shellcheck disable=SC2016
@@ -11543,13 +12046,15 @@ run_regression_tests() (
     SMART_ALLOW_SPINUP=0
     WARN_THRESHOLD_PERCENT=96
     SHOW_COLLECTOR_STATUS="auto"
+    SOAK_MIN_RUNS=14
     POOL_EXCLUDES=(original)
     if load_external_configuration &&
        [[ "$EXTERNAL_CONFIG_STATUS" == "LOADED" &&
-          "$EXTERNAL_CONFIG_OVERRIDE_COUNT" == "5" &&
+          "$EXTERNAL_CONFIG_OVERRIDE_COUNT" == "6" &&
           "$SMART_ALLOW_SPINUP" == "1" &&
           "$WARN_THRESHOLD_PERCENT" == "95" &&
           "$SHOW_COLLECTOR_STATUS" == "always" &&
+          "$SOAK_MIN_RUNS" == "20" &&
           "${POOL_EXCLUDES[*]}" == "ramtmp user0" &&
           "$XFS_PROC_KEYS" == "$inert_config_value" &&
           ! -e "$config_fixture_dir/executed" ]]
@@ -11594,6 +12099,7 @@ run_regression_tests() (
        [[ -f "$EXTERNAL_CONFIG_FILE" && ! -L "$EXTERNAL_CONFIG_FILE" &&
           "$(stat -c '%a' "$EXTERNAL_CONFIG_FILE")" == "600" ]] &&
        grep -Fq 'parsed as data, not sourced' "$EXTERNAL_CONFIG_FILE" &&
+       grep -Fq '# SOAK_MIN_RUNS=14' "$EXTERNAL_CONFIG_FILE" &&
        grep -Fq '# POOL_EXCLUDES=ramtmp,user0' "$EXTERNAL_CONFIG_FILE"
     then
         self_test_result 1 "Protected state-directory configuration template"
@@ -12272,10 +12778,14 @@ run_regression_tests() (
     else
         actual="build-failed"
     fi
-    if [[ "$actual" == "old-three|new-one|new-two|" && "$SYSLOG_CURSOR_READY" == "1" ]]; then
+    if [[ "$actual" == "old-three|new-one|new-two|" &&
+          "$SYSLOG_CURSOR_READY" == "1" &&
+          "$SYSLOG_CURSOR_MODE" == "rotation_recovery" ]]
+    then
         self_test_result 1 "Persistent syslog cursor rotation recovery fixture"
     else
-        self_test_result 0 "Persistent syslog cursor rotation recovery fixture" "found '$actual' ready=$SYSLOG_CURSOR_READY"
+        self_test_result 0 "Persistent syslog cursor rotation recovery fixture" \
+            "found '$actual' ready=$SYSLOG_CURSOR_READY mode=$SYSLOG_CURSOR_MODE"
     fi
 
     FINDING_IDS=(
@@ -12810,6 +13320,174 @@ run_regression_tests() (
         self_test_result 0 "Raw trend diagnostics retained in run log"
     fi
 
+    if soak_record_is_valid \
+           v1 1780000000 1780000030 30 0 boot-a 12 0 0 0 0 30 0 0 \
+           SEND delivered 0 1 0 0 initial_lookback 5 disk_health_fixture.log 2.15 &&
+       ! soak_record_is_valid \
+           v1 1780000000 1780000030 30 0 boot-a 12 0 0 0 0 30 0 0 \
+           SEND delivered 0 1 2 0 initial_lookback 5 disk_health_fixture.log 2.15
+    then
+        self_test_result 1 "Soak evidence schema validation"
+    else
+        self_test_result 0 "Soak evidence schema validation"
+    fi
+
+    # Emits one complete v1 fixture record to the requested file. It is local
+    # to the self-test subshell and never touches live monitoring state.
+    fixture_soak_record() {
+        local target="$1" start_epoch="$2" end_epoch="$3" exit_status="$4"
+        local boot_id="$5" outcome="$6" parity_active="$7" standby_count="$8"
+        local syslog_mode="$9" log_file="${10}"
+        local duration=$((end_epoch - start_epoch)) decision="SEND" rc=0 attempts=1
+
+        if [[ "$outcome" == "suppressed" ]]; then
+            decision="SUPPRESS"
+            attempts=0
+        elif [[ "$outcome" == "failed" ]]; then
+            rc=1
+        fi
+        printf 'v1\t%s\t%s\t%s\t%s\t%s\t12\t0\t0\t0\t0\t%s\t0\t0\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t5\t%s\t2.15\n' \
+            "$start_epoch" "$end_epoch" "$duration" "$exit_status" "$boot_id" \
+            "$duration" "$decision" "$outcome" "$rc" "$attempts" \
+            "$parity_active" "$standby_count" "$syslog_mode" "$log_file" \
+            >> "$target"
+    }
+
+    local soak_now soak_old soak_persist_file
+    soak_now=$(date +%s)
+    soak_old=$((soak_now - 172800))
+    soak_persist_file="$fixture_dir/soak-persist.tsv"
+    : > "$soak_persist_file"
+    fixture_soak_record "$soak_persist_file" "$soak_old" "$((soak_old + 30))" \
+        0 boot-old delivered 0 0 initial_lookback disk_health_old.log
+    printf 'malformed evidence row\n' >> "$soak_persist_file"
+    SOAK_RUN_HISTORY_FILE="$soak_persist_file"
+    SOAK_TELEMETRY_ENABLED=1
+    SOAK_RUN_STARTED=1
+    SOAK_RETENTION_DAYS=1
+    SOAK_MAX_RECORDS=2
+    COLLECTOR_ORDER=(soak_ok soak_deferred)
+    COLLECTOR_STATUS=([soak_ok]="OK" [soak_deferred]="DEFERRED")
+    COLLECTOR_DURATION=([soak_ok]=2 [soak_deferred]=1)
+    COLLECTOR_DETAIL=([soak_ok]="" [soak_deferred]="deferred=1")
+    SMART_DEFERRED=([/dev/sda]="standby")
+    DISCOVERED_DISKS=(/dev/sda /dev/nvme0n1)
+    NOTIFICATION_PHASE_REACHED=0
+    PARITY_ACTIVE=0
+    SYSLOG_CURSOR_MODE="cursor_continuation"
+    MASTER_LOG="$fixture_dir/disk_health_soak.log"
+    RUN_EPOCH=$((soak_now - 20))
+    persist_soak_observation 0
+    RUN_EPOCH=$((soak_now - 10))
+    persist_soak_observation 0
+    RUN_EPOCH="$soak_now"
+    persist_soak_observation 0
+    local soak_persist_lines soak_persist_invalid=0
+    soak_persist_lines=$(wc -l < "$soak_persist_file" | tr -d ' ')
+    while IFS= read -r line; do
+        IFS=$'\t' read -r -a fields <<< "$line"
+        soak_record_is_valid "${fields[@]}" || soak_persist_invalid=$((soak_persist_invalid + 1))
+    done < "$soak_persist_file"
+    if [[ "$soak_persist_lines" == "2" && "$soak_persist_invalid" == "0" ]] &&
+       ! grep -Fq 'boot-old' "$soak_persist_file"
+    then
+        self_test_result 1 "Atomic bounded soak evidence persistence"
+    else
+        self_test_result 0 "Atomic bounded soak evidence persistence" \
+            "lines=$soak_persist_lines invalid=$soak_persist_invalid"
+    fi
+
+    local soak_collecting_file="$fixture_dir/soak-collecting.tsv"
+    : > "$soak_collecting_file"
+    fixture_soak_record "$soak_collecting_file" 1780000000 1780000030 \
+        0 boot-a delivered 0 0 initial_lookback disk_health_collecting.log
+    SOAK_RUN_HISTORY_FILE="$soak_collecting_file"
+    SOAK_MIN_RUNS=2
+    SOAK_MIN_DAYS=2
+    SOAK_REQUIRE_REBOOT=1
+    SOAK_REQUIRE_STANDBY=1
+    SOAK_REQUIRE_SYSLOG_ROTATION=1
+    SOAK_REQUIRE_NOTIFICATION_DELIVERY=1
+    SOAK_REQUIRE_NOTIFICATION_SUPPRESSION=1
+    SOAK_REQUIRE_PARITY=0
+    analyze_soak_history
+    if [[ "$SOAK_ANALYSIS_STATUS" == "COLLECTING" &&
+          "$SOAK_ANALYSIS_VALID_RUNS" == "1" &&
+          "$SOAK_ANALYSIS_MISSING" == *reboot* &&
+          "$SOAK_ANALYSIS_MISSING" == *"standby deferral"* ]]
+    then
+        self_test_result 1 "Soak readiness remains collecting until coverage completes"
+    else
+        self_test_result 0 "Soak readiness remains collecting until coverage completes" \
+            "$SOAK_ANALYSIS_STATUS: $SOAK_ANALYSIS_DETAIL"
+    fi
+
+    local soak_ready_file="$fixture_dir/soak-ready.tsv"
+    : > "$soak_ready_file"
+    fixture_soak_record "$soak_ready_file" 1780000000 1780000030 \
+        0 boot-a delivered 1 1 rotation_recovery disk_health_ready_a.log
+    fixture_soak_record "$soak_ready_file" 1780172800 1780172830 \
+        0 boot-b suppressed 0 0 cursor_continuation disk_health_ready_b.log
+    SOAK_RUN_HISTORY_FILE="$soak_ready_file"
+    SOAK_REQUIRE_PARITY=1
+    analyze_soak_history
+    if [[ "$SOAK_ANALYSIS_STATUS" == "READY" &&
+          "$SOAK_ANALYSIS_CLEAN_RUNS" == "2" &&
+          "$SOAK_ANALYSIS_BOOT_COUNT" == "2" &&
+          "$SOAK_ANALYSIS_SYSLOG_ROTATION_RUNS" == "1" &&
+          "$SOAK_ANALYSIS_NOTIFICATION_DELIVERED" == "1" &&
+          "$SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED" == "1" ]]
+    then
+        self_test_result 1 "Complete soak coverage reaches readiness"
+    else
+        self_test_result 0 "Complete soak coverage reaches readiness" \
+            "$SOAK_ANALYSIS_STATUS: $SOAK_ANALYSIS_DETAIL"
+    fi
+
+    local soak_attention_file="$fixture_dir/soak-attention.tsv"
+    : > "$soak_attention_file"
+    fixture_soak_record "$soak_attention_file" 1780000000 1780000030 \
+        1 boot-a failed 0 0 initial_lookback disk_health_failed.log
+    printf 'broken\n' >> "$soak_attention_file"
+    SOAK_RUN_HISTORY_FILE="$soak_attention_file"
+    SOAK_REQUIRE_REBOOT=0
+    SOAK_REQUIRE_STANDBY=0
+    SOAK_REQUIRE_SYSLOG_ROTATION=0
+    SOAK_REQUIRE_NOTIFICATION_DELIVERY=0
+    SOAK_REQUIRE_NOTIFICATION_SUPPRESSION=0
+    SOAK_REQUIRE_PARITY=0
+    analyze_soak_history
+    if [[ "$SOAK_ANALYSIS_STATUS" == "ATTENTION" &&
+          "$SOAK_ANALYSIS_ATTENTION_RUNS" == "1" &&
+          "$SOAK_ANALYSIS_INVALID_RUNS" == "1" &&
+          "$SOAK_ANALYSIS_NOTIFICATION_FAILED" == "1" ]]
+    then
+        self_test_result 1 "Soak failures and malformed evidence require attention"
+    else
+        self_test_result 0 "Soak failures and malformed evidence require attention" \
+            "$SOAK_ANALYSIS_STATUS: $SOAK_ANALYSIS_DETAIL"
+    fi
+
+    local soak_status_output="$fixture_dir/soak-status.txt"
+    SOAK_RUN_HISTORY_FILE="$soak_ready_file"
+    SOAK_MIN_RUNS=2
+    SOAK_MIN_DAYS=2
+    SOAK_REQUIRE_REBOOT=1
+    SOAK_REQUIRE_STANDBY=1
+    SOAK_REQUIRE_SYSLOG_ROTATION=1
+    SOAK_REQUIRE_NOTIFICATION_DELIVERY=1
+    SOAK_REQUIRE_NOTIFICATION_SUPPRESSION=1
+    SOAK_REQUIRE_PARITY=1
+    print_soak_status > "$soak_status_output"
+    if grep -Fq 'Readiness: READY' "$soak_status_output" &&
+       grep -Fq 'Notification suppression: PASS; observed=1' "$soak_status_output" &&
+       grep -Fq 'Parity activity: PASS; observed=1' "$soak_status_output"
+    then
+        self_test_result 1 "Human-readable soak readiness report"
+    else
+        self_test_result 0 "Human-readable soak readiness report"
+    fi
+
     if (( SELF_TEST_TOTAL != REGRESSION_FIXTURE_COUNT )); then
         SELF_TEST_FAILED=$((SELF_TEST_FAILED + 1))
         printf '[FAIL] Fixture manifest count - expected=%d actual=%d\n' \
@@ -12954,6 +13632,11 @@ main() {
             ;;
         diagnostics)
             run_diagnostics
+            return $?
+            ;;
+        soak-status)
+            validate_configuration || return 1
+            print_soak_status
             return $?
             ;;
         self-test)
