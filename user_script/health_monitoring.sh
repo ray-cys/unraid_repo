@@ -4,7 +4,7 @@ noParity=true
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.13"
+readonly SCRIPT_VERSION="2.14"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -15,13 +15,13 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.13
+# Disk Health Monitor for Unraid v2.14
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
 #
-# Phase 13 separates trend analysis into bounded stages, normalizes history
-# input, shares per-run history snapshots, and centralizes acceleration math.
+# Phase 14 adds delivery-aware notification lifecycle tracking, bounded retries,
+# reminder cooldowns, recovery notices, and safe notification test/dry-run modes.
 ################################################################################
 # ---------------- Configuration ----------------
 # Disks health script settings. Tuned for performance and reliability.
@@ -162,6 +162,14 @@ SHOW_ZERO_COUNTS=0                              # Hide zero-count summary lines 
 NOTIFY_MAX_BODY_CHARS=12000                     # Maximum notification body length before safe truncation
 NOTIFY_MAX_BODY_LINES=180                       # Maximum notification body lines before safe truncation
 LOG_FULL_NOTIFICATION_ON_TRUNCATION=1           # Preserve the complete body in the run log when shortened
+NOTIFICATION_LIFECYCLE_ENABLED=1                # Notify on changes/recovery and use reminder cooldowns (0=every run)
+NOTIFICATION_WARNING_REMINDER_HOURS=24          # Repeat unchanged warnings after this interval (0=disable)
+NOTIFICATION_CRITICAL_REMINDER_HOURS=6          # Repeat unchanged critical alerts after this interval (0=disable)
+NOTIFICATION_OK_REMINDER_HOURS=168              # Repeat an unchanged all-clear after this interval (0=disable)
+NOTIFICATION_MAX_ATTEMPTS=3                     # Total Unraid notification delivery attempts
+NOTIFICATION_RETRY_INITIAL_DELAY_SECONDS=2      # Initial retry delay; doubles after each failed attempt
+NOTIFICATION_RETRY_MAX_DELAY_SECONDS=30         # Maximum delay between notification attempts
+NOTIFICATION_DRY_RUN=0                          # Build/log decision but do not deliver or advance notification journal
 
 # === Execution Safety / Collector Isolation ===
 SMARTCTL_TIMEOUT_SECONDS=45                     # Maximum wall time for one smartctl command
@@ -392,6 +400,9 @@ declare -a TBW_EVAL_MESSAGES                      # Output from direct TBW evalu
 declare -a COLLECTOR_ORDER                        # Deterministic collector report order
 declare -A COLLECTOR_LABEL COLLECTOR_STATUS       # Collector label and final status
 declare -A COLLECTOR_DURATION COLLECTOR_DETAIL    # Collector timing and event summary
+declare -A NOTIFY_PREV_SEVERITY NOTIFY_PREV_FINGERPRINT NOTIFY_PREV_LABEL
+declare -A NOTIFY_CURRENT_SEVERITY NOTIFY_CURRENT_FINGERPRINT NOTIFY_CURRENT_LABEL
+declare -a NOTIFY_PREV_IDS
 TBW_EVAL_STATE="OK"
 
 RUN_STAMP=""
@@ -416,7 +427,7 @@ SYSLOG_CURSOR_PENDING_SIZE=0
 SYSLOG_CURSOR_PENDING_ANCHOR="-"
 SYSLOG_CHUNK_FILE=""
 RUN_MODE="monitor"
-REGRESSION_FIXTURE_COUNT=49
+REGRESSION_FIXTURE_COUNT=58
 CONFIG_ERROR_COUNT=0
 CONFIG_WARNING_COUNT=0
 DEPENDENCY_ERROR_COUNT=0
@@ -425,6 +436,20 @@ FINDING_CRITICAL_COUNT=0
 FINDING_WARNING_COUNT=0
 FULL_NOTIFICATION_BODY=""
 NOTIFICATION_TRUNCATED=0
+NOTIFICATION_JOURNAL_LOADED=0
+NOTIFICATION_LAST_SUCCESS_EPOCH=0
+NOTIFICATION_LAST_SUCCESS_SEVERITY="normal"
+NOTIFICATION_CURRENT_SEVERITY="normal"
+NOTIFICATION_DECISION="SEND"
+NOTIFICATION_REASON="legacy every-run delivery"
+NOTIFICATION_NEW_COUNT=0
+NOTIFICATION_CHANGED_COUNT=0
+NOTIFICATION_RESOLVED_COUNT=0
+NOTIFICATION_RECOVERY_DEFERRED_COUNT=0
+NOTIFICATION_RECOVERY_SECTION=""
+NOTIFICATION_JOURNAL_COMMIT_ALLOWED=0
+NOTIFICATION_DELIVERY_ATTEMPTS=0
+NOTIFICATION_DELIVERY_RC=0
 SUBSYSTEM_SMART_STATE="OK"
 SUBSYSTEM_BTRFS_STATE="Disabled"
 SUBSYSTEM_XFS_STATE="Disabled"
@@ -495,6 +520,7 @@ DEVICE_ID_SCHEMA_FILE="$STATE_DIR/device_identity_schema.version"   # One-time /
 STATE_SCHEMA_MANIFEST_FILE="$STATE_DIR/state_schema.manifest"       # Coordinated persisted-format versions
 REPLACEMENT_EVENTS_FILE="$STATE_DIR/replacement_events.log"         # Drive replacement lifecycle events (alerts context)
 SATA_LINK_HISTORY_FILE="$STATE_DIR/sata_link_downshift_history.log" # SATA link instability events (alert context)
+NOTIFICATION_JOURNAL_FILE="$STATE_DIR/notification_lifecycle.state" # Last successfully delivered canonical finding set
 # --- Trend / Historical Analytics (longer-term forecasting, prioritization, trajectory) ---
 CAPACITY_HISTORY_FILE="$STATE_DIR/capacity_history.log"             # Array & pool capacity history (growth forecast)
 DISK_CAP_HISTORY_FILE="$STATE_DIR/disk_cap_history.log"             # Per-disk capacity history (slot pressure)
@@ -512,7 +538,7 @@ RISK_SCORES_HISTORY_FILE="$STATE_DIR/risk_scores_history.log"       # Historical
 TEMP_HISTORY_FILE="$STATE_DIR/temp_history.log"                     # Temperature samples (rate & exposure)
 SELFTEST_HISTORY_FILE="$STATE_DIR/selftest_events.log"              # SMART self-test lifecycle history (frequency/volatility)
 STATE_FILES_ALERT_RUNTIME=(
-    "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$NVME_STATE_FILE" "$PREV_ATTR_FILE" "$ALERT_NEW_SEEN_FILE" "$RISK_PREV_FILE" "$CMD_TIMEOUT_LAST_FILE" "$XFS_PROC_PREV_FILE" "$BTRFS_DEV_PREV_FILE" "$SYSLOG_CURSOR_STATE_FILE" "$STORAGE_DISCREPANCY_STATE_FILE" "$RISK_SPIKE_FILE" "$REPLACEMENT_EVENTS_FILE" "$SATA_LINK_HISTORY_FILE"
+    "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$NVME_STATE_FILE" "$PREV_ATTR_FILE" "$ALERT_NEW_SEEN_FILE" "$RISK_PREV_FILE" "$CMD_TIMEOUT_LAST_FILE" "$XFS_PROC_PREV_FILE" "$BTRFS_DEV_PREV_FILE" "$SYSLOG_CURSOR_STATE_FILE" "$STORAGE_DISCREPANCY_STATE_FILE" "$RISK_SPIKE_FILE" "$REPLACEMENT_EVENTS_FILE" "$SATA_LINK_HISTORY_FILE" "$NOTIFICATION_JOURNAL_FILE"
 )
 STATE_FILES_TREND_HISTORY=(
     "$CAPACITY_HISTORY_FILE" "$DISK_CAP_HISTORY_FILE" "$SHARE_USAGE_HISTORY_FILE" "$HEAVY_WRITER_HISTORY_FILE" "$RISK_TIER_HISTORY_FILE" "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE" "$XFS_PROC_HISTORY_FILE" "$POH_HISTORY_FILE" "$TBW_HISTORY_FILE" "$TBW_DAYSLEFT_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$RISK_SCORES_HISTORY_FILE" "$TEMP_HISTORY_FILE" "$SELFTEST_HISTORY_FILE"
@@ -1956,31 +1982,77 @@ notify_unraid() {
     # Normalize body for cleaner presentation (collapse multiple blank lines)
     local body_norm
     body_norm=$(printf "%s\n" "$body" | awk '{sub(/[ \t]+$/, "")} NF{print; blank=0; next} !blank{print ""; blank=1}')
-    local rc=0
-    if [ -x "$NOTIFY_BIN" ]; then
-        log_info "Sending notification with $icon title '$title' (critical=$crit_count, warning=$warn_count)"
-        run_bounded_checked "$NOTIFICATION_TIMEOUT_SECONDS" \
-            "Unraid notification helper" \
-            "$NOTIFY_BIN" -s "${title:-Disks Health Monitoring}" \
-            -d "$summary_line" -m "$body_norm" -i "$icon" || rc=$?
-        (( rc != 0 )) && log_warn "Sending notification FAILED - returned non-zero exit $rc; continuing"
-    else
-        # Syslog fallback when notify binary missing
-        log_warn "Sending notification FAILED - notify binary missing, using syslog fallback"
-        if command -v logger >/dev/null 2>&1; then
-            run_bounded_checked "$NOTIFICATION_TIMEOUT_SECONDS" \
-                "Syslog notification summary" logger -t "Disks Health Monitoring" \
-                "${title:-Disks Health Monitoring}: $summary_line" || rc=$?
-            run_bounded_checked "$NOTIFICATION_TIMEOUT_SECONDS" \
-                "Syslog notification body" logger -t "Disks Health Monitoring" \
-                "$body_norm" || rc=$?
-            (( rc != 0 )) && log_warn \
-                "Syslog notification fallback FAILED - returned non-zero exit $rc; continuing"
-        else
-            log_warn "Syslog notification fallback unavailable; logger is missing"
-        fi
+    if [[ ! -x "$NOTIFY_BIN" ]]; then
+        log_warn "Unraid notification helper is unavailable: $NOTIFY_BIN"
+        return 127
     fi
-    return 0
+
+    log_info "Sending notification with $icon title '$title' (critical=$crit_count, warning=$warn_count)"
+    run_bounded_checked "$NOTIFICATION_TIMEOUT_SECONDS" \
+        "Unraid notification helper" \
+        "$NOTIFY_BIN" -s "${title:-Disks Health Monitoring}" \
+        -d "$summary_line" -m "$body_norm" -i "$icon"
+}
+
+# Keep an undelivered notification visible in syslog without treating that
+# observability fallback as a successful Unraid GUI notification.
+log_notification_fallback() {
+    local title="$1" body="$2" rc=0
+
+    if ! command -v logger >/dev/null 2>&1; then
+        log_warn "Notification syslog fallback is unavailable; logger is missing"
+        return 1
+    fi
+    run_bounded_checked "$NOTIFICATION_TIMEOUT_SECONDS" \
+        "Syslog notification summary" logger -t "Disks Health Monitoring" \
+        "${title:-Disks Health Monitoring}: delivery failed" || rc=$?
+    run_bounded_checked "$NOTIFICATION_TIMEOUT_SECONDS" \
+        "Syslog notification body" logger -t "Disks Health Monitoring" \
+        "$body" || rc=$?
+    (( rc == 0 )) || log_warn \
+        "Notification syslog fallback failed with exit $rc"
+    return "$rc"
+}
+
+deliver_notification_with_retry() {
+    local title="$1" body="$2" severity="$3"
+    local attempt rc=1 delay="${NOTIFICATION_RETRY_INITIAL_DELAY_SECONDS:-0}"
+    local maximum_delay="${NOTIFICATION_RETRY_MAX_DELAY_SECONDS:-0}"
+
+    NOTIFICATION_DELIVERY_ATTEMPTS=0
+    NOTIFICATION_DELIVERY_RC=1
+
+    if [[ ! -x "$NOTIFY_BIN" ]]; then
+        notify_unraid "$title" "$body" "$severity" || rc=$?
+        NOTIFICATION_DELIVERY_ATTEMPTS=1
+        NOTIFICATION_DELIVERY_RC="$rc"
+        log_notification_fallback "$title" "$body" || true
+        return "$rc"
+    fi
+
+    for (( attempt=1; attempt<=NOTIFICATION_MAX_ATTEMPTS; attempt++ )); do
+        NOTIFICATION_DELIVERY_ATTEMPTS="$attempt"
+        if notify_unraid "$title" "$body" "$severity"; then
+            NOTIFICATION_DELIVERY_RC=0
+            log "NOTIFY" "INFO" \
+                "Notification delivered successfully on attempt $attempt"
+            return 0
+        else
+            rc=$?
+        fi
+        NOTIFICATION_DELIVERY_RC="$rc"
+        log "NOTIFY" "WARN" \
+            "Notification attempt $attempt/$NOTIFICATION_MAX_ATTEMPTS failed with exit $rc"
+        if (( attempt < NOTIFICATION_MAX_ATTEMPTS && delay > 0 )); then
+            log "NOTIFY" "INFO" "Retrying notification in ${delay}s"
+            sleep "$delay"
+            delay=$((delay * 2))
+            (( delay <= maximum_delay )) || delay="$maximum_delay"
+        fi
+    done
+
+    log_notification_fallback "$title" "$body" || true
+    return "$rc"
 }
 
 # === Helper Functions ===
@@ -6647,6 +6719,299 @@ build_health_alerts() {
     HEALTH_ALERTS_SECTION="$(printf '%s\n' "$rec" | trim_outer_blank_lines)"
 }
 
+# The notification journal contains only stable finding semantics and the last
+# successful delivery time. Volatile evidence (temperatures, counters, usage)
+# is excluded from fingerprints so routine value movement cannot bypass the
+# configured reminder cooldown.
+finding_notification_fingerprint() {
+    local id="$1" payload
+
+    printf -v payload '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+        "$id" \
+        "${FINDING_SEVERITY[$id]:-warning}" \
+        "${FINDING_CATEGORY[$id]:-general}" \
+        "${FINDING_SIGNAL[$id]:-advisory}" \
+        "${FINDING_SCOPE[$id]:-${id%%|*}}" \
+        "${FINDING_TITLE[$id]:-Finding}" \
+        "${FINDING_ACTION[$id]:-Review the related subsystem logs.}"
+    printf '%s' "$payload" | sha1sum | awk '{print $1}'
+}
+
+load_notification_journal() {
+    local line id severity fingerprint label
+    local meta_count=0 finding_count=0 malformed=0
+    local -a fields=()
+
+    NOTIFY_PREV_IDS=()
+    NOTIFY_PREV_SEVERITY=()
+    NOTIFY_PREV_FINGERPRINT=()
+    NOTIFY_PREV_LABEL=()
+    NOTIFICATION_JOURNAL_LOADED=0
+    NOTIFICATION_LAST_SUCCESS_EPOCH=0
+    NOTIFICATION_LAST_SUCCESS_SEVERITY="normal"
+
+    [[ -s "$NOTIFICATION_JOURNAL_FILE" ]] || return 0
+    [[ -r "$NOTIFICATION_JOURNAL_FILE" && -f "$NOTIFICATION_JOURNAL_FILE" &&
+       ! -L "$NOTIFICATION_JOURNAL_FILE" ]] || {
+        log "NOTIFY" "WARN" \
+            "Notification journal is unreadable or unsafe; treating it as uninitialized"
+        return 0
+    }
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ -n "$line" ]] || continue
+        fields=()
+        IFS=$'\t' read -r -a fields <<< "$line"
+        case "${fields[0]:-}" in
+            meta)
+                if (( ${#fields[@]} != 4 || meta_count != 0 )) ||
+                   [[ "${fields[1]:-}" != "1" ||
+                      ! "${fields[2]:-}" =~ ^[0-9]+$ ]] ||
+                   [[ ! "${fields[3]:-}" =~ ^(normal|warning|critical)$ ]]
+                then
+                    malformed=1
+                    break
+                fi
+                meta_count=1
+                NOTIFICATION_LAST_SUCCESS_EPOCH="${fields[2]}"
+                NOTIFICATION_LAST_SUCCESS_SEVERITY="${fields[3]}"
+                ;;
+            finding)
+                if (( ${#fields[@]} != 5 )) ||
+                   [[ -z "${fields[1]:-}" ||
+                      ! "${fields[2]:-}" =~ ^(warning|critical)$ ||
+                      ! "${fields[3]:-}" =~ ^[0-9a-f]{40}$ ||
+                      -z "${fields[4]:-}" ]]
+                then
+                    malformed=1
+                    break
+                fi
+                id="${fields[1]}"
+                severity="${fields[2]}"
+                fingerprint="${fields[3]}"
+                label="${fields[4]}"
+                if [[ -n "${NOTIFY_PREV_FINGERPRINT[$id]+present}" ]]; then
+                    malformed=1
+                    break
+                fi
+                NOTIFY_PREV_IDS+=("$id")
+                NOTIFY_PREV_SEVERITY[$id]="$severity"
+                NOTIFY_PREV_FINGERPRINT[$id]="$fingerprint"
+                NOTIFY_PREV_LABEL[$id]="$label"
+                finding_count=$((finding_count + 1))
+                ;;
+            *)
+                malformed=1
+                break
+                ;;
+        esac
+    done < "$NOTIFICATION_JOURNAL_FILE"
+
+    if (( malformed == 1 || meta_count != 1 )); then
+        NOTIFY_PREV_IDS=()
+        NOTIFY_PREV_SEVERITY=()
+        NOTIFY_PREV_FINGERPRINT=()
+        NOTIFY_PREV_LABEL=()
+        NOTIFICATION_LAST_SUCCESS_EPOCH=0
+        NOTIFICATION_LAST_SUCCESS_SEVERITY="normal"
+        log "NOTIFY" "WARN" \
+            "Notification journal is malformed; treating it as uninitialized"
+        return 0
+    fi
+
+    NOTIFICATION_JOURNAL_LOADED=1
+    log "NOTIFY" "INFO" \
+        "Loaded notification journal ($finding_count finding(s), last success epoch=$NOTIFICATION_LAST_SUCCESS_EPOCH)"
+}
+
+build_current_notification_state() {
+    local id fingerprint label
+
+    NOTIFY_CURRENT_SEVERITY=()
+    NOTIFY_CURRENT_FINGERPRINT=()
+    NOTIFY_CURRENT_LABEL=()
+
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        if [[ "$id" == *$'\t'* || "$id" == *$'\r'* || "$id" == *$'\n'* ]]; then
+            log "NOTIFY" "WARN" \
+                "Refusing a finding ID containing notification-journal delimiters"
+            return 1
+        fi
+        fingerprint="$(finding_notification_fingerprint "$id")" || return 1
+        [[ "$fingerprint" =~ ^[0-9a-f]{40}$ ]] || return 1
+        set_finding_target_label "$id"
+        label="$FINDING_TARGET_LABEL_RESULT — ${FINDING_TITLE[$id]:-Finding}"
+        label="${label//$'\t'/ }"
+        label="${label//$'\r'/ }"
+        label="${label//$'\n'/ }"
+        NOTIFY_CURRENT_SEVERITY[$id]="${FINDING_SEVERITY[$id]:-warning}"
+        NOTIFY_CURRENT_FINGERPRINT[$id]="$fingerprint"
+        NOTIFY_CURRENT_LABEL[$id]="$label"
+    done < <(emit_sorted_finding_ids)
+
+    if (( FINDING_CRITICAL_COUNT > 0 )); then
+        NOTIFICATION_CURRENT_SEVERITY="critical"
+    elif (( FINDING_WARNING_COUNT > 0 )); then
+        NOTIFICATION_CURRENT_SEVERITY="warning"
+    else
+        NOTIFICATION_CURRENT_SEVERITY="normal"
+    fi
+}
+
+notification_reminder_due() {
+    local interval_hours="$1" now="$2" elapsed
+
+    (( interval_hours > 0 )) || return 1
+    elapsed=$((now - NOTIFICATION_LAST_SUCCESS_EPOCH))
+    (( elapsed < 0 )) && elapsed=0
+    (( elapsed >= interval_hours * 3600 ))
+}
+
+prepare_notification_lifecycle() {
+    local id now interval_hours safe_state=0
+    local recovery_rows=""
+
+    NOTIFICATION_DECISION="SUPPRESS"
+    NOTIFICATION_REASON="unchanged state within reminder cooldown"
+    NOTIFICATION_NEW_COUNT=0
+    NOTIFICATION_CHANGED_COUNT=0
+    NOTIFICATION_RESOLVED_COUNT=0
+    NOTIFICATION_RECOVERY_DEFERRED_COUNT=0
+    NOTIFICATION_RECOVERY_SECTION=""
+    NOTIFICATION_JOURNAL_COMMIT_ALLOWED=0
+
+    build_current_notification_state || {
+        NOTIFICATION_DECISION="SEND"
+        NOTIFICATION_REASON="unable to fingerprint current findings"
+        log "NOTIFY" "WARN" "$NOTIFICATION_REASON; journal update disabled"
+        return 1
+    }
+    load_notification_journal
+    if all_collectors_state_safe; then
+        safe_state=1
+        NOTIFICATION_JOURNAL_COMMIT_ALLOWED=1
+    fi
+
+    for id in "${!NOTIFY_CURRENT_FINGERPRINT[@]}"; do
+        if [[ -z "${NOTIFY_PREV_FINGERPRINT[$id]+present}" ]]; then
+            NOTIFICATION_NEW_COUNT=$((NOTIFICATION_NEW_COUNT + 1))
+        elif [[ "${NOTIFY_CURRENT_FINGERPRINT[$id]}" != \
+                "${NOTIFY_PREV_FINGERPRINT[$id]}" ]]
+        then
+            NOTIFICATION_CHANGED_COUNT=$((NOTIFICATION_CHANGED_COUNT + 1))
+        fi
+    done
+
+    for id in "${NOTIFY_PREV_IDS[@]}"; do
+        [[ -z "${NOTIFY_CURRENT_FINGERPRINT[$id]+present}" ]] || continue
+        if (( safe_state == 1 )); then
+            NOTIFICATION_RESOLVED_COUNT=$((NOTIFICATION_RESOLVED_COUNT + 1))
+            recovery_rows+=" - [${NOTIFY_PREV_SEVERITY[$id]^^}] ${NOTIFY_PREV_LABEL[$id]}"$'\n'
+        else
+            NOTIFICATION_RECOVERY_DEFERRED_COUNT=$((NOTIFICATION_RECOVERY_DEFERRED_COUNT + 1))
+        fi
+    done
+    if (( NOTIFICATION_RESOLVED_COUNT > 0 )); then
+        NOTIFICATION_RECOVERY_SECTION="Resolved Since Last Successful Notification:
+${recovery_rows%$'\n'}"
+    fi
+
+    now="${RUN_EPOCH:-0}"
+    (( now > 0 )) || now="$(date +%s)"
+
+    if (( NOTIFICATION_LIFECYCLE_ENABLED == 0 )); then
+        NOTIFICATION_DECISION="SEND"
+        NOTIFICATION_REASON="notification lifecycle suppression disabled"
+    elif (( NOTIFICATION_JOURNAL_LOADED == 0 )); then
+        NOTIFICATION_DECISION="SEND"
+        NOTIFICATION_REASON="initial notification baseline"
+    elif (( NOTIFICATION_NEW_COUNT > 0 || NOTIFICATION_CHANGED_COUNT > 0 )); then
+        NOTIFICATION_DECISION="SEND"
+        NOTIFICATION_REASON="finding set changed (new=$NOTIFICATION_NEW_COUNT changed=$NOTIFICATION_CHANGED_COUNT resolved=$NOTIFICATION_RESOLVED_COUNT)"
+    elif (( NOTIFICATION_RESOLVED_COUNT > 0 )); then
+        NOTIFICATION_DECISION="SEND"
+        NOTIFICATION_REASON="$NOTIFICATION_RESOLVED_COUNT finding(s) resolved"
+    elif (( NOTIFICATION_RECOVERY_DEFERRED_COUNT > 0 &&
+            ${#NOTIFY_CURRENT_FINGERPRINT[@]} == 0 )); then
+        NOTIFICATION_REASON="recovery deferred because collector state is incomplete"
+    else
+        case "$NOTIFICATION_CURRENT_SEVERITY" in
+            critical) interval_hours="$NOTIFICATION_CRITICAL_REMINDER_HOURS" ;;
+            warning)  interval_hours="$NOTIFICATION_WARNING_REMINDER_HOURS" ;;
+            *)        interval_hours="$NOTIFICATION_OK_REMINDER_HOURS" ;;
+        esac
+        if notification_reminder_due "$interval_hours" "$now"; then
+            NOTIFICATION_DECISION="SEND"
+            NOTIFICATION_REASON="unchanged $NOTIFICATION_CURRENT_SEVERITY reminder is due"
+        elif (( interval_hours == 0 )); then
+            NOTIFICATION_REASON="unchanged $NOTIFICATION_CURRENT_SEVERITY reminders disabled"
+        fi
+    fi
+
+    log "NOTIFY" "INFO" \
+        "Lifecycle decision=$NOTIFICATION_DECISION reason='$NOTIFICATION_REASON' new=$NOTIFICATION_NEW_COUNT changed=$NOTIFICATION_CHANGED_COUNT resolved=$NOTIFICATION_RESOLVED_COUNT deferred_recovery=$NOTIFICATION_RECOVERY_DEFERRED_COUNT"
+    return 0
+}
+
+persist_notification_journal() {
+    local temp_file id label persisted_epoch="${RUN_EPOCH:-0}"
+
+    temp_file="$(state_temp_file "$NOTIFICATION_JOURNAL_FILE")" || return 1
+    (( persisted_epoch > 0 )) || persisted_epoch="$(date +%s)"
+    printf 'meta\t1\t%s\t%s\n' \
+        "$persisted_epoch" "$NOTIFICATION_CURRENT_SEVERITY" > "$temp_file" || {
+        rm -f -- "$temp_file" 2>/dev/null || true
+        return 1
+    }
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        label="${NOTIFY_CURRENT_LABEL[$id]}"
+        printf 'finding\t%s\t%s\t%s\t%s\n' \
+            "$id" "${NOTIFY_CURRENT_SEVERITY[$id]}" \
+            "${NOTIFY_CURRENT_FINGERPRINT[$id]}" "$label" >> "$temp_file" || {
+            rm -f -- "$temp_file" 2>/dev/null || true
+            return 1
+        }
+    done < <(emit_sorted_finding_ids)
+    atomic_commit "$temp_file" "$NOTIFICATION_JOURNAL_FILE"
+}
+
+process_notification_delivery() {
+    local title="$1" body="$2" severity="$3"
+
+    if [[ "$NOTIFICATION_DECISION" == "SUPPRESS" ]]; then
+        log "NOTIFY" "INFO" \
+            "External notification suppressed: $NOTIFICATION_REASON"
+        return 0
+    fi
+    if (( NOTIFICATION_DRY_RUN == 1 )); then
+        log "NOTIFY" "INFO" \
+            "Dry run: would send '$title' (severity=$severity); journal unchanged"
+        return 0
+    fi
+
+    if deliver_notification_with_retry "$title" "$body" "$severity"; then
+        if (( NOTIFICATION_JOURNAL_COMMIT_ALLOWED == 1 )); then
+            if persist_notification_journal; then
+                log "NOTIFY" "INFO" \
+                    "Notification journal advanced after successful delivery"
+            else
+                log "NOTIFY" "WARN" \
+                    "Notification delivered but journal update failed; the next run may repeat it"
+            fi
+        else
+            log "NOTIFY" "WARN" \
+                "Notification delivered but journal was preserved because collector state is incomplete"
+        fi
+    else
+        log "NOTIFY" "ERROR" \
+            "Notification delivery failed after $NOTIFICATION_DELIVERY_ATTEMPTS attempt(s); journal unchanged"
+    fi
+    return 0
+}
+
 # Trend stages intentionally communicate through the structured globals used
 # by risk evaluation and final rendering. Each stage otherwise owns its local
 # parsing state and can fail independently.
@@ -7936,12 +8301,19 @@ build_trend_section() {
 # === Helper Function ===
 # Build notification subject line
 build_subject() {
-    if (( FINDING_CRITICAL_COUNT > 0 )); then
+    if (( FINDING_CRITICAL_COUNT == 0 && FINDING_WARNING_COUNT == 0 &&
+          NOTIFICATION_RESOLVED_COUNT > 0 )); then
+        SUBJECT="Disks Health — RECOVERED (${NOTIFICATION_RESOLVED_COUNT})"
+    elif (( FINDING_CRITICAL_COUNT > 0 )); then
         SUBJECT="Disks Health — CRITICAL (${FINDING_CRITICAL_COUNT})"
     elif (( FINDING_WARNING_COUNT > 0 )); then
         SUBJECT="Disks Health — WARNING (${FINDING_WARNING_COUNT})"
     else
         SUBJECT="Disks Health — OK"
+    fi
+    if (( NOTIFICATION_RESOLVED_COUNT > 0 &&
+          (FINDING_CRITICAL_COUNT > 0 || FINDING_WARNING_COUNT > 0) )); then
+        SUBJECT+=" — ${NOTIFICATION_RESOLVED_COUNT} recovered"
     fi
 }
 
@@ -9197,6 +9569,7 @@ compose_notification() {
     add_notification_section "${STORAGE_TOP_LINES:-}"
     # Actionable findings are deliberately placed before verbose per-device
     # details so they remain visible if the body reaches its configured limit.
+    add_notification_section "${NOTIFICATION_RECOVERY_SECTION:-}"
     add_notification_section "${HEALTH_ALERTS_SECTION:-}"
     add_notification_section "${COLLECTOR_STATUS_SECTION:-}"
     add_notification_section "${DISK_HEALTH_SUMMARY:-}"
@@ -9568,6 +9941,7 @@ validate_configuration() {
         SHOW_DISABLED_SUBSYSTEMS VERBOSE_OK SHOW_ZERO_COUNTS
         WEAR_TREND_ENABLED ENABLE_MODEL_IN_ALERTS
         LOG_FULL_NOTIFICATION_ON_TRUNCATION COLLECTOR_FAILURE_NOTIFICATIONS
+        NOTIFICATION_LIFECYCLE_ENABLED NOTIFICATION_DRY_RUN
     )
     local -a integer_settings=(
         SHORT_TEST_INTERVAL_DAYS SHORT_TEST_MAX_WAIT SHORT_TEST_POLL_INTERVAL
@@ -9628,6 +10002,9 @@ validate_configuration() {
         XFS_REPAIR_TIMEOUT_SECONDS SYSTEM_COMMAND_TIMEOUT_SECONDS
         SHARE_SCAN_TIMEOUT_SECONDS NOTIFICATION_TIMEOUT_SECONDS
         COMMAND_KILL_GRACE_SECONDS COLLECTOR_SLOW_SECONDS
+        NOTIFICATION_WARNING_REMINDER_HOURS NOTIFICATION_CRITICAL_REMINDER_HOURS
+        NOTIFICATION_OK_REMINDER_HOURS NOTIFICATION_MAX_ATTEMPTS
+        NOTIFICATION_RETRY_INITIAL_DELAY_SECONDS NOTIFICATION_RETRY_MAX_DELAY_SECONDS
     )
     local -a number_settings=(
         STORAGE_DISCREPANCY_MIN_DIFF ENDURANCE_DAYSLEFT_ACCEL_MIN_DELTA
@@ -9651,6 +10028,7 @@ validate_configuration() {
         SMARTCTL_TIMEOUT_SECONDS BTRFS_COMMAND_TIMEOUT_SECONDS
         XFS_REPAIR_TIMEOUT_SECONDS SYSTEM_COMMAND_TIMEOUT_SECONDS
         SHARE_SCAN_TIMEOUT_SECONDS NOTIFICATION_TIMEOUT_SECONDS COMMAND_KILL_GRACE_SECONDS
+        NOTIFICATION_MAX_ATTEMPTS
     )
     local -a ordered_pairs=(
         LONG_TEST_MIN_INTERVAL_DAYS:LONG_TEST_MAX_INTERVAL_DAYS
@@ -9681,6 +10059,7 @@ validate_configuration() {
         BURST_WARN_BOOST:BURST_CRIT_BOOST HDD_POH_WARN_HOURS:HDD_POH_CRIT_HOURS
         SSD_POH_WARN_HOURS:SSD_POH_CRIT_HOURS NVME_POH_WARN_HOURS:NVME_POH_CRIT_HOURS
         TBW_DAYS_CRIT:TBW_DAYS_WARN TBW_CONSUMED_WARN:TBW_CONSUMED_CRIT
+        NOTIFICATION_RETRY_INITIAL_DELAY_SECONDS:NOTIFICATION_RETRY_MAX_DELAY_SECONDS
     )
 
     for setting in "${boolean_settings[@]}"; do
@@ -9806,18 +10185,24 @@ validate_runtime_dependencies() {
     DEPENDENCY_ERROR_COUNT=0
     DEPENDENCY_WARNING_COUNT=0
 
-    if [[ "$mode" == "self-test" ]]; then
-        required_commands=(
-            awk cut date grep mkdir mktemp mv rm sed sha1sum sleep sort stat
-            timeout tr wc
-        )
-    else
-        required_commands=(
-            awk basename cat cksum cp cut date df dirname dmesg find findmnt
-            flock grep head lsblk mkdir mktemp mount mountpoint mv readlink rm
-            sed sha1sum sleep smartctl sort stat tail timeout tr wc
-        )
-    fi
+    case "$mode" in
+        self-test)
+            required_commands=(
+                awk chmod cut date grep mkdir mktemp mv rm sed sha1sum sleep
+                sort stat timeout tr wc
+            )
+            ;;
+        notification-test)
+            required_commands=(awk date flock grep sed sleep timeout)
+            ;;
+        *)
+            required_commands=(
+                awk basename cat cksum cp cut date df dirname dmesg find findmnt
+                flock grep head lsblk mkdir mktemp mount mountpoint mv readlink rm
+                sed sha1sum sleep smartctl sort stat tail timeout tr wc
+            )
+            ;;
+    esac
 
     for command_name in "${required_commands[@]}"; do
         command -v "$command_name" >/dev/null 2>&1 ||
@@ -9830,7 +10215,7 @@ validate_runtime_dependencies() {
         dependency_error "GNU-compatible timeout with --kill-after support is required"
     fi
 
-    if [[ "$mode" != "self-test" ]]; then
+    if [[ "$mode" == "monitor" || "$mode" == "diagnostics" ]]; then
         if [[ "${ENABLE_BTRFS_SCRUB:-0}" == "1" ||
               "${FIRST_RUN_FORCE:-0}" == "1" ||
               "${ENABLE_BTRFS_DEVICE_STATS:-0}" == "1" ||
@@ -9846,11 +10231,6 @@ validate_runtime_dependencies() {
         fi
         command -v hdparm >/dev/null 2>&1 ||
             dependency_warning "hdparm is unavailable; standby detection will use smartctl -n"
-        if [[ ! -x "$NOTIFY_BIN" ]] && ! command -v logger >/dev/null 2>&1; then
-            dependency_warning \
-                "Neither the Unraid notify helper nor logger is available; notifications cannot be delivered"
-        fi
-
         if command -v date >/dev/null 2>&1 &&
            [[ "$(date -d '1970-01-02 00:00:00 UTC' +%s 2>/dev/null || true)" != "86400" ]]
         then
@@ -9873,6 +10253,14 @@ validate_runtime_dependencies() {
         fi
     fi
 
+    if [[ "$mode" == "monitor" || "$mode" == "diagnostics" ||
+          "$mode" == "notification-test" ]] &&
+       [[ ! -x "$NOTIFY_BIN" ]]
+    then
+        dependency_warning \
+            "Unraid notification helper is unavailable; logger is observability-only and cannot confirm delivery"
+    fi
+
     if (( DEPENDENCY_ERROR_COUNT > 0 )); then
         log "DEPENDENCY" "ERROR" \
             "Dependency validation failed with $DEPENDENCY_ERROR_COUNT error(s) and $DEPENDENCY_WARNING_COUNT warning(s)"
@@ -9892,12 +10280,19 @@ Usage:
   health_monitoring.sh --state-status  Inspect state-schema compatibility
   health_monitoring.sh --diagnostics   Run read-only environment diagnostics
   health_monitoring.sh --self-test     Run built-in regression fixtures in /tmp
+  health_monitoring.sh --test-notification
+                                       Send one notification without monitoring or state changes
+  health_monitoring.sh --notification-dry-run
+                                       Run monitoring but skip delivery and notification-journal changes
   health_monitoring.sh --version       Print the script version
   health_monitoring.sh --help          Show this help
 
-The four validation modes do not run SMART commands against disks, start
-tests or scrubs, write monitoring state, advance the syslog cursor, send
-notifications, or spin up disks.
+The configuration, state-status, diagnostics, and self-test modes do not run
+SMART commands against disks, start tests or scrubs, write monitoring state,
+advance the syslog cursor, send notifications, or spin up disks. The explicit
+notification test sends only its fixed test message. Notification dry-run is a
+normal monitoring run: only external delivery and notification-journal updates
+are skipped.
 USAGE
 }
 
@@ -9912,6 +10307,11 @@ parse_arguments() {
         --state-status) RUN_MODE="state-status" ;;
         --diagnostics)  RUN_MODE="diagnostics" ;;
         --self-test)    RUN_MODE="self-test" ;;
+        --test-notification) RUN_MODE="test-notification" ;;
+        --notification-dry-run)
+            RUN_MODE="monitor"
+            NOTIFICATION_DRY_RUN=1
+            ;;
         --version)      RUN_MODE="version" ;;
         --help|-h)      RUN_MODE="help" ;;
         *)
@@ -10015,7 +10415,8 @@ run_diagnostics() {
         diagnostic_result PASS "Unraid notification" "$NOTIFY_BIN is executable"
     elif command -v logger >/dev/null 2>&1; then
         warnings=$((warnings + 1))
-        diagnostic_result WARN "Unraid notification" "notify helper missing; logger fallback is available"
+        diagnostic_result WARN "Unraid notification" \
+            "notify helper missing; logger fallback is observability-only"
     else
         warnings=$((warnings + 1))
         diagnostic_result WARN "Unraid notification" "notify helper and logger are unavailable"
@@ -10090,7 +10491,7 @@ run_regression_tests() (
     fi
 
     if declare -F load_builtin_defaults >/dev/null 2>&1 &&
-       [[ "$SCRIPT_VERSION" == "2.13" &&
+       [[ "$SCRIPT_VERSION" == "2.14" &&
           "$STATE_SCHEMA_VERSION" == "1" &&
           "$HISTORY_SCHEMA_VERSION" == "3" &&
           "$DEVICE_ID_SCHEMA_VERSION" == "2" &&
@@ -10767,6 +11168,233 @@ run_regression_tests() (
             "truncated=$NOTIFICATION_TRUNCATED chars=$actual lines=$count"
     fi
 
+    local notification_dir="$fixture_dir/notification-lifecycle"
+    local notification_id="global|fixture_notification"
+    local notification_fingerprint journal_before journal_after
+    mkdir -p "$notification_dir"
+    NOTIFICATION_JOURNAL_FILE="$notification_dir/lifecycle.state"
+    COLLECTOR_ORDER=()
+    COLLECTOR_STATUS=()
+    RISK_MAP=()
+    NOTIFICATION_LIFECYCLE_ENABLED=1
+    NOTIFICATION_WARNING_REMINDER_HOURS=24
+    NOTIFICATION_CRITICAL_REMINDER_HOURS=6
+    NOTIFICATION_OK_REMINDER_HOURS=168
+    NOTIFICATION_DRY_RUN=0
+
+    fixture_notification_finding() {
+        local severity="$1"
+
+        FINDING_IDS=("$notification_id")
+        FINDING_SEEN=()
+        FINDING_SEVERITY=()
+        FINDING_CATEGORY=()
+        FINDING_SIGNAL=()
+        FINDING_DEVICE=()
+        FINDING_SCOPE=()
+        FINDING_TITLE=()
+        FINDING_EVIDENCE=()
+        FINDING_ACTION=()
+        FINDING_SEEN[$notification_id]=1
+        FINDING_SEVERITY[$notification_id]="$severity"
+        FINDING_CATEGORY[$notification_id]="monitoring"
+        FINDING_SIGNAL[$notification_id]="monitoring.fixture"
+        FINDING_DEVICE[$notification_id]=""
+        FINDING_SCOPE[$notification_id]="global"
+        FINDING_TITLE[$notification_id]="Fixture notification"
+        FINDING_EVIDENCE[$notification_id]="volatile counter=1"
+        FINDING_ACTION[$notification_id]="Review the fixture."
+        finalize_finding_counts
+    }
+
+    fixture_clear_notification_findings() {
+        FINDING_IDS=()
+        FINDING_SEEN=()
+        FINDING_SEVERITY=()
+        FINDING_CATEGORY=()
+        FINDING_SIGNAL=()
+        FINDING_DEVICE=()
+        FINDING_SCOPE=()
+        FINDING_TITLE=()
+        FINDING_EVIDENCE=()
+        FINDING_ACTION=()
+        finalize_finding_counts
+    }
+
+    fixture_notification_finding warning
+    RUN_EPOCH=1787000000
+    build_current_notification_state
+    notification_fingerprint="${NOTIFY_CURRENT_FINGERPRINT[$notification_id]:-}"
+    if persist_notification_journal && load_notification_journal &&
+       (( NOTIFICATION_JOURNAL_LOADED == 1 )) &&
+       [[ "${NOTIFY_PREV_FINGERPRINT[$notification_id]:-}" == \
+          "$notification_fingerprint" &&
+          "${NOTIFY_PREV_LABEL[$notification_id]:-}" == \
+          "Monitoring — Fixture notification" ]]
+    then
+        self_test_result 1 "Atomic notification journal round-trip"
+    else
+        self_test_result 0 "Atomic notification journal round-trip"
+    fi
+
+    printf 'meta\t1\tinvalid\twarning\n' > "$NOTIFICATION_JOURNAL_FILE"
+    load_notification_journal
+    if (( NOTIFICATION_JOURNAL_LOADED == 0 &&
+          ${#NOTIFY_PREV_FINGERPRINT[@]} == 0 )); then
+        self_test_result 1 "Malformed notification journal rejection"
+    else
+        self_test_result 0 "Malformed notification journal rejection"
+    fi
+
+    : > "$NOTIFICATION_JOURNAL_FILE"
+    RUN_EPOCH=1787000100
+    prepare_notification_lifecycle
+    if [[ "$NOTIFICATION_DECISION" == "SEND" &&
+          "$NOTIFICATION_REASON" == "initial notification baseline" &&
+          "$NOTIFICATION_JOURNAL_COMMIT_ALLOWED" == "1" ]]
+    then
+        self_test_result 1 "Initial notification lifecycle baseline"
+    else
+        self_test_result 0 "Initial notification lifecycle baseline" \
+            "decision=$NOTIFICATION_DECISION reason=$NOTIFICATION_REASON"
+    fi
+
+    RUN_EPOCH=1787000200
+    build_current_notification_state
+    persist_notification_journal
+    RUN_EPOCH=$((RUN_EPOCH + 3600))
+    prepare_notification_lifecycle
+    if [[ "$NOTIFICATION_DECISION" == "SUPPRESS" &&
+          "$NOTIFICATION_NEW_COUNT" == "0" &&
+          "$NOTIFICATION_CHANGED_COUNT" == "0" ]]
+    then
+        self_test_result 1 "Unchanged warning cooldown suppression"
+    else
+        self_test_result 0 "Unchanged warning cooldown suppression" \
+            "decision=$NOTIFICATION_DECISION reason=$NOTIFICATION_REASON"
+    fi
+
+    fixture_notification_finding critical
+    RUN_EPOCH=1787000300
+    build_current_notification_state
+    persist_notification_journal
+    RUN_EPOCH=$((RUN_EPOCH + NOTIFICATION_CRITICAL_REMINDER_HOURS * 3600))
+    prepare_notification_lifecycle
+    if [[ "$NOTIFICATION_DECISION" == "SEND" &&
+          "$NOTIFICATION_REASON" == *"critical reminder is due"* ]]
+    then
+        self_test_result 1 "Critical finding reminder deadline"
+    else
+        self_test_result 0 "Critical finding reminder deadline" \
+            "decision=$NOTIFICATION_DECISION reason=$NOTIFICATION_REASON"
+    fi
+
+    fixture_notification_finding warning
+    RUN_EPOCH=1787000400
+    build_current_notification_state
+    persist_notification_journal
+    fixture_clear_notification_findings
+    RUN_EPOCH=$((RUN_EPOCH + 60))
+    prepare_notification_lifecycle
+    build_subject
+    if [[ "$NOTIFICATION_DECISION" == "SEND" &&
+          "$NOTIFICATION_RESOLVED_COUNT" == "1" &&
+          "$NOTIFICATION_RECOVERY_SECTION" == *"Fixture notification"* &&
+          "$SUBJECT" == "Disks Health — RECOVERED (1)" ]]
+    then
+        self_test_result 1 "Resolved finding notification rendering"
+    else
+        self_test_result 0 "Resolved finding notification rendering" \
+            "decision=$NOTIFICATION_DECISION resolved=$NOTIFICATION_RESOLVED_COUNT subject=$SUBJECT"
+    fi
+
+    fixture_notification_finding warning
+    RUN_EPOCH=1787000500
+    build_current_notification_state
+    persist_notification_journal
+    fixture_clear_notification_findings
+    COLLECTOR_ORDER=(fixture_incomplete)
+    COLLECTOR_STATUS=([fixture_incomplete]="FAILED")
+    RUN_EPOCH=$((RUN_EPOCH + 60))
+    prepare_notification_lifecycle
+    if [[ "$NOTIFICATION_DECISION" == "SUPPRESS" &&
+          "$NOTIFICATION_RESOLVED_COUNT" == "0" &&
+          "$NOTIFICATION_RECOVERY_DEFERRED_COUNT" == "1" &&
+          "$NOTIFICATION_JOURNAL_COMMIT_ALLOWED" == "0" ]]
+    then
+        self_test_result 1 "Incomplete collector blocks false recovery"
+    else
+        self_test_result 0 "Incomplete collector blocks false recovery" \
+            "decision=$NOTIFICATION_DECISION resolved=$NOTIFICATION_RESOLVED_COUNT deferred=$NOTIFICATION_RECOVERY_DEFERRED_COUNT"
+    fi
+
+    local fake_bin_dir="$notification_dir/bin"
+    local retry_notify="$fake_bin_dir/retry-notify"
+    local failed_notify="$fake_bin_dir/failed-notify"
+    local dry_notify="$fake_bin_dir/dry-notify"
+    mkdir -p "$fake_bin_dir"
+    # These single-quoted strings deliberately create a child-shell fixture.
+    # shellcheck disable=SC2016
+    printf '%s\n' \
+        '#!/bin/bash' \
+        'counter="${0}.count"' \
+        'count=0' \
+        '[[ -f "$counter" ]] && read -r count < "$counter"' \
+        'count=$((count + 1))' \
+        'printf "%s\\n" "$count" > "$counter"' \
+        '(( count >= 2 ))' > "$retry_notify"
+    printf '%s\n' '#!/bin/bash' 'exit 9' > "$failed_notify"
+    # shellcheck disable=SC2016
+    printf '%s\n' \
+        '#!/bin/bash' \
+        'printf "called\\n" >> "${0}.count"' \
+        'exit 0' > "$dry_notify"
+    printf '%s\n' '#!/bin/bash' 'exit 0' > "$fake_bin_dir/logger"
+    chmod 700 "$retry_notify" "$failed_notify" "$dry_notify" "$fake_bin_dir/logger"
+    PATH="$fake_bin_dir:$PATH"
+    NOTIFICATION_MAX_ATTEMPTS=3
+    NOTIFICATION_RETRY_INITIAL_DELAY_SECONDS=0
+    NOTIFICATION_RETRY_MAX_DELAY_SECONDS=0
+    NOTIFY_BIN="$retry_notify"
+    if deliver_notification_with_retry "Fixture retry" "Fixture body" warning &&
+       [[ "$NOTIFICATION_DELIVERY_ATTEMPTS" == "2" &&
+          "$(<"${retry_notify}.count")" == "2" ]]
+    then
+        self_test_result 1 "Bounded notification retry recovery"
+    else
+        self_test_result 0 "Bounded notification retry recovery" \
+            "attempts=$NOTIFICATION_DELIVERY_ATTEMPTS rc=$NOTIFICATION_DELIVERY_RC"
+    fi
+
+    printf 'known-good-journal\n' > "$NOTIFICATION_JOURNAL_FILE"
+    journal_before="$(sha1sum "$NOTIFICATION_JOURNAL_FILE" | awk '{print $1}')"
+    NOTIFY_BIN="$failed_notify"
+    NOTIFICATION_MAX_ATTEMPTS=2
+    # This fixture runs inside run_regression_tests()' isolated subshell.
+    # shellcheck disable=SC2030
+    NOTIFICATION_DECISION="SEND"
+    NOTIFICATION_JOURNAL_COMMIT_ALLOWED=1
+    NOTIFICATION_DRY_RUN=0
+    process_notification_delivery "Fixture failure" "Fixture body" warning
+    journal_after="$(sha1sum "$NOTIFICATION_JOURNAL_FILE" | awk '{print $1}')"
+    local failure_preserved=0 dry_run_preserved=0
+    [[ "$journal_before" == "$journal_after" &&
+       "$NOTIFICATION_DELIVERY_ATTEMPTS" == "2" ]] && failure_preserved=1
+
+    NOTIFY_BIN="$dry_notify"
+    NOTIFICATION_DRY_RUN=1
+    process_notification_delivery "Fixture dry run" "Fixture body" warning
+    journal_after="$(sha1sum "$NOTIFICATION_JOURNAL_FILE" | awk '{print $1}')"
+    [[ ! -e "${dry_notify}.count" && "$journal_before" == "$journal_after" ]] &&
+        dry_run_preserved=1
+    if (( failure_preserved == 1 && dry_run_preserved == 1 )); then
+        self_test_result 1 "Failed/dry-run delivery preserves notification journal"
+    else
+        self_test_result 0 "Failed/dry-run delivery preserves notification journal" \
+            "failure_preserved=$failure_preserved dry_run_preserved=$dry_run_preserved"
+    fi
+    NOTIFICATION_DRY_RUN=0
+
     COLLECTOR_EVENT_FILE="$fixture_dir/collector_events.tsv"
     : > "$COLLECTOR_EVENT_FILE"
     CURRENT_COLLECTOR="timeout_fixture"
@@ -10940,6 +11568,30 @@ collect_endurance_phase() {
     return 0
 }
 
+run_notification_test() {
+    local rc
+
+    validate_configuration || return 1
+    validate_runtime_dependencies notification-test || return 1
+    acquire_lock || return 1
+
+    printf 'Sending one Unraid notification test; no monitoring or state writes will occur.\n'
+    if deliver_notification_with_retry \
+        "Disk Health Monitor v${SCRIPT_VERSION} — Notification Test" \
+        "Notification delivery test completed at $(date '+%Y-%m-%d %H:%M:%S').\nNo SMART reads, tests, scrubs, cursor updates, or monitoring-state writes were performed." \
+        normal
+    then
+        printf 'Notification test delivered successfully in %d attempt(s).\n' \
+            "$NOTIFICATION_DELIVERY_ATTEMPTS"
+        return 0
+    else
+        rc=$?
+        printf 'Notification test failed after %d attempt(s), exit=%d.\n' \
+            "$NOTIFICATION_DELIVERY_ATTEMPTS" "$rc" >&2
+        return "$rc"
+    fi
+}
+
 
 main() {
     local exit_code
@@ -10974,6 +11626,10 @@ main() {
             validate_configuration || return 1
             validate_runtime_dependencies self-test || return 1
             run_regression_tests
+            return $?
+            ;;
+        test-notification)
+            run_notification_test
             return $?
             ;;
     esac
@@ -11045,13 +11701,19 @@ main() {
     persist_risk_tier_history
     build_health_alerts
     build_subsystem_lines
+    prepare_notification_lifecycle || true
     build_subject
     compose_notification
 
-    log "NOTIFY" "INFO" \
-        "Sending consolidated notification (severity=$FINAL_NOTIFICATION_SEVERITY, critical=$FINDING_CRITICAL_COUNT, warning=$FINDING_WARNING_COUNT)"
+    # ShellCheck sees the isolated self-test subshell's assignment above; the
+    # production lifecycle decision is set in this main shell.
     # shellcheck disable=SC2031
-    notify_unraid \
+    log "NOTIFY" "INFO" \
+        "Processing consolidated notification (decision=$NOTIFICATION_DECISION, severity=$FINAL_NOTIFICATION_SEVERITY, critical=$FINDING_CRITICAL_COUNT, warning=$FINDING_WARNING_COUNT, resolved=$NOTIFICATION_RESOLVED_COUNT)"
+    # Notification composition is intentionally performed in the main shell;
+    # ShellCheck cannot infer that through every helper call above.
+    # shellcheck disable=SC2031
+    process_notification_delivery \
         "${SUBJECT:-Disk Health Summary}" \
         "$NOTIFY_BODY" \
         "$FINAL_NOTIFICATION_SEVERITY"
