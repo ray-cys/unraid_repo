@@ -15,9 +15,8 @@ umask 077
 # CONFIGURATION
 ###############################################################################
 
-# All active state, logs, locks, and archived legacy data live below this one
-# directory. Sonarr and Radarr retain separate state files because their state
-# schemas and actions are different.
+# All active state, logs, and locks live below this one directory. Sonarr and
+# Radarr retain separate state files because their schemas and actions differ.
 RUNTIME_DIR="/mnt/user/cloud/logs/arr_delete_sync_tag"
 LOG_FILE="$RUNTIME_DIR/arr-delete-sync-tag.log"
 LOCK_DIR="$RUNTIME_DIR/arr-delete-sync-tag.lock"
@@ -25,13 +24,6 @@ SONARR_STATE_FILE="$RUNTIME_DIR/sonarr-state.json"
 SONARR_STATE_BACKUP="$RUNTIME_DIR/sonarr-state.json.bak"
 RADARR_STATE_FILE="$RUNTIME_DIR/radarr-state.json"
 RADARR_STATE_BACKUP="$RUNTIME_DIR/radarr-state.json.bak"
-
-# Existing state is imported on the first unified run. After successful
-# import, the old directories are moved (never deleted) below
-# $RUNTIME_DIR/legacy so only one top-level runtime folder remains.
-LEGACY_SONARR_DIR="/mnt/user/cloud/logs/sonarr_delete_monitor"
-LEGACY_RADARR_DIR="/mnt/user/cloud/logs/radarr_delete_tagger"
-ARCHIVE_LEGACY_DIRS=true
 
 # No trailing slash. Each application keeps its own API key.
 SONARR_URL="http://192.168.50.4:8989"
@@ -169,7 +161,6 @@ remove_stale_temp_files() {
         "$RUNTIME_DIR"/.movies.*
         "$RUNTIME_DIR"/.sonarr-*
         "$RUNTIME_DIR"/.radarr-*
-        "$RUNTIME_DIR"/.migration-*
     )
     [[ "$nullglob_was_set" == true ]] || shopt -u nullglob
 
@@ -1091,98 +1082,8 @@ log INFO "Completed successfully."
 )
 
 ###############################################################################
-# UNIFIED STATE MIGRATION AND ORCHESTRATION
+# UNIFIED ORCHESTRATION
 ###############################################################################
-
-import_legacy_state() {
-    local app_name="$1"
-    local legacy_file="$2"
-    local destination="$3"
-    local validation_filter="$4"
-    local tmp
-
-    [[ -f "$destination" ]] && return 0
-    [[ -f "$legacy_file" ]] || return 0
-
-    if ! jq -e "$validation_filter" "$legacy_file" >/dev/null 2>&1; then
-        log ERROR "$app_name legacy state is invalid and was not imported: $legacy_file"
-        return 1
-    fi
-
-    tmp="$(mktemp "$RUNTIME_DIR/.migration-${app_name,,}.XXXXXX")" || return 1
-    if ! cp -- "$legacy_file" "$tmp" ||
-       ! jq -e "$validation_filter" "$tmp" >/dev/null 2>&1; then
-        rm -f -- "$tmp"
-        log ERROR "Could not safely copy $app_name legacy state."
-        return 1
-    fi
-    chmod 600 "$tmp" 2>/dev/null || true
-    mv -f -- "$tmp" "$destination" || return 1
-    log INFO "Imported $app_name state into $destination."
-}
-
-legacy_script_active() {
-    local legacy_dir="$1"
-    local lock_name="$2"
-    local pid_file="${legacy_dir}/${lock_name}/pid"
-    local pid=""
-
-    [[ -r "$pid_file" ]] || return 1
-    pid="$(<"$pid_file")"
-    [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
-}
-
-archive_legacy_dir() {
-    local app_name="$1"
-    local legacy_dir="$2"
-    local lock_name="$3"
-    local archive_root="$RUNTIME_DIR/legacy"
-    local destination
-    destination="${archive_root}/$(basename "$legacy_dir")"
-
-    [[ "$ARCHIVE_LEGACY_DIRS" == true ]] || return 0
-    [[ -d "$legacy_dir" ]] || return 0
-    [[ ! -L "$legacy_dir" ]] || {
-        log WARNING "Refusing to archive symlinked $app_name legacy directory: $legacy_dir"
-        return 0
-    }
-    if legacy_script_active "$legacy_dir" "$lock_name"; then
-        log WARNING "$app_name legacy script is still running; leaving $legacy_dir in place."
-        return 0
-    fi
-    if [[ -e "$destination" ]]; then
-        destination="${destination}-$(date '+%Y%m%d_%H%M%S')"
-        if [[ -e "$destination" ]]; then
-            log WARNING "$app_name legacy archive destination already exists; leaving $legacy_dir in place."
-            return 0
-        fi
-    fi
-
-    mkdir -p -- "$archive_root" || return 1
-    if mv -- "$legacy_dir" "$destination"; then
-        log INFO "Archived $app_name legacy runtime data below $archive_root."
-    else
-        log WARNING "Could not archive $app_name legacy directory; active state remains safe."
-        return 0
-    fi
-}
-
-migrate_legacy_runtime() {
-    import_legacy_state \
-        "Sonarr" \
-        "$LEGACY_SONARR_DIR/state.json" \
-        "$SONARR_STATE_FILE" \
-        'type == "object" and (.episodes | type == "object")' || return 1
-
-    import_legacy_state \
-        "Radarr" \
-        "$LEGACY_RADARR_DIR/state.json" \
-        "$RADARR_STATE_FILE" \
-        'type == "object" and (.movies | type == "object")' || return 1
-
-    archive_legacy_dir "Sonarr" "$LEGACY_SONARR_DIR" "delete-monitor.lock" || return 1
-    archive_legacy_dir "Radarr" "$LEGACY_RADARR_DIR" "delete-tagger.lock" || return 1
-}
 
 validate_common_configuration() {
     local command
@@ -1192,13 +1093,6 @@ validate_common_configuration() {
         printf 'Unsafe RUNTIME_DIR: %s\n' "$RUNTIME_DIR" >&2
         return 1
     }
-    [[ "$LEGACY_SONARR_DIR" != "$RUNTIME_DIR" &&
-       "$LEGACY_RADARR_DIR" != "$RUNTIME_DIR" &&
-       "$LEGACY_SONARR_DIR" != "$LEGACY_RADARR_DIR" ]] || {
-        printf 'Legacy and unified runtime directories must be different.\n' >&2
-        return 1
-    }
-
     for command in curl jq mktemp stat tee sort cut tr cp mv chmod; do
         command -v "$command" >/dev/null 2>&1 || {
             printf 'Required command not found: %s\n' "$command" >&2
@@ -1214,8 +1108,6 @@ validate_common_configuration() {
         die "INSPECT_DELETE_HISTORY must be true or false."
     [[ "$REQUIRE_DELETE_HISTORY_EVENT" == true || "$REQUIRE_DELETE_HISTORY_EVENT" == false ]] ||
         die "REQUIRE_DELETE_HISTORY_EVENT must be true or false."
-    [[ "$ARCHIVE_LEGACY_DIRS" == true || "$ARCHIVE_LEGACY_DIRS" == false ]] ||
-        die "ARCHIVE_LEGACY_DIRS must be true or false."
     [[ "$INSPECT_DELETE_HISTORY" == true || "$REQUIRE_DELETE_HISTORY_EVENT" == false ]] ||
         die "REQUIRE_DELETE_HISTORY_EVENT=true requires INSPECT_DELETE_HISTORY=true."
     [[ "$CONFIRMATION_RUNS" =~ ^[0-9]+$ ]] && (( CONFIRMATION_RUNS >= 2 )) ||
@@ -1292,7 +1184,6 @@ main() {
         esac
     fi
     remove_stale_temp_files
-    migrate_legacy_runtime || die "Legacy runtime migration failed; no Arr workflow was started."
 
     log INFO "Starting unified Arr delete workflow (mode=$mode, dry-run=$DRY_RUN)."
 
