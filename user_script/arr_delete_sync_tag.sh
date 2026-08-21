@@ -74,6 +74,27 @@ PLEX_DELETED_SERIES_TAG="plex-deleted-series"
 RADARR_REQUIRE_MOVIE_UNMONITORED=true
 PLEX_DELETED_MOVIE_TAG="plex-deleted"
 
+# Kodi sidecar quarantine. While media exists, the script records only the NFO
+# and artwork paths recognized by the Kodi metadata consumers. After the whole
+# movie or series is confirmed fileless, surviving unchanged files are moved
+# into the existing quarantine_lifecycle.sh layout. Sonarr/Radarr remain
+# responsible for media-linked extras through their own Recycling Bin setting.
+QUARANTINE_KODI_SIDECARS=true
+QUARANTINE_ROOT="/mnt/user/media/bin"
+MOVIES_ROOT="/mnt/user/media/movies"
+SERIES_ROOT="/mnt/user/media/series"
+
+# Root paths exactly as Sonarr/Radarr return them through their APIs. Keep them
+# equal to the host roots above when the containers use identical paths. For a
+# typical remap, use values such as /tv and /movies here; only the suffix below
+# each root is transferred to the matching host root.
+SONARR_API_SERIES_ROOT="/mnt/user/media/series"
+RADARR_API_MOVIES_ROOT="/mnt/user/media/movies"
+
+REQUIRE_SIDECAR_HASH_MATCH=true
+REMOVE_EMPTY_MEDIA_FOLDERS=true
+MAX_SIDECAR_SIZE_MB=100
+
 # A progress line is written for the first series and then every N series, so
 # a long library inspection is visibly active without filling the log.
 PROGRESS_LOG_EVERY=25
@@ -83,7 +104,7 @@ MAX_LOG_FILES=5
 HTTP_CONNECT_TIMEOUT=10
 HTTP_MAX_TIME=90
 HTTP_RETRIES=2
-USER_AGENT="Arr-Delete-Sync-Tag/1.0"
+USER_AGENT="Arr-Delete-Sync-Tag/1.1"
 
 ###############################################################################
 # END CONFIGURATION
@@ -98,6 +119,20 @@ ARR_URL=""
 ARR_API_KEY=""
 ARR_TEMP_PREFIX=""
 ARR_USER_AGENT=""
+QUARANTINE_RUN_ID=""
+
+SIDECARS_CAPTURED=0
+SIDECARS_QUARANTINED=0
+SIDECARS_NATIVE_MISSING=0
+SIDECARS_CHANGED=0
+SIDECAR_FAILURES=0
+FOLDERS_REMOVED=0
+
+CLEANUP_COMPLETE=false
+CLEANUP_QUARANTINED=0
+CLEANUP_NATIVE_MISSING=0
+CLEANUP_CHANGED=0
+CLEANUP_FOLDERS_REMOVED=0
 
 log() {
     local level="$1"
@@ -172,6 +207,354 @@ remove_stale_temp_files() {
 
     (( removed == 0 )) ||
         log INFO "Removed $removed stale temporary file(s) from an interrupted previous run."
+}
+
+valid_relative_path() {
+    local relative="$1"
+    [[ -n "$relative" &&
+       "$relative" != /* &&
+       "$relative" != "." &&
+       "$relative" != ".." &&
+       "$relative" != ../* &&
+       "$relative" != */../* &&
+       "$relative" != */.. &&
+       "$relative" != *$'\n'* ]]
+}
+
+map_arr_media_path() {
+    local api_path="$1"
+    local api_root="$2"
+    local host_root="$3"
+    local relative
+
+    api_path="${api_path%/}"
+    api_root="${api_root%/}"
+    host_root="${host_root%/}"
+    [[ "$api_path" == "$api_root"/* ]] || return 1
+    relative="${api_path#"$api_root"/}"
+    valid_relative_path "$relative" || return 1
+    printf '%s/%s' "$host_root" "$relative"
+}
+
+# Print a canonical media directory only when it is a child of the configured
+# root. Missing media directories are allowed for post-cleanup verification;
+# an existing path must be a real directory and never a symlink.
+media_path_under_root() {
+    local media_path="$1"
+    local media_root="$2"
+    local root_real candidate relative
+
+    media_root="${media_root%/}"
+    media_path="${media_path%/}"
+    root_real="$(realpath -- "$media_root" 2>/dev/null)" || return 1
+    [[ "$media_path" == "$media_root"/* ]] || return 1
+    relative="${media_path#"$media_root"/}"
+    valid_relative_path "$relative" || return 1
+    [[ ! -L "$media_path" ]] || return 1
+    [[ ! -e "$media_path" || -d "$media_path" ]] || return 1
+    if [[ -e "$media_path" ]]; then
+        candidate="$(realpath -- "$media_path" 2>/dev/null)" || return 1
+        [[ "$candidate" == "$root_real"/* ]] || return 1
+    else
+        candidate="${root_real}/${relative}"
+    fi
+    printf '%s' "$candidate"
+}
+
+file_size_bytes() {
+    stat -c '%s' -- "$1" 2>/dev/null || stat -f '%z' -- "$1" 2>/dev/null
+}
+
+capture_kodi_sidecars() {
+    local app_name="$1"
+    local media_path="$2"
+    local media_root="$3"
+    local media_relative_paths="$4"
+    local media_real relative lower name rel_dir file_name stem candidate
+    local file size size_after hash eligible capture_failed=0
+    local files='[]'
+    local type extension
+    local -A exact_paths=()
+
+    media_real="$(media_path_under_root "$media_path" "$media_root")" || {
+        log ERROR "Cannot capture $app_name sidecars from unsafe media path: $media_path"
+        return 1
+    }
+    [[ -d "$media_real" ]] || {
+        log ERROR "Cannot capture $app_name sidecars because the media directory is missing: $media_path"
+        return 1
+    }
+    jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null 2>&1 \
+        <<< "$media_relative_paths" || return 1
+
+    if [[ "$app_name" == sonarr ]]; then
+        for candidate in tvshow.nfo poster.jpg poster.png banner.jpg banner.png fanart.jpg fanart.png; do
+            exact_paths["$candidate"]=1
+        done
+    else
+        exact_paths["movie.nfo"]=1
+        for type in poster banner fanart clearart discart keyart landscape logo backdrop clearlogo; do
+            for extension in jpg jpeg png; do
+                exact_paths["${type}.${extension}"]=1
+            done
+        done
+    fi
+
+    while IFS= read -r relative; do
+        valid_relative_path "$relative" || {
+            log WARNING "Skipping unsafe $app_name media-relative path while capturing sidecars: $relative"
+            capture_failed=1
+            continue
+        }
+        rel_dir="${relative%/*}"
+        [[ "$rel_dir" == "$relative" ]] && rel_dir=""
+        file_name="${relative##*/}"
+        stem="${file_name%.*}"
+        [[ -n "$stem" && "$stem" != "$file_name" ]] || continue
+
+        candidate="${stem}.nfo"
+        [[ -n "$rel_dir" ]] && candidate="${rel_dir}/${candidate}"
+        exact_paths["${candidate,,}"]=1
+
+        if [[ "$app_name" == sonarr ]]; then
+            for extension in jpg png; do
+                candidate="${stem}-thumb.${extension}"
+                [[ -n "$rel_dir" ]] && candidate="${rel_dir}/${candidate}"
+                exact_paths["${candidate,,}"]=1
+            done
+        else
+            for type in thumb poster banner fanart clearart discart keyart landscape logo backdrop clearlogo; do
+                for extension in jpg jpeg png; do
+                    candidate="${stem}-${type}.${extension}"
+                    [[ -n "$rel_dir" ]] && candidate="${rel_dir}/${candidate}"
+                    exact_paths["${candidate,,}"]=1
+                done
+            done
+        fi
+    done < <(jq -r '.[]' <<< "$media_relative_paths")
+
+    while IFS= read -r -d '' file; do
+        relative="${file#"$media_real"/}"
+        valid_relative_path "$relative" || continue
+        lower="${relative,,}"
+        name="${lower##*/}"
+        eligible=false
+
+        if [[ -n "${exact_paths[$lower]+present}" ]]; then
+            eligible=true
+        elif [[ "$app_name" == sonarr &&
+                "$name" =~ ^season([0-9]{2,}|-all|-specials)-(poster|banner|fanart)\.(jpg|png)$ ]]; then
+            eligible=true
+        fi
+        [[ "$eligible" == true ]] || continue
+
+        size="$(file_size_bytes "$file")" || {
+            log WARNING "Could not stat $app_name sidecar while capturing it: $file"
+            capture_failed=1
+            continue
+        }
+        [[ "$size" =~ ^[0-9]+$ ]] || {
+            capture_failed=1
+            continue
+        }
+        if (( size > MAX_SIDECAR_SIZE_MB * 1024 * 1024 )); then
+            log WARNING "Skipping oversized $app_name sidecar (${size} bytes): $file"
+            continue
+        fi
+        hash="$(sha256sum -- "$file" 2>/dev/null | cut -d ' ' -f 1)"
+        size_after="$(file_size_bytes "$file")" || size_after=-1
+        if [[ ! "$hash" =~ ^[a-fA-F0-9]{64}$ || "$size_after" != "$size" ]]; then
+            log WARNING "Sidecar changed or could not be hashed while capturing it: $file"
+            capture_failed=1
+            continue
+        fi
+
+        files="$(jq --arg relative "$relative" \
+            --arg sha256 "${hash,,}" \
+            --argjson size "$size" \
+            '. + [{relativePath:$relative,size:$size,sha256:$sha256}] | unique_by(.relativePath)' \
+            <<< "$files")" || return 1
+    done < <(find "$media_real" -type f -print0)
+
+    (( capture_failed == 0 )) || return 1
+    printf '%s' "$files"
+}
+
+contains_video_files() {
+    local media_path="$1"
+    find "$media_path" -type f \
+        \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.m4v' \
+           -o -iname '*.avi' -o -iname '*.mov' -o -iname '*.wmv' \
+           -o -iname '*.ts' -o -iname '*.m2ts' -o -iname '*.mts' \
+           -o -iname '*.mpg' -o -iname '*.mpeg' -o -iname '*.webm' \
+           -o -iname '*.vob' -o -iname '*.iso' -o -iname '*.strm' \) \
+        -print -quit | grep -q .
+}
+
+remove_empty_media_dirs() {
+    local media_path="$1"
+    local directory removed=0
+
+    [[ -d "$media_path" ]] || return 0
+    while IFS= read -r -d '' directory; do
+        [[ ! -L "$directory" ]] || continue
+        if rmdir -- "$directory" 2>/dev/null; then
+            ((removed += 1))
+            log INFO "Removed empty media directory: $directory"
+        fi
+    done < <(find "$media_path" -depth -type d -empty -print0 2>/dev/null)
+    CLEANUP_FOLDERS_REMOVED=$((CLEANUP_FOLDERS_REMOVED + removed))
+}
+
+# Move only unchanged files from a pre-deletion manifest. Missing files are
+# treated as already handled by Arr's native Recycling Bin path. A changed,
+# symlinked, or unsafe file is never moved and keeps the manifest pending.
+quarantine_recorded_sidecars() {
+    local app_name="$1"
+    local bucket="$2"
+    local media_root="$3"
+    local current_media_path="$4"
+    local manifest="$5"
+    local recorded_media_path media_real root_real quarantine_real run_root
+    local entry relative source source_real size expected_size hash expected_hash
+    local root_relative destination destination_parent destination_real
+    local files_count
+
+    CLEANUP_COMPLETE=false
+    CLEANUP_QUARANTINED=0
+    CLEANUP_NATIVE_MISSING=0
+    CLEANUP_CHANGED=0
+    CLEANUP_FOLDERS_REMOVED=0
+
+    [[ "$QUARANTINE_RUN_ID" =~ ^[0-9]{8}_[0-9]{6}_[0-9]+$ ]] || return 1
+    [[ ! -L "$QUARANTINE_ROOT" ]] || return 1
+
+    if [[ "$manifest" == null || -z "$manifest" ]]; then
+        log WARNING "No pre-deletion Kodi sidecar manifest exists for $app_name path $current_media_path; cleanup was skipped."
+        return 3
+    fi
+    if ! jq -e 'type == "object" and (.mediaPath | type == "string") and (.files | type == "array")' \
+        >/dev/null 2>&1 <<< "$manifest"; then
+        log ERROR "Invalid Kodi sidecar manifest for $app_name path $current_media_path."
+        return 1
+    fi
+
+    recorded_media_path="$(jq -r '.mediaPath' <<< "$manifest")"
+    media_real="$(media_path_under_root "$current_media_path" "$media_root")" || {
+        log ERROR "Refusing $app_name sidecar cleanup for unsafe media path: $current_media_path"
+        return 1
+    }
+    root_real="$(realpath -- "$media_root" 2>/dev/null)" || return 1
+    if [[ "${recorded_media_path%/}" != "${current_media_path%/}" ]]; then
+        log WARNING "$app_name media path changed after manifest capture; cleanup was deferred: $recorded_media_path -> $current_media_path"
+        return 0
+    fi
+
+    files_count="$(jq '.files | length' <<< "$manifest")"
+    if [[ ! -e "$media_real" ]]; then
+        CLEANUP_NATIVE_MISSING="$files_count"
+        CLEANUP_COMPLETE=true
+        log INFO "$app_name media directory is already absent; recorded sidecars require no further cleanup: $media_real"
+        return 0
+    fi
+    if contains_video_files "$media_real"; then
+        log WARNING "$app_name cleanup was deferred because a video file still exists below $media_real."
+        return 0
+    fi
+
+    if [[ -e "$QUARANTINE_ROOT" ]]; then
+        quarantine_real="$(realpath -- "$QUARANTINE_ROOT" 2>/dev/null)" || return 1
+    else
+        quarantine_real="${QUARANTINE_ROOT%/}"
+    fi
+    run_root="${quarantine_real}/${QUARANTINE_RUN_ID}"
+    root_relative="${media_real#"$root_real"/}"
+    valid_relative_path "$root_relative" || return 1
+
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        relative="$(jq -r '.relativePath // empty' <<< "$entry")"
+        expected_size="$(jq -r '.size // empty' <<< "$entry")"
+        expected_hash="$(jq -r '.sha256 // empty' <<< "$entry")"
+        if ! valid_relative_path "$relative" ||
+           ! [[ "$expected_size" =~ ^[0-9]+$ && "$expected_hash" =~ ^[a-fA-F0-9]{64}$ ]]; then
+            log WARNING "Unsafe or invalid recorded $app_name sidecar entry was not moved: $relative"
+            ((CLEANUP_CHANGED += 1))
+            continue
+        fi
+
+        source="${media_real}/${relative}"
+        if [[ ! -e "$source" && ! -L "$source" ]]; then
+            ((CLEANUP_NATIVE_MISSING += 1))
+            continue
+        fi
+        if [[ -L "$source" || ! -f "$source" ]]; then
+            log WARNING "Recorded $app_name sidecar is no longer a regular file; leaving it untouched: $source"
+            ((CLEANUP_CHANGED += 1))
+            continue
+        fi
+        source_real="$(realpath -- "$source" 2>/dev/null)" || {
+            ((CLEANUP_CHANGED += 1))
+            continue
+        }
+        if [[ "$source_real" != "$media_real"/* ]]; then
+            log WARNING "Recorded $app_name sidecar resolved outside its media directory; leaving it untouched: $source"
+            ((CLEANUP_CHANGED += 1))
+            continue
+        fi
+
+        size="$(file_size_bytes "$source")" || size=-1
+        if [[ "$REQUIRE_SIDECAR_HASH_MATCH" == true ]]; then
+            hash="$(sha256sum -- "$source" 2>/dev/null | cut -d ' ' -f 1)"
+            if [[ "$size" != "$expected_size" || "${hash,,}" != "${expected_hash,,}" ]]; then
+                log WARNING "Recorded $app_name sidecar changed after capture; leaving it untouched: $source"
+                ((CLEANUP_CHANGED += 1))
+                continue
+            fi
+        fi
+
+        destination="${run_root}/${bucket}/${root_relative}/${relative}"
+        destination_real="${destination}"
+        [[ "$destination_real" == "$run_root"/* ]] || return 1
+
+        if [[ "$DRY_RUN" == true ]]; then
+            log INFO "DRY RUN: would quarantine $app_name Kodi sidecar: $source -> $destination"
+            ((CLEANUP_QUARANTINED += 1))
+            continue
+        fi
+
+        if [[ ! -d "$run_root" ]]; then
+            mkdir -p -- "$run_root" || return 1
+        fi
+        if [[ -L "$run_root" || ! -d "$run_root" ]]; then
+            log ERROR "Quarantine run path is not a safe directory: $run_root"
+            return 1
+        fi
+        destination_parent="$(dirname -- "$destination")"
+        mkdir -p -- "$destination_parent" || return 1
+        [[ ! -e "$destination" && ! -L "$destination" ]] || {
+            log ERROR "Quarantine destination already exists; refusing to overwrite it: $destination"
+            return 1
+        }
+        if mv -- "$source" "$destination"; then
+            log INFO "Quarantined $app_name Kodi sidecar: $source -> $destination"
+            ((CLEANUP_QUARANTINED += 1))
+        else
+            return 1
+        fi
+    done < <(jq -c '.files[]' <<< "$manifest")
+
+    if [[ "$DRY_RUN" == true ]]; then
+        [[ "$REMOVE_EMPTY_MEDIA_FOLDERS" == true ]] &&
+            log INFO "DRY RUN: would attempt rmdir-only cleanup below $media_real after quarantining sidecars."
+        return 0
+    fi
+    (( CLEANUP_CHANGED == 0 )) || return 0
+
+    if [[ "$REMOVE_EMPTY_MEDIA_FOLDERS" == true ]]; then
+        remove_empty_media_dirs "$media_real"
+    fi
+    CLEANUP_COMPLETE=true
 }
 
 ###############################################################################
@@ -355,14 +738,31 @@ sonarr_apply_snapshot() {
     local series_id="$1"
     local series_title="$2"
     local episodes_file="$3"
+    local series_path="$4"
+    local sidecar_files="$5"
     local next
     next="$(mktemp "$STATE_DIR/.state-snapshot.XXXXXX")" || return 1
 
     if ! jq --argjson series_id "$series_id" \
         --arg series_title "$series_title" \
+        --arg series_path "$series_path" \
+        --arg media_root "$SERIES_ROOT" \
         --arg now "$RUN_AT" \
+        --argjson sidecar_files "$sidecar_files" \
         --slurpfile source "$episodes_file" '($source[0] // []) as $episodes
         | .episodes //= {}
+        | .sidecarManifests //= {}
+        | if $sidecar_files != null then
+            .sidecarManifests[($series_id | tostring)] = {
+                mediaPath: $series_path,
+                mediaRoot: $media_root,
+                bucket: "series",
+                capturedAt: $now,
+                files: $sidecar_files
+            }
+          else
+            .
+          end
         | reduce $episodes[] as $episode (.;
             ($episode.id | tostring) as $key
             | (.episodes[$key] // {}) as $old
@@ -396,6 +796,74 @@ sonarr_apply_snapshot() {
                 .
               end
         )
+    ' "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$WORK_STATE"
+}
+
+sonarr_series_cleanup_eligible() {
+    local series_id="$1"
+    local episodes_file="$2"
+
+    jq --argjson series_id "$series_id" \
+        --argjson needed "$CONFIRMATION_RUNS" \
+        --argjson require_history "$REQUIRE_DELETE_HISTORY_EVENT" \
+        --slurpfile source "$episodes_file" '($source[0] // []) as $episodes
+        | .episodes as $state
+        | [
+            $state | to_entries[]
+            | select(.value.seriesId == $series_id and .value.everHadFile == true)
+          ] as $historical
+        | ($episodes | map({key:(.id | tostring),value:.}) | from_entries) as $current
+        | (
+            (($historical | length) > 0)
+            and all($episodes[]; .hasFile != true)
+            and all(
+                $historical[];
+                ($current[.key] != null)
+                and ($current[.key].hasFile != true)
+                and ((.value.missingRuns // 0) >= $needed)
+                and (
+                    ($require_history | not)
+                    or (.value.latestEpisodeFileDeletedHistory != null)
+                )
+            )
+          )
+    ' "$WORK_STATE"
+}
+
+sonarr_sidecar_manifest() {
+    local series_id="$1"
+    jq --argjson series_id "$series_id" \
+        '.sidecarManifests[($series_id | tostring)] // null' "$WORK_STATE"
+}
+
+sonarr_mark_sidecar_cleanup() {
+    local series_id="$1"
+    local quarantined="$2"
+    local native_missing="$3"
+    local folders_removed="$4"
+    local next
+    next="$(mktemp "$STATE_DIR/.state-sidecar-action.XXXXXX")" || return 1
+
+    if ! jq --arg now "$RUN_AT" \
+        --arg run_id "$QUARANTINE_RUN_ID" \
+        --argjson series_id "$series_id" \
+        --argjson quarantined "$quarantined" \
+        --argjson native_missing "$native_missing" \
+        --argjson folders_removed "$folders_removed" '
+        .sidecarCleanupActions //= {}
+        | .sidecarCleanupActions[($series_id | tostring)] = {
+            seriesId: $series_id,
+            completedAt: $now,
+            quarantineRunId: (if $quarantined > 0 then $run_id else null end),
+            quarantinedFiles: $quarantined,
+            nativeMissingFiles: $native_missing,
+            foldersRemoved: $folders_removed
+          }
+        | del(.sidecarManifests[($series_id | tostring)])
     ' "$WORK_STATE" > "$next"; then
         rm -f -- "$next"
         return 1
@@ -661,13 +1129,15 @@ sonarr_commit_state() {
     local final backup had_errors
     final="$(mktemp "$STATE_DIR/.state-final.XXXXXX")" || return 1
     had_errors=false
-    (( API_FAILURES > 0 || HISTORY_FAILURES > 0 )) && had_errors=true
+    (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )) && had_errors=true
 
     if ! jq --arg now "$RUN_AT" --argjson had_errors "$had_errors" '
-        .version = 3
+        .version = 4
         | .lastRun = $now
         | .lastRunHadApiErrors = $had_errors
         | .episodes //= {}
+        | .sidecarManifests //= {}
+        | .sidecarCleanupActions //= {}
     ' "$WORK_STATE" > "$final" ||
        ! jq -e 'type == "object" and (.episodes | type == "object")' "$final" >/dev/null; then
         rm -f -- "$final"
@@ -716,6 +1186,12 @@ EPISODE_ACTIONS=0
 SEASON_ACTIONS=0
 SERIES_ACTIONS=0
 TAGGED_SERIES_ACTIONS=0
+SIDECARS_CAPTURED=0
+SIDECARS_QUARANTINED=0
+SIDECARS_NATIVE_MISSING=0
+SIDECARS_CHANGED=0
+SIDECAR_FAILURES=0
+FOLDERS_REMOVED=0
 TAG_CATALOG=''
 PLEX_DELETED_SEASON_TAG_ID=''
 PLEX_DELETED_SERIES_TAG_ID=''
@@ -742,7 +1218,7 @@ trap 'exit 130' INT TERM
 if [[ ! -f "$STATE_FILE" ]]; then
     INITIAL_STATE="$(mktemp "$STATE_DIR/.state-initial.XXXXXX")" ||
         die "Cannot create initial state file."
-    printf '%s\n' '{"version":3,"lastRun":null,"lastRunHadApiErrors":false,"episodes":{}}' > "$INITIAL_STATE" &&
+    printf '%s\n' '{"version":4,"lastRun":null,"lastRunHadApiErrors":false,"episodes":{},"sidecarManifests":{},"sidecarCleanupActions":{}}' > "$INITIAL_STATE" &&
         mv -f -- "$INITIAL_STATE" "$STATE_FILE" || {
             rm -f -- "$INITIAL_STATE"
             die "Cannot create state file."
@@ -807,6 +1283,11 @@ SERIES_LISTED="$(jq length <<< "$SERIES")"
 while IFS= read -r SERIES_ID; do
     [[ -n "$SERIES_ID" ]] || continue
     SERIES_TITLE="$(jq -r --argjson id "$SERIES_ID" '.[] | select(.id == $id) | .title // empty' <<< "$SERIES")"
+    SERIES_API_PATH="$(jq -r --argjson id "$SERIES_ID" '.[] | select(.id == $id) | .path // empty' <<< "$SERIES")"
+    SERIES_PATH=""
+    if [[ -n "$SERIES_API_PATH" ]]; then
+        SERIES_PATH="$(map_arr_media_path "$SERIES_API_PATH" "$SONARR_API_SERIES_ROOT" "$SERIES_ROOT" || true)"
+    fi
     if [[ -z "$SERIES_TITLE" ]]; then
         log WARNING "Series $SERIES_ID is no longer returned by Sonarr; leaving its state untouched."
         continue
@@ -823,7 +1304,7 @@ while IFS= read -r SERIES_ID; do
     [[ -n "$CURRENT_SNAPSHOT_FILE" ]] && rm -f -- "$CURRENT_SNAPSHOT_FILE"
     CURRENT_SNAPSHOT_FILE="$(mktemp "$STATE_DIR/.episodes.XXXXXX")" ||
         die "Cannot create temporary episode snapshot."
-    if ! api_get_json "/api/v3/episode?seriesId=$SERIES_ID" > "$CURRENT_SNAPSHOT_FILE"; then
+    if ! api_get_json "/api/v3/episode?seriesId=$SERIES_ID&includeEpisodeFile=true" > "$CURRENT_SNAPSHOT_FILE"; then
         ((API_FAILURES += 1))
         log ERROR "Skipping $SERIES_TITLE; its state was not advanced."
         continue
@@ -840,7 +1321,28 @@ while IFS= read -r SERIES_ID; do
     ((EPISODES_SCANNED += COUNT))
     ((FILES_PRESENT += PRESENT))
 
-    sonarr_apply_snapshot "$SERIES_ID" "$SERIES_TITLE" "$CURRENT_SNAPSHOT_FILE" ||
+    SIDECAR_FILES=null
+    if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( PRESENT > 0 )); then
+        MEDIA_RELATIVE_PATHS="$(jq '[
+            .[]
+            | select(.hasFile == true and (.episodeFile.relativePath | type == "string"))
+            | .episodeFile.relativePath
+        ] | unique' "$CURRENT_SNAPSHOT_FILE")" || die "Could not list Sonarr media paths for $SERIES_TITLE."
+        if [[ -z "$SERIES_PATH" || "$(jq length <<< "$MEDIA_RELATIVE_PATHS")" == 0 ]]; then
+            ((SIDECAR_FAILURES += 1))
+            log ERROR "Could not capture Kodi sidecars for $SERIES_TITLE because Sonarr omitted its media path."
+        elif SIDECAR_FILES="$(capture_kodi_sidecars sonarr "$SERIES_PATH" "$SERIES_ROOT" "$MEDIA_RELATIVE_PATHS")"; then
+            CAPTURED="$(jq length <<< "$SIDECAR_FILES")"
+            ((SIDECARS_CAPTURED += CAPTURED))
+        else
+            SIDECAR_FILES=null
+            ((SIDECAR_FAILURES += 1))
+            log ERROR "Kodi sidecar manifest capture failed for $SERIES_TITLE; the previous manifest was retained."
+        fi
+    fi
+
+    sonarr_apply_snapshot "$SERIES_ID" "$SERIES_TITLE" "$CURRENT_SNAPSHOT_FILE" \
+        "$SERIES_PATH" "$SIDECAR_FILES" ||
         die "Could not update temporary state for $SERIES_TITLE."
 
     NEW="$(sonarr_new_candidate_count "$SERIES_ID")"
@@ -908,6 +1410,34 @@ while IFS= read -r SERIES_ID; do
             else
                 ((API_FAILURES += 1))
                 log ERROR "Episode update failed for $SERIES_TITLE; it will be retried next run."
+            fi
+        fi
+    fi
+
+    if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] &&
+       [[ "$(sonarr_series_cleanup_eligible "$SERIES_ID" "$CURRENT_SNAPSHOT_FILE")" == true ]]; then
+        if [[ -z "$SERIES_PATH" ]]; then
+            ((SIDECAR_FAILURES += 1))
+            log ERROR "Cannot map Sonarr path '$SERIES_API_PATH' from SONARR_API_SERIES_ROOT to SERIES_ROOT; sidecar cleanup for $SERIES_TITLE was deferred."
+        else
+            MANIFEST="$(sonarr_sidecar_manifest "$SERIES_ID")" ||
+                die "Could not read Kodi sidecar manifest for $SERIES_TITLE."
+            if quarantine_recorded_sidecars sonarr series "$SERIES_ROOT" "$SERIES_PATH" "$MANIFEST"; then
+                ((SIDECARS_QUARANTINED += CLEANUP_QUARANTINED))
+                ((SIDECARS_NATIVE_MISSING += CLEANUP_NATIVE_MISSING))
+                ((SIDECARS_CHANGED += CLEANUP_CHANGED))
+                ((FOLDERS_REMOVED += CLEANUP_FOLDERS_REMOVED))
+                if [[ "$CLEANUP_COMPLETE" == true ]]; then
+                    sonarr_mark_sidecar_cleanup "$SERIES_ID" "$CLEANUP_QUARANTINED" \
+                        "$CLEANUP_NATIVE_MISSING" "$CLEANUP_FOLDERS_REMOVED" ||
+                        die "Could not record Kodi sidecar cleanup for $SERIES_TITLE."
+                fi
+            else
+                CLEANUP_RC=$?
+                if (( CLEANUP_RC != 3 )); then
+                    ((SIDECAR_FAILURES += 1))
+                    log ERROR "Kodi sidecar quarantine failed for $SERIES_TITLE; its manifest was retained."
+                fi
             fi
         fi
     fi
@@ -1072,10 +1602,10 @@ WORK_STATE=""
 
 ACTION_LABEL=applied
 [[ "$DRY_RUN" == true ]] && ACTION_LABEL=would-apply
-log INFO "Summary: series-listed=$SERIES_LISTED, series-scanned=$SERIES_SCANNED, episodes=$EPISODES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$EPISODES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, episode-actions-$ACTION_LABEL=$EPISODE_ACTIONS, season-actions-$ACTION_LABEL=$SEASON_ACTIONS, series-actions-$ACTION_LABEL=$SERIES_ACTIONS, tagged-series-$ACTION_LABEL=$TAGGED_SERIES_ACTIONS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES."
+log INFO "Summary: series-listed=$SERIES_LISTED, series-scanned=$SERIES_SCANNED, episodes=$EPISODES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$EPISODES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, episode-actions-$ACTION_LABEL=$EPISODE_ACTIONS, season-actions-$ACTION_LABEL=$SEASON_ACTIONS, series-actions-$ACTION_LABEL=$SERIES_ACTIONS, tagged-series-$ACTION_LABEL=$TAGGED_SERIES_ACTIONS, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
 
-if (( API_FAILURES > 0 || HISTORY_FAILURES > 0 )); then
-    log WARNING "Completed with API or History failures; safe state was saved and unfinished actions will be retried."
+if (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )); then
+    log WARNING "Completed with API, History, or sidecar failures; safe state was saved and unfinished actions will be retried."
     exit 2
 fi
 log INFO "Completed successfully."
@@ -1093,7 +1623,8 @@ validate_common_configuration() {
         printf 'Unsafe RUNTIME_DIR: %s\n' "$RUNTIME_DIR" >&2
         return 1
     }
-    for command in curl jq mktemp stat tee sort cut tr cp mv chmod; do
+    for command in curl jq mktemp stat tee sort cut tr cp mv find grep realpath \
+        sha256sum dirname rmdir; do
         command -v "$command" >/dev/null 2>&1 || {
             printf 'Required command not found: %s\n' "$command" >&2
             return 1
@@ -1108,12 +1639,20 @@ validate_common_configuration() {
         die "INSPECT_DELETE_HISTORY must be true or false."
     [[ "$REQUIRE_DELETE_HISTORY_EVENT" == true || "$REQUIRE_DELETE_HISTORY_EVENT" == false ]] ||
         die "REQUIRE_DELETE_HISTORY_EVENT must be true or false."
+    [[ "$QUARANTINE_KODI_SIDECARS" == true || "$QUARANTINE_KODI_SIDECARS" == false ]] ||
+        die "QUARANTINE_KODI_SIDECARS must be true or false."
+    [[ "$REQUIRE_SIDECAR_HASH_MATCH" == true || "$REQUIRE_SIDECAR_HASH_MATCH" == false ]] ||
+        die "REQUIRE_SIDECAR_HASH_MATCH must be true or false."
+    [[ "$REMOVE_EMPTY_MEDIA_FOLDERS" == true || "$REMOVE_EMPTY_MEDIA_FOLDERS" == false ]] ||
+        die "REMOVE_EMPTY_MEDIA_FOLDERS must be true or false."
     [[ "$INSPECT_DELETE_HISTORY" == true || "$REQUIRE_DELETE_HISTORY_EVENT" == false ]] ||
         die "REQUIRE_DELETE_HISTORY_EVENT=true requires INSPECT_DELETE_HISTORY=true."
     [[ "$CONFIRMATION_RUNS" =~ ^[0-9]+$ ]] && (( CONFIRMATION_RUNS >= 2 )) ||
         die "CONFIRMATION_RUNS must be an integer of at least 2."
     [[ "$MAX_HISTORY_INSPECTIONS_PER_RUN" =~ ^[1-9][0-9]*$ ]] ||
         die "MAX_HISTORY_INSPECTIONS_PER_RUN must be a positive integer."
+    [[ "$MAX_SIDECAR_SIZE_MB" =~ ^[1-9][0-9]*$ ]] ||
+        die "MAX_SIDECAR_SIZE_MB must be a positive integer."
     [[ "$MAX_LOG_SIZE_MB" =~ ^[1-9][0-9]*$ && "$MAX_LOG_FILES" =~ ^[1-9][0-9]*$ ]] ||
         die "MAX_LOG_SIZE_MB and MAX_LOG_FILES must be positive integers."
     [[ "$HTTP_CONNECT_TIMEOUT" =~ ^[1-9][0-9]*$ &&
@@ -1123,6 +1662,31 @@ validate_common_configuration() {
     [[ "$RESCAN_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ &&
        "$RESCAN_POLL_SECONDS" =~ ^[1-9][0-9]*$ ]] ||
         die "Rescan timeout and poll values must be positive integers."
+
+    if [[ "$QUARANTINE_KODI_SIDECARS" == true ]]; then
+        [[ "$QUARANTINE_ROOT" == /mnt/user/* && "$QUARANTINE_ROOT" != "/mnt/user/" &&
+           "$MOVIES_ROOT" == /mnt/user/* && "$MOVIES_ROOT" != "/mnt/user/" &&
+           "$SERIES_ROOT" == /mnt/user/* && "$SERIES_ROOT" != "/mnt/user/" &&
+           "$QUARANTINE_ROOT" != *$'\n'* && "$MOVIES_ROOT" != *$'\n'* &&
+           "$SERIES_ROOT" != *$'\n'* ]] ||
+            die "Kodi sidecar roots must be safe children of /mnt/user."
+        [[ "$QUARANTINE_ROOT" != "$MOVIES_ROOT" &&
+           "$QUARANTINE_ROOT" != "$SERIES_ROOT" &&
+           "$MOVIES_ROOT" != "$SERIES_ROOT" &&
+           "$QUARANTINE_ROOT" != "$MOVIES_ROOT"/* &&
+           "$QUARANTINE_ROOT" != "$SERIES_ROOT"/* &&
+           "$MOVIES_ROOT" != "$QUARANTINE_ROOT"/* &&
+           "$SERIES_ROOT" != "$QUARANTINE_ROOT"/* ]] ||
+            die "Quarantine, movies, and series roots must not overlap."
+        [[ ! -L "$QUARANTINE_ROOT" && ! -L "$MOVIES_ROOT" && ! -L "$SERIES_ROOT" ]] ||
+            die "Quarantine, movies, and series roots must not be symlinks."
+        [[ "$SONARR_API_SERIES_ROOT" == /* && "$SONARR_API_SERIES_ROOT" != "/" &&
+           "$RADARR_API_MOVIES_ROOT" == /* && "$RADARR_API_MOVIES_ROOT" != "/" &&
+           "$SONARR_API_SERIES_ROOT" != *$'\n'* && "$RADARR_API_MOVIES_ROOT" != *$'\n'* &&
+           "$SONARR_API_SERIES_ROOT" != */../* && "$SONARR_API_SERIES_ROOT" != */.. &&
+           "$RADARR_API_MOVIES_ROOT" != */../* && "$RADARR_API_MOVIES_ROOT" != */.. ]] ||
+            die "SONARR_API_SERIES_ROOT and RADARR_API_MOVIES_ROOT must be safe absolute paths."
+    fi
 }
 
 acquire_main_lock() {
@@ -1185,6 +1749,10 @@ main() {
     fi
     remove_stale_temp_files
 
+    QUARANTINE_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
+    [[ "$QUARANTINE_RUN_ID" =~ ^[0-9]{8}_[0-9]{6}_[0-9]+$ ]] ||
+        die "Could not create a valid quarantine run ID."
+
     log INFO "Starting unified Arr delete workflow (mode=$mode, dry-run=$DRY_RUN)."
 
     if [[ "$mode" == all || "$mode" == sonarr ]]; then
@@ -1214,13 +1782,16 @@ main() {
 # confirmation counter instead of being treated as a deletion.
 radarr_apply_snapshot() {
     local movies_file="$1"
+    local sidecar_manifests="$2"
     local next
     next="$(mktemp "$STATE_DIR/.state-snapshot.XXXXXX")" || return 1
 
     if ! jq --arg now "$RUN_AT" \
         --argjson require_unmonitored "$RADARR_REQUIRE_MOVIE_UNMONITORED" \
+        --argjson sidecar_manifests "$sidecar_manifests" \
         --slurpfile source "$movies_file" '($source[0] // []) as $movies
         | .movies //= {}
+        | .sidecarManifests = ((.sidecarManifests // {}) * $sidecar_manifests)
         | reduce $movies[] as $movie (.;
             ($movie.id | tostring) as $key
             | (.movies[$key] // {}) as $old
@@ -1261,6 +1832,54 @@ radarr_apply_snapshot() {
                 .
               end
         )
+    ' "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$WORK_STATE"
+}
+
+radarr_sidecar_manifest() {
+    local movie_id="$1"
+    jq --argjson movie_id "$movie_id" \
+        '.sidecarManifests[($movie_id | tostring)] // null' "$WORK_STATE"
+}
+
+radarr_cleanup_history_eligible() {
+    local movie_id="$1"
+    if [[ "$REQUIRE_DELETE_HISTORY_EVENT" == false ]]; then
+        printf 'true'
+        return 0
+    fi
+    jq -r --argjson movie_id "$movie_id" '
+        (.movies[($movie_id | tostring)].latestMovieFileDeletedHistory // null) != null
+    ' "$WORK_STATE"
+}
+
+radarr_mark_sidecar_cleanup() {
+    local movie_id="$1"
+    local quarantined="$2"
+    local native_missing="$3"
+    local folders_removed="$4"
+    local next
+    next="$(mktemp "$STATE_DIR/.state-sidecar-action.XXXXXX")" || return 1
+
+    if ! jq --arg now "$RUN_AT" \
+        --arg run_id "$QUARANTINE_RUN_ID" \
+        --argjson movie_id "$movie_id" \
+        --argjson quarantined "$quarantined" \
+        --argjson native_missing "$native_missing" \
+        --argjson folders_removed "$folders_removed" '
+        .sidecarCleanupActions //= {}
+        | .sidecarCleanupActions[($movie_id | tostring)] = {
+            movieId: $movie_id,
+            completedAt: $now,
+            quarantineRunId: (if $quarantined > 0 then $run_id else null end),
+            quarantinedFiles: $quarantined,
+            nativeMissingFiles: $native_missing,
+            foldersRemoved: $folders_removed
+          }
+        | del(.sidecarManifests[($movie_id | tostring)])
     ' "$WORK_STATE" > "$next"; then
         rm -f -- "$next"
         return 1
@@ -1311,6 +1930,7 @@ radarr_confirmed_movies() {
                 id: $movie.id,
                 title: ($movie.title // "Unknown"),
                 year: ($movie.year // null),
+                path: ($movie.path // ""),
                 tags: ($movie.tags // [])
               }
           ]
@@ -1390,13 +2010,15 @@ radarr_commit_state() {
     local final backup had_errors
     final="$(mktemp "$STATE_DIR/.state-final.XXXXXX")" || return 1
     had_errors=false
-    (( API_FAILURES > 0 || HISTORY_FAILURES > 0 )) && had_errors=true
+    (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )) && had_errors=true
 
     if ! jq --arg now "$RUN_AT" --argjson had_errors "$had_errors" '
-        .version = 1
+        .version = 2
         | .lastRun = $now
         | .lastRunHadApiErrors = $had_errors
         | .movies //= {}
+        | .sidecarManifests //= {}
+        | .sidecarCleanupActions //= {}
     ' "$WORK_STATE" > "$final" ||
        ! jq -e 'type == "object" and (.movies | type == "object")' "$final" >/dev/null; then
         rm -f -- "$final"
@@ -1446,6 +2068,12 @@ HISTORY_INSPECTIONS=0
 HISTORY_DELETE_EVENTS=0
 HISTORY_LIMIT_SKIPS=0
 TAG_ACTIONS=0
+SIDECARS_CAPTURED=0
+SIDECARS_QUARANTINED=0
+SIDECARS_NATIVE_MISSING=0
+SIDECARS_CHANGED=0
+SIDECAR_FAILURES=0
+FOLDERS_REMOVED=0
 TAG_CATALOG=''
 PLEX_DELETED_MOVIE_TAG_ID=''
 
@@ -1463,7 +2091,7 @@ trap 'exit 130' INT TERM
 if [[ ! -f "$STATE_FILE" ]]; then
     INITIAL_STATE="$(mktemp "$STATE_DIR/.state-initial.XXXXXX")" ||
         die "Cannot create initial state file."
-    printf '%s\n' '{"version":1,"lastRun":null,"lastRunHadApiErrors":false,"movies":{}}' > "$INITIAL_STATE" &&
+    printf '%s\n' '{"version":2,"lastRun":null,"lastRunHadApiErrors":false,"movies":{},"sidecarManifests":{},"sidecarCleanupActions":{}}' > "$INITIAL_STATE" &&
         mv -f -- "$INITIAL_STATE" "$STATE_FILE" || {
             rm -f -- "$INITIAL_STATE"
             die "Cannot create state file."
@@ -1524,7 +2152,45 @@ MOVIES_LISTED="$(jq length "$CURRENT_SNAPSHOT_FILE")"
 MOVIES_SCANNED="$MOVIES_LISTED"
 FILES_PRESENT="$(jq '[.[] | select(.hasFile == true)] | length' "$CURRENT_SNAPSHOT_FILE")"
 
-radarr_apply_snapshot "$CURRENT_SNAPSHOT_FILE" || die "Could not update temporary state."
+RADARR_SIDECAR_MANIFESTS='{}'
+if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( FILES_PRESENT > 0 )); then
+    while IFS= read -r MOVIE_WITH_FILE; do
+        [[ -n "$MOVIE_WITH_FILE" ]] || continue
+        MOVIE_ID="$(jq -r '.id' <<< "$MOVIE_WITH_FILE")"
+        MOVIE_API_PATH="$(jq -r '.path // empty' <<< "$MOVIE_WITH_FILE")"
+        MOVIE_PATH="$(map_arr_media_path "$MOVIE_API_PATH" "$RADARR_API_MOVIES_ROOT" "$MOVIES_ROOT" || true)"
+        MOVIE_RELATIVE_PATH="$(jq -r '.movieFile.relativePath // empty' <<< "$MOVIE_WITH_FILE")"
+        if [[ -z "$MOVIE_PATH" || -z "$MOVIE_RELATIVE_PATH" ]]; then
+            ((SIDECAR_FAILURES += 1))
+            log ERROR "Could not map or capture Kodi sidecars for Radarr movie $MOVIE_ID (API path: $MOVIE_API_PATH)."
+            continue
+        fi
+        MEDIA_RELATIVE_PATHS="$(jq -cn --arg path "$MOVIE_RELATIVE_PATH" '[$path]')"
+        if SIDECAR_FILES="$(capture_kodi_sidecars radarr "$MOVIE_PATH" "$MOVIES_ROOT" "$MEDIA_RELATIVE_PATHS")"; then
+            CAPTURED="$(jq length <<< "$SIDECAR_FILES")"
+            ((SIDECARS_CAPTURED += CAPTURED))
+            RADARR_SIDECAR_MANIFESTS="$(jq --arg key "$MOVIE_ID" \
+                --arg media_path "$MOVIE_PATH" \
+                --arg media_root "$MOVIES_ROOT" \
+                --arg now "$RUN_AT" \
+                --argjson files "$SIDECAR_FILES" '
+                . + {($key):{
+                    mediaPath:$media_path,
+                    mediaRoot:$media_root,
+                    bucket:"movies",
+                    capturedAt:$now,
+                    files:$files
+                }}
+            ' <<< "$RADARR_SIDECAR_MANIFESTS")" || die "Could not build Radarr sidecar manifest batch."
+        else
+            ((SIDECAR_FAILURES += 1))
+            log ERROR "Kodi sidecar manifest capture failed for Radarr movie $MOVIE_ID; its previous manifest was retained."
+        fi
+    done < <(jq -c '.[] | select(.hasFile == true)' "$CURRENT_SNAPSHOT_FILE")
+fi
+
+radarr_apply_snapshot "$CURRENT_SNAPSHOT_FILE" "$RADARR_SIDECAR_MANIFESTS" ||
+    die "Could not update temporary state."
 
 FIRST_MISSING="$(radarr_new_candidate_count)"
 (( FIRST_MISSING == 0 )) || radarr_log_new_candidates
@@ -1577,7 +2243,7 @@ if (( MOVIES_CONFIRMED > 0 )); then
                     fi
                 fi
 
-                if [[ "$REQUIRE_HISTORY_DELETE_EVENT" == true ]] &&
+                if [[ "$REQUIRE_DELETE_HISTORY_EVENT" == true ]] &&
                    { [[ "$HISTORY_INSPECTED" != true ]] || [[ "$HISTORY_EVIDENCE" == null ]]; }; then
                     log INFO "Not tagging $MOVIE_LABEL because no verified movieFileDeleted History event is available."
                     continue
@@ -1635,15 +2301,53 @@ if (( MOVIES_CONFIRMED > 0 )); then
     fi
 fi
 
+if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( MOVIES_CONFIRMED > 0 )); then
+    while IFS= read -r MOVIE; do
+        [[ -n "$MOVIE" ]] || continue
+        MOVIE_ID="$(jq -r '.id' <<< "$MOVIE")"
+        MOVIE_API_PATH="$(jq -r '.path // empty' <<< "$MOVIE")"
+        MOVIE_PATH="$(map_arr_media_path "$MOVIE_API_PATH" "$RADARR_API_MOVIES_ROOT" "$MOVIES_ROOT" || true)"
+        MOVIE_LABEL="$(radarr_movie_name "$MOVIE")"
+        if [[ -z "$MOVIE_PATH" ]]; then
+            ((SIDECAR_FAILURES += 1))
+            log ERROR "Cannot map Radarr path '$MOVIE_API_PATH' from RADARR_API_MOVIES_ROOT to MOVIES_ROOT; sidecar cleanup for $MOVIE_LABEL was deferred."
+            continue
+        fi
+        if [[ "$(radarr_cleanup_history_eligible "$MOVIE_ID")" != true ]]; then
+            log INFO "Not quarantining Kodi sidecars for $MOVIE_LABEL because required deletion History evidence is unavailable."
+            continue
+        fi
+        MANIFEST="$(radarr_sidecar_manifest "$MOVIE_ID")" ||
+            die "Could not read Kodi sidecar manifest for $MOVIE_LABEL."
+        if quarantine_recorded_sidecars radarr movies "$MOVIES_ROOT" "$MOVIE_PATH" "$MANIFEST"; then
+            ((SIDECARS_QUARANTINED += CLEANUP_QUARANTINED))
+            ((SIDECARS_NATIVE_MISSING += CLEANUP_NATIVE_MISSING))
+            ((SIDECARS_CHANGED += CLEANUP_CHANGED))
+            ((FOLDERS_REMOVED += CLEANUP_FOLDERS_REMOVED))
+            if [[ "$CLEANUP_COMPLETE" == true ]]; then
+                radarr_mark_sidecar_cleanup "$MOVIE_ID" "$CLEANUP_QUARANTINED" \
+                    "$CLEANUP_NATIVE_MISSING" "$CLEANUP_FOLDERS_REMOVED" ||
+                    die "Could not record Kodi sidecar cleanup for $MOVIE_LABEL."
+            fi
+        else
+            CLEANUP_RC=$?
+            if (( CLEANUP_RC != 3 )); then
+                ((SIDECAR_FAILURES += 1))
+                log ERROR "Kodi sidecar quarantine failed for $MOVIE_LABEL; its manifest was retained."
+            fi
+        fi
+    done < <(jq -c '.[]' <<< "$CONFIRMED")
+fi
+
 radarr_commit_state || die "Could not atomically save state."
 WORK_STATE=""
 
 ACTION_LABEL=applied
 [[ "$DRY_RUN" == true ]] && ACTION_LABEL=would-apply
-log INFO "Summary: movies-listed=$MOVIES_LISTED, movies-scanned=$MOVIES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$MOVIES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, tag-actions-$ACTION_LABEL=$TAG_ACTIONS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES."
+log INFO "Summary: movies-listed=$MOVIES_LISTED, movies-scanned=$MOVIES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$MOVIES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, tag-actions-$ACTION_LABEL=$TAG_ACTIONS, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
 
-if (( API_FAILURES > 0 || HISTORY_FAILURES > 0 )); then
-    log WARNING "Completed with API failures; safely retrieved state was saved and unfinished tag actions will be retried."
+if (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )); then
+    log WARNING "Completed with API, History, or sidecar failures; safe state was saved and unfinished actions will be retried."
     exit 2
 fi
 log INFO "Completed successfully."

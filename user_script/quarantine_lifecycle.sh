@@ -4,7 +4,7 @@
 # Metadata Quarantine Lifecycle Manager
 #
 # Audits, restores, and optionally expires run directories created by
-# metadata_cleanup.sh under /mnt/user/media/bin.
+# metadata_cleanup.sh and arr_delete_sync_tag.sh under /mnt/user/media/bin.
 #
 # Usage:
 #   quarantine_lifecycle.sh audit
