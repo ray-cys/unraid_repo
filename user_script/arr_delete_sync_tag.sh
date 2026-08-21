@@ -104,7 +104,7 @@ MAX_LOG_FILES=5
 HTTP_CONNECT_TIMEOUT=10
 HTTP_MAX_TIME=90
 HTTP_RETRIES=2
-USER_AGENT="Arr-Delete-Sync-Tag/1.1"
+USER_AGENT="Arr-Delete-Sync-Tag/1.1.1"
 
 ###############################################################################
 # END CONFIGURATION
@@ -114,6 +114,8 @@ APP_CONTEXT="MAIN"
 LOCK_HELD=false
 WORK_STATE=""
 CURRENT_SNAPSHOT_FILE=""
+SIDECAR_BATCH_FILE=""
+SIDECAR_ENTRY_FILE=""
 ARR_NAME=""
 ARR_URL=""
 ARR_API_KEY=""
@@ -152,6 +154,10 @@ cleanup_app() {
     [[ -n "$WORK_STATE" && -f "$WORK_STATE" ]] && rm -f -- "$WORK_STATE"
     [[ -n "$CURRENT_SNAPSHOT_FILE" && -f "$CURRENT_SNAPSHOT_FILE" ]] &&
         rm -f -- "$CURRENT_SNAPSHOT_FILE"
+    [[ -n "$SIDECAR_BATCH_FILE" && -f "$SIDECAR_BATCH_FILE" ]] &&
+        rm -f -- "$SIDECAR_BATCH_FILE"
+    [[ -n "$SIDECAR_ENTRY_FILE" && -f "$SIDECAR_ENTRY_FILE" ]] &&
+        rm -f -- "$SIDECAR_ENTRY_FILE"
     trap - EXIT
     exit "$status"
 }
@@ -196,6 +202,7 @@ remove_stale_temp_files() {
         "$RUNTIME_DIR"/.movies.*
         "$RUNTIME_DIR"/.sonarr-*
         "$RUNTIME_DIR"/.radarr-*
+        "$RUNTIME_DIR"/.sidecars.*
     )
     [[ "$nullglob_was_set" == true ]] || shopt -u nullglob
 
@@ -739,7 +746,7 @@ sonarr_apply_snapshot() {
     local series_title="$2"
     local episodes_file="$3"
     local series_path="$4"
-    local sidecar_files="$5"
+    local sidecar_files_file="$5"
     local next
     next="$(mktemp "$STATE_DIR/.state-snapshot.XXXXXX")" || return 1
 
@@ -748,8 +755,9 @@ sonarr_apply_snapshot() {
         --arg series_path "$series_path" \
         --arg media_root "$SERIES_ROOT" \
         --arg now "$RUN_AT" \
-        --argjson sidecar_files "$sidecar_files" \
+        --slurpfile sidecar_source "$sidecar_files_file" \
         --slurpfile source "$episodes_file" '($source[0] // []) as $episodes
+        | ($sidecar_source[0] // null) as $sidecar_files
         | .episodes //= {}
         | .sidecarManifests //= {}
         | if $sidecar_files != null then
@@ -1171,6 +1179,8 @@ STATE_BACKUP="$SONARR_STATE_BACKUP"
 RUN_AT="$(date '+%Y-%m-%dT%H:%M:%S%z')"
 WORK_STATE=""
 CURRENT_SNAPSHOT_FILE=""
+SIDECAR_BATCH_FILE=""
+SIDECAR_ENTRY_FILE=""
 API_FAILURES=0
 HISTORY_FAILURES=0
 HISTORY_INSPECTIONS=0
@@ -1321,7 +1331,9 @@ while IFS= read -r SERIES_ID; do
     ((EPISODES_SCANNED += COUNT))
     ((FILES_PRESENT += PRESENT))
 
-    SIDECAR_FILES=null
+    [[ -n "$SIDECAR_ENTRY_FILE" ]] && rm -f -- "$SIDECAR_ENTRY_FILE"
+    SIDECAR_ENTRY_FILE="$(mktemp "$STATE_DIR/.sidecars.entry.XXXXXX")" ||
+        die "Cannot create temporary Sonarr sidecar manifest."
     if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( PRESENT > 0 )); then
         MEDIA_RELATIVE_PATHS="$(jq '[
             .[]
@@ -1331,19 +1343,22 @@ while IFS= read -r SERIES_ID; do
         if [[ -z "$SERIES_PATH" || "$(jq length <<< "$MEDIA_RELATIVE_PATHS")" == 0 ]]; then
             ((SIDECAR_FAILURES += 1))
             log ERROR "Could not capture Kodi sidecars for $SERIES_TITLE because Sonarr omitted its media path."
-        elif SIDECAR_FILES="$(capture_kodi_sidecars sonarr "$SERIES_PATH" "$SERIES_ROOT" "$MEDIA_RELATIVE_PATHS")"; then
-            CAPTURED="$(jq length <<< "$SIDECAR_FILES")"
+        elif capture_kodi_sidecars sonarr "$SERIES_PATH" "$SERIES_ROOT" \
+            "$MEDIA_RELATIVE_PATHS" > "$SIDECAR_ENTRY_FILE"; then
+            CAPTURED="$(jq length "$SIDECAR_ENTRY_FILE")"
             ((SIDECARS_CAPTURED += CAPTURED))
         else
-            SIDECAR_FILES=null
+            : > "$SIDECAR_ENTRY_FILE"
             ((SIDECAR_FAILURES += 1))
             log ERROR "Kodi sidecar manifest capture failed for $SERIES_TITLE; the previous manifest was retained."
         fi
     fi
 
     sonarr_apply_snapshot "$SERIES_ID" "$SERIES_TITLE" "$CURRENT_SNAPSHOT_FILE" \
-        "$SERIES_PATH" "$SIDECAR_FILES" ||
+        "$SERIES_PATH" "$SIDECAR_ENTRY_FILE" ||
         die "Could not update temporary state for $SERIES_TITLE."
+    rm -f -- "$SIDECAR_ENTRY_FILE"
+    SIDECAR_ENTRY_FILE=""
 
     NEW="$(sonarr_new_candidate_count "$SERIES_ID")"
     ((FIRST_MISSING += NEW))
@@ -1782,14 +1797,15 @@ main() {
 # confirmation counter instead of being treated as a deletion.
 radarr_apply_snapshot() {
     local movies_file="$1"
-    local sidecar_manifests="$2"
+    local sidecar_manifests_file="$2"
     local next
     next="$(mktemp "$STATE_DIR/.state-snapshot.XXXXXX")" || return 1
 
     if ! jq --arg now "$RUN_AT" \
         --argjson require_unmonitored "$RADARR_REQUIRE_MOVIE_UNMONITORED" \
-        --argjson sidecar_manifests "$sidecar_manifests" \
+        --slurpfile sidecar_source "$sidecar_manifests_file" \
         --slurpfile source "$movies_file" '($source[0] // []) as $movies
+        | (($sidecar_source | add) // {}) as $sidecar_manifests
         | .movies //= {}
         | .sidecarManifests = ((.sidecarManifests // {}) * $sidecar_manifests)
         | reduce $movies[] as $movie (.;
@@ -2057,6 +2073,8 @@ STATE_BACKUP="$RADARR_STATE_BACKUP"
 RUN_AT="$(date '+%Y-%m-%dT%H:%M:%S%z')"
 WORK_STATE=""
 CURRENT_SNAPSHOT_FILE=""
+SIDECAR_BATCH_FILE=""
+SIDECAR_ENTRY_FILE=""
 API_FAILURES=0
 HISTORY_FAILURES=0
 MOVIES_LISTED=0
@@ -2152,7 +2170,8 @@ MOVIES_LISTED="$(jq length "$CURRENT_SNAPSHOT_FILE")"
 MOVIES_SCANNED="$MOVIES_LISTED"
 FILES_PRESENT="$(jq '[.[] | select(.hasFile == true)] | length' "$CURRENT_SNAPSHOT_FILE")"
 
-RADARR_SIDECAR_MANIFESTS='{}'
+SIDECAR_BATCH_FILE="$(mktemp "$STATE_DIR/.sidecars.batch.XXXXXX")" ||
+    die "Cannot create temporary Radarr sidecar manifest batch."
 if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( FILES_PRESENT > 0 )); then
     while IFS= read -r MOVIE_WITH_FILE; do
         [[ -n "$MOVIE_WITH_FILE" ]] || continue
@@ -2166,31 +2185,42 @@ if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( FILES_PRESENT > 0 )); then
             continue
         fi
         MEDIA_RELATIVE_PATHS="$(jq -cn --arg path "$MOVIE_RELATIVE_PATH" '[$path]')"
-        if SIDECAR_FILES="$(capture_kodi_sidecars radarr "$MOVIE_PATH" "$MOVIES_ROOT" "$MEDIA_RELATIVE_PATHS")"; then
-            CAPTURED="$(jq length <<< "$SIDECAR_FILES")"
+        [[ -n "$SIDECAR_ENTRY_FILE" ]] && rm -f -- "$SIDECAR_ENTRY_FILE"
+        SIDECAR_ENTRY_FILE="$(mktemp "$STATE_DIR/.sidecars.entry.XXXXXX")" ||
+            die "Cannot create temporary Radarr sidecar manifest."
+        if capture_kodi_sidecars radarr "$MOVIE_PATH" "$MOVIES_ROOT" \
+            "$MEDIA_RELATIVE_PATHS" > "$SIDECAR_ENTRY_FILE"; then
+            CAPTURED="$(jq length "$SIDECAR_ENTRY_FILE")"
             ((SIDECARS_CAPTURED += CAPTURED))
-            RADARR_SIDECAR_MANIFESTS="$(jq --arg key "$MOVIE_ID" \
+            if ! jq -n --arg key "$MOVIE_ID" \
                 --arg media_path "$MOVIE_PATH" \
                 --arg media_root "$MOVIES_ROOT" \
                 --arg now "$RUN_AT" \
-                --argjson files "$SIDECAR_FILES" '
-                . + {($key):{
+                --slurpfile files_source "$SIDECAR_ENTRY_FILE" '
+                ($files_source[0] // []) as $files
+                | {($key):{
                     mediaPath:$media_path,
                     mediaRoot:$media_root,
                     bucket:"movies",
                     capturedAt:$now,
                     files:$files
                 }}
-            ' <<< "$RADARR_SIDECAR_MANIFESTS")" || die "Could not build Radarr sidecar manifest batch."
+            ' >> "$SIDECAR_BATCH_FILE"; then
+                die "Could not build Radarr sidecar manifest batch."
+            fi
         else
             ((SIDECAR_FAILURES += 1))
             log ERROR "Kodi sidecar manifest capture failed for Radarr movie $MOVIE_ID; its previous manifest was retained."
         fi
+        rm -f -- "$SIDECAR_ENTRY_FILE"
+        SIDECAR_ENTRY_FILE=""
     done < <(jq -c '.[] | select(.hasFile == true)' "$CURRENT_SNAPSHOT_FILE")
 fi
 
-radarr_apply_snapshot "$CURRENT_SNAPSHOT_FILE" "$RADARR_SIDECAR_MANIFESTS" ||
+radarr_apply_snapshot "$CURRENT_SNAPSHOT_FILE" "$SIDECAR_BATCH_FILE" ||
     die "Could not update temporary state."
+rm -f -- "$SIDECAR_BATCH_FILE"
+SIDECAR_BATCH_FILE=""
 
 FIRST_MISSING="$(radarr_new_candidate_count)"
 (( FIRST_MISSING == 0 )) || radarr_log_new_candidates
