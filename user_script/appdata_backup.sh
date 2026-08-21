@@ -11,16 +11,17 @@
 # Appdata workflow:
 #
 #   1. Validate source/destination
-#   2. Prune old backups to reserve space for the new backup
-#   3. Validate available destination space
+#   2. Validate available destination space while retaining the last good backup
+#   3. Create and verify the replacement backup
 #   4. Record currently-running Docker containers
 #   5. Stop selected running containers
 #   6. Compress each top-level appdata directory
 #   7. Verify every archive
 #   8. Promote the .partial backup only when the entire appdata backup succeeds
-#   9. Restart only containers that were running before the backup
-#  10. Optionally mirror additional shares with rsync
-#  11. Prune logs and send one consolidated Unraid notification
+#   9. Prune the previous successful backup only after promotion succeeds
+#  10. Restart only containers that were running before the backup
+#  11. Optionally mirror additional shares with rsync
+#  12. Prune logs and send one consolidated Unraid notification
 #
 #
 # SAFETY
@@ -29,9 +30,10 @@
 # - A failed container stop aborts the appdata backup.
 # - An EXIT/signal trap attempts to restart containers if the script exits
 #   unexpectedly after stopping them.
-# - Old backups are pruned before backup creation so the destination has room.
-#   With MAX_BACKUPS=1, this creates a period with no successful backup at the
-#   destination if the new backup subsequently fails.
+# - The previous successful backup is retained until the new backup has been
+#   completely created, verified, and promoted from its .partial directory.
+# - If there is not enough free space to hold both generations temporarily,
+#   the run aborts without deleting the previous successful backup.
 # - New backups remain ".partial" until all archives pass verification.
 # - Individual archives are written to ".tmp" first and promoted only after
 #   gzip/tar integrity checks pass.
@@ -88,8 +90,9 @@ SKIP_APPDATA_DIRS=(
 
 # Number of VERIFIED successful backup directories to retain.
 #
-# Before a new backup starts, successful backups are reduced to
-# MAX_BACKUPS - 1 so the new backup has a retention slot available.
+# Successful backups are pruned to this count only after a new verified backup
+# has been promoted. With MAX_BACKUPS=1, the previous generation remains
+# available for the entire backup operation.
 #
 MAX_BACKUPS=1
 
@@ -270,6 +273,7 @@ APPDATA_FAILED=0
 APPDATA_SKIPPED=0
 APPDATA_TOTAL_BYTES=0
 APPDATA_FINALIZE_FAILED=0
+RETENTION_FAILED=0
 APPDATA_REPORT=""
 APPDATA_BACKUP_PATH=""
 
@@ -1106,6 +1110,7 @@ run_appdata_backup() {
     APPDATA_SKIPPED=0
     APPDATA_TOTAL_BYTES=0
     APPDATA_FINALIZE_FAILED=0
+    RETENTION_FAILED=0
     APPDATA_REPORT=""
     APPDATA_BACKUP_PATH=""
 
@@ -1178,9 +1183,13 @@ run_appdata_backup() {
             log "BACKUP" "INFO" \
                 "Appdata backup verified and finalized: $FINAL_DIR"
 
-            # Enforce the normal post-backup retention count. Pre-backup
-            # cleanup should already have reserved one slot.
-            prune_successful_backups
+            # The previous successful generation is deliberately retained
+            # until this new verified generation has been promoted.
+            if ! prune_successful_backups; then
+                RETENTION_FAILED=1
+                log "BACKUP" "ERROR" \
+                    "New backup is valid, but old successful backup pruning failed"
+            fi
 
             return 0
         fi
@@ -1475,6 +1484,7 @@ send_final_notification() {
     local appdata_status="OK"
     local shares_status="OK"
     local restart_status="OK"
+    local retention_status="OK"
     local overall_status="OK"
 
     local importance="normal"
@@ -1491,6 +1501,13 @@ send_final_notification() {
         overall_status="FAILED"
     fi
 
+    if [ "$RETENTION_FAILED" -gt 0 ]; then
+        retention_status="FAILED"
+        if [ "$overall_status" = "OK" ]; then
+            overall_status="WARNING"
+        fi
+    fi
+
     if [ "$SHARES_FAILED" -gt 0 ]; then
         shares_status="FAILED"
         overall_status="FAILED"
@@ -1503,6 +1520,8 @@ send_final_notification() {
 
     if [ "$overall_status" = "FAILED" ]; then
         importance="alert"
+    elif [ "$overall_status" = "WARNING" ]; then
+        importance="warning"
     fi
 
     description="Appdata & Shares - ${overall_status}"
@@ -1519,6 +1538,10 @@ send_final_notification() {
 
     if [ "$APPDATA_FINALIZE_FAILED" -gt 0 ]; then
         body+="  Finalize: FAILED"$'\n'
+    fi
+
+    if [ "$RETENTION_FAILED" -gt 0 ]; then
+        body+="  Retention cleanup: ${retention_status} (new backup remains valid)"$'\n'
     fi
 
     if [ -n "$APPDATA_BACKUP_PATH" ]; then
@@ -1633,17 +1656,15 @@ ${SRC_DIR}"
         return 1
     fi
 
-    # Reserve space for the backup before assessing destination capacity.
-    # Old partials are incomplete and are never allowed to compete with a new
-    # run. Successful backups are reduced to MAX_BACKUPS - 1 so that the new
-    # verified backup will bring the total back to MAX_BACKUPS.
-    if ! prune_partial_backups 0 ||
-       ! prune_successful_backups "$((MAX_BACKUPS - 1))"
-    then
+    # Old partials are incomplete and are not allowed to compete with a new
+    # run. The previous successful generation is never removed here; capacity
+    # assessment must prove the destination can temporarily hold both the old
+    # and replacement generations.
+    if ! prune_partial_backups 0; then
         notify_unraid \
             "alert" \
             "Backup FAILED - Cleanup" \
-            "Unable to remove an old backup before starting the new backup.
+            "Unable to remove an old partial backup before starting the new backup.
 Destination: ${DEST_DIR}
 See log:
 ${LOG_FILE}"
@@ -1754,6 +1775,7 @@ ${LOG_FILE}"
 
     if [ "$APPDATA_FAILED" -gt 0 ] ||
        [ "$APPDATA_FINALIZE_FAILED" -gt 0 ] ||
+       [ "$RETENTION_FAILED" -gt 0 ] ||
        [ "$SHARES_FAILED" -gt 0 ] ||
        [ "$RESTART_FAILED" -gt 0 ]
     then
