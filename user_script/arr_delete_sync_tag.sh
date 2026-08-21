@@ -88,8 +88,8 @@ SERIES_ROOT="/mnt/user/media/series"
 # equal to the host roots above when the containers use identical paths. For a
 # typical remap, use values such as /tv and /movies here; only the suffix below
 # each root is transferred to the matching host root.
-SONARR_API_SERIES_ROOT="/mnt/user/media/series"
-RADARR_API_MOVIES_ROOT="/mnt/user/media/movies"
+SONARR_API_SERIES_ROOT="/data/series"
+RADARR_API_MOVIES_ROOT="/data/movies"
 
 REQUIRE_SIDECAR_HASH_MATCH=true
 REMOVE_EMPTY_MEDIA_FOLDERS=true
