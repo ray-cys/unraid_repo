@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# SABnzbd Stranded Completed Download Cleanup v1.0
+# SABnzbd Stranded Completed Download Cleanup v1.1
 #
 # PURPOSE
 # -------
@@ -24,6 +24,8 @@
 #   - The number of verified imported paths accounts for all remaining source
 #     media files. Ambiguous season packs are skipped, not guessed.
 #   - Every resolved source/destination path remains below an explicit root.
+#   - Unraid Mover is not running at startup, before a quarantine move, or
+#     before quarantine purge.
 #
 # SAFETY MODEL
 # ------------
@@ -32,6 +34,7 @@
 #   - Quarantine is purged only after QUARANTINE_RETENTION_DAYS.
 #   - MAX_QUARANTINES_PER_RUN limits the impact of any one run.
 #   - Any API, pagination, path, history, or filesystem ambiguity is a skip.
+#   - An active Unraid Mover stops the run successfully before further writes.
 #   - SAB history is never deleted, archived, or modified.
 #   - The script never removes Arr queue/history records or library files.
 #
@@ -57,7 +60,7 @@ set -uo pipefail
 # CONFIGURATION
 ###############################################################################
 
-VERSION="1.0"
+VERSION="1.1"
 
 # ---------------------------------------------------------------------------
 # Execution behavior
@@ -78,6 +81,16 @@ QUARANTINE_RETENTION_DAYS="${QUARANTINE_RETENTION_DAYS:-14}"
 
 # Limit real quarantine moves per run. Zero means unlimited.
 MAX_QUARANTINES_PER_RUN="${MAX_QUARANTINES_PER_RUN:-10}"
+
+# Refuse to overlap Unraid Mover. The process pattern matches current and
+# legacy Unraid mover entry points and is shared with mover_audit.sh.
+MOVER_GUARD_ENABLED="${MOVER_GUARD_ENABLED:-true}"
+MOVER_PROCESS_PATTERN="${MOVER_PROCESS_PATTERN:-(^|/)(mover|mover\.old)( |$)|mover\.php}"
+
+# Send a normal Unraid notification when a scheduled cleanup is skipped because
+# Mover is still active. The script exits successfully so User Scripts does not
+# report the deliberate skip as a failure.
+NOTIFY_MOVER_SKIP="${NOTIFY_MOVER_SKIP:-true}"
 
 # ---------------------------------------------------------------------------
 # Sonarr
@@ -183,6 +196,7 @@ HISTORY_UNPROVEN=0
 DESTINATION_UNVERIFIED=0
 SOURCE_UNACCOUNTED=0
 SAFETY_SKIPPED=0
+MOVER_PROTECTED=0
 ELIGIBLE=0
 QUARANTINED=0
 PURGED=0
@@ -193,6 +207,9 @@ BYTES_PURGED=0
 
 QUARANTINE_DETAILS=()
 PURGE_DETAILS=()
+
+MOVER_GUARD_TRIGGERED=false
+MOVER_GUARD_CONTEXT=""
 
 ###############################################################################
 # GENERAL HELPERS
@@ -370,6 +387,11 @@ require_commands() {
     fi
   done
 
+  if is_true "$MOVER_GUARD_ENABLED" && ! command -v pgrep >/dev/null 2>&1; then
+    log "ERROR" "Required Mover guard command not found: pgrep"
+    missing=1
+  fi
+
   (( missing == 0 )) || die "One or more required commands are unavailable."
 }
 
@@ -464,6 +486,8 @@ paths_overlap() {
 validate_environment() {
   validate_boolean "DRY_RUN" "$DRY_RUN"
   validate_boolean "PURGE_QUARANTINE" "$PURGE_QUARANTINE"
+  validate_boolean "MOVER_GUARD_ENABLED" "$MOVER_GUARD_ENABLED"
+  validate_boolean "NOTIFY_MOVER_SKIP" "$NOTIFY_MOVER_SKIP"
   validate_boolean "SONARR_ENABLED" "$SONARR_ENABLED"
   validate_boolean "RADARR_ENABLED" "$RADARR_ENABLED"
   validate_boolean "SEND_NOTIFICATIONS" "$SEND_NOTIFICATIONS"
@@ -515,6 +539,10 @@ validate_environment() {
     die "SAB movie and TV categories must be different."
   fi
 
+  if is_true "$MOVER_GUARD_ENABLED" && [[ -z "$MOVER_PROCESS_PATTERN" ]]; then
+    die "MOVER_PROCESS_PATTERN cannot be empty while the Mover guard is enabled."
+  fi
+
   if ! is_true "$DRY_RUN"; then
     mkdir -p -- "$QUARANTINE_DIR_REAL/items/Sonarr" "$QUARANTINE_DIR_REAL/items/Radarr" || \
       die "Unable to create quarantine directories."
@@ -548,6 +576,46 @@ initialize() {
   RADARR_QUEUE_FILE="$TMP_DIR/radarr_queue.json"
 
   validate_environment
+}
+
+###############################################################################
+# UNRAID MOVER GUARD
+###############################################################################
+
+mover_is_running() {
+  is_true "$MOVER_GUARD_ENABLED" || return 1
+  pgrep -f "$MOVER_PROCESS_PATTERN" >/dev/null 2>&1
+}
+
+notify_mover_skip() {
+  local context="$1"
+
+  is_true "$SEND_NOTIFICATIONS" || return 0
+  is_true "$NOTIFY_MOVER_SKIP" || return 0
+  [[ -x "$NOTIFY" ]] || return 0
+
+  "$NOTIFY" \
+    -i normal \
+    -s "SABnzbd Stranded Cleanup" \
+    -d "Cleanup skipped while Unraid Mover is active" \
+    -m "Guard point: ${context}. No further cleanup writes were attempted; the next scheduled run will retry." \
+    >/dev/null 2>&1 || true
+}
+
+check_mover_guard() {
+  local context="$1"
+
+  mover_is_running || return 0
+
+  MOVER_GUARD_TRIGGERED=true
+  MOVER_GUARD_CONTEXT="$context"
+  ((MOVER_PROTECTED++)) || true
+
+  log "WARNING" "Unraid Mover is running at guard point '$context'."
+  log "WARNING" "Stopping cleanup successfully; no further cleanup writes will be attempted."
+  notify_mover_skip "$context"
+
+  return 20
 }
 
 ###############################################################################
@@ -1211,6 +1279,10 @@ quarantine_payload() {
     return 0
   fi
 
+  # This is deliberately the last check before the first quarantine write.
+  # If Mover started after the initial scan, stop the entire run here.
+  check_mover_guard "before quarantine move for ${download_id}" || return $?
+
   mkdir -p -- "$wrapper" || return 1
 
   local wrapper_real
@@ -1279,6 +1351,8 @@ purge_quarantine() {
 
   [[ -d "$QUARANTINE_DIR_REAL/items" ]] || return 0
 
+  check_mover_guard "before quarantine purge" || return $?
+
   local cutoff_minutes=$((QUARANTINE_RETENTION_DAYS * 1440))
   local wrapper
   local wrapper_real
@@ -1315,6 +1389,10 @@ purge_quarantine() {
       PURGE_DETAILS+=("$wrapper")
       continue
     fi
+
+    # Recheck for every destructive purge so a Mover that starts during a
+    # longer cleanup stops all remaining writes immediately.
+    check_mover_guard "before purging ${wrapper}" || return $?
 
     if rm -rf -- "$wrapper"; then
       log "INFO" "Purged quarantine: $wrapper"
@@ -1356,6 +1434,7 @@ process_completed_jobs() {
   local proof_status
   local verified_paths
   local source_media
+  local quarantine_status
 
   log "INFO" "Evaluating completed SABnzbd jobs."
 
@@ -1507,7 +1586,7 @@ process_completed_jobs() {
       continue
     fi
 
-    if quarantine_payload \
+    quarantine_payload \
       "$owner" \
       "$category" \
       "$download_id" \
@@ -1516,7 +1595,9 @@ process_completed_jobs() {
       "$source_path" \
       "$size" \
       "$proof_file"
-    then
+    quarantine_status=$?
+
+    if (( quarantine_status == 0 )); then
       ((QUARANTINED++)) || true
       ((BYTES_QUARANTINED += size)) || true
       QUARANTINE_DETAILS+=("$owner | $job_name | $(bytes_human "$size")")
@@ -1526,6 +1607,8 @@ process_completed_jobs() {
       else
         log "INFO" "Action: moved to quarantine"
       fi
+    elif (( quarantine_status == 20 )); then
+      return 20
     else
       ((ERRORS++)) || true
       log "ERROR" "Failed to quarantine: $source_path"
@@ -1578,6 +1661,10 @@ print_summary() {
   log "INFO" "Imported destination unverified: $DESTINATION_UNVERIFIED"
   log "INFO" "Source media unaccounted: $SOURCE_UNACCOUNTED"
   log "INFO" "Other safety skips: $SAFETY_SKIPPED"
+  log "INFO" "Mover guard stops: $MOVER_PROTECTED"
+  if is_true "$MOVER_GUARD_TRIGGERED"; then
+    log "INFO" "Mover guard context: $MOVER_GUARD_CONTEXT"
+  fi
   log "INFO" "Eligible: $ELIGIBLE ($(bytes_human "$BYTES_ELIGIBLE"))"
   log "INFO" "Quarantined/planned: $QUARANTINED ($(bytes_human "$BYTES_QUARANTINED"))"
   log "INFO" "Purged/planned: $PURGED ($(bytes_human "$BYTES_PURGED"))"
@@ -1597,6 +1684,8 @@ print_summary() {
 ###############################################################################
 
 main() {
+  local operation_status
+
   parse_args "$@"
   initialize
 
@@ -1605,10 +1694,34 @@ main() {
   log "INFO" "Minimum completed age: ${MIN_COMPLETED_AGE_HOURS}h"
   log "INFO" "Minimum path stability: ${MIN_PATH_STABLE_HOURS}h"
   log "INFO" "Quarantine retention: ${QUARANTINE_RETENTION_DAYS}d"
+  log "INFO" "Mover guard enabled: $MOVER_GUARD_ENABLED"
+
+  check_mover_guard "startup"
+  operation_status=$?
+  if (( operation_status == 20 )); then
+    print_summary
+    return 0
+  fi
 
   fetch_required_state
   process_completed_jobs
+  operation_status=$?
+  if (( operation_status == 20 )); then
+    print_summary
+    return 0
+  elif (( operation_status != 0 )); then
+    die "Completed-job processing failed with status $operation_status."
+  fi
+
   purge_quarantine
+  operation_status=$?
+  if (( operation_status == 20 )); then
+    print_summary
+    return 0
+  elif (( operation_status != 0 )); then
+    die "Quarantine purge failed with status $operation_status."
+  fi
+
   print_summary
   notify_summary
 
