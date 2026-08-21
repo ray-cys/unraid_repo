@@ -4,7 +4,7 @@ noParity=true
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.15.1"
+readonly SCRIPT_VERSION="2.15.2"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -15,7 +15,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.15.1
+# Disk Health Monitor for Unraid v2.15.2
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
@@ -28,6 +28,9 @@ fi
 # containing no positive deltas, and safely resolves legitimate Unraid
 # exclusive-share paths to their physical pool target before managed paths are
 # derived.
+# v2.15.2 restores the external configuration to the private state directory so
+# normal Unraid share ownership and setgid permissions on LOG_DIR do not make a
+# trusted configuration unsafe. Legacy shared-directory copies are ignored.
 ################################################################################
 # ---------------- Configuration ----------------
 # Disks health script settings. Tuned for performance and reliability.
@@ -563,7 +566,7 @@ SYSLOG_CHUNK_FILE=""
 SYSLOG_CURSOR_MODE="not_run"
 RUN_MODE="monitor"
 ROLLBACK_BACKUP_ID=""
-REGRESSION_FIXTURE_COUNT=89
+REGRESSION_FIXTURE_COUNT=93
 CONFIG_ERROR_COUNT=0
 CONFIG_WARNING_COUNT=0
 DEPENDENCY_ERROR_COUNT=0
@@ -625,7 +628,8 @@ SUBSYSTEM_MONITORING_STATE="OK"
 
 # === Logs Paths ===
 STATE_DIR="${LOG_DIR:-}/state"
-EXTERNAL_CONFIG_FILE="$LOG_DIR/health_monitoring.conf"
+EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+LEGACY_EXTERNAL_CONFIG_FILE="$LOG_DIR/health_monitoring.conf"
 STATE_BACKUP_DIR="$STATE_DIR/backups"
 
 # === Categorized Timestamp Logging ===
@@ -881,6 +885,67 @@ validate_managed_file_target() {
     return 0
 }
 
+# Unraid may remap existing share content to nobody:users (uid 99) even when
+# the script originally created it. The state/config path is a fixed bootstrap
+# path that external configuration cannot override, so root may safely reclaim
+# only this exact directory and regular, single-link configuration file before
+# parsing. Symbolic links, hard links, and unexpected path layouts still fail.
+harden_existing_external_config_path() {
+    local expected="$STATE_DIR/health_monitoring.conf"
+
+    if [[ "$EXTERNAL_CONFIG_FILE" != "$expected" ]]; then
+        PATH_VALIDATION_REASON="external configuration is outside the managed state directory"
+        return 1
+    fi
+    if [[ ! -e "$STATE_DIR" && ! -L "$STATE_DIR" ]]; then
+        return 0
+    fi
+    validate_symlink_free_path "$STATE_DIR" || return 1
+    if [[ ! -d "$STATE_DIR" ]]; then
+        PATH_VALIDATION_REASON="managed state path is not a directory"
+        return 1
+    fi
+    if ! command -v chmod >/dev/null 2>&1; then
+        PATH_VALIDATION_REASON="chmod is unavailable for state-directory hardening"
+        return 1
+    fi
+
+    if (( EUID == 0 )); then
+        if ! command -v chown >/dev/null 2>&1; then
+            PATH_VALIDATION_REASON="chown is unavailable for Unraid ownership repair"
+            return 1
+        fi
+        chown "$EUID" -- "$STATE_DIR" 2>/dev/null || {
+            PATH_VALIDATION_REASON="cannot assign the state directory to uid $EUID"
+            return 1
+        }
+    fi
+    chmod 700 -- "$STATE_DIR" 2>/dev/null || {
+        PATH_VALIDATION_REASON="cannot restrict state directory permissions"
+        return 1
+    }
+
+    if [[ -e "$EXTERNAL_CONFIG_FILE" || -L "$EXTERNAL_CONFIG_FILE" ]]; then
+        validate_managed_file_target "$EXTERNAL_CONFIG_FILE" || return 1
+        if (( EUID == 0 )); then
+            chown "$EUID" -- "$EXTERNAL_CONFIG_FILE" 2>/dev/null || {
+                PATH_VALIDATION_REASON="cannot assign the external configuration to uid $EUID"
+                return 1
+            }
+        fi
+        chmod 600 -- "$EXTERNAL_CONFIG_FILE" 2>/dev/null || {
+            PATH_VALIDATION_REASON="cannot restrict external configuration permissions"
+            return 1
+        }
+    fi
+
+    validate_secure_owned_directory "$STATE_DIR" || return 1
+    if [[ -e "$EXTERNAL_CONFIG_FILE" || -L "$EXTERNAL_CONFIG_FILE" ]]; then
+        validate_secure_owned_file "$EXTERNAL_CONFIG_FILE" || return 1
+    fi
+    return 0
+}
+
 ensure_dir() {
     local path="$1"
 
@@ -903,6 +968,12 @@ ensure_private_dir() {
     local path="$1"
 
     ensure_dir "$path" || return 1
+    if (( EUID == 0 )); then
+        chown "$EUID" -- "$path" 2>/dev/null || {
+            log "PATH" "ERROR" "Unable to assign private directory to uid $EUID: $path"
+            return 1
+        }
+    fi
     chmod 700 -- "$path" 2>/dev/null || {
         log "PATH" "ERROR" "Unable to restrict directory permissions: $path"
         return 1
@@ -1028,6 +1099,12 @@ load_external_configuration() {
     EXTERNAL_CONFIG_LOAD_FAILED=0
 
     if [[ ! -e "$EXTERNAL_CONFIG_FILE" && ! -L "$EXTERNAL_CONFIG_FILE" ]]; then
+        if [[ -e "$LEGACY_EXTERNAL_CONFIG_FILE" ||
+              -L "$LEGACY_EXTERNAL_CONFIG_FILE" ]]; then
+            EXTERNAL_CONFIG_DETAIL="using built-in defaults; legacy shared-directory configuration is ignored"
+            external_config_log WARN \
+                "Ignoring legacy configuration $LEGACY_EXTERNAL_CONFIG_FILE because LOG_DIR is not a trusted configuration directory; review and copy intended overrides into $EXTERNAL_CONFIG_FILE"
+        fi
         return 0
     fi
     parent="${EXTERNAL_CONFIG_FILE%/*}"
@@ -1036,7 +1113,7 @@ load_external_configuration() {
         EXTERNAL_CONFIG_DETAIL="$PATH_VALIDATION_REASON"
         EXTERNAL_CONFIG_LOAD_FAILED=1
         external_config_log ERROR \
-            "Refusing external configuration: $EXTERNAL_CONFIG_DETAIL"
+            "Refusing external configuration $EXTERNAL_CONFIG_FILE: $EXTERNAL_CONFIG_DETAIL"
         return 1
     fi
     if ! validate_secure_owned_file "$EXTERNAL_CONFIG_FILE"; then
@@ -1044,7 +1121,7 @@ load_external_configuration() {
         EXTERNAL_CONFIG_DETAIL="$PATH_VALIDATION_REASON"
         EXTERNAL_CONFIG_LOAD_FAILED=1
         external_config_log ERROR \
-            "Refusing external configuration: $EXTERNAL_CONFIG_DETAIL"
+            "Refusing external configuration $EXTERNAL_CONFIG_FILE: $EXTERNAL_CONFIG_DETAIL"
         return 1
     fi
 
@@ -11612,22 +11689,22 @@ validate_runtime_dependencies() {
     case "$mode" in
         self-test)
             required_commands=(
-                awk chmod cp cut date find flock grep ln mkdir mktemp mv rm sed
+                awk chmod chown cp cut date find flock grep ln mkdir mktemp mv rm sed
                 sha1sum sleep sort stat timeout tr wc
             )
             ;;
         notification-test)
-            required_commands=(awk chmod date flock grep sed sleep stat timeout)
+            required_commands=(awk chmod chown date flock grep sed sleep stat timeout)
             ;;
         state-admin)
             required_commands=(
-                awk chmod cp date find flock grep mkdir mktemp mv rm sed sort
+                awk chmod chown cp date find flock grep mkdir mktemp mv rm sed sort
                 stat wc
             )
             ;;
         *)
             required_commands=(
-                awk basename cat cksum cp cut date df dirname dmesg find findmnt
+                awk basename cat chmod chown cksum cp cut date df dirname dmesg find findmnt
                 flock grep head lsblk mkdir mktemp mount mountpoint mv readlink rm
                 sed sha1sum sleep smartctl sort stat tail timeout tr wc
             )
@@ -11915,7 +11992,7 @@ run_diagnostics() {
             ;;
         ABSENT)
             diagnostic_result INFO "External configuration" \
-                "$EXTERNAL_CONFIG_FILE will be created on the next monitoring run"
+                "$EXTERNAL_CONFIG_DETAIL; $EXTERNAL_CONFIG_FILE will be created on the next monitoring run"
             ;;
         *)
             diagnostic_result FAIL "External configuration" "$EXTERNAL_CONFIG_DETAIL"
@@ -12002,7 +12079,7 @@ run_regression_tests() (
     fi
 
     if declare -F load_builtin_defaults >/dev/null 2>&1 &&
-       [[ "$SCRIPT_VERSION" == "2.15.1" &&
+       [[ "$SCRIPT_VERSION" == "2.15.2" &&
           "$STATE_SCHEMA_VERSION" == "2" &&
           "$HISTORY_SCHEMA_VERSION" == "3" &&
           "$DEVICE_ID_SCHEMA_VERSION" == "2" &&
@@ -12012,6 +12089,16 @@ run_regression_tests() (
         self_test_result 1 "Built-in defaults and schema constants"
     else
         self_test_result 0 "Built-in defaults and schema constants"
+    fi
+
+    if [[ "$EXTERNAL_CONFIG_FILE" == "$STATE_DIR/health_monitoring.conf" &&
+          "$LEGACY_EXTERNAL_CONFIG_FILE" == "$LOG_DIR/health_monitoring.conf" &&
+          "$EXTERNAL_CONFIG_FILE" != "$LEGACY_EXTERNAL_CONFIG_FILE" ]]
+    then
+        self_test_result 1 "External configuration uses private state directory"
+    else
+        self_test_result 0 "External configuration uses private state directory" \
+            "active=$EXTERNAL_CONFIG_FILE legacy=$LEGACY_EXTERNAL_CONFIG_FILE"
     fi
 
     if validate_secure_absolute_path "$fixture_dir/safe/state" &&
@@ -12161,6 +12248,67 @@ run_regression_tests() (
         self_test_result 1 "Derived external-configuration setting allowlist"
     else
         self_test_result 0 "Derived external-configuration setting allowlist"
+    fi
+
+    local legacy_config_dir="$fixture_dir/legacy-shared-config"
+    local private_config_dir="$fixture_dir/private-state-config"
+    mkdir -p "$legacy_config_dir" "$private_config_dir"
+    chmod 2775 "$legacy_config_dir"
+    chmod 700 "$private_config_dir"
+    LEGACY_EXTERNAL_CONFIG_FILE="$legacy_config_dir/health_monitoring.conf"
+    # These fixture-only mutations are isolated by run_regression_tests().
+    # shellcheck disable=SC2030
+    EXTERNAL_CONFIG_FILE="$private_config_dir/health_monitoring.conf"
+    printf 'SMART_ALLOW_SPINUP=1\n' > "$LEGACY_EXTERNAL_CONFIG_FILE"
+    # shellcheck disable=SC2030
+    SMART_ALLOW_SPINUP=0
+    if load_external_configuration &&
+       [[ "$EXTERNAL_CONFIG_STATUS" == "ABSENT" &&
+          "$EXTERNAL_CONFIG_LOAD_FAILED" == "0" &&
+          "$EXTERNAL_CONFIG_OVERRIDE_COUNT" == "0" &&
+          "$SMART_ALLOW_SPINUP" == "0" ]]
+    then
+        self_test_result 1 "Legacy shared-directory configuration is safely ignored"
+    else
+        self_test_result 0 "Legacy shared-directory configuration is safely ignored" \
+            "$EXTERNAL_CONFIG_STATUS: $EXTERNAL_CONFIG_DETAIL"
+    fi
+
+    local fixture_real
+    fixture_real=$(cd "$fixture_dir" && pwd -P)
+    local config_repair_state="$fixture_real/config-repair-state"
+    STATE_DIR="$config_repair_state"
+    EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+    mkdir -p "$STATE_DIR"
+    printf 'SMART_ALLOW_SPINUP=0\n' > "$EXTERNAL_CONFIG_FILE"
+    chmod 2775 "$STATE_DIR"
+    chmod 0664 "$EXTERNAL_CONFIG_FILE"
+    if (( EUID == 0 )); then
+        chown 99 -- "$STATE_DIR" "$EXTERNAL_CONFIG_FILE"
+    fi
+    if harden_existing_external_config_path &&
+       validate_secure_owned_directory "$STATE_DIR" &&
+       validate_secure_owned_file "$EXTERNAL_CONFIG_FILE"
+    then
+        self_test_result 1 "Existing Unraid state configuration ownership repair"
+    else
+        self_test_result 0 "Existing Unraid state configuration ownership repair" \
+            "$PATH_VALIDATION_REASON"
+    fi
+
+    local config_link_real="$fixture_real/config-link-real"
+    local config_link_state="$fixture_real/config-link-state"
+    mkdir -p "$config_link_real"
+    ln -s "$config_link_real" "$config_link_state"
+    STATE_DIR="$config_link_state"
+    EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+    if ! harden_existing_external_config_path &&
+       [[ "$PATH_VALIDATION_REASON" == *"symbolic-link component"* ]]
+    then
+        self_test_result 1 "External configuration state-link rejection"
+    else
+        self_test_result 0 "External configuration state-link rejection" \
+            "$PATH_VALIDATION_REASON"
     fi
 
     local config_fixture_dir="$fixture_dir/external-config" inert_config_value
@@ -13913,5 +14061,15 @@ main() {
 }
 
 
-load_external_configuration || true
+# Fixture mutations occur only inside the self-test subshell.
+# shellcheck disable=SC2031
+if harden_existing_external_config_path; then
+    load_external_configuration || true
+else
+    EXTERNAL_CONFIG_STATUS="UNSAFE"
+    EXTERNAL_CONFIG_DETAIL="$PATH_VALIDATION_REASON"
+    EXTERNAL_CONFIG_LOAD_FAILED=1
+    external_config_log ERROR \
+        "Unable to secure external configuration $EXTERNAL_CONFIG_FILE: $EXTERNAL_CONFIG_DETAIL"
+fi
 main "$@"
