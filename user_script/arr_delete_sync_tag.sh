@@ -93,6 +93,9 @@ RADARR_API_MOVIES_ROOT="/data/movies"
 
 REQUIRE_SIDECAR_HASH_MATCH=true
 REMOVE_EMPTY_MEDIA_FOLDERS=true
+# Let API/state work continue, but defer sidecar moves and rmdir cleanup while
+# Unraid Mover is active. Pending manifests remain eligible for the next run.
+DEFER_SIDECAR_CLEANUP_WHILE_MOVER=true
 MAX_SIDECAR_SIZE_MB=100
 
 # A progress line is written for the first series and then every N series, so
@@ -104,7 +107,7 @@ MAX_LOG_FILES=5
 HTTP_CONNECT_TIMEOUT=10
 HTTP_MAX_TIME=90
 HTTP_RETRIES=2
-USER_AGENT="Arr-Delete-Sync-Tag/1.1.1"
+USER_AGENT="Arr-Delete-Sync-Tag/1.2"
 
 ###############################################################################
 # END CONFIGURATION
@@ -129,6 +132,8 @@ SIDECARS_NATIVE_MISSING=0
 SIDECARS_CHANGED=0
 SIDECAR_FAILURES=0
 FOLDERS_REMOVED=0
+MOVER_DEFERRALS=0
+MOVER_GUARD_NOTICE_LOGGED=false
 
 CLEANUP_COMPLETE=false
 CLEANUP_QUARANTINED=0
@@ -398,6 +403,10 @@ contains_video_files() {
         -print -quit | grep -q .
 }
 
+unraid_mover_running() {
+    pgrep -f '(^|/)(mover|mover\.old)( |$)|mover\.php' >/dev/null 2>&1
+}
+
 remove_empty_media_dirs() {
     local media_path="$1"
     local directory removed=0
@@ -467,6 +476,13 @@ quarantine_recorded_sidecars() {
     if contains_video_files "$media_real"; then
         log WARNING "$app_name cleanup was deferred because a video file still exists below $media_real."
         return 0
+    fi
+    if [[ "$DEFER_SIDECAR_CLEANUP_WHILE_MOVER" == true ]] && unraid_mover_running; then
+        if [[ "$MOVER_GUARD_NOTICE_LOGGED" == false ]]; then
+            log WARNING "Unraid Mover is running; sidecar quarantine and empty-folder cleanup are deferred. Pending manifests will be retried next run."
+            MOVER_GUARD_NOTICE_LOGGED=true
+        fi
+        return 4
     fi
 
     if [[ -e "$QUARANTINE_ROOT" ]]; then
@@ -1202,6 +1218,8 @@ SIDECARS_NATIVE_MISSING=0
 SIDECARS_CHANGED=0
 SIDECAR_FAILURES=0
 FOLDERS_REMOVED=0
+MOVER_DEFERRALS=0
+MOVER_GUARD_NOTICE_LOGGED=false
 TAG_CATALOG=''
 PLEX_DELETED_SEASON_TAG_ID=''
 PLEX_DELETED_SERIES_TAG_ID=''
@@ -1449,10 +1467,14 @@ while IFS= read -r SERIES_ID; do
                 fi
             else
                 CLEANUP_RC=$?
-                if (( CLEANUP_RC != 3 )); then
-                    ((SIDECAR_FAILURES += 1))
-                    log ERROR "Kodi sidecar quarantine failed for $SERIES_TITLE; its manifest was retained."
-                fi
+                case "$CLEANUP_RC" in
+                    3) ;;
+                    4) ((MOVER_DEFERRALS += 1)) ;;
+                    *)
+                        ((SIDECAR_FAILURES += 1))
+                        log ERROR "Kodi sidecar quarantine failed for $SERIES_TITLE; its manifest was retained."
+                        ;;
+                esac
             fi
         fi
     fi
@@ -1617,7 +1639,7 @@ WORK_STATE=""
 
 ACTION_LABEL=applied
 [[ "$DRY_RUN" == true ]] && ACTION_LABEL=would-apply
-log INFO "Summary: series-listed=$SERIES_LISTED, series-scanned=$SERIES_SCANNED, episodes=$EPISODES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$EPISODES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, episode-actions-$ACTION_LABEL=$EPISODE_ACTIONS, season-actions-$ACTION_LABEL=$SEASON_ACTIONS, series-actions-$ACTION_LABEL=$SERIES_ACTIONS, tagged-series-$ACTION_LABEL=$TAGGED_SERIES_ACTIONS, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
+log INFO "Summary: series-listed=$SERIES_LISTED, series-scanned=$SERIES_SCANNED, episodes=$EPISODES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$EPISODES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, episode-actions-$ACTION_LABEL=$EPISODE_ACTIONS, season-actions-$ACTION_LABEL=$SEASON_ACTIONS, series-actions-$ACTION_LABEL=$SERIES_ACTIONS, tagged-series-$ACTION_LABEL=$TAGGED_SERIES_ACTIONS, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, mover-deferrals=$MOVER_DEFERRALS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
 
 if (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )); then
     log WARNING "Completed with API, History, or sidecar failures; safe state was saved and unfinished actions will be retried."
@@ -1638,8 +1660,8 @@ validate_common_configuration() {
         printf 'Unsafe RUNTIME_DIR: %s\n' "$RUNTIME_DIR" >&2
         return 1
     }
-    for command in curl jq mktemp stat tee sort cut tr cp mv find grep realpath \
-        sha256sum dirname rmdir; do
+    for command in curl jq mktemp stat tee sort cut tr cp mv find grep pgrep \
+        realpath sha256sum dirname rmdir; do
         command -v "$command" >/dev/null 2>&1 || {
             printf 'Required command not found: %s\n' "$command" >&2
             return 1
@@ -1660,6 +1682,9 @@ validate_common_configuration() {
         die "REQUIRE_SIDECAR_HASH_MATCH must be true or false."
     [[ "$REMOVE_EMPTY_MEDIA_FOLDERS" == true || "$REMOVE_EMPTY_MEDIA_FOLDERS" == false ]] ||
         die "REMOVE_EMPTY_MEDIA_FOLDERS must be true or false."
+    [[ "$DEFER_SIDECAR_CLEANUP_WHILE_MOVER" == true ||
+       "$DEFER_SIDECAR_CLEANUP_WHILE_MOVER" == false ]] ||
+        die "DEFER_SIDECAR_CLEANUP_WHILE_MOVER must be true or false."
     [[ "$INSPECT_DELETE_HISTORY" == true || "$REQUIRE_DELETE_HISTORY_EVENT" == false ]] ||
         die "REQUIRE_DELETE_HISTORY_EVENT=true requires INSPECT_DELETE_HISTORY=true."
     [[ "$CONFIRMATION_RUNS" =~ ^[0-9]+$ ]] && (( CONFIRMATION_RUNS >= 2 )) ||
@@ -2092,6 +2117,8 @@ SIDECARS_NATIVE_MISSING=0
 SIDECARS_CHANGED=0
 SIDECAR_FAILURES=0
 FOLDERS_REMOVED=0
+MOVER_DEFERRALS=0
+MOVER_GUARD_NOTICE_LOGGED=false
 TAG_CATALOG=''
 PLEX_DELETED_MOVIE_TAG_ID=''
 
@@ -2361,10 +2388,14 @@ if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( MOVIES_CONFIRMED > 0 )); then
             fi
         else
             CLEANUP_RC=$?
-            if (( CLEANUP_RC != 3 )); then
-                ((SIDECAR_FAILURES += 1))
-                log ERROR "Kodi sidecar quarantine failed for $MOVIE_LABEL; its manifest was retained."
-            fi
+            case "$CLEANUP_RC" in
+                3) ;;
+                4) ((MOVER_DEFERRALS += 1)) ;;
+                *)
+                    ((SIDECAR_FAILURES += 1))
+                    log ERROR "Kodi sidecar quarantine failed for $MOVIE_LABEL; its manifest was retained."
+                    ;;
+            esac
         fi
     done < <(jq -c '.[]' <<< "$CONFIRMED")
 fi
@@ -2374,7 +2405,7 @@ WORK_STATE=""
 
 ACTION_LABEL=applied
 [[ "$DRY_RUN" == true ]] && ACTION_LABEL=would-apply
-log INFO "Summary: movies-listed=$MOVIES_LISTED, movies-scanned=$MOVIES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$MOVIES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, tag-actions-$ACTION_LABEL=$TAG_ACTIONS, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
+log INFO "Summary: movies-listed=$MOVIES_LISTED, movies-scanned=$MOVIES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$MOVIES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, tag-actions-$ACTION_LABEL=$TAG_ACTIONS, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, mover-deferrals=$MOVER_DEFERRALS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
 
 if (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )); then
     log WARNING "Completed with API, History, or sidecar failures; safe state was saved and unfinished actions will be retried."
