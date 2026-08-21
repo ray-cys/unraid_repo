@@ -201,7 +201,7 @@ SOAK_REQUIRE_NOTIFICATION_SUPPRESSION=1        # Require at least one lifecycle-
 SOAK_REQUIRE_PARITY=0                          # Optionally require a run observed during parity activity
 
 # === Paths / Integration ===
-LOG_DIR="/mnt/user/cloud/logs/disk_health"       # Run logs and persistent state
+LOG_DIR="/mnt/vault/cloud/logs/disk_health"       # Run logs and persistent state
 LOCK_FILE="/run/health_monitoring.lock"          # Root-controlled non-blocking single-instance lock
 NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
 
@@ -530,7 +530,7 @@ SUBSYSTEM_MONITORING_STATE="OK"
 
 # === Logs Paths ===
 STATE_DIR="${LOG_DIR:-}/state"
-EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+EXTERNAL_CONFIG_FILE="$LOG_DIR/health_monitoring.conf"
 STATE_BACKUP_DIR="$STATE_DIR/backups"
 
 # === Categorized Timestamp Logging ===
