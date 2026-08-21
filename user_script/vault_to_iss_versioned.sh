@@ -13,7 +13,7 @@
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.1.1"
+readonly SCRIPT_VERSION="1.2"
 
 ###############################################################################
 # CONFIGURATION
@@ -42,6 +42,8 @@ REMOTE_KEEP=3
 ENABLE_WOL=true
 MAX_SSH_WAIT=420
 SSH_WAIT_INTERVAL=15
+ARRAY_READY_WAIT=180
+ARRAY_READY_INTERVAL=6
 SHUTDOWN_REMOTE_ON_SUCCESS=true
 
 # Keep true for the first manually reviewed run.
@@ -73,7 +75,6 @@ START_EPOCH="$(date +%s)"
 RESULT_STATUS="FAILED"
 RESULT_SUMMARY="Script exited before completion"
 RECEIPT_WRITTEN=0
-REMOTE_READY=0
 FILES_VERIFIED=0
 BYTES_TRANSFERRED=0
 
@@ -201,6 +202,18 @@ validate_configuration() {
         log ERROR "REMOTE_KEEP must be at least 1"
         return 1
     }
+    [[ "$MAX_SSH_WAIT" =~ ^[1-9][0-9]*$ &&
+       "$SSH_WAIT_INTERVAL" =~ ^[1-9][0-9]*$ &&
+       "$ARRAY_READY_WAIT" =~ ^[1-9][0-9]*$ &&
+       "$ARRAY_READY_INTERVAL" =~ ^[1-9][0-9]*$ ]] || {
+        log ERROR "Remote readiness timeouts and intervals must be positive integers"
+        return 1
+    }
+    (( SSH_WAIT_INTERVAL <= MAX_SSH_WAIT &&
+       ARRAY_READY_INTERVAL <= ARRAY_READY_WAIT )) || {
+        log ERROR "Remote readiness intervals must not exceed their timeouts"
+        return 1
+    }
     (( ${#BACKUP_JOBS[@]} > 0 )) || {
         log ERROR "No BACKUP_JOBS are configured"
         return 1
@@ -238,30 +251,50 @@ send_wol() {
 }
 
 wait_for_remote() {
-    local waited=0 root_q
+    local ssh_waited=0 array_waited=0 root_q
+    local ssh_ready=0 array_ready=0
     root_q="$(shell_quote "$REMOTE_VERSION_ROOT")"
     send_wol
 
-    while (( waited <= MAX_SSH_WAIT )); do
+    log INFO "Waiting up to ${MAX_SSH_WAIT}s for $DEST_NAS SSH"
+    while (( ssh_waited <= MAX_SSH_WAIT )); do
         if ssh_exec "true" >/dev/null 2>&1; then
-            REMOTE_READY=1
+            ssh_ready=1
             break
         fi
-        (( waited == 0 )) && log INFO "Waiting for $DEST_NAS SSH"
+        (( ssh_waited >= MAX_SSH_WAIT )) && break
         sleep "$SSH_WAIT_INTERVAL"
-        waited=$((waited + SSH_WAIT_INTERVAL))
+        ssh_waited=$((ssh_waited + SSH_WAIT_INTERVAL))
     done
 
-    (( REMOTE_READY == 1 )) || {
+    (( ssh_ready == 1 )) || {
         log ERROR "$DEST_NAS did not become reachable within ${MAX_SSH_WAIT}s"
         return 1
     }
+    log INFO "$DEST_NAS SSH is reachable after ${ssh_waited}s"
 
-    ssh_exec "mountpoint -q /mnt/user && test -d $root_q && test ! -L $root_q" ||
-    {
-        log ERROR "Remote /mnt/user or version root is not ready: $REMOTE_VERSION_ROOT"
+    log INFO "Waiting up to ${ARRAY_READY_WAIT}s for $DEST_NAS /mnt/user mount"
+    while (( array_waited <= ARRAY_READY_WAIT )); do
+        if ssh_exec 'mountpoint -q /mnt/user 2>/dev/null || grep -qsE "[[:space:]]/mnt/user[[:space:]]" /proc/mounts' \
+            >/dev/null 2>&1; then
+            array_ready=1
+            break
+        fi
+        (( array_waited >= ARRAY_READY_WAIT )) && break
+        sleep "$ARRAY_READY_INTERVAL"
+        array_waited=$((array_waited + ARRAY_READY_INTERVAL))
+    done
+
+    (( array_ready == 1 )) || {
+        log ERROR "$DEST_NAS /mnt/user was not mounted within ${ARRAY_READY_WAIT}s"
         return 1
     }
+    log INFO "$DEST_NAS /mnt/user is mounted after ${array_waited}s"
+
+    if ! ssh_exec "test -d $root_q && test ! -L $root_q"; then
+        log ERROR "Remote version root is missing, unavailable, or a symlink: $REMOTE_VERSION_ROOT"
+        return 1
+    fi
 }
 
 build_manifest() {
