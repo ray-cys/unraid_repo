@@ -4,7 +4,7 @@ noParity=true
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.15"
+readonly SCRIPT_VERSION="2.15.1"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -15,7 +15,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.15
+# Disk Health Monitor for Unraid v2.15.1
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
@@ -24,6 +24,10 @@ fi
 # read-only readiness report. It observes existing collector, standby, parity,
 # syslog-cursor, and notification behavior without adding disk reads or changing
 # health, scheduling, or delivery decisions.
+# v2.15.1 hardens empty-array handling under nounset, including Btrfs histories
+# containing no positive deltas, and safely resolves legitimate Unraid
+# exclusive-share paths to their physical pool target before managed paths are
+# derived.
 ################################################################################
 # ---------------- Configuration ----------------
 # Disks health script settings. Tuned for performance and reliability.
@@ -358,6 +362,97 @@ action:invert_mwi_small;regex:WD[[:space:]]+Red.*SA500;cap_min:0.48;cap_max:0.52
 
 load_builtin_defaults
 
+# Unraid Exclusive Shares expose /mnt/user/<share> as a symbolic link to the
+# same share on one physical pool. Resolve only that exact, constrained shape;
+# arbitrary redirects, nested links, and mismatched share names remain unsafe.
+UNRAID_EXCLUSIVE_PATH_RESULT=""
+UNRAID_EXCLUSIVE_PATH_STATUS="UNCHANGED"
+UNRAID_EXCLUSIVE_PATH_REASON=""
+
+resolve_unraid_exclusive_share_path() {
+    local requested="$1" user_root="${2:-/mnt/user}" mount_root="${3:-/mnt}"
+    local relative share suffix source target target_relative pool target_share
+    local remainder component current
+
+    UNRAID_EXCLUSIVE_PATH_RESULT="$requested"
+    UNRAID_EXCLUSIVE_PATH_STATUS="UNCHANGED"
+    UNRAID_EXCLUSIVE_PATH_REASON=""
+
+    [[ "$requested" == "$user_root"/* ]] || return 0
+    relative="${requested#"$user_root"/}"
+    share="${relative%%/*}"
+    suffix=""
+    [[ "$relative" == */* ]] && suffix="${relative#*/}"
+    if [[ -z "$share" || ! "$share" =~ ^[A-Za-z0-9._-]+$ ||
+          "$share" == "." || "$share" == ".." ]]; then
+        UNRAID_EXCLUSIVE_PATH_REASON="invalid Unraid share name"
+        return 1
+    fi
+
+    source="$user_root/$share"
+    [[ -L "$source" ]] || return 0
+    target=$(readlink -- "$source" 2>/dev/null) || {
+        UNRAID_EXCLUSIVE_PATH_REASON="cannot read exclusive-share link $source"
+        return 1
+    }
+    if [[ "$target" != /* || "$target" == *"//"* || "$target" =~ [[:cntrl:]] ]]; then
+        UNRAID_EXCLUSIVE_PATH_REASON="exclusive-share link target is not a clean absolute path"
+        return 1
+    fi
+    [[ "$target" == "$mount_root"/* ]] || {
+        UNRAID_EXCLUSIVE_PATH_REASON="exclusive-share link leaves $mount_root"
+        return 1
+    }
+
+    target_relative="${target#"$mount_root"/}"
+    pool="${target_relative%%/*}"
+    target_share="${target_relative#*/}"
+    if [[ -z "$pool" || "$target_relative" == "$pool" ||
+          "$target_share" != "$share" || "$target_share" == */* ||
+          ! "$pool" =~ ^[A-Za-z0-9._-]+$ ||
+          "$pool" == "user" || "$pool" == "user0" ||
+          "$pool" =~ ^disk[0-9]+$ ]]; then
+        UNRAID_EXCLUSIVE_PATH_REASON="exclusive-share link does not target the same share on one pool"
+        return 1
+    fi
+    if [[ ! -d "$target" || -L "$mount_root" || -L "$mount_root/$pool" ||
+          -L "$target" ]]; then
+        UNRAID_EXCLUSIVE_PATH_REASON="exclusive-share pool target is missing or contains a symbolic link"
+        return 1
+    fi
+
+    current="$target"
+    remainder="$suffix"
+    while [[ -n "$remainder" ]]; do
+        component="${remainder%%/*}"
+        if [[ -z "$component" || "$component" == "." || "$component" == ".." ]]; then
+            UNRAID_EXCLUSIVE_PATH_REASON="exclusive-share suffix contains an unsafe component"
+            return 1
+        fi
+        current+="/$component"
+        if [[ -L "$current" ]]; then
+            UNRAID_EXCLUSIVE_PATH_REASON="exclusive-share suffix contains symbolic-link component $current"
+            return 1
+        fi
+        [[ "$remainder" == */* ]] || break
+        remainder="${remainder#*/}"
+    done
+
+    UNRAID_EXCLUSIVE_PATH_RESULT="$target${suffix:+/$suffix}"
+    UNRAID_EXCLUSIVE_PATH_STATUS="RESOLVED"
+    return 0
+}
+
+if ! resolve_unraid_exclusive_share_path "$LOG_DIR"; then
+    printf '%s [PATH][ERROR] Unsafe Unraid exclusive-share log path %s: %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$LOG_DIR" \
+        "$UNRAID_EXCLUSIVE_PATH_REASON" >&2
+    exit 2
+fi
+if [[ "$UNRAID_EXCLUSIVE_PATH_STATUS" == "RESOLVED" ]]; then
+    LOG_DIR="$UNRAID_EXCLUSIVE_PATH_RESULT"
+fi
+
 # Derive the allowlist directly from assignments in load_builtin_defaults().
 # This avoids a second setting list and remains stable even if the caller's
 # environment already contains a variable with the same name as a setting.
@@ -387,61 +482,61 @@ readonly STATE_SCHEMA_FORMAT="health-monitoring-state"
 
 
 # === Runtime State (do not modify) ===
-declare -A SMART_STATE                            # Map device -> OK/WARNING/CRITICAL
-declare -A SMART_MSGS                             # Map device -> aggregated SMART message string
-declare -A MOUNT_TO_DEV                           # Map /mnt/diskX -> /dev/sdX|nvme
-declare -A POOL_MEMBER_MAP                        # Map base device (/dev/sdX|nvme0n1) -> pool name
-declare -A BURST_BOOST                            # Base device -> accumulated burst boost this run (0-100)
-declare -A TBW_STATUS_MAP                         # Map device -> TBW status (OK/WARNING/CRITICAL)
-declare -A TBW_DAILY                              # Map device -> daily TBW bytes (over window)
-declare -A TBW_DAYS_LEFT                          # Map device -> forecasted days left to endurance
-declare -A NVME_WEAR_DAYS_LEFT NVME_WEAR_RATE     # NVMe depletion projection
-declare -A TBW_FORECAST_CONFIDENCE                # Per-device TBW forecast confidence
-declare -A NVME_WEAR_CONFIDENCE                   # Per-device NVMe wear forecast confidence
-declare -A TEMP_RATE_CONFIDENCE                   # Per-device temperature-rate confidence
-declare -A IO_ERROR_RAW_MAP                       # Map device -> raw I/O error line count (duplicates included)
-declare -A IO_ERROR_UNIQUE_MAP                    # Map device -> unique I/O error event count (dedup within window)
-declare -A LAST_TEST                              # Map device -> last SMART test timestamp
-declare -A LAST_TEST_EPOCH LAST_TEST_KIND         # Actual test-start epoch/type (legacy date state remains supported)
-declare -A NVME_LAST_UNSAFE                       # NVMe device -> last unsafe shutdown count
-declare -A NVME_LAST_ERRLOG                       # NVMe device -> last error information log entries
-declare -A NVME_LAST_PCIE_CORR                    # NVMe device -> last PCIe correctable error count
-declare -A NVME_LAST_PCIE_UNC                     # NVMe device -> last PCIe uncorrectable error count
-declare -A NVME_LAST_THERM_T1                     # NVMe device -> last thermal management T1 transitions
-declare -A NVME_LAST_THERM_T2                     # NVMe device -> last thermal management T2 transitions
-declare -A NVME_LAST_WARN_TEMP_TIME               # NVMe device -> last warning temperature time (seconds)
-declare -A NVME_LAST_CRIT_TEMP_TIME               # NVMe device -> last critical temperature time (seconds)
-declare -A PREV_ATTR                              # device|attr -> previous raw value
-declare -A CUR_ATTR                               # device|attr -> current raw value
-declare -A NEW_SEEN                               # Newly seen alerts/disks set
-declare -A LONG_LAST_POH                          # Map device -> last long self-test lifetime hours
-declare -A LONG_TEST_DUE_SOON                     # Map device -> days until next long test when near
-declare -A CMD_TIMEOUT_LAST                       # Map device -> previous command timeout count
-declare -A LONG_TEST_RUNNING_LONG                 # Map device -> 1 if a long/extended self-test is currently in progress
-declare -A RISK_SPIKE_TS                          # Map device -> epoch timestamp of last captured risk spike
-declare -a FINDING_IDS                            # Ordered canonical finding identifiers
-declare -A FINDING_SEEN                           # Canonical finding de-duplication within a run
-declare -A FINDING_SEVERITY FINDING_CATEGORY      # Finding classification
-declare -A FINDING_SIGNAL FINDING_DEVICE          # Risk signal and normalized base device
-declare -A FINDING_SCOPE                          # Stable device, mount, pool, or global finding scope
-declare -A FINDING_TITLE FINDING_EVIDENCE         # User-facing finding content
-declare -A FINDING_ACTION                         # Canonical recommended action
-declare -A SATA_POWER_STATE SMART_DEFERRED         # Cached SATA power state and deferred SMART checks
-declare -A PREVIOUS_RISK                           # Previous persisted risk, retained when a disk stays asleep
-declare -A DEVICE_ID_BY_PATH DEVICE_PATH_BY_ID     # Runtime path <-> stable persistent identity
-declare -A DEVICE_ID_SOURCE                        # Identity source: WWN, by-id, serial, or path fallback
-declare -a DISCOVERED_DISKS                        # Ordered SMART-capable base-device candidates
-declare -A RISK_MAP AGE_CLASS                     # Canonical risk results and lifecycle annotations
-declare -a NOTIFY_SECTIONS                        # Final notification sections
-declare -a TBW_EVAL_MESSAGES                      # Output from direct TBW evaluation
-declare -a COLLECTOR_ORDER                        # Deterministic collector report order
-declare -A COLLECTOR_LABEL COLLECTOR_STATUS       # Collector label and final status
-declare -A COLLECTOR_DURATION COLLECTOR_DETAIL    # Collector timing and event summary
-declare -A NOTIFY_PREV_SEVERITY NOTIFY_PREV_FINGERPRINT NOTIFY_PREV_LABEL
-declare -A NOTIFY_CURRENT_SEVERITY NOTIFY_CURRENT_FINGERPRINT NOTIFY_CURRENT_LABEL
-declare -A EXTERNAL_CONFIG_VALUES
-declare -a NOTIFY_PREV_IDS
-declare -a EXTERNAL_CONFIG_OVERRIDE_KEYS
+declare -A SMART_STATE=()                         # Map device -> OK/WARNING/CRITICAL
+declare -A SMART_MSGS=()                          # Map device -> aggregated SMART message string
+declare -A MOUNT_TO_DEV=()                        # Map /mnt/diskX -> /dev/sdX|nvme
+declare -A POOL_MEMBER_MAP=()                     # Map base device (/dev/sdX|nvme0n1) -> pool name
+declare -A BURST_BOOST=()                         # Base device -> accumulated burst boost this run (0-100)
+declare -A TBW_STATUS_MAP=()                      # Map device -> TBW status (OK/WARNING/CRITICAL)
+declare -A TBW_DAILY=()                           # Map device -> daily TBW bytes (over window)
+declare -A TBW_DAYS_LEFT=()                       # Map device -> forecasted days left to endurance
+declare -A NVME_WEAR_DAYS_LEFT=() NVME_WEAR_RATE=() # NVMe depletion projection
+declare -A TBW_FORECAST_CONFIDENCE=()             # Per-device TBW forecast confidence
+declare -A NVME_WEAR_CONFIDENCE=()                # Per-device NVMe wear forecast confidence
+declare -A TEMP_RATE_CONFIDENCE=()                # Per-device temperature-rate confidence
+declare -A IO_ERROR_RAW_MAP=()                    # Map device -> raw I/O error line count (duplicates included)
+declare -A IO_ERROR_UNIQUE_MAP=()                 # Map device -> unique I/O error event count (dedup within window)
+declare -A LAST_TEST=()                           # Map device -> last SMART test timestamp
+declare -A LAST_TEST_EPOCH=() LAST_TEST_KIND=()   # Actual test-start epoch/type (legacy date state remains supported)
+declare -A NVME_LAST_UNSAFE=()                    # NVMe device -> last unsafe shutdown count
+declare -A NVME_LAST_ERRLOG=()                    # NVMe device -> last error information log entries
+declare -A NVME_LAST_PCIE_CORR=()                 # NVMe device -> last PCIe correctable error count
+declare -A NVME_LAST_PCIE_UNC=()                  # NVMe device -> last PCIe uncorrectable error count
+declare -A NVME_LAST_THERM_T1=()                  # NVMe device -> last thermal management T1 transitions
+declare -A NVME_LAST_THERM_T2=()                  # NVMe device -> last thermal management T2 transitions
+declare -A NVME_LAST_WARN_TEMP_TIME=()            # NVMe device -> last warning temperature time (seconds)
+declare -A NVME_LAST_CRIT_TEMP_TIME=()            # NVMe device -> last critical temperature time (seconds)
+declare -A PREV_ATTR=()                           # device|attr -> previous raw value
+declare -A CUR_ATTR=()                            # device|attr -> current raw value
+declare -A NEW_SEEN=()                            # Newly seen alerts/disks set
+declare -A LONG_LAST_POH=()                       # Map device -> last long self-test lifetime hours
+declare -A LONG_TEST_DUE_SOON=()                  # Map device -> days until next long test when near
+declare -A CMD_TIMEOUT_LAST=()                    # Map device -> previous command timeout count
+declare -A LONG_TEST_RUNNING_LONG=()              # Map device -> 1 if a long/extended self-test is currently in progress
+declare -A RISK_SPIKE_TS=()                       # Map device -> epoch timestamp of last captured risk spike
+declare -a FINDING_IDS=()                         # Ordered canonical finding identifiers
+declare -A FINDING_SEEN=()                        # Canonical finding de-duplication within a run
+declare -A FINDING_SEVERITY=() FINDING_CATEGORY=() # Finding classification
+declare -A FINDING_SIGNAL=() FINDING_DEVICE=()    # Risk signal and normalized base device
+declare -A FINDING_SCOPE=()                       # Stable device, mount, pool, or global finding scope
+declare -A FINDING_TITLE=() FINDING_EVIDENCE=()   # User-facing finding content
+declare -A FINDING_ACTION=()                      # Canonical recommended action
+declare -A SATA_POWER_STATE=() SMART_DEFERRED=()  # Cached SATA power state and deferred SMART checks
+declare -A PREVIOUS_RISK=()                       # Previous persisted risk, retained when a disk stays asleep
+declare -A DEVICE_ID_BY_PATH=() DEVICE_PATH_BY_ID=() # Runtime path <-> stable persistent identity
+declare -A DEVICE_ID_SOURCE=()                    # Identity source: WWN, by-id, serial, or path fallback
+declare -a DISCOVERED_DISKS=()                    # Ordered SMART-capable base-device candidates
+declare -A RISK_MAP=() AGE_CLASS=()               # Canonical risk results and lifecycle annotations
+declare -a NOTIFY_SECTIONS=()                     # Final notification sections
+declare -a TBW_EVAL_MESSAGES=()                   # Output from direct TBW evaluation
+declare -a COLLECTOR_ORDER=()                     # Deterministic collector report order
+declare -A COLLECTOR_LABEL=() COLLECTOR_STATUS=() # Collector label and final status
+declare -A COLLECTOR_DURATION=() COLLECTOR_DETAIL=() # Collector timing and event summary
+declare -A NOTIFY_PREV_SEVERITY=() NOTIFY_PREV_FINGERPRINT=() NOTIFY_PREV_LABEL=()
+declare -A NOTIFY_CURRENT_SEVERITY=() NOTIFY_CURRENT_FINGERPRINT=() NOTIFY_CURRENT_LABEL=()
+declare -A EXTERNAL_CONFIG_VALUES=()
+declare -a NOTIFY_PREV_IDS=()
+declare -a EXTERNAL_CONFIG_OVERRIDE_KEYS=()
 TBW_EVAL_STATE="OK"
 
 RUN_STAMP=""
@@ -468,7 +563,7 @@ SYSLOG_CHUNK_FILE=""
 SYSLOG_CURSOR_MODE="not_run"
 RUN_MODE="monitor"
 ROLLBACK_BACKUP_ID=""
-REGRESSION_FIXTURE_COUNT=84
+REGRESSION_FIXTURE_COUNT=89
 CONFIG_ERROR_COUNT=0
 CONFIG_WARNING_COUNT=0
 DEPENDENCY_ERROR_COUNT=0
@@ -2753,7 +2848,7 @@ prune_history_files() {
 # === Helper Functions ===
 # Caching wrappers for external commands to minimize repeated calls
 declare LSBLK_ALL_CACHE=""
-declare -A BTRFS_DF_CACHE_DATA BTRFS_DF_CACHE_META
+declare -A BTRFS_DF_CACHE_DATA=() BTRFS_DF_CACHE_META=()
 cache_lsblk_all() {
     if [[ -z "$LSBLK_ALL_CACHE" ]]; then
         LSBLK_ALL_CACHE="$(lsblk_bounded -b -dn -o NAME,SIZE,ROTA,TYPE 2>/dev/null || true)"
@@ -6009,7 +6104,7 @@ run_smart_test() {
     if echo "$model_raw" | grep -qi 'ultrastar' && echo "$model_raw" | grep -qi 'wd\|western'; then
         patterns+=("Extended offline" "Extended" "Long offline" "Offline" "Extended-Offline" "Long_test")
     fi
-    declare -A _seen_pat
+    declare -A _seen_pat=()
     local p uniq_patterns=()
     for p in "${patterns[@]}"; do
         [[ -z "$p" ]] && continue
@@ -6277,7 +6372,7 @@ augment_messages_with_deltas() {
 # === Helper Function ===
 # Detect newly completed long tests and summarize result
 check_completed_long_tests() {
-    declare -A PROCESSED
+    declare -A PROCESSED=()
     local -a disks=()
     local disk temp_file d id stored_key state_key
 
@@ -6577,7 +6672,7 @@ evaluate_capacity_alerts() {
 # shellcheck disable=SC2329
 evaluate_per_mount_thresholds() {
     local candidates=(/mnt/disk* /mnt/cache /mnt/*)
-    declare -A seen
+    declare -A seen=()
     local uniq=()
     local mp
     for mp in "${candidates[@]}"; do
@@ -6663,7 +6758,7 @@ fi
         win_wear=${WEAR_TREND_WINDOW_DAYS:-90}
         cutoff_wear=$(date -d "-${win_wear} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
         if [[ -f "$SMART_ATTR_HISTORY_FILE" ]]; then
-            declare -A _WEAR_SAMPLE_VALUE _WEAR_SAMPLE_EPOCH _WEAR_DEVICE_SEEN _WEAR_SEQUENCE
+            declare -A _WEAR_SAMPLE_VALUE=() _WEAR_SAMPLE_EPOCH=() _WEAR_DEVICE_SEEN=() _WEAR_SEQUENCE=()
             declare -g -A NVME_WEAR_DAYS_LEFT NVME_WEAR_RATE NVME_WEAR_CONFIDENCE
             NVME_WEAR_DAYS_LEFT=()
             NVME_WEAR_RATE=()
@@ -6979,7 +7074,7 @@ scan_syslog_disk_errors() {
 
     IO_ERROR_RAW_MAP=()
     IO_ERROR_UNIQUE_MAP=()
-    declare -A HASH_SEEN NEW_IO_EVENT_MAP
+    declare -A HASH_SEEN=() NEW_IO_EVENT_MAP=()
 
     if ! build_new_syslog_chunk; then
         log "SYSLOG" "WARN" "Unable to build the incremental syslog chunk; cursor was not advanced"
@@ -7148,7 +7243,7 @@ build_storage_and_disk_lines() {
     for d in /mnt/disk*; do [[ -d "$d" ]] || continue; mountpoint -q "$d" || continue; arr+=("$d"); done
     ARRAY_COUNT=${#arr[@]}
     local arr_used=0 arr_size=0
-    declare -a ARR_INFO POOL_INFO
+    declare -a ARR_INFO=() POOL_INFO=()
     local name
     # For each array disk: parse df usage, compute percent and capacity, combine with SMART severity, and collect reasons
     for d in "${arr[@]}"; do
@@ -8463,8 +8558,8 @@ analyze_temperature_trends() {
         local now_ts
         now_ts=$(date +%s)
         local cut_ts=$(( now_ts - temp_win*86400 ))
-        declare -A TT_CNT TT_FIRST TT_LAST TT_FIRST_TS TT_LAST_TS TT_MAX_GAP_SECONDS
-        declare -A TEMP_SAMPLE_VALUE TEMP_SAMPLE_EPOCH TEMP_DEVICE_SEEN TEMP_SEQUENCE
+        declare -A TT_CNT=() TT_FIRST=() TT_LAST=() TT_FIRST_TS=() TT_LAST_TS=() TT_MAX_GAP_SECONDS=()
+        declare -A TEMP_SAMPLE_VALUE=() TEMP_SAMPLE_EPOCH=() TEMP_DEVICE_SEEN=() TEMP_SEQUENCE=()
         TEMP_RATE_CONFIDENCE=()
         while read -r dt stored_key rest; do
             [[ "$dt" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
@@ -8607,7 +8702,7 @@ analyze_smart_attribute_trends() {
         local win_attr=${SMART_ATTR_TREND_WINDOW_DAYS:-7}
         local cutoff_attr
         cutoff_attr=$(date -d "-${win_attr} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
-        declare -A first_line_attr last_line_attr first_dt_attr last_dt_attr
+        declare -A first_line_attr=() last_line_attr=() first_dt_attr=() last_dt_attr=()
         if prepare_trend_history_cache smart-attributes "$SMART_ATTR_HISTORY_FILE" 50000; then
                 local smart_attr_cache="$TREND_CACHE_RESULT"
                 local stored_key
@@ -8622,7 +8717,7 @@ analyze_smart_attribute_trends() {
                 for dev in "${!last_line_attr[@]}"; do
                     local f="${first_line_attr[$dev]}" l="${last_line_attr[$dev]}"
                     local -a first_tokens=() last_tokens=()
-                    declare -A fv_attr lv_attr
+                    declare -A fv_attr=() lv_attr=()
                     fv_attr=()
                     lv_attr=()
                     IFS=$' \t' read -r -a first_tokens <<< "$f"
@@ -8712,7 +8807,7 @@ analyze_endurance_trends() {
            prepare_trend_history_cache power-on-hours "$POH_HISTORY_FILE" 50000
         then
                 local poh_cache="$TREND_CACHE_RESULT"
-                declare -A poh_first_epoch poh_first_v poh_last_epoch poh_last_v
+                declare -A poh_first_epoch=() poh_first_v=() poh_last_epoch=() poh_last_v=()
                 local dt stored_key rest v poh_epoch
                 while read -r dt stored_key rest; do
                     v=$(history_field_value "$rest" poh 2>/dev/null || true)
@@ -8790,7 +8885,7 @@ analyze_endurance_trends() {
         then
                 local dl_cache="$TREND_CACHE_RESULT"
                 local accel_factor=${ENDURANCE_DAYSLEFT_ACCEL_FACTOR_PCT:-50} accel_min=${ENDURANCE_DAYSLEFT_ACCEL_MIN_DELTA:-0.5}
-                declare -A dl_first_dt dl_first_v dl_last_dt dl_last_v dl_last_confidence dl_seq
+                declare -A dl_first_dt=() dl_first_v=() dl_last_dt=() dl_last_v=() dl_last_confidence=() dl_seq=()
                 local dt stored_key rest v confidence
                 while read -r dt stored_key rest; do
                     v=$(history_field_value "$rest" days_left 2>/dev/null || true)
@@ -8876,7 +8971,7 @@ analyze_error_rate_trends() {
         cutoff_err=$(date -d "-${win_err} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
 
         # Btrfs device/mount sequences
-        declare -A BSEQ MSEQ
+        declare -A BSEQ=() MSEQ=()
         if prepare_trend_history_cache btrfs-errors "$BTRFS_DEV_HIST_FILE" 50000; then
             local btrfs_cache="$TREND_CACHE_RESULT"
             while read -r dt rest; do
@@ -8919,7 +9014,7 @@ analyze_error_rate_trends() {
             fi
         done
 
-        declare -A XSEQ
+        declare -A XSEQ=()
         if prepare_trend_history_cache xfs-errors "$XFS_PROC_HISTORY_FILE" 20000; then
             local xfs_cache="$TREND_CACHE_RESULT"
             while read -r dt rest; do
@@ -8985,7 +9080,7 @@ analyze_btrfs_cumulative_trends() {
         local win_bt=${BTRFS_TREND_WINDOW_DAYS:-7} cutoff_bt
         local btrfs_cache="$TREND_CACHE_RESULT"
         cutoff_bt=$(date -d "-${win_bt} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
-        declare -A DEV_SUM
+        declare -A DEV_SUM=()
         while read -r dt rest; do
             parse_btrfs_trend_row "$rest" || continue
             [[ "$TREND_ROW_EVENT" != "reset" ]] || continue
@@ -9072,7 +9167,7 @@ render_trend_section() {
             local disk_capacity_cache="$TREND_CACHE_RESULT"
             _win_dg=$HISTORY_WINDOW_DAYS
             _cutoff_dg=$(date -d "-${_win_dg} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
-                    declare -A _DG_FDT _DG_FU _DG_LDT _DG_LU _DG_SZ
+                    declare -A _DG_FDT=() _DG_FU=() _DG_LDT=() _DG_LU=() _DG_SZ=()
                     local dt disk rest used sz
                     while read -r dt disk rest; do
                         used=$(history_field_value "$rest" used 2>/dev/null || true)
@@ -9158,7 +9253,7 @@ render_trend_section() {
             _win_s=$HISTORY_WINDOW_DAYS
             _cut_s=$(date -d "-${_win_s} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
                 # Predeclare arrays to avoid nounset when data is sparse
-                declare -A _SFDT _SFB _SLDT _SLB
+                declare -A _SFDT=() _SFB=() _SLDT=() _SLB=()
                 local dt s rest b
                 while read -r dt s rest; do
                     b=$(history_field_value "$rest" bytes 2>/dev/null || true)
@@ -9282,7 +9377,7 @@ render_trend_section() {
                     local _sorted _s=""
                     _sorted=$(printf "%s\n" "${_hr[@]}" | sort -nr -k1,1 -k2,2 | head -n 5)
                     # Global writer classification arrays for guidance and alerts
-                    declare -A WRITER_WEEKLY_PCT WRITER_TIER
+                    declare -A WRITER_WEEKLY_PCT=() WRITER_TIER=()
                     while read -r pct dev daily cap_tb; do
                         local rate; rate=$(format_bytes_per_day "$daily")
                         # pct is daily % of capacity; derive weekly percent
@@ -9508,7 +9603,7 @@ render_trend_section() {
             local _cut_sat
             local sata_link_cache="$TREND_CACHE_RESULT"
             _cut_sat=$(date -d "-${_win_sat} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
-                declare -A _DEV_DATES _DEV_LAST_MAX _DEV_LAST_CURR
+                declare -A _DEV_DATES=() _DEV_LAST_MAX=() _DEV_LAST_CURR=()
                 local stored_key
                 while read -r dt stored_key rest; do
                     dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
@@ -9719,7 +9814,7 @@ compute_risk_and_lifecycle() {
     declare -g -A RISK_MAP AGE_CLASS
     declare -g AGE_AWARE_LINES
     AGE_AWARE_LINES=""
-    declare -A RISK
+    declare -A RISK=()
     # Compute per-device risk scores
     for dev in "${!SMART_STATE[@]}"; do
         local st="${SMART_STATE[$dev]:-OK}"
@@ -10128,8 +10223,8 @@ tbw_forecast_and_heavy_writers() {
             log_warn "Unable to clear today's TBW days-left history"
         return 0
     fi
-    declare -A _TBW_SAMPLE_VALUE _TBW_SAMPLE_EPOCH _TBW_DEVICE_SEEN _TBW_SEQUENCE
-    declare -A first_v last_v TBW_SPAN_DAYS
+    declare -A _TBW_SAMPLE_VALUE=() _TBW_SAMPLE_EPOCH=() _TBW_DEVICE_SEEN=() _TBW_SEQUENCE=()
+    declare -A first_v=() last_v=() TBW_SPAN_DAYS=()
     local stored_key dt rest v sample_key sample_epoch
     while read -r dt stored_key rest; do
         [[ "$dt" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
@@ -10402,7 +10497,7 @@ collect_btrfs_device_stats() {
     local out_has=0 baseline_count=0 reset_count=0 delta_count=0
     local today
     local -a mounts=()
-    declare -A PREV_STAT PREV_PRESENT
+    declare -A PREV_STAT=() PREV_PRESENT=()
 
     now_epoch=$(date +%s)
     [[ -r /proc/sys/kernel/random/boot_id ]] && read -r current_boot_id < /proc/sys/kernel/random/boot_id || true
@@ -10553,7 +10648,7 @@ collect_xfs_proc_stats() {
     local suppress=0 baseline_all=0 snapshot_count=0 baseline_count=0 reset_count=0 delta_count=0
     local had_any=0 had_crit=0
     local -a keys=() filtered=() xfs_mounts_arr=()
-    declare -A PREV_XFS PREV_XFS_PRESENT
+    declare -A PREV_XFS=() PREV_XFS_PRESENT=()
 
     now_epoch=$(date +%s)
     today=$(date '+%Y-%m-%d')
@@ -11509,7 +11604,7 @@ dependency_warning() {
 
 validate_runtime_dependencies() {
     local mode="${1:-monitor}" command_name
-    local -a required_commands
+    local -a required_commands=()
 
     DEPENDENCY_ERROR_COUNT=0
     DEPENDENCY_WARNING_COUNT=0
@@ -11907,7 +12002,7 @@ run_regression_tests() (
     fi
 
     if declare -F load_builtin_defaults >/dev/null 2>&1 &&
-       [[ "$SCRIPT_VERSION" == "2.15" &&
+       [[ "$SCRIPT_VERSION" == "2.15.1" &&
           "$STATE_SCHEMA_VERSION" == "2" &&
           "$HISTORY_SCHEMA_VERSION" == "3" &&
           "$DEVICE_ID_SCHEMA_VERSION" == "2" &&
@@ -11940,6 +12035,49 @@ run_regression_tests() (
     else
         self_test_result 0 "Symbolic-link path component rejection" \
             "$PATH_VALIDATION_REASON"
+    fi
+
+    local exclusive_root="$fixture_dir/exclusive-mnt"
+    local exclusive_target="$exclusive_root/vault/cloud"
+    mkdir -p "$exclusive_root/user" "$exclusive_target/logs/disk_health"
+    ln -s "$exclusive_target" "$exclusive_root/user/cloud"
+    if resolve_unraid_exclusive_share_path \
+           "$exclusive_root/user/cloud/logs/disk_health" \
+           "$exclusive_root/user" "$exclusive_root" &&
+       [[ "$UNRAID_EXCLUSIVE_PATH_STATUS" == "RESOLVED" &&
+          "$UNRAID_EXCLUSIVE_PATH_RESULT" == \
+          "$exclusive_target/logs/disk_health" ]]
+    then
+        self_test_result 1 "Constrained Unraid exclusive-share resolution"
+    else
+        self_test_result 0 "Constrained Unraid exclusive-share resolution" \
+            "$UNRAID_EXCLUSIVE_PATH_REASON"
+    fi
+
+    mkdir -p "$exclusive_root/vault/other"
+    ln -s "$exclusive_root/vault/other" "$exclusive_root/user/mismatch"
+    if ! resolve_unraid_exclusive_share_path \
+           "$exclusive_root/user/mismatch/logs" \
+           "$exclusive_root/user" "$exclusive_root" &&
+       [[ "$UNRAID_EXCLUSIVE_PATH_REASON" == \
+          *"does not target the same share"* ]]
+    then
+        self_test_result 1 "Mismatched exclusive-share redirect rejection"
+    else
+        self_test_result 0 "Mismatched exclusive-share redirect rejection" \
+            "$UNRAID_EXCLUSIVE_PATH_REASON"
+    fi
+
+    SMART_DEFERRED=()
+    DISCOVERED_DISKS=()
+    RISK_MAP=()
+    if (( ${#SMART_DEFERRED[@]} == 0 &&
+          ${#DISCOVERED_DISKS[@]} == 0 &&
+          ${#RISK_MAP[@]} == 0 ))
+    then
+        self_test_result 1 "Empty global arrays remain safe under nounset"
+    else
+        self_test_result 0 "Empty global arrays remain safe under nounset"
     fi
 
     local schema_dir="$fixture_dir/schema" current_manifest future_manifest malformed_manifest
@@ -12409,6 +12547,36 @@ run_regression_tests() (
         self_test_result 1 "Btrfs trend-row decoding and reset isolation"
     else
         self_test_result 0 "Btrfs trend-row decoding and reset isolation" "found '$actual'"
+    fi
+
+    local btrfs_empty_history="$fixture_dir/btrfs-empty-history.log"
+    local btrfs_reset_history="$fixture_dir/btrfs-reset-history.log"
+    local btrfs_empty_run="$fixture_dir/btrfs-empty-run"
+    mkdir -p "$btrfs_empty_run"
+    : > "$btrfs_empty_history"
+    RUN_DIR="$btrfs_empty_run"
+    BTRFS_DEV_TREND_ENABLED=1
+    BTRFS_TREND_WINDOW_DAYS=7
+    BTRFS_DEV_HIST_FILE="$btrfs_empty_history"
+    TREND_HISTORY_CACHE=()
+    BTRFS_SUM_LINE=""
+    if analyze_btrfs_cumulative_trends && [[ -z "$BTRFS_SUM_LINE" ]]; then
+        self_test_result 1 "Empty Btrfs trend history under nounset"
+    else
+        self_test_result 0 "Empty Btrfs trend history under nounset" \
+            "found '$BTRFS_SUM_LINE'"
+    fi
+
+    printf '%s disk_wwn mount=/mnt/cache key=write_io_errs event=reset captured_epoch=1 schema=3\n' \
+        "$(date '+%Y-%m-%d')" > "$btrfs_reset_history"
+    BTRFS_DEV_HIST_FILE="$btrfs_reset_history"
+    TREND_HISTORY_CACHE=()
+    BTRFS_SUM_LINE=""
+    if analyze_btrfs_cumulative_trends && [[ -z "$BTRFS_SUM_LINE" ]]; then
+        self_test_result 1 "Reset-only Btrfs trend history under nounset"
+    else
+        self_test_result 0 "Reset-only Btrfs trend history under nounset" \
+            "found '$BTRFS_SUM_LINE'"
     fi
 
     parse_xfs_trend_row 'key=extent_alloc delta=7 rate_day=3.5 event=growth'
