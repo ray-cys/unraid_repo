@@ -1047,9 +1047,11 @@ remote_df() {
     local dest="$1"
 
     local attempt=1
+    # shellcheck disable=SC2178
     local output=""
 
     while [ "$attempt" -le "$REMOTE_DF_RETRIES" ]; do
+        # shellcheck disable=SC2178
         output="$(
             ssh_run \
                 df \
@@ -1062,6 +1064,7 @@ remote_df() {
                     'NR == 2 {print $1 "|" $4 "|" $6}'
         )"
 
+        # shellcheck disable=SC2128
         if [ -n "$output" ]; then
             printf '%s\n' "$output"
             return 0
@@ -1255,6 +1258,7 @@ preflight_space() {
         mountpoint="${mount_by_device[$device]:-unknown}"
 
         percentage_buffer=$(
+            # shellcheck disable=SC2035
             (needed * PREFLIGHT_BUFFER_PERCENT / 100)
         )
 
