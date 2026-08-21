@@ -13,7 +13,7 @@
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.1"
+readonly SCRIPT_VERSION="1.1.1"
 
 ###############################################################################
 # CONFIGURATION
@@ -33,8 +33,8 @@ BACKUP_JOBS=(
     "appdata|/mnt/vault/backup/cache"
     "flash|/mnt/vault/backup/flash"
     "user_scripts|/boot/config/plugins/user.scripts"
-    "github|/mnt/user/cloud/github"
-    "photos|/mnt/user/cloud/photo"
+    "github|/mnt/vault/cloud/github"
+    "photos|/mnt/vault/cloud/photos"
 )
 
 # Each generation is a complete independent copy.
@@ -359,10 +359,8 @@ shutdown_remote() {
 main() {
     local job label source manifest
 
-    if ! mountpoint -q /mnt/vault ||
-       ! mountpoint -q /mnt/user ||
-       ! mountpoint -q /boot; then
-        printf 'Required local mounts are unavailable: /mnt/vault, /mnt/user, and/or /boot\n' >&2
+    if ! mountpoint -q /mnt/vault || ! mountpoint -q /boot; then
+        printf 'Required local mounts are unavailable: /mnt/vault and/or /boot\n' >&2
         return 1
     fi
     mkdir -p -- "$LOG_DIR" || return 1
