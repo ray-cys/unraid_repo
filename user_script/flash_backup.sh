@@ -19,7 +19,7 @@ set -uo pipefail
 BACKUP_DIR="/mnt/vault/backup/flash"
 POOL_PATH="/mnt/vault"
 
-MAX_BACKUPS=3
+MAX_BACKUPS=2
 
 HELPER="/usr/local/emhttp/webGui/scripts/flash_backup"
 NOTIFY="/usr/local/emhttp/webGui/scripts/notify"
@@ -109,28 +109,6 @@ notify() {
         -m "$message" \
         >/dev/null 2>&1 || \
         log "WARNING: Notification command failed"
-
-}
-
-cleanup() {
-
-    if [ -n "$MARKER" ]; then
-
-        rm -f -- "$MARKER" 2>/dev/null || true
-
-    fi
-
-    if [ -n "$HELPER_LOG" ]; then
-
-        rm -f -- "$HELPER_LOG" 2>/dev/null || true
-
-    fi
-
-    if [ -n "$TEMP_FILE" ] && [ -f "$TEMP_FILE" ]; then
-
-        rm -f -- "$TEMP_FILE" 2>/dev/null || true
-
-    fi
 
 }
 
@@ -289,7 +267,7 @@ if [ ! -d "$POOL_PATH" ]; then
         "Boot backup aborted: pool unavailable: $POOL_PATH"
 
     notify alert \
-        "🔴 Backup - POOL UNAVAILABLE" \
+        "Backup - POOL UNAVAILABLE" \
         "Destination pool is unavailable."$'\n\n'"Pool: $POOL_PATH"$'\n'"Runtime: $(runtime)"
 
     exit 2
@@ -315,7 +293,7 @@ if command -v findmnt >/dev/null 2>&1; then
             "Boot backup aborted because $POOL_PATH is not mounted"
 
         notify alert \
-            "🔴 Backup - POOL NOT MOUNTED" \
+            "Backup - POOL NOT MOUNTED" \
             "$POOL_PATH is not mounted."$'\n\n'"Backup aborted to prevent writing into RAM."$'\n'"Runtime: $(runtime)"
 
         exit 2
@@ -336,7 +314,7 @@ if [ ! -x "$HELPER" ]; then
         "Native Unraid boot backup helper missing"
 
     notify alert \
-        "🔴 Backup - HELPER MISSING" \
+        "Backup - HELPER MISSING" \
         "Unable to locate:"$'\n'"$HELPER"$'\n\n'"Runtime: $(runtime)"
 
     exit 127
@@ -356,7 +334,7 @@ if [ ! -d "$BACKUP_DIR" ]; then
         log "ERROR: Unable to create $BACKUP_DIR"
 
         notify alert \
-            "🔴 Backup - DIRECTORY ERROR" \
+            "Backup - DIRECTORY ERROR" \
             "Unable to create:"$'\n'"$BACKUP_DIR"$'\n\n'"Runtime: $(runtime)"
 
         exit 3
@@ -377,7 +355,7 @@ if ! touch "$WRITE_TEST" 2>/dev/null; then
     log "ERROR: Destination is not writable: $BACKUP_DIR"
 
     notify alert \
-        "🔴 Backup - NOT WRITABLE" \
+        "Backup - NOT WRITABLE" \
         "Backup destination is not writable:"$'\n'"$BACKUP_DIR"$'\n\n'"Runtime: $(runtime)"
 
     exit 3
@@ -451,7 +429,7 @@ else
     )
 
     notify alert \
-        "🔴 Backup - FAILED" \
+        "Backup - FAILED" \
         "Native Unraid backup helper failed."$'\n\n'"Exit code: $RC"$'\n\n'"${HELPER_EXCERPT}"$'\n\n'"Runtime: $(runtime)"
 
     exit "$RC"
@@ -635,7 +613,7 @@ if [ -z "${BACKUP_SOURCE:-}" ] || [ ! -f "$BACKUP_SOURCE" ]; then
         "Backup helper completed but generated archive could not be located"
 
     notify alert \
-        "🔴 Backup - NO ARCHIVE" \
+        "Backup - NO ARCHIVE" \
         "The native Unraid helper completed successfully but the generated boot-backup ZIP could not be located."$'\n\n'"Check the User Scripts log for helper and WebGUI details."$'\n\n'"Runtime: $(runtime)"
 
     exit 5
@@ -662,7 +640,7 @@ if ! verify_zip "$BACKUP_SOURCE"; then
         "Boot backup source archive failed ZIP verification: $BACKUP_SOURCE"
 
     notify alert \
-        "🔴 Backup - CORRUPT ARCHIVE" \
+        "Backup - CORRUPT ARCHIVE" \
         "Unraid created a backup archive but ZIP integrity verification failed."$'\n\n'"File: $(basename "$BACKUP_SOURCE")"$'\n'"Size: $(bytes_human "$SOURCE_SIZE")"$'\n'"Runtime: $(runtime)"
 
     exit 6
@@ -707,7 +685,7 @@ if (( AVAILABLE_BYTES < REQUIRED_BYTES )); then
         "Insufficient space for boot backup"
 
     notify alert \
-        "🔵 Backup - NO SPACE" \
+        "Backup - NO SPACE" \
         "Insufficient destination space."$'\n\n'"Required: $(bytes_human "$REQUIRED_BYTES")"$'\n'"Available: $(bytes_human "$AVAILABLE_BYTES")"$'\n'"Destination: $BACKUP_DIR"$'\n'"Runtime: $(runtime)"
 
     exit 7
@@ -741,7 +719,7 @@ if ! cp -- "$BACKUP_SOURCE" "$TEMP_FILE"; then
         "Unable to copy boot backup to $BACKUP_DIR"
 
     notify alert \
-        "🔴 Backup - COPY FAILED" \
+        "Backup - COPY FAILED" \
         "Unable to copy boot backup to:"$'\n'"$BACKUP_DIR"$'\n\n'"Runtime: $(runtime)"
 
     exit 8
@@ -766,7 +744,7 @@ if [ "$SOURCE_SIZE" -ne "$DEST_SIZE" ]; then
         "Boot backup copy size mismatch"
 
     notify alert \
-        "🔴 Backup - SIZE MISMATCH" \
+        "Backup - SIZE MISMATCH" \
         "Backup copy verification failed."$'\n\n'"Source: $(bytes_human "$SOURCE_SIZE")"$'\n'"Destination: $(bytes_human "$DEST_SIZE")"$'\n'"Runtime: $(runtime)"
 
     exit 9
@@ -784,7 +762,7 @@ if ! verify_zip "$TEMP_FILE"; then
         "Copied boot backup failed ZIP verification"
 
     notify alert \
-        "🔴 Backup - COPY CORRUPT" \
+        "Backup - COPY CORRUPT" \
         "The backup was copied to the SSD but failed ZIP integrity verification."$'\n\n'"Runtime: $(runtime)"
 
     exit 10
@@ -809,7 +787,7 @@ if ! mv -f -- "$TEMP_FILE" "$BACKUP_FILE"; then
         "Unable to finalize boot backup at destination"
 
     notify alert \
-        "🔴 Backup - FINALIZE FAILED" \
+        "Backup - FINALIZE FAILED" \
         "Backup was copied but could not be finalized."$'\n\n'"Destination: $BACKUP_FILE"$'\n'"Runtime: $(runtime)"
 
     exit 11
@@ -911,7 +889,7 @@ syslog info \
     "Boot device backup successful: $(basename "$BACKUP_FILE"), size $(bytes_human "$BACKUP_SIZE"), runtime $RUNTIME"
 
 notify normal \
-    "🟢 Backup - OK" \
+    "Backup - OK" \
     "Boot-device backup completed successfully."$'\n\n'"File: $(basename "$BACKUP_FILE")"$'\n'"Size: $(bytes_human "$BACKUP_SIZE")"$'\n'"Destination: $BACKUP_DIR"$'\n'"Free space: $(bytes_human "$AVAILABLE_BYTES")"$'\n'"Retention: $MAX_BACKUPS backups"$'\n'"Runtime: $RUNTIME"
 
 exit 0
