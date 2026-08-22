@@ -4,7 +4,7 @@ noParity=true
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.15.3"
+readonly SCRIPT_VERSION="2.15.4"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -15,7 +15,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.15.3
+# Disk Health Monitor for Unraid v2.15.4
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
@@ -34,6 +34,9 @@ fi
 # v2.15.3 separates concise, grouped notification trends from full run-log
 # diagnostics, caps noisy device lists, and suppresses invalid or negligible
 # endurance and power-on-hour evidence from user-facing summaries.
+# v2.15.4 separates recent SSD workload intensity from the longer endurance
+# forecast, tracks improvement against the preceding window, makes workload-
+# only health findings opt-in, and uses plain-text notification markers.
 ################################################################################
 # ---------------- Configuration ----------------
 # Disks health script settings. Tuned for performance and reliability.
@@ -258,9 +261,13 @@ WEAR_TREND_TOP_N=5                               # Top N soonest depletion estim
 WEAR_STABLE_MIN_RATE=0.001                       # Percent/day below which treat as stable (shows ∞)
 WEAR_DAYS_LEFT_WARN=120                          # Projected days-left <= warning threshold (0=disable)
 WEAR_DAYS_LEFT_CRIT=60                           # Projected days-left <= critical threshold (0=disable)
-WRITER_WEEKLY_WARN_PCT=3                         # Weekly write volume as % of capacity >= warning
-WRITER_WEEKLY_CRIT_PCT=5                         # Weekly write volume as % of capacity >= critical
-WRITER_TIER_MODERATE_PCT=1                       # Weekly % >= this and < warn -> Moderate tier; below -> Light
+HEAVY_WRITER_RECENT_DAYS=3                       # Recent window used for workload intensity and improvement tracking
+HEAVY_WRITER_MIN_RECENT_SAMPLES=2                # Minimum recent counter samples required before using the recent rate
+HEAVY_WRITER_IMPROVEMENT_PCT=20                  # Recent rate change needed to label improving or rising
+HEAVY_WRITER_ALERTS_ENABLED=0                    # Promote workload alone to health findings (0=trend information only)
+WRITER_WEEKLY_WARN_PCT=100                       # High workload tier at one device-capacity write/week
+WRITER_WEEKLY_CRIT_PCT=350                       # Very-high workload tier at 3.5 device-capacity writes/week
+WRITER_TIER_MODERATE_PCT=50                      # Moderate workload tier at half a device-capacity write/week
 UNSAFE_SDWN_DELTA_WARN=5                         # Unsafe shutdowns delta >= warning (M)
 UNSAFE_SDWN_ABSOLUTE_MIN=100                     # Only warn if total unsafe shutdowns >= N (0=disable)
 UNSAFE_SDWN_COOLDOWN_DAYS=3                      # Suppress repeat warnings for X days after one triggers (0=disable)
@@ -499,8 +506,13 @@ declare -A MOUNT_TO_DEV=()                        # Map /mnt/diskX -> /dev/sdX|n
 declare -A POOL_MEMBER_MAP=()                     # Map base device (/dev/sdX|nvme0n1) -> pool name
 declare -A BURST_BOOST=()                         # Base device -> accumulated burst boost this run (0-100)
 declare -A TBW_STATUS_MAP=()                      # Map device -> TBW status (OK/WARNING/CRITICAL)
-declare -A TBW_DAILY=()                           # Map device -> daily TBW bytes (over window)
+declare -A TBW_DAILY=()                           # Map device -> long-window daily TBW bytes (endurance forecast)
 declare -A TBW_DAYS_LEFT=()                       # Map device -> forecasted days left to endurance
+declare -A WRITER_DAILY=()                        # Map device -> recent daily bytes (workload presentation)
+declare -A WRITER_PREVIOUS_DAILY=()               # Map device -> preceding-window daily bytes
+declare -A WRITER_DIRECTION=()                    # Map device -> IMPROVING/RISING/STEADY/COLLECTING
+declare -A WRITER_CHANGE_PCT=()                   # Map device -> signed recent-vs-previous rate change
+declare -A WRITER_RECENT_READY=()                 # Map device -> 1 when recent window has sufficient evidence
 declare -A NVME_WEAR_DAYS_LEFT=() NVME_WEAR_RATE=() # NVMe depletion projection
 declare -A TBW_FORECAST_CONFIDENCE=()             # Per-device TBW forecast confidence
 declare -A NVME_WEAR_CONFIDENCE=()                # Per-device NVMe wear forecast confidence
@@ -574,7 +586,7 @@ SYSLOG_CHUNK_FILE=""
 SYSLOG_CURSOR_MODE="not_run"
 RUN_MODE="monitor"
 ROLLBACK_BACKUP_ID=""
-REGRESSION_FIXTURE_COUNT=98
+REGRESSION_FIXTURE_COUNT=103
 CONFIG_ERROR_COUNT=0
 CONFIG_WARNING_COUNT=0
 DEPENDENCY_ERROR_COUNT=0
@@ -1269,6 +1281,10 @@ ensure_external_config_template() {
 # TREND_SHOW_NORMAL_POH=0
 # TREND_SHOW_DATA_QUALITY_DEVICES=0
 # TREND_GROUP_IDENTICAL_EVENTS=1
+# HEAVY_WRITER_RECENT_DAYS=3
+# HEAVY_WRITER_ALERTS_ENABLED=0
+# WRITER_WEEKLY_WARN_PCT=100
+# WRITER_WEEKLY_CRIT_PCT=350
 # SOAK_TELEMETRY_ENABLED=1
 # SOAK_MIN_RUNS=14
 # SOAK_MIN_DAYS=14
@@ -7279,7 +7295,6 @@ scan_syslog_disk_errors() {
 # === Notification Builder ===
 severity_rank() { case "$1" in CRITICAL) echo 2;; WARNING) echo 1;; *) echo 0;; esac; }
 status_word()   { case "$1" in 2) echo "CRITICAL";; 1) echo "WARNING";; *) echo "OK";; esac; }
-map_emoji()     { case "$1" in 2) printf "🔴";; 1) printf "🟡";; *) printf "🟢";; esac; }
 
 # === Helper Function ===
 # Condense and sanitize SMART message lists for inline display.
@@ -7596,18 +7611,14 @@ build_storage_and_disk_lines() {
     elif awk -v p="${ARRAY_PERCENT:-0}" -v t="$THRESHOLD" -v d="$NEAR_THRESHOLD_DELTA" 'BEGIN{exit (p + d >= t)?0:1}' && [[ $ARRAY_MAX_SEV -lt 1 ]]; then ARRAY_MAX_SEV=1; fi
     if awk -v p="${POOLS_PERCENT:-0}" -v t="$THRESHOLD" 'BEGIN{exit (p>t)?0:1}'; then POOLS_MAX_SEV=2
     elif awk -v p="${POOLS_PERCENT:-0}" -v t="$THRESHOLD" -v d="$NEAR_THRESHOLD_DELTA" 'BEGIN{exit (p + d >= t)?0:1}' && [[ $POOLS_MAX_SEV -lt 1 ]]; then POOLS_MAX_SEV=1; fi
-    local a_emoji
-    a_emoji=$(map_emoji "$ARRAY_MAX_SEV")
-    local p_emoji
-    p_emoji=$(map_emoji "$POOLS_MAX_SEV")
     local a_word
     a_word=$(status_word "$ARRAY_MAX_SEV")
     local p_word
     p_word=$(status_word "$POOLS_MAX_SEV")
     # Build the top summary line for array and pools
-    STORAGE_TOP_LINES=$(printf "%s Array %s (%d Disk): %s%% — %s used of %s\n%s Pools %s (%d Disk): %s%% — %s used of %s" \
-        "$a_emoji" "$a_word" "$ARRAY_COUNT" "${ARRAY_PERCENT:-0.0}" "${ARRAY_USED_HR:-0 B}" "${ARRAY_TOTAL_HR:-0 B}" \
-        "$p_emoji" "$p_word" "$POOLS_COUNT" "${POOLS_PERCENT:-0.0}" "${POOLS_USED_HR:-0 B}" "${POOLS_TOTAL_HR:-0 B}")
+    STORAGE_TOP_LINES=$(printf "Array [%s] (%d disks): %s%% - %s used of %s\nPools [%s] (%d disks): %s%% - %s used of %s" \
+        "$a_word" "$ARRAY_COUNT" "${ARRAY_PERCENT:-0.0}" "${ARRAY_USED_HR:-0 B}" "${ARRAY_TOTAL_HR:-0 B}" \
+        "$p_word" "$POOLS_COUNT" "${POOLS_PERCENT:-0.0}" "${POOLS_USED_HR:-0 B}" "${POOLS_TOTAL_HR:-0 B}")
     # Dynamic alignment for [Array Disks] and [Pool Disks]
     local NAME_COL_WIDTH=6 USAGE_COL_WIDTH=22 PCT_COL_WIDTH=4 STATUS_COL_WIDTH=7 DRIVER_COL_WIDTH=0 REASON_COL_WIDTH=0
     local tmp_entry
@@ -7699,7 +7710,7 @@ validate_storage_metrics() {
                         collector_atomic_write_text "$STORAGE_DISCREPANCY_STATE_FILE" \
                             "${streak} ${diff}"$'\n' || true
                         if (( streak >= ${STORAGE_DISCREPANCY_SUSTAIN_RUNS:-2} )); then
-                            record_alert warning "Storage Validation" "Storage discrepancy diff=${diff}% (array ${ARRAY_PERCENT:-0}% vs /mnt/user ${user_pct_calc}%) — investigate share settings (Cache, Include/Exclude), mover status, recent deletions."
+                            record_alert warning "Storage Validation" "Storage discrepancy diff=${diff}% (array ${ARRAY_PERCENT:-0}% vs /mnt/user ${user_pct_calc}%) - investigate share settings (Cache, Include/Exclude), mover status, recent deletions."
                         fi
                     fi
                 else
@@ -7946,11 +7957,11 @@ build_health_alerts() {
         if [[ -n "$device" ]]; then
             risk="${RISK_MAP[$device]:-0}"
             [[ "$risk" =~ ^[0-9]+$ ]] || risk=0
-            risk_text=" — risk $risk"
+            risk_text=" - risk $risk"
         fi
 
         rec+=$'\n'
-        rec+=" - [${severity^^}] $target${risk_text} — $count finding"
+        rec+=" - [${severity^^}] $target${risk_text} - $count finding"
         (( count == 1 )) || rec+="s"
 
         while IFS= read -r id; do
@@ -7959,7 +7970,7 @@ build_health_alerts() {
             evidence="${evidence//$'\n'/ }"
             evidence="${evidence//\\n/ }"
             rec+=$'\n'
-            rec+="   • ${FINDING_TITLE[$id]:-Finding}: $evidence"
+            rec+="   - ${FINDING_TITLE[$id]:-Finding}: $evidence"
         done <<< "$group_ids"
 
         while IFS= read -r id; do
@@ -7972,7 +7983,7 @@ build_health_alerts() {
             fi
             action_seen[$action_key]=1
             rec+=$'\n'
-            rec+="   → $action"
+            rec+="     Action: $action"
         done <<< "$group_ids"
     done
 
@@ -8102,7 +8113,7 @@ build_current_notification_state() {
         fingerprint="$(finding_notification_fingerprint "$id")" || return 1
         [[ "$fingerprint" =~ ^[0-9a-f]{40}$ ]] || return 1
         set_finding_target_label "$id"
-        label="$FINDING_TARGET_LABEL_RESULT — ${FINDING_TITLE[$id]:-Finding}"
+        label="$FINDING_TARGET_LABEL_RESULT - ${FINDING_TITLE[$id]:-Finding}"
         label="${label//$'\t'/ }"
         label="${label//$'\r'/ }"
         label="${label//$'\n'/ }"
@@ -8383,7 +8394,7 @@ trend_append_summary_group() {
     (( $# > 0 )) || return 0
     TREND_SECTION+=$'\n\n'"$heading"
     for item in "$@"; do
-        TREND_SECTION+=$'\n'"• $item"
+        TREND_SECTION+=$'\n'"- $item"
     done
 }
 
@@ -9494,10 +9505,10 @@ render_trend_section() {
                         if (( sz>0 )); then
                             pct=$(awk -v pd="$pd" -v sz="$sz" 'BEGIN{printf "%.2f", (pd/sz)*100}')
                             _items_shrink+=("${disk} decreased by an average of ${rate} (${pct}% of capacity/day)")
-                            _summary_shrink+=("${disk} −${rate} (${pct}%/day)")
+                            _summary_shrink+=("${disk} down ${rate} (${pct}%/day)")
                         else
                             _items_shrink+=("${disk} decreased by an average of ${rate}")
-                            _summary_shrink+=("${disk} −${rate}")
+                            _summary_shrink+=("${disk} down ${rate}")
                         fi
                         trend_add_diagnostic "disk usage" "device=$disk direction=decrease bytes_per_day=$pd capacity_percent_per_day=${pct:-unknown}"
                     done < <(printf "%s\n" "$_sorted_s")
@@ -9643,11 +9654,11 @@ render_trend_section() {
                 trend_compact_items "$TREND_NOTIFICATION_TOP_N" "${_tbw_summary_items[@]}"
                 trend_add_summary_item endurance "$TREND_COMPACT_RESULT"
             fi
-            if declare -p TBW_DAILY &>/dev/null; then
-                local _hr=() ; for dev in "${!TBW_DAILY[@]}"; do
+            if declare -p WRITER_DAILY &>/dev/null; then
+                local _hr=() ; for dev in "${!WRITER_DAILY[@]}"; do
                     forecast_confidence_is_actionable \
                         "${TBW_FORECAST_CONFIDENCE[$dev]:-INSUFFICIENT}" || continue
-                    local daily=${TBW_DAILY[$dev]:-0} cap_tb
+                    local daily=${WRITER_DAILY[$dev]:-0} cap_tb
                     cap_tb=$(get_device_capacity_tb "$dev")
                     [[ -z "$cap_tb" || -z "$daily" ]] && continue
                     if [[ "$cap_tb" =~ ^[0-9]+(\.[0-9]+)?$ && "$daily" =~ ^[0-9]+$ ]]; then
@@ -9659,39 +9670,43 @@ render_trend_section() {
                     local _sorted _s=""
                     local -a _writer_attention=()
                     _sorted=$(printf "%s\n" "${_hr[@]}" | sort -nr -k1,1 -k2,2 | head -n 5)
-                    # Global writer classification arrays for guidance and alerts
+                    # Workload tiers are informational by default. Endurance
+                    # health remains governed by consumed wear and days-left.
                     declare -A WRITER_WEEKLY_PCT=() WRITER_TIER=()
                     while read -r pct dev daily cap_tb; do
-                        local rate; rate=$(format_bytes_per_day "$daily")
+                        local rate direction direction_text change_pct recent_ready
+                        rate=$(format_bytes_per_day "$daily")
                         # pct is daily % of capacity; derive weekly percent
                         local weekly_pct; weekly_pct=$(awk -v d="$pct" 'BEGIN{printf "%.6f", d*7}')
                         WRITER_WEEKLY_PCT[$dev]="$weekly_pct"
-                        # Determine tier
-                        local tier="" tier_text="" w="$weekly_pct"
-                        if awk -v w="$w" -v c="$WRITER_WEEKLY_CRIT_PCT" 'BEGIN{exit (w>=c)?0:1}'; then
-                            tier="H"; tier_text="high write rate"
-                            record_alert critical "Heavy Writer" "Disk $dev weekly write ~$(awk -v w="$w" 'BEGIN{printf "%.2f", w}')% cap/week >= ${WRITER_WEEKLY_CRIT_PCT}%"
-                        elif awk -v w="$w" -v wthr="$WRITER_WEEKLY_WARN_PCT" 'BEGIN{exit (w>=wthr)?0:1}'; then
-                            tier="H"; tier_text="high write rate"
-                            record_alert warning "Heavy Writer" "Disk $dev weekly write ~$(awk -v w="$w" 'BEGIN{printf "%.2f", w}')% cap/week >= ${WRITER_WEEKLY_WARN_PCT}%"
-                        elif awk -v w="$w" -v m="$WRITER_TIER_MODERATE_PCT" 'BEGIN{exit (w>=m)?0:1}'; then
-                            tier="M"; tier_text="moderate write rate"
-                        else
-                            tier="L"; tier_text="light write rate"
-                        fi
+                        classify_writer_tier "$weekly_pct"
+                        local tier="$WRITER_TIER_RESULT" tier_text="$WRITER_TIER_TEXT_RESULT"
                         WRITER_TIER[$dev]="$tier"
-                        _s+="$(basename "$dev") ${rate} ($(printf '%.3f' "$pct")% of capacity/day; ${tier_text}) | "
-                        if [[ "$tier" == "H" ]]; then
-                            _writer_attention+=("$(basename "$dev") ${rate} ($(printf '%.1f' "$pct")% of capacity/day)")
+                        direction="${WRITER_DIRECTION[$dev]:-COLLECTING}"
+                        change_pct="${WRITER_CHANGE_PCT[$dev]:-0.0}"
+                        recent_ready="${WRITER_RECENT_READY[$dev]:-0}"
+                        case "$direction" in
+                            IMPROVING) direction_text="improving ${change_pct#-}% vs previous window" ;;
+                            RISING)    direction_text="rising ${change_pct}% vs previous window" ;;
+                            STEADY)    direction_text="steady vs previous window" ;;
+                            *)         direction_text="collecting recent comparison" ;;
+                        esac
+                        _s+="$(basename "$dev") ${rate} ($(printf '%.1f' "$weekly_pct")% of capacity/week; ${tier_text}; ${direction_text}); "
+                        if [[ "$tier" == "V" || "$tier" == "H" ]]; then
+                            _writer_attention+=("$(basename "$dev") ${rate} ($(printf '%.1f' "$weekly_pct")%/week; ${direction_text})")
+                        fi
+                        if (( recent_ready == 1 )); then
+                            record_writer_workload_alert "$dev" "$weekly_pct" \
+                                "$direction" "$change_pct"
                         fi
                         trend_add_diagnostic "write intensity" \
-                            "device=$(basename "$dev") bytes_per_day=$daily capacity_percent_per_day=$pct weekly_percent=$weekly_pct tier=$tier"
+                            "device=$(basename "$dev") recent_bytes_per_day=$daily long_bytes_per_day=${TBW_DAILY[$dev]:-0} previous_bytes_per_day=${WRITER_PREVIOUS_DAILY[$dev]:-0} capacity_percent_per_day=$pct weekly_percent=$weekly_pct tier=$tier direction=$direction change_percent=$change_pct recent_ready=$recent_ready"
                     done < <(printf "%s\n" "$_sorted")
-                    _s=${_s%" | "}; trend_add_line "Write intensity" "$_s"
+                    _s=${_s%'; '}; trend_add_line "Write intensity" "$_s"
                     if (( ${#_writer_attention[@]} > 0 )); then
                         trend_compact_items "$TREND_NOTIFICATION_TOP_N" "${_writer_attention[@]}"
                         trend_add_summary_item attention \
-                            "High SSD writes: $TREND_COMPACT_RESULT. Verify backup, download, VM, and container workloads"
+                            "High SSD workload: $TREND_COMPACT_RESULT. Confirm it matches the device role; endurance health is evaluated separately"
                     fi
                 fi
             fi
@@ -10076,17 +10091,17 @@ build_trend_section() {
 build_subject() {
     if (( FINDING_CRITICAL_COUNT == 0 && FINDING_WARNING_COUNT == 0 &&
           NOTIFICATION_RESOLVED_COUNT > 0 )); then
-        SUBJECT="Disks Health — RECOVERED (${NOTIFICATION_RESOLVED_COUNT})"
+        SUBJECT="Disks Health - RECOVERED (${NOTIFICATION_RESOLVED_COUNT})"
     elif (( FINDING_CRITICAL_COUNT > 0 )); then
-        SUBJECT="Disks Health — CRITICAL (${FINDING_CRITICAL_COUNT})"
+        SUBJECT="Disks Health - CRITICAL (${FINDING_CRITICAL_COUNT})"
     elif (( FINDING_WARNING_COUNT > 0 )); then
-        SUBJECT="Disks Health — WARNING (${FINDING_WARNING_COUNT})"
+        SUBJECT="Disks Health - WARNING (${FINDING_WARNING_COUNT})"
     else
-        SUBJECT="Disks Health — OK"
+        SUBJECT="Disks Health - OK"
     fi
     if (( NOTIFICATION_RESOLVED_COUNT > 0 &&
           (FINDING_CRITICAL_COUNT > 0 || FINDING_WARNING_COUNT > 0) )); then
-        SUBJECT+=" — ${NOTIFICATION_RESOLVED_COUNT} recovered"
+        SUBJECT+=" - ${NOTIFICATION_RESOLVED_COUNT} recovered"
     fi
 }
 
@@ -10566,8 +10581,128 @@ capacity_forecast_and_export() {
     POOL_FORECAST_SPAN_DAYS="$capacity_span_days"
 }
 
+# Compute a monotonic counter rate inside one bounded epoch range. Results are
+# returned through globals so callers do not lose side effects in a subshell.
+COUNTER_WINDOW_RATE=0
+COUNTER_WINDOW_SPAN_DAYS="0"
+COUNTER_WINDOW_SAMPLES=0
+WRITER_DIRECTION_RESULT="COLLECTING"
+WRITER_CHANGE_RESULT="0.0"
+WRITER_TIER_RESULT="L"
+WRITER_TIER_TEXT_RESULT="light workload"
+
+calculate_counter_window_rate() {
+    local sequence="$1" minimum_epoch="$2" maximum_epoch="$3" minimum_samples="$4"
+    local sample_epoch value previous_value="" first_epoch=0 first_value=0
+    local last_epoch=0 last_value=0 samples=0 reset_seen=0 span_seconds
+
+    COUNTER_WINDOW_RATE=0
+    COUNTER_WINDOW_SPAN_DAYS="0"
+    COUNTER_WINDOW_SAMPLES=0
+    [[ "$minimum_epoch" =~ ^[0-9]+$ && "$maximum_epoch" =~ ^[0-9]+$ &&
+       "$minimum_samples" =~ ^[1-9][0-9]*$ ]] || return 1
+    (( maximum_epoch >= minimum_epoch )) || return 1
+
+    while read -r sample_epoch value; do
+        [[ "$sample_epoch" =~ ^[0-9]+$ && "$value" =~ ^[0-9]+$ ]] || continue
+        (( sample_epoch >= minimum_epoch && sample_epoch <= maximum_epoch )) || continue
+        if (( samples == 0 )); then
+            first_epoch=$sample_epoch
+            first_value=$value
+        elif (( value < previous_value )); then
+            reset_seen=1
+        fi
+        last_epoch=$sample_epoch
+        last_value=$value
+        previous_value=$value
+        samples=$((samples + 1))
+    done < <(printf '%s' "$sequence" | LC_ALL=C sort -n -k1,1)
+
+    COUNTER_WINDOW_SAMPLES=$samples
+    (( samples >= minimum_samples && reset_seen == 0 && last_epoch > first_epoch )) || return 1
+    (( last_value >= first_value )) || return 1
+    span_seconds=$((last_epoch - first_epoch))
+    COUNTER_WINDOW_SPAN_DAYS=$(awk -v seconds="$span_seconds" \
+        'BEGIN { printf "%.3f", seconds/86400.0 }')
+    COUNTER_WINDOW_RATE=$(awk -v first="$first_value" -v last="$last_value" \
+        -v seconds="$span_seconds" \
+        'BEGIN { printf "%d", ((last-first)*86400.0)/seconds }')
+    return 0
+}
+
+classify_writer_direction() {
+    local recent="$1" previous="$2" threshold="$3"
+
+    WRITER_DIRECTION_RESULT="COLLECTING"
+    WRITER_CHANGE_RESULT="0.0"
+    [[ "$recent" =~ ^[0-9]+$ && "$previous" =~ ^[0-9]+$ &&
+       "$threshold" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
+    (( previous > 0 )) || return 0
+    WRITER_CHANGE_RESULT=$(awk -v recent="$recent" -v previous="$previous" \
+        'BEGIN { printf "%.1f", ((recent-previous)/previous)*100 }')
+    if awk -v change="$WRITER_CHANGE_RESULT" -v threshold="$threshold" \
+        'BEGIN { exit !(change <= -threshold) }'
+    then
+        WRITER_DIRECTION_RESULT="IMPROVING"
+    elif awk -v change="$WRITER_CHANGE_RESULT" -v threshold="$threshold" \
+        'BEGIN { exit !(change >= threshold) }'
+    then
+        WRITER_DIRECTION_RESULT="RISING"
+    else
+        WRITER_DIRECTION_RESULT="STEADY"
+    fi
+}
+
+classify_writer_tier() {
+    local weekly_pct="$1"
+
+    WRITER_TIER_RESULT="L"
+    WRITER_TIER_TEXT_RESULT="light workload"
+    [[ "$weekly_pct" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
+    if awk -v value="$weekly_pct" -v threshold="$WRITER_WEEKLY_CRIT_PCT" \
+        'BEGIN { exit !(value >= threshold) }'
+    then
+        WRITER_TIER_RESULT="V"
+        WRITER_TIER_TEXT_RESULT="very high workload"
+    elif awk -v value="$weekly_pct" -v threshold="$WRITER_WEEKLY_WARN_PCT" \
+        'BEGIN { exit !(value >= threshold) }'
+    then
+        WRITER_TIER_RESULT="H"
+        WRITER_TIER_TEXT_RESULT="high workload"
+    elif awk -v value="$weekly_pct" -v threshold="$WRITER_TIER_MODERATE_PCT" \
+        'BEGIN { exit !(value >= threshold) }'
+    then
+        WRITER_TIER_RESULT="M"
+        WRITER_TIER_TEXT_RESULT="moderate workload"
+    fi
+}
+
+record_writer_workload_alert() {
+    local dev="$1" weekly_pct="$2" direction="$3" change_pct="$4"
+    local direction_text=""
+
+    (( HEAVY_WRITER_ALERTS_ENABLED == 1 )) || return 0
+    classify_writer_tier "$weekly_pct"
+    case "$direction" in
+        IMPROVING) direction_text="; improving by ${change_pct#-}% versus the previous ${HEAVY_WRITER_RECENT_DAYS}-day window" ;;
+        RISING)    direction_text="; rising by ${change_pct}% versus the previous ${HEAVY_WRITER_RECENT_DAYS}-day window" ;;
+        STEADY)    direction_text="; steady versus the previous ${HEAVY_WRITER_RECENT_DAYS}-day window" ;;
+    esac
+    case "$WRITER_TIER_RESULT" in
+        V)
+            record_alert critical "Heavy Writer" \
+                "Disk $dev recent write rate projects to $(printf '%.1f' "$weekly_pct")% of capacity/week${direction_text}"
+            ;;
+        H)
+            record_alert warning "Heavy Writer" \
+                "Disk $dev recent write rate projects to $(printf '%.1f' "$weekly_pct")% of capacity/week${direction_text}"
+            ;;
+    esac
+}
+
 # === Main Function ===
-# Analyze TBW history to estimate daily write rates and days to threshold
+# Analyze TBW history for a smoothed endurance forecast and a separate recent
+# workload rate that can respond quickly when writes are reduced.
 # shellcheck disable=SC2329
 tbw_forecast_and_heavy_writers() {
     # Forecast days-to-endurance threshold and list heavy writers (normalized by capacity)
@@ -10576,6 +10711,11 @@ tbw_forecast_and_heavy_writers() {
     TBW_DAYS_LEFT=()
     TBW_STATUS_MAP=()
     TBW_FORECAST_CONFIDENCE=()
+    WRITER_DAILY=()
+    WRITER_PREVIOUS_DAILY=()
+    WRITER_DIRECTION=()
+    WRITER_CHANGE_PCT=()
+    WRITER_RECENT_READY=()
     local today
     today=$(date '+%Y-%m-%d')
     local -a tbw_records=()
@@ -10626,6 +10766,13 @@ tbw_forecast_and_heavy_writers() {
         _TBW_SEQUENCE[$dev]="${_TBW_SEQUENCE[$dev]:-}${_TBW_SAMPLE_EPOCH[$sample_key]} ${_TBW_SAMPLE_VALUE[$sample_key]}"$'\n'
     done
 
+    local writer_window_seconds=$((HEAVY_WRITER_RECENT_DAYS * 86400))
+    local writer_recent_min=$((RUN_EPOCH - writer_window_seconds))
+    local writer_previous_min=$((RUN_EPOCH - writer_window_seconds * 2))
+    local writer_previous_max=$writer_recent_min
+    (( writer_recent_min >= 0 )) || writer_recent_min=0
+    (( writer_previous_min >= 0 )) || writer_previous_min=0
+
     for dev in "${!_TBW_DEVICE_SEEN[@]}"; do
         local first_epoch=0 last_epoch=0 previous_epoch=0 previous_value=""
         local samples=0 max_gap_seconds=0 gap_seconds reset_seen=0
@@ -10658,6 +10805,30 @@ tbw_forecast_and_heavy_writers() {
         fi
         TBW_FORECAST_CONFIDENCE[$dev]="$confidence"
         TBW_SPAN_DAYS[$dev]="$span_days"
+
+        if calculate_counter_window_rate "${_TBW_SEQUENCE[$dev]:-}" \
+            "$writer_recent_min" "$RUN_EPOCH" "$HEAVY_WRITER_MIN_RECENT_SAMPLES"
+        then
+            WRITER_DAILY[$dev]="$COUNTER_WINDOW_RATE"
+            WRITER_RECENT_READY[$dev]=1
+            if calculate_counter_window_rate "${_TBW_SEQUENCE[$dev]:-}" \
+                "$writer_previous_min" "$writer_previous_max" \
+                "$HEAVY_WRITER_MIN_RECENT_SAMPLES"
+            then
+                WRITER_PREVIOUS_DAILY[$dev]="$COUNTER_WINDOW_RATE"
+                classify_writer_direction "${WRITER_DAILY[$dev]}" \
+                    "${WRITER_PREVIOUS_DAILY[$dev]}" "$HEAVY_WRITER_IMPROVEMENT_PCT"
+                WRITER_DIRECTION[$dev]="$WRITER_DIRECTION_RESULT"
+                WRITER_CHANGE_PCT[$dev]="$WRITER_CHANGE_RESULT"
+            else
+                WRITER_DIRECTION[$dev]="COLLECTING"
+                WRITER_CHANGE_PCT[$dev]="0.0"
+            fi
+        else
+            WRITER_RECENT_READY[$dev]=0
+            WRITER_DIRECTION[$dev]="COLLECTING"
+            WRITER_CHANGE_PCT[$dev]="0.0"
+        fi
     done
 
     declare -a heavy_rank=()
@@ -10674,6 +10845,9 @@ tbw_forecast_and_heavy_writers() {
             local daily
             daily=$(awk -v e="$end" -v s="$start" -v d="$days" 'BEGIN{printf "%d", int(((e+0)-(s+0))/(d+0))}')
             TBW_DAILY[$dev]=$daily
+            if [[ -z "${WRITER_DAILY[$dev]+present}" ]]; then
+                WRITER_DAILY[$dev]="$daily"
+            fi
             local model cap tbw_thresh
             model=$(get_device_model "$dev")
             cap=$(get_device_capacity_tb "$dev")
@@ -10723,12 +10897,14 @@ tbw_forecast_and_heavy_writers() {
             fi
             local cap_tb
             cap_tb=$(printf "%s" "$cap" | awk '/^[0-9]+(\.[0-9]+)?$/{print ($0+0)}')
+            local writer_daily="${WRITER_DAILY[$dev]:-$daily}"
             if awk -v c="$cap_tb" 'BEGIN{exit !(c+0>0)}' &&
+               [[ "$writer_daily" =~ ^[0-9]+$ ]] &&
                forecast_confidence_is_actionable "${TBW_FORECAST_CONFIDENCE[$dev]:-INSUFFICIENT}"
             then
                 local norm_pct
-                norm_pct=$(awk -v daily="$daily" -v cap_tb="$cap_tb" 'BEGIN{printf "%.6f", ((daily+0)/ (cap_tb*1000000000000.0))*100}')
-                heavy_rank+=("$norm_pct $dev $daily $cap_tb")
+                norm_pct=$(awk -v daily="$writer_daily" -v cap_tb="$cap_tb" 'BEGIN{printf "%.6f", ((daily+0)/ (cap_tb*1000000000000.0))*100}')
+                heavy_rank+=("$norm_pct $dev $writer_daily $cap_tb")
             fi
         fi
     done
@@ -10739,7 +10915,7 @@ tbw_forecast_and_heavy_writers() {
         sorted=$(printf "%s\n" "${heavy_rank[@]}" | sort -nr -k1,1 | head -n 5)
         while read -r pct dev daily cap_tb; do
             [[ -z "$dev" ]] && continue
-            heavy_writer_records+=("$today $(persistent_device_key "$dev") norm=$pct daily=$daily confidence=${TBW_FORECAST_CONFIDENCE[$dev]:-INSUFFICIENT} captured_epoch=$RUN_EPOCH schema=$HISTORY_SCHEMA_VERSION")
+            heavy_writer_records+=("$today $(persistent_device_key "$dev") norm=$pct daily=$daily long_daily=${TBW_DAILY[$dev]:-0} previous_daily=${WRITER_PREVIOUS_DAILY[$dev]:-0} direction=${WRITER_DIRECTION[$dev]:-COLLECTING} change_pct=${WRITER_CHANGE_PCT[$dev]:-0.0} recent_ready=${WRITER_RECENT_READY[$dev]:-0} confidence=${TBW_FORECAST_CONFIDENCE[$dev]:-INSUFFICIENT} captured_epoch=$RUN_EPOCH schema=$HISTORY_SCHEMA_VERSION")
         done < <(printf "%s\n" "$sorted")
     fi
     collector_replace_daily_history \
@@ -11264,9 +11440,9 @@ append_subsystem_subject_suffix() {
             done
 
             if [[ -n "$degraded_list" ]]; then
-                SUBJECT="${SUBJECT:-Disks Health} — Subsystems degraded: $degraded_list"
+                SUBJECT="${SUBJECT:-Disks Health} - Subsystems degraded: $degraded_list"
             elif [[ "$SHOW_SUBSYSTEMS_BLOCK" == "always" ]]; then
-                SUBJECT="${SUBJECT:-Disks Health} — All subsystems nominal"
+                SUBJECT="${SUBJECT:-Disks Health} - All subsystems nominal"
             fi
             ;;
     esac
@@ -11718,6 +11894,7 @@ validate_configuration() {
         SHOW_DISABLED_SUBSYSTEMS VERBOSE_OK SHOW_ZERO_COUNTS
         TREND_SHOW_NORMAL_POH TREND_SHOW_DATA_QUALITY_DEVICES
         TREND_GROUP_IDENTICAL_EVENTS
+        HEAVY_WRITER_ALERTS_ENABLED
         WEAR_TREND_ENABLED ENABLE_MODEL_IN_ALERTS
         LOG_FULL_NOTIFICATION_ON_TRUNCATION COLLECTOR_FAILURE_NOTIFICATIONS
         NOTIFICATION_LIFECYCLE_ENABLED NOTIFICATION_DRY_RUN
@@ -11760,6 +11937,8 @@ validate_configuration() {
         END_TO_END_ERR_CRIT SOFT_READ_ERR_WARN NVME_TEMP_WARNING NVME_TEMP_CRITICAL
         NVME_PERCENT_USED_WARN NVME_PERCENT_USED_CRIT WEAR_TREND_WINDOW_DAYS
         WEAR_TREND_TOP_N WEAR_DAYS_LEFT_WARN WEAR_DAYS_LEFT_CRIT
+        HEAVY_WRITER_RECENT_DAYS HEAVY_WRITER_MIN_RECENT_SAMPLES
+        HEAVY_WRITER_IMPROVEMENT_PCT
         WRITER_WEEKLY_WARN_PCT WRITER_WEEKLY_CRIT_PCT WRITER_TIER_MODERATE_PCT
         UNSAFE_SDWN_DELTA_WARN UNSAFE_SDWN_ABSOLUTE_MIN UNSAFE_SDWN_COOLDOWN_DAYS
         NVME_AVAIL_SPARE_WARN NVME_ERR_LOG_DELTA_WARN NVME_ERR_LOG_DELTA_CRIT
@@ -11802,7 +11981,7 @@ validate_configuration() {
         LONG_TEST_RISK_THRESHOLD STORAGE_DISCREPANCY_MIN_DIFF
         SSD_WEAR_WARN SSD_WEAR_CRIT NVME_PERCENT_USED_WARN NVME_PERCENT_USED_CRIT
         NVME_AVAIL_SPARE_WARN TBW_CONSUMED_WARN TBW_CONSUMED_CRIT
-        RISK_MONITOR RISK_REPLACE
+        RISK_MONITOR RISK_REPLACE HEAVY_WRITER_IMPROVEMENT_PCT
     )
     local -a positive_integer_settings=(
         LONG_TEST_ACCEL_FACTOR IO_ERROR_WINDOW_MINUTES
@@ -11811,6 +11990,8 @@ validate_configuration() {
         FORECAST_HIGH_SAMPLES FORECAST_MAX_GAP_DAYS
         TREND_FORECAST_MAX_DISPLAY_DAYS
         TREND_NOTIFICATION_TOP_N
+        HEAVY_WRITER_RECENT_DAYS HEAVY_WRITER_MIN_RECENT_SAMPLES
+        WRITER_WEEKLY_WARN_PCT WRITER_WEEKLY_CRIT_PCT WRITER_TIER_MODERATE_PCT
         NOTIFY_MAX_BODY_CHARS NOTIFY_MAX_BODY_LINES
         SMARTCTL_TIMEOUT_SECONDS BTRFS_COMMAND_TIMEOUT_SECONDS
         XFS_REPAIR_TIMEOUT_SECONDS SYSTEM_COMMAND_TIMEOUT_SECONDS
@@ -11920,6 +12101,20 @@ validate_configuration() {
     fi
     if [[ "${THRESHOLD:-}" =~ ^[0-9]+$ ]] && (( THRESHOLD == 0 )); then
         configuration_error "THRESHOLD must be greater than zero"
+    fi
+    if [[ "${HEAVY_WRITER_RECENT_DAYS:-}" =~ ^[0-9]+$ &&
+          "${HISTORY_WINDOW_DAYS:-}" =~ ^[0-9]+$ ]] &&
+       (( HEAVY_WRITER_RECENT_DAYS * 2 > HISTORY_WINDOW_DAYS ))
+    then
+        configuration_error \
+            "HISTORY_WINDOW_DAYS must cover two HEAVY_WRITER_RECENT_DAYS windows"
+    fi
+    if [[ "${HEAVY_WRITER_MIN_RECENT_SAMPLES:-}" =~ ^[0-9]+$ &&
+          "${HEAVY_WRITER_RECENT_DAYS:-}" =~ ^[0-9]+$ ]] &&
+       (( HEAVY_WRITER_MIN_RECENT_SAMPLES > HEAVY_WRITER_RECENT_DAYS + 1 ))
+    then
+        configuration_error \
+            "HEAVY_WRITER_MIN_RECENT_SAMPLES exceeds the expected daily samples in its window"
     fi
     if [[ "${NOTIFY_MAX_BODY_CHARS:-}" =~ ^[0-9]+$ ]] &&
        (( NOTIFY_MAX_BODY_CHARS < 512 ))
@@ -12392,11 +12587,13 @@ run_regression_tests() (
     fi
 
     if declare -F load_builtin_defaults >/dev/null 2>&1 &&
-       [[ "$SCRIPT_VERSION" == "2.15.3" &&
+       [[ "$SCRIPT_VERSION" == "2.15.4" &&
           "$STATE_SCHEMA_VERSION" == "2" &&
           "$HISTORY_SCHEMA_VERSION" == "3" &&
           "$DEVICE_ID_SCHEMA_VERSION" == "2" &&
           "$SMART_ALLOW_SPINUP" == "0" &&
+          "$HEAVY_WRITER_ALERTS_ENABLED" == "0" &&
+          "$HEAVY_WRITER_RECENT_DAYS" == "3" &&
           "$SOAK_TELEMETRY_ENABLED" == "1" ]]
     then
         self_test_result 1 "Built-in defaults and schema constants"
@@ -12702,6 +12899,7 @@ run_regression_tests() (
        grep -Fq 'parsed as data, not sourced' "$EXTERNAL_CONFIG_FILE" &&
        grep -Fq '# SOAK_MIN_RUNS=14' "$EXTERNAL_CONFIG_FILE" &&
        grep -Fq '# TREND_NOTIFICATION_MODE=summary' "$EXTERNAL_CONFIG_FILE" &&
+       grep -Fq '# HEAVY_WRITER_ALERTS_ENABLED=0' "$EXTERNAL_CONFIG_FILE" &&
        grep -Fq '# POOL_EXCLUDES=ramtmp,user0' "$EXTERNAL_CONFIG_FILE"
     then
         self_test_result 1 "Protected state-directory configuration template"
@@ -12889,6 +13087,60 @@ run_regression_tests() (
         self_test_result 1 "Explicit daily byte-rate units"
     else
         self_test_result 0 "Explicit daily byte-rate units" "found '$actual'"
+    fi
+
+    local writer_base_epoch=1787000000 writer_day=86400
+    local writer_sequence writer_recent_rate writer_previous_rate
+    writer_sequence=$(printf '%s\n' \
+        "$writer_base_epoch 0" \
+        "$((writer_base_epoch + writer_day)) 100" \
+        "$((writer_base_epoch + writer_day * 2)) 200" \
+        "$((writer_base_epoch + writer_day * 3)) 300" \
+        "$((writer_base_epoch + writer_day * 4)) 340" \
+        "$((writer_base_epoch + writer_day * 5)) 380" \
+        "$((writer_base_epoch + writer_day * 6)) 420")
+    if calculate_counter_window_rate "$writer_sequence" \
+        "$((writer_base_epoch + writer_day * 3))" \
+        "$((writer_base_epoch + writer_day * 6))" 2
+    then
+        writer_recent_rate="$COUNTER_WINDOW_RATE"
+    else
+        writer_recent_rate="invalid"
+    fi
+    if calculate_counter_window_rate "$writer_sequence" \
+        "$writer_base_epoch" "$((writer_base_epoch + writer_day * 3))" 2
+    then
+        writer_previous_rate="$COUNTER_WINDOW_RATE"
+    else
+        writer_previous_rate="invalid"
+    fi
+    if [[ "$writer_recent_rate" == "40" && "$writer_previous_rate" == "100" ]]
+    then
+        self_test_result 1 "Separate recent and previous writer-rate windows"
+    else
+        self_test_result 0 "Separate recent and previous writer-rate windows" \
+            "recent=$writer_recent_rate previous=$writer_previous_rate"
+    fi
+
+    classify_writer_direction "$writer_recent_rate" "$writer_previous_rate" 20
+    if [[ "$WRITER_DIRECTION_RESULT" == "IMPROVING" &&
+          "$WRITER_CHANGE_RESULT" == "-60.0" ]]
+    then
+        self_test_result 1 "Writer-rate improvement classification"
+    else
+        self_test_result 0 "Writer-rate improvement classification" \
+            "direction=$WRITER_DIRECTION_RESULT change=$WRITER_CHANGE_RESULT"
+    fi
+
+    writer_sequence+=$'\n'"$((writer_base_epoch + writer_day * 7)) 10"
+    if ! calculate_counter_window_rate "$writer_sequence" \
+        "$((writer_base_epoch + writer_day * 4))" \
+        "$((writer_base_epoch + writer_day * 7))" 2
+    then
+        self_test_result 1 "Writer-rate counter reset rejection"
+    else
+        self_test_result 0 "Writer-rate counter reset rejection" \
+            "unexpected rate=$COUNTER_WINDOW_RATE"
     fi
 
     actual=$(smart_growth_description 'nvme0n1 W+2.00% PCIE US WT+300s')
@@ -13451,6 +13703,50 @@ run_regression_tests() (
             "found '$actual' ready=$SYSLOG_CURSOR_READY mode=$SYSLOG_CURSOR_MODE"
     fi
 
+    FINDING_IDS=()
+    FINDING_SEEN=()
+    FINDING_SEVERITY=()
+    FINDING_CATEGORY=()
+    FINDING_SIGNAL=()
+    FINDING_DEVICE=()
+    FINDING_SCOPE=()
+    FINDING_TITLE=()
+    FINDING_EVIDENCE=()
+    FINDING_ACTION=()
+    RISK_SPIKE_TS=()
+    HEAVY_WRITER_ALERTS_ENABLED=0
+    record_writer_workload_alert /dev/nvme0n1 600 RISING 25.0
+    local workload_alert_disabled_count=${#FINDING_IDS[@]}
+    classify_writer_tier 89.3
+    local cache_workload_tier="$WRITER_TIER_RESULT"
+    classify_writer_tier 617.7
+    local download_workload_tier="$WRITER_TIER_RESULT"
+    HEAVY_WRITER_ALERTS_ENABLED=1
+    record_writer_workload_alert /dev/nvme0n1 600 RISING 25.0
+    local workload_finding_id="${FINDING_IDS[0]:-}"
+    if (( workload_alert_disabled_count == 0 && ${#FINDING_IDS[@]} == 1 )) &&
+       [[ -n "$workload_finding_id" &&
+          "${FINDING_SEVERITY[$workload_finding_id]:-}" == "critical" &&
+          "$cache_workload_tier" == "M" && "$download_workload_tier" == "V" ]]
+    then
+        self_test_result 1 "Workload-only health findings are opt-in"
+    else
+        self_test_result 0 "Workload-only health findings are opt-in" \
+            "disabled_count=$workload_alert_disabled_count enabled_count=${#FINDING_IDS[@]}"
+    fi
+    HEAVY_WRITER_ALERTS_ENABLED=0
+    FINDING_IDS=()
+    FINDING_SEEN=()
+    FINDING_SEVERITY=()
+    FINDING_CATEGORY=()
+    FINDING_SIGNAL=()
+    FINDING_DEVICE=()
+    FINDING_SCOPE=()
+    FINDING_TITLE=()
+    FINDING_EVIDENCE=()
+    FINDING_ACTION=()
+    RISK_SPIKE_TS=()
+
     FINDING_IDS=(
         'device:/dev/sdb|capacity_warning'
         'device:/dev/sda|pending_sectors'
@@ -13516,11 +13812,11 @@ run_regression_tests() (
     ENABLE_MODEL_IN_ALERTS=0
     finalize_finding_counts
     build_health_alerts
-    count=$(printf '%s\n' "$HEALTH_ALERTS_SECTION" | grep -F -c '→ Inspect now.' || true)
+    count=$(printf '%s\n' "$HEALTH_ALERTS_SECTION" | grep -F -c 'Action: Inspect now.' || true)
     if (( FINDING_CRITICAL_COUNT == 3 && FINDING_WARNING_COUNT == 2 )) &&
        [[ "$count" == "1" ]] &&
        printf '%s\n' "$HEALTH_ALERTS_SECTION" |
-           grep -Fq -- '- [CRITICAL] disk1 [sda] — risk 90 — 2 findings'
+           grep -Fq -- '- [CRITICAL] disk1 [sda] - risk 90 - 2 findings'
     then
         self_test_result 1 "Grouped finding rendering and action de-duplication"
     else
@@ -13555,7 +13851,7 @@ run_regression_tests() (
         "Review the fixture log." "fixture_timeout"
     finalize_finding_counts
     build_health_alerts
-    local golden_health_alerts=$'Health Alerts:\n - [WARNING] Monitoring — 1 finding\n   • Collector timeout: Fixture collector exceeded deadline.\n   → Review the fixture log.'
+    local golden_health_alerts=$'Health Alerts:\n - [WARNING] Monitoring - 1 finding\n   - Collector timeout: Fixture collector exceeded deadline.\n     Action: Review the fixture log.'
     if [[ "$HEALTH_ALERTS_SECTION" == "$golden_health_alerts" &&
           "$FINDING_WARNING_COUNT" == "1" && "$FINDING_CRITICAL_COUNT" == "0" ]]
     then
@@ -13652,7 +13948,7 @@ run_regression_tests() (
        [[ "${NOTIFY_PREV_FINGERPRINT[$notification_id]:-}" == \
           "$notification_fingerprint" &&
           "${NOTIFY_PREV_LABEL[$notification_id]:-}" == \
-          "Monitoring — Fixture notification" ]]
+          "Monitoring - Fixture notification" ]]
     then
         self_test_result 1 "Atomic notification journal round-trip"
     else
@@ -13722,7 +14018,7 @@ run_regression_tests() (
     if [[ "$NOTIFICATION_DECISION" == "SEND" &&
           "$NOTIFICATION_RESOLVED_COUNT" == "1" &&
           "$NOTIFICATION_RECOVERY_SECTION" == *"Fixture notification"* &&
-          "$SUBJECT" == "Disks Health — RECOVERED (1)" ]]
+          "$SUBJECT" == "Disks Health - RECOVERED (1)" ]]
     then
         self_test_result 1 "Resolved finding notification rendering"
     else
@@ -13940,6 +14236,12 @@ run_regression_tests() (
     TBW_TREND_ENABLED=1
     TBW_DAYS_LEFT=([/dev/nvme0n1]=500 [/dev/nvme1n1]=2000000)
     TBW_DAILY=([/dev/nvme0n1]=1000000000 [/dev/nvme1n1]=75000)
+    WRITER_DAILY=([/dev/nvme0n1]=880000000000 [/dev/nvme1n1]=127000000000)
+    WRITER_PREVIOUS_DAILY=([/dev/nvme0n1]=1173333333333 [/dev/nvme1n1]=127000000000)
+    WRITER_DIRECTION=([/dev/nvme0n1]=IMPROVING [/dev/nvme1n1]=STEADY)
+    WRITER_CHANGE_PCT=([/dev/nvme0n1]=-25.0 [/dev/nvme1n1]=0.0)
+    WRITER_RECENT_READY=([/dev/nvme0n1]=1 [/dev/nvme1n1]=1)
+    HEAVY_WRITER_ALERTS_ENABLED=0
     TBW_FORECAST_CONFIDENCE=([/dev/nvme0n1]=HIGH [/dev/nvme1n1]=HIGH)
     LSBLK_ALL_CACHE=$'nvme0n1 1000000000000 0 disk\nnvme1n1 1000000000000 0 disk'
     WEAR_TREND_ENABLED=1
@@ -13964,9 +14266,9 @@ run_regression_tests() (
     TREND_HISTORY_CACHE=()
     render_trend_section
     if [[ "$TREND_SECTION" == *'Trend Summary:'* &&
-          "$TREND_SECTION" == *$'Capacity\n• Array usage is stable or decreasing; it is not projected to reach 90%; Pool usage is growing by 0.247 percentage points/day; estimated 257 days to reach 90% (high forecast confidence)'* &&
-          "$TREND_SECTION" == *$'SSD endurance\n• nvme0n1: 1.00 GB/day, about 16.4 months remaining'* &&
-          "$TREND_SECTION" == *$'Data quality / collecting\n• Temperature history is stale for 1 disk, likely because it is sleeping'* &&
+          "$TREND_SECTION" == *$'Capacity\n- Array usage is stable or decreasing; it is not projected to reach 90%; Pool usage is growing by 0.247 percentage points/day; estimated 257 days to reach 90% (high forecast confidence)'* &&
+          "$TREND_SECTION" == *$'SSD endurance\n- nvme0n1: 1.00 GB/day, about 16.4 months remaining'* &&
+          "$TREND_SECTION" == *$'Data quality / collecting\n- Temperature history is stale for 1 disk, likely because it is sleeping'* &&
           "$TREND_SECTION" == *'1 device forecast is rebuilding after a counter reset: nvme2n1'* &&
           "$TREND_SECTION" != *'nvme1n1'* &&
           "$TREND_SECTION" != *'Power-on-hour'* &&
@@ -13975,6 +14277,14 @@ run_regression_tests() (
         self_test_result 1 "Grouped concise trend notification rendering"
     else
         self_test_result 0 "Grouped concise trend notification rendering" \
+            "found '$TREND_SECTION'"
+    fi
+    if [[ "$TREND_SECTION" == *$'Attention\n- High SSD workload: nvme0n1 880.00 GB/day (616.0%/week; improving 25.0% vs previous window). Confirm it matches the device role; endurance health is evaluated separately'* &&
+          "$TREND_SECTION" != *'nvme1n1 127.00 GB/day'* ]]
+    then
+        self_test_result 1 "Recent writer improvement and role-aware tier rendering"
+    else
+        self_test_result 0 "Recent writer improvement and role-aware tier rendering" \
             "found '$TREND_SECTION'"
     fi
     if [[ "$TREND_SECTION" != *sda* &&
@@ -13999,7 +14309,7 @@ run_regression_tests() (
     if [[ "$TREND_SECTION" == *'Capacity forecast:'* &&
           "$TREND_SECTION" == *'SSD endurance forecast:'* &&
           "$TREND_SECTION" == *'Power-on-hour history:'* &&
-          "$TREND_SECTION" != *$'\n• '* ]]
+          "$TREND_SECTION" != *$'\n- '* ]]
     then
         self_test_result 1 "Detailed trend notification compatibility mode"
     else
@@ -14273,7 +14583,7 @@ run_notification_test() {
 
     printf 'Sending one Unraid notification test; no monitoring or state writes will occur.\n'
     if deliver_notification_with_retry \
-        "Disk Health Monitor v${SCRIPT_VERSION} — Notification Test" \
+        "Disk Health Monitor v${SCRIPT_VERSION} - Notification Test" \
         "Notification delivery test completed at $(date '+%Y-%m-%d %H:%M:%S').\nNo SMART reads, tests, scrubs, cursor updates, or monitoring-state writes were performed." \
         normal
     then
