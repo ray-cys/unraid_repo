@@ -147,7 +147,7 @@ SAB_CONTAINER_COMPLETE_ROOT="${SAB_CONTAINER_COMPLETE_ROOT:-}"
 
 # Keep quarantine outside SAB_COMPLETE_ROOT but preferably on the same Unraid
 # share/filesystem so the move is fast and recoverable.
-QUARANTINE_DIR="${QUARANTINE_DIR:-/mnt/user/media/net/sabnzbd_cleanup_quarantine}"
+QUARANTINE_DIR="${QUARANTINE_DIR:-/mnt/user/media/net/quarantine}"
 
 LOG_DIR="${LOG_DIR:-/mnt/user/cloud/logs/sabnzbd_stranded_cleanup}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/sabnzbd_stranded_cleanup.log}"
