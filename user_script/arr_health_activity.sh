@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Download / Import Monitor v2.6
+# ARR Download / Import Monitor v2.6.1
 #
 # PURPOSE
 # -------
@@ -35,6 +35,9 @@
 #
 #   ARR warnings / CF rejection / TBA:
 #       Eligible after WARNING_AFTER_HOURS
+#
+#   ARR manual intervention:
+#       Eligible after MANUAL_AFTER_HOURS
 #
 #   Generic Arr import stalls:
 #       Eligible after STALL_AFTER_HOURS
@@ -260,6 +263,10 @@ SAB_IGNORED_CATEGORY="f1"
 
 # Ignore very fresh queue entries.
 IGNORE_BEFORE_HOURS=1
+
+# Explicit manual-intervention conditions should be reported promptly after the
+# fresh-entry grace period because Arr will not resolve them automatically.
+MANUAL_AFTER_HOURS=1
 
 # Normal policy / metadata / warning threshold.
 WARNING_AFTER_HOURS=3
@@ -1144,7 +1151,7 @@ classify_issue() {
 
     if echo "$combined" |
        grep -Eq \
-       'manual import|manual intervention|requires manual|manually import|needs manual'
+       'manual import|manual intervention|requires manual|manually import|needs manual|found matching (series|movie) via grab history.*automatic import is not possible'
     then
 
         echo "MANUAL"
@@ -1268,13 +1275,17 @@ classification_min_age() {
         UPGRADE_REJECT|\
         TBA_METADATA|\
         WARNING|\
-        MANUAL|\
         FILE_LOCKED|\
         SAMPLE_DETECTION|\
         TITLE_MISMATCH|\
         QUALITY_PARSE)
 
             echo "$WARNING_AFTER_HOURS"
+            ;;
+
+        MANUAL)
+
+            echo "$MANUAL_AFTER_HOURS"
             ;;
 
         UNMATCHED_MEDIA|\
@@ -5792,7 +5803,7 @@ fi
 # START
 ###############################################################################
 
-log "Starting ARR Import Monitor v2.6"
+log "Starting ARR Import Monitor v2.6.1"
 log "Recommended schedule: hourly"
 log "Notifications enabled: $SEND_NOTIFICATIONS"
 log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -6042,7 +6053,7 @@ write_persistent_activity_summary
 RUNTIME=$(runtime)
 
 log "============================================================"
-log "ARR Import Monitor v2.6 completed"
+log "ARR Import Monitor v2.6.1 completed"
 
 log ""
 log "SCAN HEALTH"
