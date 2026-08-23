@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.3.0
+# ARR Health / Download / Import Monitor v3.3.1
 #
 # PURPOSE
 # -------
@@ -429,7 +429,16 @@ SAB_REPAIR_STALL_MINUTES=120
 SAB_EXTRACT_STALL_MINUTES=60
 SAB_MOVE_STALL_MINUTES=30
 SAB_SCRIPT_STALL_MINUTES=30
-SAB_POSTPROCESS_WAIT_MINUTES=60
+
+# SAB history status "Queued" is the intentional wait before the next batched
+# Arr import run. Allow one complete four-hour batch interval plus one hour for
+# that run to start and make progress. This delay applies only to Queued;
+# active download and post-processing stages retain the thresholds above.
+SAB_BATCH_IMPORT_INTERVAL_MINUTES=240
+SAB_BATCH_IMPORT_GRACE_MINUTES=60
+SAB_POSTPROCESS_WAIT_MINUTES=$((
+    SAB_BATCH_IMPORT_INTERVAL_MINUTES + SAB_BATCH_IMPORT_GRACE_MINUTES
+))
 
 # Per-job operational conditions. An intentionally propagating job is allowed
 # to reach its advertised ready time plus this grace period before it can be
@@ -10710,7 +10719,7 @@ rotate_persistent_log
 
 persistent_log \
     "START" \
-    "ARR Health Monitor v3.3.0"
+    "ARR Health Monitor v3.3.1"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -10723,7 +10732,7 @@ fi
 # START
 ###############################################################################
 
-log "Starting ARR Health Monitor v3.3.0"
+log "Starting ARR Health Monitor v3.3.1"
 log "Recommended schedule: every five minutes"
 log "Notifications enabled: $SEND_NOTIFICATIONS"
 log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -11209,7 +11218,7 @@ write_persistent_activity_summary
 RUNTIME=$(runtime)
 
 log "============================================================"
-log "ARR Health Monitor v3.3.0 completed"
+log "ARR Health Monitor v3.3.1 completed"
 
 log ""
 log "SCAN HEALTH"
