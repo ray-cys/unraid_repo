@@ -10,7 +10,7 @@
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.0"
+readonly SCRIPT_VERSION="1.1"
 
 ###############################################################################
 # CONFIGURATION
@@ -33,7 +33,13 @@ ARTIFACT_RULES=(
     "Appdata backup|/mnt/vault/backup/cache|d|backup_[0-9]*_[0-9]*|192"
     "Boot-device backup|/mnt/vault/backup/flash|f|*.zip|192"
     "Disk health monitor|/mnt/vault/cloud/logs/disk_health|f|*.log|30"
-    "Arr health monitor|/mnt/vault/cloud/logs/arr_health_activity|f|arr_health_activity.log|1"
+)
+
+# label|state file|max age minutes|required (0/1)
+# This independently consumes arr_health_activity.sh's run-start heartbeat so
+# the digest can report that the monitor itself stopped running.
+HEARTBEAT_RULES=(
+    "Arr health monitor|/mnt/vault/cloud/logs/arr_health_activity/state.json|15|1"
 )
 
 SEND_NOTIFICATION=true
@@ -221,6 +227,38 @@ check_artifact() {
     fi
 }
 
+check_heartbeat() {
+    local rule="$1" label state_file max_minutes required
+    local epoch age status
+
+    IFS='|' read -r label state_file max_minutes required <<<"$rule"
+
+    if [[ ! -s "$state_file" ]] || ! jq -e . "$state_file" >/dev/null 2>&1; then
+        if [[ "$required" == 1 ]]; then
+            add_item CRITICAL "$label: heartbeat state missing or invalid"
+        fi
+        return
+    fi
+
+    epoch="$(jq -r '.monitor.lastStartedAt // 0' "$state_file")"
+    status="$(jq -r '.monitor.lastStatus // "unknown"' "$state_file")"
+    [[ "$epoch" =~ ^[0-9]+$ ]] || epoch=0
+
+    if (( epoch <= 0 )); then
+        add_item CRITICAL "$label: heartbeat has never been recorded"
+        return
+    fi
+
+    age=$((START_EPOCH - epoch))
+    (( age < 0 )) && age=0
+
+    if (( age > max_minutes * 60 )); then
+        add_item CRITICAL "$label: heartbeat stale ($(human_age "$age")); last status=$status"
+    else
+        add_item OK "$label heartbeat ($(human_age "$age")): last status=$status"
+    fi
+}
+
 ###############################################################################
 # REPORTING
 ###############################################################################
@@ -248,9 +286,15 @@ build_body() {
     body+="Generated: $(date '+%Y-%m-%d %H:%M:%S')"$'\n'
     body+="Script version: $SCRIPT_VERSION"$'\n'
     body+="OK: ${#OK_ITEMS[@]}  Warnings: ${#WARNING_ITEMS[@]}  Critical: ${#CRITICAL_ITEMS[@]}"$'\n\n'
-    body+="$(append_section "Critical" "!" "${CRITICAL_ITEMS[@]}")"
-    body+="$(append_section "Warnings" "-" "${WARNING_ITEMS[@]}")"
-    body+="$(append_section "Healthy / current" "+" "${OK_ITEMS[@]}")"
+    if (( ${#CRITICAL_ITEMS[@]} > 0 )); then
+        body+="$(append_section "Critical" "!" "${CRITICAL_ITEMS[@]}")"$'\n\n'
+    fi
+    if (( ${#WARNING_ITEMS[@]} > 0 )); then
+        body+="$(append_section "Warnings" "-" "${WARNING_ITEMS[@]}")"$'\n\n'
+    fi
+    if (( ${#OK_ITEMS[@]} > 0 )); then
+        body+="$(append_section "Healthy / current" "+" "${OK_ITEMS[@]}")"$'\n'
+    fi
     printf '%s' "$body"
 }
 
@@ -286,6 +330,9 @@ main() {
     done
     for rule in "${ARTIFACT_RULES[@]}"; do
         check_artifact "$rule"
+    done
+    for rule in "${HEARTBEAT_RULES[@]}"; do
+        check_heartbeat "$rule"
     done
 
     body="$(build_body)"

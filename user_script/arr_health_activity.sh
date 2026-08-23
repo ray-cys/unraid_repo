@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.0.0
+# ARR Health / Download / Import Monitor v3.1.0
 #
 # PURPOSE
 # -------
@@ -117,7 +117,11 @@
 #   ERROR
 #
 # Native /api/v3/health entries are also mirrored dynamically, so newly added
-# Sonarr/Radarr health checks are not silently missed by a fixed message list.
+# Sonarr/Radarr health sources are not silently missed by a fixed message list.
+# Error, warning, and notice types map to ERROR, WARNING, and INFO respectively;
+# an unfamiliar future type is retained and conservatively treated as WARNING.
+# Health identity uses application, source, and normalized message so changing
+# paths, URLs, UUIDs, and other volatile values do not create alert churn.
 #
 #
 # ARR MESSAGE TELEMETRY - v2.3
@@ -178,6 +182,14 @@
 #   SAB_STALLED_*
 #   SAB_CATEGORY_UNKNOWN
 #
+# MONITOR SELF-HEALTH
+# -------------------
+#   SERVICE_API_UNAVAILABLE
+#   SERVICE_API_AUTHENTICATION
+#   MONITOR_SCAN_FAILURE
+#   MONITOR_NOTIFICATION_FAILURE
+#   MONITOR_SCHEDULE_MISSED
+#
 #
 # SAB CATEGORY MAPPING
 # --------------------
@@ -196,6 +208,8 @@
 #   active
 #   resolvedAt
 #   notifiedSignature
+#   source
+#   normalizedMessage
 #
 # When an issue disappears during a successful scan:
 #
@@ -294,15 +308,36 @@ STALL_AFTER_HOURS=6
 POLICY_ESCALATE_AFTER_HOURS=72
 
 # Native Arr health warnings must remain present for this many consecutive
-# successful health scans before notification. Native health errors alert on
-# the first successful scan that returns them.
+# successful health scans before notification. Errors and notices alert on the
+# first successful scan; unfamiliar future types follow the warning threshold.
 ARR_HEALTH_WARNING_NOTIFY_RUNS=2
 ARR_HEALTH_ERROR_NOTIFY_RUNS=1
+ARR_HEALTH_NOTICE_NOTIFY_RUNS=1
+ARR_HEALTH_UNKNOWN_NOTIFY_RUNS=2
 
 # A service API problem becomes actionable only after repeated complete-run
 # failures. This avoids noise during a normal container restart.
 API_FAILURE_NOTIFY_RUNS=3
 API_FAILURE_ESCALATE_MINUTES=60
+
+# ---------------------------------------------------------------------------
+# Monitor self-health
+# ---------------------------------------------------------------------------
+
+# The configured cron interval and tolerated scheduler/startup jitter. A gap
+# greater than their sum becomes a lifecycle issue when the script next runs.
+# An external watcher is still required to alert while this script is absent.
+MONITOR_EXPECTED_INTERVAL_MINUTES=5
+MONITOR_MISSED_RUN_GRACE_MINUTES=10
+
+# Secondary collection/processing failures not already owned by a service API
+# issue must repeat before notification.
+MONITOR_SCAN_FAILURE_NOTIFY_RUNS=3
+MONITOR_SCAN_FAILURE_ESCALATE_MINUTES=60
+
+# A missing or failing Unraid notification command is recorded immediately,
+# retried on later runs, and mirrored to syslog as a fallback.
+MONITOR_NOTIFICATION_FAILURE_NOTIFY_RUNS=1
 
 # ---------------------------------------------------------------------------
 # SAB stranded download thresholds - v2.2
@@ -580,6 +615,12 @@ SAB_PRIMARY_DOWNLOADS_FILE=""
 SAB_PROGRESS_SEEN_FILE=""
 SAB_PROGRESS_OBSERVATIONS_FILE=""
 STATE_WRITE_ALERT_SENT=false
+NOTIFICATION_ATTEMPTED=false
+NOTIFICATION_LAST_ERROR=""
+PREVIOUS_RUN_STARTED_AT=0
+PREVIOUS_RUN_COMPLETED_AT=0
+PREVIOUS_RUN_INCOMPLETE=false
+PREVIOUS_RUN_GAP_MINUTES=0
 
 TOTAL_QUEUE=0
 TOTAL_ISSUES=0
@@ -614,6 +655,9 @@ SAB_FAILED_JOB_COUNT=0
 SAB_STALLED_JOB_COUNT=0
 SAB_PAUSED_COUNT=0
 SAB_UNKNOWN_CATEGORY_COUNT=0
+MONITOR_SCAN_FAILURE_COUNT=0
+MONITOR_NOTIFICATION_FAILURE_COUNT=0
+MONITOR_SCHEDULE_MISSED_COUNT=0
 
 RESOLVED_COUNT=0
 
@@ -829,6 +873,21 @@ require_command() {
 # UNRAID NOTIFICATION
 ###############################################################################
 
+notification_fallback_alert() {
+
+    local reason="$1"
+
+    persistent_log "ERROR" "Notification command failure | ${reason}"
+
+    if command -v logger >/dev/null 2>&1; then
+        logger \
+            -t "arr_health_activity" \
+            -- \
+            "Unraid notification command failure: ${reason}" \
+            2>/dev/null || true
+    fi
+}
+
 notify() {
 
     local importance="$1"
@@ -845,9 +904,15 @@ notify() {
         return 2
     fi
 
+    NOTIFICATION_ATTEMPTED=true
+    NOTIFICATION_LAST_ERROR=""
+
     if [ ! -x "$NOTIFY" ]; then
 
         log "WARNING: Unraid notification command unavailable"
+
+        NOTIFICATION_LAST_ERROR="notification command is missing or not executable: ${NOTIFY}"
+        notification_fallback_alert "$NOTIFICATION_LAST_ERROR"
 
         return 1
     fi
@@ -866,6 +931,9 @@ notify() {
     fi
 
     log "WARNING: Failed to send grouped Unraid notification"
+
+    NOTIFICATION_LAST_ERROR="notification command returned a non-zero exit status: ${NOTIFY}"
+    notification_fallback_alert "$NOTIFICATION_LAST_ERROR"
 
     return 1
 }
@@ -1292,28 +1360,245 @@ age_hours() {
 # ARR MESSAGE
 ###############################################################################
 
-queue_message() {
+queue_reason_records() {
 
     local item="$1"
 
-    echo "$item" |
-        jq -r '
+    printf '%s' "$item" |
+        jq -c '
             [
-                (.errorMessage // empty),
-
+                (
+                    (.errorMessage // "")
+                    | select(type == "string" and length > 0)
+                    | {
+                        origin: "errorMessage",
+                        label: "Queue error",
+                        message: .
+                    }
+                ),
                 (
                     .statusMessages[]?
-                    | (
-                        .title?,
-                        .message?,
-                        .messages[]?
-                    )
+                    |
+                    if type == "string" then
+                        select(length > 0)
+                        | {
+                            origin: "statusMessage",
+                            label: "Status message",
+                            message: .
+                        }
+                    else
+                        . as $statusMessage
+                        | ($statusMessage.title // "Status message") as $title
+                        | [
+                            ($statusMessage.message? // empty),
+                            ($statusMessage.messages[]? // empty)
+                        ]
+                        | map(select(type == "string" and length > 0))
+                        | unique
+                        | if length > 0 then
+                            .[]
+                            | {
+                                origin: "statusMessage",
+                                label: ("Status message: " + $title),
+                                message: .
+                            }
+                          elif ($title | length) > 0 then
+                            {
+                                origin: "statusMessage",
+                                label: "Status message",
+                                message: $title
+                            }
+                          else
+                            empty
+                          end
+                    end
                 )
             ]
-            | map(select(. != null and . != ""))
-            | unique
-            | join(" | ")
+            | unique_by(.message)
+            | to_entries[]
+            | .value + {index: .key}
         '
+}
+
+severity_rank() {
+
+    case "$1" in
+        ERROR) echo 3 ;;
+        WARNING) echo 2 ;;
+        INFO) echo 1 ;;
+        *) echo 0 ;;
+    esac
+}
+
+analyze_arr_queue_reasons() {
+
+    local tracked_status="$1"
+    local tracked_state="$2"
+    local status="$3"
+    local age="$4"
+    local item="$5"
+    local output="$6"
+
+    local raw_file
+    local classified_file
+    local record
+    local index
+    local label
+    local reason_message
+    local classification
+    local severity
+    local rank
+    local min_age
+    local reason
+    local normalized
+    local eligible
+
+    raw_file=$(mktemp "${TMP_DIR}/arr-queue-raw.XXXXXX") || return 1
+    classified_file=$(mktemp "${TMP_DIR}/arr-queue-classified.XXXXXX") || return 1
+
+    queue_reason_records "$item" >"$raw_file" || return 1
+
+    if [ ! -s "$raw_file" ]; then
+        jq -nc \
+            --arg message "" \
+            '{origin:"queueState",label:"Queue state",message:$message,index:0}' \
+            >"$raw_file" || return 1
+    fi
+
+    : >"$classified_file"
+
+    while IFS= read -r record; do
+
+        [ -n "$record" ] || continue
+
+        index=$(jq -r '.index // 0' <<<"$record")
+        label=$(jq -r '.label // "Status message"' <<<"$record")
+        reason_message=$(jq -r '.message // ""' <<<"$record")
+
+        classification=$(classify_issue \
+            "$tracked_status" \
+            "$tracked_state" \
+            "$status" \
+            "$reason_message")
+
+        if [ "$classification" = "NONE" ]; then
+            severity="NONE"
+            rank=0
+            min_age=999999
+            reason="No actionable classification matched this queue message"
+            eligible=false
+        else
+            severity=$(classification_severity "$classification" "$age")
+            rank=$(severity_rank "$severity")
+            min_age=$(classification_min_age "$classification")
+            reason=$(classification_reason "$classification" "$age")
+
+            if (( age >= min_age )); then
+                eligible=true
+            else
+                eligible=false
+            fi
+        fi
+
+        normalized=$(normalize_arr_message "$(arr_pattern_raw_message \
+            "$tracked_status" \
+            "$tracked_state" \
+            "$status" \
+            "$reason_message")")
+
+        jq -nc \
+            --argjson index "$index" \
+            --arg label "$label" \
+            --arg message "$reason_message" \
+            --arg normalizedMessage "$normalized" \
+            --arg classification "$classification" \
+            --arg severity "$severity" \
+            --argjson severityRank "$rank" \
+            --argjson minAge "$min_age" \
+            --arg reason "$reason" \
+            --argjson eligible "$eligible" \
+            '{
+                index: $index,
+                label: $label,
+                message: $message,
+                normalizedMessage: $normalizedMessage,
+                classification: $classification,
+                severity: $severity,
+                severityRank: $severityRank,
+                minAge: $minAge,
+                reason: $reason,
+                eligible: $eligible
+            }' \
+            >>"$classified_file" || return 1
+
+    done <"$raw_file"
+
+    jq -s '
+        . as $all
+        | [$all[] | select(.classification != "NONE")] as $classified
+        | [$classified[] | select(.eligible)] as $eligible
+        | ($classified | sort_by(.severityRank, .index) | last) as $primaryAny
+        | ($eligible | sort_by(.severityRank, .index) | last) as $primary
+        | {
+            hasIssue: (($classified | length) > 0),
+            eligible: (($eligible | length) > 0),
+            primaryAnyClassification: ($primaryAny.classification // "NONE"),
+            primaryAnySeverity: ($primaryAny.severity // "NONE"),
+            primaryClassification: ($primary.classification // "NONE"),
+            primarySeverity: ($primary.severity // "NONE"),
+            primaryReason: ($primary.reason // ""),
+            allMessage: (
+                [$all[].message | select(length > 0)]
+                | unique
+                | join(" | ")
+            ),
+            signatureMessage: (
+                $all
+                | map(
+                    .classification
+                    + "|"
+                    + .severity
+                    + "|eligible="
+                    + (.eligible | tostring)
+                    + "|"
+                    + .normalizedMessage
+                )
+                | sort
+                | unique
+                | join(" || ")
+            ),
+            reasonDetail: (
+                $all
+                | map(
+                    .label
+                    + ": "
+                    + (
+                        if .classification == "NONE"
+                        then "UNCLASSIFIED"
+                        else .classification + " [" + .severity + "]"
+                        end
+                    )
+                    + (
+                        if .classification != "NONE" and (.eligible | not)
+                        then " [pending until " + (.minAge | tostring) + "h]"
+                        else ""
+                        end
+                    )
+                    + "\n"
+                    + .reason
+                    + (
+                        if .message != ""
+                        then "\nArr detail: " + .message[0:1000]
+                        else ""
+                        end
+                    )
+                )
+                | join("\n")
+            ),
+            reasons: $all
+        }
+        ' \
+        "$classified_file" >"$output"
 }
 
 ###############################################################################
@@ -1558,7 +1843,7 @@ classify_issue() {
     # correlation enriches the later notification but never gates detection.
     if echo "$combined" |
        grep -Eq \
-       'manual import|manual intervention|requires manual|manually import|needs manual|importblocked|import blocked|found matching (series|movie) via grab history.*automatic import is not possible'
+       'manual import|manual intervention|requires manual|manually import|needs manual|importblocked|import blocked|automatic import.*not possible|found matching (series|movie) via grab history.*automatic import is not possible'
     then
 
         echo "MANUAL"
@@ -1995,9 +2280,20 @@ initialize_state() {
 
         cat >"$STATE_FILE" <<'EOF'
 {
-  "version": 8,
+  "version": 9,
   "issues": {},
   "sabProgress": {},
+  "monitor": {
+    "lastStartedAt": 0,
+    "lastCompletedAt": 0,
+    "lastStatus": "unknown",
+    "notification": {
+      "failed": false,
+      "reason": "",
+      "lastFailureAt": 0,
+      "lastSuccessAt": 0
+    }
+  },
   "telemetry": {
     "version": 1,
     "patterns": {}
@@ -2024,9 +2320,20 @@ EOF
 
             cat >"$STATE_FILE" <<'EOF'
 {
-  "version": 8,
+  "version": 9,
   "issues": {},
   "sabProgress": {},
+  "monitor": {
+    "lastStartedAt": 0,
+    "lastCompletedAt": 0,
+    "lastStatus": "unknown",
+    "notification": {
+      "failed": false,
+      "reason": "",
+      "lastFailureAt": 0,
+      "lastSuccessAt": 0
+    }
+  },
   "telemetry": {
     "version": 1,
     "patterns": {}
@@ -2046,11 +2353,36 @@ EOF
     migrate_tmp="$TMP_DIR/state.migrate.json"
 
     if jq '
-        .version = 8
+        .version = 9
         |
         .issues = (.issues // {})
         |
         .sabProgress = (.sabProgress // {})
+        |
+        .monitor = (
+            {
+                lastStartedAt: 0,
+                lastCompletedAt: 0,
+                lastStatus: "unknown",
+                notification: {
+                    failed: false,
+                    reason: "",
+                    lastFailureAt: 0,
+                    lastSuccessAt: 0
+                }
+            }
+            * (.monitor // {})
+        )
+        |
+        .monitor.notification = (
+            {
+                failed: false,
+                reason: "",
+                lastFailureAt: 0,
+                lastSuccessAt: 0
+            }
+            * (.monitor.notification // {})
+        )
         |
         .telemetry = (
             .telemetry
@@ -2072,7 +2404,7 @@ EOF
 
     else
 
-        log "ERROR: Unable to migrate state file to schema version 8"
+        log "ERROR: Unable to migrate state file to schema version 9"
         exit 3
     fi
 }
@@ -2108,6 +2440,93 @@ save_state() {
     fi
 
     return 1
+}
+
+###############################################################################
+# MONITOR RUN / NOTIFICATION STATE - v3.1
+###############################################################################
+
+begin_monitor_run() {
+
+    local now="$START_TIME"
+    local tmp="${TMP_DIR}/state.monitor-start.json"
+
+    PREVIOUS_RUN_STARTED_AT=$(jq -r '.monitor.lastStartedAt // 0' "$STATE_FILE")
+    PREVIOUS_RUN_COMPLETED_AT=$(jq -r '.monitor.lastCompletedAt // 0' "$STATE_FILE")
+
+    [[ "$PREVIOUS_RUN_STARTED_AT" =~ ^[0-9]+$ ]] || PREVIOUS_RUN_STARTED_AT=0
+    [[ "$PREVIOUS_RUN_COMPLETED_AT" =~ ^[0-9]+$ ]] || PREVIOUS_RUN_COMPLETED_AT=0
+
+    if (( PREVIOUS_RUN_STARTED_AT > 0 && now > PREVIOUS_RUN_STARTED_AT )); then
+        PREVIOUS_RUN_GAP_MINUTES=$(( (now - PREVIOUS_RUN_STARTED_AT) / 60 ))
+    fi
+
+    if (( PREVIOUS_RUN_STARTED_AT > PREVIOUS_RUN_COMPLETED_AT )); then
+        PREVIOUS_RUN_INCOMPLETE=true
+    fi
+
+    jq \
+        --argjson now "$now" \
+        '
+        .version = 9
+        |
+        .monitor.lastStartedAt = $now
+        |
+        .monitor.lastStatus = "running"
+        ' \
+        "$STATE_FILE" >"$tmp" || return 1
+
+    save_state "$tmp"
+}
+
+complete_monitor_run() {
+
+    local status="$1"
+    local now
+    local tmp="${TMP_DIR}/state.monitor-complete.json"
+
+    now=$(date +%s)
+
+    jq \
+        --arg status "$status" \
+        --argjson now "$now" \
+        '
+        .monitor.lastCompletedAt = $now
+        |
+        .monitor.lastStatus = $status
+        ' \
+        "$STATE_FILE" >"$tmp" || return 1
+
+    save_state "$tmp"
+}
+
+set_monitor_notification_state() {
+
+    local failed="$1"
+    local reason="${2:-}"
+    local now
+    local tmp="${TMP_DIR}/state.monitor-notification.json"
+
+    now=$(date +%s)
+
+    jq \
+        --argjson failed "$failed" \
+        --arg reason "$reason" \
+        --argjson now "$now" \
+        '
+        .monitor.notification.failed = $failed
+        |
+        .monitor.notification.reason = $reason
+        |
+        if $failed then
+            .monitor.notification.lastFailureAt = $now
+        else
+            .monitor.notification.lastSuccessAt = $now
+        end
+        ' \
+        "$STATE_FILE" >"$tmp" || return 1
+
+    save_state "$tmp"
 }
 
 ###############################################################################
@@ -2473,7 +2892,7 @@ record_arr_telemetry() {
         --argjson maxIssueKeys "$ARR_TELEMETRY_MAX_ISSUE_KEYS" \
         --argjson maxExamples "$ARR_TELEMETRY_MAX_EXAMPLES" \
         '
-        .version = 8
+        .version = 9
         |
         .telemetry = (
             .telemetry
@@ -2845,6 +3264,8 @@ update_issue_state() {
     local severity="$6"
     local stage="$7"
     local message="$8"
+    local issue_source="${9:-}"
+    local normalized_message="${10:-}"
 
     local now
     local tmp
@@ -2862,9 +3283,11 @@ update_issue_state() {
         --arg severity "$severity" \
         --arg stage "$stage" \
         --arg message "$message" \
+        --arg issueSource "$issue_source" \
+        --arg normalizedMessage "$normalized_message" \
         --argjson now "$now" \
         '
-        .version = 8
+        .version = 9
         |
         (.issues[$key] // {}) as $old
         |
@@ -2887,6 +3310,8 @@ update_issue_state() {
             severity: $severity,
             stage: $stage,
             message: $message,
+            source: $issueSource,
+            normalizedMessage: $normalizedMessage,
 
             firstSeen:
                 (
@@ -3092,6 +3517,27 @@ source_can_resolve() {
                     [ "$SAB_HISTORY_OK" = true ] &&
                     [ "$SONARR_QUEUE_OK" = true ] &&
                     [ "$RADARR_QUEUE_OK" = true ]
+                    ;;
+            esac
+            ;;
+
+        Monitor)
+
+            # Monitor-generated issues are marked seen only while their
+            # condition is present. A completed current run is sufficient to
+            # resolve schedule/scan issues; notification recovery is persisted
+            # only after the notification command succeeds.
+            case "$issue_key" in
+
+                Monitor:notification-command)
+                    jq -e \
+                        '(.monitor.notification.failed // false) == false' \
+                        "$STATE_FILE" \
+                        >/dev/null 2>&1
+                    ;;
+
+                *)
+                    return 0
                     ;;
             esac
             ;;
@@ -3361,7 +3807,7 @@ send_grouped_notification() {
 
     shown=0
 
-    for source in Sonarr Radarr SABnzbd; do
+    for source in Monitor Sonarr Radarr SABnzbd; do
 
         local source_count
 
@@ -3519,6 +3965,8 @@ record_normalized_issue() {
     local notify_runs="${10:-1}"
     local minimum_minutes="${11:-0}"
     local escalate_minutes="${12:-0}"
+    local issue_source="${13:-}"
+    local normalized_message="${14:-}"
 
     if issue_seen_this_run "$issue_key"; then
         return 0
@@ -3555,13 +4003,19 @@ record_normalized_issue() {
         stage="escalated"
     fi
 
+    local signature_message="$message"
+
+    if [ -n "$normalized_message" ]; then
+        signature_message="$normalized_message"
+    fi
+
     signature=$(issue_signature \
         "$source" \
         "$issue_key" \
         "$classification" \
         "$severity" \
         "$stage" \
-        "$message")
+        "$signature_message")
 
     if issue_transition_should_persist "$issue_key" "$signature"; then
         persist_issue_transition=true
@@ -3575,7 +4029,9 @@ record_normalized_issue() {
         "$classification" \
         "$severity" \
         "$stage" \
-        "$message"
+        "$message" \
+        "$issue_source" \
+        "$normalized_message"
     then
         log "ERROR: Unable to update normalized issue state: $issue_key"
         return 1
@@ -3660,8 +4116,10 @@ process_arr_native_health() {
 
         local health_source
         local health_type
+        local normalized_message
         local message
         local wiki_url
+        local classification
         local severity
         local notify_runs
         local issue_hash
@@ -3671,22 +4129,42 @@ process_arr_native_health() {
         health_type=$(jq -r '.type // "warning"' <<<"$record")
         message=$(jq -r '.message // "No health detail supplied"' <<<"$record")
         wiki_url=$(jq -r '.wikiUrl // ""' <<<"$record")
+        normalized_message=$(normalize_arr_message "$message")
 
         case "${health_type,,}" in
 
             error)
+                classification="ARR_HEALTH_ERROR"
                 severity="ERROR"
                 notify_runs="$ARR_HEALTH_ERROR_NOTIFY_RUNS"
                 ;;
 
-            *)
+            warning)
+                classification="ARR_HEALTH_WARNING"
                 severity="WARNING"
                 notify_runs="$ARR_HEALTH_WARNING_NOTIFY_RUNS"
                 ;;
+
+            notice)
+                classification="ARR_HEALTH_NOTICE"
+                severity="INFO"
+                notify_runs="$ARR_HEALTH_NOTICE_NOTIFY_RUNS"
+                ;;
+
+            *)
+                classification="ARR_HEALTH_UNKNOWN_TYPE"
+                severity="WARNING"
+                notify_runs="$ARR_HEALTH_UNKNOWN_NOTIFY_RUNS"
+                ;;
         esac
 
-        issue_hash=$(stable_issue_hash "${app}|${health_source}|${message}")
+        issue_hash=$(stable_issue_hash "${app}|${health_source}|${normalized_message}")
         detail="$message"
+
+        if [ "$classification" = "ARR_HEALTH_UNKNOWN_TYPE" ]; then
+            detail+=$'\n'
+            detail+="Reported health type: ${health_type}"
+        fi
 
         if [ -n "$wiki_url" ]; then
             detail+=$'\n'
@@ -3699,7 +4177,7 @@ process_arr_native_health() {
             "${app}:health:${issue_hash}" \
             "$app" \
             "Health: ${health_source}" \
-            "ARR_HEALTH_${health_type^^}" \
+            "$classification" \
             "$severity" \
             "active" \
             "$message" \
@@ -3707,7 +4185,9 @@ process_arr_native_health() {
             "$detail" \
             "$notify_runs" \
             0 \
-            "$API_FAILURE_ESCALATE_MINUTES"
+            "$API_FAILURE_ESCALATE_MINUTES" \
+            "$health_source" \
+            "$normalized_message"
 
         ((ARR_NATIVE_HEALTH_COUNT++)) || true
 
@@ -3725,11 +4205,14 @@ record_service_api_issue() {
 
     local classification="SERVICE_API_UNAVAILABLE"
     local notify_runs="$API_FAILURE_NOTIFY_RUNS"
+    local normalized_failures
 
     if grep -Eqi 'authentication rejected|HTTP (401|403)|api key.*(incorrect|required)' <<<"$failures"; then
         classification="SERVICE_API_AUTHENTICATION"
         notify_runs=2
     fi
+
+    normalized_failures=$(normalize_arr_message "$failures")
 
     record_normalized_issue \
         "${app}:service-api" \
@@ -3743,9 +4226,163 @@ record_service_api_issue() {
         "$failures" \
         "$notify_runs" \
         0 \
-        "$API_FAILURE_ESCALATE_MINUTES"
+        "$API_FAILURE_ESCALATE_MINUTES" \
+        "api" \
+        "$normalized_failures"
 
     ((SERVICE_API_ISSUE_COUNT++)) || true
+}
+
+###############################################################################
+# MONITOR SELF-HEALTH
+###############################################################################
+
+preflight_notification_command() {
+
+    if [ "$SEND_NOTIFICATIONS" != true ]; then
+        set_monitor_notification_state false "" || true
+        return
+    fi
+
+    if [ ! -x "$NOTIFY" ]; then
+        NOTIFICATION_LAST_ERROR="notification command is missing or not executable: ${NOTIFY}"
+        set_monitor_notification_state true "$NOTIFICATION_LAST_ERROR" || true
+        notification_fallback_alert "$NOTIFICATION_LAST_ERROR"
+    fi
+}
+
+record_monitor_schedule_issue() {
+
+    local allowed_gap
+    local message
+
+    allowed_gap=$(( MONITOR_EXPECTED_INTERVAL_MINUTES + MONITOR_MISSED_RUN_GRACE_MINUTES ))
+
+    (( PREVIOUS_RUN_STARTED_AT > 0 )) || return
+    (( PREVIOUS_RUN_GAP_MINUTES > allowed_gap )) || return
+
+    message="The interval between monitor starts was ${PREVIOUS_RUN_GAP_MINUTES} minutes; expected at most ${allowed_gap} minutes (${MONITOR_EXPECTED_INTERVAL_MINUTES}-minute schedule plus ${MONITOR_MISSED_RUN_GRACE_MINUTES}-minute grace)."
+
+    record_normalized_issue \
+        "Monitor:schedule-gap" \
+        "Monitor" \
+        "ARR health monitor missed its expected interval" \
+        "MONITOR_SCHEDULE_MISSED" \
+        "WARNING" \
+        "active" \
+        "$message" \
+        "" \
+        "$message" \
+        1 \
+        0 \
+        0 \
+        "scheduler" \
+        "monitor start interval exceeded expected schedule"
+
+    ((MONITOR_SCHEDULE_MISSED_COUNT++)) || true
+}
+
+record_monitor_notification_issue() {
+
+    local failed
+    local reason
+
+    failed=$(jq -r \
+        '(.monitor.notification.failed // false) | tostring' \
+        "$STATE_FILE")
+
+    [ "$failed" = true ] || return
+
+    reason=$(jq -r \
+        '.monitor.notification.reason // "Unraid notification command failed"' \
+        "$STATE_FILE")
+
+    record_normalized_issue \
+        "Monitor:notification-command" \
+        "Monitor" \
+        "Unraid notification delivery failed" \
+        "MONITOR_NOTIFICATION_FAILURE" \
+        "ERROR" \
+        "active" \
+        "$reason" \
+        "" \
+        "${reason}"$'\n'"The issue is also written to the persistent monitor log and Unraid syslog. Delivery will be retried on a later run." \
+        "$MONITOR_NOTIFICATION_FAILURE_NOTIFY_RUNS" \
+        0 \
+        "$API_FAILURE_ESCALATE_MINUTES" \
+        "notification-command" \
+        "unraid notification command failure"
+
+    ((MONITOR_NOTIFICATION_FAILURE_COUNT++)) || true
+}
+
+record_monitor_scan_issue() {
+
+    local -a failures=()
+    local message
+    local normalized
+
+    if [ "$PREVIOUS_RUN_INCOMPLETE" = true ]; then
+        failures+=("Previous monitor run did not reach its completion checkpoint")
+    fi
+
+    if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
+
+        if [ "$SONARR_ENABLED" = true ] &&
+           [ "$SONARR_API_OK" = true ] &&
+           [ "$SONARR_AUDIT_OK" != true ]
+        then
+            failures+=("Sonarr activity-history scan failed while core Sonarr endpoints remained reachable")
+        fi
+
+        if [ "$RADARR_ENABLED" = true ] &&
+           [ "$RADARR_API_OK" = true ] &&
+           [ "$RADARR_AUDIT_OK" != true ]
+        then
+            failures+=("Radarr activity-history scan failed while core Radarr endpoints remained reachable")
+        fi
+
+        if [ "$SAB_ENABLED" = true ] &&
+           [ "$SAB_API_OK" = true ] &&
+           [ "$SAB_AUDIT_OK" != true ]
+        then
+            failures+=("SABnzbd activity scan could not be completed from the retrieved history")
+        fi
+    fi
+
+    if [ "$FLOW_ANOMALY_ENABLED" = true ] &&
+       [ "$ACTIVITY_AUDIT_ENABLED" = true ] &&
+       [ "$SONARR_AUDIT_OK" = true ] &&
+       [ "$RADARR_AUDIT_OK" = true ] &&
+       [ "$SAB_AUDIT_OK" = true ] &&
+       [ "$FLOW_ANALYSIS_OK" != true ]
+    then
+        failures+=("Activity-flow analysis failed: ${FLOW_ANALYSIS_REASON}")
+    fi
+
+    (( ${#failures[@]} > 0 )) || return
+
+    printf -v message '%s; ' "${failures[@]}"
+    message=${message%; }
+    normalized=$(normalize_arr_message "$message")
+
+    record_normalized_issue \
+        "Monitor:scan-failure" \
+        "Monitor" \
+        "ARR health monitor scan repeatedly incomplete" \
+        "MONITOR_SCAN_FAILURE" \
+        "ERROR" \
+        "degraded" \
+        "$message" \
+        "" \
+        "$message" \
+        "$MONITOR_SCAN_FAILURE_NOTIFY_RUNS" \
+        0 \
+        "$MONITOR_SCAN_FAILURE_ESCALATE_MINUTES" \
+        "scan" \
+        "$normalized"
+
+    ((MONITOR_SCAN_FAILURE_COUNT++)) || true
 }
 
 ###############################################################################
@@ -4059,8 +4696,11 @@ process_queue() {
         local message
         local classification
         local severity
-        local min_age
         local reason
+        local reason_detail
+        local signature_message
+        local analysis_file
+        local queue_issue_eligible
 
         id=$(echo "$item" | jq -r '.id // ""')
         download_id=$(echo "$item" | jq -r '.downloadId // ""')
@@ -4088,17 +4728,41 @@ process_queue() {
             continue
         fi
 
-        message=$(queue_message "$item")
+        analysis_file=$(mktemp "${TMP_DIR}/arr-queue-analysis.XXXXXX") || {
+            log "ERROR: Unable to create Arr queue analysis file"
+            continue
+        }
 
-        classification=$(
-            classify_issue \
-                "$tracked_status" \
-                "$tracked_state" \
-                "$status" \
-                "$message"
-        )
+        if ! analyze_arr_queue_reasons \
+            "$tracked_status" \
+            "$tracked_state" \
+            "$status" \
+            "$age" \
+            "$item" \
+            "$analysis_file"
+        then
+            log "ERROR: Unable to classify ${app} queue messages separately"
+            continue
+        fi
 
-        [ "$classification" != "NONE" ] || continue
+        if ! jq -e '.hasIssue == true' "$analysis_file" >/dev/null 2>&1; then
+            continue
+        fi
+
+        queue_issue_eligible=$(jq -r '.eligible | tostring' "$analysis_file")
+        message=$(jq -r '.allMessage // ""' "$analysis_file")
+        signature_message=$(jq -r '.signatureMessage // ""' "$analysis_file")
+        reason_detail=$(jq -r '.reasonDetail // ""' "$analysis_file")
+
+        if [ "$queue_issue_eligible" = true ]; then
+            classification=$(jq -r '.primaryClassification' "$analysis_file")
+            severity=$(jq -r '.primarySeverity' "$analysis_file")
+            reason=$(jq -r '.primaryReason' "$analysis_file")
+        else
+            classification=$(jq -r '.primaryAnyClassification' "$analysis_file")
+            severity=$(jq -r '.primaryAnySeverity' "$analysis_file")
+            reason=$(classification_reason "$classification" "$age")
+        fi
 
         #######################################################################
         # PRIMARY-CAUSE CORRELATION
@@ -4154,6 +4818,13 @@ process_queue() {
                     log "To: $promoted_classification"
 
                     classification="$promoted_classification"
+                    severity=$(classification_severity "$classification" "$age")
+                    reason=$(classification_reason "$classification" "$age")
+                    signature_message+=" || promoted=${classification}"
+
+                    if (( age < $(classification_min_age "$classification") )); then
+                        queue_issue_eligible=false
+                    fi
 
                     ((PROMOTION_RULE_MATCHES++)) || true
 
@@ -4191,38 +4862,36 @@ process_queue() {
         # This has NO effect on notification eligibility or classification.
         ###############################################################################
 
-        record_arr_telemetry \
-            "$app" \
-            "$issue_key" \
-            "$media_name" \
-            "$release" \
-            "$classification" \
-            "$tracked_status" \
-            "$tracked_state" \
-            "$status" \
-            "$message"
+        while IFS= read -r reason_record; do
+
+            local reason_classification
+            local reason_message
+
+            reason_classification=$(jq -r '.classification' <<<"$reason_record")
+            reason_message=$(jq -r '.message // ""' <<<"$reason_record")
+
+            [ "$reason_classification" != "NONE" ] || continue
+
+            record_arr_telemetry \
+                "$app" \
+                "$issue_key" \
+                "$media_name" \
+                "$release" \
+                "$reason_classification" \
+                "$tracked_status" \
+                "$tracked_state" \
+                "$status" \
+                "$reason_message"
+
+        done < <(jq -c '.reasons[]?' "$analysis_file")
 
         ###############################################################################
         # NORMAL AGE THRESHOLD
         ###############################################################################
 
-        min_age=$(classification_min_age "$classification")
-
-        if (( age < min_age )); then
+        if [ "$queue_issue_eligible" != true ]; then
             continue
         fi
-
-        severity=$(
-            classification_severity \
-                "$classification" \
-                "$age"
-        )
-
-        reason=$(
-            classification_reason \
-                "$classification" \
-                "$age"
-        )
 
         ((TOTAL_ISSUES++)) || true
 
@@ -4241,32 +4910,47 @@ process_queue() {
                 ;;
         esac
 
-        case "$classification" in
+        if jq -e \
+            'any(.reasons[]?; .classification | startswith("CF_REJECT"))' \
+            "$analysis_file" >/dev/null 2>&1
+        then
+            ((CF_REJECT_COUNT++)) || true
+        fi
 
-            CF_REJECT*)
-                ((CF_REJECT_COUNT++)) || true
-                ;;
+        if jq -e \
+            'any(.reasons[]?; .classification == "UPGRADE_REJECT")' \
+            "$analysis_file" >/dev/null 2>&1
+        then
+            ((UPGRADE_REJECT_COUNT++)) || true
+        fi
 
-            UPGRADE_REJECT)
-                ((UPGRADE_REJECT_COUNT++)) || true
-                ;;
+        if jq -e \
+            'any(.reasons[]?; .classification == "TBA_METADATA")' \
+            "$analysis_file" >/dev/null 2>&1
+        then
+            ((TBA_COUNT++)) || true
+        fi
 
-            TBA_METADATA)
-                ((TBA_COUNT++)) || true
-                ;;
+        if jq -e \
+            'any(.reasons[]?; .classification == "UNMATCHED_MEDIA")' \
+            "$analysis_file" >/dev/null 2>&1
+        then
+            ((UNMATCHED_COUNT++)) || true
+        fi
 
-            UNMATCHED_MEDIA)
-                ((UNMATCHED_COUNT++)) || true
-                ;;
+        if jq -e \
+            'any(.reasons[]?; .classification == "NO_IMPORTABLE_FILES")' \
+            "$analysis_file" >/dev/null 2>&1
+        then
+            ((NO_IMPORT_COUNT++)) || true
+        fi
 
-            NO_IMPORTABLE_FILES)
-                ((NO_IMPORT_COUNT++)) || true
-                ;;
-
-            ARR_IMPORT_STALLED)
-                ((STALL_COUNT++)) || true
-                ;;
-        esac
+        if jq -e \
+            'any(.reasons[]?; .classification == "ARR_IMPORT_STALLED")' \
+            "$analysis_file" >/dev/null 2>&1
+        then
+            ((STALL_COUNT++)) || true
+        fi
 
         #######################################################################
         # SAB CORRELATION
@@ -4309,12 +4993,20 @@ process_queue() {
         [ "$sab_status" != "Unknown" ] &&
             log "SAB status: $sab_status"
 
-        if [[ "$classification" == CF_REJECT* ]]; then
+        if jq -e \
+            'any(.reasons[]?; .classification | startswith("CF_REJECT"))' \
+            "$analysis_file" >/dev/null 2>&1
+        then
             log_cf_details "$message"
         fi
 
-        [ -n "$message" ] &&
-            log "Arr message: $message"
+        if [ -n "$reason_detail" ]; then
+            log "Classified queue reasons:"
+
+            while IFS= read -r detail_line; do
+                [ -n "$detail_line" ] && log "  ${detail_line}"
+            done <<<"$reason_detail"
+        fi
 
         #######################################################################
         # STATE
@@ -4339,7 +5031,7 @@ process_queue() {
                 "$classification" \
                 "$severity" \
                 "$stage" \
-                "$message"
+                "$signature_message"
         )
 
         local persist_issue_transition=false
@@ -4359,7 +5051,9 @@ process_queue() {
             "$classification" \
             "$severity" \
             "$stage" \
-            "$message"
+            "$reason_detail" \
+            "queue" \
+            "$signature_message"
 
         if [ "$persist_issue_transition" = true ]; then
 
@@ -4376,19 +5070,22 @@ process_queue() {
 
             local detail=""
 
-            if [[ "$classification" == CF_REJECT* ]]; then
-
-                detail=$(build_cf_group_detail "$message")
-
-            elif [ -n "$reason" ]; then
-
-                detail="$reason"
+            if [ -n "$reason_detail" ]; then
+                detail="Import reasons:"
+                detail+=$'\n'
+                detail+="$reason_detail"
             fi
 
-            if [ -n "$message" ]; then
+            if [[ "$classification" == CF_REJECT* ]]; then
 
-                [ -z "$detail" ] || detail+=$'\n'
-                detail+="Arr detail: ${message:0:1000}"
+                local cf_detail
+
+                cf_detail=$(build_cf_group_detail "$message")
+
+                if [ -n "$cf_detail" ]; then
+                    [ -z "$detail" ] || detail+=$'\n'
+                    detail+="$cf_detail"
+                fi
             fi
 
             [ -z "$detail" ] || detail+=$'\n'
@@ -7762,6 +8459,11 @@ SAB_PROGRESS_OBSERVATIONS_FILE="${TMP_DIR}/sab_progress_observations.jsonl"
 
 initialize_state
 
+if ! begin_monitor_run; then
+    log "ERROR: Unable to update monitor run-start heartbeat"
+    persistent_log "ERROR" "Unable to update monitor run-start heartbeat"
+fi
+
 ###############################################################################
 # v2.5 PERSISTENT LOG / ACTIVITY AUDIT INITIALIZATION
 ###############################################################################
@@ -7770,7 +8472,7 @@ rotate_persistent_log
 
 persistent_log \
     "START" \
-    "ARR Health Monitor v3.0.0"
+    "ARR Health Monitor v3.1.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -7783,10 +8485,14 @@ fi
 # START
 ###############################################################################
 
-log "Starting ARR Health Monitor v3.0.0"
+log "Starting ARR Health Monitor v3.1.0"
 log "Recommended schedule: every five minutes"
 log "Notifications enabled: $SEND_NOTIFICATIONS"
 log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
+
+preflight_notification_command
+record_monitor_schedule_issue
+record_monitor_notification_issue
 
 ###############################################################################
 # SABNZBD
@@ -8191,6 +8897,11 @@ prune_sab_progress_state
 
 assess_activity_flow
 
+# Core service endpoint failures are already represented by the per-service
+# API lifecycle issues. This adds repeated incomplete-run, secondary history,
+# and internal flow-analysis failures without duplicating those API alerts.
+record_monitor_scan_issue
+
 ###############################################################################
 # RESOLUTION CHECK
 #
@@ -8203,7 +8914,24 @@ resolve_missing_issues
 # SEND ONE GROUPED NOTIFICATION
 ###############################################################################
 
+NOTIFICATION_ATTEMPTED=false
+NOTIFICATION_LAST_ERROR=""
+
 send_grouped_notification
+NOTIFICATION_SEND_RC=$?
+
+if [ "$NOTIFICATION_ATTEMPTED" = true ]; then
+
+    if (( NOTIFICATION_SEND_RC == 0 )); then
+        set_monitor_notification_state false "" || true
+    else
+        [ -n "$NOTIFICATION_LAST_ERROR" ] || \
+            NOTIFICATION_LAST_ERROR="Unraid notification command failed"
+
+        set_monitor_notification_state true "$NOTIFICATION_LAST_ERROR" || true
+        record_monitor_notification_issue
+    fi
+fi
 
 ###############################################################################
 # PRUNE OLD RESOLVED STATE
@@ -8226,7 +8954,7 @@ write_persistent_activity_summary
 RUNTIME=$(runtime)
 
 log "============================================================"
-log "ARR Health Monitor v3.0.0 completed"
+log "ARR Health Monitor v3.1.0 completed"
 
 log ""
 log "SCAN HEALTH"
@@ -8246,6 +8974,14 @@ log "SAB failed jobs: $SAB_FAILED_JOB_COUNT"
 log "SAB stalled jobs: $SAB_STALLED_JOB_COUNT"
 log "SAB queue pauses: $SAB_PAUSED_COUNT"
 log "SAB unknown-category jobs: $SAB_UNKNOWN_CATEGORY_COUNT"
+
+log ""
+log "MONITOR SELF-HEALTH"
+log "Missed-schedule issues: $MONITOR_SCHEDULE_MISSED_COUNT"
+log "Repeated/incomplete scan issues: $MONITOR_SCAN_FAILURE_COUNT"
+log "Notification-command issues: $MONITOR_NOTIFICATION_FAILURE_COUNT"
+log "Previous start gap: ${PREVIOUS_RUN_GAP_MINUTES}m"
+log "Previous run incomplete: $PREVIOUS_RUN_INCOMPLETE"
 
 log ""
 log "RECENT ACTIVITY - LAST ${ACTIVITY_AUDIT_LOOKBACK_HOURS}H"
@@ -8400,5 +9136,10 @@ log "============================================================"
 persistent_log \
     "END" \
     "runtime=${RUNTIME} | active_issues=${TOTAL_ISSUES} | info=${INFO_COUNT} | warnings=${WARNING_COUNT} | errors=${ERROR_COUNT}"
+
+if ! complete_monitor_run "$PIPELINE_STATUS"; then
+    log "ERROR: Unable to update monitor completion heartbeat"
+    persistent_log "ERROR" "Unable to update monitor completion heartbeat"
+fi
     
 exit 0
