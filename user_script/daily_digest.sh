@@ -33,7 +33,7 @@ ARTIFACT_RULES=(
     "Appdata backup|/mnt/vault/backup/cache|d|backup_[0-9]*_[0-9]*|192"
     "Boot-device backup|/mnt/vault/backup/flash|f|*.zip|192"
     "Disk health monitor|/mnt/vault/cloud/logs/disk_health|f|*.log|30"
-    "Arr import monitor|/mnt/vault/cloud/logs/arr_import_monitor|f|arr_import_monitor.log|2"
+    "Arr health monitor|/mnt/vault/cloud/logs/arr_health_activity|f|arr_health_activity.log|1"
 )
 
 SEND_NOTIFICATION=true

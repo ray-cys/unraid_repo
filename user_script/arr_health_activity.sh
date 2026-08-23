@@ -1,11 +1,11 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Download / Import Monitor v2.6.1
+# ARR Health / Download / Import Monitor v3.0.0
 #
 # PURPOSE
 # -------
-# Read-only monitoring of the Usenet -> Arr import workflow:
+# Read-only monitoring of Sonarr, Radarr, and the Usenet -> Arr workflow:
 #
 #   SABnzbd
 #      |
@@ -20,15 +20,15 @@
 #
 # RECOMMENDED SCHEDULE
 # --------------------
-# Run this script ONCE PER HOUR using Unraid User Scripts.
+# Run this script EVERY FIVE MINUTES using Unraid User Scripts.
 #
 # Recommended cron:
 #
-#   0 * * * *
+#   */5 * * * *
 #
 # The script itself does NOT create or manage its schedule.
 #
-# With an hourly schedule, notification timing is approximately:
+# With the recommended schedule, notification timing is approximately:
 #
 #   ARR errors:
 #       Eligible after ERROR_AFTER_HOURS
@@ -71,7 +71,7 @@
 #       Empty leftover directory:
 #           Log only; no notification
 #
-# Because this is normally run hourly, a threshold may be detected up to
+# Because this is normally run every five minutes, a threshold may be detected up to
 # approximately one run interval after it is crossed.
 #
 #
@@ -96,7 +96,7 @@
 #   - It crosses an escalation threshold
 #   - It was previously resolved and later reappears
 #
-# Resolutions are logged but DO NOT generate notifications.
+# Resolutions can be included in the same grouped notification.
 #
 #
 # ARR-SIDE DETECTION
@@ -115,6 +115,9 @@
 #   ARR_IMPORT_STALLED
 #   WARNING
 #   ERROR
+#
+# Native /api/v3/health entries are also mirrored dynamically, so newly added
+# Sonarr/Radarr health checks are not silently missed by a fixed message list.
 #
 #
 # ARR MESSAGE TELEMETRY - v2.3
@@ -165,6 +168,16 @@
 #   SAB_EMPTY_LEFTOVER
 #       Empty directory; log only
 #
+# SAB OPERATIONAL DETECTION
+# -------------------------
+#   SAB_API_UNAVAILABLE
+#   SAB_WARNING
+#   SAB_ERROR
+#   SAB_DOWNLOAD_FAILED_*
+#   SAB_QUEUE_PAUSED
+#   SAB_STALLED_*
+#   SAB_CATEGORY_UNKNOWN
+#
 #
 # SAB CATEGORY MAPPING
 # --------------------
@@ -189,7 +202,7 @@
 #   active = false
 #   resolvedAt = current time
 #
-# No resolution email is sent.
+# Resolution notifications are configurable and grouped.
 #
 # If the same issue later returns, it starts a new lifecycle and may generate
 # a new notification.
@@ -280,6 +293,17 @@ STALL_AFTER_HOURS=6
 # CF / upgrade / TBA escalation.
 POLICY_ESCALATE_AFTER_HOURS=72
 
+# Native Arr health warnings must remain present for this many consecutive
+# successful health scans before notification. Native health errors alert on
+# the first successful scan that returns them.
+ARR_HEALTH_WARNING_NOTIFY_RUNS=2
+ARR_HEALTH_ERROR_NOTIFY_RUNS=1
+
+# A service API problem becomes actionable only after repeated complete-run
+# failures. This avoids noise during a normal container restart.
+API_FAILURE_NOTIFY_RUNS=3
+API_FAILURE_ESCALATE_MINUTES=60
+
 # ---------------------------------------------------------------------------
 # SAB stranded download thresholds - v2.2
 # ---------------------------------------------------------------------------
@@ -305,6 +329,41 @@ SAB_ORPHAN_ESCALATE_HOURS=72
 #
 # 100 MiB.
 SAB_SIGNIFICANT_OTHER_BYTES=$((100 * 1024 * 1024))
+
+# ---------------------------------------------------------------------------
+# SAB operational monitoring - v3.0
+# ---------------------------------------------------------------------------
+
+# Failed movie/TV jobs remain actionable for this many hours. SAB history is
+# persistent, so the monitor intentionally treats older failures as resolved.
+SAB_FAILED_ACTIVE_HOURS=24
+
+# A paused queue with monitored jobs must remain paused this long before it is
+# reported. Disk/quota pauses and native SAB errors remain immediate.
+SAB_PAUSE_WARN_MINUTES=30
+
+# Optional daily pause windows that should not generate an unexpected-pause
+# issue. Use 24-hour HH:MM-HH:MM ranges; crossing midnight is supported.
+# Example: "02:00-03:30"
+SAB_ALLOWED_PAUSE_WINDOWS=()
+
+# No-progress thresholds for live download and post-processing stages.
+SAB_DOWNLOAD_STALL_MINUTES=45
+SAB_FETCH_STALL_MINUTES=60
+SAB_VERIFY_STALL_MINUTES=60
+SAB_REPAIR_STALL_MINUTES=120
+SAB_EXTRACT_STALL_MINUTES=60
+SAB_MOVE_STALL_MINUTES=30
+SAB_SCRIPT_STALL_MINUTES=30
+SAB_POSTPROCESS_WAIT_MINUTES=60
+
+# Report jobs outside the configured movie, TV, and ignored categories.
+SAB_MONITOR_UNKNOWN_CATEGORIES=true
+
+# Maximum history retained in one scan. Retrieval is paginated and merged into
+# a temporary file, so the JSON payload is never passed through argv.
+SAB_HISTORY_MAX_RECORDS=5000
+SAB_QUEUE_MAX_RECORDS=5000
 
 # ---------------------------------------------------------------------------
 # Arr message telemetry - v2.3
@@ -359,6 +418,10 @@ ARR_TELEMETRY_REVIEW_TOP=10
 
 SEND_NOTIFICATIONS=true
 
+# Include resolved issues in the same grouped notification as new/escalated
+# issues. No separate notification script is used.
+SEND_RESOLUTION_NOTIFICATIONS=true
+
 NOTIFY="/usr/local/emhttp/webGui/scripts/notify"
 
 NOTIFY_ONCE=true
@@ -378,7 +441,7 @@ STATE_FILE="${STATE_DIR}/state.json"
 STATE_BACKUP="${STATE_DIR}/state.json.bak"
 
 # Resolved historical issues older than this are removed from state.
-STATE_RETENTION_DAYS=14
+STATE_RETENTION_DAYS=30
 
 # ---------------------------------------------------------------------------
 # Persistent operational log - v2.5
@@ -465,6 +528,7 @@ LOCKFILE="/tmp/arr_health_activity.lock"
 
 QUEUE_PAGE_SIZE=1000
 SAB_HISTORY_LIMIT=500
+ARR_QUEUE_MAX_RECORDS=10000
 
 ###############################################################################
 # INITIALIZATION
@@ -479,11 +543,43 @@ SEEN_ISSUES_FILE=""
 SONARR_QUEUE=""
 RADARR_QUEUE=""
 SAB_HISTORY=""
+SONARR_HEALTH=""
+RADARR_HEALTH=""
+SONARR_SYSTEM_STATUS=""
+RADARR_SYSTEM_STATUS=""
+SAB_QUEUE=""
+SAB_WARNINGS=""
+SAB_STATUS=""
 
-# Scan health.
+# Component scan health. The legacy *_SCAN_OK values continue to represent the
+# queue/history data required by the existing import and stranded-file checks.
 SONARR_SCAN_OK=false
 RADARR_SCAN_OK=false
 SAB_SCAN_OK=false
+
+SONARR_QUEUE_OK=false
+RADARR_QUEUE_OK=false
+SONARR_HEALTH_OK=false
+RADARR_HEALTH_OK=false
+SONARR_STATUS_OK=false
+RADARR_STATUS_OK=false
+SONARR_API_OK=false
+RADARR_API_OK=false
+
+SAB_HISTORY_OK=false
+SAB_QUEUE_OK=false
+SAB_WARNINGS_OK=false
+SAB_STATUS_OK=false
+SAB_API_OK=false
+
+SONARR_API_FAILURES=""
+RADARR_API_FAILURES=""
+SAB_API_FAILURES=""
+
+SAB_PRIMARY_DOWNLOADS_FILE=""
+SAB_PROGRESS_SEEN_FILE=""
+SAB_PROGRESS_OBSERVATIONS_FILE=""
+STATE_WRITE_ALERT_SENT=false
 
 TOTAL_QUEUE=0
 TOTAL_ISSUES=0
@@ -510,6 +606,14 @@ SAB_OTHER_STRANDED_COUNT=0
 SAB_RESIDUE_COUNT=0
 SAB_SAMPLE_RESIDUE_COUNT=0
 SAB_EMPTY_COUNT=0
+
+ARR_NATIVE_HEALTH_COUNT=0
+SERVICE_API_ISSUE_COUNT=0
+SAB_NATIVE_WARNING_COUNT=0
+SAB_FAILED_JOB_COUNT=0
+SAB_STALLED_JOB_COUNT=0
+SAB_PAUSED_COUNT=0
+SAB_UNKNOWN_CATEGORY_COUNT=0
 
 RESOLVED_COUNT=0
 
@@ -696,6 +800,8 @@ bytes_human() {
     '
 }
 
+# Invoked indirectly by the EXIT trap below.
+# shellcheck disable=SC2329
 cleanup() {
 
     if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
@@ -729,6 +835,12 @@ notify() {
     local description="$2"
     local message="$3"
 
+    # Notifications generated by this script are intentionally emoji-free.
+    # Filtering at the final boundary also removes emoji supplied by an API or
+    # embedded in a release title while preserving normal Unicode text.
+    description=$(strip_notification_emoji "$description")
+    message=$(strip_notification_emoji "$message")
+
     if [ "$SEND_NOTIFICATIONS" != true ]; then
         return 2
     fi
@@ -742,7 +854,7 @@ notify() {
 
     if "$NOTIFY" \
         -i "$importance" \
-        -s "ARR Import Monitor" \
+        -s "ARR Health Monitor" \
         -d "$description" \
         -m "$message" \
         >/dev/null 2>&1
@@ -758,6 +870,26 @@ notify() {
     return 1
 }
 
+strip_notification_emoji() {
+
+    local value="$1"
+
+    printf '%s' "$value" |
+        jq -Rs -r '
+            explode
+            | map(
+                select(
+                    . != 8205
+                    and . != 8419
+                    and . != 65039
+                    and (. < 9728 or . > 10175)
+                    and (. < 126976 or . > 129791)
+                )
+            )
+            | implode
+        '
+}
+
 ###############################################################################
 # APIs
 ###############################################################################
@@ -768,7 +900,12 @@ api_get() {
     local api_key="$2"
     local output="$3"
 
-    if ! curl \
+    local http_code
+    local curl_rc
+
+    API_LAST_ERROR=""
+
+    http_code=$(curl \
         --silent \
         --show-error \
         --fail \
@@ -776,40 +913,340 @@ api_get() {
         --max-time 30 \
         -H "X-Api-Key: $api_key" \
         "$url" \
-        -o "$output"
-    then
+        -o "$output" \
+        --write-out '%{http_code}')
+    curl_rc=$?
+
+    if (( curl_rc != 0 )); then
+
+        case "$http_code" in
+
+            401|403)
+                API_LAST_ERROR="authentication rejected (HTTP ${http_code})"
+                ;;
+
+            000|"")
+                API_LAST_ERROR="connection failed or timed out"
+                ;;
+
+            *)
+                API_LAST_ERROR="HTTP ${http_code}"
+                ;;
+        esac
+
         return 1
     fi
 
-    jq empty "$output" >/dev/null 2>&1
+    if ! jq empty "$output" >/dev/null 2>&1; then
+
+        API_LAST_ERROR="invalid JSON response"
+
+        return 1
+    fi
+
+    return 0
 }
 
 sab_get() {
 
     local mode="$1"
     local output="$2"
+    local start="${3:-0}"
+    local limit="${4:-$SAB_HISTORY_LIMIT}"
 
     local url="${SAB_URL%/}/api"
+    local http_code
+    local curl_rc
+    local -a request_args
 
-    if ! curl \
-        --silent \
-        --show-error \
-        --fail \
-        --connect-timeout 10 \
-        --max-time 30 \
-        --get \
-        --data-urlencode "mode=$mode" \
-        --data-urlencode "output=json" \
-        --data-urlencode "apikey=$SAB_API_KEY" \
-        --data-urlencode "start=0" \
-        --data-urlencode "limit=$SAB_HISTORY_LIMIT" \
+    API_LAST_ERROR=""
+
+    request_args=(
+        --silent
+        --show-error
+        --fail
+        --connect-timeout 10
+        --max-time 30
+        --get
+        --data-urlencode "mode=$mode"
+        --data-urlencode "output=json"
+        --data-urlencode "apikey=$SAB_API_KEY"
+    )
+
+    case "$mode" in
+
+        history|queue)
+            request_args+=(
+                --data-urlencode "start=$start"
+                --data-urlencode "limit=$limit"
+            )
+            ;;
+
+        status)
+            request_args+=(
+                --data-urlencode "skip_dashboard=1"
+            )
+            ;;
+    esac
+
+    http_code=$(curl \
+        "${request_args[@]}" \
         "$url" \
-        -o "$output"
-    then
+        -o "$output" \
+        --write-out '%{http_code}')
+    curl_rc=$?
+
+    if (( curl_rc != 0 )); then
+
+        case "$http_code" in
+
+            401|403)
+                API_LAST_ERROR="authentication rejected (HTTP ${http_code})"
+                ;;
+
+            000|"")
+                API_LAST_ERROR="connection failed or timed out"
+                ;;
+
+            *)
+                API_LAST_ERROR="HTTP ${http_code}"
+                ;;
+        esac
+
         return 1
     fi
 
-    jq empty "$output" >/dev/null 2>&1
+    if ! jq empty "$output" >/dev/null 2>&1; then
+
+        API_LAST_ERROR="invalid JSON response"
+
+        return 1
+    fi
+
+    if jq -e '
+        (.status | type) == "boolean"
+        and .status == false
+        and ((.error // "") != "")
+        ' "$output" >/dev/null 2>&1
+    then
+
+        API_LAST_ERROR=$(jq -r '.error // "SABnzbd API rejected the request"' "$output")
+
+        return 1
+    fi
+
+    return 0
+}
+
+append_api_failure() {
+
+    local current="$1"
+    local endpoint="$2"
+    local error="${3:-request failed}"
+
+    if [ -n "$current" ]; then
+        printf '%s; %s: %s' "$current" "$endpoint" "$error"
+    else
+        printf '%s: %s' "$endpoint" "$error"
+    fi
+}
+
+###############################################################################
+# PAGED API FETCHERS
+###############################################################################
+
+fetch_arr_queue() {
+
+    local app="$1"
+    local base_url="$2"
+    local api_key="$3"
+    local output="$4"
+
+    local include_query
+    local page=1
+    local total=0
+    local loaded=0
+    local max_pages
+    local page_file
+    local merged
+    local -a page_files=()
+
+    case "$app" in
+
+        Sonarr)
+            include_query="includeUnknownSeriesItems=true&includeSeries=true&includeEpisode=true"
+            ;;
+
+        Radarr)
+            include_query="includeUnknownMovieItems=true&includeMovie=true"
+            ;;
+
+        *)
+            return 1
+            ;;
+    esac
+
+    max_pages=$(( (ARR_QUEUE_MAX_RECORDS + QUEUE_PAGE_SIZE - 1) / QUEUE_PAGE_SIZE ))
+
+    while (( page <= max_pages )); do
+
+        page_file="${TMP_DIR}/${app,,}_queue_page_${page}.json"
+
+        if ! api_get \
+            "${base_url%/}/api/v3/queue?page=${page}&pageSize=${QUEUE_PAGE_SIZE}&${include_query}" \
+            "$api_key" \
+            "$page_file"
+        then
+            return 1
+        fi
+
+        page_files+=("$page_file")
+
+        loaded=$(( loaded + $(jq '.records // [] | length' "$page_file") ))
+        total=$(jq -r '.totalRecords // (.records // [] | length)' "$page_file")
+
+        if (( loaded >= total )); then
+            break
+        fi
+
+        ((page++)) || true
+    done
+
+    merged="${TMP_DIR}/${app,,}_queue_merged.json"
+
+    jq -s '
+        . as $pages
+        | $pages[0] as $first
+        | $first
+        | .page = 1
+        | .records = [ $pages[] | .records[]? ]
+        | .pageSize = (.records | length)
+        ' \
+        "${page_files[@]}" >"$merged" || return 1
+
+    mv -f "$merged" "$output"
+
+    if (( loaded < total )); then
+
+        log "WARNING: ${app} queue reached ARR_QUEUE_MAX_RECORDS=${ARR_QUEUE_MAX_RECORDS}"
+    fi
+
+    return 0
+}
+
+fetch_sab_history() {
+
+    local output="$1"
+    local page=0
+    local start=0
+    local loaded=0
+    local total=0
+    local page_file
+    local merged
+    local -a page_files=()
+
+    while (( loaded < SAB_HISTORY_MAX_RECORDS )); do
+
+        page_file="${TMP_DIR}/sab_history_page_${page}.json"
+
+        if ! sab_get history "$page_file" "$start" "$SAB_HISTORY_LIMIT"; then
+            return 1
+        fi
+
+        page_files+=("$page_file")
+
+        local page_count
+        page_count=$(jq '.history.slots // [] | length' "$page_file")
+        loaded=$(( loaded + page_count ))
+        total=$(jq -r '.history.noofslots // (.history.slots // [] | length)' "$page_file")
+
+        if (( page_count == 0 || loaded >= total )); then
+            break
+        fi
+
+        start="$loaded"
+        ((page++)) || true
+    done
+
+    merged="${TMP_DIR}/sab_history_merged.json"
+
+    jq -s '
+        . as $pages
+        | $pages[0] as $first
+        | $first
+        | .history.slots = [ $pages[] | .history.slots[]? ]
+        | .history.noofslots = ($first.history.noofslots // (.history.slots | length))
+        ' \
+        "${page_files[@]}" >"$merged" || return 1
+
+    mv -f "$merged" "$output"
+
+    if (( loaded < total )); then
+
+        log "WARNING: SAB history reached SAB_HISTORY_MAX_RECORDS=${SAB_HISTORY_MAX_RECORDS}"
+        SAB_AUDIT_WINDOW_INCOMPLETE=true
+    fi
+
+    return 0
+}
+
+fetch_sab_queue() {
+
+    local output="$1"
+    local page=0
+    local start=0
+    local loaded=0
+    local total=0
+    local page_file
+    local merged
+    local -a page_files=()
+
+    while (( loaded < SAB_QUEUE_MAX_RECORDS )); do
+
+        page_file="${TMP_DIR}/sab_queue_page_${page}.json"
+
+        if ! sab_get queue "$page_file" "$start" "$SAB_HISTORY_LIMIT"; then
+            return 1
+        fi
+
+        page_files+=("$page_file")
+
+        local page_count
+        page_count=$(jq '.queue.slots // [] | length' "$page_file")
+        loaded=$(( loaded + page_count ))
+        total=$(jq -r '
+            .queue.noofslots_total
+            // .queue.noofslots
+            // (.queue.slots // [] | length)
+            ' "$page_file")
+
+        if (( page_count == 0 || loaded >= total )); then
+            break
+        fi
+
+        start="$loaded"
+        ((page++)) || true
+    done
+
+    merged="${TMP_DIR}/sab_queue_merged.json"
+
+    jq -s '
+        . as $pages
+        | $pages[0] as $first
+        | $first
+        | .queue.slots = [ $pages[] | .queue.slots[]? ]
+        | .queue.start = 0
+        | .queue.limit = (.queue.slots | length)
+        ' \
+        "${page_files[@]}" >"$merged" || return 1
+
+    mv -f "$merged" "$output"
+
+    if (( loaded < total )); then
+        log "WARNING: SAB queue reached SAB_QUEUE_MAX_RECORDS=${SAB_QUEUE_MAX_RECORDS}"
+    fi
+
+    return 0
 }
 
 ###############################################################################
@@ -866,7 +1303,11 @@ queue_message() {
 
                 (
                     .statusMessages[]?
-                    | .messages[]?
+                    | (
+                        .title?,
+                        .message?,
+                        .messages[]?
+                    )
                 )
             ]
             | map(select(. != null and . != ""))
@@ -1113,6 +1554,17 @@ classify_issue() {
         return
     fi
 
+    # Queue state is authoritative for manual-intervention detection. History
+    # correlation enriches the later notification but never gates detection.
+    if echo "$combined" |
+       grep -Eq \
+       'manual import|manual intervention|requires manual|manually import|needs manual|importblocked|import blocked|found matching (series|movie) via grab history.*automatic import is not possible'
+    then
+
+        echo "MANUAL"
+        return
+    fi
+
     if echo "$combined" |
        grep -Eq \
        'not an upgrade|existing file.*better|existing.*preferred|quality.*not.*upgrade|does not improve|not an improvement'
@@ -1133,6 +1585,105 @@ classify_issue() {
 
     if echo "$combined" |
        grep -Eq \
+       'not enough (free )?(disk )?space|insufficient (free )?space|disk.*full|no space left'
+    then
+
+        echo "DISK_SPACE"
+        return
+    fi
+
+    if echo "$combined" |
+       grep -Eq \
+       'remote path mapping|remote.*path.*map|path mapping.*missing|different path.*download client'
+    then
+
+        echo "REMOTE_PATH_MAPPING"
+        return
+    fi
+
+    if echo "$combined" |
+       grep -Eq \
+       'unable to communicate with download client|download client.*unavailable|download client.*not available|download client.*failed|connection.*download client'
+    then
+
+        echo "DOWNLOAD_CLIENT"
+        return
+    fi
+
+    if echo "$combined" |
+       grep -Eq \
+       'file.*locked|being used by another process|resource busy|temporarily unavailable'
+    then
+
+        echo "FILE_LOCKED"
+        return
+    fi
+
+    if echo "$combined" |
+       grep -Eq \
+       'failed to move|unable to move|could not move|move.*failed'
+    then
+
+        echo "MOVE_FAILED"
+        return
+    fi
+
+    if echo "$combined" |
+       grep -Eq \
+       'failed to copy|unable to copy|could not copy|copy.*failed'
+    then
+
+        echo "COPY_FAILED"
+        return
+    fi
+
+    if echo "$combined" |
+       grep -Eq \
+       'file.*too small|smaller than minimum|does not meet.*minimum.*size'
+    then
+
+        echo "FILE_TOO_SMALL"
+        return
+    fi
+
+    if echo "$combined" |
+       grep -Eq \
+       'unable to determine.*sample|could not determine.*sample|sample.*detection'
+    then
+
+        echo "SAMPLE_DETECTION"
+        return
+    fi
+
+    if echo "$combined" |
+       grep -Eq \
+       'title.*mismatch|title.*does not match|does not match.*expected'
+    then
+
+        echo "TITLE_MISMATCH"
+        return
+    fi
+
+    if echo "$combined" |
+       grep -Eq \
+       'unable to parse.*quality|could not parse.*quality|quality.*unknown|failed to parse.*release'
+    then
+
+        echo "QUALITY_PARSE"
+        return
+    fi
+
+    if echo "$combined" |
+       grep -Eq \
+       'destination.*already exists|existing destination|conflicting destination|destination.*conflict'
+    then
+
+        echo "DESTINATION_CONFLICT"
+        return
+    fi
+
+    if echo "$combined" |
+       grep -Eq \
        'path.*does not exist|folder.*does not exist|directory.*does not exist|cannot find|no such file|not accessible|unable to access|folder is missing'
     then
 
@@ -1146,15 +1697,6 @@ classify_issue() {
     then
 
         echo "IMPORT_FAILED"
-        return
-    fi
-
-    if echo "$combined" |
-       grep -Eq \
-       'manual import|manual intervention|requires manual|manually import|needs manual|found matching (series|movie) via grab history.*automatic import is not possible'
-    then
-
-        echo "MANUAL"
         return
     fi
 
@@ -1453,8 +1995,9 @@ initialize_state() {
 
         cat >"$STATE_FILE" <<'EOF'
 {
-  "version": 7,
+  "version": 8,
   "issues": {},
+  "sabProgress": {},
   "telemetry": {
     "version": 1,
     "patterns": {}
@@ -1481,8 +2024,9 @@ EOF
 
             cat >"$STATE_FILE" <<'EOF'
 {
-  "version": 7,
+  "version": 8,
   "issues": {},
+  "sabProgress": {},
   "telemetry": {
     "version": 1,
     "patterns": {}
@@ -1502,9 +2046,11 @@ EOF
     migrate_tmp="$TMP_DIR/state.migrate.json"
 
     if jq '
-        .version = 7
+        .version = 8
         |
         .issues = (.issues // {})
+        |
+        .sabProgress = (.sabProgress // {})
         |
         .telemetry = (
             .telemetry
@@ -1518,14 +2064,15 @@ EOF
         |
         .telemetry.patterns = (.telemetry.patterns // {})
         ' \
-        "$STATE_FILE" >"$migrate_tmp"
+        "$STATE_FILE" >"$migrate_tmp" &&
+       save_state "$migrate_tmp"
     then
 
-        save_state "$migrate_tmp"
+        :
 
     else
 
-        log "ERROR: Unable to migrate state file to schema version 7"
+        log "ERROR: Unable to migrate state file to schema version 8"
         exit 3
     fi
 }
@@ -1534,9 +2081,33 @@ save_state() {
 
     local new_state="$1"
 
+    if ! jq empty "$new_state" >/dev/null 2>&1; then
+
+        log "ERROR: Refusing to replace state with invalid JSON: $new_state"
+
+        return 1
+    fi
+
     cp -f "$STATE_FILE" "$STATE_BACKUP" 2>/dev/null || true
 
-    mv -f "$new_state" "$STATE_FILE"
+    if mv -f "$new_state" "$STATE_FILE"; then
+        return 0
+    fi
+
+    log "ERROR: Unable to replace state file: $STATE_FILE"
+    persistent_log "ERROR" "Unable to replace monitor state file"
+
+    if [ "$STATE_WRITE_ALERT_SENT" != true ]; then
+
+        STATE_WRITE_ALERT_SENT=true
+
+        notify \
+            "alert" \
+            "ARR Health Monitor - State Write Failed" \
+            "The monitor could not update ${STATE_FILE}. Issue lifecycle and notification deduplication may be stale."
+    fi
+
+    return 1
 }
 
 ###############################################################################
@@ -1902,7 +2473,7 @@ record_arr_telemetry() {
         --argjson maxIssueKeys "$ARR_TELEMETRY_MAX_ISSUE_KEYS" \
         --argjson maxExamples "$ARR_TELEMETRY_MAX_EXAMPLES" \
         '
-        .version = 7
+        .version = 8
         |
         .telemetry = (
             .telemetry
@@ -2293,7 +2864,7 @@ update_issue_state() {
         --arg message "$message" \
         --argjson now "$now" \
         '
-        .version = 7
+        .version = 8
         |
         (.issues[$key] // {}) as $old
         |
@@ -2443,32 +3014,86 @@ mark_issue_resolved() {
 source_can_resolve() {
 
     local source="$1"
+    local issue_key="${2:-}"
 
     case "$source" in
 
         Sonarr)
 
-            [ "$SONARR_SCAN_OK" = true ]
+            case "$issue_key" in
+
+                Sonarr:service-api)
+                    [ "$SONARR_API_OK" = true ]
+                    ;;
+
+                Sonarr:health:*)
+                    [ "$SONARR_HEALTH_OK" = true ]
+                    ;;
+
+                Sonarr:history:*)
+                    [ "$SONARR_AUDIT_OK" = true ]
+                    ;;
+
+                *)
+                    [ "$SONARR_QUEUE_OK" = true ]
+                    ;;
+            esac
             ;;
 
         Radarr)
 
-            [ "$RADARR_SCAN_OK" = true ]
+            case "$issue_key" in
+
+                Radarr:service-api)
+                    [ "$RADARR_API_OK" = true ]
+                    ;;
+
+                Radarr:health:*)
+                    [ "$RADARR_HEALTH_OK" = true ]
+                    ;;
+
+                Radarr:history:*)
+                    [ "$RADARR_AUDIT_OK" = true ]
+                    ;;
+
+                *)
+                    [ "$RADARR_QUEUE_OK" = true ]
+                    ;;
+            esac
             ;;
 
         SABnzbd)
 
-            #
-            # SAB_STRANDED depends on SAB plus Arr queue knowledge.
-            #
-            # Be deliberately conservative:
-            # only resolve SAB cross-app issues if SAB AND both Arr queues
-            # were successfully scanned.
-            #
+            case "$issue_key" in
 
-            [ "$SAB_SCAN_OK" = true ] &&
-            [ "$SONARR_SCAN_OK" = true ] &&
-            [ "$RADARR_SCAN_OK" = true ]
+                SABnzbd:service-api)
+                    [ "$SAB_API_OK" = true ]
+                    ;;
+
+                SABnzbd:warning:*)
+                    [ "$SAB_WARNINGS_OK" = true ]
+                    ;;
+
+                SABnzbd:status:*)
+                    [ "$SAB_STATUS_OK" = true ]
+                    ;;
+
+                SABnzbd:queue:*|SABnzbd:category:*)
+                    [ "$SAB_QUEUE_OK" = true ]
+                    ;;
+
+                SABnzbd:history:*)
+                    [ "$SAB_HISTORY_OK" = true ]
+                    ;;
+
+                *)
+                    # Existing stranded-file issues depend on SAB history and
+                    # successful knowledge of both Arr queues.
+                    [ "$SAB_HISTORY_OK" = true ] &&
+                    [ "$SONARR_QUEUE_OK" = true ] &&
+                    [ "$RADARR_QUEUE_OK" = true ]
+                    ;;
+            esac
             ;;
 
         *)
@@ -2512,11 +3137,13 @@ resolve_missing_issues() {
         local first_seen
         local now
         local lifetime_hours
+        local notified_signature
 
         issue_key=$(echo "$record" | jq -r '.key')
         source=$(echo "$record" | jq -r '.value.app // ""')
         title=$(echo "$record" | jq -r '.value.title // "Unknown"')
         classification=$(echo "$record" | jq -r '.value.classification // "Unknown"')
+        notified_signature=$(echo "$record" | jq -r '.value.notifiedSignature // ""')
 
         if issue_seen_this_run "$issue_key"; then
             continue
@@ -2526,7 +3153,7 @@ resolve_missing_issues() {
         # Do not declare resolution if the relevant API was unavailable.
         #
 
-        if ! source_can_resolve "$source"; then
+        if ! source_can_resolve "$source" "$issue_key"; then
 
             log "Resolution deferred for $issue_key because required source scan was unavailable"
 
@@ -2555,10 +3182,35 @@ resolve_missing_issues() {
             log "Media: $title"
             log "Previous classification: $classification"
             log "Observed lifetime: approximately ${lifetime_hours}h"
-            log "Resolution notification: disabled by design"
+            log "Resolution notification enabled: $SEND_RESOLUTION_NOTIFICATIONS"
             persistent_log \
                 "RESOLVED" \
                 "${source} | ${classification} | ${title} | lifetime=${lifetime_hours}h"
+
+            if [ "$SEND_RESOLUTION_NOTIFICATIONS" = true ] &&
+               [ -n "$notified_signature" ]; then
+
+                local resolution_signature
+
+                resolution_signature=$(issue_signature \
+                    "$source" \
+                    "$issue_key" \
+                    "$classification" \
+                    "INFO" \
+                    "resolved" \
+                    "resolved")
+
+                queue_group_notification \
+                    "$issue_key" \
+                    "$resolution_signature" \
+                    "$source" \
+                    "$title" \
+                    "$classification" \
+                    "INFO" \
+                    "$lifetime_hours" \
+                    "Condition is no longer present" \
+                    "resolved"
+            fi
 
         else
 
@@ -2582,6 +3234,7 @@ queue_group_notification() {
     local severity="$6"
     local age="$7"
     local detail="$8"
+    local event="${9:-new}"
 
     jq -nc \
         --arg issueKey "$issue_key" \
@@ -2592,6 +3245,7 @@ queue_group_notification() {
         --arg severity "$severity" \
         --arg age "$age" \
         --arg detail "$detail" \
+        --arg event "$event" \
         '{
             issueKey: $issueKey,
             signature: $signature,
@@ -2600,7 +3254,8 @@ queue_group_notification() {
             classification: $classification,
             severity: $severity,
             age: $age,
-            detail: $detail
+            detail: $detail,
+            event: $event
         }' \
         >>"$NOTIFICATION_BATCH"
 
@@ -2612,7 +3267,7 @@ queue_group_notification() {
 batch_highest_severity() {
 
     if jq -e \
-        'select(.severity == "ERROR")' \
+        'select(.severity == "ERROR" and .event != "resolved")' \
         "$NOTIFICATION_BATCH" \
         >/dev/null 2>&1
     then
@@ -2621,7 +3276,7 @@ batch_highest_severity() {
     fi
 
     if jq -e \
-        'select(.severity == "WARNING")' \
+        'select(.severity == "WARNING" and .event != "resolved")' \
         "$NOTIFICATION_BATCH" \
         >/dev/null 2>&1
     then
@@ -2648,6 +3303,7 @@ send_grouped_notification() {
     local info_new
     local warning_new
     local error_new
+    local resolved
 
     local body=""
     local source
@@ -2660,19 +3316,25 @@ send_grouped_notification() {
 
     info_new=$(
         jq -s \
-            '[.[] | select(.severity == "INFO")] | length' \
+            '[.[] | select(.severity == "INFO" and .event != "resolved")] | length' \
             "$NOTIFICATION_BATCH"
     )
 
     warning_new=$(
         jq -s \
-            '[.[] | select(.severity == "WARNING")] | length' \
+            '[.[] | select(.severity == "WARNING" and .event != "resolved")] | length' \
             "$NOTIFICATION_BATCH"
     )
 
     error_new=$(
         jq -s \
-            '[.[] | select(.severity == "ERROR")] | length' \
+            '[.[] | select(.severity == "ERROR" and .event != "resolved")] | length' \
+            "$NOTIFICATION_BATCH"
+    )
+
+    resolved=$(
+        jq -s \
+            '[.[] | select(.event == "resolved")] | length' \
             "$NOTIFICATION_BATCH"
     )
 
@@ -2680,22 +3342,22 @@ send_grouped_notification() {
 
         ERROR)
             importance="alert"
-            description="🔴 Import Monitor - ${total} New Issue(s)"
+            description="ARR Health Monitor - ${total} Update(s)"
             ;;
 
         WARNING)
             importance="warning"
-            description="🟠 Import Monitor - ${total} New Issue(s)"
+            description="ARR Health Monitor - ${total} Update(s)"
             ;;
 
         *)
             importance="normal"
-            description="🟡 Import Monitor - ${total} New Issue(s)"
+            description="ARR Health Monitor - ${total} Update(s)"
             ;;
     esac
 
-    body="New issues detected: ${total}"$'\n'
-    body+="Info: ${info_new} | Warnings: ${warning_new} | Errors: ${error_new}"$'\n'
+    body="Health/activity updates: ${total}"$'\n'
+    body+="Info: ${info_new} | Warnings: ${warning_new} | Errors: ${error_new} | Resolved: ${resolved}"$'\n'
 
     shown=0
 
@@ -2727,15 +3389,22 @@ send_grouped_notification() {
             local severity
             local age
             local detail
+            local event
 
             item_title=$(echo "$record" | jq -r '.title')
             classification=$(echo "$record" | jq -r '.classification')
             severity=$(echo "$record" | jq -r '.severity')
             age=$(echo "$record" | jq -r '.age')
             detail=$(echo "$record" | jq -r '.detail')
+            event=$(echo "$record" | jq -r '.event // "new"')
 
-            body+="• ${item_title}"$'\n'
-            body+="  ${classification} [${severity}]"$'\n'
+            body+="- ${item_title}"$'\n'
+
+            if [ "$event" = "resolved" ]; then
+                body+="  ${classification} [RESOLVED]"$'\n'
+            else
+                body+="  ${classification} [${severity}]"$'\n'
+            fi
 
             if [ -n "$age" ] && [ "$age" != "0" ]; then
                 body+="  Age: ${age}h"$'\n'
@@ -2778,7 +3447,7 @@ send_grouped_notification() {
     fi
 
     body+=$'\n'
-    body+="Monitor schedule: hourly recommended"$'\n'
+    body+="Monitor schedule: every five minutes recommended"$'\n'
     body+="Runtime: $(runtime)"
 
     notify \
@@ -2827,6 +3496,314 @@ send_grouped_notification() {
     log "Issues included: $total"
 
     return 0
+}
+
+###############################################################################
+# NORMALIZED ISSUE RECORDER - v3.0
+#
+# Service collectors emit the same compact issue shape. This is the only new
+# path responsible for lifecycle, deduplication, escalation, and grouping.
+###############################################################################
+
+record_normalized_issue() {
+
+    local issue_key="$1"
+    local source="$2"
+    local title="$3"
+    local classification="$4"
+    local severity="$5"
+    local stage="$6"
+    local message="$7"
+    local display_age="$8"
+    local detail="$9"
+    local notify_runs="${10:-1}"
+    local minimum_minutes="${11:-0}"
+    local escalate_minutes="${12:-0}"
+
+    if issue_seen_this_run "$issue_key"; then
+        return 0
+    fi
+
+    local now
+    local first_seen
+    local active
+    local elapsed_minutes=0
+    local signature
+    local persist_issue_transition=false
+    local occurrences
+
+    now=$(date +%s)
+
+    active=$(jq -r \
+        --arg key "$issue_key" \
+        '(.issues[$key].active // false) | tostring' \
+        "$STATE_FILE")
+
+    first_seen=$(jq -r \
+        --arg key "$issue_key" \
+        '.issues[$key].firstSeen // 0' \
+        "$STATE_FILE")
+
+    if [ "$active" = true ] &&
+       [[ "$first_seen" =~ ^[0-9]+$ ]] &&
+       (( first_seen > 0 && now > first_seen ))
+    then
+        elapsed_minutes=$(( (now - first_seen) / 60 ))
+    fi
+
+    if (( escalate_minutes > 0 && elapsed_minutes >= escalate_minutes )); then
+        stage="escalated"
+    fi
+
+    signature=$(issue_signature \
+        "$source" \
+        "$issue_key" \
+        "$classification" \
+        "$severity" \
+        "$stage" \
+        "$message")
+
+    if issue_transition_should_persist "$issue_key" "$signature"; then
+        persist_issue_transition=true
+    fi
+
+    if ! update_issue_state \
+        "$issue_key" \
+        "$signature" \
+        "$source" \
+        "$title" \
+        "$classification" \
+        "$severity" \
+        "$stage" \
+        "$message"
+    then
+        log "ERROR: Unable to update normalized issue state: $issue_key"
+        return 1
+    fi
+
+    occurrences=$(jq -r \
+        --arg key "$issue_key" \
+        '.issues[$key].occurrences // 1' \
+        "$STATE_FILE")
+
+    ((TOTAL_ISSUES++)) || true
+
+    case "$severity" in
+
+        INFO)
+            ((INFO_COUNT++)) || true
+            ;;
+
+        WARNING)
+            ((WARNING_COUNT++)) || true
+            ;;
+
+        ERROR)
+            ((ERROR_COUNT++)) || true
+            ;;
+    esac
+
+    if [ "$persist_issue_transition" = true ]; then
+
+        persistent_log \
+            "ISSUE" \
+            "${source} | ${classification} | ${severity} | ${title} | stage=${stage}"
+    fi
+
+    if (( occurrences < notify_runs || elapsed_minutes < minimum_minutes )); then
+
+        log "Notification pending threshold: $issue_key"
+        log "Observations: ${occurrences}/${notify_runs}; active minutes: ${elapsed_minutes}/${minimum_minutes}"
+
+        return 0
+    fi
+
+    if should_notify "$issue_key" "$signature"; then
+
+        queue_group_notification \
+            "$issue_key" \
+            "$signature" \
+            "$source" \
+            "$title" \
+            "$classification" \
+            "$severity" \
+            "$display_age" \
+            "$detail"
+
+    else
+
+        log "Notification suppressed: normalized issue already reported"
+    fi
+}
+
+stable_issue_hash() {
+
+    printf '%s' "$1" |
+        sha256sum |
+        awk '{print $1}'
+}
+
+###############################################################################
+# SONARR / RADARR NATIVE HEALTH
+###############################################################################
+
+process_arr_native_health() {
+
+    local app="$1"
+    local health_file="$2"
+
+    [ -f "$health_file" ] || return 0
+
+    while IFS= read -r record; do
+
+        [ -n "$record" ] || continue
+
+        local health_source
+        local health_type
+        local message
+        local wiki_url
+        local severity
+        local notify_runs
+        local issue_hash
+        local detail
+
+        health_source=$(jq -r '.source // "Unknown health check"' <<<"$record")
+        health_type=$(jq -r '.type // "warning"' <<<"$record")
+        message=$(jq -r '.message // "No health detail supplied"' <<<"$record")
+        wiki_url=$(jq -r '.wikiUrl // ""' <<<"$record")
+
+        case "${health_type,,}" in
+
+            error)
+                severity="ERROR"
+                notify_runs="$ARR_HEALTH_ERROR_NOTIFY_RUNS"
+                ;;
+
+            *)
+                severity="WARNING"
+                notify_runs="$ARR_HEALTH_WARNING_NOTIFY_RUNS"
+                ;;
+        esac
+
+        issue_hash=$(stable_issue_hash "${app}|${health_source}|${message}")
+        detail="$message"
+
+        if [ -n "$wiki_url" ]; then
+            detail+=$'\n'
+            detail+="Help: ${wiki_url}"
+        fi
+
+        log "${app} native health issue: ${health_source} (${health_type})"
+
+        record_normalized_issue \
+            "${app}:health:${issue_hash}" \
+            "$app" \
+            "Health: ${health_source}" \
+            "ARR_HEALTH_${health_type^^}" \
+            "$severity" \
+            "active" \
+            "$message" \
+            "" \
+            "$detail" \
+            "$notify_runs" \
+            0 \
+            "$API_FAILURE_ESCALATE_MINUTES"
+
+        ((ARR_NATIVE_HEALTH_COUNT++)) || true
+
+    done < <(jq -c '.[]?' "$health_file")
+}
+
+record_service_api_issue() {
+
+    local app="$1"
+    local api_ok="$2"
+    local failures="$3"
+
+    [ "$api_ok" = true ] && return 0
+    [ -n "$failures" ] || failures="one or more required API endpoints failed"
+
+    local classification="SERVICE_API_UNAVAILABLE"
+    local notify_runs="$API_FAILURE_NOTIFY_RUNS"
+
+    if grep -Eqi 'authentication rejected|HTTP (401|403)|api key.*(incorrect|required)' <<<"$failures"; then
+        classification="SERVICE_API_AUTHENTICATION"
+        notify_runs=2
+    fi
+
+    record_normalized_issue \
+        "${app}:service-api" \
+        "$app" \
+        "${app} API unavailable" \
+        "$classification" \
+        "ERROR" \
+        "degraded" \
+        "$failures" \
+        "" \
+        "$failures" \
+        "$notify_runs" \
+        0 \
+        "$API_FAILURE_ESCALATE_MINUTES"
+
+    ((SERVICE_API_ISSUE_COUNT++)) || true
+}
+
+###############################################################################
+# DOWNLOAD CORRELATION HELPERS
+###############################################################################
+
+arr_queue_item_by_download_id() {
+
+    local owner="$1"
+    local download_id="$2"
+    local queue=""
+
+    case "$owner" in
+
+        Sonarr)
+            queue="$SONARR_QUEUE"
+            ;;
+
+        Radarr)
+            queue="$RADARR_QUEUE"
+            ;;
+    esac
+
+    if [ -z "$queue" ] || [ ! -f "$queue" ]; then
+        printf '{}'
+        return 0
+    fi
+
+    jq -c \
+        --arg id "$download_id" \
+        '[
+            .records[]?
+            | select(
+                ((.downloadId // "") | ascii_downcase)
+                ==
+                ($id | ascii_downcase)
+            )
+        ]
+        | first // {}' \
+        "$queue"
+}
+
+mark_sab_primary_download() {
+
+    local download_id="${1,,}"
+
+    [ -n "$download_id" ] || return 0
+
+    printf '%s\n' "$download_id" >>"$SAB_PRIMARY_DOWNLOADS_FILE"
+}
+
+sab_primary_download_exists() {
+
+    local download_id="${1,,}"
+
+    [ -n "$download_id" ] || return 1
+
+    grep -Fqx -- "$download_id" "$SAB_PRIMARY_DOWNLOADS_FILE" 2>/dev/null
 }
 
 ###############################################################################
@@ -3054,11 +4031,7 @@ process_queue() {
     local app="$1"
     local queue_file="$2"
 
-    local records
-
-    records=$(jq -c '.records[]?' "$queue_file")
-
-    if [ -z "$records" ]; then
+    if ! jq -e '(.records // [] | length) > 0' "$queue_file" >/dev/null 2>&1; then
 
         log "$app queue: no entries"
 
@@ -3126,6 +4099,21 @@ process_queue() {
         )
 
         [ "$classification" != "NONE" ] || continue
+
+        #######################################################################
+        # PRIMARY-CAUSE CORRELATION
+        #
+        # A current SAB failed/stalled issue owns the notification for this
+        # download. The Arr queue symptom is retained in SAB's detail instead
+        # of producing a second email for the same download chain.
+        #######################################################################
+
+        if [ -n "$download_id" ] &&
+           sab_primary_download_exists "$download_id"
+        then
+            log "$app queue symptom suppressed by primary SAB issue: $download_id"
+            continue
+        fi
 
         ###############################################################################
         # v2.4 REVIEWED CLASSIFICATION PROMOTION
@@ -3397,6 +4385,22 @@ process_queue() {
                 detail="$reason"
             fi
 
+            if [ -n "$message" ]; then
+
+                [ -z "$detail" ] || detail+=$'\n'
+                detail+="Arr detail: ${message:0:1000}"
+            fi
+
+            [ -z "$detail" ] || detail+=$'\n'
+            detail+="Release: ${release}"
+            detail+=$'\n'
+            detail+="Queue: status=${status}, tracked=${tracked_status}/${tracked_state}"
+
+            if [ "$sab_status" != "Unknown" ]; then
+                detail+=$'\n'
+                detail+="SAB status: ${sab_status}"
+            fi
+
             queue_group_notification \
                 "$issue_key" \
                 "$signature" \
@@ -3412,7 +4416,7 @@ process_queue() {
             log "Notification suppressed: issue already reported"
         fi
 
-    done <<<"$records"
+    done < <(jq -c '.records[]?' "$queue_file")
 }
 
 ###############################################################################
@@ -3479,6 +4483,808 @@ sab_category_root() {
     fi
 
     echo ""
+}
+
+###############################################################################
+# SAB NATIVE WARNINGS / FAILED JOBS / LIVE PROGRESS - v3.0
+###############################################################################
+
+process_sab_warnings() {
+
+    [ "$SAB_WARNINGS_OK" = true ] || return 0
+    [ -f "$SAB_WARNINGS" ] || return 0
+
+    while IFS= read -r record; do
+
+        [ -n "$record" ] || continue
+
+        local warning_type
+        local warning_text
+        local warning_origin
+        local severity
+        local classification
+        local notify_runs
+        local issue_hash
+
+        warning_type=$(jq -r '.type // "WARNING"' <<<"$record")
+        warning_text=$(jq -r '.text // .message // "SABnzbd warning without detail"' <<<"$record")
+        warning_origin=$(jq -r '.origin // "SABnzbd"' <<<"$record")
+
+        case "${warning_type^^}" in
+
+            ERROR)
+                severity="ERROR"
+                classification="SAB_ERROR"
+                notify_runs=1
+                ;;
+
+            *)
+                severity="WARNING"
+                classification="SAB_WARNING"
+                notify_runs=2
+                ;;
+        esac
+
+        if grep -Eqi \
+            'disk.*full|too little disk|no space left|permission denied|authentication failed|login failed|all servers.*unavailable' \
+            <<<"$warning_text"
+        then
+            severity="ERROR"
+            notify_runs=1
+        fi
+
+        issue_hash=$(stable_issue_hash "${warning_type}|${warning_origin}|${warning_text}")
+
+        record_normalized_issue \
+            "SABnzbd:warning:${issue_hash}" \
+            "SABnzbd" \
+            "SAB warning: ${warning_origin}" \
+            "$classification" \
+            "$severity" \
+            "active" \
+            "$warning_text" \
+            "" \
+            "$warning_text" \
+            "$notify_runs" \
+            0 \
+            "$API_FAILURE_ESCALATE_MINUTES"
+
+        ((SAB_NATIVE_WARNING_COUNT++)) || true
+
+    done < <(jq -c '(.warnings // . // [])[]?' "$SAB_WARNINGS" 2>/dev/null)
+}
+
+sab_failure_message() {
+
+    local item="$1"
+
+    jq -r '
+        [
+            (.fail_message // empty),
+            (.error // empty),
+            (
+                .stage_log?
+                | ..
+                | strings
+            )
+        ]
+        | map(select(. != ""))
+        | unique
+        | join(" | ")
+        | if length > 1500 then .[:1500] + "..." else . end
+        ' <<<"$item"
+}
+
+classify_sab_failure() {
+
+    local message="${1,,}"
+
+    if grep -Eq 'authentication|authorization|login|username|password.*server' <<<"$message"; then
+        echo "SAB_DOWNLOAD_FAILED_SERVER_AUTH"
+    elif grep -Eq 'missing articles|not enough repair|repair.*failed|cannot be completed|aborted.*articles' <<<"$message"; then
+        echo "SAB_DOWNLOAD_FAILED_MISSING_ARTICLES"
+    elif grep -Eq 'encrypted|password required|password protected|wrong password' <<<"$message"; then
+        echo "SAB_DOWNLOAD_FAILED_PASSWORD"
+    elif grep -Eq 'unpack|extract|unrar|7-zip|7zip' <<<"$message"; then
+        echo "SAB_DOWNLOAD_FAILED_UNPACK"
+    elif grep -Eq 'disk.*full|no space left|too little disk|insufficient.*space' <<<"$message"; then
+        echo "SAB_DOWNLOAD_FAILED_DISK"
+    elif grep -Eq 'permission denied|access denied|not permitted|no such file|path.*missing|folder.*missing' <<<"$message"; then
+        echo "SAB_DOWNLOAD_FAILED_PATH"
+    elif grep -Eq 'script.*failed|post.processing.*failed|exit code|returned.*non.zero' <<<"$message"; then
+        echo "SAB_DOWNLOAD_FAILED_SCRIPT"
+    else
+        echo "SAB_DOWNLOAD_FAILED_UNKNOWN"
+    fi
+}
+
+sab_failure_action() {
+
+    case "$1" in
+
+        SAB_DOWNLOAD_FAILED_MISSING_ARTICLES)
+            echo "Choose another release; the current post cannot be repaired"
+            ;;
+
+        SAB_DOWNLOAD_FAILED_PASSWORD)
+            echo "Supply the archive password or choose an unencrypted release"
+            ;;
+
+        SAB_DOWNLOAD_FAILED_UNPACK)
+            echo "Inspect the archive/unpack log and retry only after correcting the archive problem"
+            ;;
+
+        SAB_DOWNLOAD_FAILED_DISK)
+            echo "Restore free space before retrying the download"
+            ;;
+
+        SAB_DOWNLOAD_FAILED_PATH)
+            echo "Correct the folder mapping or permissions before retrying"
+            ;;
+
+        SAB_DOWNLOAD_FAILED_SERVER_AUTH)
+            echo "Correct the affected news-server credentials or connection"
+            ;;
+
+        SAB_DOWNLOAD_FAILED_SCRIPT)
+            echo "Inspect the configured post-processing script and its exit output"
+            ;;
+
+        *)
+            echo "Inspect the SAB job details and choose whether to retry or select another release"
+            ;;
+    esac
+}
+
+sab_correlated_title() {
+
+    local owner="$1"
+    local download_id="$2"
+    local fallback="$3"
+    local queue_item
+
+    queue_item=$(arr_queue_item_by_download_id "$owner" "$download_id")
+
+    if jq -e 'length > 0' <<<"$queue_item" >/dev/null 2>&1; then
+        friendly_media_name "$owner" "$queue_item"
+    else
+        printf '%s' "$fallback"
+    fi
+}
+
+process_sab_failed_jobs() {
+
+    [ "$SAB_HISTORY_OK" = true ] || return 0
+    [ -f "$SAB_HISTORY" ] || return 0
+
+    while IFS= read -r item; do
+
+        [ -n "$item" ] || continue
+
+        local category
+        local owner
+        local download_id
+        local name
+        local event_epoch
+        local age
+        local message
+        local classification
+        local title
+        local detail
+        local queue_item
+        local action
+
+        category=$(jq -r '.category // .cat // ""' <<<"$item")
+
+        if [ "${category,,}" = "${SAB_IGNORED_CATEGORY,,}" ]; then
+            continue
+        fi
+
+        owner=$(sab_category_owner "$category")
+        [ -n "$owner" ] || continue
+
+        event_epoch=$(sab_history_event_epoch "$item")
+        (( event_epoch > 0 )) || continue
+
+        age=$(( ($(date +%s) - event_epoch) / 3600 ))
+        (( age >= 0 )) || age=0
+        (( age <= SAB_FAILED_ACTIVE_HOURS )) || continue
+
+        download_id=$(jq -r '.nzo_id // ""' <<<"$item")
+        name=$(jq -r '.name // .nzb_name // "Unknown SAB job"' <<<"$item")
+        message=$(sab_failure_message "$item")
+        [ -n "$message" ] || message="SABnzbd marked the job as failed without a failure message"
+
+        classification=$(classify_sab_failure "$message")
+        action=$(sab_failure_action "$classification")
+        title=$(sab_correlated_title "$owner" "$download_id" "$name")
+        queue_item=$(arr_queue_item_by_download_id "$owner" "$download_id")
+
+        detail="Owner: ${owner}"$'\n'
+        detail+="Release: ${name}"$'\n'
+        detail+="Failure: ${message}"$'\n'
+        detail+="Suggested action: ${action}"
+
+        if jq -e 'length > 0' <<<"$queue_item" >/dev/null 2>&1; then
+            detail+=$'\n'
+            detail+="Arr queue: $(jq -r '
+                "status=" + (.status // "unknown")
+                + ", tracked="
+                + (.trackedDownloadStatus // "unknown")
+                + "/"
+                + (.trackedDownloadState // "unknown")
+                ' <<<"$queue_item")"
+        fi
+
+        mark_sab_primary_download "$download_id"
+
+        record_normalized_issue \
+            "SABnzbd:history:${download_id:-$(stable_issue_hash "${category}|${name}|${event_epoch}")}" \
+            "SABnzbd" \
+            "$title" \
+            "$classification" \
+            "ERROR" \
+            "failed" \
+            "$message" \
+            "$age" \
+            "$detail" \
+            1 \
+            0 \
+            "$API_FAILURE_ESCALATE_MINUTES"
+
+        ((SAB_FAILED_JOB_COUNT++)) || true
+
+    done < <(
+        jq -c '
+            .history.slots[]?
+            | select((.status // "" | ascii_downcase) == "failed")
+            ' "$SAB_HISTORY"
+    )
+}
+
+sab_stage_threshold() {
+
+    local source_kind="$1"
+    local status="${2,,}"
+
+    case "${source_kind}:${status}" in
+
+        queue:downloading)
+            echo "$SAB_DOWNLOAD_STALL_MINUTES"
+            ;;
+
+        queue:fetching|queue:propagating)
+            echo "$SAB_FETCH_STALL_MINUTES"
+            ;;
+
+        history:quickcheck|history:verifying)
+            echo "$SAB_VERIFY_STALL_MINUTES"
+            ;;
+
+        history:repairing|history:fetching)
+            echo "$SAB_REPAIR_STALL_MINUTES"
+            ;;
+
+        history:extracting)
+            echo "$SAB_EXTRACT_STALL_MINUTES"
+            ;;
+
+        history:moving)
+            echo "$SAB_MOVE_STALL_MINUTES"
+            ;;
+
+        history:running)
+            echo "$SAB_SCRIPT_STALL_MINUTES"
+            ;;
+
+        history:queued)
+            echo "$SAB_POSTPROCESS_WAIT_MINUTES"
+            ;;
+
+        *)
+            echo 0
+            ;;
+    esac
+}
+
+observe_sab_progress() {
+
+    local source_kind="$1"
+    local owner="$2"
+    local category="$3"
+    local download_id="$4"
+    local name="$5"
+    local status="$6"
+    local remaining="$7"
+
+    [ -n "$download_id" ] || return 0
+
+    local progress_signature
+
+    progress_signature="${status,,}|${remaining}"
+    printf '%s\n' "$download_id" >>"$SAB_PROGRESS_SEEN_FILE"
+
+    jq -nc \
+        --arg id "$download_id" \
+        --arg signature "$progress_signature" \
+        --arg status "$status" \
+        --arg sourceKind "$source_kind" \
+        --arg owner "$owner" \
+        --arg name "$name" \
+        --arg category "$category" \
+        --arg remaining "$remaining" \
+        '{
+            id: $id,
+            signature: $signature,
+            status: $status,
+            sourceKind: $sourceKind,
+            owner: $owner,
+            name: $name,
+            category: $category,
+            remaining: $remaining
+        }' >>"$SAB_PROGRESS_OBSERVATIONS_FILE"
+}
+
+evaluate_sab_progress() {
+
+    [ -s "$SAB_PROGRESS_OBSERVATIONS_FILE" ] || return 0
+
+    local now
+    local observations_array
+    local tmp
+
+    now=$(date +%s)
+    observations_array="${TMP_DIR}/sab_progress_observations.json"
+    tmp="${TMP_DIR}/state.sab-progress.json"
+
+    jq -s '.' "$SAB_PROGRESS_OBSERVATIONS_FILE" >"$observations_array" || return 1
+
+    jq \
+        --slurpfile observations "$observations_array" \
+        --argjson now "$now" \
+        '
+        reduce ($observations[0][]?) as $item (
+            .;
+            (.sabProgress[$item.id] // {}) as $old
+            | .sabProgress[$item.id] = {
+                signature: $item.signature,
+                status: $item.status,
+                sourceKind: $item.sourceKind,
+                name: $item.name,
+                category: $item.category,
+                remaining: $item.remaining,
+                lastSeen: $now,
+                lastProgressAt: (
+                    if ($old.signature // "") == $item.signature
+                    then ($old.lastProgressAt // $now)
+                    else $now
+                    end
+                )
+            }
+        )
+        ' "$STATE_FILE" >"$tmp" || return 1
+
+    save_state "$tmp" || return 1
+
+    while IFS= read -r observation; do
+
+        [ -n "$observation" ] || continue
+
+        local source_kind
+        local owner
+        local download_id
+        local name
+        local status
+        local remaining
+        local last_progress
+        local elapsed_minutes
+        local threshold
+        local stage
+        local severity
+        local classification
+        local title
+        local detail
+
+        source_kind=$(jq -r '.sourceKind' <<<"$observation")
+        owner=$(jq -r '.owner' <<<"$observation")
+        download_id=$(jq -r '.id' <<<"$observation")
+        name=$(jq -r '.name' <<<"$observation")
+        status=$(jq -r '.status' <<<"$observation")
+        remaining=$(jq -r '.remaining' <<<"$observation")
+
+        last_progress=$(jq -r \
+            --arg id "$download_id" \
+            '.sabProgress[$id].lastProgressAt // 0' \
+            "$STATE_FILE")
+
+        elapsed_minutes=$(( (now - last_progress) / 60 ))
+        threshold=$(sab_stage_threshold "$source_kind" "$status")
+
+        (( threshold > 0 && elapsed_minutes >= threshold )) || continue
+
+        stage="warning"
+        severity="WARNING"
+
+        if (( elapsed_minutes >= threshold * 4 )); then
+            stage="escalated"
+            severity="ERROR"
+        fi
+
+        classification="SAB_STALLED_$(printf '%s' "$status" | tr '[:lower:] -' '[:upper:]__')"
+        title=$(sab_correlated_title "$owner" "$download_id" "$name")
+        detail="Owner: ${owner}"$'\n'
+        detail+="SAB stage: ${status}"$'\n'
+        detail+="No progress: ${elapsed_minutes} minute(s)"
+
+        if [ -n "$remaining" ]; then
+            detail+=$'\n'
+            detail+="Remaining: ${remaining} MB"
+        fi
+
+        mark_sab_primary_download "$download_id"
+
+        record_normalized_issue \
+            "SABnzbd:${source_kind}:stalled:${download_id}" \
+            "SABnzbd" \
+            "$title" \
+            "$classification" \
+            "$severity" \
+            "$stage" \
+            "${status} has made no observable progress for ${elapsed_minutes} minutes" \
+            "$(( (elapsed_minutes + 59) / 60 ))" \
+            "$detail" \
+            1 \
+            0 \
+            0
+
+        ((SAB_STALLED_JOB_COUNT++)) || true
+
+    done <"$SAB_PROGRESS_OBSERVATIONS_FILE"
+}
+
+process_sab_live_progress() {
+
+    if [ "$SAB_QUEUE_OK" = true ] && [ -f "$SAB_QUEUE" ]; then
+
+        while IFS= read -r item; do
+
+            [ -n "$item" ] || continue
+
+            local category
+            local owner
+            local download_id
+            local name
+            local status
+            local remaining
+
+            category=$(jq -r '.cat // .category // ""' <<<"$item")
+
+            if [ "${category,,}" = "${SAB_IGNORED_CATEGORY,,}" ]; then
+                continue
+            fi
+
+            owner=$(sab_category_owner "$category")
+            [ -n "$owner" ] || continue
+
+            download_id=$(jq -r '.nzo_id // ""' <<<"$item")
+            name=$(jq -r '.filename // .name // .nzb_name // "Unknown SAB job"' <<<"$item")
+            status=$(jq -r '.status // ""' <<<"$item")
+            remaining=$(jq -r '.mbleft // .sizeleft // ""' <<<"$item")
+
+            observe_sab_progress \
+                "queue" \
+                "$owner" \
+                "$category" \
+                "$download_id" \
+                "$name" \
+                "$status" \
+                "$remaining"
+
+        done < <(jq -c '.queue.slots[]?' "$SAB_QUEUE")
+    fi
+
+    if [ "$SAB_HISTORY_OK" = true ] && [ -f "$SAB_HISTORY" ]; then
+
+        while IFS= read -r item; do
+
+            [ -n "$item" ] || continue
+
+            local category
+            local owner
+            local download_id
+            local name
+            local status
+
+            category=$(jq -r '.category // .cat // ""' <<<"$item")
+
+            if [ "${category,,}" = "${SAB_IGNORED_CATEGORY,,}" ]; then
+                continue
+            fi
+
+            owner=$(sab_category_owner "$category")
+            [ -n "$owner" ] || continue
+
+            download_id=$(jq -r '.nzo_id // ""' <<<"$item")
+            name=$(jq -r '.name // .nzb_name // "Unknown SAB job"' <<<"$item")
+            status=$(jq -r '.status // ""' <<<"$item")
+
+            observe_sab_progress \
+                "history" \
+                "$owner" \
+                "$category" \
+                "$download_id" \
+                "$name" \
+                "$status" \
+                ""
+
+        done < <(
+            jq -c '
+                .history.slots[]?
+                | select(
+                    ((.status // "") | ascii_downcase)
+                    | IN(
+                        "quickcheck",
+                        "verifying",
+                        "repairing",
+                        "fetching",
+                        "extracting",
+                        "moving",
+                        "running",
+                        "queued"
+                    )
+                )
+                ' "$SAB_HISTORY"
+        )
+    fi
+}
+
+sab_pause_allowed_now() {
+
+    local now_hour
+    local now_minute
+    local now_total
+    local window
+
+    now_hour=$(date '+%H')
+    now_minute=$(date '+%M')
+    now_total=$(( 10#$now_hour * 60 + 10#$now_minute ))
+
+    for window in "${SAB_ALLOWED_PAUSE_WINDOWS[@]}"; do
+
+        [[ "$window" =~ ^([0-2][0-9]):([0-5][0-9])-([0-2][0-9]):([0-5][0-9])$ ]] || continue
+
+        local start_total
+        local end_total
+
+        if (( 10#${BASH_REMATCH[1]} > 23 || 10#${BASH_REMATCH[3]} > 23 )); then
+            continue
+        fi
+
+        start_total=$(( 10#${BASH_REMATCH[1]} * 60 + 10#${BASH_REMATCH[2]} ))
+        end_total=$(( 10#${BASH_REMATCH[3]} * 60 + 10#${BASH_REMATCH[4]} ))
+
+        if (( start_total <= end_total )); then
+
+            if (( now_total >= start_total && now_total <= end_total )); then
+                return 0
+            fi
+
+        elif (( now_total >= start_total || now_total <= end_total )); then
+
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+process_sab_queue_health() {
+
+    [ "$SAB_QUEUE_OK" = true ] || return 0
+    [ -f "$SAB_QUEUE" ] || return 0
+
+    local monitored_count
+    local paused
+    local pause_reason=""
+    local minimum_minutes
+    local severity
+    local classification
+
+    monitored_count=$(jq \
+        --arg movie "${SAB_MOVIE_CATEGORY,,}" \
+        --arg tv "${SAB_TV_CATEGORY,,}" \
+        '[
+            .queue.slots[]?
+            | select(
+                ((.cat // .category // "") | ascii_downcase) == $movie
+                or
+                ((.cat // .category // "") | ascii_downcase) == $tv
+            )
+        ] | length' "$SAB_QUEUE")
+
+    paused=$(jq -r '.queue.paused // .paused // false' "$SAB_QUEUE")
+
+    if [ "$SAB_STATUS_OK" = true ] && [ -f "$SAB_STATUS" ]; then
+
+        paused=$(jq -r \
+            --argjson fallback "$paused" \
+            '.status.paused // .paused // $fallback' \
+            "$SAB_STATUS")
+
+        pause_reason=$(jq -r \
+            '.status.pause_reason // .pause_reason // ""' \
+            "$SAB_STATUS")
+    fi
+
+    if [ "$paused" = true ] && (( monitored_count > 0 )); then
+
+        minimum_minutes="$SAB_PAUSE_WARN_MINUTES"
+        severity="WARNING"
+        classification="SAB_QUEUE_PAUSED"
+
+        if grep -Eqi 'disk|space|quota' <<<"$pause_reason" ||
+           jq -e '
+                (
+                    .queue.have_quota == true
+                    and
+                    ((.queue.left_quota | tonumber?) // 1) <= 0
+                )
+                or
+                (((.queue.diskspace1 | tonumber?) // 1) <= 0)
+                or
+                (((.queue.diskspace2 | tonumber?) // 1) <= 0)
+                ' "$SAB_QUEUE" >/dev/null 2>&1 ||
+           jq -e '
+                .warnings[]?
+                | select(
+                    (.text // .message // "")
+                    | test("disk|space|quota"; "i")
+                )
+                ' "$SAB_WARNINGS" >/dev/null 2>&1
+        then
+            minimum_minutes=0
+            severity="ERROR"
+            classification="SAB_QUEUE_PAUSED_STORAGE"
+        fi
+
+        if [ "$classification" = "SAB_QUEUE_PAUSED" ] && sab_pause_allowed_now; then
+
+            log "SABnzbd queue pause is inside an allowed pause window"
+
+        else
+
+            [ -n "$pause_reason" ] || pause_reason="SABnzbd queue is paused with monitored jobs waiting"
+
+            record_normalized_issue \
+                "SABnzbd:queue:global-pause" \
+                "SABnzbd" \
+                "SABnzbd queue paused" \
+                "$classification" \
+                "$severity" \
+                "paused" \
+                "$pause_reason" \
+                "" \
+                "${pause_reason}; monitored jobs: ${monitored_count}" \
+                1 \
+                "$minimum_minutes" \
+                "$API_FAILURE_ESCALATE_MINUTES"
+
+            ((SAB_PAUSED_COUNT++)) || true
+        fi
+    fi
+
+    if [ "$SAB_STATUS_OK" = true ] &&
+       jq -e '
+            [.status.servers[]? | select(.serveractive == true)] as $active
+            | ($active | length) > 0
+            and
+            all($active[]; (.servererror // "") != "")
+            ' "$SAB_STATUS" >/dev/null 2>&1
+    then
+
+        local server_errors
+
+        server_errors=$(jq -r '
+            [
+                .status.servers[]?
+                | select(
+                    .serveractive == true
+                    and
+                    (.servererror // "") != ""
+                )
+                | (.servername // "Unknown server")
+                  + ": "
+                  + .servererror
+            ]
+            | join(" | ")
+            ' "$SAB_STATUS")
+
+        record_normalized_issue \
+            "SABnzbd:status:all-servers-unavailable" \
+            "SABnzbd" \
+            "All SAB news servers unavailable" \
+            "SAB_ALL_SERVERS_UNAVAILABLE" \
+            "ERROR" \
+            "active" \
+            "$server_errors" \
+            "" \
+            "$server_errors" \
+            1 \
+            0 \
+            "$API_FAILURE_ESCALATE_MINUTES"
+    fi
+
+    [ "$SAB_MONITOR_UNKNOWN_CATEGORIES" = true ] || return 0
+
+    while IFS= read -r item; do
+
+        [ -n "$item" ] || continue
+
+        local category
+        local download_id
+        local name
+        local issue_hash
+
+        category=$(jq -r '.cat // .category // ""' <<<"$item")
+
+        if [ "${category,,}" = "${SAB_MOVIE_CATEGORY,,}" ] ||
+           [ "${category,,}" = "${SAB_TV_CATEGORY,,}" ] ||
+           [ "${category,,}" = "${SAB_IGNORED_CATEGORY,,}" ]
+        then
+            continue
+        fi
+
+        download_id=$(jq -r '.nzo_id // ""' <<<"$item")
+        name=$(jq -r '.filename // .name // "Unknown SAB job"' <<<"$item")
+        issue_hash="${download_id:-$(stable_issue_hash "${category}|${name}")}"
+
+        record_normalized_issue \
+            "SABnzbd:category:${issue_hash}" \
+            "SABnzbd" \
+            "$name" \
+            "SAB_CATEGORY_UNKNOWN" \
+            "WARNING" \
+            "active" \
+            "Unexpected SAB category: ${category:-default}" \
+            "" \
+            "Category: ${category:-default}" \
+            2 \
+            0 \
+            0
+
+        ((SAB_UNKNOWN_CATEGORY_COUNT++)) || true
+
+    done < <(jq -c '.queue.slots[]?' "$SAB_QUEUE")
+}
+
+prune_sab_progress_state() {
+
+    if [ "$SAB_QUEUE_OK" != true ] || [ "$SAB_HISTORY_OK" != true ]; then
+        return 0
+    fi
+
+    local ids_file="${TMP_DIR}/sab_progress_ids.json"
+    local tmp="${TMP_DIR}/state.sab-progress-pruned.json"
+
+    jq -R -s '
+        split("\n")
+        | map(select(length > 0))
+        | unique
+        ' "$SAB_PROGRESS_SEEN_FILE" >"$ids_file" || return 1
+
+    jq \
+        --slurpfile ids "$ids_file" \
+        '
+        ($ids[0] // []) as $activeIds
+        | .sabProgress = (
+            (.sabProgress // {})
+            | with_entries(
+                select(.key as $key | $activeIds | index($key))
+            )
+        )
+        ' "$STATE_FILE" >"$tmp" || return 1
+
+    save_state "$tmp"
 }
 
 ###############################################################################
@@ -3962,14 +5768,10 @@ process_sab_orphans() {
 
     log "Checking SABnzbd completed jobs for stranded downloads"
 
-    local records
-
-    records=$(jq -c '.history.slots[]?' "$SAB_HISTORY")
-
-    [ -n "$records" ] || {
+    if ! jq -e '(.history.slots // [] | length) > 0' "$SAB_HISTORY" >/dev/null 2>&1; then
         log "SABnzbd history contains no jobs"
         return
-    }
+    fi
 
     while IFS= read -r item; do
 
@@ -3981,7 +5783,7 @@ process_sab_orphans() {
         local name
 
         status=$(echo "$item" | jq -r '.status // ""')
-        category=$(echo "$item" | jq -r '.category // ""')
+        category=$(echo "$item" | jq -r '.category // .cat // ""')
         nzo_id=$(echo "$item" | jq -r '.nzo_id // ""')
         name=$(echo "$item" | jq -r '.name // .nzb_name // "Unknown"')
 
@@ -4413,7 +6215,7 @@ process_sab_orphans() {
             log "Notification suppressed: stranded issue already reported"
         fi
 
-    done <<<"$records"
+    done < <(jq -c '.history.slots[]?' "$SAB_HISTORY")
 }
 
 ###############################################################################
@@ -4642,6 +6444,145 @@ process_arr_activity_audit() {
 }
 
 ###############################################################################
+# PROCESS ARR HISTORY FAILURES - v3.0
+#
+# Queue state remains the primary detector. History fills the gap when a
+# failed download leaves the queue before the next five-minute scan.
+###############################################################################
+
+history_media_name() {
+
+    local app="$1"
+    local item="$2"
+
+    if [ "$app" = "Sonarr" ]; then
+
+        jq -r '
+            def pad2:
+                tostring | if length < 2 then "0" + . else . end;
+
+            if (.series.title // "") != "" then
+                .series.title
+                + (
+                    if (.episode.seasonNumber // null) != null
+                       and (.episode.episodeNumber // null) != null
+                    then
+                        " - S"
+                        + (.episode.seasonNumber | pad2)
+                        + "E"
+                        + (.episode.episodeNumber | pad2)
+                        + (
+                            if (.episode.title // "") != ""
+                            then " - " + .episode.title
+                            else ""
+                            end
+                        )
+                    else ""
+                    end
+                )
+            else
+                (.sourceTitle // "Unknown")
+            end
+            ' <<<"$item"
+
+    else
+
+        jq -r '
+            if (.movie.title // "") != "" then
+                .movie.title
+                + (
+                    if (.movie.year // 0) > 0
+                    then " (" + (.movie.year | tostring) + ")"
+                    else ""
+                    end
+                )
+            else
+                (.sourceTitle // "Unknown")
+            end
+            ' <<<"$item"
+    fi
+}
+
+process_arr_history_failures() {
+
+    local app="$1"
+    local history_file="$2"
+
+    [ -f "$history_file" ] || return 0
+
+    while IFS= read -r item; do
+
+        [ -n "$item" ] || continue
+
+        local record_id
+        local download_id
+        local title
+        local release
+        local date_value
+        local age
+        local message
+        local issue_id
+
+        record_id=$(jq -r '.id // ""' <<<"$item")
+        download_id=$(jq -r '.downloadId // .data.downloadId // .data.downloadClientId // ""' <<<"$item")
+
+        if [ -n "$download_id" ] && sab_primary_download_exists "$download_id"; then
+            continue
+        fi
+
+        if [ -n "$download_id" ] &&
+           jq -e \
+                --arg id "$download_id" \
+                'any(
+                    .[]?;
+                    .eventType == "downloadFolderImported"
+                    and
+                    (
+                        (.downloadId // .data.downloadId // .data.downloadClientId // "")
+                        == $id
+                    )
+                )' \
+                "$history_file" >/dev/null 2>&1
+        then
+            continue
+        fi
+
+        title=$(history_media_name "$app" "$item")
+        release=$(jq -r '.sourceTitle // "Unknown release"' <<<"$item")
+        date_value=$(jq -r '.date // ""' <<<"$item")
+        age=$(age_hours "$date_value")
+        message=$(jq -r '
+            .data.message
+            // .data.reason
+            // .data.statusMessage
+            // "Arr recorded a failed download"
+            ' <<<"$item")
+
+        issue_id="${download_id:-${record_id:-$(stable_issue_hash "${app}|${release}|${date_value}")}}"
+
+        record_normalized_issue \
+            "${app}:history:download-failed:${issue_id}" \
+            "$app" \
+            "$title" \
+            "ARR_DOWNLOAD_FAILED_HISTORY" \
+            "ERROR" \
+            "failed" \
+            "$message" \
+            "$age" \
+            "Release: ${release}"$'\n'"Failure: ${message}" \
+            1 \
+            0 \
+            "$API_FAILURE_ESCALATE_MINUTES"
+
+    done < <(
+        jq -c '
+            .[]?
+            | select(.eventType == "downloadFailed")
+            ' "$history_file"
+    )
+}
+
+###############################################################################
 # SAB HISTORY EVENT TIME - v2.5
 #
 # Reuses the timestamp styles SAB has already exposed to this script.
@@ -4684,12 +6625,19 @@ process_sab_activity_audit() {
     fi
 
     local loaded
+    local total_available
     local oldest_epoch=0
 
     loaded=$(
         jq '.history.slots // [] | length' \
             "$SAB_HISTORY" 2>/dev/null ||
             echo 0
+    )
+
+    total_available=$(
+        jq '.history.noofslots // (.history.slots // [] | length)' \
+            "$SAB_HISTORY" 2>/dev/null ||
+            echo "$loaded"
     )
 
     while IFS= read -r item; do
@@ -4707,7 +6655,7 @@ process_sab_activity_audit() {
 
         category=$(
             echo "$item" |
-                jq -r '.category // ""'
+                jq -r '.category // .cat // ""'
         )
 
         event_epoch=$(sab_history_event_epoch "$item")
@@ -4779,14 +6727,13 @@ process_sab_activity_audit() {
     ###########################################################################
     # DETECT POSSIBLY TRUNCATED HISTORY
     #
-    # If all SAB_HISTORY_LIMIT records are loaded and even the oldest loaded
-    # record is still newer than our requested audit cutoff, SAB may contain
-    # additional relevant records beyond the API limit.
+    # If the paginated safety cap was reached and even the oldest loaded record
+    # is newer than our requested audit cutoff, relevant records may remain.
     ###########################################################################
 
     SAB_AUDIT_WINDOW_INCOMPLETE=false
 
-    if (( loaded >= SAB_HISTORY_LIMIT )) &&
+    if (( loaded < total_available )) &&
        (( oldest_epoch > AUDIT_CUTOFF_EPOCH ))
     then
 
@@ -4817,34 +6764,30 @@ assess_pipeline_health() {
     local recent_failure_signals=0
     local recent_activity=0
 
-    recent_failure_signals=$(
-        (
-            SAB_AUDIT_MOVIE_FAILED
-            + SAB_AUDIT_TV_FAILED
-            + SONARR_AUDIT_DOWNLOAD_FAILED
-            + RADARR_AUDIT_DOWNLOAD_FAILED
-        )
-    )
+    recent_failure_signals=$((
+        SAB_AUDIT_MOVIE_FAILED
+        + SAB_AUDIT_TV_FAILED
+        + SONARR_AUDIT_DOWNLOAD_FAILED
+        + RADARR_AUDIT_DOWNLOAD_FAILED
+    ))
 
-    recent_activity=$(
-        (
-            SAB_AUDIT_MOVIE_COMPLETED
-            + SAB_AUDIT_TV_COMPLETED
-            + SONARR_AUDIT_IMPORTED
-            + RADARR_AUDIT_IMPORTED
-        )
-    )
+    recent_activity=$((
+        SAB_AUDIT_MOVIE_COMPLETED
+        + SAB_AUDIT_TV_COMPLETED
+        + SONARR_AUDIT_IMPORTED
+        + RADARR_AUDIT_IMPORTED
+    ))
 
     ###########################################################################
     # REQUIRED API UNAVAILABLE
     ###########################################################################
 
     if { [ "$SONARR_ENABLED" = true ] &&
-         [ "$SONARR_SCAN_OK" != true ]; } ||
+         [ "$SONARR_API_OK" != true ]; } ||
        { [ "$RADARR_ENABLED" = true ] &&
-         [ "$RADARR_SCAN_OK" != true ]; } ||
+         [ "$RADARR_API_OK" != true ]; } ||
        { [ "$SAB_ENABLED" = true ] &&
-         [ "$SAB_SCAN_OK" != true ]; }
+         [ "$SAB_API_OK" != true ]; }
     then
 
         PIPELINE_STATUS="UNAVAILABLE"
@@ -4962,7 +6905,7 @@ write_persistent_activity_summary() {
 
     persistent_log \
         "API" \
-        "Sonarr=${SONARR_SCAN_OK} | Radarr=${RADARR_SCAN_OK} | SABnzbd=${SAB_SCAN_OK}"
+        "Sonarr=${SONARR_API_OK} | Radarr=${RADARR_API_OK} | SABnzbd=${SAB_API_OK}"
 
     if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -5112,7 +7055,7 @@ calculate_flow_sab_activity() {
 
         category=$(
             echo "$item" |
-                jq -r '.category // ""'
+                jq -r '.category // .cat // ""'
         )
 
         #######################################################################
@@ -5176,6 +7119,7 @@ flow_explaining_issue_count() {
 
     jq -r \
         --arg app "$app" \
+        --argjson runStart "$START_TIME" \
         '
         [
             (
@@ -5186,6 +7130,10 @@ flow_explaining_issue_count() {
 
             | select(
                 (.value.active // false) == true
+            )
+
+            | select(
+                (.value.lastSeen // 0) >= $runStart
             )
 
             | select(
@@ -5421,6 +7369,23 @@ record_activity_flow_anomaly() {
         persistent_log \
             "ISSUE" \
             "${app} | ${classification} | ${severity} | ${kind} | SAB_completed=${sab_completed} | Arr_imports=${arr_imports} | window=${FLOW_ANOMALY_LOOKBACK_HOURS}h | stage=${stage}"
+    fi
+
+    if should_notify "$issue_key" "$signature"; then
+
+        queue_group_notification \
+            "$issue_key" \
+            "$signature" \
+            "$app" \
+            "$title" \
+            "$classification" \
+            "$severity" \
+            "" \
+            "$message"
+
+    else
+
+        log "Notification suppressed: activity-flow issue already reported"
     fi
 }
 
@@ -5688,6 +7653,15 @@ prune_state() {
 
         |
 
+        .sabProgress = (
+            (.sabProgress // {})
+            | with_entries(
+                select((.value.lastSeen // 0) >= $issueCutoff)
+            )
+        )
+
+        |
+
         #######################################################################
         # ARR TELEMETRY
         #######################################################################
@@ -5772,9 +7746,15 @@ TMP_DIR=$(mktemp -d /tmp/arr_health_activity.XXXXXX) || {
 
 NOTIFICATION_BATCH="${TMP_DIR}/notification_batch.jsonl"
 SEEN_ISSUES_FILE="${TMP_DIR}/seen_issues.txt"
+SAB_PRIMARY_DOWNLOADS_FILE="${TMP_DIR}/sab_primary_downloads.txt"
+SAB_PROGRESS_SEEN_FILE="${TMP_DIR}/sab_progress_seen.txt"
+SAB_PROGRESS_OBSERVATIONS_FILE="${TMP_DIR}/sab_progress_observations.jsonl"
 
 : >"$NOTIFICATION_BATCH"
 : >"$SEEN_ISSUES_FILE"
+: >"$SAB_PRIMARY_DOWNLOADS_FILE"
+: >"$SAB_PROGRESS_SEEN_FILE"
+: >"$SAB_PROGRESS_OBSERVATIONS_FILE"
 
 ###############################################################################
 # STATE
@@ -5790,7 +7770,7 @@ rotate_persistent_log
 
 persistent_log \
     "START" \
-    "ARR Import Monitor v2.6"
+    "ARR Health Monitor v3.0.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -5803,8 +7783,8 @@ fi
 # START
 ###############################################################################
 
-log "Starting ARR Import Monitor v2.6.1"
-log "Recommended schedule: hourly"
+log "Starting ARR Health Monitor v3.0.0"
+log "Recommended schedule: every five minutes"
 log "Notifications enabled: $SEND_NOTIFICATIONS"
 log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
 
@@ -5817,9 +7797,13 @@ if [ "$SAB_ENABLED" = true ]; then
     log "Connecting to SABnzbd"
 
     SAB_HISTORY="$TMP_DIR/sab_history.json"
+    SAB_QUEUE="$TMP_DIR/sab_queue.json"
+    SAB_WARNINGS="$TMP_DIR/sab_warnings.json"
+    SAB_STATUS="$TMP_DIR/sab_status.json"
 
-    if sab_get history "$SAB_HISTORY"; then
+    if fetch_sab_history "$SAB_HISTORY"; then
 
+        SAB_HISTORY_OK=true
         SAB_SCAN_OK=true
 
         SAB_COUNT=$(
@@ -5832,10 +7816,67 @@ if [ "$SAB_ENABLED" = true ]; then
 
     else
 
+        SAB_HISTORY_OK=false
         SAB_SCAN_OK=false
         SAB_HISTORY=""
 
-        log "WARNING: Unable to retrieve SABnzbd history"
+        SAB_API_FAILURES=$(append_api_failure \
+            "$SAB_API_FAILURES" \
+            "history" \
+            "$API_LAST_ERROR")
+    fi
+
+    if fetch_sab_queue "$SAB_QUEUE"; then
+
+        SAB_QUEUE_OK=true
+        log "SABnzbd queue entries: $(jq '.queue.slots // [] | length' "$SAB_QUEUE")"
+
+    else
+
+        SAB_QUEUE_OK=false
+        SAB_QUEUE=""
+        SAB_API_FAILURES=$(append_api_failure \
+            "$SAB_API_FAILURES" \
+            "queue" \
+            "$API_LAST_ERROR")
+    fi
+
+    if sab_get warnings "$SAB_WARNINGS"; then
+
+        SAB_WARNINGS_OK=true
+
+    else
+
+        SAB_WARNINGS_OK=false
+        SAB_WARNINGS=""
+        SAB_API_FAILURES=$(append_api_failure \
+            "$SAB_API_FAILURES" \
+            "warnings" \
+            "$API_LAST_ERROR")
+    fi
+
+    if sab_get status "$SAB_STATUS"; then
+
+        SAB_STATUS_OK=true
+
+    else
+
+        SAB_STATUS_OK=false
+        SAB_STATUS=""
+        SAB_API_FAILURES=$(append_api_failure \
+            "$SAB_API_FAILURES" \
+            "status" \
+            "$API_LAST_ERROR")
+    fi
+
+    SAB_API_OK=false
+
+    if [ "$SAB_HISTORY_OK" = true ] &&
+       [ "$SAB_QUEUE_OK" = true ] &&
+       [ "$SAB_WARNINGS_OK" = true ] &&
+       [ "$SAB_STATUS_OK" = true ]
+    then
+        SAB_API_OK=true
     fi
 fi
 
@@ -5845,18 +7886,20 @@ fi
 
 if [ "$SONARR_ENABLED" = true ]; then
 
-    log "Checking Sonarr queue"
+    log "Checking Sonarr health and queue"
 
     SONARR_QUEUE="$TMP_DIR/sonarr_queue.json"
+    SONARR_HEALTH="$TMP_DIR/sonarr_health.json"
+    SONARR_SYSTEM_STATUS="$TMP_DIR/sonarr_system_status.json"
 
-    SONARR_ENDPOINT="${SONARR_URL%/}/api/v3/queue?page=1&pageSize=${QUEUE_PAGE_SIZE}&includeUnknownSeriesItems=true&includeSeries=true&includeEpisode=true"
-
-    if api_get \
-        "$SONARR_ENDPOINT" \
+    if fetch_arr_queue \
+        "Sonarr" \
+        "$SONARR_URL" \
         "$SONARR_API_KEY" \
         "$SONARR_QUEUE"
     then
 
+        SONARR_QUEUE_OK=true
         SONARR_SCAN_OK=true
 
         SONARR_COUNT=$(
@@ -5867,16 +7910,56 @@ if [ "$SONARR_ENABLED" = true ]; then
 
         log "Sonarr queue entries: $SONARR_COUNT"
 
-        process_queue \
-            "Sonarr" \
-            "$SONARR_QUEUE"
-
     else
 
+        SONARR_QUEUE_OK=false
         SONARR_SCAN_OK=false
         SONARR_QUEUE=""
 
-        log "ERROR: Unable to retrieve Sonarr queue"
+        SONARR_API_FAILURES=$(append_api_failure \
+            "$SONARR_API_FAILURES" \
+            "queue" \
+            "$API_LAST_ERROR")
+    fi
+
+    if api_get \
+        "${SONARR_URL%/}/api/v3/health" \
+        "$SONARR_API_KEY" \
+        "$SONARR_HEALTH"
+    then
+        SONARR_HEALTH_OK=true
+    else
+        SONARR_HEALTH_OK=false
+        SONARR_HEALTH=""
+        SONARR_API_FAILURES=$(append_api_failure \
+            "$SONARR_API_FAILURES" \
+            "health" \
+            "$API_LAST_ERROR")
+    fi
+
+    if api_get \
+        "${SONARR_URL%/}/api/v3/system/status" \
+        "$SONARR_API_KEY" \
+        "$SONARR_SYSTEM_STATUS"
+    then
+        SONARR_STATUS_OK=true
+        log "Connected to Sonarr $(jq -r '.version // "unknown"' "$SONARR_SYSTEM_STATUS")"
+    else
+        SONARR_STATUS_OK=false
+        SONARR_SYSTEM_STATUS=""
+        SONARR_API_FAILURES=$(append_api_failure \
+            "$SONARR_API_FAILURES" \
+            "system/status" \
+            "$API_LAST_ERROR")
+    fi
+
+    SONARR_API_OK=false
+
+    if [ "$SONARR_QUEUE_OK" = true ] &&
+       [ "$SONARR_HEALTH_OK" = true ] &&
+       [ "$SONARR_STATUS_OK" = true ]
+    then
+        SONARR_API_OK=true
     fi
 fi
 
@@ -5886,18 +7969,20 @@ fi
 
 if [ "$RADARR_ENABLED" = true ]; then
 
-    log "Checking Radarr queue"
+    log "Checking Radarr health and queue"
 
     RADARR_QUEUE="$TMP_DIR/radarr_queue.json"
+    RADARR_HEALTH="$TMP_DIR/radarr_health.json"
+    RADARR_SYSTEM_STATUS="$TMP_DIR/radarr_system_status.json"
 
-    RADARR_ENDPOINT="${RADARR_URL%/}/api/v3/queue?page=1&pageSize=${QUEUE_PAGE_SIZE}&includeUnknownMovieItems=true&includeMovie=true"
-
-    if api_get \
-        "$RADARR_ENDPOINT" \
+    if fetch_arr_queue \
+        "Radarr" \
+        "$RADARR_URL" \
         "$RADARR_API_KEY" \
         "$RADARR_QUEUE"
     then
 
+        RADARR_QUEUE_OK=true
         RADARR_SCAN_OK=true
 
         RADARR_COUNT=$(
@@ -5908,16 +7993,96 @@ if [ "$RADARR_ENABLED" = true ]; then
 
         log "Radarr queue entries: $RADARR_COUNT"
 
-        process_queue \
-            "Radarr" \
-            "$RADARR_QUEUE"
-
     else
 
+        RADARR_QUEUE_OK=false
         RADARR_SCAN_OK=false
         RADARR_QUEUE=""
 
-        log "ERROR: Unable to retrieve Radarr queue"
+        RADARR_API_FAILURES=$(append_api_failure \
+            "$RADARR_API_FAILURES" \
+            "queue" \
+            "$API_LAST_ERROR")
+    fi
+
+    if api_get \
+        "${RADARR_URL%/}/api/v3/health" \
+        "$RADARR_API_KEY" \
+        "$RADARR_HEALTH"
+    then
+        RADARR_HEALTH_OK=true
+    else
+        RADARR_HEALTH_OK=false
+        RADARR_HEALTH=""
+        RADARR_API_FAILURES=$(append_api_failure \
+            "$RADARR_API_FAILURES" \
+            "health" \
+            "$API_LAST_ERROR")
+    fi
+
+    if api_get \
+        "${RADARR_URL%/}/api/v3/system/status" \
+        "$RADARR_API_KEY" \
+        "$RADARR_SYSTEM_STATUS"
+    then
+        RADARR_STATUS_OK=true
+        log "Connected to Radarr $(jq -r '.version // "unknown"' "$RADARR_SYSTEM_STATUS")"
+    else
+        RADARR_STATUS_OK=false
+        RADARR_SYSTEM_STATUS=""
+        RADARR_API_FAILURES=$(append_api_failure \
+            "$RADARR_API_FAILURES" \
+            "system/status" \
+            "$API_LAST_ERROR")
+    fi
+
+    RADARR_API_OK=false
+
+    if [ "$RADARR_QUEUE_OK" = true ] &&
+       [ "$RADARR_HEALTH_OK" = true ] &&
+       [ "$RADARR_STATUS_OK" = true ]
+    then
+        RADARR_API_OK=true
+    fi
+fi
+
+###############################################################################
+# UNIFIED HEALTH / QUEUE PROCESSING
+###############################################################################
+
+if [ "$SAB_ENABLED" = true ]; then
+
+    record_service_api_issue "SABnzbd" "$SAB_API_OK" "$SAB_API_FAILURES"
+    process_sab_warnings
+    process_sab_queue_health
+    process_sab_failed_jobs
+    process_sab_live_progress
+    evaluate_sab_progress
+fi
+
+if [ "$SONARR_ENABLED" = true ]; then
+
+    record_service_api_issue "Sonarr" "$SONARR_API_OK" "$SONARR_API_FAILURES"
+
+    if [ "$SONARR_HEALTH_OK" = true ]; then
+        process_arr_native_health "Sonarr" "$SONARR_HEALTH"
+    fi
+
+    if [ "$SONARR_QUEUE_OK" = true ]; then
+        process_queue "Sonarr" "$SONARR_QUEUE"
+    fi
+fi
+
+if [ "$RADARR_ENABLED" = true ]; then
+
+    record_service_api_issue "Radarr" "$RADARR_API_OK" "$RADARR_API_FAILURES"
+
+    if [ "$RADARR_HEALTH_OK" = true ]; then
+        process_arr_native_health "Radarr" "$RADARR_HEALTH"
+    fi
+
+    if [ "$RADARR_QUEUE_OK" = true ]; then
+        process_queue "Radarr" "$RADARR_QUEUE"
     fi
 fi
 
@@ -5939,8 +8104,7 @@ if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
     # SONARR HISTORY
     ###########################################################################
 
-    if [ "$SONARR_ENABLED" = true ] &&
-       [ "$SONARR_SCAN_OK" = true ]
+    if [ "$SONARR_ENABLED" = true ]
     then
 
         SONARR_AUDIT_HISTORY="${TMP_DIR}/sonarr_history_audit.json"
@@ -5955,6 +8119,10 @@ if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
             SONARR_AUDIT_OK=true
 
             process_arr_activity_audit \
+                "Sonarr" \
+                "$SONARR_AUDIT_HISTORY"
+
+            process_arr_history_failures \
                 "Sonarr" \
                 "$SONARR_AUDIT_HISTORY"
 
@@ -5974,8 +8142,7 @@ if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
     # RADARR HISTORY
     ###########################################################################
 
-    if [ "$RADARR_ENABLED" = true ] &&
-       [ "$RADARR_SCAN_OK" = true ]
+    if [ "$RADARR_ENABLED" = true ]
     then
 
         RADARR_AUDIT_HISTORY="${TMP_DIR}/radarr_history_audit.json"
@@ -5990,6 +8157,10 @@ if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
             RADARR_AUDIT_OK=true
 
             process_arr_activity_audit \
+                "Radarr" \
+                "$RADARR_AUDIT_HISTORY"
+
+            process_arr_history_failures \
                 "Radarr" \
                 "$RADARR_AUDIT_HISTORY"
 
@@ -6011,6 +8182,8 @@ fi
 ###############################################################################
 
 process_sab_orphans
+
+prune_sab_progress_state
 
 ###############################################################################
 # ACTIVITY FLOW ANOMALY - v2.6
@@ -6053,13 +8226,26 @@ write_persistent_activity_summary
 RUNTIME=$(runtime)
 
 log "============================================================"
-log "ARR Import Monitor v2.6.1 completed"
+log "ARR Health Monitor v3.0.0 completed"
 
 log ""
 log "SCAN HEALTH"
-log "Sonarr scan successful: $SONARR_SCAN_OK"
-log "Radarr scan successful: $RADARR_SCAN_OK"
-log "SABnzbd scan successful: $SAB_SCAN_OK"
+log "Sonarr API healthy: $SONARR_API_OK"
+log "  Queue: $SONARR_QUEUE_OK | Health: $SONARR_HEALTH_OK | Status: $SONARR_STATUS_OK"
+log "Radarr API healthy: $RADARR_API_OK"
+log "  Queue: $RADARR_QUEUE_OK | Health: $RADARR_HEALTH_OK | Status: $RADARR_STATUS_OK"
+log "SABnzbd API healthy: $SAB_API_OK"
+log "  History: $SAB_HISTORY_OK | Queue: $SAB_QUEUE_OK | Warnings: $SAB_WARNINGS_OK | Status: $SAB_STATUS_OK"
+
+log ""
+log "NATIVE HEALTH"
+log "Arr native health issues: $ARR_NATIVE_HEALTH_COUNT"
+log "Service API issues: $SERVICE_API_ISSUE_COUNT"
+log "SAB warnings/errors: $SAB_NATIVE_WARNING_COUNT"
+log "SAB failed jobs: $SAB_FAILED_JOB_COUNT"
+log "SAB stalled jobs: $SAB_STALLED_JOB_COUNT"
+log "SAB queue pauses: $SAB_PAUSED_COUNT"
+log "SAB unknown-category jobs: $SAB_UNKNOWN_CATEGORY_COUNT"
 
 log ""
 log "RECENT ACTIVITY - LAST ${ACTIVITY_AUDIT_LOOKBACK_HOURS}H"
@@ -6207,7 +8393,7 @@ else
 fi
 
 log ""
-log "Recommended run interval: hourly"
+log "Recommended run interval: every five minutes"
 log "Runtime: $RUNTIME"
 log "============================================================"
 
