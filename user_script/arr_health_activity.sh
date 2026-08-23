@@ -372,7 +372,7 @@ GROUP_NOTIFICATION_MAX_ITEMS=20
 # State
 # ---------------------------------------------------------------------------
 
-STATE_DIR="/mnt/vault/cloud/logs/arr_import_monitor"
+STATE_DIR="/mnt/vault/cloud/logs/arr_health_activity"
 
 STATE_FILE="${STATE_DIR}/state.json"
 STATE_BACKUP="${STATE_DIR}/state.json.bak"
@@ -384,16 +384,16 @@ STATE_RETENTION_DAYS=14
 # Persistent operational log - v2.5
 # ---------------------------------------------------------------------------
 
-LOG_FILE="${STATE_DIR}/arr_import_monitor.log"
+LOG_FILE="${STATE_DIR}/arr_health_activity.log"
 
 # Rotate after approximately 10 MiB.
 LOG_MAX_SIZE_MB=10
 
 # Keep:
-#   arr_import_monitor.log
-#   arr_import_monitor.log.1
-#   arr_import_monitor.log.2
-#   arr_import_monitor.log.3
+#   arr_health_activity.log
+#   arr_health_activity.log.1
+#   arr_health_activity.log.2
+#   arr_health_activity.log.3
 LOG_BACKUPS=3
 
 # ---------------------------------------------------------------------------
@@ -461,7 +461,7 @@ FLOW_ANOMALY_ESCALATE_HOURS=24
 # Runtime
 # ---------------------------------------------------------------------------
 
-LOCKFILE="/tmp/arr_import_monitor.lock"
+LOCKFILE="/tmp/arr_health_activity.lock"
 
 QUEUE_PAGE_SIZE=1000
 SAB_HISTORY_LIMIT=500
@@ -5765,7 +5765,7 @@ require_command grep
 # TEMP DIRECTORY
 ###############################################################################
 
-TMP_DIR=$(mktemp -d /tmp/arr_import_monitor.XXXXXX) || {
+TMP_DIR=$(mktemp -d /tmp/arr_health_activity.XXXXXX) || {
     log "ERROR: Unable to create temporary directory"
     exit 3
 }
