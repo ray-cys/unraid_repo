@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.2.0
+# ARR Health / Download / Import Monitor v3.3.0
 #
 # PURPOSE
 # -------
@@ -97,6 +97,17 @@
 #   - It was previously resolved and later reappears
 #
 # Resolutions can be included in the same grouped notification.
+# Active warnings and errors receive severity-based reminders. Acknowledging an
+# issue suppresses its unchanged signature until it resolves; an escalation or
+# other material signature change clears the acknowledgement automatically.
+#
+# Lifecycle commands from an Unraid terminal:
+#
+#   script --list-active
+#   script --ack ACK_ID "optional note"
+#   script --unack ACK_ID
+#
+# Each notification includes the short ACK_ID needed by these commands.
 #
 #
 # ARR-SIDE DETECTION
@@ -214,7 +225,7 @@
 #
 # ISSUE LIFECYCLE
 # ---------------
-# v2.2 records:
+# State records include:
 #
 #   firstSeen
 #   lastSeen
@@ -222,6 +233,11 @@
 #   active
 #   resolvedAt
 #   notifiedSignature
+#   lastNotifiedAt
+#   reminderCount
+#   transitionTimestamps
+#   flappingStartedAt / flappingUntil / flapNotifiedAt
+#   ackId / acknowledgedSignature / acknowledgedAt
 #   source
 #   normalizedMessage
 #
@@ -232,8 +248,8 @@
 #
 # Resolution notifications are configurable and grouped.
 #
-# If the same issue later returns, it starts a new lifecycle and may generate
-# a new notification.
+# If the same issue later returns, it normally starts a new lifecycle. Rapid
+# repeats are combined into a flapping episode instead.
 #
 #
 # SAFETY
@@ -515,6 +531,27 @@ GROUP_NOTIFICATION_MAX_BYTES=24000
 GROUP_NOTIFICATION_ITEM_MAX_CHARS=4000
 
 # ---------------------------------------------------------------------------
+# Notification lifecycle - v3.3
+# ---------------------------------------------------------------------------
+
+# Repeat unchanged active errors and warnings until they resolve or are
+# acknowledged. Informational issues do not receive reminders.
+REMINDERS_ENABLED=true
+ERROR_REMINDER_INTERVAL_HOURS=6
+WARNING_REMINDER_INTERVAL_HOURS=24
+
+# 0 means unlimited reminders while the issue remains active.
+REMINDER_MAX_COUNT=0
+
+# Treat repeated active/resolved transitions as one flapping episode. The
+# first detected episode is reported once; routine raise/restore messages are
+# then suppressed for the configured period.
+FLAP_DETECTION_ENABLED=true
+FLAP_WINDOW_MINUTES=60
+FLAP_TRANSITION_THRESHOLD=4
+FLAP_SUPPRESSION_MINUTES=120
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
@@ -745,6 +782,12 @@ DOWNLOAD_LEDGER_ISSUE_COUNT=0
 DOWNLOAD_LEDGER_NOT_REACHED_COUNT=0
 DOWNLOAD_LEDGER_VANISHED_COUNT=0
 DOWNLOAD_LEDGER_IMPORT_MISSING_COUNT=0
+REMINDER_NOTIFICATION_COUNT=0
+FLAPPING_NOTIFICATION_COUNT=0
+FLAPPING_SUPPRESSED_COUNT=0
+ACKNOWLEDGED_SUPPRESSED_COUNT=0
+NOTIFICATION_DECISION_EVENT="new"
+RESOLVED_ISSUE_KEY=""
 MONITOR_SCAN_FAILURE_COUNT=0
 MONITOR_NOTIFICATION_FAILURE_COUNT=0
 MONITOR_SCHEDULE_MISSED_COUNT=0
@@ -2607,7 +2650,7 @@ initialize_state() {
 
         cat >"$STATE_FILE" <<'EOF'
 {
-  "version": 10,
+  "version": 11,
   "issues": {},
   "sabProgress": {},
   "downloadLedger": {},
@@ -2649,7 +2692,7 @@ EOF
 
             cat >"$STATE_FILE" <<'EOF'
 {
-  "version": 10,
+  "version": 11,
   "issues": {},
   "sabProgress": {},
   "downloadLedger": {},
@@ -2683,10 +2726,52 @@ EOF
 
     migrate_tmp="$TMP_DIR/state.migrate.json"
 
-    if jq '
-        .version = 10
+    if jq \
+        --argjson migrationNow "$START_TIME" \
+        '
+        .version = 11
         |
         .issues = (.issues // {})
+        |
+        .issues |= with_entries(
+            .value |= (
+                .transitionTimestamps = (
+                    .transitionTimestamps
+                    // []
+                )
+                |
+                .flappingUntil = (.flappingUntil // 0)
+                |
+                .flappingStartedAt = (.flappingStartedAt // 0)
+                |
+                .flapNotifiedAt = (.flapNotifiedAt // 0)
+                |
+                .lastNotifiedAt = (
+                    if (.lastNotifiedAt // 0) > 0
+                    then .lastNotifiedAt
+                    elif (.notifiedSignature // "") != ""
+                    then $migrationNow
+                    else 0
+                    end
+                )
+                |
+                .reminderCount = (.reminderCount // 0)
+                |
+                .ackId = (.ackId // "")
+                |
+                .acknowledgedSignature = (
+                    .acknowledgedSignature
+                    // ""
+                )
+                |
+                .acknowledgedAt = (.acknowledgedAt // 0)
+                |
+                .acknowledgementNote = (
+                    .acknowledgementNote
+                    // ""
+                )
+            )
+        )
         |
         .sabProgress = (.sabProgress // {})
         |
@@ -2739,7 +2824,7 @@ EOF
 
     else
 
-        log "ERROR: Unable to migrate state file to schema version 10"
+        log "ERROR: Unable to migrate state file to schema version 11"
         exit 3
     fi
 }
@@ -2803,7 +2888,7 @@ begin_monitor_run() {
     jq \
         --argjson now "$now" \
         '
-        .version = 10
+        .version = 11
         |
         .monitor.lastStartedAt = $now
         |
@@ -3227,7 +3312,7 @@ record_arr_telemetry() {
         --argjson maxIssueKeys "$ARR_TELEMETRY_MAX_ISSUE_KEYS" \
         --argjson maxExamples "$ARR_TELEMETRY_MAX_EXAMPLES" \
         '
-        .version = 10
+        .version = 11
         |
         .telemetry = (
             .telemetry
@@ -3577,6 +3662,27 @@ issue_transition_should_persist() {
     return 1
 }
 
+issue_ack_id() {
+
+    printf '%s' "$1" |
+        sha256sum |
+        awk '{print substr($1, 1, 12)}'
+}
+
+issue_is_flapping() {
+
+    local issue_key="$1"
+    local now="${2:-$(date +%s)}"
+
+    [ "$FLAP_DETECTION_ENABLED" = true ] || return 1
+
+    jq -e \
+        --arg key "$issue_key" \
+        --argjson now "$now" \
+        '(.issues[$key].flappingUntil // 0) > $now' \
+        "$STATE_FILE" >/dev/null 2>&1
+}
+
 ###############################################################################
 # ISSUE STATE UPDATE
 #
@@ -3584,7 +3690,7 @@ issue_transition_should_persist() {
 #
 #   - firstSeen resets
 #   - occurrences resets
-#   - notifiedSignature resets
+#   - notifiedSignature resets unless a flapping suppression is active
 #
 # This allows the returning issue to alert again.
 ###############################################################################
@@ -3604,8 +3710,14 @@ update_issue_state() {
 
     local now
     local tmp
+    local ack_id
+    local transition_cutoff
+    local flap_suppression_seconds
 
     now=$(date +%s)
+    ack_id=$(issue_ack_id "$issue_key")
+    transition_cutoff=$((now - FLAP_WINDOW_MINUTES * 60))
+    flap_suppression_seconds=$((FLAP_SUPPRESSION_MINUTES * 60))
 
     tmp="$TMP_DIR/state.new.json"
 
@@ -3620,22 +3732,75 @@ update_issue_state() {
         --arg message "$message" \
         --arg issueSource "$issue_source" \
         --arg normalizedMessage "$normalized_message" \
+        --arg ackId "$ack_id" \
         --argjson now "$now" \
+        --argjson flapEnabled "$FLAP_DETECTION_ENABLED" \
+        --argjson transitionCutoff "$transition_cutoff" \
+        --argjson flapThreshold "$FLAP_TRANSITION_THRESHOLD" \
+        --argjson flapSuppressionSeconds "$flap_suppression_seconds" \
         '
-        .version = 10
+        .version = 11
         |
         (.issues[$key] // {}) as $old
         |
         ($old.active // false) as $wasActive
+        |
+        (
+            ($old.transitionTimestamps // [])
+            | map(
+                select(
+                    type == "number"
+                    and . >= $transitionCutoff
+                )
+              )
+        ) as $recentTransitions
+        |
+        (
+            if $wasActive
+            then $recentTransitions
+            else $recentTransitions + [$now]
+            end
+        ) as $transitions
+        |
+        (($old.flappingUntil // 0) > $now) as $wasFlapping
+        |
+        (
+            $flapEnabled
+            and ($wasActive | not)
+            and (($transitions | length) >= $flapThreshold)
+            and ($wasFlapping | not)
+        ) as $startFlapping
         |
         .issues[$key] = {
             signature: $signature,
 
             notifiedSignature:
                 (
-                    if $wasActive
+                    if $wasActive or $wasFlapping
                     then ($old.notifiedSignature // "")
                     else ""
+                    end
+                ),
+
+            lastNotifiedAt:
+                (
+                    if $wasActive or $wasFlapping
+                    then
+                        if ($old.lastNotifiedAt // 0) > 0
+                        then $old.lastNotifiedAt
+                        elif ($old.notifiedSignature // "") != ""
+                        then $now
+                        else 0
+                        end
+                    else 0
+                    end
+                ),
+
+            reminderCount:
+                (
+                    if $wasActive or $wasFlapping
+                    then ($old.reminderCount // 0)
+                    else 0
                     end
                 ),
 
@@ -3667,7 +3832,50 @@ update_issue_state() {
                 ),
 
             active: true,
-            resolvedAt: null
+            resolvedAt: null,
+
+            ackId: $ackId,
+            acknowledgedSignature:
+                (
+                    if $wasActive
+                       and ($old.signature // "") == $signature
+                    then ($old.acknowledgedSignature // "")
+                    else ""
+                    end
+                ),
+            acknowledgedAt:
+                (
+                    if $wasActive
+                       and ($old.signature // "") == $signature
+                    then ($old.acknowledgedAt // 0)
+                    else 0
+                    end
+                ),
+            acknowledgementNote:
+                (
+                    if $wasActive
+                       and ($old.signature // "") == $signature
+                    then ($old.acknowledgementNote // "")
+                    else ""
+                    end
+                ),
+
+            transitionTimestamps: $transitions,
+            flappingUntil:
+                (
+                    if $startFlapping
+                    then $now + $flapSuppressionSeconds
+                    else ($old.flappingUntil // 0)
+                    end
+                ),
+            flappingStartedAt:
+                (
+                    if $startFlapping
+                    then $now
+                    else ($old.flappingStartedAt // 0)
+                    end
+                ),
+            flapNotifiedAt: ($old.flapNotifiedAt // 0)
         }
         ' \
         "$STATE_FILE" >"$tmp" || return 1
@@ -3685,45 +3893,152 @@ should_notify() {
 
     local issue_key="$1"
     local signature="$2"
+    local severity="${3:-}"
+
+    local lifecycle
+    local previous
+    local last_notified_at
+    local reminder_count
+    local acknowledged_signature
+    local flapping_until
+    local flapping_started_at
+    local flap_notified_at
+    local stored_severity
+    local now
+    local reminder_interval_hours=0
+
+    NOTIFICATION_DECISION_EVENT="new"
+    now=$(date +%s)
+
+    lifecycle=$(jq -r \
+        --arg key "$issue_key" \
+        '
+        (.issues[$key] // {})
+        | [
+            (.notifiedSignature // ""),
+            ((.lastNotifiedAt // 0) | tostring),
+            ((.reminderCount // 0) | tostring),
+            (.acknowledgedSignature // ""),
+            ((.flappingUntil // 0) | tostring),
+            ((.flappingStartedAt // 0) | tostring),
+            ((.flapNotifiedAt // 0) | tostring),
+            (.severity // "")
+          ]
+        | join("|")
+        ' "$STATE_FILE")
+
+    IFS='|' read -r \
+        previous \
+        last_notified_at \
+        reminder_count \
+        acknowledged_signature \
+        flapping_until \
+        flapping_started_at \
+        flap_notified_at \
+        stored_severity \
+        <<<"$lifecycle"
+
+    [[ "$last_notified_at" =~ ^[0-9]+$ ]] || last_notified_at=0
+    [[ "$reminder_count" =~ ^[0-9]+$ ]] || reminder_count=0
+    [[ "$flapping_until" =~ ^[0-9]+$ ]] || flapping_until=0
+    [[ "$flapping_started_at" =~ ^[0-9]+$ ]] || flapping_started_at=0
+    [[ "$flap_notified_at" =~ ^[0-9]+$ ]] || flap_notified_at=0
+
+    [ -n "$severity" ] || severity="$stored_severity"
+
+    if [ -n "$acknowledged_signature" ] &&
+       [ "$acknowledged_signature" = "$signature" ]
+    then
+        ((ACKNOWLEDGED_SUPPRESSED_COUNT++)) || true
+        ((NOTIFICATIONS_SUPPRESSED++)) || true
+        return 1
+    fi
+
+    if (( flapping_until > now && flap_notified_at < flapping_started_at )); then
+        NOTIFICATION_DECISION_EVENT="flapping"
+        ((FLAPPING_NOTIFICATION_COUNT++)) || true
+        return 0
+    fi
+
+    if [ "$previous" != "$signature" ]; then
+        return 0
+    fi
+
+    if (( flapping_until > now )); then
+        ((FLAPPING_SUPPRESSED_COUNT++)) || true
+        ((NOTIFICATIONS_SUPPRESSED++)) || true
+        return 1
+    fi
 
     if [ "$NOTIFY_ONCE" != true ]; then
         return 0
     fi
 
-    local previous
+    if [ "$REMINDERS_ENABLED" = true ]; then
 
-    previous=$(
-        jq -r \
-            --arg key "$issue_key" \
-            '.issues[$key].notifiedSignature // ""' \
-            "$STATE_FILE"
-    )
+        case "$severity" in
+            ERROR)
+                reminder_interval_hours="$ERROR_REMINDER_INTERVAL_HOURS"
+                ;;
 
-    if [ "$previous" = "$signature" ]; then
+            WARNING)
+                reminder_interval_hours="$WARNING_REMINDER_INTERVAL_HOURS"
+                ;;
+        esac
 
-        ((NOTIFICATIONS_SUPPRESSED++)) || true
-
-        return 1
+        if (( reminder_interval_hours > 0 && last_notified_at > 0 )) &&
+           (( now - last_notified_at >= reminder_interval_hours * 3600 )) &&
+           { (( REMINDER_MAX_COUNT == 0 )) ||
+             (( reminder_count < REMINDER_MAX_COUNT )); }
+        then
+            NOTIFICATION_DECISION_EVENT="reminder"
+            ((REMINDER_NOTIFICATION_COUNT++)) || true
+            return 0
+        fi
     fi
 
-    return 0
+    ((NOTIFICATIONS_SUPPRESSED++)) || true
+    return 1
 }
 
 mark_notified() {
 
     local issue_key="$1"
     local signature="$2"
+    local event="${3:-new}"
 
     local tmp
+    local now
 
     tmp="$TMP_DIR/state.notified.json"
+    now=$(date +%s)
 
     jq \
         --arg key "$issue_key" \
         --arg signature "$signature" \
+        --arg event "$event" \
+        --argjson now "$now" \
         '
         if .issues[$key] then
             .issues[$key].notifiedSignature = $signature
+            |
+            .issues[$key].lastNotifiedAt = $now
+            |
+            .issues[$key].reminderCount = (
+                if $event == "reminder"
+                then ((.issues[$key].reminderCount // 0) + 1)
+                elif $event == "resolved"
+                then (.issues[$key].reminderCount // 0)
+                else 0
+                end
+            )
+            |
+            .issues[$key].flapNotifiedAt = (
+                if $event == "flapping"
+                then $now
+                else (.issues[$key].flapNotifiedAt // 0)
+                end
+            )
         else
             .
         end
@@ -3743,20 +4058,79 @@ mark_issue_resolved() {
 
     local now
     local tmp
+    local transition_cutoff
+    local flap_suppression_seconds
 
     now=$(date +%s)
+    transition_cutoff=$((now - FLAP_WINDOW_MINUTES * 60))
+    flap_suppression_seconds=$((FLAP_SUPPRESSION_MINUTES * 60))
 
     tmp="$TMP_DIR/state.resolved.json"
 
     jq \
         --arg key "$issue_key" \
         --argjson now "$now" \
+        --argjson flapEnabled "$FLAP_DETECTION_ENABLED" \
+        --argjson transitionCutoff "$transition_cutoff" \
+        --argjson flapThreshold "$FLAP_TRANSITION_THRESHOLD" \
+        --argjson flapSuppressionSeconds "$flap_suppression_seconds" \
         '
         if .issues[$key] then
-
+            (.issues[$key] // {}) as $old
+            |
+            ($old.active // false) as $wasActive
+            |
+            (
+                ($old.transitionTimestamps // [])
+                | map(
+                    select(
+                        type == "number"
+                        and . >= $transitionCutoff
+                    )
+                  )
+            ) as $recentTransitions
+            |
+            (
+                if $wasActive
+                then $recentTransitions + [$now]
+                else $recentTransitions
+                end
+            ) as $transitions
+            |
+            (($old.flappingUntil // 0) > $now) as $wasFlapping
+            |
+            (
+                $flapEnabled
+                and $wasActive
+                and (($transitions | length) >= $flapThreshold)
+                and ($wasFlapping | not)
+            ) as $startFlapping
+            |
             .issues[$key].active = false
             |
             .issues[$key].resolvedAt = $now
+            |
+            .issues[$key].transitionTimestamps = $transitions
+            |
+            .issues[$key].flappingUntil = (
+                if $startFlapping
+                then $now + $flapSuppressionSeconds
+                else ($old.flappingUntil // 0)
+                end
+            )
+            |
+            .issues[$key].flappingStartedAt = (
+                if $startFlapping
+                then $now
+                else ($old.flappingStartedAt // 0)
+                end
+            )
+            |
+            .issues[$key].acknowledgedSignature = ""
+            |
+            .issues[$key].acknowledgedAt = 0
+            |
+            .issues[$key].acknowledgementNote = ""
 
         else
             .
@@ -3765,6 +4139,199 @@ mark_issue_resolved() {
         "$STATE_FILE" >"$tmp" || return 1
 
     save_state "$tmp"
+}
+
+###############################################################################
+# OPERATOR ACKNOWLEDGEMENT - v3.3
+###############################################################################
+
+resolve_active_issue_selector() {
+
+    local selector="$1"
+    local record
+    local issue_key
+    local ack_id
+    local -a matches=()
+
+    RESOLVED_ISSUE_KEY=""
+
+    while IFS= read -r record; do
+
+        [ -n "$record" ] || continue
+
+        issue_key=$(jq -r '.key' <<<"$record")
+        ack_id=$(jq -r '.value.ackId // ""' <<<"$record")
+
+        [ -n "$ack_id" ] || ack_id=$(issue_ack_id "$issue_key")
+
+        if [ "$issue_key" = "$selector" ] ||
+           [[ "$ack_id" == "$selector"* ]]
+        then
+            matches+=("$issue_key")
+        fi
+
+    done < <(
+        jq -c '
+            .issues
+            | to_entries[]?
+            | select(.value.active == true)
+            ' "$STATE_FILE"
+    )
+
+    case "${#matches[@]}" in
+        1)
+            RESOLVED_ISSUE_KEY="${matches[0]}"
+            return 0
+            ;;
+
+        0)
+            log "ERROR: No active issue matches acknowledgement selector: $selector"
+            return 1
+            ;;
+
+        *)
+            log "ERROR: Acknowledgement selector is ambiguous: $selector"
+            return 1
+            ;;
+    esac
+}
+
+acknowledge_active_issue() {
+
+    local selector="$1"
+    local note="${2:-}"
+    local issue_key
+    local ack_id
+    local now
+    local tmp="${TMP_DIR}/state.acknowledged.json"
+
+    resolve_active_issue_selector "$selector" || return 1
+    issue_key="$RESOLVED_ISSUE_KEY"
+    ack_id=$(issue_ack_id "$issue_key")
+    now=$(date +%s)
+
+    jq \
+        --arg key "$issue_key" \
+        --arg ackId "$ack_id" \
+        --arg note "$note" \
+        --argjson now "$now" \
+        '
+        if (.issues[$key].active // false) == true then
+            .issues[$key].ackId = $ackId
+            |
+            .issues[$key].acknowledgedSignature = (
+                .issues[$key].signature
+                // ""
+            )
+            |
+            .issues[$key].acknowledgedAt = $now
+            |
+            .issues[$key].acknowledgementNote = $note
+        else
+            .
+        end
+        ' "$STATE_FILE" >"$tmp" || return 1
+
+    save_state "$tmp" || return 1
+
+    persistent_log \
+        "ACKNOWLEDGED" \
+        "issue=${issue_key} | ack_id=${ack_id} | note=${note:-none}"
+
+    printf 'Acknowledged active issue %s (%s)\n' "$ack_id" "$issue_key"
+}
+
+unacknowledge_active_issue() {
+
+    local selector="$1"
+    local issue_key
+    local ack_id
+    local tmp="${TMP_DIR}/state.unacknowledged.json"
+
+    resolve_active_issue_selector "$selector" || return 1
+    issue_key="$RESOLVED_ISSUE_KEY"
+    ack_id=$(issue_ack_id "$issue_key")
+
+    jq \
+        --arg key "$issue_key" \
+        '
+        if .issues[$key] then
+            .issues[$key].acknowledgedSignature = ""
+            |
+            .issues[$key].acknowledgedAt = 0
+            |
+            .issues[$key].acknowledgementNote = ""
+        else
+            .
+        end
+        ' "$STATE_FILE" >"$tmp" || return 1
+
+    save_state "$tmp" || return 1
+
+    persistent_log \
+        "UNACKNOWLEDGED" \
+        "issue=${issue_key} | ack_id=${ack_id}"
+
+    printf 'Removed acknowledgement from %s (%s)\n' "$ack_id" "$issue_key"
+}
+
+list_active_issues() {
+
+    local record
+    local issue_key
+    local ack_id
+    local acknowledged
+
+    printf 'ACK ID       SEVERITY  SOURCE     ACKNOWLEDGED  CLASSIFICATION  TITLE\n'
+
+    while IFS= read -r record; do
+
+        [ -n "$record" ] || continue
+
+        issue_key=$(jq -r '.key' <<<"$record")
+        ack_id=$(jq -r '.value.ackId // ""' <<<"$record")
+        [ -n "$ack_id" ] || ack_id=$(issue_ack_id "$issue_key")
+
+        acknowledged=$(jq -r '
+            (
+                (.value.acknowledgedSignature // "") != ""
+                and
+                (.value.acknowledgedSignature == .value.signature)
+            )
+            | tostring
+            ' <<<"$record")
+
+        jq -r \
+            --arg ackId "$ack_id" \
+            --arg acknowledged "$acknowledged" \
+            '[
+                $ackId,
+                (.value.severity // "UNKNOWN"),
+                (.value.app // "Unknown"),
+                $acknowledged,
+                (.value.classification // "UNKNOWN"),
+                (.value.title // "Unknown")
+             ]
+             | @tsv' <<<"$record"
+
+    done < <(
+        jq -c '
+            .issues
+            | to_entries[]?
+            | select(.value.active == true)
+            ' "$STATE_FILE"
+    )
+}
+
+print_lifecycle_command_help() {
+
+    printf '%s\n' \
+        'ARR Health Monitor lifecycle commands:' \
+        '  --list-active' \
+        '  --ack ACK_ID [note]' \
+        '  --unack ACK_ID' \
+        '' \
+        'Acknowledgements apply only to the current issue signature and clear on resolution or material change.'
 }
 
 ###############################################################################
@@ -3989,8 +4556,14 @@ resolve_missing_issues() {
                 "RESOLVED" \
                 "${source} | ${classification} | ${title} | lifetime=${lifetime_hours}h"
 
-            if [ "$SEND_RESOLUTION_NOTIFICATIONS" = true ] &&
-               [ -n "$notified_signature" ]; then
+            if issue_is_flapping "$issue_key" "$now"; then
+
+                ((FLAPPING_SUPPRESSED_COUNT++)) || true
+                ((NOTIFICATIONS_SUPPRESSED++)) || true
+                log "Resolution notification suppressed during flapping episode: $issue_key"
+
+            elif [ "$SEND_RESOLUTION_NOTIFICATIONS" = true ] &&
+                 [ -n "$notified_signature" ]; then
 
                 local resolution_signature
 
@@ -4036,7 +4609,10 @@ queue_group_notification() {
     local severity="$6"
     local age="$7"
     local detail="$8"
-    local event="${9:-new}"
+    local event="${9:-${NOTIFICATION_DECISION_EVENT:-new}}"
+    local ack_id
+
+    ack_id=$(issue_ack_id "$issue_key")
 
     jq -nc \
         --arg issueKey "$issue_key" \
@@ -4048,6 +4624,7 @@ queue_group_notification() {
         --arg age "$age" \
         --arg detail "$detail" \
         --arg event "$event" \
+        --arg ackId "$ack_id" \
         '{
             issueKey: $issueKey,
             signature: $signature,
@@ -4057,11 +4634,14 @@ queue_group_notification() {
             severity: $severity,
             age: $age,
             detail: $detail,
-            event: $event
+            event: $event,
+            ackId: $ackId
         }' \
         >>"$NOTIFICATION_BATCH"
 
     ((BATCHED_NOTIFICATION_ITEMS++)) || true
+
+    NOTIFICATION_DECISION_EVENT="new"
 
     log "Queued issue for grouped notification"
 }
@@ -4099,13 +4679,30 @@ notification_record_text() {
     rendered=$(jq -r '
         (.event // "new") as $event
         | (.detail // "") as $detail
+        | (.ackId // "") as $ackId
         | "- [" + (.source // "Unknown") + "] " + (.title // "Unknown")
           + "\n  "
           + (.classification // "UNKNOWN")
           + (
                 if $event == "resolved"
                 then " [RESOLVED]"
+                elif $event == "reminder"
+                then " [" + (.severity // "INFO") + "] [REMINDER]"
+                elif $event == "flapping"
+                then " [" + (.severity // "INFO") + "] [FLAPPING]"
                 else " [" + (.severity // "INFO") + "]"
+            end
+          )
+          + (
+                if $event != "resolved" and $ackId != ""
+                then "\n  Ack ID: " + $ackId
+                else ""
+            end
+          )
+          + (
+                if $event == "flapping"
+                then "\n  Lifecycle: repeated raise/resolve transitions detected; routine notifications are temporarily suppressed."
+                else ""
             end
           )
           + (
@@ -4153,6 +4750,8 @@ send_notification_page() {
     local warning_new
     local error_new
     local resolved
+    local reminders
+    local flapping
     local body=""
     local record
     local entry
@@ -4171,6 +4770,12 @@ send_notification_page() {
         "$page_file")
     resolved=$(jq -s \
         '[.[] | select(.event == "resolved")] | length' \
+        "$page_file")
+    reminders=$(jq -s \
+        '[.[] | select(.event == "reminder")] | length' \
+        "$page_file")
+    flapping=$(jq -s \
+        '[.[] | select(.event == "flapping")] | length' \
         "$page_file")
 
     case "$highest" in
@@ -4196,6 +4801,7 @@ send_notification_page() {
 
     body="Health/activity updates: ${batch_total}"$'\n'
     body+="This batch: ${page_items} | Info: ${info_new} | Warnings: ${warning_new} | Errors: ${error_new} | Resolved: ${resolved}"$'\n'
+    body+="Reminders: ${reminders} | Flapping: ${flapping}"$'\n'
 
     if (( page_total > 1 )); then
         body+="Batch: ${page_number}/${page_total}"$'\n'
@@ -4227,18 +4833,20 @@ send_notification_page() {
     fi
 
     # Only records actually included in this successfully delivered page are
-    # acknowledged. Later or failed pages remain eligible on the next run.
+    # marked delivered. Later or failed pages remain eligible on the next run.
     while IFS= read -r record; do
 
         [ -n "$record" ] || continue
 
         local issue_key
         local signature
+        local event
 
         issue_key=$(jq -r '.issueKey' <<<"$record")
         signature=$(jq -r '.signature' <<<"$record")
+        event=$(jq -r '.event // "new"' <<<"$record")
 
-        if ! mark_notified "$issue_key" "$signature"; then
+        if ! mark_notified "$issue_key" "$signature" "$event"; then
             log "WARNING: Failed to mark issue notified: $issue_key"
         fi
 
@@ -10057,6 +10665,38 @@ ensure_state_storage_ready
 
 initialize_state
 
+case "${1:-}" in
+    --list-active)
+        list_active_issues
+        exit 0
+        ;;
+
+    --ack)
+        if [ -z "${2:-}" ]; then
+            print_lifecycle_command_help
+            exit 2
+        fi
+
+        acknowledge_active_issue "$2" "${*:3}" || exit 2
+        exit 0
+        ;;
+
+    --unack)
+        if [ -z "${2:-}" ]; then
+            print_lifecycle_command_help
+            exit 2
+        fi
+
+        unacknowledge_active_issue "$2" || exit 2
+        exit 0
+        ;;
+
+    --help|--lifecycle-help)
+        print_lifecycle_command_help
+        exit 0
+        ;;
+esac
+
 if ! begin_monitor_run; then
     log "ERROR: Unable to update monitor run-start heartbeat"
     persistent_log "ERROR" "Unable to update monitor run-start heartbeat"
@@ -10070,7 +10710,7 @@ rotate_persistent_log
 
 persistent_log \
     "START" \
-    "ARR Health Monitor v3.2.0"
+    "ARR Health Monitor v3.3.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -10083,7 +10723,7 @@ fi
 # START
 ###############################################################################
 
-log "Starting ARR Health Monitor v3.2.0"
+log "Starting ARR Health Monitor v3.3.0"
 log "Recommended schedule: every five minutes"
 log "Notifications enabled: $SEND_NOTIFICATIONS"
 log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -10569,7 +11209,7 @@ write_persistent_activity_summary
 RUNTIME=$(runtime)
 
 log "============================================================"
-log "ARR Health Monitor v3.2.0 completed"
+log "ARR Health Monitor v3.3.0 completed"
 
 log ""
 log "SCAN HEALTH"
@@ -10678,6 +11318,10 @@ log "Filesystem scan deferred by mover: $SAB_FILESYSTEM_SCAN_DEFERRED"
 log ""
 log "LIFECYCLE"
 log "Issues resolved this run: $RESOLVED_COUNT"
+log "Reminders queued: $REMINDER_NOTIFICATION_COUNT"
+log "Flapping episodes queued: $FLAPPING_NOTIFICATION_COUNT"
+log "Flapping notifications suppressed: $FLAPPING_SUPPRESSED_COUNT"
+log "Acknowledged notifications suppressed: $ACKNOWLEDGED_SUPPRESSED_COUNT"
 
 log ""
 log "TOTAL"
@@ -10747,17 +11391,17 @@ log "Reason: $PIPELINE_REASON"
 
 log ""
 log "NOTIFICATIONS"
-log "New/escalated issues queued for grouping: $BATCHED_NOTIFICATION_ITEMS"
+log "Lifecycle updates queued for grouping: $BATCHED_NOTIFICATION_ITEMS"
 
 if [ "$SEND_NOTIFICATIONS" = true ]; then
 
     log "Grouped notifications sent: $NOTIFICATIONS_SENT"
-    log "Previously-notified issues suppressed: $NOTIFICATIONS_SUPPRESSED"
+    log "Notifications suppressed by lifecycle state: $NOTIFICATIONS_SUPPRESSED"
 
 else
 
     log "Notifications: DISABLED"
-    log "Previously-notified issues suppressed: $NOTIFICATIONS_SUPPRESSED"
+    log "Notifications suppressed by lifecycle state: $NOTIFICATIONS_SUPPRESSED"
 fi
 
 log ""
@@ -10767,7 +11411,7 @@ log "============================================================"
 
 persistent_log \
     "END" \
-    "runtime=${RUNTIME} | active_issues=${TOTAL_ISSUES} | info=${INFO_COUNT} | warnings=${WARNING_COUNT} | errors=${ERROR_COUNT}"
+    "runtime=${RUNTIME} | active_issues=${TOTAL_ISSUES} | info=${INFO_COUNT} | warnings=${WARNING_COUNT} | errors=${ERROR_COUNT} | reminders=${REMINDER_NOTIFICATION_COUNT} | flapping=${FLAPPING_NOTIFICATION_COUNT} | acknowledged_suppressed=${ACKNOWLEDGED_SUPPRESSED_COUNT}"
 
 if ! complete_monitor_run "$PIPELINE_STATUS"; then
     log "ERROR: Unable to update monitor completion heartbeat"
