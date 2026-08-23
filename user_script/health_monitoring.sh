@@ -4,7 +4,7 @@ noParity=true
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.15.5"
+readonly SCRIPT_VERSION="2.15.6"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -15,7 +15,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.15.5
+# Disk Health Monitor for Unraid v2.15.6
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
@@ -41,6 +41,9 @@ fi
 # findings and collector status, applies role-aware array/pool workload policy
 # with per-pool overrides and sustained array anomaly gates, and confirms
 # recovery across consecutive safe runs before clearing an alert.
+# v2.15.6 makes aggregate array/pool capacity the default notification view,
+# keeps the legacy per-device inventory available as an explicit opt-in, and
+# labels aggregate pool counts as pools rather than disks.
 ################################################################################
 # ---------------- Configuration ----------------
 # Disks health script settings. Tuned for performance and reliability.
@@ -179,6 +182,7 @@ SHOW_SUBSYSTEMS_BLOCK="auto"                    # Subsystems block policy (auto|
 SHOW_OK_SUBSYSTEMS=0                            # Hide OK subsystems if any WARN/CRIT exist (0=show)
 SHOW_DISABLED_SUBSYSTEMS=0                      # Hide Disabled subsystems in description/body (0=show)
 VERBOSE_OK=1                                    # Show OK lines (0=suppress)
+SHOW_STORAGE_DEVICE_DETAILS=0                   # Include legacy per-device array/pool inventory (0=aggregate only)
 SHOW_ZERO_COUNTS=0                              # Deprecated compatibility setting; aggregate notification was removed
 TREND_NOTIFICATION_MODE="summary"              # Trend presentation policy (summary|detailed)
 TREND_NOTIFICATION_TOP_N=3                     # Devices/items shown per trend bullet before +N more
@@ -1304,6 +1308,7 @@ ensure_external_config_template() {
 # TREND_SHOW_NORMAL_POH=0
 # TREND_SHOW_DATA_QUALITY_DEVICES=0
 # TREND_GROUP_IDENTICAL_EVENTS=1
+# SHOW_STORAGE_DEVICE_DETAILS=0
 # HEAVY_WRITER_RECENT_DAYS=3
 # HEAVY_WRITER_ALERTS_ENABLED=1
 # ARRAY_WRITER_ALERTS_ENABLED=1
@@ -7653,10 +7658,14 @@ build_storage_and_disk_lines() {
     a_word=$(status_word "$ARRAY_MAX_SEV")
     local p_word
     p_word=$(status_word "$POOLS_MAX_SEV")
+    local array_unit="disks" pool_unit="pools"
+    (( ARRAY_COUNT == 1 )) && array_unit="disk"
+    (( POOLS_COUNT == 1 )) && pool_unit="pool"
     # Build the top summary line for array and pools
-    STORAGE_TOP_LINES=$(printf "Array [%s] (%d disks): %s%% - %s used of %s\nPools [%s] (%d disks): %s%% - %s used of %s" \
-        "$a_word" "$ARRAY_COUNT" "${ARRAY_PERCENT:-0.0}" "${ARRAY_USED_HR:-0 B}" "${ARRAY_TOTAL_HR:-0 B}" \
-        "$p_word" "$POOLS_COUNT" "${POOLS_PERCENT:-0.0}" "${POOLS_USED_HR:-0 B}" "${POOLS_TOTAL_HR:-0 B}")
+    STORAGE_TOP_LINES=$(printf "Array [%s] (%d %s): %s%% - %s used of %s\nPools [%s] (%d %s): %s%% - %s used of %s" \
+        "$a_word" "$ARRAY_COUNT" "$array_unit" "${ARRAY_PERCENT:-0.0}" "${ARRAY_USED_HR:-0 B}" "${ARRAY_TOTAL_HR:-0 B}" \
+        "$p_word" "$POOLS_COUNT" "$pool_unit" "${POOLS_PERCENT:-0.0}" "${POOLS_USED_HR:-0 B}" "${POOLS_TOTAL_HR:-0 B}")
+    (( SHOW_STORAGE_DEVICE_DETAILS == 1 )) || return 0
     # Dynamic alignment for [Array Disks] and [Pool Disks]
     local NAME_COL_WIDTH=6 USAGE_COL_WIDTH=22 PCT_COL_WIDTH=4 STATUS_COL_WIDTH=7 DRIVER_COL_WIDTH=0 REASON_COL_WIDTH=0
     local tmp_entry
@@ -11716,20 +11725,21 @@ limit_notification_body() {
 
 
 compose_notification() {
-    local array_section pool_section
+    local array_section="" pool_section=""
     local index
 
     append_subsystem_subject_suffix
 
-    array_section="[Array Disks]:\n${PARITY_STATUS_LINE:-}\n${PARITY_DETAILS_SECTION:-}${ARRAY_DISK_LINES:-}"
-    pool_section=""
-    if printf '%s' "${POOL_LINES:-}" | grep -q '[^[:space:]]'; then
-        pool_section="[Pool Disks]:\n${POOL_LINES}"
+    if (( SHOW_STORAGE_DEVICE_DETAILS == 1 )); then
+        array_section="[Array Disks]:\n${PARITY_STATUS_LINE:-}\n${PARITY_DETAILS_SECTION:-}${ARRAY_DISK_LINES:-}"
+        if printf '%s' "${POOL_LINES:-}" | grep -q '[^[:space:]]'; then
+            pool_section="[Pool Disks]:\n${POOL_LINES}"
+        fi
     fi
 
     NOTIFY_SECTIONS=()
     add_notification_section "${STORAGE_TOP_LINES:-}"
-    # Actionable findings are deliberately placed before verbose per-device
+    # Actionable findings are deliberately placed before optional per-device
     # details so they remain visible if the body reaches its configured limit.
     add_notification_section "${NOTIFICATION_RECOVERY_SECTION:-}"
     add_notification_section "${HEALTH_ALERTS_SECTION:-}"
@@ -12133,7 +12143,8 @@ validate_configuration() {
         POH_TREND_ENABLED TBW_TREND_ENABLED TEMP_RATE_ALERT_ENABLED
         IO_ERROR_MONITOR_ENABLED IO_ERROR_DEDUP_ENABLED LOG_PRUNE_ENABLED
         HISTORY_PRUNE_ENABLED LOG_MIRROR_STDOUT SHOW_OK_SUBSYSTEMS
-        SHOW_DISABLED_SUBSYSTEMS VERBOSE_OK SHOW_ZERO_COUNTS
+        SHOW_DISABLED_SUBSYSTEMS VERBOSE_OK SHOW_STORAGE_DEVICE_DETAILS
+        SHOW_ZERO_COUNTS
         TREND_SHOW_NORMAL_POH TREND_SHOW_DATA_QUALITY_DEVICES
         TREND_GROUP_IDENTICAL_EVENTS
         HEAVY_WRITER_ALERTS_ENABLED ARRAY_WRITER_ALERTS_ENABLED
@@ -12850,7 +12861,7 @@ run_regression_tests() (
     fi
 
     if declare -F load_builtin_defaults >/dev/null 2>&1 &&
-       [[ "$SCRIPT_VERSION" == "2.15.5" &&
+       [[ "$SCRIPT_VERSION" == "2.15.6" &&
           "$STATE_SCHEMA_VERSION" == "2" &&
           "$HISTORY_SCHEMA_VERSION" == "3" &&
           "$DEVICE_ID_SCHEMA_VERSION" == "2" &&
@@ -12858,6 +12869,7 @@ run_regression_tests() (
           "$HEAVY_WRITER_ALERTS_ENABLED" == "1" &&
           "$ARRAY_WRITER_ALERTS_ENABLED" == "1" &&
           "$POOL_WRITER_ALERTS_ENABLED" == "0" &&
+          "$SHOW_STORAGE_DEVICE_DETAILS" == "0" &&
           "$NOTIFICATION_RECOVERY_CONFIRM_RUNS" == "2" &&
           "$HEAVY_WRITER_RECENT_DAYS" == "3" &&
           "$SOAK_TELEMETRY_ENABLED" == "1" ]]
@@ -13167,6 +13179,7 @@ run_regression_tests() (
        grep -Fq 'parsed as data, not sourced' "$EXTERNAL_CONFIG_FILE" &&
        grep -Fq '# SOAK_MIN_RUNS=14' "$EXTERNAL_CONFIG_FILE" &&
        grep -Fq '# TREND_NOTIFICATION_MODE=summary' "$EXTERNAL_CONFIG_FILE" &&
+       grep -Fq '# SHOW_STORAGE_DEVICE_DETAILS=0' "$EXTERNAL_CONFIG_FILE" &&
        grep -Fq '# HEAVY_WRITER_ALERTS_ENABLED=1' "$EXTERNAL_CONFIG_FILE" &&
        grep -Fq '# POOL_WRITER_POLICY=cache:100:350,data:500:1000' "$EXTERNAL_CONFIG_FILE" &&
        grep -Fq '# POOL_EXCLUDES=ramtmp,user0' "$EXTERNAL_CONFIG_FILE"
@@ -14142,27 +14155,41 @@ run_regression_tests() (
 
     SMART_STATE=([/dev/sda]="CRITICAL" [/dev/sdb]="WARNING" [/dev/sdc]="OK")
     compute_disk_health_counts
-    STORAGE_TOP_LINES=""
+    STORAGE_TOP_LINES=$'Array [OK] (1 disk): 50.000% - 5.00 TB used of 10.00 TB\nPools [OK] (1 pool): 25.000% - 250.00 GB used of 1.00 TB'
     NOTIFICATION_RECOVERY_SECTION=""
     COLLECTOR_STATUS_SECTION=""
-    PARITY_STATUS_LINE=""
+    PARITY_STATUS_LINE="Parity: Valid"
     PARITY_DETAILS_SECTION=""
-    ARRAY_DISK_LINES=""
-    POOL_LINES=""
+    ARRAY_DISK_LINES=$'disk1 5.00 TB / 10.00 TB (50.0%) [OK]\n'
+    POOL_LINES=$'cache 250.00 GB / 1.00 TB (25.0%) [OK]\n'
     STORAGE_VALIDATION_SECTION=""
     TREND_SECTION=""
     DISK_HEALTH_SUMMARY=$'Disk Health Summary:\n - legacy duplicate'
+    # Fixture-only mutation is isolated by the regression-test subshell.
+    # shellcheck disable=SC2030
     SUBJECT="Disks Health - WARNING (1)"
     NOTIFY_MAX_BODY_CHARS=12000
     NOTIFY_MAX_BODY_LINES=180
+    SHOW_STORAGE_DEVICE_DETAILS=0
     compose_notification
+    local aggregate_only_body="$NOTIFY_BODY"
+    SHOW_STORAGE_DEVICE_DETAILS=1
+    compose_notification
+    local legacy_detail_body="$NOTIFY_BODY"
+    SHOW_STORAGE_DEVICE_DETAILS=0
     if [[ "$CRIT_DISK_COUNT" == "1" && "$WARN_DISK_COUNT" == "1" &&
-          "$NOTIFY_BODY" == *"Health Alerts:"* &&
-          "$NOTIFY_BODY" != *"Disk Health Summary:"* ]]
+          "$aggregate_only_body" == *"Array [OK] (1 disk):"* &&
+          "$aggregate_only_body" == *"Health Alerts:"* &&
+          "$aggregate_only_body" != *"[Array Disks]:"* &&
+          "$aggregate_only_body" != *"[Pool Disks]:"* &&
+          "$aggregate_only_body" != *"Disk Health Summary:"* &&
+          "$legacy_detail_body" == *"[Array Disks]:"* &&
+          "$legacy_detail_body" == *"disk1 5.00 TB / 10.00 TB"* &&
+          "$legacy_detail_body" == *"[Pool Disks]:"* ]]
     then
-        self_test_result 1 "Canonical notification omits duplicate disk-health summary"
+        self_test_result 1 "Aggregate-only storage notification with opt-in legacy detail"
     else
-        self_test_result 0 "Canonical notification omits duplicate disk-health summary"
+        self_test_result 0 "Aggregate-only storage notification with opt-in legacy detail"
     fi
 
     # shellcheck disable=SC2030
