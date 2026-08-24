@@ -149,7 +149,7 @@ SAB_CONTAINER_COMPLETE_ROOT="${SAB_CONTAINER_COMPLETE_ROOT:-}"
 # share/filesystem so the move is fast and recoverable.
 QUARANTINE_DIR="${QUARANTINE_DIR:-/mnt/user/media/net/quarantine}"
 
-LOG_DIR="${LOG_DIR:-/mnt/user/cloud/logs/sabnzbd_stranded_cleanup}"
+LOG_DIR="${LOG_DIR:-/mnt/user/cloud/logs/script/sabnzbd_stranded_cleanup}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/sabnzbd_stranded_cleanup.log}"
 LOG_MAX_BYTES="${LOG_MAX_BYTES:-2097152}"
 LOG_KEEP="${LOG_KEEP:-2}"

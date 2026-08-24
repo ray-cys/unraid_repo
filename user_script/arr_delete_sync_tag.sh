@@ -17,7 +17,7 @@ umask 077
 
 # All active state, logs, and locks live below this one directory. Sonarr and
 # Radarr retain separate state files because their schemas and actions differ.
-RUNTIME_DIR="/mnt/user/cloud/logs/arr_delete_sync_tag"
+RUNTIME_DIR="/mnt/user/cloud/logs/script/arr_delete_sync_tag"
 LOG_FILE="$RUNTIME_DIR/arr-delete-sync-tag.log"
 LOCK_DIR="$RUNTIME_DIR/arr-delete-sync-tag.lock"
 SONARR_STATE_FILE="$RUNTIME_DIR/sonarr-state.json"

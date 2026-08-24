@@ -564,7 +564,7 @@ FLAP_SUPPRESSION_MINUTES=120
 # State
 # ---------------------------------------------------------------------------
 
-STATE_DIR="/mnt/vault/cloud/logs/arr_health_activity"
+STATE_DIR="/mnt/vault/cloud/logs/script/arr_health_activity"
 
 # Never create the state tree beneath an absent backing mount. The SAB guard
 # affects only filesystem orphan/residue analysis; API monitoring continues.

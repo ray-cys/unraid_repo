@@ -89,7 +89,7 @@ TMP_FILE="/tmp/DBRepair.sh"
 # Therefore a maximum of three rolling log files are normally retained.
 # ---------------------------------------------------------------------------
 
-LOG_DIR="/mnt/vault/cloud/logs/dbrepair_logs"
+LOG_DIR="/mnt/vault/cloud/logs/script/plex_dbrepair"
 
 LOG_FILE="${LOG_DIR}/dbrepair.log"
 

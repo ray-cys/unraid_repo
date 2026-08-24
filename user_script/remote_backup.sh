@@ -78,7 +78,7 @@ ENABLE_WOL=true
 # Logging
 # ---------------------------------------------------------------------------
 
-LOG_DIR="/mnt/user/cloud/logs/remote_logs"
+LOG_DIR="/mnt/user/cloud/logs/script/remote_backup"
 RAW_LOG_DIR="${LOG_DIR}/rsync_raw"
 
 MAX_LOGS=2

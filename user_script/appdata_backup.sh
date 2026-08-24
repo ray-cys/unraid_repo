@@ -60,7 +60,7 @@ set -uo pipefail
 SRC_DIR="/mnt/cache/appdata"
 DEST_DIR="/mnt/vault/backup/cache"
 
-LOG_DIR="/mnt/vault/cloud/logs/appdata_logs"
+LOG_DIR="/mnt/vault/cloud/logs/script/appdata_backup"
 
 
 # ---------------------------------------------------------------------------
