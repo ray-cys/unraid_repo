@@ -7,7 +7,8 @@
 #
 # Uses Unraid's native boot-device backup helper, verifies the generated ZIP,
 # copies it safely to the configured SSD backup directory, verifies the copied
-# archive, then removes the temporary source archive.
+# archive, then removes the temporary source archive. Console output is also
+# written to a size-rotated persistent log when the log share is available.
 ###############################################################################
 
 set -uo pipefail
@@ -26,6 +27,11 @@ NOTIFY="/usr/local/emhttp/webGui/scripts/notify"
 
 LOCKFILE="/tmp/flash_backup.lock"
 
+LOG_DIR="/mnt/user/cloud/logs/script/flash_backup"
+LOG_FILE="${LOG_DIR}/flash_backup.log"
+LOG_MAX_BYTES=$((2 * 1024 * 1024))
+LOG_KEEP=3
+
 ###############################################################################
 # INITIALIZATION
 ###############################################################################
@@ -36,13 +42,42 @@ MARKER=""
 HELPER_LOG=""
 TEMP_FILE=""
 
+LOG_READY=false
+LOG_FAILURE_REPORTED=false
+
 ###############################################################################
 # FUNCTIONS
 ###############################################################################
 
 log() {
 
-    printf '%s : %s\n' "$(date '+%Y/%m/%d %T')" "$*"
+    local line
+
+    line="$(date '+%Y/%m/%d %T') : $*"
+
+    printf '%s\n' "$line"
+
+    if [ "$LOG_READY" = true ]; then
+
+        if ! printf '%s\n' "$line" >>"$LOG_FILE"; then
+
+            LOG_READY=false
+
+            if [ "$LOG_FAILURE_REPORTED" = false ]; then
+
+                LOG_FAILURE_REPORTED=true
+
+                printf '%s : WARNING: Persistent log became unavailable: %s\n' \
+                    "$(date '+%Y/%m/%d %T')" \
+                    "$LOG_FILE" \
+                    >&2
+
+                syslog warning \
+                    "Boot backup persistent log became unavailable: $LOG_FILE"
+
+            fi
+        fi
+    fi
 
 }
 
@@ -52,10 +87,108 @@ syslog() {
 
     shift
 
+    command -v logger >/dev/null 2>&1 || return 0
+
     logger \
         -t flash_backup \
         -p "user.${level}" \
-        -- "$*"
+        -- "$*" \
+        2>/dev/null || true
+
+}
+
+rotate_logs() {
+
+    [ -f "$LOG_FILE" ] || return 0
+
+    local size
+    local i
+
+    size=$(stat -c '%s' "$LOG_FILE" 2>/dev/null || echo 0)
+
+    [[ "$size" =~ ^[0-9]+$ ]] || size=0
+
+    (( size >= LOG_MAX_BYTES )) || return 0
+
+    if (( LOG_KEEP <= 0 )); then
+
+        : >"$LOG_FILE"
+
+        return $?
+
+    fi
+
+    rm -f -- "${LOG_FILE}.${LOG_KEEP}" 2>/dev/null || return 1
+
+    for ((i=LOG_KEEP-1; i>=1; i--)); do
+
+        if [ -f "${LOG_FILE}.${i}" ]; then
+
+            mv -f -- \
+                "${LOG_FILE}.${i}" \
+                "${LOG_FILE}.$((i + 1))" || return 1
+
+        fi
+    done
+
+    mv -f -- "$LOG_FILE" "${LOG_FILE}.1"
+
+}
+
+initialize_logging() {
+
+    local rotation_ok=true
+
+    if ! [[ "$LOG_MAX_BYTES" =~ ^[0-9]+$ ]] ||
+       ! [[ "$LOG_KEEP" =~ ^[0-9]+$ ]] ||
+       (( LOG_MAX_BYTES <= 0 ))
+    then
+
+        log "WARNING: Invalid log rotation configuration; persistent logging disabled"
+
+        syslog warning \
+            "Boot backup persistent logging disabled by invalid rotation configuration"
+
+        return 0
+
+    fi
+
+    if ! mkdir -p -- "$LOG_DIR" 2>/dev/null; then
+
+        log "WARNING: Persistent log directory unavailable: $LOG_DIR"
+
+        syslog warning \
+            "Boot backup persistent log directory unavailable: $LOG_DIR"
+
+        return 0
+
+    fi
+
+    rotate_logs || rotation_ok=false
+
+    if ! : >>"$LOG_FILE"; then
+
+        log "WARNING: Persistent log is not writable: $LOG_FILE"
+
+        syslog warning \
+            "Boot backup persistent log is not writable: $LOG_FILE"
+
+        return 0
+
+    fi
+
+    LOG_READY=true
+
+    if [ "$rotation_ok" = false ]; then
+
+        log "WARNING: Log rotation failed; continuing with the current log"
+
+        syslog warning \
+            "Boot backup log rotation failed: $LOG_FILE"
+
+    fi
+
+    log "Persistent log: $LOG_FILE"
 
 }
 
@@ -97,6 +230,16 @@ notify() {
     local description="$2"
     local message="$3"
 
+    if [ "$LOG_READY" = true ]; then
+
+        message+=$'\n\n'"Log: $LOG_FILE"
+
+    else
+
+        message+=$'\n\n'"Persistent log unavailable; see the User Scripts output or Unraid system log."
+
+    fi
+
     if [ ! -x "$NOTIFY" ]; then
         log "WARNING: Unraid notify command not found"
         return 0
@@ -109,6 +252,34 @@ notify() {
         -m "$message" \
         >/dev/null 2>&1 || \
         log "WARNING: Notification command failed"
+
+}
+
+# Invoked indirectly by the EXIT trap below.
+# shellcheck disable=SC2329
+cleanup() {
+
+    local exit_code=$?
+    local file
+
+    trap - EXIT
+
+    for file in "$MARKER" "$HELPER_LOG" "$TEMP_FILE"; do
+
+        [ -n "$file" ] || continue
+        [ -e "$file" ] || continue
+
+        if ! rm -f -- "$file"; then
+
+            log "WARNING: Unable to remove temporary file: $file"
+
+            syslog warning \
+                "Unable to remove temporary boot backup file: $file"
+
+        fi
+    done
+
+    return "$exit_code"
 
 }
 
@@ -241,10 +412,16 @@ if ! flock -n 9; then
 fi
 
 ###############################################################################
+# LOGGING
+###############################################################################
+
+initialize_logging
+
+###############################################################################
 # CLEANUP TRAP
 ###############################################################################
 
-trap 'cleanup' EXIT
+trap cleanup EXIT
 
 ###############################################################################
 # PRE-FLIGHT CHECKS
@@ -409,6 +586,18 @@ log "Running native Unraid backup helper"
 if "$HELPER" >"$HELPER_LOG" 2>&1; then
 
     log "Native backup helper completed successfully"
+
+    if [ -s "$HELPER_LOG" ]; then
+
+        log "Native helper output follows:"
+
+        while IFS= read -r line; do
+
+            log "HELPER: $line"
+
+        done <"$HELPER_LOG"
+
+    fi
 
 else
 
