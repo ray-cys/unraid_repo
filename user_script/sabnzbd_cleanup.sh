@@ -1,12 +1,16 @@
 #!/bin/bash
 
 ###############################################################################
-# SABnzbd Stranded Completed Download Cleanup v1.1
+# SABnzbd Cleanup v2.0
 #
 # PURPOSE
 # -------
-# Safely reclaim completed SABnzbd download folders after Sonarr or Radarr has
-# already imported the payload, while leaving SABnzbd history untouched.
+# Apply all local SABnzbd retention in one place:
+#
+#   1. Delete expired NZB backup files.
+#   2. Delete expired SABnzbd application backup ZIP files.
+#   3. Safely reclaim completed download folders after Sonarr or Radarr has
+#      already imported the payload, while leaving SABnzbd history untouched.
 #
 # This is designed for the Unraid User Scripts plugin. A nightly schedule is
 # recommended after the configuration and dry-run output have been reviewed.
@@ -24,12 +28,13 @@
 #   - The number of verified imported paths accounts for all remaining source
 #     media files. Ambiguous season packs are skipped, not guessed.
 #   - Every resolved source/destination path remains below an explicit root.
-#   - Unraid Mover is not running at startup, before a quarantine move, or
-#     before quarantine purge.
+#   - Unraid Mover is not running at startup or immediately before any backup
+#     deletion, quarantine move, or quarantine purge.
 #
 # SAFETY MODEL
 # ------------
 #   - DRY_RUN defaults to true.
+#   - Backup cleanup matches only .nzb, .nzb.gz, and top-level .zip files.
 #   - Eligible payloads are moved into a manifest-backed quarantine first.
 #   - Quarantine is purged only after QUARANTINE_RETENTION_DAYS.
 #   - MAX_QUARANTINES_PER_RUN limits the impact of any one run.
@@ -42,15 +47,15 @@
 # -----
 #   1. Fill in all API keys and confirm every path/path mapping below.
 #   2. Run with DRY_RUN=true until every candidate is expected.
-#   3. Set DRY_RUN=false to enable quarantine moves.
+#   3. Set DRY_RUN=false to enable backup deletion and quarantine operations.
 #   4. Keep PURGE_QUARANTINE=false initially if you want manual review.
 #   5. When satisfied, set PURGE_QUARANTINE=true for delayed space recovery.
 #
 # Optional command-line overrides:
 #
-#   sabnzbd_stranded_cleanup.sh --dry-run
-#   sabnzbd_stranded_cleanup.sh --execute
-#   sabnzbd_stranded_cleanup.sh --execute --no-purge
+#   sabnzbd_cleanup.sh --dry-run
+#   sabnzbd_cleanup.sh --execute
+#   sabnzbd_cleanup.sh --execute --no-purge
 #
 ###############################################################################
 
@@ -60,14 +65,29 @@ set -uo pipefail
 # CONFIGURATION
 ###############################################################################
 
-VERSION="1.1"
+VERSION="2.0"
 
 # ---------------------------------------------------------------------------
 # Execution behavior
 # ---------------------------------------------------------------------------
 
 DRY_RUN="${DRY_RUN:-true}"
+
+# Each cleanup module can be disabled independently. Quarantine purge does not
+# require SABnzbd or Arr API access when stranded-download cleanup is disabled.
+CLEAN_BACKUPS="${CLEAN_BACKUPS:-true}"
+CLEAN_STRANDED_DOWNLOADS="${CLEAN_STRANDED_DOWNLOADS:-true}"
 PURGE_QUARANTINE="${PURGE_QUARANTINE:-true}"
+
+# ---------------------------------------------------------------------------
+# SABnzbd backup retention
+# ---------------------------------------------------------------------------
+
+SAB_BACKUP_DIR="${SAB_BACKUP_DIR:-/mnt/vault/backup/arr_db/sabnzbd}"
+NZB_BACKUP_DIR="${NZB_BACKUP_DIR:-${SAB_BACKUP_DIR}/nzb}"
+
+NZB_RETENTION_DAYS="${NZB_RETENTION_DAYS:-60}"
+APP_BACKUP_RETENTION_DAYS="${APP_BACKUP_RETENTION_DAYS:-7}"
 
 # A conservative grace period. Radarr/Sonarr also regard aggressive SAB
 # history retention (less than 14 days) as unsafe.
@@ -149,8 +169,8 @@ SAB_CONTAINER_COMPLETE_ROOT="${SAB_CONTAINER_COMPLETE_ROOT:-}"
 # share/filesystem so the move is fast and recoverable.
 QUARANTINE_DIR="${QUARANTINE_DIR:-/mnt/user/media/net/quarantine}"
 
-LOG_DIR="${LOG_DIR:-/mnt/user/cloud/logs/script/sabnzbd_stranded_cleanup}"
-LOG_FILE="${LOG_FILE:-${LOG_DIR}/sabnzbd_stranded_cleanup.log}"
+LOG_DIR="${LOG_DIR:-/mnt/user/cloud/logs/script/sabnzbd_cleanup}"
+LOG_FILE="${LOG_FILE:-${LOG_DIR}/sabnzbd_cleanup.log}"
 LOG_MAX_BYTES="${LOG_MAX_BYTES:-2097152}"
 LOG_KEEP="${LOG_KEEP:-2}"
 
@@ -158,7 +178,7 @@ SEND_NOTIFICATIONS="${SEND_NOTIFICATIONS:-true}"
 NOTIFY_DRY_RUN="${NOTIFY_DRY_RUN:-false}"
 NOTIFY="${NOTIFY:-/usr/local/emhttp/webGui/scripts/notify}"
 
-LOCK_FILE="${LOCK_FILE:-/tmp/sabnzbd_stranded_cleanup.lock}"
+LOCK_FILE="${LOCK_FILE:-/tmp/sabnzbd_cleanup.lock}"
 
 SAB_HISTORY_PAGE_SIZE="${SAB_HISTORY_PAGE_SIZE:-500}"
 SAB_HISTORY_MAX_PAGES="${SAB_HISTORY_MAX_PAGES:-100}"
@@ -185,6 +205,19 @@ RADARR_QUEUE_FILE=""
 SAB_MOVIE_DIR_REAL=""
 SAB_TV_DIR_REAL=""
 QUARANTINE_DIR_REAL=""
+SAB_BACKUP_DIR_REAL=""
+NZB_BACKUP_DIR_REAL=""
+
+BACKUP_CLEANUP_STATUS="DISABLED"
+STRANDED_CLEANUP_STATUS="DISABLED"
+QUARANTINE_PURGE_STATUS="DISABLED"
+
+NZB_BACKUPS_ELIGIBLE=0
+APP_BACKUPS_ELIGIBLE=0
+NZB_BACKUPS_REMOVED=0
+APP_BACKUPS_REMOVED=0
+NZB_BACKUP_BYTES=0
+APP_BACKUP_BYTES=0
 
 SCANNED=0
 COMPLETED_SCANNED=0
@@ -315,11 +348,11 @@ trap 'exit 130' INT TERM
 
 usage() {
   cat <<'EOF'
-Usage: sabnzbd_stranded_cleanup.sh [options]
+Usage: sabnzbd_cleanup.sh [options]
 
 Options:
-  --dry-run     Report eligible payloads without moving or purging anything.
-  --execute     Enable quarantine moves (subject to every safety check).
+  --dry-run     Report all eligible cleanup without changing anything.
+  --execute     Enable backup deletion and quarantine operations.
   --purge       Enable delayed quarantine purge.
   --no-purge    Disable delayed quarantine purge.
   --help        Show this help.
@@ -380,7 +413,7 @@ require_commands() {
   local command_name
   local missing=0
 
-  for command_name in awk basename curl cut date dirname find flock jq mkdir mktemp mv realpath sed sort stat tee tr wc; do
+  for command_name in awk basename cat curl cut date dirname find flock jq mkdir mktemp mv realpath rm rmdir sed sort stat tee tr wc; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       log "ERROR" "Required command not found: $command_name"
       missing=1
@@ -399,22 +432,37 @@ validate_boolean() {
   local name="$1"
   local value="$2"
   if ! is_true "$value" && ! is_false "$value"; then
-    die "$name must be true/false, yes/no, on/off, or 1/0."
+    ((ERRORS++)) || true
+    log "ERROR" "$name must be true/false, yes/no, on/off, or 1/0."
+    return 1
   fi
 }
 
 validate_integer() {
   local name="$1"
   local value="$2"
-  [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be a non-negative integer."
+  if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+    ((ERRORS++)) || true
+    log "ERROR" "$name must be a non-negative integer."
+    return 1
+  fi
 }
 
 validate_api_key() {
   local app="$1"
   local key="$2"
 
-  [[ -n "$key" ]] || die "$app API key is empty."
-  [[ "$key" != PUT_YOUR_* ]] || die "$app API key still contains its placeholder value."
+  if [[ -z "$key" ]]; then
+    ((ERRORS++)) || true
+    log "ERROR" "$app API key is empty."
+    return 1
+  fi
+
+  if [[ "$key" == PUT_YOUR_* ]]; then
+    ((ERRORS++)) || true
+    log "ERROR" "$app API key still contains its placeholder value."
+    return 1
+  fi
 }
 
 validate_library_roots() {
@@ -423,6 +471,7 @@ validate_library_roots() {
   local root_list=()
   local root
   local valid=0
+  local invalid=0
 
   IFS=';' read -r -a root_list <<<"$roots"
 
@@ -431,22 +480,33 @@ validate_library_roots() {
 
     if [[ -d "$root" ]]; then
       root="$(realpath -- "$root")" || continue
-      dangerously_broad_path "$root" && \
-        die "$app library root is dangerously broad: $root"
+      if dangerously_broad_path "$root"; then
+        ((ERRORS++)) || true
+        log "ERROR" "$app library root is dangerously broad: $root"
+        invalid=1
+        continue
+      fi
       ((valid++)) || true
     else
       log "WARNING" "$app library root does not exist and cannot verify imports: $root"
     fi
   done
 
-  (( valid > 0 )) || die "$app has no accessible library root for import verification."
+  if (( valid == 0 )); then
+    ((ERRORS++)) || true
+    log "ERROR" "$app has no accessible library root for import verification."
+    invalid=1
+  fi
+
+  (( invalid == 0 ))
 }
 
 dangerously_broad_path() {
   case "$1" in
     /|/mnt|/mnt/user|/mnt/user/media) return 0 ;;
-    *) return 1 ;;
   esac
+
+  [[ "$1" =~ ^/mnt/[^/]+$ ]]
 }
 
 canonicalize_target() {
@@ -483,73 +543,211 @@ paths_overlap() {
   [[ "$first" == "$second" || "$first" == "$second"/* || "$second" == "$first"/* ]]
 }
 
-validate_environment() {
-  validate_boolean "DRY_RUN" "$DRY_RUN"
-  validate_boolean "PURGE_QUARANTINE" "$PURGE_QUARANTINE"
-  validate_boolean "MOVER_GUARD_ENABLED" "$MOVER_GUARD_ENABLED"
-  validate_boolean "NOTIFY_MOVER_SKIP" "$NOTIFY_MOVER_SKIP"
-  validate_boolean "SONARR_ENABLED" "$SONARR_ENABLED"
-  validate_boolean "RADARR_ENABLED" "$RADARR_ENABLED"
-  validate_boolean "SEND_NOTIFICATIONS" "$SEND_NOTIFICATIONS"
-  validate_boolean "NOTIFY_DRY_RUN" "$NOTIFY_DRY_RUN"
-  validate_boolean "TLS_VERIFY" "$TLS_VERIFY"
+validate_common_environment() {
+  local valid=true
 
-  validate_integer "MIN_COMPLETED_AGE_HOURS" "$MIN_COMPLETED_AGE_HOURS"
-  validate_integer "MIN_PATH_STABLE_HOURS" "$MIN_PATH_STABLE_HOURS"
-  validate_integer "QUARANTINE_RETENTION_DAYS" "$QUARANTINE_RETENTION_DAYS"
-  validate_integer "MAX_QUARANTINES_PER_RUN" "$MAX_QUARANTINES_PER_RUN"
-  validate_integer "SAB_HISTORY_PAGE_SIZE" "$SAB_HISTORY_PAGE_SIZE"
-  validate_integer "SAB_HISTORY_MAX_PAGES" "$SAB_HISTORY_MAX_PAGES"
-  validate_integer "ARR_QUEUE_PAGE_SIZE" "$ARR_QUEUE_PAGE_SIZE"
-  validate_integer "ARR_HISTORY_PAGE_SIZE" "$ARR_HISTORY_PAGE_SIZE"
+  validate_boolean "DRY_RUN" "$DRY_RUN" || valid=false
+  validate_boolean "CLEAN_BACKUPS" "$CLEAN_BACKUPS" || valid=false
+  validate_boolean "CLEAN_STRANDED_DOWNLOADS" "$CLEAN_STRANDED_DOWNLOADS" || valid=false
+  validate_boolean "PURGE_QUARANTINE" "$PURGE_QUARANTINE" || valid=false
+  validate_boolean "MOVER_GUARD_ENABLED" "$MOVER_GUARD_ENABLED" || valid=false
+  validate_boolean "NOTIFY_MOVER_SKIP" "$NOTIFY_MOVER_SKIP" || valid=false
+  validate_boolean "SEND_NOTIFICATIONS" "$SEND_NOTIFICATIONS" || valid=false
+  validate_boolean "NOTIFY_DRY_RUN" "$NOTIFY_DRY_RUN" || valid=false
+  validate_boolean "TLS_VERIFY" "$TLS_VERIFY" || valid=false
+  validate_integer "LOG_MAX_BYTES" "$LOG_MAX_BYTES" || valid=false
+  validate_integer "LOG_KEEP" "$LOG_KEEP" || valid=false
+  validate_integer "CURL_CONNECT_TIMEOUT" "$CURL_CONNECT_TIMEOUT" || valid=false
+  validate_integer "CURL_MAX_TIME" "$CURL_MAX_TIME" || valid=false
 
-  (( SAB_HISTORY_PAGE_SIZE > 0 )) || die "SAB_HISTORY_PAGE_SIZE must be greater than zero."
-  (( SAB_HISTORY_MAX_PAGES > 0 )) || die "SAB_HISTORY_MAX_PAGES must be greater than zero."
-  (( ARR_QUEUE_PAGE_SIZE > 0 )) || die "ARR_QUEUE_PAGE_SIZE must be greater than zero."
-  (( ARR_HISTORY_PAGE_SIZE > 0 )) || die "ARR_HISTORY_PAGE_SIZE must be greater than zero."
-
-  validate_api_key "SABnzbd" "$SAB_API_KEY"
-
-  if is_true "$SONARR_ENABLED"; then
-    validate_api_key "Sonarr" "$SONARR_API_KEY"
-    validate_library_roots "Sonarr" "$SONARR_LIBRARY_ROOTS"
-  fi
-
-  if is_true "$RADARR_ENABLED"; then
-    validate_api_key "Radarr" "$RADARR_API_KEY"
-    validate_library_roots "Radarr" "$RADARR_LIBRARY_ROOTS"
-  fi
-
-  [[ -d "$SAB_MOVIE_DIR" ]] || die "SAB movie directory does not exist: $SAB_MOVIE_DIR"
-  [[ -d "$SAB_TV_DIR" ]] || die "SAB TV directory does not exist: $SAB_TV_DIR"
-
-  SAB_MOVIE_DIR_REAL="$(realpath -- "$SAB_MOVIE_DIR")" || die "Unable to resolve: $SAB_MOVIE_DIR"
-  SAB_TV_DIR_REAL="$(realpath -- "$SAB_TV_DIR")" || die "Unable to resolve: $SAB_TV_DIR"
-  QUARANTINE_DIR_REAL="$(canonicalize_target "$QUARANTINE_DIR")" || die "Unable to resolve quarantine target: $QUARANTINE_DIR"
-
-  dangerously_broad_path "$SAB_MOVIE_DIR_REAL" && die "SAB movie directory is dangerously broad: $SAB_MOVIE_DIR_REAL"
-  dangerously_broad_path "$SAB_TV_DIR_REAL" && die "SAB TV directory is dangerously broad: $SAB_TV_DIR_REAL"
-  dangerously_broad_path "$QUARANTINE_DIR_REAL" && die "Quarantine directory is dangerously broad: $QUARANTINE_DIR_REAL"
-
-  paths_overlap "$SAB_MOVIE_DIR_REAL" "$SAB_TV_DIR_REAL" && die "SAB movie and TV roots must not overlap."
-  paths_overlap "$QUARANTINE_DIR_REAL" "$SAB_MOVIE_DIR_REAL" && die "Quarantine and SAB movie roots must not overlap."
-  paths_overlap "$QUARANTINE_DIR_REAL" "$SAB_TV_DIR_REAL" && die "Quarantine and SAB TV roots must not overlap."
-
-  if [[ "${SAB_MOVIE_CATEGORY,,}" == "${SAB_TV_CATEGORY,,}" ]]; then
-    die "SAB movie and TV categories must be different."
+  if ! is_true "$CLEAN_BACKUPS" &&
+     ! is_true "$CLEAN_STRANDED_DOWNLOADS" &&
+     ! is_true "$PURGE_QUARANTINE"
+  then
+    ((ERRORS++)) || true
+    log "ERROR" "At least one cleanup module must be enabled."
+    valid=false
   fi
 
   if is_true "$MOVER_GUARD_ENABLED" && [[ -z "$MOVER_PROCESS_PATTERN" ]]; then
-    die "MOVER_PROCESS_PATTERN cannot be empty while the Mover guard is enabled."
+    ((ERRORS++)) || true
+    log "ERROR" "MOVER_PROCESS_PATTERN cannot be empty while the Mover guard is enabled."
+    valid=false
+  fi
+
+  is_true "$valid"
+}
+
+validate_backup_environment() {
+  local valid=true
+
+  validate_integer "NZB_RETENTION_DAYS" "$NZB_RETENTION_DAYS" || valid=false
+  validate_integer "APP_BACKUP_RETENTION_DAYS" "$APP_BACKUP_RETENTION_DAYS" || valid=false
+
+  if [[ ! -d "$SAB_BACKUP_DIR" ]]; then
+    ((ERRORS++)) || true
+    log "ERROR" "SABnzbd backup directory does not exist: $SAB_BACKUP_DIR"
+    return 1
+  fi
+
+  SAB_BACKUP_DIR_REAL="$(realpath -- "$SAB_BACKUP_DIR")" || {
+    ((ERRORS++)) || true
+    log "ERROR" "Unable to resolve SABnzbd backup directory: $SAB_BACKUP_DIR"
+    return 1
+  }
+
+  if dangerously_broad_path "$SAB_BACKUP_DIR_REAL"; then
+    ((ERRORS++)) || true
+    log "ERROR" "SABnzbd backup directory is dangerously broad: $SAB_BACKUP_DIR_REAL"
+    valid=false
+  fi
+
+  if [[ -d "$NZB_BACKUP_DIR" ]]; then
+    NZB_BACKUP_DIR_REAL="$(realpath -- "$NZB_BACKUP_DIR")" || {
+      ((ERRORS++)) || true
+      log "ERROR" "Unable to resolve NZB backup directory: $NZB_BACKUP_DIR"
+      return 1
+    }
+
+    if ! path_is_below "$NZB_BACKUP_DIR_REAL" "$SAB_BACKUP_DIR_REAL"; then
+      ((ERRORS++)) || true
+      log "ERROR" "NZB backup directory must be below SAB_BACKUP_DIR: $NZB_BACKUP_DIR_REAL"
+      valid=false
+    fi
+  else
+    NZB_BACKUP_DIR_REAL=""
+    log "WARNING" "NZB backup directory is unavailable; NZB retention will be skipped: $NZB_BACKUP_DIR"
+  fi
+
+  is_true "$valid"
+}
+
+prepare_quarantine_environment() {
+  validate_integer "QUARANTINE_RETENTION_DAYS" "$QUARANTINE_RETENTION_DAYS" || return 1
+
+  QUARANTINE_DIR_REAL="$(canonicalize_target "$QUARANTINE_DIR")" || {
+    ((ERRORS++)) || true
+    log "ERROR" "Unable to resolve quarantine target: $QUARANTINE_DIR"
+    return 1
+  }
+
+  if dangerously_broad_path "$QUARANTINE_DIR_REAL"; then
+    ((ERRORS++)) || true
+    log "ERROR" "Quarantine directory is dangerously broad: $QUARANTINE_DIR_REAL"
+    return 1
   fi
 
   if ! is_true "$DRY_RUN"; then
-    mkdir -p -- "$QUARANTINE_DIR_REAL/items/Sonarr" "$QUARANTINE_DIR_REAL/items/Radarr" || \
-      die "Unable to create quarantine directories."
+    if ! mkdir -p -- "$QUARANTINE_DIR_REAL/items/Sonarr" "$QUARANTINE_DIR_REAL/items/Radarr"; then
+      ((ERRORS++)) || true
+      log "ERROR" "Unable to create quarantine directories."
+      return 1
+    fi
 
-    QUARANTINE_DIR_REAL="$(realpath -- "$QUARANTINE_DIR_REAL")" || \
-      die "Unable to resolve created quarantine directory."
+    QUARANTINE_DIR_REAL="$(realpath -- "$QUARANTINE_DIR_REAL")" || {
+      ((ERRORS++)) || true
+      log "ERROR" "Unable to resolve created quarantine directory."
+      return 1
+    }
   fi
+}
+
+validate_stranded_environment() {
+  local valid=true
+
+  validate_boolean "SONARR_ENABLED" "$SONARR_ENABLED" || valid=false
+  validate_boolean "RADARR_ENABLED" "$RADARR_ENABLED" || valid=false
+  validate_integer "MIN_COMPLETED_AGE_HOURS" "$MIN_COMPLETED_AGE_HOURS" || valid=false
+  validate_integer "MIN_PATH_STABLE_HOURS" "$MIN_PATH_STABLE_HOURS" || valid=false
+  validate_integer "MAX_QUARANTINES_PER_RUN" "$MAX_QUARANTINES_PER_RUN" || valid=false
+  validate_integer "SAB_HISTORY_PAGE_SIZE" "$SAB_HISTORY_PAGE_SIZE" || valid=false
+  validate_integer "SAB_HISTORY_MAX_PAGES" "$SAB_HISTORY_MAX_PAGES" || valid=false
+  validate_integer "ARR_QUEUE_PAGE_SIZE" "$ARR_QUEUE_PAGE_SIZE" || valid=false
+  validate_integer "ARR_HISTORY_PAGE_SIZE" "$ARR_HISTORY_PAGE_SIZE" || valid=false
+
+  if [[ "$SAB_HISTORY_PAGE_SIZE" =~ ^[0-9]+$ ]] && (( SAB_HISTORY_PAGE_SIZE == 0 )); then
+    ((ERRORS++)) || true
+    log "ERROR" "SAB_HISTORY_PAGE_SIZE must be greater than zero."
+    valid=false
+  fi
+  if [[ "$SAB_HISTORY_MAX_PAGES" =~ ^[0-9]+$ ]] && (( SAB_HISTORY_MAX_PAGES == 0 )); then
+    ((ERRORS++)) || true
+    log "ERROR" "SAB_HISTORY_MAX_PAGES must be greater than zero."
+    valid=false
+  fi
+  if [[ "$ARR_QUEUE_PAGE_SIZE" =~ ^[0-9]+$ ]] && (( ARR_QUEUE_PAGE_SIZE == 0 )); then
+    ((ERRORS++)) || true
+    log "ERROR" "ARR_QUEUE_PAGE_SIZE must be greater than zero."
+    valid=false
+  fi
+  if [[ "$ARR_HISTORY_PAGE_SIZE" =~ ^[0-9]+$ ]] && (( ARR_HISTORY_PAGE_SIZE == 0 )); then
+    ((ERRORS++)) || true
+    log "ERROR" "ARR_HISTORY_PAGE_SIZE must be greater than zero."
+    valid=false
+  fi
+
+  validate_api_key "SABnzbd" "$SAB_API_KEY" || valid=false
+
+  if is_true "$SONARR_ENABLED"; then
+    validate_api_key "Sonarr" "$SONARR_API_KEY" || valid=false
+    validate_library_roots "Sonarr" "$SONARR_LIBRARY_ROOTS" || valid=false
+  fi
+
+  if is_true "$RADARR_ENABLED"; then
+    validate_api_key "Radarr" "$RADARR_API_KEY" || valid=false
+    validate_library_roots "Radarr" "$RADARR_LIBRARY_ROOTS" || valid=false
+  fi
+
+  if [[ ! -d "$SAB_MOVIE_DIR" ]]; then
+    ((ERRORS++)) || true
+    log "ERROR" "SAB movie directory does not exist: $SAB_MOVIE_DIR"
+    valid=false
+  else
+    SAB_MOVIE_DIR_REAL="$(realpath -- "$SAB_MOVIE_DIR")" || valid=false
+  fi
+
+  if [[ ! -d "$SAB_TV_DIR" ]]; then
+    ((ERRORS++)) || true
+    log "ERROR" "SAB TV directory does not exist: $SAB_TV_DIR"
+    valid=false
+  else
+    SAB_TV_DIR_REAL="$(realpath -- "$SAB_TV_DIR")" || valid=false
+  fi
+
+  if [[ -n "$SAB_MOVIE_DIR_REAL" ]] && dangerously_broad_path "$SAB_MOVIE_DIR_REAL"; then
+    ((ERRORS++)) || true
+    log "ERROR" "SAB movie directory is dangerously broad: $SAB_MOVIE_DIR_REAL"
+    valid=false
+  fi
+  if [[ -n "$SAB_TV_DIR_REAL" ]] && dangerously_broad_path "$SAB_TV_DIR_REAL"; then
+    ((ERRORS++)) || true
+    log "ERROR" "SAB TV directory is dangerously broad: $SAB_TV_DIR_REAL"
+    valid=false
+  fi
+
+  if [[ -n "$SAB_MOVIE_DIR_REAL" && -n "$SAB_TV_DIR_REAL" ]] && paths_overlap "$SAB_MOVIE_DIR_REAL" "$SAB_TV_DIR_REAL"; then
+    ((ERRORS++)) || true
+    log "ERROR" "SAB movie and TV roots must not overlap."
+    valid=false
+  fi
+  if [[ -n "$QUARANTINE_DIR_REAL" && -n "$SAB_MOVIE_DIR_REAL" ]] && paths_overlap "$QUARANTINE_DIR_REAL" "$SAB_MOVIE_DIR_REAL"; then
+    ((ERRORS++)) || true
+    log "ERROR" "Quarantine and SAB movie roots must not overlap."
+    valid=false
+  fi
+  if [[ -n "$QUARANTINE_DIR_REAL" && -n "$SAB_TV_DIR_REAL" ]] && paths_overlap "$QUARANTINE_DIR_REAL" "$SAB_TV_DIR_REAL"; then
+    ((ERRORS++)) || true
+    log "ERROR" "Quarantine and SAB TV roots must not overlap."
+    valid=false
+  fi
+
+  if [[ "${SAB_MOVIE_CATEGORY,,}" == "${SAB_TV_CATEGORY,,}" ]]; then
+    ((ERRORS++)) || true
+    log "ERROR" "SAB movie and TV categories must be different."
+    valid=false
+  fi
+
+  is_true "$valid"
 }
 
 initialize() {
@@ -563,11 +761,11 @@ initialize() {
 
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
-    log "INFO" "Another SABnzbd stranded cleanup run is active; exiting."
+    log "INFO" "Another SABnzbd cleanup run is active; exiting."
     exit 0
   fi
 
-  TMP_DIR="$(mktemp -d '/tmp/sabnzbd_stranded_cleanup.XXXXXX')" || \
+  TMP_DIR="$(mktemp -d '/tmp/sabnzbd_cleanup.XXXXXX')" || \
     die "Unable to create temporary directory."
 
   SAB_HISTORY_FILE="$TMP_DIR/sab_history.json"
@@ -575,7 +773,9 @@ initialize() {
   SONARR_QUEUE_FILE="$TMP_DIR/sonarr_queue.json"
   RADARR_QUEUE_FILE="$TMP_DIR/radarr_queue.json"
 
-  validate_environment
+  if ! validate_common_environment; then
+    die "Common configuration validation failed."
+  fi
 }
 
 ###############################################################################
@@ -596,7 +796,7 @@ notify_mover_skip() {
 
   "$NOTIFY" \
     -i normal \
-    -s "SABnzbd Stranded Cleanup" \
+    -s "SABnzbd Cleanup" \
     -d "Cleanup skipped while Unraid Mover is active" \
     -m "Guard point: ${context}. No further cleanup writes were attempted; the next scheduled run will retry." \
     >/dev/null 2>&1 || true
@@ -616,6 +816,174 @@ check_mover_guard() {
   notify_mover_skip "$context"
 
   return 20
+}
+
+###############################################################################
+# BACKUP RETENTION
+###############################################################################
+
+find_backup_candidates() {
+  local backup_kind="$1"
+
+  case "$backup_kind" in
+    nzb)
+      [[ -n "$NZB_BACKUP_DIR_REAL" ]] || return 0
+      find "$NZB_BACKUP_DIR_REAL" \
+        -type f \
+        \( -iname '*.nzb' -o -iname '*.nzb.gz' \) \
+        -mmin "+$((NZB_RETENTION_DAYS * 1440))" \
+        -print0
+      ;;
+    application)
+      find "$SAB_BACKUP_DIR_REAL" \
+        -maxdepth 1 \
+        -type f \
+        -iname '*.zip' \
+        -mmin "+$((APP_BACKUP_RETENTION_DAYS * 1440))" \
+        -print0
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+
+backup_candidate_is_contained() {
+  local backup_kind="$1"
+  local file="$2"
+  local file_real
+  local expected_root
+
+  file_real="$(realpath -- "$file" 2>/dev/null)" || return 1
+
+  case "$backup_kind" in
+    nzb) expected_root="$NZB_BACKUP_DIR_REAL" ;;
+    application) expected_root="$SAB_BACKUP_DIR_REAL" ;;
+    *) return 1 ;;
+  esac
+
+  path_is_below "$file_real" "$expected_root"
+}
+
+process_backup_candidate() {
+  local backup_kind="$1"
+  local file="$2"
+  local label
+  local size
+  local guard_status
+
+  case "$backup_kind" in
+    nzb) label="NZB backup" ;;
+    application) label="application backup" ;;
+    *) return 2 ;;
+  esac
+
+  if ! backup_candidate_is_contained "$backup_kind" "$file"; then
+    ((ERRORS++)) || true
+    log "ERROR" "Refusing ${label} outside its validated root: $file"
+    return 1
+  fi
+
+  size="$(stat_size "$file")"
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
+
+  case "$backup_kind" in
+    nzb)
+      ((NZB_BACKUPS_ELIGIBLE++)) || true
+      ((NZB_BACKUP_BYTES += size)) || true
+      ;;
+    application)
+      ((APP_BACKUPS_ELIGIBLE++)) || true
+      ((APP_BACKUP_BYTES += size)) || true
+      ;;
+  esac
+
+  if is_true "$DRY_RUN"; then
+    log "INFO" "[DRY RUN] Would delete ${label}: $file"
+    return 0
+  fi
+
+  check_mover_guard "before deleting ${label} ${file}"
+  guard_status=$?
+  (( guard_status == 0 )) || return "$guard_status"
+
+  if rm -f -- "$file"; then
+    log "INFO" "Deleted ${label}: $file"
+    case "$backup_kind" in
+      nzb) ((NZB_BACKUPS_REMOVED++)) || true ;;
+      application) ((APP_BACKUPS_REMOVED++)) || true ;;
+    esac
+    return 0
+  fi
+
+  ((ERRORS++)) || true
+  log "ERROR" "Failed to delete ${label}: $file"
+  return 1
+}
+
+cleanup_backup_class() {
+  local backup_kind="$1"
+  local file
+  local candidate_status
+  local class_failed=false
+
+  while IFS= read -r -d '' file; do
+    process_backup_candidate "$backup_kind" "$file"
+    candidate_status=$?
+
+    if (( candidate_status == 20 )); then
+      return 20
+    elif (( candidate_status != 0 )); then
+      class_failed=true
+    fi
+  done < <(find_backup_candidates "$backup_kind")
+
+  ! is_true "$class_failed"
+}
+
+remove_empty_nzb_backup_directories() {
+  local guard_status
+
+  is_true "$DRY_RUN" && return 0
+  [[ -n "$NZB_BACKUP_DIR_REAL" ]] || return 0
+
+  check_mover_guard "before removing empty NZB backup directories"
+  guard_status=$?
+  (( guard_status == 0 )) || return "$guard_status"
+
+  find "$NZB_BACKUP_DIR_REAL" \
+    -mindepth 1 \
+    -depth \
+    -type d \
+    -empty \
+    -delete 2>/dev/null || true
+}
+
+cleanup_backups() {
+  local operation_status
+  local cleanup_failed=false
+
+  log "INFO" "Cleaning SABnzbd backups."
+  log "INFO" "NZB retention: ${NZB_RETENTION_DAYS}d"
+  log "INFO" "Application backup retention: ${APP_BACKUP_RETENTION_DAYS}d"
+
+  if [[ -n "$NZB_BACKUP_DIR_REAL" ]]; then
+    cleanup_backup_class nzb
+    operation_status=$?
+    (( operation_status == 20 )) && return 20
+    (( operation_status == 0 )) || cleanup_failed=true
+  fi
+
+  cleanup_backup_class application
+  operation_status=$?
+  (( operation_status == 20 )) && return 20
+  (( operation_status == 0 )) || cleanup_failed=true
+
+  remove_empty_nzb_backup_directories
+  operation_status=$?
+  (( operation_status == 20 )) && return 20
+
+  ! is_true "$cleanup_failed"
 }
 
 ###############################################################################
@@ -823,21 +1191,35 @@ fetch_arr_history_for_download() {
 
 fetch_required_state() {
   log "INFO" "Fetching SABnzbd history and queue."
-  fetch_sab_history || die "Unable to fetch complete SABnzbd history. No cleanup was attempted."
-  fetch_sab_queue || die "Unable to fetch SABnzbd queue. No cleanup was attempted."
+  if ! fetch_sab_history; then
+    ((ERRORS++)) || true
+    log "ERROR" "Unable to fetch complete SABnzbd history. Stranded cleanup was skipped."
+    return 1
+  fi
+  if ! fetch_sab_queue; then
+    ((ERRORS++)) || true
+    log "ERROR" "Unable to fetch SABnzbd queue. Stranded cleanup was skipped."
+    return 1
+  fi
 
   if is_true "$SONARR_ENABLED"; then
     log "INFO" "Fetching Sonarr Activity queue."
-    fetch_arr_queue Sonarr "$SONARR_QUEUE_FILE" || \
-      die "Unable to fetch complete Sonarr queue. No cleanup was attempted."
+    if ! fetch_arr_queue Sonarr "$SONARR_QUEUE_FILE"; then
+      ((ERRORS++)) || true
+      log "ERROR" "Unable to fetch complete Sonarr queue. Stranded cleanup was skipped."
+      return 1
+    fi
   else
     printf '{"records":[],"totalRecords":0}\n' > "$SONARR_QUEUE_FILE"
   fi
 
   if is_true "$RADARR_ENABLED"; then
     log "INFO" "Fetching Radarr Activity queue."
-    fetch_arr_queue Radarr "$RADARR_QUEUE_FILE" || \
-      die "Unable to fetch complete Radarr queue. No cleanup was attempted."
+    if ! fetch_arr_queue Radarr "$RADARR_QUEUE_FILE"; then
+      ((ERRORS++)) || true
+      log "ERROR" "Unable to fetch complete Radarr queue. Stranded cleanup was skipped."
+      return 1
+    fi
   else
     printf '{"records":[],"totalRecords":0}\n' > "$RADARR_QUEUE_FILE"
   fi
@@ -1628,7 +2010,11 @@ notify_summary() {
     return 0
   fi
 
-  (( QUARANTINED > 0 || PURGED > 0 || ERRORS > 0 )) || return 0
+  (( NZB_BACKUPS_ELIGIBLE > 0 ||
+     APP_BACKUPS_ELIGIBLE > 0 ||
+     QUARANTINED > 0 ||
+     PURGED > 0 ||
+     ERRORS > 0 )) || return 0
 
   local importance="normal"
   (( ERRORS > 0 )) && importance="warning"
@@ -1637,20 +2023,40 @@ notify_summary() {
   is_true "$DRY_RUN" && mode="DRY RUN"
 
   local message
-  message="Mode=${mode}; eligible=${ELIGIBLE}; quarantined=${QUARANTINED} ($(bytes_human "$BYTES_QUARANTINED")); purged=${PURGED} ($(bytes_human "$BYTES_PURGED")); errors=${ERRORS}"
+  message="Mode=${mode}; backup_status=${BACKUP_CLEANUP_STATUS}; backup_files=$((NZB_BACKUPS_ELIGIBLE + APP_BACKUPS_ELIGIBLE)) ($(bytes_human "$((NZB_BACKUP_BYTES + APP_BACKUP_BYTES))")); stranded_status=${STRANDED_CLEANUP_STATUS}; quarantined=${QUARANTINED} ($(bytes_human "$BYTES_QUARANTINED")); purge_status=${QUARANTINE_PURGE_STATUS}; purged=${PURGED} ($(bytes_human "$BYTES_PURGED")); errors=${ERRORS}"
 
   "$NOTIFY" \
     -i "$importance" \
-    -s "SABnzbd Stranded Cleanup" \
-    -d "Completed download cleanup summary" \
+    -s "SABnzbd Cleanup" \
+    -d "Backup and completed-download cleanup summary" \
     -m "$message" >/dev/null 2>&1 || true
+}
+
+log_detail_list() {
+  local heading="$1"
+  shift
+
+  (( $# > 0 )) || return 0
+
+  log "INFO" "$heading"
+
+  local detail
+  for detail in "$@"; do
+    log "INFO" "  - $detail"
+  done
 }
 
 print_summary() {
   log "INFO" "============================================================"
-  log "INFO" "SABnzbd stranded cleanup v${VERSION} summary"
+  log "INFO" "SABnzbd cleanup v${VERSION} summary"
   log "INFO" "Mode: $(is_true "$DRY_RUN" && printf 'DRY RUN' || printf 'EXECUTE')"
   log "INFO" "Runtime: $(runtime)"
+  log "INFO" "Backup cleanup status: $BACKUP_CLEANUP_STATUS"
+  log "INFO" "NZB backups eligible: $NZB_BACKUPS_ELIGIBLE ($(bytes_human "$NZB_BACKUP_BYTES"))"
+  log "INFO" "NZB backups removed: $NZB_BACKUPS_REMOVED"
+  log "INFO" "Application backups eligible: $APP_BACKUPS_ELIGIBLE ($(bytes_human "$APP_BACKUP_BYTES"))"
+  log "INFO" "Application backups removed: $APP_BACKUPS_REMOVED"
+  log "INFO" "Stranded cleanup status: $STRANDED_CLEANUP_STATUS"
   log "INFO" "SAB records scanned: $SCANNED"
   log "INFO" "Completed records scanned: $COMPLETED_SCANNED"
   log "INFO" "Too young: $TOO_YOUNG"
@@ -1667,16 +2073,12 @@ print_summary() {
   fi
   log "INFO" "Eligible: $ELIGIBLE ($(bytes_human "$BYTES_ELIGIBLE"))"
   log "INFO" "Quarantined/planned: $QUARANTINED ($(bytes_human "$BYTES_QUARANTINED"))"
+  log "INFO" "Quarantine purge status: $QUARANTINE_PURGE_STATUS"
   log "INFO" "Purged/planned: $PURGED ($(bytes_human "$BYTES_PURGED"))"
   log "INFO" "Errors: $ERRORS"
 
-  if (( ${#QUARANTINE_DETAILS[@]} > 0 )); then
-    log "INFO" "Quarantine details:"
-    local detail
-    for detail in "${QUARANTINE_DETAILS[@]}"; do
-      log "INFO" "  - $detail"
-    done
-  fi
+  log_detail_list "Quarantine details:" "${QUARANTINE_DETAILS[@]}"
+  log_detail_list "Purge details:" "${PURGE_DETAILS[@]}"
 }
 
 ###############################################################################
@@ -1685,41 +2087,101 @@ print_summary() {
 
 main() {
   local operation_status
+  local quarantine_ready=false
 
   parse_args "$@"
   initialize
 
-  log "INFO" "Starting SABnzbd stranded completed download cleanup v${VERSION}."
-  log "INFO" "DRY_RUN=$DRY_RUN | PURGE_QUARANTINE=$PURGE_QUARANTINE"
-  log "INFO" "Minimum completed age: ${MIN_COMPLETED_AGE_HOURS}h"
-  log "INFO" "Minimum path stability: ${MIN_PATH_STABLE_HOURS}h"
-  log "INFO" "Quarantine retention: ${QUARANTINE_RETENTION_DAYS}d"
+  log "INFO" "Starting SABnzbd cleanup v${VERSION}."
+  log "INFO" "DRY_RUN=$DRY_RUN | CLEAN_BACKUPS=$CLEAN_BACKUPS | CLEAN_STRANDED_DOWNLOADS=$CLEAN_STRANDED_DOWNLOADS | PURGE_QUARANTINE=$PURGE_QUARANTINE"
   log "INFO" "Mover guard enabled: $MOVER_GUARD_ENABLED"
 
   check_mover_guard "startup"
   operation_status=$?
   if (( operation_status == 20 )); then
+    is_true "$CLEAN_BACKUPS" && BACKUP_CLEANUP_STATUS="MOVER_SKIPPED"
+    is_true "$CLEAN_STRANDED_DOWNLOADS" && STRANDED_CLEANUP_STATUS="MOVER_SKIPPED"
+    is_true "$PURGE_QUARANTINE" && QUARANTINE_PURGE_STATUS="MOVER_SKIPPED"
     print_summary
     return 0
   fi
 
-  fetch_required_state
-  process_completed_jobs
-  operation_status=$?
-  if (( operation_status == 20 )); then
-    print_summary
-    return 0
-  elif (( operation_status != 0 )); then
-    die "Completed-job processing failed with status $operation_status."
+  if is_true "$CLEAN_BACKUPS"; then
+    if validate_backup_environment; then
+      BACKUP_CLEANUP_STATUS="RUNNING"
+      cleanup_backups
+      operation_status=$?
+
+      if (( operation_status == 20 )); then
+        BACKUP_CLEANUP_STATUS="MOVER_STOPPED"
+        is_true "$CLEAN_STRANDED_DOWNLOADS" && STRANDED_CLEANUP_STATUS="MOVER_SKIPPED"
+        is_true "$PURGE_QUARANTINE" && QUARANTINE_PURGE_STATUS="MOVER_SKIPPED"
+        print_summary
+        return 0
+      elif (( operation_status == 0 )); then
+        BACKUP_CLEANUP_STATUS="COMPLETED"
+      else
+        BACKUP_CLEANUP_STATUS="COMPLETED_WITH_ERRORS"
+      fi
+    else
+      BACKUP_CLEANUP_STATUS="SKIPPED_CONFIGURATION"
+    fi
   fi
 
-  purge_quarantine
-  operation_status=$?
-  if (( operation_status == 20 )); then
-    print_summary
-    return 0
-  elif (( operation_status != 0 )); then
-    die "Quarantine purge failed with status $operation_status."
+  if is_true "$CLEAN_STRANDED_DOWNLOADS" || is_true "$PURGE_QUARANTINE"; then
+    if prepare_quarantine_environment; then
+      quarantine_ready=true
+    else
+      is_true "$CLEAN_STRANDED_DOWNLOADS" && STRANDED_CLEANUP_STATUS="SKIPPED_CONFIGURATION"
+      is_true "$PURGE_QUARANTINE" && QUARANTINE_PURGE_STATUS="SKIPPED_CONFIGURATION"
+    fi
+  fi
+
+  if is_true "$CLEAN_STRANDED_DOWNLOADS" && is_true "$quarantine_ready"; then
+    log "INFO" "Minimum completed age: ${MIN_COMPLETED_AGE_HOURS}h"
+    log "INFO" "Minimum path stability: ${MIN_PATH_STABLE_HOURS}h"
+
+    if ! validate_stranded_environment; then
+      STRANDED_CLEANUP_STATUS="SKIPPED_CONFIGURATION"
+    elif ! fetch_required_state; then
+      STRANDED_CLEANUP_STATUS="SKIPPED_API_FAILURE"
+    else
+      STRANDED_CLEANUP_STATUS="RUNNING"
+      process_completed_jobs
+      operation_status=$?
+
+      if (( operation_status == 20 )); then
+        STRANDED_CLEANUP_STATUS="MOVER_STOPPED"
+        is_true "$PURGE_QUARANTINE" && QUARANTINE_PURGE_STATUS="MOVER_SKIPPED"
+        print_summary
+        return 0
+      elif (( operation_status == 0 )); then
+        STRANDED_CLEANUP_STATUS="COMPLETED"
+      else
+        ((ERRORS++)) || true
+        STRANDED_CLEANUP_STATUS="COMPLETED_WITH_ERRORS"
+        log "ERROR" "Completed-job processing failed with status $operation_status."
+      fi
+    fi
+  fi
+
+  if is_true "$PURGE_QUARANTINE" && is_true "$quarantine_ready"; then
+    log "INFO" "Quarantine retention: ${QUARANTINE_RETENTION_DAYS}d"
+    QUARANTINE_PURGE_STATUS="RUNNING"
+    purge_quarantine
+    operation_status=$?
+
+    if (( operation_status == 20 )); then
+      QUARANTINE_PURGE_STATUS="MOVER_STOPPED"
+      print_summary
+      return 0
+    elif (( operation_status == 0 )); then
+      QUARANTINE_PURGE_STATUS="COMPLETED"
+    else
+      ((ERRORS++)) || true
+      QUARANTINE_PURGE_STATUS="FAILED"
+      log "ERROR" "Quarantine purge failed with status $operation_status."
+    fi
   fi
 
   print_summary
