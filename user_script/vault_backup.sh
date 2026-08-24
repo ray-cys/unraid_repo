@@ -54,11 +54,11 @@ IONICE_CLASS=2
 IONICE_PRIORITY=7
 NICE_LEVEL=10
 
-LOG_DIR="/mnt/vault/cloud/logs/vault_to_iss"
+LOG_DIR="/mnt/vault/cloud/logs/script/vault_backup"
 MAX_LOGS=5
 STATUS_DIR="/mnt/vault/cloud/logs/user_scripts_status"
 NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
-LOCK_FILE="/run/vault_to_iss_versioned.lock"
+LOCK_FILE="/run/vault_backup.lock"
 
 ###############################################################################
 # RUNTIME
@@ -139,9 +139,9 @@ write_receipt() {
     now="$(date +%s)"
     mkdir -p -- "$STATUS_DIR" 2>/dev/null || return 0
     command -v jq >/dev/null 2>&1 || return 0
-    tmp="$(mktemp "${STATUS_DIR}/.vault_to_iss_versioned.XXXXXX")" || return 0
+    tmp="$(mktemp "${STATUS_DIR}/.vault_backup.XXXXXX")" || return 0
     if jq -n \
-        --arg name "vault_to_iss_versioned" \
+        --arg name "vault_backup" \
         --arg status "$status" \
         --arg summary "$summary" \
         --arg log "$LOG_FILE" \
@@ -150,7 +150,7 @@ write_receipt() {
         '{name:$name,status:$status,summary:$summary,log:$log,epoch:$epoch,duration_seconds:$duration}' \
         >"$tmp"
     then
-        mv -f -- "$tmp" "${STATUS_DIR}/vault_to_iss_versioned.json"
+        mv -f -- "$tmp" "${STATUS_DIR}/vault_backup.json"
         RECEIPT_WRITTEN=1
     else
         rm -f -- "$tmp"
