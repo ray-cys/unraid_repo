@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Unraid Boot Device Backup
+# Unraid Boot Device Backup v1.0
 #
 # Designed for Unraid 7.3+
 #
