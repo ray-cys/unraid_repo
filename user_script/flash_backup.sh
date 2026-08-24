@@ -72,28 +72,9 @@ log() {
                     "$LOG_FILE" \
                     >&2
 
-                syslog warning \
-                    "Boot backup persistent log became unavailable: $LOG_FILE"
-
             fi
         fi
     fi
-
-}
-
-syslog() {
-
-    local level="$1"
-
-    shift
-
-    command -v logger >/dev/null 2>&1 || return 0
-
-    logger \
-        -t flash_backup \
-        -p "user.${level}" \
-        -- "$*" \
-        2>/dev/null || true
 
 }
 
@@ -146,9 +127,6 @@ initialize_logging() {
 
         log "WARNING: Invalid log rotation configuration; persistent logging disabled"
 
-        syslog warning \
-            "Boot backup persistent logging disabled by invalid rotation configuration"
-
         return 0
 
     fi
@@ -156,9 +134,6 @@ initialize_logging() {
     if ! mkdir -p -- "$LOG_DIR" 2>/dev/null; then
 
         log "WARNING: Persistent log directory unavailable: $LOG_DIR"
-
-        syslog warning \
-            "Boot backup persistent log directory unavailable: $LOG_DIR"
 
         return 0
 
@@ -170,9 +145,6 @@ initialize_logging() {
 
         log "WARNING: Persistent log is not writable: $LOG_FILE"
 
-        syslog warning \
-            "Boot backup persistent log is not writable: $LOG_FILE"
-
         return 0
 
     fi
@@ -182,9 +154,6 @@ initialize_logging() {
     if [ "$rotation_ok" = false ]; then
 
         log "WARNING: Log rotation failed; continuing with the current log"
-
-        syslog warning \
-            "Boot backup log rotation failed: $LOG_FILE"
 
     fi
 
@@ -273,9 +242,6 @@ cleanup() {
 
             log "WARNING: Unable to remove temporary file: $file"
 
-            syslog warning \
-                "Unable to remove temporary boot backup file: $file"
-
         fi
     done
 
@@ -293,8 +259,7 @@ cleanup_webgui_symlinks() {
 
         if ! rm -f -- "$link"; then
 
-            syslog warning \
-                "Unable to remove WebGUI backup symlink: $link"
+            log "WARNING: Unable to remove WebGUI backup symlink: $link"
 
         fi
 
@@ -386,9 +351,8 @@ prune_backups() {
         log "Deleting old backup: ${files[$i]}"
 
         if ! rm -f -- "${files[$i]}"; then
-        
-            syslog warning \
-                "Unable to delete old boot backup: ${files[$i]}"
+
+            log "WARNING: Unable to delete old boot backup: ${files[$i]}"
 
         fi
     done
@@ -403,9 +367,6 @@ exec 9>"$LOCKFILE"
 if ! flock -n 9; then
 
     log "Another boot-device backup is already running."
-
-    syslog warning \
-        "Backup skipped because another instance is running"
 
     exit 1
 
@@ -440,9 +401,6 @@ if [ ! -d "$POOL_PATH" ]; then
 
     log "ERROR: Pool path does not exist: $POOL_PATH"
 
-    syslog err \
-        "Boot backup aborted: pool unavailable: $POOL_PATH"
-
     notify alert \
         "Backup - POOL UNAVAILABLE" \
         "Destination pool is unavailable."$'\n\n'"Pool: $POOL_PATH"$'\n'"Runtime: $(runtime)"
@@ -466,9 +424,6 @@ if command -v findmnt >/dev/null 2>&1; then
         log "ERROR: $POOL_PATH is not an active mount point"
         log "Detected mount target: ${mount_target:-<none>}"
 
-        syslog err \
-            "Boot backup aborted because $POOL_PATH is not mounted"
-
         notify alert \
             "Backup - POOL NOT MOUNTED" \
             "$POOL_PATH is not mounted."$'\n\n'"Backup aborted to prevent writing into RAM."$'\n'"Runtime: $(runtime)"
@@ -486,9 +441,6 @@ fi
 if [ ! -x "$HELPER" ]; then
 
     log "ERROR: Native Unraid backup helper not found: $HELPER"
-
-    syslog err \
-        "Native Unraid boot backup helper missing"
 
     notify alert \
         "Backup - HELPER MISSING" \
@@ -611,8 +563,6 @@ else
 
     done < "$HELPER_LOG"
 
-    syslog err \
-        "Native boot backup helper failed with exit code $RC"
     HELPER_EXCERPT=$(
         tail -n 20 "$HELPER_LOG" 2>/dev/null || true
     )
@@ -798,9 +748,6 @@ if [ -z "${BACKUP_SOURCE:-}" ] || [ ! -f "$BACKUP_SOURCE" ]; then
             -exec ls -la {} \; 2>/dev/null
     )
 
-    syslog err \
-        "Backup helper completed but generated archive could not be located"
-
     notify alert \
         "Backup - NO ARCHIVE" \
         "The native Unraid helper completed successfully but the generated boot-backup ZIP could not be located."$'\n\n'"Check the User Scripts log for helper and WebGUI details."$'\n\n'"Runtime: $(runtime)"
@@ -824,9 +771,6 @@ log "Verifying source ZIP archive"
 if ! verify_zip "$BACKUP_SOURCE"; then
 
     log "ERROR: Source ZIP verification failed"
-
-    syslog err \
-        "Boot backup source archive failed ZIP verification: $BACKUP_SOURCE"
 
     notify alert \
         "Backup - CORRUPT ARCHIVE" \
@@ -870,9 +814,6 @@ if (( AVAILABLE_BYTES < REQUIRED_BYTES )); then
     log "Required: $(bytes_human "$REQUIRED_BYTES")"
     log "Available: $(bytes_human "$AVAILABLE_BYTES")"
 
-    syslog err \
-        "Insufficient space for boot backup"
-
     notify alert \
         "Backup - NO SPACE" \
         "Insufficient destination space."$'\n\n'"Required: $(bytes_human "$REQUIRED_BYTES")"$'\n'"Available: $(bytes_human "$AVAILABLE_BYTES")"$'\n'"Destination: $BACKUP_DIR"$'\n'"Runtime: $(runtime)"
@@ -904,9 +845,6 @@ if ! cp -- "$BACKUP_SOURCE" "$TEMP_FILE"; then
 
     log "ERROR: Failed to copy backup to destination"
 
-    syslog err \
-        "Unable to copy boot backup to $BACKUP_DIR"
-
     notify alert \
         "Backup - COPY FAILED" \
         "Unable to copy boot backup to:"$'\n'"$BACKUP_DIR"$'\n\n'"Runtime: $(runtime)"
@@ -929,9 +867,6 @@ if [ "$SOURCE_SIZE" -ne "$DEST_SIZE" ]; then
     log "Source: $SOURCE_SIZE bytes"
     log "Destination: $DEST_SIZE bytes"
 
-    syslog err \
-        "Boot backup copy size mismatch"
-
     notify alert \
         "Backup - SIZE MISMATCH" \
         "Backup copy verification failed."$'\n\n'"Source: $(bytes_human "$SOURCE_SIZE")"$'\n'"Destination: $(bytes_human "$DEST_SIZE")"$'\n'"Runtime: $(runtime)"
@@ -946,9 +881,6 @@ log "Verifying copied ZIP archive"
 if ! verify_zip "$TEMP_FILE"; then
 
     log "ERROR: Destination ZIP verification failed"
-
-    syslog err \
-        "Copied boot backup failed ZIP verification"
 
     notify alert \
         "Backup - COPY CORRUPT" \
@@ -972,9 +904,6 @@ if ! mv -f -- "$TEMP_FILE" "$BACKUP_FILE"; then
 
     log "ERROR: Unable to finalize destination archive"
 
-    syslog err \
-        "Unable to finalize boot backup at destination"
-
     notify alert \
         "Backup - FINALIZE FAILED" \
         "Backup was copied but could not be finalized."$'\n\n'"Destination: $BACKUP_FILE"$'\n'"Runtime: $(runtime)"
@@ -996,10 +925,10 @@ log "Backup finalized successfully"
 #
 
 chown nobody:users "$BACKUP_FILE" 2>/dev/null || \
-    syslog warning "Unable to chown $BACKUP_FILE"
+    log "WARNING: Unable to set backup ownership: $BACKUP_FILE"
 
 chmod 0644 "$BACKUP_FILE" 2>/dev/null || \
-    syslog warning "Unable to chmod $BACKUP_FILE"
+    log "WARNING: Unable to set backup permissions: $BACKUP_FILE"
 
 ###############################################################################
 # REMOVE SOURCE ARCHIVE
@@ -1022,9 +951,6 @@ if rm -f -- "$BACKUP_SOURCE"; then
 else
 
     log "WARNING: Unable to remove source archive: $BACKUP_SOURCE"
-
-    syslog warning \
-        "Unable to remove temporary boot backup source: $BACKUP_SOURCE"
 
 fi
 
@@ -1073,9 +999,6 @@ log "File: $(basename "$BACKUP_FILE")"
 log "Size: $(bytes_human "$BACKUP_SIZE")"
 log "Destination: $BACKUP_DIR"
 log "Runtime: $RUNTIME"
-
-syslog info \
-    "Boot device backup successful: $(basename "$BACKUP_FILE"), size $(bytes_human "$BACKUP_SIZE"), runtime $RUNTIME"
 
 notify normal \
     "Backup - OK" \
