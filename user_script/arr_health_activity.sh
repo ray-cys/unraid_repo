@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.3.1
+# ARR Health / Download / Import Monitor v3.4.0
 #
 # PURPOSE
 # -------
@@ -660,12 +660,15 @@ FLOW_ANOMALY_ESCALATE_HOURS=24
 
 # Exact cross-application flow ledger. Aggregate flow detection remains as a
 # fallback, while records with a shared downloadId/nzo_id are assessed one by
-# one. Terminal records are pruned with the rest of the retained monitor state.
+# one. Only recent completions or downloads observed live by this monitor are
+# enrolled; old SAB history is not treated as a newly discovered workflow.
+# Once enrolled, a download remains monitored beyond the discovery window.
 DOWNLOAD_LEDGER_ENABLED=true
 DOWNLOAD_LEDGER_GRAB_TO_SAB_WARN_MINUTES=60
 DOWNLOAD_LEDGER_SAB_VANISHED_WARN_MINUTES=60
-DOWNLOAD_LEDGER_IMPORT_WARN_MINUTES=90
-DOWNLOAD_LEDGER_ESCALATE_MINUTES=360
+DOWNLOAD_LEDGER_IMPORT_WARN_MINUTES=300
+DOWNLOAD_LEDGER_ESCALATE_MINUTES=720
+DOWNLOAD_LEDGER_DISCOVERY_HOURS=24
 DOWNLOAD_LEDGER_RETENTION_DAYS=7
 
 # ---------------------------------------------------------------------------
@@ -787,10 +790,12 @@ SAB_CAPACITY_ISSUE_COUNT=0
 SAB_FILESYSTEM_SCAN_DEFERRED_COUNT=0
 
 DOWNLOAD_LEDGER_OBSERVATIONS_FILE=""
+DOWNLOAD_LEDGER_ENROLLED_IDS_FILE=""
 DOWNLOAD_LEDGER_ISSUE_COUNT=0
 DOWNLOAD_LEDGER_NOT_REACHED_COUNT=0
 DOWNLOAD_LEDGER_VANISHED_COUNT=0
 DOWNLOAD_LEDGER_IMPORT_MISSING_COUNT=0
+DOWNLOAD_LEDGER_HISTORICAL_RETIRED_COUNT=0
 REMINDER_NOTIFICATION_COUNT=0
 FLAPPING_NOTIFICATION_COUNT=0
 FLAPPING_SUPPRESSED_COUNT=0
@@ -2659,7 +2664,7 @@ initialize_state() {
 
         cat >"$STATE_FILE" <<'EOF'
 {
-  "version": 11,
+  "version": 12,
   "issues": {},
   "sabProgress": {},
   "downloadLedger": {},
@@ -2701,7 +2706,7 @@ EOF
 
             cat >"$STATE_FILE" <<'EOF'
 {
-  "version": 11,
+  "version": 12,
   "issues": {},
   "sabProgress": {},
   "downloadLedger": {},
@@ -2726,9 +2731,12 @@ EOF
         fi
     fi
     ###########################################################################
-    # v2.3 STATE MIGRATION
+    # STATE MIGRATION - v3.4
     #
-    # Existing v2.1/v2.2 state files are upgraded in place.
+    # Existing state is upgraded in place. Completion-only ledger records that
+    # predate the discovery window are not enrolled. Any active historical
+    # false-positive created from such a record is retired silently here so it
+    # cannot generate either another reminder or a mass resolution email.
     ###########################################################################
 
     local migrate_tmp
@@ -2737,8 +2745,9 @@ EOF
 
     if jq \
         --argjson migrationNow "$START_TIME" \
+        --argjson discoverySeconds "$((DOWNLOAD_LEDGER_DISCOVERY_HOURS * 3600))" \
         '
-        .version = 11
+        .version = 12
         |
         .issues = (.issues // {})
         |
@@ -2786,6 +2795,119 @@ EOF
         |
         .downloadLedger = (.downloadLedger // {})
         |
+        .issues as $issues
+        |
+        .downloadLedger |= with_entries(
+            .key as $id
+            |
+            .value |= (
+                . as $record
+                |
+                ($issues["FLOW:DOWNLOAD:" + $id] // {}) as $issue
+                |
+                (
+                    (($record.arrGrabbedAt // 0) > 0)
+                    or (($record.arrQueueLastSeen // 0) > 0)
+                    or (($record.sabQueuedAt // 0) > 0)
+                    or (($record.sabQueueLastSeen // 0) > 0)
+                ) as $liveEvidence
+                |
+                (
+                    (($issue.classification // "") == "DOWNLOAD_FLOW_IMPORT_MISSING")
+                    and (($issue.firstSeen // 0) > 0)
+                    and (($record.sabCompletedAt // 0) > 0)
+                    and (($issue.firstSeen - $record.sabCompletedAt) >= 0)
+                    and (($issue.firstSeen - $record.sabCompletedAt) <= $discoverySeconds)
+                ) as $credibleExistingIssue
+                |
+                (
+                    if (($record.flowEnrolled | type) == "boolean")
+                    then $record.flowEnrolled
+                    elif $liveEvidence
+                    then true
+                    elif $credibleExistingIssue
+                    then true
+                    elif (($record.sabCompletedAt // 0) >= ($migrationNow - $discoverySeconds))
+                    then true
+                    else false
+                    end
+                ) as $enrolled
+                |
+                .flowEnrolled = $enrolled
+                |
+                .flowEnrolledAt = (
+                    if $enrolled
+                    then
+                        if (($record.flowEnrolledAt // 0) > 0)
+                        then $record.flowEnrolledAt
+                        elif (($issue.firstSeen // 0) > 0)
+                        then $issue.firstSeen
+                        elif (($record.lastSeen // 0) > 0)
+                        then $record.lastSeen
+                        else $migrationNow
+                        end
+                    else 0
+                    end
+                )
+                |
+                .flowEnrollmentReason = (
+                    if $enrolled
+                    then
+                        if (($record.flowEnrollmentReason // "") != "")
+                        then $record.flowEnrollmentReason
+                        elif $liveEvidence
+                        then "observed-live"
+                        elif $credibleExistingIssue
+                        then "migrated-active"
+                        else "recent-completion"
+                        end
+                    else "historical-completion"
+                    end
+                )
+            )
+        )
+        |
+        .downloadLedger as $ledger
+        |
+        .issues |= with_entries(
+            .key as $issueKey
+            |
+            ($issueKey | ltrimstr("FLOW:DOWNLOAD:")) as $downloadId
+            |
+            if
+                ($issueKey | startswith("FLOW:DOWNLOAD:"))
+                and ((.value.active // false) == true)
+                and ((.value.classification // "") == "DOWNLOAD_FLOW_IMPORT_MISSING")
+                and (($ledger[$downloadId].sabCompletedAt // 0) > 0)
+                and ($ledger[$downloadId].flowEnrolled == false)
+            then
+                .value |= (
+                    .active = false
+                    |
+                    .resolvedAt = $migrationNow
+                    |
+                    .lastSeen = $migrationNow
+                    |
+                    .notifiedSignature = ""
+                    |
+                    .lastNotifiedAt = 0
+                    |
+                    .reminderCount = 0
+                    |
+                    .acknowledgedSignature = ""
+                    |
+                    .acknowledgedAt = 0
+                    |
+                    .acknowledgementNote = ""
+                    |
+                    .historicalRetiredAt = $migrationNow
+                    |
+                    .historicalRetiredReason = "SAB completion predates exact-ledger discovery window"
+                )
+            else .
+            end
+        )
+        |
         .sabServerStats = (.sabServerStats // {})
         |
         .monitor = (
@@ -2829,11 +2951,25 @@ EOF
        save_state "$migrate_tmp"
     then
 
-        :
+        DOWNLOAD_LEDGER_HISTORICAL_RETIRED_COUNT=$(jq -r \
+            --argjson migrationNow "$START_TIME" \
+            '[
+                .issues[]?
+                | select((.historicalRetiredAt // 0) == $migrationNow)
+            ]
+            | length' \
+            "$STATE_FILE")
+
+        [[ "$DOWNLOAD_LEDGER_HISTORICAL_RETIRED_COUNT" =~ ^[0-9]+$ ]] || \
+            DOWNLOAD_LEDGER_HISTORICAL_RETIRED_COUNT=0
+
+        if (( DOWNLOAD_LEDGER_HISTORICAL_RETIRED_COUNT > 0 )); then
+            log "Silently retired ${DOWNLOAD_LEDGER_HISTORICAL_RETIRED_COUNT} historical download-flow issue(s) from before ledger monitoring"
+        fi
 
     else
 
-        log "ERROR: Unable to migrate state file to schema version 11"
+        log "ERROR: Unable to migrate state file to schema version 12"
         exit 3
     fi
 }
@@ -2897,7 +3033,7 @@ begin_monitor_run() {
     jq \
         --argjson now "$now" \
         '
-        .version = 11
+        .version = 12
         |
         .monitor.lastStartedAt = $now
         |
@@ -3321,7 +3457,7 @@ record_arr_telemetry() {
         --argjson maxIssueKeys "$ARR_TELEMETRY_MAX_ISSUE_KEYS" \
         --argjson maxExamples "$ARR_TELEMETRY_MAX_EXAMPLES" \
         '
-        .version = 11
+        .version = 12
         |
         .telemetry = (
             .telemetry
@@ -3748,7 +3884,7 @@ update_issue_state() {
         --argjson flapThreshold "$FLAP_TRANSITION_THRESHOLD" \
         --argjson flapSuppressionSeconds "$flap_suppression_seconds" \
         '
-        .version = 11
+        .version = 12
         |
         (.issues[$key] // {}) as $old
         |
@@ -8912,8 +9048,46 @@ process_arr_history_failures() {
 }
 
 ###############################################################################
-# EXACT DOWNLOAD WORKFLOW LEDGER - v3.2
+# EXACT DOWNLOAD WORKFLOW LEDGER - v3.4
 ###############################################################################
+
+prepare_download_ledger_enrollment_cache() {
+
+    : >"$DOWNLOAD_LEDGER_ENROLLED_IDS_FILE"
+
+    jq -r '
+        .downloadLedger
+        // {}
+        | to_entries[]?
+        | select((.value.flowEnrolled // false) == true)
+        | .key
+        ' \
+        "$STATE_FILE" \
+        >>"$DOWNLOAD_LEDGER_ENROLLED_IDS_FILE" || return 1
+}
+
+download_ledger_id_is_enrolled() {
+
+    local download_id="${1,,}"
+
+    [ -n "$download_id" ] || return 1
+
+    grep -Fxiq -- \
+        "$download_id" \
+        "$DOWNLOAD_LEDGER_ENROLLED_IDS_FILE" \
+        2>/dev/null
+}
+
+mark_download_ledger_id_enrolled() {
+
+    local download_id="${1,,}"
+
+    [ -n "$download_id" ] || return 0
+
+    if ! download_ledger_id_is_enrolled "$download_id"; then
+        printf '%s\n' "$download_id" >>"$DOWNLOAD_LEDGER_ENROLLED_IDS_FILE"
+    fi
+}
 
 append_download_ledger_observation() {
 
@@ -8929,6 +9103,12 @@ append_download_ledger_observation() {
     [ -n "$download_id" ] || return 0
     [[ "$event_epoch" =~ ^[0-9]+$ ]] || event_epoch=0
     [[ "$observed_at" =~ ^[0-9]+$ ]] || observed_at="$START_TIME"
+
+    case "$kind" in
+        arrGrabbed|arrQueue|sabQueue)
+            mark_download_ledger_id_enrolled "$download_id"
+            ;;
+    esac
 
     jq -nc \
         --arg id "$download_id" \
@@ -9059,6 +9239,10 @@ collect_arr_download_ledger() {
 
 collect_sab_download_ledger() {
 
+    local discovery_cutoff=$((
+        START_TIME - DOWNLOAD_LEDGER_DISCOVERY_HOURS * 3600
+    ))
+
     if [ "$SAB_QUEUE_OK" = true ] && [ -f "$SAB_QUEUE" ]; then
 
         while IFS= read -r item; do
@@ -9078,6 +9262,7 @@ collect_sab_download_ledger() {
 
             download_id=$(jq -r '.nzo_id // ""' <<<"$item")
             [ -n "$download_id" ] || continue
+            download_id="${download_id,,}"
 
             release=$(jq -r '.filename // .name // "Unknown SAB job"' <<<"$item")
             status=$(jq -r '.status // "unknown"' <<<"$item")
@@ -9118,6 +9303,7 @@ collect_sab_download_ledger() {
 
             download_id=$(jq -r '.nzo_id // ""' <<<"$item")
             [ -n "$download_id" ] || continue
+            download_id="${download_id,,}"
 
             release=$(jq -r '.name // .nzb_name // "Unknown SAB job"' <<<"$item")
             status=$(jq -r '.status // "unknown"' <<<"$item")
@@ -9146,6 +9332,13 @@ collect_sab_download_ledger() {
 
             (( event_epoch > 0 )) || event_epoch="$observed_at"
 
+            if [ "$kind" = "sabCompleted" ] &&
+               (( event_epoch < discovery_cutoff )) &&
+               ! download_ledger_id_is_enrolled "$download_id"
+            then
+                continue
+            fi
+
             append_download_ledger_observation \
                 "$download_id" \
                 "$owner" \
@@ -9168,6 +9361,8 @@ update_download_ledger_state() {
 
     jq \
         --slurpfile observations "$DOWNLOAD_LEDGER_OBSERVATIONS_FILE" \
+        --argjson enrollmentCutoff "$((START_TIME - DOWNLOAD_LEDGER_DISCOVERY_HOURS * 3600))" \
+        --argjson enrollmentNow "$START_TIME" \
         '
         def epoch_max($first; $second):
             [($first // 0), ($second // 0)] | max;
@@ -9192,8 +9387,20 @@ update_download_ledger_state() {
                 sabFailedAt: 0,
                 arrImportedAt: 0,
                 arrFailedAt: 0,
-                arrIgnoredAt: 0
+                arrIgnoredAt: 0,
+                flowEnrolled: false,
+                flowEnrolledAt: 0,
+                flowEnrollmentReason: ""
             }) as $old
+            | (
+                ($item.kind == "arrGrabbed")
+                or ($item.kind == "arrQueue")
+                or ($item.kind == "sabQueue")
+                or (
+                    ($item.kind == "sabCompleted")
+                    and ($item.eventEpoch >= $enrollmentCutoff)
+                )
+            ) as $enrollmentObservation
             | .downloadLedger[$item.id] = (
                 $old
                 | .app = (if $item.app != "" then $item.app else .app end)
@@ -9204,6 +9411,25 @@ update_download_ledger_state() {
                     if (.firstSeen // 0) <= 0 then $item.observedAt
                     elif $item.observedAt > 0 and $item.observedAt < .firstSeen then $item.observedAt
                     else .firstSeen
+                    end
+                )
+                | .flowEnrolled = ((.flowEnrolled // false) or $enrollmentObservation)
+                | .flowEnrolledAt = (
+                    if ((.flowEnrolled // false) == true) and ((.flowEnrolledAt // 0) > 0)
+                    then .flowEnrolledAt
+                    elif $enrollmentObservation
+                    then $enrollmentNow
+                    else 0
+                    end
+                )
+                | .flowEnrollmentReason = (
+                    if (($old.flowEnrolled // false) == true) and (($old.flowEnrollmentReason // "") != "")
+                    then $old.flowEnrollmentReason
+                    elif ($item.kind == "arrGrabbed") or ($item.kind == "arrQueue") or ($item.kind == "sabQueue")
+                    then "observed-live"
+                    elif $enrollmentObservation
+                    then "recent-completion"
+                    else (.flowEnrollmentReason // "")
                     end
                 )
             )
@@ -9292,6 +9518,7 @@ process_download_ledger_issues() {
         local arr_imported_at
         local arr_failed_at
         local arr_ignored_at
+        local flow_enrolled
         local last_sab_seen
         local classification=""
         local message=""
@@ -9303,8 +9530,10 @@ process_download_ledger_issues() {
 
         download_id=$(jq -r '.id' <<<"$record")
         app=$(jq -r '.app // ""' <<<"$record")
+        flow_enrolled=$(jq -r '(.flowEnrolled // false) | tostring' <<<"$record")
 
         download_ledger_can_evaluate "$app" || continue
+        [ "$flow_enrolled" = true ] || continue
 
         title=$(jq -r '.title // .release // "Unknown download"' <<<"$record")
         release=$(jq -r '.release // "Unknown release"' <<<"$record")
@@ -9409,6 +9638,11 @@ process_exact_download_ledger() {
     [ "$ACTIVITY_AUDIT_ENABLED" = true ] || return 0
 
     : >"$DOWNLOAD_LEDGER_OBSERVATIONS_FILE"
+
+    if ! prepare_download_ledger_enrollment_cache; then
+        log "ERROR: Unable to prepare exact download workflow enrollment cache"
+        return 1
+    fi
 
     if [ "$SONARR_AUDIT_OK" = true ]; then
         collect_arr_download_ledger \
@@ -10658,6 +10892,7 @@ SAB_PRIMARY_DOWNLOADS_FILE="${TMP_DIR}/sab_primary_downloads.txt"
 SAB_PROGRESS_SEEN_FILE="${TMP_DIR}/sab_progress_seen.txt"
 SAB_PROGRESS_OBSERVATIONS_FILE="${TMP_DIR}/sab_progress_observations.jsonl"
 DOWNLOAD_LEDGER_OBSERVATIONS_FILE="${TMP_DIR}/download_ledger_observations.jsonl"
+DOWNLOAD_LEDGER_ENROLLED_IDS_FILE="${TMP_DIR}/download_ledger_enrolled_ids.txt"
 
 : >"$NOTIFICATION_BATCH"
 : >"$SEEN_ISSUES_FILE"
@@ -10665,6 +10900,7 @@ DOWNLOAD_LEDGER_OBSERVATIONS_FILE="${TMP_DIR}/download_ledger_observations.jsonl
 : >"$SAB_PROGRESS_SEEN_FILE"
 : >"$SAB_PROGRESS_OBSERVATIONS_FILE"
 : >"$DOWNLOAD_LEDGER_OBSERVATIONS_FILE"
+: >"$DOWNLOAD_LEDGER_ENROLLED_IDS_FILE"
 
 ###############################################################################
 # STATE
@@ -10719,7 +10955,7 @@ rotate_persistent_log
 
 persistent_log \
     "START" \
-    "ARR Health Monitor v3.3.1"
+    "ARR Health Monitor v3.4.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -10732,7 +10968,7 @@ fi
 # START
 ###############################################################################
 
-log "Starting ARR Health Monitor v3.3.1"
+log "Starting ARR Health Monitor v3.4.0"
 log "Recommended schedule: every five minutes"
 log "Notifications enabled: $SEND_NOTIFICATIONS"
 log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -11218,7 +11454,7 @@ write_persistent_activity_summary
 RUNTIME=$(runtime)
 
 log "============================================================"
-log "ARR Health Monitor v3.3.1 completed"
+log "ARR Health Monitor v3.4.0 completed"
 
 log ""
 log "SCAN HEALTH"
@@ -11304,6 +11540,7 @@ log "Workflow issues: $DOWNLOAD_LEDGER_ISSUE_COUNT"
 log "  Grab did not reach SAB: $DOWNLOAD_LEDGER_NOT_REACHED_COUNT"
 log "  SAB job vanished: $DOWNLOAD_LEDGER_VANISHED_COUNT"
 log "  SAB completion missing Arr terminal event: $DOWNLOAD_LEDGER_IMPORT_MISSING_COUNT"
+log "Historical pre-monitor issues retired: $DOWNLOAD_LEDGER_HISTORICAL_RETIRED_COUNT"
 
 log ""
 log "SAB CROSS-APP"
