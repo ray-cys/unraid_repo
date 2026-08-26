@@ -24,6 +24,7 @@ SONARR_STATE_FILE="$RUNTIME_DIR/sonarr-state.json"
 SONARR_STATE_BACKUP="$RUNTIME_DIR/sonarr-state.json.bak"
 RADARR_STATE_FILE="$RUNTIME_DIR/radarr-state.json"
 RADARR_STATE_BACKUP="$RUNTIME_DIR/radarr-state.json.bak"
+NOTIFICATION_STATE_FILE="$RUNTIME_DIR/notification-state.json"
 
 # No trailing slash. Each application keeps its own API key.
 SONARR_URL="http://192.168.50.4:8989"
@@ -74,11 +75,11 @@ PLEX_DELETED_SERIES_TAG="plex-deleted-series"
 RADARR_REQUIRE_MOVIE_UNMONITORED=true
 PLEX_DELETED_MOVIE_TAG="plex-deleted"
 
-# Kodi sidecar quarantine. While media exists, the script records only the NFO
-# and artwork paths recognized by the Kodi metadata consumers. After the whole
-# movie or series is confirmed fileless, surviving unchanged files are moved
-# into the existing quarantine_lifecycle.sh layout. Sonarr/Radarr remain
-# responsible for media-linked extras through their own Recycling Bin setting.
+# Kodi sidecar quarantine. While media exists, the script records recognized
+# NFO, artwork, and external subtitle files. After the whole movie or series is
+# confirmed fileless, surviving unchanged files are moved into the existing
+# quarantine_lifecycle.sh layout. Other media-linked extras remain the
+# responsibility of Sonarr/Radarr and their Recycling Bin setting.
 QUARANTINE_KODI_SIDECARS=true
 QUARANTINE_ROOT="/mnt/user/media/bin"
 MOVIES_ROOT="/mnt/user/media/movies"
@@ -101,6 +102,15 @@ CLEANUP_REMAINING_LOG_MAX_ITEMS=10
 DEFER_SIDECAR_CLEANUP_WHILE_MOVER=true
 MAX_SIDECAR_SIZE_MB=100
 
+# One notification is rendered after both application workflows finish. A run
+# with no actions or attention items sends nothing. Unchanged folder blockers
+# are state-suppressed until their contents change or cleanup resolves.
+SEND_GROUPED_NOTIFICATIONS=true
+NOTIFY_DRY_RUN=false
+NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
+NOTIFICATION_MAX_ITEMS=25
+NOTIFICATION_ITEM_MAX_CHARS=600
+
 # A progress line is written for the first series and then every N series, so
 # a long library inspection is visibly active without filling the log.
 PROGRESS_LOG_EVERY=25
@@ -110,7 +120,7 @@ MAX_LOG_FILES=5
 HTTP_CONNECT_TIMEOUT=10
 HTTP_MAX_TIME=90
 HTTP_RETRIES=2
-USER_AGENT="Arr-Delete-Sync-Tag/1.3"
+USER_AGENT="Arr-Delete-Sync-Tag/1.4"
 
 ###############################################################################
 # END CONFIGURATION
@@ -128,6 +138,7 @@ ARR_API_KEY=""
 ARR_TEMP_PREFIX=""
 ARR_USER_AGENT=""
 QUARANTINE_RUN_ID=""
+NOTIFICATION_BATCH=""
 
 SIDECARS_CAPTURED=0
 SIDECARS_QUARANTINED=0
@@ -149,6 +160,8 @@ CLEANUP_PROGRESS_QUARANTINED=0
 CLEANUP_PROGRESS_NATIVE_MISSING=0
 CLEANUP_PROGRESS_FOLDERS_REMOVED=0
 CLEANUP_QUARANTINE_RUN_ID=""
+CLEANUP_BLOCKER_COUNT=0
+CLEANUP_BLOCKER_DETAILS=""
 
 log() {
     local level="$1"
@@ -158,7 +171,297 @@ log() {
         tee -a "$LOG_FILE" >&2
 }
 
+notification_hash() {
+    printf '%s' "$1" | sha256sum | cut -d ' ' -f 1
+}
+
+strip_notification_emoji() {
+    printf '%s' "$1" | jq -Rs -r '
+        explode
+        | map(
+            select(
+                . != 8205
+                and . != 8419
+                and . != 65039
+                and (. < 9728 or . > 10175)
+                and (. < 126976 or . > 129791)
+            )
+          )
+        | implode
+        '
+}
+
+initialize_grouped_notifications() {
+    local next invalid_backup
+
+    [[ "$SEND_GROUPED_NOTIFICATIONS" == true ]] || return 0
+
+    if [[ -f "$NOTIFICATION_STATE_FILE" ]] &&
+       ! jq -e 'type == "object" and ((.attention // {}) | type == "object")' \
+            "$NOTIFICATION_STATE_FILE" >/dev/null 2>&1; then
+        invalid_backup="${NOTIFICATION_STATE_FILE}.invalid.$(date '+%Y%m%d_%H%M%S')"
+        cp -f -- "$NOTIFICATION_STATE_FILE" "$invalid_backup" 2>/dev/null || true
+        log WARNING "Invalid grouped-notification state was archived and will be rebuilt: $invalid_backup"
+        rm -f -- "$NOTIFICATION_STATE_FILE"
+    fi
+
+    if [[ ! -f "$NOTIFICATION_STATE_FILE" ]]; then
+        next="$(mktemp "$RUNTIME_DIR/.notification-state.XXXXXX")" || return 1
+        printf '%s\n' '{"version":1,"attention":{},"lastSentAt":null}' > "$next" || {
+            rm -f -- "$next"
+            return 1
+        }
+        mv -f -- "$next" "$NOTIFICATION_STATE_FILE" || return 1
+    fi
+
+    NOTIFICATION_BATCH="$(mktemp "$RUNTIME_DIR/.notification-batch.XXXXXX")" || return 1
+    : > "$NOTIFICATION_BATCH"
+}
+
+append_notification_record() {
+    local event="$1"
+    local severity="$2"
+    local app_name="$3"
+    local key="$4"
+    local signature="$5"
+    local title="$6"
+    local detail="$7"
+
+    [[ "$SEND_GROUPED_NOTIFICATIONS" == true ]] || return 0
+    [[ -n "$NOTIFICATION_BATCH" && -f "$NOTIFICATION_BATCH" ]] || return 0
+
+    jq -cn \
+        --arg event "$event" \
+        --arg severity "$severity" \
+        --arg app "$app_name" \
+        --arg key "$key" \
+        --arg signature "$signature" \
+        --arg title "$title" \
+        --arg detail "$detail" \
+        '{
+            event: $event,
+            severity: $severity,
+            app: $app,
+            key: $key,
+            signature: $signature,
+            title: $title,
+            detail: $detail
+        }' >> "$NOTIFICATION_BATCH"
+}
+
+queue_action_notification() {
+    local app_name="$1"
+    local title="$2"
+    local detail="$3"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        [[ "$NOTIFY_DRY_RUN" == true ]] || return 0
+        title="DRY RUN: $title"
+    fi
+
+    append_notification_record action INFO "$app_name" "" "" "$title" "$detail"
+}
+
+queue_attention_notification() {
+    local severity="$1"
+    local app_name="$2"
+    local title="$3"
+    local detail="$4"
+
+    append_notification_record attention "$severity" "$app_name" "" "" "$title" "$detail"
+}
+
+queue_folder_blocker_notification() {
+    local app_name="$1"
+    local item_id="$2"
+    local title="$3"
+    local media_path="$4"
+    local key signature previous
+    local detail
+
+    [[ "$SEND_GROUPED_NOTIFICATIONS" == true ]] || return 0
+    [[ -n "$NOTIFICATION_BATCH" && -f "$NOTIFICATION_BATCH" ]] || return 0
+
+    key="folder:${app_name,,}:${item_id}"
+    detail="Directory: ${media_path}"$'\n'
+    detail+="Blocking entries: ${CLEANUP_BLOCKER_COUNT}"
+    [[ -n "$CLEANUP_BLOCKER_DETAILS" ]] && detail+=$'\n'"${CLEANUP_BLOCKER_DETAILS}"
+    signature="$(notification_hash "$media_path|$CLEANUP_BLOCKER_COUNT|$CLEANUP_BLOCKER_DETAILS")"
+    previous="$(jq -r --arg key "$key" '.attention[$key].signature // ""' \
+        "$NOTIFICATION_STATE_FILE" 2>/dev/null || true)"
+
+    [[ "$previous" != "$signature" ]] || return 0
+    if jq -e --arg key "$key" 'select(.key == $key)' "$NOTIFICATION_BATCH" \
+        >/dev/null 2>&1; then
+        return 0
+    fi
+
+    append_notification_record attention WARNING "$app_name" "$key" \
+        "$signature" "$title" "$detail"
+}
+
+queue_folder_resolution_notification() {
+    local app_name="$1"
+    local item_id="$2"
+    local title="$3"
+    local media_path="$4"
+    local key
+
+    [[ "$SEND_GROUPED_NOTIFICATIONS" == true ]] || return 0
+    [[ -n "$NOTIFICATION_BATCH" && -f "$NOTIFICATION_BATCH" ]] || return 0
+
+    key="folder:${app_name,,}:${item_id}"
+    jq -e --arg key "$key" '.attention[$key] != null' "$NOTIFICATION_STATE_FILE" \
+        >/dev/null 2>&1 || return 0
+
+    append_notification_record resolved INFO "$app_name" "$key" "" \
+        "$title" "Pending directory cleanup completed: $media_path"
+}
+
+queue_cleanup_action_notification() {
+    local app_name="$1"
+    local title="$2"
+    local media_path="$3"
+    local detail=""
+
+    (( CLEANUP_QUARANTINED > 0 || CLEANUP_FOLDERS_REMOVED > 0 )) || return 0
+
+    detail="Sidecars quarantined: ${CLEANUP_QUARANTINED}; empty directories removed: ${CLEANUP_FOLDERS_REMOVED}."
+    detail+=$'\n'"Media path: ${media_path}"
+    queue_action_notification "$app_name" "$title cleanup" "$detail"
+}
+
+mark_notification_batch_delivered() {
+    local delivered_file="$1"
+    local next now
+
+    now="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    next="$(mktemp "$RUNTIME_DIR/.notification-state.XXXXXX")" || return 1
+
+    if ! jq --arg now "$now" --slurpfile events "$delivered_file" '
+        .version = 1
+        | .attention //= {}
+        | reduce $events[] as $event (.;
+            if $event.event == "attention" and $event.key != "" then
+                .attention[$event.key] = {
+                    signature: $event.signature,
+                    app: $event.app,
+                    title: $event.title,
+                    lastNotifiedAt: $now
+                }
+            elif $event.event == "resolved" and $event.key != "" then
+                del(.attention[$event.key])
+            else
+                .
+            end
+          )
+        | .lastSentAt = $now
+        ' "$NOTIFICATION_STATE_FILE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$NOTIFICATION_STATE_FILE"
+}
+
+send_grouped_notification() {
+    local total actions attention resolved errors
+    local importance description mode body="" record entry shown=0 omitted
+    local sorted delivered
+
+    [[ "$SEND_GROUPED_NOTIFICATIONS" == true ]] || return 0
+    [[ -n "$NOTIFICATION_BATCH" && -s "$NOTIFICATION_BATCH" ]] || return 0
+
+    total="$(wc -l < "$NOTIFICATION_BATCH" | tr -d ' ')"
+    actions="$(jq -s '[.[] | select(.event == "action")] | length' "$NOTIFICATION_BATCH")"
+    attention="$(jq -s '[.[] | select(.event == "attention")] | length' "$NOTIFICATION_BATCH")"
+    resolved="$(jq -s '[.[] | select(.event == "resolved")] | length' "$NOTIFICATION_BATCH")"
+    errors="$(jq -s '[.[] | select(.severity == "ERROR")] | length' "$NOTIFICATION_BATCH")"
+
+    importance=normal
+    (( attention > 0 )) && importance=warning
+    (( errors > 0 )) && importance=alert
+    mode=EXECUTE
+    [[ "$DRY_RUN" == true ]] && mode="DRY RUN"
+    description="Daily grouped summary: actions=${actions}, attention=${attention}, resolved=${resolved}"
+    body="Mode: ${mode}"$'\n'
+    body+="Actions: ${actions} | Attention: ${attention} | Resolved: ${resolved}"$'\n\n'
+
+    sorted="$(mktemp "$RUNTIME_DIR/.notification-render.XXXXXX")" || return 1
+    delivered="$(mktemp "$RUNTIME_DIR/.notification-delivered.XXXXXX")" || {
+        rm -f -- "$sorted"
+        return 1
+    }
+    : > "$delivered"
+    jq -sc '
+        sort_by(
+            if .severity == "ERROR" then 0
+            elif .event == "attention" then 1
+            elif .event == "resolved" then 2
+            else 3
+            end,
+            .app,
+            .title
+        ) | .[]
+        ' "$NOTIFICATION_BATCH" > "$sorted" || {
+        rm -f -- "$sorted" "$delivered"
+        return 1
+    }
+
+    while IFS= read -r record; do
+        [[ -n "$record" ]] || continue
+        (( shown < NOTIFICATION_MAX_ITEMS )) || break
+        entry="$(jq -r --argjson maximum "$NOTIFICATION_ITEM_MAX_CHARS" '
+            (if .event == "attention" then "ATTENTION"
+             elif .event == "resolved" then "RESOLVED"
+             else "ACTION" end) as $label
+            | ("- [" + .app + "] " + .title + " [" + $label + "]"
+              + if .detail == "" then "" else "\n  " + (.detail | gsub("[\\r\\n]+"; "\n  ")) end) as $text
+            | if ($text | length) > $maximum
+              then $text[0:$maximum] + "\n  Detail shortened; see the persistent log."
+              else $text
+              end
+            ' <<< "$record")"
+        body+="$entry"$'\n\n'
+        printf '%s\n' "$record" >> "$delivered"
+        ((shown += 1))
+    done < "$sorted"
+    rm -f -- "$sorted"
+
+    omitted=$((total - shown))
+    if (( omitted > 0 )); then
+        body+="${omitted} additional item(s) omitted; see ${LOG_FILE}."$'\n'
+    fi
+
+    if [[ ! -x "$NOTIFY_BIN" ]]; then
+        rm -f -- "$delivered"
+        log ERROR "Grouped notification helper is unavailable: $NOTIFY_BIN"
+        return 1
+    fi
+
+    description="$(strip_notification_emoji "$description")"
+    body="$(strip_notification_emoji "$body")"
+
+    if ! "$NOTIFY_BIN" \
+        -i "$importance" \
+        -s "Arr Delete Sync" \
+        -d "$description" \
+        -m "$body" >/dev/null 2>&1; then
+        rm -f -- "$delivered"
+        log ERROR "Could not send grouped Arr delete notification."
+        return 1
+    fi
+
+    mark_notification_batch_delivered "$delivered" || {
+        rm -f -- "$delivered"
+        log ERROR "Notification was sent, but its suppression state could not be updated."
+        return 1
+    }
+    rm -f -- "$delivered"
+    log INFO "Sent one grouped notification with $shown of $total queued item(s)."
+}
+
 die() {
+    queue_attention_notification ERROR "$APP_CONTEXT" "Workflow stopped" "$*" || true
     log ERROR "$*"
     exit 1
 }
@@ -178,6 +481,8 @@ cleanup_app() {
 
 cleanup_main() {
     local status=$?
+    [[ -n "$NOTIFICATION_BATCH" && -f "$NOTIFICATION_BATCH" ]] &&
+        rm -f -- "$NOTIFICATION_BATCH"
     if [[ "$LOCK_HELD" == true ]]; then
         rm -f -- "$LOCK_DIR/pid"
         rmdir -- "$LOCK_DIR" 2>/dev/null || true
@@ -217,6 +522,7 @@ remove_stale_temp_files() {
         "$RUNTIME_DIR"/.sonarr-*
         "$RUNTIME_DIR"/.radarr-*
         "$RUNTIME_DIR"/.sidecars.*
+        "$RUNTIME_DIR"/.notification-*
     )
     [[ "$nullglob_was_set" == true ]] || shopt -u nullglob
 
@@ -366,6 +672,13 @@ capture_kodi_sidecars() {
         elif [[ "$app_name" == sonarr &&
                 "$name" =~ ^season([0-9]{2,}|-all|-specials)-(poster|banner|fanart)\.(jpg|png)$ ]]; then
             eligible=true
+        else
+            extension="${name##*.}"
+            case "$extension" in
+                srt|ass|ssa|vtt|sub|idx|sup|smi|sami)
+                    eligible=true
+                    ;;
+            esac
         fi
         [[ "$eligible" == true ]] || continue
 
@@ -438,12 +751,17 @@ log_media_cleanup_blockers() {
     local remaining=0 shown=0 additional
     local entry_word="entries"
 
+    CLEANUP_BLOCKER_COUNT=0
+    CLEANUP_BLOCKER_DETAILS=""
+
     while IFS= read -r -d '' entry; do
         ((remaining += 1))
         if (( shown < CLEANUP_REMAINING_LOG_MAX_ITEMS )); then
             relative="${entry#"$media_path"/}"
             relative="${relative//$'\n'/ }"
             log WARNING "$app_name folder cleanup blocker: $relative"
+            [[ -z "$CLEANUP_BLOCKER_DETAILS" ]] || CLEANUP_BLOCKER_DETAILS+=$'\n'
+            CLEANUP_BLOCKER_DETAILS+="- $relative"
             ((shown += 1))
         fi
     done < <(find "$media_path" -mindepth 1 ! -type d -print0 2>/dev/null)
@@ -458,6 +776,7 @@ log_media_cleanup_blockers() {
 
     entry_word="entries"
     [[ "$remaining" == 1 ]] && entry_word="entry"
+    CLEANUP_BLOCKER_COUNT="$remaining"
     log WARNING "$app_name media directory remains with $remaining blocking $entry_word; folder cleanup stays pending and will be retried: $media_path"
 }
 
@@ -607,6 +926,8 @@ quarantine_recorded_sidecars() {
     CLEANUP_PROGRESS_NATIVE_MISSING=0
     CLEANUP_PROGRESS_FOLDERS_REMOVED=0
     CLEANUP_QUARANTINE_RUN_ID=""
+    CLEANUP_BLOCKER_COUNT=0
+    CLEANUP_BLOCKER_DETAILS=""
 
     [[ "$QUARANTINE_RUN_ID" =~ ^[0-9]{8}_[0-9]{6}_[0-9]+$ ]] || return 1
     [[ ! -L "$QUARANTINE_ROOT" ]] || return 1
@@ -1600,6 +1921,12 @@ while IFS= read -r SERIES_ID; do
                     ACTION_IDS="$IDS_WITH_HISTORY"
                 fi
                 log INFO "History audit: $IDS_WITH_HISTORY_COUNT of $ID_COUNT confirmed episode(s) in $SERIES_TITLE have episodeFileDeleted evidence."
+                if [[ "$REQUIRE_DELETE_HISTORY_EVENT" == true ]] &&
+                   (( IDS_WITH_HISTORY_COUNT < ID_COUNT )); then
+                    queue_attention_notification WARNING Sonarr \
+                        "$SERIES_TITLE deletion action awaiting History evidence" \
+                        "$((ID_COUNT - IDS_WITH_HISTORY_COUNT)) confirmed episode(s) remain monitored because required episodeFileDeleted evidence is unavailable."
+                fi
             else
                 ((HISTORY_FAILURES += 1))
                 log WARNING "History audit failed for $SERIES_TITLE."
@@ -1609,6 +1936,11 @@ while IFS= read -r SERIES_ID; do
             ((HISTORY_LIMIT_SKIPS += ID_COUNT))
             log WARNING "History inspection cap reached; deferred audit for $ID_COUNT episode(s) in $SERIES_TITLE."
             [[ "$REQUIRE_DELETE_HISTORY_EVENT" == true ]] && ACTION_IDS='[]'
+            if [[ "$REQUIRE_DELETE_HISTORY_EVENT" == true ]]; then
+                queue_attention_notification WARNING Sonarr \
+                    "$SERIES_TITLE deletion action deferred" \
+                    "The daily History inspection cap was reached before $ID_COUNT confirmed episode(s) could be verified."
+            fi
         fi
     fi
 
@@ -1629,7 +1961,15 @@ while IFS= read -r SERIES_ID; do
             else
                 ((API_FAILURES += 1))
                 log ERROR "Episode update failed for $SERIES_TITLE; it will be retried next run."
+                queue_attention_notification ERROR Sonarr \
+                    "$SERIES_TITLE episode update failed" \
+                    "$ACTION_ID_COUNT confirmed episode(s) could not be unmonitored and will be retried."
             fi
+        fi
+
+        if (( $(jq length <<< "$EFFECTIVE") > 0 )); then
+            queue_action_notification Sonarr "$SERIES_TITLE episodes unmonitored" \
+                "Count: $ACTION_ID_COUNT; episode IDs: $(jq -r 'join(", ")' <<< "$EFFECTIVE")"
         fi
     fi
 
@@ -1638,6 +1978,8 @@ while IFS= read -r SERIES_ID; do
         if [[ -z "$SERIES_PATH" ]]; then
             ((SIDECAR_FAILURES += 1))
             log ERROR "Cannot map Sonarr path '$SERIES_API_PATH' from SONARR_API_SERIES_ROOT to SERIES_ROOT; sidecar cleanup for $SERIES_TITLE was deferred."
+            queue_attention_notification WARNING Sonarr "$SERIES_TITLE cleanup deferred" \
+                "The Sonarr media path could not be mapped safely: $SERIES_API_PATH"
         else
             MANIFEST="$(prepare_sidecar_cleanup_manifest "$SERIES_ID" \
                 "$SERIES_PATH" "$SERIES_ROOT" series)" ||
@@ -1650,7 +1992,10 @@ while IFS= read -r SERIES_ID; do
                 ((SIDECARS_NATIVE_MISSING += CLEANUP_NATIVE_MISSING))
                 ((SIDECARS_CHANGED += CLEANUP_CHANGED))
                 ((FOLDERS_REMOVED += CLEANUP_FOLDERS_REMOVED))
+                queue_cleanup_action_notification Sonarr "$SERIES_TITLE" "$SERIES_PATH"
                 if [[ "$CLEANUP_COMPLETE" == true ]]; then
+                    queue_folder_resolution_notification Sonarr "$SERIES_ID" \
+                        "$SERIES_TITLE folder cleanup" "$SERIES_PATH"
                     sonarr_mark_sidecar_cleanup "$SERIES_ID" ||
                         die "Could not record Kodi sidecar cleanup for $SERIES_TITLE."
                 elif [[ "$CLEANUP_FOLDER_PENDING" == true ]]; then
@@ -1658,6 +2003,12 @@ while IFS= read -r SERIES_ID; do
                         "$SERIES_ROOT" series ||
                         die "Could not retain pending folder cleanup for $SERIES_TITLE."
                     ((FOLDER_CLEANUP_PENDING += 1))
+                    queue_folder_blocker_notification Sonarr "$SERIES_ID" \
+                        "$SERIES_TITLE folder cleanup pending" "$SERIES_PATH"
+                elif (( CLEANUP_CHANGED > 0 )); then
+                    queue_attention_notification WARNING Sonarr \
+                        "$SERIES_TITLE sidecar cleanup deferred" \
+                        "$CLEANUP_CHANGED recorded sidecar file(s) changed or became unsafe. See $LOG_FILE."
                 fi
             else
                 CLEANUP_RC=$?
@@ -1667,6 +2018,9 @@ while IFS= read -r SERIES_ID; do
                     *)
                         ((SIDECAR_FAILURES += 1))
                         log ERROR "Kodi sidecar quarantine failed for $SERIES_TITLE; its manifest was retained."
+                        queue_attention_notification ERROR Sonarr \
+                            "$SERIES_TITLE sidecar quarantine failed" \
+                            "The manifest was retained and the next daily run will retry. See $LOG_FILE."
                         ;;
                 esac
             fi
@@ -1762,6 +2116,8 @@ while IFS= read -r SERIES_ID; do
         fi
         log INFO "DRY RUN: would ensure series tag(s) [$ACTION_TAG_LABEL_TEXT] on $SERIES_TITLE."
         ((TAGGED_SERIES_ACTIONS += 1))
+        queue_action_notification Sonarr "$SERIES_TITLE monitoring and tags" \
+            "Seasons to unmonitor: $(jq -r 'if length == 0 then "none" else join(", ") end' <<< "$ACTIVE"); series unmonitor: $SERIES_ACTION; tags: $ACTION_TAG_LABEL_TEXT"
         continue
     fi
 
@@ -1817,9 +2173,14 @@ while IFS= read -r SERIES_ID; do
         fi
         log INFO "Ensured series tag(s) [$ACTION_TAG_LABEL_TEXT] on $SERIES_TITLE."
         ((TAGGED_SERIES_ACTIONS += 1))
+        queue_action_notification Sonarr "$SERIES_TITLE monitoring and tags" \
+            "Seasons unmonitored: $(jq -r 'if length == 0 then "none" else join(", ") end' <<< "$ACTIVE"); series unmonitored: $SERIES_ACTION; tags: $ACTION_TAG_LABEL_TEXT"
     else
         ((API_FAILURES += 1))
         log ERROR "Season/series update failed for $SERIES_TITLE; it will be retried next run."
+        queue_attention_notification ERROR Sonarr \
+            "$SERIES_TITLE season or series update failed" \
+            "The monitoring and tag update will be retried during the next daily run."
     fi
 done < <(
     {
@@ -1836,6 +2197,11 @@ ACTION_LABEL=applied
 log INFO "Summary: series-listed=$SERIES_LISTED, series-scanned=$SERIES_SCANNED, episodes=$EPISODES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$EPISODES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, episode-actions-$ACTION_LABEL=$EPISODE_ACTIONS, season-actions-$ACTION_LABEL=$SEASON_ACTIONS, series-actions-$ACTION_LABEL=$SERIES_ACTIONS, tagged-series-$ACTION_LABEL=$TAGGED_SERIES_ACTIONS, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, folder-cleanup-pending=$FOLDER_CLEANUP_PENDING, mover-deferrals=$MOVER_DEFERRALS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
 
 if (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )); then
+    FAILURE_SEVERITY=WARNING
+    (( API_FAILURES > 0 || SIDECAR_FAILURES > 0 )) && FAILURE_SEVERITY=ERROR
+    queue_attention_notification "$FAILURE_SEVERITY" Sonarr \
+        "Daily Sonarr delete-sync completed with failures" \
+        "API failures: $API_FAILURES; History failures: $HISTORY_FAILURES; sidecar failures: $SIDECAR_FAILURES. See $LOG_FILE."
     log WARNING "Completed with API, History, or sidecar failures; safe state was saved and unfinished actions will be retried."
     exit 2
 fi
@@ -1879,6 +2245,10 @@ validate_common_configuration() {
     [[ "$DEFER_SIDECAR_CLEANUP_WHILE_MOVER" == true ||
        "$DEFER_SIDECAR_CLEANUP_WHILE_MOVER" == false ]] ||
         die "DEFER_SIDECAR_CLEANUP_WHILE_MOVER must be true or false."
+    [[ "$SEND_GROUPED_NOTIFICATIONS" == true || "$SEND_GROUPED_NOTIFICATIONS" == false ]] ||
+        die "SEND_GROUPED_NOTIFICATIONS must be true or false."
+    [[ "$NOTIFY_DRY_RUN" == true || "$NOTIFY_DRY_RUN" == false ]] ||
+        die "NOTIFY_DRY_RUN must be true or false."
     [[ "$INSPECT_DELETE_HISTORY" == true || "$REQUIRE_DELETE_HISTORY_EVENT" == false ]] ||
         die "REQUIRE_DELETE_HISTORY_EVENT=true requires INSPECT_DELETE_HISTORY=true."
     [[ "$CONFIRMATION_RUNS" =~ ^[0-9]+$ ]] && (( CONFIRMATION_RUNS >= 2 )) ||
@@ -1889,6 +2259,9 @@ validate_common_configuration() {
         die "MAX_SIDECAR_SIZE_MB must be a positive integer."
     [[ "$CLEANUP_REMAINING_LOG_MAX_ITEMS" =~ ^[1-9][0-9]*$ ]] ||
         die "CLEANUP_REMAINING_LOG_MAX_ITEMS must be a positive integer."
+    [[ "$NOTIFICATION_MAX_ITEMS" =~ ^[1-9][0-9]*$ &&
+       "$NOTIFICATION_ITEM_MAX_CHARS" =~ ^[1-9][0-9]*$ ]] ||
+        die "Notification item limits must be positive integers."
     [[ "$MAX_LOG_SIZE_MB" =~ ^[1-9][0-9]*$ && "$MAX_LOG_FILES" =~ ^[1-9][0-9]*$ ]] ||
         die "MAX_LOG_SIZE_MB and MAX_LOG_FILES must be positive integers."
     [[ "$HTTP_CONNECT_TIMEOUT" =~ ^[1-9][0-9]*$ &&
@@ -1945,7 +2318,7 @@ acquire_main_lock() {
 
 main() {
     local mode="${1:-all}"
-    local sonarr_rc=0 radarr_rc=0 lock_rc=0
+    local sonarr_rc=0 radarr_rc=0 lock_rc=0 notification_rc=0
 
     case "$mode" in
         all|sonarr|radarr) ;;
@@ -1984,6 +2357,7 @@ main() {
         esac
     fi
     remove_stale_temp_files
+    initialize_grouped_notifications || die "Could not initialize grouped notification state."
 
     QUARANTINE_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
     [[ "$QUARANTINE_RUN_ID" =~ ^[0-9]{8}_[0-9]{6}_[0-9]+$ ]] ||
@@ -2002,6 +2376,17 @@ main() {
     log INFO "Combined summary: sonarr-rc=$sonarr_rc, radarr-rc=$radarr_rc."
     if (( sonarr_rc != 0 || radarr_rc != 0 )); then
         log WARNING "Unified Arr delete workflow completed with one or more application failures."
+        queue_attention_notification ERROR MAIN "Application workflow failure" \
+            "Sonarr exit status: ${sonarr_rc}; Radarr exit status: ${radarr_rc}. See ${LOG_FILE}."
+    fi
+
+    send_grouped_notification || notification_rc=$?
+
+    if (( sonarr_rc != 0 || radarr_rc != 0 )); then
+        return 2
+    fi
+    if (( notification_rc != 0 )); then
+        log WARNING "Unified Arr delete workflow completed, but its grouped notification failed."
         return 2
     fi
     log INFO "Unified Arr delete workflow completed successfully."
@@ -2495,6 +2880,9 @@ if (( MOVIES_CONFIRMED > 0 )); then
                 if [[ "$REQUIRE_DELETE_HISTORY_EVENT" == true ]] &&
                    { [[ "$HISTORY_INSPECTED" != true ]] || [[ "$HISTORY_EVIDENCE" == null ]]; }; then
                     log INFO "Not tagging $MOVIE_LABEL because no verified movieFileDeleted History event is available."
+                    queue_attention_notification WARNING Radarr \
+                        "$MOVIE_LABEL tag action awaiting History evidence" \
+                        "The required movieFileDeleted event is unavailable; the movie remains untagged."
                     continue
                 fi
 
@@ -2511,6 +2899,9 @@ if (( MOVIES_CONFIRMED > 0 )); then
                     while IFS= read -r MOVIE; do
                         [[ -n "$MOVIE" ]] || continue
                         log INFO "DRY RUN: would add '$PLEX_DELETED_MOVIE_TAG' to $(radarr_movie_name "$MOVIE")."
+                        queue_action_notification Radarr \
+                            "$(radarr_movie_name "$MOVIE") tag update" \
+                            "Tag to add: $PLEX_DELETED_MOVIE_TAG"
                     done < <(
                         jq --argjson ids "$ELIGIBLE_IDS" '
                             [ .[] | . as $movie | select(($ids | index($movie.id)) != null) ][]
@@ -2533,6 +2924,9 @@ if (( MOVIES_CONFIRMED > 0 )); then
                             while IFS= read -r MOVIE; do
                                 [[ -n "$MOVIE" ]] || continue
                                 log INFO "Added '$PLEX_DELETED_MOVIE_TAG' to $(radarr_movie_name "$MOVIE")."
+                                queue_action_notification Radarr \
+                                    "$(radarr_movie_name "$MOVIE") tag update" \
+                                    "Added tag: $PLEX_DELETED_MOVIE_TAG"
                             done < <(
                                 jq --argjson ids "$ELIGIBLE_IDS" '
                                     [ .[] | . as $movie | select(($ids | index($movie.id)) != null) ][]
@@ -2542,6 +2936,9 @@ if (( MOVIES_CONFIRMED > 0 )); then
                         else
                             ((API_FAILURES += 1))
                             log ERROR "Bulk tag update failed; confirmed movies will be retried next run."
+                            queue_attention_notification ERROR Radarr \
+                                "Confirmed movie tag update failed" \
+                                "$ELIGIBLE_COUNT confirmed movie(s) could not be tagged and will be retried."
                         fi
                     fi
                 fi
@@ -2560,6 +2957,8 @@ if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( MOVIES_CONFIRMED > 0 )); then
         if [[ -z "$MOVIE_PATH" ]]; then
             ((SIDECAR_FAILURES += 1))
             log ERROR "Cannot map Radarr path '$MOVIE_API_PATH' from RADARR_API_MOVIES_ROOT to MOVIES_ROOT; sidecar cleanup for $MOVIE_LABEL was deferred."
+            queue_attention_notification WARNING Radarr "$MOVIE_LABEL cleanup deferred" \
+                "The Radarr media path could not be mapped safely: $MOVIE_API_PATH"
             continue
         fi
         if [[ "$(radarr_cleanup_history_eligible "$MOVIE_ID")" != true ]]; then
@@ -2577,7 +2976,10 @@ if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( MOVIES_CONFIRMED > 0 )); then
             ((SIDECARS_NATIVE_MISSING += CLEANUP_NATIVE_MISSING))
             ((SIDECARS_CHANGED += CLEANUP_CHANGED))
             ((FOLDERS_REMOVED += CLEANUP_FOLDERS_REMOVED))
+            queue_cleanup_action_notification Radarr "$MOVIE_LABEL" "$MOVIE_PATH"
             if [[ "$CLEANUP_COMPLETE" == true ]]; then
+                queue_folder_resolution_notification Radarr "$MOVIE_ID" \
+                    "$MOVIE_LABEL folder cleanup" "$MOVIE_PATH"
                 radarr_mark_sidecar_cleanup "$MOVIE_ID" ||
                     die "Could not record Kodi sidecar cleanup for $MOVIE_LABEL."
             elif [[ "$CLEANUP_FOLDER_PENDING" == true ]]; then
@@ -2585,6 +2987,12 @@ if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( MOVIES_CONFIRMED > 0 )); then
                     "$MOVIES_ROOT" movies ||
                     die "Could not retain pending folder cleanup for $MOVIE_LABEL."
                 ((FOLDER_CLEANUP_PENDING += 1))
+                queue_folder_blocker_notification Radarr "$MOVIE_ID" \
+                    "$MOVIE_LABEL folder cleanup pending" "$MOVIE_PATH"
+            elif (( CLEANUP_CHANGED > 0 )); then
+                queue_attention_notification WARNING Radarr \
+                    "$MOVIE_LABEL sidecar cleanup deferred" \
+                    "$CLEANUP_CHANGED recorded sidecar file(s) changed or became unsafe. See $LOG_FILE."
             fi
         else
             CLEANUP_RC=$?
@@ -2594,6 +3002,9 @@ if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( MOVIES_CONFIRMED > 0 )); then
                 *)
                     ((SIDECAR_FAILURES += 1))
                     log ERROR "Kodi sidecar quarantine failed for $MOVIE_LABEL; its manifest was retained."
+                    queue_attention_notification ERROR Radarr \
+                        "$MOVIE_LABEL sidecar quarantine failed" \
+                        "The manifest was retained and the next daily run will retry. See $LOG_FILE."
                     ;;
             esac
         fi
@@ -2608,6 +3019,11 @@ ACTION_LABEL=applied
 log INFO "Summary: movies-listed=$MOVIES_LISTED, movies-scanned=$MOVIES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$MOVIES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, tag-actions-$ACTION_LABEL=$TAG_ACTIONS, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, folder-cleanup-pending=$FOLDER_CLEANUP_PENDING, mover-deferrals=$MOVER_DEFERRALS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
 
 if (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )); then
+    FAILURE_SEVERITY=WARNING
+    (( API_FAILURES > 0 || SIDECAR_FAILURES > 0 )) && FAILURE_SEVERITY=ERROR
+    queue_attention_notification "$FAILURE_SEVERITY" Radarr \
+        "Daily Radarr delete-sync completed with failures" \
+        "API failures: $API_FAILURES; History failures: $HISTORY_FAILURES; sidecar failures: $SIDECAR_FAILURES. See $LOG_FILE."
     log WARNING "Completed with API, History, or sidecar failures; safe state was saved and unfinished actions will be retried."
     exit 2
 fi
