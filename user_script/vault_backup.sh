@@ -13,7 +13,7 @@
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.2"
+readonly SCRIPT_VERSION="1.3"
 
 ###############################################################################
 # CONFIGURATION
@@ -44,6 +44,8 @@ MAX_SSH_WAIT=420
 SSH_WAIT_INTERVAL=15
 ARRAY_READY_WAIT=180
 ARRAY_READY_INTERVAL=6
+# Shutdown is automatically skipped when remote Mover/parity activity is
+# detected or when that activity state cannot be verified.
 SHUTDOWN_REMOTE_ON_SUCCESS=true
 
 # Keep true for the first manually reviewed run.
@@ -77,6 +79,8 @@ RESULT_SUMMARY="Script exited before completion"
 RECEIPT_WRITTEN=0
 FILES_VERIFIED=0
 BYTES_TRANSFERRED=0
+REMOTE_SHUTDOWN_FAILED=0
+REMOTE_SHUTDOWN_SKIPPED_REASON=""
 
 SSH_OPTIONS=(
     -p "$SSH_PORT"
@@ -377,12 +381,84 @@ prune_remote_generations() {
     done
 }
 
+remote_shutdown_blockers() {
+    ssh "${SSH_OPTIONS[@]}" "$REMOTE" 'bash -s' <<'REMOTE_ACTIVITY_PROBE'
+command -v pgrep >/dev/null 2>&1 || exit 3
+if pgrep -f '(^|/)(mover|mover\.old)( |$)|mover\.php' >/dev/null 2>&1; then
+    printf '%s\n' 'Mover is active'
+fi
+
+if [ -x /usr/local/sbin/mdcmd ]; then
+    mdcmd_bin=/usr/local/sbin/mdcmd
+elif command -v mdcmd >/dev/null 2>&1; then
+    mdcmd_bin=mdcmd
+else
+    exit 3
+fi
+
+md_status="$($mdcmd_bin status 2>/dev/null)" || exit 3
+printf '%s\n' "$md_status" | awk -F= '
+    function clean(value) {
+        gsub(/^[[:space:]"\r]+|[[:space:]"\r]+$/, "", value)
+        return value
+    }
+    tolower($1) == "mdresyncaction" { action=clean($2) }
+    tolower($1) == "mdresyncpos"    { pos=clean($2) }
+    tolower($1) == "mdresyncsize"   { size=clean($2) }
+    tolower($1) == "mdresyncspeed"  { speed=clean($2) }
+    tolower($1) == "mdresyncrem"    { remaining=clean($2) }
+    END {
+        action_lc=tolower(action)
+        active=0
+        complete=0
+        if (speed ~ /^[0-9]+$/ && speed + 0 > 0) active=1
+        if (remaining ~ /^[0-9]+$/ && remaining + 0 > 0) active=1
+        if (pos ~ /^[0-9]+$/ && size ~ /^[0-9]+$/ &&
+            size + 0 > 0 && pos + 0 < size + 0) active=1
+        if (pos ~ /^[0-9]+$/ && size ~ /^[0-9]+$/ &&
+            size + 0 > 0 && pos + 0 >= size + 0 &&
+            (!(speed ~ /^[0-9]+$/) || speed + 0 == 0) &&
+            (!(remaining ~ /^[0-9]+$/) || remaining + 0 == 0)) complete=1
+        if (!active && !complete && action_lc != "" && action_lc != "idle") active=1
+        if (active) {
+            if (action != "") printf "Parity operation is active (%s)\n", action
+            else printf "Parity operation is active\n"
+        }
+    }
+'
+REMOTE_ACTIVITY_PROBE
+}
+
 shutdown_remote() {
+    local blockers=""
+    local blocker_status=0
+
     [[ "$SHUTDOWN_REMOTE_ON_SUCCESS" == true ]] || return 0
+
+    blockers="$(remote_shutdown_blockers 2>/dev/null)"
+    blocker_status=$?
+
+    if (( blocker_status != 0 )); then
+        REMOTE_SHUTDOWN_SKIPPED_REASON="Mover/parity status could not be verified"
+        log WARN "Remote shutdown skipped: ${REMOTE_SHUTDOWN_SKIPPED_REASON}. $DEST_NAS will remain powered on."
+        return 0
+    fi
+
+    if [[ -n "$blockers" ]]; then
+        REMOTE_SHUTDOWN_SKIPPED_REASON="${blockers//$'\n'/; }"
+        log WARN "Remote shutdown skipped: ${REMOTE_SHUTDOWN_SKIPPED_REASON}. $DEST_NAS will remain powered on."
+        return 0
+    fi
+
     log INFO "Requesting clean shutdown of $DEST_NAS"
-    ssh_exec "/usr/local/sbin/powerdown" >/dev/null 2>&1 ||
-        ssh_exec "poweroff" >/dev/null 2>&1 ||
-        log WARN "Remote shutdown request failed"
+    if ssh_exec "/usr/local/sbin/powerdown" >/dev/null 2>&1 ||
+       ssh_exec "poweroff" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    REMOTE_SHUTDOWN_FAILED=1
+    log WARN "Remote shutdown request failed"
+    return 1
 }
 
 ###############################################################################
@@ -390,7 +466,7 @@ shutdown_remote() {
 ###############################################################################
 
 main() {
-    local job label source manifest
+    local job label source manifest notification_message
 
     if ! mountpoint -q /mnt/vault || ! mountpoint -q /boot; then
         printf 'Required local mounts are unavailable: /mnt/vault and/or /boot\n' >&2
@@ -456,10 +532,15 @@ main() {
     RESULT_STATUS="OK"
     RESULT_SUMMARY="Verified ${GENERATION_NAME}: ${FILES_VERIFIED} files, $(human_bytes "$BYTES_TRANSFERRED")"
     log INFO "$RESULT_SUMMARY"
-    notify_unraid normal "Backup completed" \
-        "$RESULT_SUMMARY"$'\n'"Destination: $REMOTE_FINAL"
+    shutdown_remote || true
+    notification_message="$RESULT_SUMMARY"$'\n'"Destination: $REMOTE_FINAL"
+    if [[ -n "$REMOTE_SHUTDOWN_SKIPPED_REASON" ]]; then
+        notification_message+=$'\n'"Remote shutdown: skipped (${REMOTE_SHUTDOWN_SKIPPED_REASON}); $DEST_NAS left powered on"
+    elif (( REMOTE_SHUTDOWN_FAILED == 1 )); then
+        notification_message+=$'\n'"Remote shutdown: request failed"
+    fi
+    notify_unraid normal "Backup completed" "$notification_message"
     write_receipt "$RESULT_STATUS" "$RESULT_SUMMARY"
-    shutdown_remote
 }
 
 main "$@"

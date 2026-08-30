@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Remote NAS Backup v2
+# Remote NAS Backup v2.1
 #
 # PURPOSE
 # -------
@@ -268,6 +268,8 @@ ARRAY_READY_INTERVAL=6
 # Current behavior is retained:
 #
 # Successful backup -> shut remote NAS down.
+# The final shutdown is automatically skipped when remote Mover/parity activity
+# is detected or when that activity state cannot be verified.
 #
 SHUTDOWN_REMOTE_ON_SUCCESS=true
 
@@ -312,6 +314,7 @@ PREFLIGHT_FAILURE_DETAIL=""
 
 REMOTE_SHUTDOWN_REQUESTED=0
 REMOTE_SHUTDOWN_FAILED=0
+REMOTE_SHUTDOWN_SKIPPED_REASON=""
 
 declare -a PRIORITY_PREFIX=()
 declare -a FAILED_LABELS=()
@@ -1653,9 +1656,64 @@ refresh_remote_space_for_report() {
 # REMOTE SHUTDOWN
 ###############################################################################
 
+remote_shutdown_blockers() {
+    ssh \
+        -o BatchMode=yes \
+        -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" \
+        -p "$SSH_PORT" \
+        "$REMOTE" \
+        'bash -s' <<'REMOTE_ACTIVITY_PROBE'
+command -v pgrep >/dev/null 2>&1 || exit 3
+if pgrep -f '(^|/)(mover|mover\.old)( |$)|mover\.php' >/dev/null 2>&1; then
+    printf '%s\n' 'Mover is active'
+fi
+
+if [ -x /usr/local/sbin/mdcmd ]; then
+    mdcmd_bin=/usr/local/sbin/mdcmd
+elif command -v mdcmd >/dev/null 2>&1; then
+    mdcmd_bin=mdcmd
+else
+    exit 3
+fi
+
+md_status="$($mdcmd_bin status 2>/dev/null)" || exit 3
+printf '%s\n' "$md_status" | awk -F= '
+    function clean(value) {
+        gsub(/^[[:space:]"\r]+|[[:space:]"\r]+$/, "", value)
+        return value
+    }
+    tolower($1) == "mdresyncaction" { action=clean($2) }
+    tolower($1) == "mdresyncpos"    { pos=clean($2) }
+    tolower($1) == "mdresyncsize"   { size=clean($2) }
+    tolower($1) == "mdresyncspeed"  { speed=clean($2) }
+    tolower($1) == "mdresyncrem"    { remaining=clean($2) }
+    END {
+        action_lc=tolower(action)
+        active=0
+        complete=0
+        if (speed ~ /^[0-9]+$/ && speed + 0 > 0) active=1
+        if (remaining ~ /^[0-9]+$/ && remaining + 0 > 0) active=1
+        if (pos ~ /^[0-9]+$/ && size ~ /^[0-9]+$/ &&
+            size + 0 > 0 && pos + 0 < size + 0) active=1
+        if (pos ~ /^[0-9]+$/ && size ~ /^[0-9]+$/ &&
+            size + 0 > 0 && pos + 0 >= size + 0 &&
+            (!(speed ~ /^[0-9]+$/) || speed + 0 == 0) &&
+            (!(remaining ~ /^[0-9]+$/) || remaining + 0 == 0)) complete=1
+        if (!active && !complete && action_lc != "" && action_lc != "idle") active=1
+        if (active) {
+            if (action != "") printf "Parity operation is active (%s)\n", action
+            else printf "Parity operation is active\n"
+        }
+    }
+'
+REMOTE_ACTIVITY_PROBE
+}
+
 shutdown_remote() {
     local backup_failed="$1"
     local should_shutdown=false
+    local blockers=""
+    local blocker_status=0
 
     if [ "$REMOTE_READY" -ne 1 ]; then
         return 0
@@ -1686,6 +1744,23 @@ shutdown_remote() {
                 "Remote NAS left running because backup failed and SHUTDOWN_REMOTE_ON_FAILURE=false"
         fi
 
+        return 0
+    fi
+
+    blockers="$(remote_shutdown_blockers 2>/dev/null)"
+    blocker_status=$?
+
+    if [ "$blocker_status" -ne 0 ]; then
+        REMOTE_SHUTDOWN_SKIPPED_REASON="Mover/parity status could not be verified"
+        log "REMOTE" "WARN" \
+            "Remote shutdown skipped: ${REMOTE_SHUTDOWN_SKIPPED_REASON}. ${DEST_NAS} will remain powered on."
+        return 0
+    fi
+
+    if [ -n "$blockers" ]; then
+        REMOTE_SHUTDOWN_SKIPPED_REASON="${blockers//$'\n'/; }"
+        log "REMOTE" "WARN" \
+            "Remote shutdown skipped: ${REMOTE_SHUTDOWN_SKIPPED_REASON}. ${DEST_NAS} will remain powered on."
         return 0
     fi
 
@@ -1920,6 +1995,8 @@ send_final_notification() {
         else
             body+="Remote shutdown: FAILED"$'\n'
         fi
+    elif [ -n "$REMOTE_SHUTDOWN_SKIPPED_REASON" ]; then
+        body+="Remote shutdown: skipped (${REMOTE_SHUTDOWN_SKIPPED_REASON}); ${DEST_NAS} left powered on"$'\n'
     elif [ "$DRY_RUN" = "true" ]; then
         body+="Remote shutdown: skipped for dry run"$'\n'
     elif [ "$backup_failed" -ne 0 ]; then
