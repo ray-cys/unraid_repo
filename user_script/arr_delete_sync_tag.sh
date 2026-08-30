@@ -82,6 +82,11 @@ PLEX_DELETED_MOVIE_TAG="plex-deleted"
 # responsibility of Sonarr/Radarr and their Recycling Bin setting.
 QUARANTINE_KODI_SIDECARS=true
 QUARANTINE_ROOT="/mnt/user/media/bin"
+# Normalize only QUARANTINE_ROOT and its contents. Supplying an owner without a
+# group deliberately preserves each entry's existing group ownership.
+QUARANTINE_OWNER="nobody"
+QUARANTINE_DIRECTORY_MODE="0755"
+QUARANTINE_FILE_MODE="0644"
 MOVIES_ROOT="/mnt/user/media/movies"
 SERIES_ROOT="/mnt/user/media/series"
 
@@ -120,7 +125,7 @@ MAX_LOG_FILES=5
 HTTP_CONNECT_TIMEOUT=10
 HTTP_MAX_TIME=90
 HTTP_RETRIES=2
-USER_AGENT="Arr-Delete-Sync-Tag/1.4"
+USER_AGENT="Arr-Delete-Sync-Tag/1.5"
 
 ###############################################################################
 # END CONFIGURATION
@@ -546,6 +551,44 @@ valid_relative_path() {
        "$relative" != */../* &&
        "$relative" != */.. &&
        "$relative" != *$'\n'* ]]
+}
+
+normalize_quarantine_permissions() {
+    local target="$1"
+    local quarantine_real target_real
+    local failed=false
+
+    [[ -e "$QUARANTINE_ROOT" && ! -L "$QUARANTINE_ROOT" ]] || {
+        log ERROR "Quarantine root is unavailable or unsafe for permission normalization: $QUARANTINE_ROOT"
+        return 1
+    }
+    quarantine_real="$(realpath -- "$QUARANTINE_ROOT" 2>/dev/null)" || return 1
+    target_real="$(realpath -- "$target" 2>/dev/null)" || return 1
+
+    if [[ "$target_real" != "$quarantine_real" &&
+          "$target_real" != "$quarantine_real"/* ]]; then
+        log ERROR "Refusing to change ownership or permissions outside quarantine: $target_real"
+        return 1
+    fi
+
+    # find does not follow symlinks by default. chown -h changes a symlink's
+    # own owner; chmod is limited to real directories and regular files.
+    if ! find "$target_real" -xdev -exec chown -h -- "$QUARANTINE_OWNER" {} +; then
+        log ERROR "Unable to set quarantine owner '$QUARANTINE_OWNER': $target_real"
+        failed=true
+    fi
+    if ! find "$target_real" -xdev -type d \
+        -exec chmod -- "$QUARANTINE_DIRECTORY_MODE" {} +; then
+        log ERROR "Unable to set quarantine directory mode $QUARANTINE_DIRECTORY_MODE: $target_real"
+        failed=true
+    fi
+    if ! find "$target_real" -xdev -type f \
+        -exec chmod -- "$QUARANTINE_FILE_MODE" {} +; then
+        log ERROR "Unable to set quarantine file mode $QUARANTINE_FILE_MODE: $target_real"
+        failed=true
+    fi
+
+    [[ "$failed" == false ]]
 }
 
 map_arr_media_path() {
@@ -1059,11 +1102,19 @@ quarantine_recorded_sidecars() {
         fi
         destination_parent="$(dirname -- "$destination")"
         mkdir -p -- "$destination_parent" || return 1
+        normalize_quarantine_permissions "$run_root" || {
+            log ERROR "Quarantine directories were created but their ownership or permissions could not be normalized: $run_root"
+            return 1
+        }
         [[ ! -e "$destination" && ! -L "$destination" ]] || {
             log ERROR "Quarantine destination already exists; refusing to overwrite it: $destination"
             return 1
         }
         if mv -- "$source" "$destination"; then
+            normalize_quarantine_permissions "$destination" || {
+                log ERROR "Sidecar was quarantined but its ownership or permissions could not be normalized: $destination"
+                return 1
+            }
             log INFO "Quarantined $app_name Kodi sidecar: $source -> $destination"
             [[ -n "$CLEANUP_QUARANTINE_RUN_ID" ]] || \
                 CLEANUP_QUARANTINE_RUN_ID="$QUARANTINE_RUN_ID"
@@ -2220,7 +2271,7 @@ validate_common_configuration() {
         printf 'Unsafe RUNTIME_DIR: %s\n' "$RUNTIME_DIR" >&2
         return 1
     }
-    for command in curl jq mktemp stat tee sort cut tr cp mv find grep pgrep \
+    for command in curl jq mktemp stat tee sort cut tr cp mv find grep pgrep chown chmod \
         realpath sha256sum dirname rmdir; do
         command -v "$command" >/dev/null 2>&1 || {
             printf 'Required command not found: %s\n' "$command" >&2
@@ -2273,6 +2324,12 @@ validate_common_configuration() {
         die "Rescan timeout and poll values must be positive integers."
 
     if [[ "$QUARANTINE_KODI_SIDECARS" == true ]]; then
+        [[ -n "$QUARANTINE_OWNER" && "$QUARANTINE_OWNER" != *:* ]] ||
+            die "QUARANTINE_OWNER must name one owner without a group."
+        [[ "$QUARANTINE_DIRECTORY_MODE" =~ ^0?[0-7]{3}$ ]] ||
+            die "QUARANTINE_DIRECTORY_MODE must be a three- or four-digit octal mode."
+        [[ "$QUARANTINE_FILE_MODE" =~ ^0?[0-7]{3}$ ]] ||
+            die "QUARANTINE_FILE_MODE must be a three- or four-digit octal mode."
         [[ "$QUARANTINE_ROOT" == /mnt/user/* && "$QUARANTINE_ROOT" != "/mnt/user/" &&
            "$MOVIES_ROOT" == /mnt/user/* && "$MOVIES_ROOT" != "/mnt/user/" &&
            "$SERIES_ROOT" == /mnt/user/* && "$SERIES_ROOT" != "/mnt/user/" &&
@@ -2358,6 +2415,12 @@ main() {
     fi
     remove_stale_temp_files
     initialize_grouped_notifications || die "Could not initialize grouped notification state."
+
+    if [[ "$QUARANTINE_KODI_SIDECARS" == true && "$DRY_RUN" == false &&
+          -e "$QUARANTINE_ROOT" ]]; then
+        normalize_quarantine_permissions "$QUARANTINE_ROOT" ||
+            die "Could not normalize quarantine ownership and permissions."
+    fi
 
     QUARANTINE_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
     [[ "$QUARANTINE_RUN_ID" =~ ^[0-9]{8}_[0-9]{6}_[0-9]+$ ]] ||

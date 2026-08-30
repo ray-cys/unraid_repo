@@ -65,7 +65,7 @@ set -uo pipefail
 # CONFIGURATION
 ###############################################################################
 
-VERSION="2.0"
+VERSION="2.1"
 
 # ---------------------------------------------------------------------------
 # Execution behavior
@@ -168,6 +168,12 @@ SAB_CONTAINER_COMPLETE_ROOT="${SAB_CONTAINER_COMPLETE_ROOT:-}"
 # Keep quarantine outside SAB_COMPLETE_ROOT but preferably on the same Unraid
 # share/filesystem so the move is fast and recoverable.
 QUARANTINE_DIR="${QUARANTINE_DIR:-/mnt/user/media/net/quarantine}"
+
+# Normalize only QUARANTINE_DIR and its contents. Supplying an owner without a
+# group deliberately preserves each entry's existing group ownership.
+QUARANTINE_OWNER="${QUARANTINE_OWNER:-nobody}"
+QUARANTINE_DIRECTORY_MODE="${QUARANTINE_DIRECTORY_MODE:-0755}"
+QUARANTINE_FILE_MODE="${QUARANTINE_FILE_MODE:-0644}"
 
 LOG_DIR="${LOG_DIR:-/mnt/user/cloud/logs/script/arr_sabnzbd_cleanup}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/arr_sabnzbd_cleanup.log}"
@@ -413,7 +419,7 @@ require_commands() {
   local command_name
   local missing=0
 
-  for command_name in awk basename cat curl cut date dirname find flock jq mkdir mktemp mv realpath rm rmdir sed sort stat tee tr wc; do
+  for command_name in awk basename cat chown chmod curl cut date dirname find flock jq mkdir mktemp mv realpath rm rmdir sed sort stat tee tr wc; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       log "ERROR" "Required command not found: $command_name"
       missing=1
@@ -536,6 +542,42 @@ path_is_below() {
   [[ "$child" == "$root"/* && "$child" != "$root" ]]
 }
 
+normalize_quarantine_permissions() {
+  local target="$1"
+  local target_real
+  local failed=false
+
+  target_real="$(realpath -- "$target")" || {
+    log "ERROR" "Unable to resolve quarantine permission target: $target"
+    return 1
+  }
+
+  if [[ "$target_real" != "$QUARANTINE_DIR_REAL" ]] && \
+     ! path_is_below "$target_real" "$QUARANTINE_DIR_REAL"; then
+    log "ERROR" "Refusing to change ownership or permissions outside quarantine: $target_real"
+    return 1
+  fi
+
+  # find does not follow symlinks by default. chown -h changes a symlink's own
+  # owner, while chmod is limited to real directories and regular files.
+  if ! find "$target_real" -xdev -exec chown -h -- "$QUARANTINE_OWNER" {} +; then
+    log "ERROR" "Unable to set quarantine owner '$QUARANTINE_OWNER': $target_real"
+    failed=true
+  fi
+
+  if ! find "$target_real" -xdev -type d -exec chmod -- "$QUARANTINE_DIRECTORY_MODE" {} +; then
+    log "ERROR" "Unable to set quarantine directory mode $QUARANTINE_DIRECTORY_MODE: $target_real"
+    failed=true
+  fi
+
+  if ! find "$target_real" -xdev -type f -exec chmod -- "$QUARANTINE_FILE_MODE" {} +; then
+    log "ERROR" "Unable to set quarantine file mode $QUARANTINE_FILE_MODE: $target_real"
+    failed=true
+  fi
+
+  ! is_true "$failed"
+}
+
 paths_overlap() {
   local first="$1"
   local second="$2"
@@ -625,6 +667,24 @@ validate_backup_environment() {
 prepare_quarantine_environment() {
   validate_integer "QUARANTINE_RETENTION_DAYS" "$QUARANTINE_RETENTION_DAYS" || return 1
 
+  if [[ -z "$QUARANTINE_OWNER" || "$QUARANTINE_OWNER" == *:* ]]; then
+    ((ERRORS++)) || true
+    log "ERROR" "QUARANTINE_OWNER must name one owner without a group."
+    return 1
+  fi
+
+  if ! [[ "$QUARANTINE_DIRECTORY_MODE" =~ ^0?[0-7]{3}$ ]]; then
+    ((ERRORS++)) || true
+    log "ERROR" "QUARANTINE_DIRECTORY_MODE must be a three- or four-digit octal mode."
+    return 1
+  fi
+
+  if ! [[ "$QUARANTINE_FILE_MODE" =~ ^0?[0-7]{3}$ ]]; then
+    ((ERRORS++)) || true
+    log "ERROR" "QUARANTINE_FILE_MODE must be a three- or four-digit octal mode."
+    return 1
+  fi
+
   QUARANTINE_DIR_REAL="$(canonicalize_target "$QUARANTINE_DIR")" || {
     ((ERRORS++)) || true
     log "ERROR" "Unable to resolve quarantine target: $QUARANTINE_DIR"
@@ -649,6 +709,11 @@ prepare_quarantine_environment() {
       log "ERROR" "Unable to resolve created quarantine directory."
       return 1
     }
+
+    if ! normalize_quarantine_permissions "$QUARANTINE_DIR_REAL"; then
+      ((ERRORS++)) || true
+      return 1
+    fi
   fi
 }
 
@@ -1687,6 +1752,12 @@ quarantine_payload() {
     return 1
   fi
 
+  if ! normalize_quarantine_permissions "$wrapper"; then
+    ((ERRORS++)) || true
+    log "ERROR" "Payload was quarantined but its ownership or permissions could not be normalized: $wrapper"
+    return 1
+  fi
+
   local proof_json
   proof_json="$(cat "$proof_file")"
 
@@ -1719,6 +1790,12 @@ quarantine_payload() {
     }' > "$manifest"
   then
     log "ERROR" "Payload moved but manifest creation failed: $wrapper"
+    return 1
+  fi
+
+  if ! normalize_quarantine_permissions "$manifest"; then
+    ((ERRORS++)) || true
+    log "ERROR" "Quarantine manifest was written but its ownership or permissions could not be normalized: $manifest"
     return 1
   fi
 
