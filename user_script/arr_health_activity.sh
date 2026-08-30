@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.5.0
+# ARR Health / Download / Import Monitor v3.6.0
 #
 # PURPOSE
 # -------
@@ -96,10 +96,12 @@
 #   - It crosses an escalation threshold
 #   - It was previously resolved and later reappears
 #
-# Resolutions can be included in the same grouped notification.
-# Active warnings and errors receive severity-based reminders. Acknowledging an
-# issue suppresses its unchanged signature until it resolves; an escalation or
-# other material signature change clears the acknowledgement automatically.
+# Resolutions can be included in the same grouped notification. Live actionable
+# warnings/errors receive severity-based reminders, historical events are
+# notification-once, and heuristic/evidence-gap reminders are bounded.
+# Acknowledging an issue suppresses its unchanged signature until it resolves;
+# an escalation or other material signature change clears the acknowledgement
+# automatically.
 #
 # Lifecycle commands from an Unraid terminal:
 #
@@ -547,7 +549,7 @@ GROUP_NOTIFICATION_MAX_BYTES=24000
 GROUP_NOTIFICATION_ITEM_MAX_CHARS=4000
 
 # ---------------------------------------------------------------------------
-# Notification lifecycle - v3.3
+# Notification lifecycle - v3.6
 # ---------------------------------------------------------------------------
 
 # Repeat unchanged active errors and warnings until they resolve or are
@@ -558,6 +560,19 @@ WARNING_REMINDER_INTERVAL_HOURS=24
 
 # 0 means unlimited reminders while the issue remains active.
 REMINDER_MAX_COUNT=0
+
+# Historical events are notification-once. Known heuristic conditions use a
+# slower, bounded reminder policy so that a persistent observation cannot
+# create unlimited email. A material signature or severity change still
+# generates a fresh notification.
+HEURISTIC_ERROR_REMINDER_INTERVAL_HOURS=24
+HEURISTIC_WARNING_REMINDER_INTERVAL_HOURS=48
+HEURISTIC_REMINDER_MAX_COUNT=2
+
+# An exact download-flow evidence gap receives up to three daily reminders if
+# API-only reconciliation cannot safely prove a terminal outcome.
+DOWNLOAD_FLOW_REMINDER_INTERVAL_HOURS=24
+DOWNLOAD_FLOW_REMINDER_MAX_COUNT=3
 
 # Treat repeated active/resolved transitions as one flapping episode. The
 # first detected episode is reported once; routine raise/restore messages are
@@ -820,6 +835,9 @@ DOWNLOAD_LEDGER_RECONCILED_COUNT=0
 DOWNLOAD_LEDGER_RECONCILIATION_FAILED_COUNT=0
 DOWNLOAD_LEDGER_RECONCILIATION_RESULTS_FILE=""
 REMINDER_NOTIFICATION_COUNT=0
+EVENT_REPEAT_SUPPRESSED_COUNT=0
+EVENT_RESOLUTION_SUPPRESSED_COUNT=0
+BOUNDED_REMINDER_SUPPRESSED_COUNT=0
 FLAPPING_NOTIFICATION_COUNT=0
 FLAPPING_SUPPRESSED_COUNT=0
 ACKNOWLEDGED_SUPPRESSED_COUNT=0
@@ -4107,6 +4125,82 @@ update_issue_state() {
 # NOTIFICATION DEDUP
 ###############################################################################
 
+reminder_policy_for_classification() {
+
+    local classification="$1"
+    local severity="$2"
+    local mode="persistent"
+    local interval_hours=0
+    local maximum="$REMINDER_MAX_COUNT"
+
+    case "$severity" in
+        ERROR)
+            interval_hours="$ERROR_REMINDER_INTERVAL_HOURS"
+            ;;
+
+        WARNING)
+            interval_hours="$WARNING_REMINDER_INTERVAL_HOURS"
+            ;;
+    esac
+
+    case "$classification" in
+
+        # These describe an event that already happened. The same event may
+        # remain inside an API history/warning window for several runs, but it
+        # does not become more actionable because it was observed again.
+        ARR_DOWNLOAD_FAILED_HISTORY|\
+        SAB_DOWNLOAD_FAILED_*|\
+        SAB_ERROR|\
+        SAB_WARNING|\
+        MONITOR_SCHEDULE_MISSED|\
+        DOWNLOAD_FLOW_RECONCILED_*)
+            mode="once"
+            interval_hours=0
+            maximum=0
+            ;;
+
+        # These are exact workflow evidence gaps. Reconciliation is attempted
+        # first; if it cannot prove an outcome, retain a small daily reminder
+        # budget so a genuine missing import is not hidden indefinitely.
+        DOWNLOAD_FLOW_IMPORT_MISSING|\
+        DOWNLOAD_FLOW_NOT_REACHED_SAB|\
+        DOWNLOAD_FLOW_SAB_VANISHED)
+            mode="bounded"
+            interval_hours="$DOWNLOAD_FLOW_REMINDER_INTERVAL_HOURS"
+            maximum="$DOWNLOAD_FLOW_REMINDER_MAX_COUNT"
+            ;;
+
+        # These are time-window, policy, or statistical observations. They
+        # remain visible in state/logs after the reminder budget is exhausted.
+        ACTIVITY_FLOW_ANOMALY|\
+        CF_REJECT|\
+        CF_REJECT_*|\
+        UPGRADE_REJECT|\
+        TBA_METADATA|\
+        SAB_STALLED_*|\
+        SAB_JOB_DUPLICATE|\
+        SAB_JOB_PAUSED|\
+        SAB_CATEGORY_UNKNOWN|\
+        SAB_SERVER_LOW_ARTICLE_SUCCESS|\
+        SAB_STRANDED_*)
+            mode="bounded"
+            maximum="$HEURISTIC_REMINDER_MAX_COUNT"
+
+            case "$severity" in
+                ERROR)
+                    interval_hours="$HEURISTIC_ERROR_REMINDER_INTERVAL_HOURS"
+                    ;;
+
+                WARNING)
+                    interval_hours="$HEURISTIC_WARNING_REMINDER_INTERVAL_HOURS"
+                    ;;
+            esac
+            ;;
+    esac
+
+    printf '%s\t%s\t%s\n' "$mode" "$interval_hours" "$maximum"
+}
+
 should_notify() {
 
     local issue_key="$1"
@@ -4122,8 +4216,11 @@ should_notify() {
     local flapping_started_at
     local flap_notified_at
     local stored_severity
+    local stored_classification
     local now
+    local reminder_mode="persistent"
     local reminder_interval_hours=0
+    local reminder_maximum="$REMINDER_MAX_COUNT"
 
     NOTIFICATION_DECISION_EVENT="new"
     now=$(date +%s)
@@ -4140,7 +4237,8 @@ should_notify() {
             ((.flappingUntil // 0) | tostring),
             ((.flappingStartedAt // 0) | tostring),
             ((.flapNotifiedAt // 0) | tostring),
-            (.severity // "")
+            (.severity // ""),
+            (.classification // "")
           ]
         | join("|")
         ' "$STATE_FILE")
@@ -4154,6 +4252,7 @@ should_notify() {
         flapping_started_at \
         flap_notified_at \
         stored_severity \
+        stored_classification \
         <<<"$lifecycle"
 
     [[ "$last_notified_at" =~ ^[0-9]+$ ]] || last_notified_at=0
@@ -4194,24 +4293,37 @@ should_notify() {
 
     if [ "$REMINDERS_ENABLED" = true ]; then
 
-        case "$severity" in
-            ERROR)
-                reminder_interval_hours="$ERROR_REMINDER_INTERVAL_HOURS"
-                ;;
+        IFS=$'\t' read -r \
+            reminder_mode \
+            reminder_interval_hours \
+            reminder_maximum \
+            < <(reminder_policy_for_classification \
+                "$stored_classification" \
+                "$severity")
 
-            WARNING)
-                reminder_interval_hours="$WARNING_REMINDER_INTERVAL_HOURS"
-                ;;
-        esac
+        [[ "$reminder_interval_hours" =~ ^[0-9]+$ ]] || reminder_interval_hours=0
+        [[ "$reminder_maximum" =~ ^[0-9]+$ ]] || reminder_maximum=0
+
+        if [ "$reminder_mode" = "once" ]; then
+            ((EVENT_REPEAT_SUPPRESSED_COUNT++)) || true
+            ((NOTIFICATIONS_SUPPRESSED++)) || true
+            return 1
+        fi
 
         if (( reminder_interval_hours > 0 && last_notified_at > 0 )) &&
            (( now - last_notified_at >= reminder_interval_hours * 3600 )) &&
-           { (( REMINDER_MAX_COUNT == 0 )) ||
-             (( reminder_count < REMINDER_MAX_COUNT )); }
+           { (( reminder_maximum == 0 )) ||
+             (( reminder_count < reminder_maximum )); }
         then
             NOTIFICATION_DECISION_EVENT="reminder"
             ((REMINDER_NOTIFICATION_COUNT++)) || true
             return 0
+        fi
+
+        if [ "$reminder_mode" = "bounded" ] &&
+           (( reminder_maximum > 0 && reminder_count >= reminder_maximum ))
+        then
+            ((BOUNDED_REMINDER_SUPPRESSED_COUNT++)) || true
         fi
     fi
 
@@ -4740,6 +4852,8 @@ resolve_missing_issues() {
         local now
         local lifetime_hours
         local notified_signature
+        local severity
+        local notification_policy_mode
         local automatic_reconciliation=false
         local reconciliation_kind=""
 
@@ -4747,7 +4861,13 @@ resolve_missing_issues() {
         source=$(echo "$record" | jq -r '.value.app // ""')
         title=$(echo "$record" | jq -r '.value.title // "Unknown"')
         classification=$(echo "$record" | jq -r '.value.classification // "Unknown"')
+        severity=$(echo "$record" | jq -r '.value.severity // "INFO"')
         notified_signature=$(echo "$record" | jq -r '.value.notifiedSignature // ""')
+
+        notification_policy_mode=$(reminder_policy_for_classification \
+            "$classification" \
+            "$severity")
+        notification_policy_mode=${notification_policy_mode%%$'\t'*}
 
         case "$issue_key" in
             FLOW:DOWNLOAD:*)
@@ -4816,6 +4936,20 @@ resolve_missing_issues() {
                 # A richer, one-time AUTO-RECONCILED record is already queued.
                 # Suppress the generic "condition no longer present" duplicate.
                 log "Generic resolution notification replaced by automatic reconciliation detail: $issue_key"
+
+            elif [ "$notification_policy_mode" = "once" ]; then
+
+                # An event aging out of a history/warning window is not a
+                # verified recovery. Keep the lifecycle transition in state and
+                # logs without generating a misleading second email.
+                if [ "$SEND_RESOLUTION_NOTIFICATIONS" = true ] &&
+                   [ -n "$notified_signature" ]
+                then
+                    ((EVENT_RESOLUTION_SUPPRESSED_COUNT++)) || true
+                    ((NOTIFICATIONS_SUPPRESSED++)) || true
+                fi
+
+                log "Resolution notification suppressed for notification-once event: $issue_key"
 
             elif [ "$SEND_RESOLUTION_NOTIFICATIONS" = true ] &&
                  [ -n "$notified_signature" ]; then
@@ -12776,6 +12910,9 @@ log ""
 log "LIFECYCLE"
 log "Issues resolved this run: $RESOLVED_COUNT"
 log "Reminders queued: $REMINDER_NOTIFICATION_COUNT"
+log "Historical event repeats suppressed: $EVENT_REPEAT_SUPPRESSED_COUNT"
+log "Historical event expiry notices suppressed: $EVENT_RESOLUTION_SUPPRESSED_COUNT"
+log "Bounded reminder limits reached: $BOUNDED_REMINDER_SUPPRESSED_COUNT"
 log "Flapping episodes queued: $FLAPPING_NOTIFICATION_COUNT"
 log "Flapping notifications suppressed: $FLAPPING_SUPPRESSED_COUNT"
 log "Acknowledged notifications suppressed: $ACKNOWLEDGED_SUPPRESSED_COUNT"
@@ -12868,7 +13005,7 @@ log "============================================================"
 
 persistent_log \
     "END" \
-    "runtime=${RUNTIME} | active_issues=${TOTAL_ISSUES} | info=${INFO_COUNT} | warnings=${WARNING_COUNT} | errors=${ERROR_COUNT} | reminders=${REMINDER_NOTIFICATION_COUNT} | flapping=${FLAPPING_NOTIFICATION_COUNT} | acknowledged_suppressed=${ACKNOWLEDGED_SUPPRESSED_COUNT}"
+    "runtime=${RUNTIME} | active_issues=${TOTAL_ISSUES} | info=${INFO_COUNT} | warnings=${WARNING_COUNT} | errors=${ERROR_COUNT} | reminders=${REMINDER_NOTIFICATION_COUNT} | event_repeats_suppressed=${EVENT_REPEAT_SUPPRESSED_COUNT} | event_expiry_suppressed=${EVENT_RESOLUTION_SUPPRESSED_COUNT} | bounded_limits_reached=${BOUNDED_REMINDER_SUPPRESSED_COUNT} | flapping=${FLAPPING_NOTIFICATION_COUNT} | acknowledged_suppressed=${ACKNOWLEDGED_SUPPRESSED_COUNT}"
 
 if ! complete_monitor_run "$PIPELINE_STATUS"; then
     log "ERROR: Unable to update monitor completion heartbeat"
