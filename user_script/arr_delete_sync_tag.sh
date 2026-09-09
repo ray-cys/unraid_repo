@@ -78,9 +78,12 @@ PLEX_DELETED_MOVIE_TAG="plex-deleted"
 # Kodi sidecar quarantine. While media exists, the script records recognized
 # NFO, artwork, and external subtitle files. After the whole movie or series is
 # confirmed fileless, surviving unchanged files are moved into the existing
-# quarantine_lifecycle.sh layout. Other media-linked extras remain the
-# responsibility of Sonarr/Radarr and their Recycling Bin setting.
+# quarantine_lifecycle.sh layout. Recognized sidecars created after the original
+# capture must remain unchanged across two cleanup runs before they are moved.
+# Other media-linked extras remain the responsibility of Sonarr/Radarr and their
+# Recycling Bin setting.
 QUARANTINE_KODI_SIDECARS=true
+CAPTURE_LATE_KODI_SIDECARS=true
 QUARANTINE_ROOT="/mnt/user/media/bin"
 # Normalize only QUARANTINE_ROOT and its contents. Supplying an owner without a
 # group deliberately preserves each entry's existing group ownership.
@@ -125,7 +128,7 @@ MAX_LOG_FILES=5
 HTTP_CONNECT_TIMEOUT=10
 HTTP_MAX_TIME=90
 HTTP_RETRIES=2
-USER_AGENT="Arr-Delete-Sync-Tag/1.5"
+USER_AGENT="Arr-Delete-Sync-Tag/1.6"
 
 ###############################################################################
 # END CONFIGURATION
@@ -149,6 +152,8 @@ SIDECARS_CAPTURED=0
 SIDECARS_QUARANTINED=0
 SIDECARS_NATIVE_MISSING=0
 SIDECARS_CHANGED=0
+SIDECARS_LATE_CANDIDATES=0
+SIDECARS_LATE_CONFIRMED=0
 SIDECAR_FAILURES=0
 FOLDERS_REMOVED=0
 FOLDER_CLEANUP_PENDING=0
@@ -165,6 +170,9 @@ CLEANUP_PROGRESS_QUARANTINED=0
 CLEANUP_PROGRESS_NATIVE_MISSING=0
 CLEANUP_PROGRESS_FOLDERS_REMOVED=0
 CLEANUP_QUARANTINE_RUN_ID=""
+CLEANUP_LATE_CANDIDATES='[]'
+CLEANUP_LATE_CANDIDATE_COUNT=0
+CLEANUP_LATE_CONFIRMED_COUNT=0
 CLEANUP_BLOCKER_COUNT=0
 CLEANUP_BLOCKER_DETAILS=""
 
@@ -290,8 +298,11 @@ queue_folder_blocker_notification() {
     key="folder:${app_name,,}:${item_id}"
     detail="Directory: ${media_path}"$'\n'
     detail+="Blocking entries: ${CLEANUP_BLOCKER_COUNT}"
+    if (( CLEANUP_LATE_CANDIDATE_COUNT > 0 )); then
+        detail+=$'\n'"Recognized late sidecars awaiting next-run confirmation: ${CLEANUP_LATE_CANDIDATE_COUNT}"
+    fi
     [[ -n "$CLEANUP_BLOCKER_DETAILS" ]] && detail+=$'\n'"${CLEANUP_BLOCKER_DETAILS}"
-    signature="$(notification_hash "$media_path|$CLEANUP_BLOCKER_COUNT|$CLEANUP_BLOCKER_DETAILS")"
+    signature="$(notification_hash "$media_path|$CLEANUP_BLOCKER_COUNT|$CLEANUP_LATE_CANDIDATE_COUNT|$CLEANUP_BLOCKER_DETAILS")"
     previous="$(jq -r --arg key "$key" '.attention[$key].signature // ""' \
         "$NOTIFICATION_STATE_FILE" 2>/dev/null || true)"
 
@@ -332,6 +343,9 @@ queue_cleanup_action_notification() {
     (( CLEANUP_QUARANTINED > 0 || CLEANUP_FOLDERS_REMOVED > 0 )) || return 0
 
     detail="Sidecars quarantined: ${CLEANUP_QUARANTINED}; empty directories removed: ${CLEANUP_FOLDERS_REMOVED}."
+    if (( CLEANUP_LATE_CONFIRMED_COUNT > 0 )); then
+        detail+=$'\n'"Late sidecars confirmed unchanged and quarantined: ${CLEANUP_LATE_CONFIRMED_COUNT}."
+    fi
     detail+=$'\n'"Media path: ${media_path}"
     queue_action_notification "$app_name" "$title cleanup" "$detail"
 }
@@ -658,17 +672,16 @@ capture_kodi_sidecars() {
         <<< "$media_relative_paths" || return 1
 
     if [[ "$app_name" == sonarr ]]; then
-        for candidate in tvshow.nfo poster.jpg poster.png banner.jpg banner.png fanart.jpg fanart.png; do
-            exact_paths["$candidate"]=1
-        done
+        exact_paths["tvshow.nfo"]=1
     else
         exact_paths["movie.nfo"]=1
-        for type in poster banner fanart clearart discart keyart landscape logo backdrop clearlogo; do
-            for extension in jpg jpeg png; do
-                exact_paths["${type}.${extension}"]=1
-            done
-        done
     fi
+    for type in poster banner fanart clearart characterart discart keyart \
+        landscape logo backdrop clearlogo folder thumb; do
+        for extension in jpg jpeg png; do
+            exact_paths["${type}.${extension}"]=1
+        done
+    done
 
     while IFS= read -r relative; do
         valid_relative_path "$relative" || {
@@ -687,7 +700,7 @@ capture_kodi_sidecars() {
         exact_paths["${candidate,,}"]=1
 
         if [[ "$app_name" == sonarr ]]; then
-            for extension in jpg png; do
+            for extension in jpg jpeg png; do
                 candidate="${stem}-thumb.${extension}"
                 [[ -n "$rel_dir" ]] && candidate="${rel_dir}/${candidate}"
                 exact_paths["${candidate,,}"]=1
@@ -713,12 +726,12 @@ capture_kodi_sidecars() {
         if [[ -n "${exact_paths[$lower]+present}" ]]; then
             eligible=true
         elif [[ "$app_name" == sonarr &&
-                "$name" =~ ^season([0-9]{2,}|-all|-specials)-(poster|banner|fanart)\.(jpg|png)$ ]]; then
+                "$name" =~ ^season([0-9]{2,}|-all|-specials)-(poster|banner|fanart|landscape|thumb)\.(jpg|jpeg|png)$ ]]; then
             eligible=true
         else
             extension="${name##*.}"
             case "$extension" in
-                srt|ass|ssa|vtt|sub|idx|sup|smi|sami)
+                nfo|srt|ass|ssa|vtt|sub|idx|sup|smi|sami)
                     eligible=true
                     ;;
             esac
@@ -755,6 +768,73 @@ capture_kodi_sidecars() {
 
     (( capture_failed == 0 )) || return 1
     printf '%s' "$files"
+}
+
+# Build a file-backed cleanup plan without placing a potentially large sidecar
+# list in jq's argument vector. A recognized file absent from the original
+# manifest is moved only when its path, size, and hash match the candidate saved
+# by the previous cleanup run.
+build_sidecar_cleanup_plan() {
+    local app_name="$1"
+    local media_path="$2"
+    local media_root="$3"
+    local manifest="$4"
+    local current_file plan
+
+    if [[ "$CAPTURE_LATE_KODI_SIDECARS" != true ]]; then
+        jq '{
+            moveEntries: (.files // []),
+            lateCandidates: [],
+            lateConfirmed: [],
+            observedLate: []
+        }' <<< "$manifest"
+        return
+    fi
+
+    current_file="$(mktemp "$RUNTIME_DIR/.sidecars.late-current.XXXXXX")" || return 1
+    if ! capture_kodi_sidecars "$app_name" "$media_path" "$media_root" '[]' \
+        > "$current_file"; then
+        rm -f -- "$current_file"
+        return 1
+    fi
+
+    plan="$(jq --slurpfile current_source "$current_file" '
+        def same_file($left; $right):
+            ($left.relativePath == $right.relativePath)
+            and ($left.size == $right.size)
+            and (($left.sha256 | ascii_downcase) == ($right.sha256 | ascii_downcase));
+
+        . as $manifest
+        | ($manifest.files // []) as $recorded
+        | ($manifest.lateSidecarCandidates // []) as $previous
+        | ($current_source[0] // []) as $current
+        | [
+            $current[] as $candidate
+            | select(all($recorded[]; .relativePath != $candidate.relativePath))
+            | $candidate
+          ] as $late
+        | [
+            $late[] as $candidate
+            | select(any($previous[]; same_file($candidate; .)))
+            | $candidate
+          ] as $confirmed
+        | [
+            $late[] as $candidate
+            | select(all($previous[]; same_file($candidate; .) | not))
+            | $candidate
+          ] as $pending
+        | {
+            moveEntries: (($recorded + $confirmed) | unique_by(.relativePath)),
+            lateCandidates: $pending,
+            lateConfirmed: $confirmed,
+            observedLate: $late
+          }
+        ' <<< "$manifest")" || {
+        rm -f -- "$current_file"
+        return 1
+    }
+    rm -f -- "$current_file"
+    printf '%s' "$plan"
 }
 
 contains_video_files() {
@@ -855,6 +935,7 @@ prepare_sidecar_cleanup_manifest() {
                 bucket: $bucket,
                 capturedAt: $now,
                 files: [],
+                lateSidecarCandidates: [],
                 cleanupPending: false,
                 cleanupProgress: {
                     quarantineRunId: null,
@@ -884,6 +965,7 @@ prepare_sidecar_cleanup_manifest() {
             bucket: $bucket,
             capturedAt: ($action.completedAt // $now),
             files: [],
+            lateSidecarCandidates: [],
             cleanupPending: true,
             cleanupPendingSince: ($action.completedAt // $now),
             cleanupProgress: {
@@ -917,7 +999,8 @@ mark_sidecar_folder_cleanup_pending() {
         --arg quarantine_run_id "$CLEANUP_QUARANTINE_RUN_ID" \
         --argjson quarantined "$total_quarantined" \
         --argjson native_missing "$total_native_missing" \
-        --argjson folders_removed "$total_folders_removed" '
+        --argjson folders_removed "$total_folders_removed" \
+        --argjson late_candidates "$CLEANUP_LATE_CANDIDATES" '
         (.sidecarManifests[$key] // {}) as $old_manifest
         | (.sidecarCleanupActions[$key] // {}) as $old_action
         | .sidecarManifests[$key] = {
@@ -926,6 +1009,13 @@ mark_sidecar_folder_cleanup_pending() {
             bucket: $bucket,
             capturedAt: ($old_manifest.capturedAt // $old_action.completedAt // $now),
             files: [],
+            lateSidecarCandidates: $late_candidates,
+            lateSidecarCandidateAt: (
+                if ($late_candidates | length) > 0
+                then $now
+                else null
+                end
+            ),
             cleanupPending: true,
             cleanupPendingSince: ($old_manifest.cleanupPendingSince // $old_action.completedAt // $now),
             cleanupLastAttemptAt: $now,
@@ -944,9 +1034,10 @@ mark_sidecar_folder_cleanup_pending() {
     mv -f -- "$next" "$WORK_STATE"
 }
 
-# Move only unchanged files from a pre-deletion manifest. Missing files are
-# treated as already handled by Arr's native Recycling Bin path. A changed,
-# symlinked, or unsafe file is never moved and keeps the manifest pending.
+# Move unchanged files from a pre-deletion manifest plus recognized late
+# sidecars confirmed by two cleanup runs. Missing files are treated as already
+# handled by Arr's native Recycling Bin path. A changed, symlinked, or unsafe
+# file is never moved and keeps the manifest pending.
 quarantine_recorded_sidecars() {
     local app_name="$1"
     local bucket="$2"
@@ -958,6 +1049,8 @@ quarantine_recorded_sidecars() {
     local root_relative destination destination_parent destination_real
     local files_count
     local cleanup_progress
+    local cleanup_plan
+    local late_candidate
 
     CLEANUP_COMPLETE=false
     CLEANUP_FOLDER_PENDING=false
@@ -969,6 +1062,9 @@ quarantine_recorded_sidecars() {
     CLEANUP_PROGRESS_NATIVE_MISSING=0
     CLEANUP_PROGRESS_FOLDERS_REMOVED=0
     CLEANUP_QUARANTINE_RUN_ID=""
+    CLEANUP_LATE_CANDIDATES='[]'
+    CLEANUP_LATE_CANDIDATE_COUNT=0
+    CLEANUP_LATE_CONFIRMED_COUNT=0
     CLEANUP_BLOCKER_COUNT=0
     CLEANUP_BLOCKER_DETAILS=""
 
@@ -1040,6 +1136,30 @@ quarantine_recorded_sidecars() {
     run_root="${quarantine_real}/${QUARANTINE_RUN_ID}"
     root_relative="${media_real#"$root_real"/}"
     valid_relative_path "$root_relative" || return 1
+
+    cleanup_plan="$(build_sidecar_cleanup_plan \
+        "$app_name" \
+        "$media_real" \
+        "$media_root" \
+        "$manifest")" || {
+        log ERROR "Could not build the $app_name late-sidecar cleanup plan: $media_real"
+        return 1
+    }
+    CLEANUP_LATE_CANDIDATES="$(jq -c '.lateCandidates // []' <<< "$cleanup_plan")" || return 1
+    CLEANUP_LATE_CANDIDATE_COUNT="$(jq '.lateCandidates | length' <<< "$cleanup_plan")" || return 1
+    CLEANUP_LATE_CONFIRMED_COUNT="$(jq '.lateConfirmed | length' <<< "$cleanup_plan")" || return 1
+    ((SIDECARS_LATE_CANDIDATES += CLEANUP_LATE_CANDIDATE_COUNT)) || true
+    ((SIDECARS_LATE_CONFIRMED += CLEANUP_LATE_CONFIRMED_COUNT)) || true
+
+    while IFS= read -r late_candidate; do
+        [[ -n "$late_candidate" ]] || continue
+        log INFO "$app_name late sidecar candidate requires one more unchanged cleanup run: $late_candidate"
+    done < <(jq -r '.lateCandidates[]?.relativePath' <<< "$cleanup_plan")
+
+    while IFS= read -r late_candidate; do
+        [[ -n "$late_candidate" ]] || continue
+        log INFO "$app_name late sidecar candidate confirmed for quarantine: $late_candidate"
+    done < <(jq -r '.lateConfirmed[]?.relativePath' <<< "$cleanup_plan")
 
     while IFS= read -r entry; do
         [[ -n "$entry" ]] || continue
@@ -1122,7 +1242,7 @@ quarantine_recorded_sidecars() {
         else
             return 1
         fi
-    done < <(jq -c '.files[]' <<< "$manifest")
+    done < <(jq -c '.moveEntries[]?' <<< "$cleanup_plan")
 
     if [[ "$DRY_RUN" == true ]]; then
         [[ "$REMOVE_EMPTY_MEDIA_FOLDERS" == true ]] &&
@@ -1130,6 +1250,13 @@ quarantine_recorded_sidecars() {
         return 0
     fi
     (( CLEANUP_CHANGED == 0 )) || return 0
+
+    if (( CLEANUP_LATE_CANDIDATE_COUNT > 0 )) &&
+       [[ "$REMOVE_EMPTY_MEDIA_FOLDERS" != true ]]; then
+        CLEANUP_FOLDER_PENDING=true
+        log INFO "$app_name cleanup remains pending for $CLEANUP_LATE_CANDIDATE_COUNT late sidecar candidate(s): $media_real"
+        return 0
+    fi
 
     if [[ "$REMOVE_EMPTY_MEDIA_FOLDERS" == true ]]; then
         remove_empty_media_dirs "$media_real"
@@ -1344,7 +1471,8 @@ sonarr_apply_snapshot() {
                 mediaRoot: $media_root,
                 bucket: "series",
                 capturedAt: $now,
-                files: $sidecar_files
+                files: $sidecar_files,
+                lateSidecarCandidates: []
             }
           else
             .
@@ -1714,7 +1842,7 @@ sonarr_commit_state() {
     (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )) && had_errors=true
 
     if ! jq --arg now "$RUN_AT" --argjson had_errors "$had_errors" '
-        .version = 5
+        .version = 6
         | .lastRun = $now
         | .lastRunHadApiErrors = $had_errors
         | .episodes //= {}
@@ -1774,8 +1902,11 @@ SIDECARS_CAPTURED=0
 SIDECARS_QUARANTINED=0
 SIDECARS_NATIVE_MISSING=0
 SIDECARS_CHANGED=0
+SIDECARS_LATE_CANDIDATES=0
+SIDECARS_LATE_CONFIRMED=0
 SIDECAR_FAILURES=0
 FOLDERS_REMOVED=0
+FOLDER_CLEANUP_PENDING=0
 MOVER_DEFERRALS=0
 MOVER_GUARD_NOTICE_LOGGED=false
 TAG_CATALOG=''
@@ -1804,7 +1935,7 @@ trap 'exit 130' INT TERM
 if [[ ! -f "$STATE_FILE" ]]; then
     INITIAL_STATE="$(mktemp "$STATE_DIR/.state-initial.XXXXXX")" ||
         die "Cannot create initial state file."
-    printf '%s\n' '{"version":5,"lastRun":null,"lastRunHadApiErrors":false,"episodes":{},"sidecarManifests":{},"sidecarCleanupActions":{}}' > "$INITIAL_STATE" &&
+    printf '%s\n' '{"version":6,"lastRun":null,"lastRunHadApiErrors":false,"episodes":{},"sidecarManifests":{},"sidecarCleanupActions":{}}' > "$INITIAL_STATE" &&
         mv -f -- "$INITIAL_STATE" "$STATE_FILE" || {
             rm -f -- "$INITIAL_STATE"
             die "Cannot create state file."
@@ -2245,7 +2376,7 @@ WORK_STATE=""
 
 ACTION_LABEL=applied
 [[ "$DRY_RUN" == true ]] && ACTION_LABEL=would-apply
-log INFO "Summary: series-listed=$SERIES_LISTED, series-scanned=$SERIES_SCANNED, episodes=$EPISODES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$EPISODES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, episode-actions-$ACTION_LABEL=$EPISODE_ACTIONS, season-actions-$ACTION_LABEL=$SEASON_ACTIONS, series-actions-$ACTION_LABEL=$SERIES_ACTIONS, tagged-series-$ACTION_LABEL=$TAGGED_SERIES_ACTIONS, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, folder-cleanup-pending=$FOLDER_CLEANUP_PENDING, mover-deferrals=$MOVER_DEFERRALS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
+log INFO "Summary: series-listed=$SERIES_LISTED, series-scanned=$SERIES_SCANNED, episodes=$EPISODES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$EPISODES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, episode-actions-$ACTION_LABEL=$EPISODE_ACTIONS, season-actions-$ACTION_LABEL=$SEASON_ACTIONS, series-actions-$ACTION_LABEL=$SERIES_ACTIONS, tagged-series-$ACTION_LABEL=$TAGGED_SERIES_ACTIONS, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, late-sidecar-candidates=$SIDECARS_LATE_CANDIDATES, late-sidecars-confirmed-$ACTION_LABEL=$SIDECARS_LATE_CONFIRMED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, folder-cleanup-pending=$FOLDER_CLEANUP_PENDING, mover-deferrals=$MOVER_DEFERRALS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
 
 if (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )); then
     FAILURE_SEVERITY=WARNING
@@ -2289,6 +2420,8 @@ validate_common_configuration() {
         die "REQUIRE_DELETE_HISTORY_EVENT must be true or false."
     [[ "$QUARANTINE_KODI_SIDECARS" == true || "$QUARANTINE_KODI_SIDECARS" == false ]] ||
         die "QUARANTINE_KODI_SIDECARS must be true or false."
+    [[ "$CAPTURE_LATE_KODI_SIDECARS" == true || "$CAPTURE_LATE_KODI_SIDECARS" == false ]] ||
+        die "CAPTURE_LATE_KODI_SIDECARS must be true or false."
     [[ "$REQUIRE_SIDECAR_HASH_MATCH" == true || "$REQUIRE_SIDECAR_HASH_MATCH" == false ]] ||
         die "REQUIRE_SIDECAR_HASH_MATCH must be true or false."
     [[ "$REMOVE_EMPTY_MEDIA_FOLDERS" == true || "$REMOVE_EMPTY_MEDIA_FOLDERS" == false ]] ||
@@ -2694,7 +2827,7 @@ radarr_commit_state() {
     (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )) && had_errors=true
 
     if ! jq --arg now "$RUN_AT" --argjson had_errors "$had_errors" '
-        .version = 3
+        .version = 4
         | .lastRun = $now
         | .lastRunHadApiErrors = $had_errors
         | .movies //= {}
@@ -2755,8 +2888,11 @@ SIDECARS_CAPTURED=0
 SIDECARS_QUARANTINED=0
 SIDECARS_NATIVE_MISSING=0
 SIDECARS_CHANGED=0
+SIDECARS_LATE_CANDIDATES=0
+SIDECARS_LATE_CONFIRMED=0
 SIDECAR_FAILURES=0
 FOLDERS_REMOVED=0
+FOLDER_CLEANUP_PENDING=0
 MOVER_DEFERRALS=0
 MOVER_GUARD_NOTICE_LOGGED=false
 TAG_CATALOG=''
@@ -2776,7 +2912,7 @@ trap 'exit 130' INT TERM
 if [[ ! -f "$STATE_FILE" ]]; then
     INITIAL_STATE="$(mktemp "$STATE_DIR/.state-initial.XXXXXX")" ||
         die "Cannot create initial state file."
-    printf '%s\n' '{"version":3,"lastRun":null,"lastRunHadApiErrors":false,"movies":{},"sidecarManifests":{},"sidecarCleanupActions":{}}' > "$INITIAL_STATE" &&
+    printf '%s\n' '{"version":4,"lastRun":null,"lastRunHadApiErrors":false,"movies":{},"sidecarManifests":{},"sidecarCleanupActions":{}}' > "$INITIAL_STATE" &&
         mv -f -- "$INITIAL_STATE" "$STATE_FILE" || {
             rm -f -- "$INITIAL_STATE"
             die "Cannot create state file."
@@ -2870,7 +3006,8 @@ if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( FILES_PRESENT > 0 )); then
                     mediaRoot:$media_root,
                     bucket:"movies",
                     capturedAt:$now,
-                    files:$files
+                    files:$files,
+                    lateSidecarCandidates:[]
                 }}
             ' >> "$SIDECAR_BATCH_FILE"; then
                 die "Could not build Radarr sidecar manifest batch."
@@ -3079,7 +3216,7 @@ WORK_STATE=""
 
 ACTION_LABEL=applied
 [[ "$DRY_RUN" == true ]] && ACTION_LABEL=would-apply
-log INFO "Summary: movies-listed=$MOVIES_LISTED, movies-scanned=$MOVIES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$MOVIES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, tag-actions-$ACTION_LABEL=$TAG_ACTIONS, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, folder-cleanup-pending=$FOLDER_CLEANUP_PENDING, mover-deferrals=$MOVER_DEFERRALS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
+log INFO "Summary: movies-listed=$MOVIES_LISTED, movies-scanned=$MOVIES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$MOVIES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, tag-actions-$ACTION_LABEL=$TAG_ACTIONS, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, late-sidecar-candidates=$SIDECARS_LATE_CANDIDATES, late-sidecars-confirmed-$ACTION_LABEL=$SIDECARS_LATE_CONFIRMED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, folder-cleanup-pending=$FOLDER_CLEANUP_PENDING, mover-deferrals=$MOVER_DEFERRALS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
 
 if (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )); then
     FAILURE_SEVERITY=WARNING
