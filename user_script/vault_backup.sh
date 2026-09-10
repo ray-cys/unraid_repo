@@ -58,7 +58,7 @@ NICE_LEVEL=10
 
 LOG_DIR="/mnt/vault/cloud/logs/script/vault_backup"
 MAX_LOGS=5
-STATUS_DIR="/mnt/vault/cloud/logs/user_scripts_status"
+STATUS_DIR="/mnt/vault/cloud/logs/script/vault_backup/user_scripts_status"
 NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
 LOCK_FILE="/run/vault_backup.lock"
 
