@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Remote NAS Backup v2.1
+# Remote NAS Backup v2.2
 #
 # PURPOSE
 # -------
@@ -265,17 +265,20 @@ ARRAY_READY_INTERVAL=6
 # Remote shutdown
 # ---------------------------------------------------------------------------
 
-# Current behavior is retained:
-#
 # Successful backup -> shut remote NAS down.
-# The final shutdown is automatically skipped when remote Mover/parity activity
-# is detected or when that activity state cannot be verified.
-#
 SHUTDOWN_REMOTE_ON_SUCCESS=true
 
 # Failed backup -> leave remote NAS running unless explicitly enabled.
 #
 SHUTDOWN_REMOTE_ON_FAILURE=false
+
+# Independent remote-activity shutdown guards. Ordinary read/correcting parity
+# checks may be interrupted by the clean shutdown after backup. More critical
+# parity sync, rebuild, and disk-clear operations remain protected.
+#
+DEFER_REMOTE_SHUTDOWN_WHILE_MOVER=true
+DEFER_REMOTE_SHUTDOWN_DURING_PARITY_CHECK=false
+DEFER_REMOTE_SHUTDOWN_DURING_CRITICAL_ARRAY_OPERATION=true
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +512,8 @@ validate_configuration() {
     local dest=""
     local extra_excludes=""
     local bwlimit=""
+    local boolean_name=""
+    local boolean_value=""
 
     local -A seen_labels=()
 
@@ -568,6 +573,25 @@ validate_configuration() {
             "REMOTE_DF_RETRIES must be an integer >= 1"
         return 1
     fi
+
+    for boolean_name in \
+        SHUTDOWN_REMOTE_ON_SUCCESS \
+        SHUTDOWN_REMOTE_ON_FAILURE \
+        DEFER_REMOTE_SHUTDOWN_WHILE_MOVER \
+        DEFER_REMOTE_SHUTDOWN_DURING_PARITY_CHECK \
+        DEFER_REMOTE_SHUTDOWN_DURING_CRITICAL_ARRAY_OPERATION
+    do
+        boolean_value="${!boolean_name}"
+        case "$boolean_value" in
+            true|false)
+                ;;
+            *)
+                log "PREFLIGHT" "ERROR" \
+                    "${boolean_name} must be true or false"
+                return 1
+                ;;
+        esac
+    done
 
     for descriptor in "${BACKUP_JOBS[@]}"; do
         IFS='|' read -r \
@@ -1662,10 +1686,34 @@ remote_shutdown_blockers() {
         -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" \
         -p "$SSH_PORT" \
         "$REMOTE" \
-        'bash -s' <<'REMOTE_ACTIVITY_PROBE'
-command -v pgrep >/dev/null 2>&1 || exit 3
-if pgrep -f '(^|/)(mover|mover\.old)( |$)|mover\.php' >/dev/null 2>&1; then
-    printf '%s\n' 'Mover is active'
+        bash -s -- \
+        "$DEFER_REMOTE_SHUTDOWN_WHILE_MOVER" \
+        "$DEFER_REMOTE_SHUTDOWN_DURING_PARITY_CHECK" \
+        "$DEFER_REMOTE_SHUTDOWN_DURING_CRITICAL_ARRAY_OPERATION" \
+        <<'REMOTE_ACTIVITY_PROBE'
+defer_mover="$1"
+defer_parity_check="$2"
+defer_critical_operation="$3"
+
+case "${defer_mover}:${defer_parity_check}:${defer_critical_operation}" in
+    true:true:true|true:true:false|true:false:true|true:false:false|\
+    false:true:true|false:true:false|false:false:true|false:false:false)
+        ;;
+    *)
+        exit 3
+        ;;
+esac
+
+if [ "$defer_mover" = true ]; then
+    command -v pgrep >/dev/null 2>&1 || exit 3
+    if pgrep -f '(^|/)(mover|mover\.old)( |$)|mover\.php' >/dev/null 2>&1; then
+        printf '%s\n' 'Mover is active'
+    fi
+fi
+
+if [ "$defer_parity_check" != true ] &&
+   [ "$defer_critical_operation" != true ]; then
+    exit 0
 fi
 
 if [ -x /usr/local/sbin/mdcmd ]; then
@@ -1683,29 +1731,29 @@ printf '%s\n' "$md_status" | awk -F= '
         return value
     }
     tolower($1) == "mdresyncaction" { action=clean($2) }
+    tolower($1) == "mdresync"       { resync=clean($2) }
     tolower($1) == "mdresyncpos"    { pos=clean($2) }
-    tolower($1) == "mdresyncsize"   { size=clean($2) }
-    tolower($1) == "mdresyncspeed"  { speed=clean($2) }
-    tolower($1) == "mdresyncrem"    { remaining=clean($2) }
     END {
+        if (!(resync ~ /^[0-9]+$/) || !(pos ~ /^[0-9]+$/)) exit 3
+
         action_lc=tolower(action)
-        active=0
-        complete=0
-        if (speed ~ /^[0-9]+$/ && speed + 0 > 0) active=1
-        if (remaining ~ /^[0-9]+$/ && remaining + 0 > 0) active=1
-        if (pos ~ /^[0-9]+$/ && size ~ /^[0-9]+$/ &&
-            size + 0 > 0 && pos + 0 < size + 0) active=1
-        if (pos ~ /^[0-9]+$/ && size ~ /^[0-9]+$/ &&
-            size + 0 > 0 && pos + 0 >= size + 0 &&
-            (!(speed ~ /^[0-9]+$/) || speed + 0 == 0) &&
-            (!(remaining ~ /^[0-9]+$/) || remaining + 0 == 0)) complete=1
-        if (!active && !complete && action_lc != "" && action_lc != "idle") active=1
-        if (active) {
-            if (action != "") printf "Parity operation is active (%s)\n", action
-            else printf "Parity operation is active\n"
+        active=(resync + 0 > 0 || pos + 0 > 0)
+        if (!active) exit
+
+        state=(resync + 0 > 0 ? "active" : "paused")
+        if (action_lc ~ /^check([[:space:]]|$)/) {
+            if (defer_parity_check == "true")
+                printf "Parity check is %s (%s)\n", state, action
+        } else if (defer_critical_operation == "true") {
+            if (action != "")
+                printf "Critical array operation is %s (%s)\n", state, action
+            else
+                printf "Critical array operation is %s\n", state
         }
     }
-'
+' \
+    defer_parity_check="$defer_parity_check" \
+    defer_critical_operation="$defer_critical_operation"
 REMOTE_ACTIVITY_PROBE
 }
 
