@@ -7,7 +7,7 @@ umask 002
 #
 # SABnzbd arguments (3.0+):
 #   $1 complete directory   $2 original NZB name   $3 clean job name
-#   $4 indexer report ID   $5 category             $6 newsgroup
+#   $4 legacy placeholder  $5 category             $6 newsgroup
 #   $7 post-processing status (0 = success)        $8 failure URL
 #
 #  NZB RSS Feed Keywords: formula1 "year"
@@ -28,7 +28,7 @@ DEST_DIR="${F1_DEST_DIR:-/data/formula1}"
 
 # This must be the parent directory that contains SABnzbd's completed jobs.
 # A job directory must be a child of this path before this script may remove it.
-SAB_COMPLETED_ROOT="${F1_SAB_COMPLETED_ROOT:-/data/complete}"
+SAB_COMPLETED_ROOT="${F1_SAB_COMPLETED_ROOT:-/data/net/complete}"
 
 # current:
 #   F1 (2026)/Season 01/
@@ -50,6 +50,8 @@ STATE_DIR="${F1_SCRIPT_STATE_DIR:-/config/scripts/state/formula1-sabnzbd}"
 MIN_FILE_BYTES="${F1_MIN_FILE_BYTES:-52428800}"
 SIZE_UPGRADE_PERCENT="${F1_SIZE_UPGRADE_PERCENT:-10}"
 LOCK_STALE_SECONDS="${F1_LOCK_STALE_SECONDS:-3600}"
+CLEANUP_RETRIES="${F1_CLEANUP_RETRIES:-3}"
+CLEANUP_RETRY_SECONDS="${F1_CLEANUP_RETRY_SECONDS:-1}"
 
 # ---------------------------------------------------------------------------
 # Session definitions
@@ -116,6 +118,7 @@ FINAL_REPORTED=0
 STAGED_FILE=""
 ORIGINAL_FILE=""
 LOCK_DIR=""
+CLEANUP_ERROR=""
 
 finish() {
   local outcome="$1"
@@ -134,7 +137,7 @@ on_exit() {
     fi
   fi
   if [[ -n "$LOCK_DIR" && -d "$LOCK_DIR" ]]; then
-    rm -rf -- "$LOCK_DIR"
+    rm -rf -- "$LOCK_DIR" || true
   fi
   if (( status != 0 && FINAL_REPORTED == 0 )); then
     printf '[Formula 1] Outcome: Failed | Job: %s | Unexpected script error (exit %d)\n' \
@@ -179,20 +182,57 @@ validate_removal_target() {
 
 remove_job_directory() {
   local candidate="$1"
+  local attempt output
+
+  CLEANUP_ERROR=""
+
+  # Another process may already have removed the completed-job directory.
+  [[ ! -e "$candidate" ]] && return 0
+
   if ! validate_removal_target "$candidate"; then
-    finish "Failed" "Safety check refused removal of source directory: $candidate"
-    return 1
+    CLEANUP_ERROR="Safety check refused removal of source directory: $candidate"
+    return 2
   fi
-  rm -rf -- "$candidate"
+
+  # On Unraid, SABnzbd or the FUSE layer can briefly recreate an entry while
+  # rm is walking the directory. Retry a small number of times instead of
+  # allowing one transient 'Directory not empty' result to abort the job.
+  for ((attempt = 1; attempt <= CLEANUP_RETRIES; attempt++)); do
+    if output=$(rm -rf -- "$candidate" 2>&1); then
+      return 0
+    fi
+    if [[ ! -e "$candidate" ]]; then
+      return 0
+    fi
+    CLEANUP_ERROR="${output:-rm returned a non-zero status}"
+    if (( attempt < CLEANUP_RETRIES )); then
+      sleep "$CLEANUP_RETRY_SECONDS"
+    fi
+  done
+
+  return 1
 }
 
 reject_and_remove() {
-  local reason="$1"
+  local reason="$1" cleanup_status
   if remove_job_directory "$SRC_DIR"; then
     finish "Rejected" "$reason; validated SABnzbd job directory removed"
     exit 0
+  else
+    cleanup_status=$?
   fi
-  exit 1
+
+  if (( cleanup_status == 2 )); then
+    finish "Failed" "$reason; $CLEANUP_ERROR"
+    exit 1
+  fi
+
+  # The policy decision succeeded even if Unraid could not finish deleting
+  # the source directory. Report the retained path without marking the whole
+  # SABnzbd post-processing job as failed.
+  finish "Rejected with warning" \
+    "$reason; source cleanup incomplete and may be retried later: $SRC_DIR; $CLEANUP_ERROR"
+  exit 0
 }
 
 normalize_words() {
@@ -212,8 +252,14 @@ session_pattern() {
 source_feed() {
   local value="$1"
   value="${value^^}"
-  if [[ "$value" =~ (^|[._[:space:]-])(F1TV|F1LIVE|SKY)([._[:space:]-]|$) ]]; then
-    printf '%s' "${BASH_REMATCH[2]^^}"
+  # Some releases contain both F1LIVE and F1TV. In that case F1TV is the
+  # actual source marker and must win regardless of its position in the name.
+  if [[ "$value" =~ (^|[._[:space:]-])F1TV([._[:space:]-]|$) ]]; then
+    printf '%s' "F1TV"
+  elif [[ "$value" =~ (^|[._[:space:]-])F1LIVE([._[:space:]-]|$) ]]; then
+    printf '%s' "F1LIVE"
+  elif [[ "$value" =~ (^|[._[:space:]-])SKY([._[:space:]-]|$) ]]; then
+    printf '%s' "SKY"
   else
     printf '%s' "UNKNOWN"
   fi
@@ -366,6 +412,12 @@ incoming_is_upgrade() {
 # Validate SABnzbd invocation before examining or deleting anything
 # ---------------------------------------------------------------------------
 
+if (( $# == 0 )); then
+  finish "Skipped" \
+    "No SABnzbd arguments supplied; this file is only a SABnzbd post-processing script"
+  exit 0
+fi
+
 if (( $# < 7 )); then
   finish "Failed" "Expected at least 7 SABnzbd arguments; received $#"
   exit 1
@@ -383,14 +435,20 @@ case "${NAMING_PROFILE,,}" in
     ;;
 esac
 
-for numeric_setting in "$MIN_FILE_BYTES" "$SIZE_UPGRADE_PERCENT" "$LOCK_STALE_SECONDS"; do
+for numeric_setting in \
+  "$MIN_FILE_BYTES" \
+  "$SIZE_UPGRADE_PERCENT" \
+  "$LOCK_STALE_SECONDS" \
+  "$CLEANUP_RETRIES" \
+  "$CLEANUP_RETRY_SECONDS"; do
   if [[ ! "$numeric_setting" =~ ^[0-9]+$ ]]; then
-    finish "Failed" "File-size and lock settings must be non-negative integers"
+    finish "Failed" "File-size, lock, and cleanup settings must be non-negative integers"
     exit 1
   fi
 done
-if (( MIN_FILE_BYTES < 1 || LOCK_STALE_SECONDS < 1 )); then
-  finish "Failed" "Minimum file size and stale-lock time must be greater than zero"
+if (( MIN_FILE_BYTES < 1 || LOCK_STALE_SECONDS < 1 || CLEANUP_RETRIES < 1 )); then
+  finish "Failed" \
+    "Minimum file size, stale-lock time, and cleanup retries must be greater than zero"
   exit 1
 fi
 
@@ -614,7 +672,16 @@ fi
 write_state "$STATE_FILE" "$TARGET" "$FEED" "$IN_QUALITY" \
   "$IN_QUALITY_RANK" "$IN_CODEC_HINT" "$IN_SIZE"
 
-remove_job_directory "$SRC_DIR"
+if remove_job_directory "$SRC_DIR"; then
+  CLEANUP_DETAIL="Source job directory removed"
+else
+  CLEANUP_STATUS=$?
+  if (( CLEANUP_STATUS == 2 )); then
+    CLEANUP_DETAIL="WARNING: imported successfully, but cleanup safety check refused the source path: $SRC_DIR"
+  else
+    CLEANUP_DETAIL="WARNING: imported successfully, but source cleanup is incomplete: $SRC_DIR; $CLEANUP_ERROR"
+  fi
+fi
 finish "$ACTION" \
-  "Profile: $NAMING_PROFILE | Feed: $FEED | Quality hint: $IN_QUALITY | Codec hint: $IN_CODEC_HINT | Destination: $TARGET"
+  "Profile: $NAMING_PROFILE | Feed: $FEED | Quality hint: $IN_QUALITY | Codec hint: $IN_CODEC_HINT | Destination: $TARGET | Cleanup: $CLEANUP_DETAIL"
 exit 0
