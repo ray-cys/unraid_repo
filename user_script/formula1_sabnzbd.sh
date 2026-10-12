@@ -5,10 +5,14 @@ umask 002
 
 # Formula 1 SABnzbd post-processing script.
 #
-# SABnzbd arguments (3.0+):
+# SABnzbd 3.0-5.1 post-processing arguments:
 #   $1 complete directory   $2 original NZB name   $3 clean job name
 #   $4 legacy placeholder  $5 category             $6 newsgroup
 #   $7 post-processing status (0 = success)        $8 failure URL
+#
+# SABnzbd 5.2+ no longer supplies command-line arguments. The equivalent
+# SAB_COMPLETE_DIR, SAB_FINAL_NAME, SAB_CAT, and SAB_PP_STATUS environment
+# variables are detected automatically below.
 #
 #  NZB RSS Feed Keywords: formula1 "year"
 #  Sabnzbd RSS Filters:
@@ -113,7 +117,8 @@ KOMETA_LABEL["Post-Race.Press.Conference"]="Post-Race Press Conference"
 # Logging and safety helpers
 # ---------------------------------------------------------------------------
 
-JOB_NAME="${3:-unknown}"
+JOB_NAME="unknown"
+INVOCATION_MODE="unknown"
 FINAL_REPORTED=0
 STAGED_FILE=""
 ORIGINAL_FILE=""
@@ -409,23 +414,50 @@ incoming_is_upgrade() {
 }
 
 # ---------------------------------------------------------------------------
-# Validate SABnzbd invocation before examining or deleting anything
+# Load and validate the SABnzbd invocation before examining or deleting anything
 # ---------------------------------------------------------------------------
 
-if (( $# == 0 )); then
-  finish "Skipped" \
-    "No SABnzbd arguments supplied; this file is only a SABnzbd post-processing script"
-  exit 0
-fi
-
-if (( $# < 7 )); then
+if (( $# >= 7 )); then
+  # SABnzbd 3.0-5.1 compatibility. These releases also provide environment
+  # variables, but the documented positional values take precedence.
+  SRC_DIR="$1"
+  JOB_NAME="${3:-${SAB_FINAL_NAME:-unknown}}"
+  CATEGORY="$5"
+  POSTPROC_STATUS="$7"
+  INVOCATION_MODE="arguments"
+elif (( $# > 0 )); then
+  JOB_NAME="${3:-${SAB_FINAL_NAME:-unknown}}"
   finish "Failed" "Expected at least 7 SABnzbd arguments; received $#"
   exit 1
-fi
+elif [[ -n "${SAB_COMPLETE_DIR:-}" || \
+  -n "${SAB_FINAL_NAME:-}" || \
+  -n "${SAB_PP_STATUS:-}" || \
+  -n "${SAB_SCRIPT:-}" ]]; then
+  # SABnzbd 5.2+ compatibility. Command-line arguments were removed and the
+  # complete post-processing context is supplied through SAB_* variables.
+  JOB_NAME="${SAB_FINAL_NAME:-unknown}"
+  MISSING_CONTEXT=""
+  [[ -n "${SAB_COMPLETE_DIR:-}" ]] || MISSING_CONTEXT="SAB_COMPLETE_DIR"
+  if [[ -z "${SAB_FINAL_NAME:-}" ]]; then
+    MISSING_CONTEXT+="${MISSING_CONTEXT:+, }SAB_FINAL_NAME"
+  fi
+  if [[ -z "${SAB_PP_STATUS:-}" ]]; then
+    MISSING_CONTEXT+="${MISSING_CONTEXT:+, }SAB_PP_STATUS"
+  fi
+  if [[ -n "$MISSING_CONTEXT" ]]; then
+    finish "Failed" "Incomplete SABnzbd environment; missing: $MISSING_CONTEXT"
+    exit 1
+  fi
 
-SRC_DIR="$1"
-CATEGORY="$5"
-POSTPROC_STATUS="$7"
+  SRC_DIR="$SAB_COMPLETE_DIR"
+  CATEGORY="${SAB_CAT:-}"
+  POSTPROC_STATUS="$SAB_PP_STATUS"
+  INVOCATION_MODE="environment"
+else
+  finish "Skipped" \
+    "No SABnzbd post-processing context supplied; run this script through a SABnzbd category"
+  exit 0
+fi
 
 case "${NAMING_PROFILE,,}" in
   current|kometa) NAMING_PROFILE="${NAMING_PROFILE,,}" ;;
@@ -683,5 +715,5 @@ else
   fi
 fi
 finish "$ACTION" \
-  "Profile: $NAMING_PROFILE | Feed: $FEED | Quality hint: $IN_QUALITY | Codec hint: $IN_CODEC_HINT | Destination: $TARGET | Cleanup: $CLEANUP_DETAIL"
+  "Invocation: $INVOCATION_MODE | Profile: $NAMING_PROFILE | Feed: $FEED | Quality hint: $IN_QUALITY | Codec hint: $IN_CODEC_HINT | Destination: $TARGET | Cleanup: $CLEANUP_DETAIL"
 exit 0
