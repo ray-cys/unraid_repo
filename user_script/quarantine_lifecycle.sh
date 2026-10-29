@@ -47,13 +47,13 @@ MAX_PURGE_BYTES_PER_EXECUTION=$((10 * 1024 * 1024 * 1024))
 # is actively changing user-share placement.
 DEFER_PURGE_WHILE_MOVER=true
 
-LOG_DIR="/mnt/vault/cloud/logs/quarantine_lifecycle"
+LOG_DIR="/mnt/vault/cloud/logs/script/quarantine_lifecycle"
 LOG_FILE="${LOG_DIR}/quarantine-lifecycle.log"
 INDEX_FILE="${LOG_DIR}/quarantine-index.tsv"
 NOTIFICATION_STATE_FILE="${LOG_DIR}/notification-state.json"
 LOG_MAX_BYTES=$((5 * 1024 * 1024))
 
-STATUS_DIR="/mnt/vault/cloud/logs/user_scripts_status"
+STATUS_DIR="/mnt/vault/cloud/logs/script/user_scripts_status"
 NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
 LOCK_FILE="/run/quarantine_lifecycle.lock"
 
