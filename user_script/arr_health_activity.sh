@@ -108,8 +108,13 @@
 #   script --list-active
 #   script --ack ACK_ID "optional note"
 #   script --unack ACK_ID
+#   script --dismiss-download ACK_ID "manual removal reason"
 #
 # Each notification includes the short ACK_ID needed by these commands.
+# Dismissing a download-flow issue records an explicit operator disposition,
+# resolves it immediately, and queues one informational item for the next
+# normal grouped notification. It does not change Sonarr, Radarr, SABnzbd, or
+# any media file.
 #
 #
 # ARR-SIDE DETECTION
@@ -209,6 +214,7 @@
 #   DOWNLOAD_FLOW_SAB_VANISHED
 #   DOWNLOAD_FLOW_IMPORT_MISSING
 #   DOWNLOAD_FLOW_RECONCILED_*
+#   DOWNLOAD_FLOW_MANUALLY_DISMISSED
 #
 # Missing-import issues are reconciled automatically through Arr APIs. Exact
 # download history is checked first. If no terminal history is available, the
@@ -833,6 +839,7 @@ DOWNLOAD_LEDGER_RECONCILIATION_CHECKED_COUNT=0
 DOWNLOAD_LEDGER_RECONCILIATION_PENDING_COUNT=0
 DOWNLOAD_LEDGER_RECONCILED_COUNT=0
 DOWNLOAD_LEDGER_RECONCILIATION_FAILED_COUNT=0
+DOWNLOAD_LEDGER_MANUAL_DISMISSAL_NOTIFICATION_COUNT=0
 DOWNLOAD_LEDGER_RECONCILIATION_RESULTS_FILE=""
 REMINDER_NOTIFICATION_COUNT=0
 EVENT_REPEAT_SUPPRESSED_COUNT=0
@@ -2705,7 +2712,7 @@ initialize_state() {
 
         cat >"$STATE_FILE" <<'EOF'
 {
-  "version": 13,
+  "version": 14,
   "issues": {},
   "sabProgress": {},
   "downloadLedger": {},
@@ -2747,7 +2754,7 @@ EOF
 
             cat >"$STATE_FILE" <<'EOF'
 {
-  "version": 13,
+  "version": 14,
   "issues": {},
   "sabProgress": {},
   "downloadLedger": {},
@@ -2772,7 +2779,7 @@ EOF
         fi
     fi
     ###########################################################################
-    # STATE MIGRATION - v3.5
+    # STATE MIGRATION - v3.6
     #
     # Existing state is upgraded in place. Completion-only ledger records that
     # predate the discovery window are not enrolled. Any active historical
@@ -2788,7 +2795,7 @@ EOF
         --argjson migrationNow "$START_TIME" \
         --argjson discoverySeconds "$((DOWNLOAD_LEDGER_DISCOVERY_HOURS * 3600))" \
         '
-        .version = 13
+        .version = 14
         |
         .issues = (.issues // {})
         |
@@ -2955,6 +2962,24 @@ EOF
                 .reconciliationNotifiedAt = (
                     .reconciliationNotifiedAt // 0
                 )
+                |
+                .manuallyDismissedAt = (.manuallyDismissedAt // 0)
+                |
+                .manualDismissalReason = (
+                    .manualDismissalReason // ""
+                )
+                |
+                .manualDismissalAckId = (
+                    .manualDismissalAckId // ""
+                )
+                |
+                .manualDismissalPreviousClassification = (
+                    .manualDismissalPreviousClassification // ""
+                )
+                |
+                .manualDismissalNotifiedAt = (
+                    .manualDismissalNotifiedAt // 0
+                )
             )
         )
         |
@@ -3060,7 +3085,7 @@ EOF
 
     else
 
-        log "ERROR: Unable to migrate state file to schema version 13"
+        log "ERROR: Unable to migrate state file to schema version 14"
         exit 3
     fi
 }
@@ -3124,7 +3149,7 @@ begin_monitor_run() {
     jq \
         --argjson now "$now" \
         '
-        .version = 13
+        .version = 14
         |
         .monitor.lastStartedAt = $now
         |
@@ -3548,7 +3573,7 @@ record_arr_telemetry() {
         --argjson maxIssueKeys "$ARR_TELEMETRY_MAX_ISSUE_KEYS" \
         --argjson maxExamples "$ARR_TELEMETRY_MAX_EXAMPLES" \
         '
-        .version = 13
+        .version = 14
         |
         .telemetry = (
             .telemetry
@@ -3975,7 +4000,7 @@ update_issue_state() {
         --argjson flapThreshold "$FLAP_TRANSITION_THRESHOLD" \
         --argjson flapSuppressionSeconds "$flap_suppression_seconds" \
         '
-        .version = 13
+        .version = 14
         |
         (.issues[$key] // {}) as $old
         |
@@ -4349,7 +4374,22 @@ mark_notified() {
         --arg event "$event" \
         --argjson now "$now" \
         '
-        if $event == "reconciled" and ($key | startswith("FLOW:RECONCILIATION:"))
+        if $event == "dismissed" and ($key | startswith("FLOW:DOWNLOAD:"))
+        then
+            ($key | ltrimstr("FLOW:DOWNLOAD:") | ascii_downcase) as $downloadId
+            |
+            if .downloadLedger[$downloadId]
+            then
+                .downloadLedger[$downloadId].manualDismissalNotifiedAt = (
+                    [
+                        $now,
+                        (.downloadLedger[$downloadId].manuallyDismissedAt // 0)
+                    ]
+                    | max
+                )
+            else .
+            end
+        elif $event == "reconciled" and ($key | startswith("FLOW:RECONCILIATION:"))
         then
             ($key | ltrimstr("FLOW:RECONCILIATION:") | ascii_downcase) as $downloadId
             |
@@ -4487,7 +4527,7 @@ mark_issue_resolved() {
 }
 
 ###############################################################################
-# OPERATOR ACKNOWLEDGEMENT - v3.3
+# OPERATOR ACKNOWLEDGEMENT AND DOWNLOAD DISMISSAL - v3.6
 ###############################################################################
 
 resolve_active_issue_selector() {
@@ -4586,6 +4626,132 @@ acknowledge_active_issue() {
     printf 'Acknowledged active issue %s (%s)\n' "$ack_id" "$issue_key"
 }
 
+dismiss_download_flow_issue() {
+
+    local selector="$1"
+    local reason="${2:-Manually removed from Arr and download client}"
+    local issue_key
+    local download_id
+    local classification
+    local ack_id
+    local now
+    local tmp="${TMP_DIR}/state.download-dismissed.json"
+
+    resolve_active_issue_selector "$selector" || return 1
+    issue_key="$RESOLVED_ISSUE_KEY"
+
+    case "$issue_key" in
+        FLOW:DOWNLOAD:*)
+            download_id="${issue_key#FLOW:DOWNLOAD:}"
+            download_id="${download_id,,}"
+            ;;
+
+        *)
+            log "ERROR: Manual download dismissal applies only to FLOW:DOWNLOAD issues: $issue_key"
+            return 1
+            ;;
+    esac
+
+    classification=$(jq -r \
+        --arg key "$issue_key" \
+        '.issues[$key].classification // ""' \
+        "$STATE_FILE")
+
+    case "$classification" in
+        DOWNLOAD_FLOW_NOT_REACHED_SAB|\
+        DOWNLOAD_FLOW_SAB_VANISHED|\
+        DOWNLOAD_FLOW_IMPORT_MISSING)
+            ;;
+
+        *)
+            log "ERROR: Issue is not an exact unresolved download-flow condition: $classification"
+            return 1
+            ;;
+    esac
+
+    if ! jq -e \
+        --arg id "$download_id" \
+        '.downloadLedger[$id] != null' \
+        "$STATE_FILE" >/dev/null 2>&1
+    then
+        log "ERROR: Download ledger record is unavailable for $download_id"
+        return 1
+    fi
+
+    reason="${reason//$'\r'/ }"
+    reason="${reason//$'\n'/ }"
+    [ -n "$reason" ] || reason="Manually removed from Arr and download client"
+
+    ack_id=$(issue_ack_id "$issue_key")
+    now=$(date +%s)
+
+    jq \
+        --arg key "$issue_key" \
+        --arg id "$download_id" \
+        --arg ackId "$ack_id" \
+        --arg reason "$reason" \
+        --arg classification "$classification" \
+        --argjson now "$now" \
+        '
+        .downloadLedger[$id] |= (
+            .manuallyDismissedAt = $now
+            |
+            .manualDismissalReason = $reason
+            |
+            .manualDismissalAckId = $ackId
+            |
+            .manualDismissalPreviousClassification = $classification
+            |
+            .manualDismissalNotifiedAt = 0
+            |
+            .reconciliationCandidateFingerprint = ""
+            |
+            .reconciliationCandidateRuns = 0
+            |
+            .reconciliationCandidateFirstSeenAt = 0
+            |
+            .reconciliationCandidateLastSeenAt = 0
+            |
+            .lastSeen = ([ (.lastSeen // 0), $now ] | max)
+        )
+        |
+        .issues[$key] |= (
+            .active = false
+            |
+            .resolvedAt = $now
+            |
+            .lastSeen = $now
+            |
+            .manuallyDismissedAt = $now
+            |
+            .manualDismissalReason = $reason
+            |
+            .transitionTimestamps = (
+                ((.transitionTimestamps // []) + [$now])
+                | map(select(type == "number"))
+                | unique
+                | sort
+            )
+            |
+            .acknowledgedSignature = ""
+            |
+            .acknowledgedAt = 0
+            |
+            .acknowledgementNote = ""
+        )
+        ' "$STATE_FILE" >"$tmp" || return 1
+
+    save_state "$tmp" || return 1
+
+    persistent_log \
+        "MANUALLY_DISMISSED" \
+        "issue=${issue_key} | ack_id=${ack_id} | download_id=${download_id} | previous_classification=${classification} | reason=${reason}"
+
+    printf 'Dismissed download-flow issue %s (%s); no Arr, SABnzbd, or media changes were made.\n' \
+        "$ack_id" \
+        "$issue_key"
+}
+
 unacknowledge_active_issue() {
 
     local selector="$1"
@@ -4675,8 +4841,10 @@ print_lifecycle_command_help() {
         '  --list-active' \
         '  --ack ACK_ID [note]' \
         '  --unack ACK_ID' \
+        '  --dismiss-download ACK_ID [reason]' \
         '' \
-        'Acknowledgements apply only to the current issue signature and clear on resolution or material change.'
+        'Acknowledgements apply only to the current issue signature and clear on resolution or material change.' \
+        'Download dismissal closes an intentional manual abandonment in monitor state only; it does not change Arr, SABnzbd, or media.'
 }
 
 ###############################################################################
@@ -5077,6 +5245,8 @@ notification_record_text() {
                 then " [RESOLVED]"
                 elif $event == "reconciled"
                 then " [" + (.severity // "INFO") + "] [AUTO-RECONCILED]"
+                elif $event == "dismissed"
+                then " [" + (.severity // "INFO") + "] [MANUALLY DISMISSED]"
                 elif $event == "reminder"
                 then " [" + (.severity // "INFO") + "] [REMINDER]"
                 elif $event == "flapping"
@@ -5142,6 +5312,7 @@ send_notification_page() {
     local error_new
     local resolved
     local reconciled
+    local dismissed
     local reminders
     local flapping
     local body=""
@@ -5165,6 +5336,9 @@ send_notification_page() {
         "$page_file")
     reconciled=$(jq -s \
         '[.[] | select(.event == "reconciled")] | length' \
+        "$page_file")
+    dismissed=$(jq -s \
+        '[.[] | select(.event == "dismissed")] | length' \
         "$page_file")
     reminders=$(jq -s \
         '[.[] | select(.event == "reminder")] | length' \
@@ -5195,7 +5369,8 @@ send_notification_page() {
     fi
 
     body="Health/activity updates: ${batch_total}"$'\n'
-    body+="This batch: ${page_items} | Info: ${info_new} | Warnings: ${warning_new} | Errors: ${error_new} | Resolved: ${resolved} | Auto-reconciled: ${reconciled}"$'\n'
+    body+="This batch: ${page_items} | Info: ${info_new} | Warnings: ${warning_new} | Errors: ${error_new} | Resolved: ${resolved}"$'\n'
+    body+="Auto-reconciled: ${reconciled} | Manually dismissed: ${dismissed}"$'\n'
     body+="Reminders: ${reminders} | Flapping: ${flapping}"$'\n'
 
     if (( page_total > 1 )); then
@@ -9775,7 +9950,12 @@ update_download_ledger_state() {
                 reconciliationCandidateFirstSeenAt: 0,
                 reconciliationCandidateLastSeenAt: 0,
                 reconciliationLastCheckedAt: 0,
-                reconciliationNotifiedAt: 0
+                reconciliationNotifiedAt: 0,
+                manuallyDismissedAt: 0,
+                manualDismissalReason: "",
+                manualDismissalAckId: "",
+                manualDismissalPreviousClassification: "",
+                manualDismissalNotifiedAt: 0
             }) as $old
             | (
                 ($item.kind == "arrGrabbed")
@@ -10675,6 +10855,81 @@ queue_download_reconciliation_notifications() {
     done <"$records_file"
 }
 
+queue_download_manual_dismissal_notifications() {
+
+    local records_file="${TMP_DIR}/download-manual-dismissals.jsonl"
+
+    jq -c '
+        .downloadLedger
+        // {}
+        | to_entries[]?
+        | .value
+        | select((.manuallyDismissedAt // 0) > 0)
+        | select(
+            (.manualDismissalNotifiedAt // 0)
+            < (.manuallyDismissedAt // 0)
+        )
+        ' "$STATE_FILE" >"$records_file" || return 1
+
+    while IFS= read -r record; do
+
+        [ -n "$record" ] || continue
+
+        local download_id
+        local app
+        local title
+        local release
+        local dismissed_at
+        local reason
+        local previous_classification
+        local original_ack_id
+        local issue_key
+        local signature
+        local detail
+
+        download_id=$(jq -r '.id' <<<"$record")
+        app=$(jq -r '.app // "Arr"' <<<"$record")
+        title=$(jq -r '.title // .release // "Unknown download"' <<<"$record")
+        release=$(jq -r '.release // "Unknown release"' <<<"$record")
+        dismissed_at=$(jq -r '.manuallyDismissedAt // 0' <<<"$record")
+        reason=$(jq -r '.manualDismissalReason // "No reason recorded"' <<<"$record")
+        previous_classification=$(jq -r '.manualDismissalPreviousClassification // "DOWNLOAD_FLOW_UNKNOWN"' <<<"$record")
+        original_ack_id=$(jq -r '.manualDismissalAckId // ""' <<<"$record")
+        issue_key="FLOW:DOWNLOAD:${download_id}"
+        [ -n "$original_ack_id" ] || original_ack_id=$(issue_ack_id "$issue_key")
+
+        detail="Download ID: ${download_id}"$'\n'
+        detail+="Release: ${release}"$'\n'
+        detail+="Previous classification: ${previous_classification}"$'\n'
+        detail+="Original Ack ID: ${original_ack_id}"$'\n'
+        detail+="Reason: ${reason}"$'\n'
+        detail+="Action taken: closed the monitor's exact download-flow issue"$'\n'
+        detail+="Arr/SAB/media changes: none"
+
+        signature=$(issue_signature \
+            "$app" \
+            "$issue_key" \
+            "DOWNLOAD_FLOW_MANUALLY_DISMISSED" \
+            "INFO" \
+            "dismissed" \
+            "${dismissed_at}|${reason}")
+
+        queue_group_notification \
+            "$issue_key" \
+            "$signature" \
+            "$app" \
+            "$title" \
+            "DOWNLOAD_FLOW_MANUALLY_DISMISSED" \
+            "INFO" \
+            "0" \
+            "$detail" \
+            "dismissed"
+
+        ((DOWNLOAD_LEDGER_MANUAL_DISMISSAL_NOTIFICATION_COUNT++)) || true
+
+    done <"$records_file"
+}
+
 perform_download_ledger_reconciliation() {
 
     [ "$DOWNLOAD_LEDGER_RECONCILE_ENABLED" = true ] || return 0
@@ -10710,6 +10965,7 @@ perform_download_ledger_reconciliation() {
             | select((.value.arrIgnoredAt // 0) <= 0)
             | select((.value.sabFailedAt // 0) <= 0)
             | select((.value.arrReconciledAt // 0) <= 0)
+            | select((.value.manuallyDismissedAt // 0) <= 0)
             | select(
                 (($now - (.value.sabCompletedAt // $now)) / 60)
                 >= $minimumMinutes
@@ -10838,6 +11094,7 @@ process_download_ledger_issues() {
         local arr_failed_at
         local arr_ignored_at
         local arr_reconciled_at
+        local manually_dismissed_at
         local reconciliation_candidate_runs
         local flow_enrolled
         local last_sab_seen
@@ -10867,9 +11124,15 @@ process_download_ledger_issues() {
         arr_failed_at=$(jq -r '.arrFailedAt // 0' <<<"$record")
         arr_ignored_at=$(jq -r '.arrIgnoredAt // 0' <<<"$record")
         arr_reconciled_at=$(jq -r '.arrReconciledAt // 0' <<<"$record")
+        manually_dismissed_at=$(jq -r '.manuallyDismissedAt // 0' <<<"$record")
         reconciliation_candidate_runs=$(jq -r '.reconciliationCandidateRuns // 0' <<<"$record")
 
-        if (( arr_imported_at > 0 || arr_failed_at > 0 || arr_ignored_at > 0 || arr_reconciled_at > 0 || sab_failed_at > 0 )); then
+        if (( arr_imported_at > 0 ||
+              arr_failed_at > 0 ||
+              arr_ignored_at > 0 ||
+              arr_reconciled_at > 0 ||
+              manually_dismissed_at > 0 ||
+              sab_failed_at > 0 )); then
             continue
         fi
 
@@ -10999,6 +11262,11 @@ process_exact_download_ledger() {
 
     if ! perform_download_ledger_reconciliation; then
         log "ERROR: Unable to complete automatic download reconciliation"
+        return 1
+    fi
+
+    if ! queue_download_manual_dismissal_notifications; then
+        log "ERROR: Unable to queue manual download-dismissal notifications"
         return 1
     fi
 
@@ -12118,6 +12386,8 @@ prune_state() {
                     or
                     (.value.arrReconciledAt // 0) >= $ledgerCutoff
                     or
+                    (.value.manuallyDismissedAt // 0) >= $ledgerCutoff
+                    or
                     (.value.sabFailedAt // 0) >= $ledgerCutoff
                     or
                     (
@@ -12277,6 +12547,16 @@ case "${1:-}" in
         exit 0
         ;;
 
+    --dismiss-download)
+        if [ -z "${2:-}" ]; then
+            print_lifecycle_command_help
+            exit 2
+        fi
+
+        dismiss_download_flow_issue "$2" "${*:3}" || exit 2
+        exit 0
+        ;;
+
     --help|--lifecycle-help)
         print_lifecycle_command_help
         exit 0
@@ -12296,7 +12576,7 @@ rotate_persistent_log
 
 persistent_log \
     "START" \
-    "ARR Health Monitor v3.5.0"
+    "ARR Health Monitor v3.6.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -12309,7 +12589,7 @@ fi
 # START
 ###############################################################################
 
-log "Starting ARR Health Monitor v3.5.0"
+log "Starting ARR Health Monitor v3.6.0"
 log "Recommended schedule: every five minutes"
 log "Notifications enabled: $SEND_NOTIFICATIONS"
 log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -12795,7 +13075,7 @@ write_persistent_activity_summary
 RUNTIME=$(runtime)
 
 log "============================================================"
-log "ARR Health Monitor v3.5.0 completed"
+log "ARR Health Monitor v3.6.0 completed"
 
 log ""
 log "SCAN HEALTH"
@@ -12886,6 +13166,7 @@ log "Automatic reconciliation checks: $DOWNLOAD_LEDGER_RECONCILIATION_CHECKED_CO
 log "Reconciliation awaiting confirmation: $DOWNLOAD_LEDGER_RECONCILIATION_PENDING_COUNT"
 log "Automatically reconciled this run: $DOWNLOAD_LEDGER_RECONCILED_COUNT"
 log "Reconciliation API checks failed: $DOWNLOAD_LEDGER_RECONCILIATION_FAILED_COUNT"
+log "Manual dismissal notices queued: $DOWNLOAD_LEDGER_MANUAL_DISMISSAL_NOTIFICATION_COUNT"
 
 log ""
 log "SAB CROSS-APP"
