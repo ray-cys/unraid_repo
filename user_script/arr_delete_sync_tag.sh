@@ -3,8 +3,9 @@
 # Sonarr + Radarr - Plex Delete Sync and Tagger
 #
 # Once-daily, persistent-state deletion confirmation for Sonarr and Radarr.
-# Sonarr can unmonitor confirmed deleted episodes/seasons and optionally a
-# fully deleted series. Radarr only adds an audit tag. Requirements: bash 4+,
+# Sonarr unmonitors confirmed deleted episodes/seasons and can retire a fully
+# deleted series. Radarr adds an audit tag, watches for monitored/fileless
+# movies, and can retire a confirmed deleted movie. Requirements: bash 4+,
 # curl, jq.
 
 set -uo pipefail
@@ -63,6 +64,18 @@ SONARR_UNMONITOR_SEASON=true
 # download history in its state file.
 SONARR_UNMONITOR_SERIES=false
 
+# Full-series retirement is deliberately separate from the ordinary series
+# switch above. A partial season deletion can never enter this path. An ended,
+# previously-downloaded series becomes eligible only after every file is gone,
+# sidecar/folder cleanup is complete, and every historical deletion has passed
+# the normal confirmation policy. Continuing series additionally require the
+# opt-in tag unless SONARR_RETIRE_CONTINUING_SERIES is explicitly enabled.
+SONARR_RETIRE_FULLY_DELETED_SERIES=true
+SONARR_RETIRE_CONTINUING_SERIES=false
+SONARR_RETIREMENT_REQUIRED_TAG="retire-series"
+SONARR_RETIREMENT_EXEMPT_TAG="keep-in-arr"
+SONARR_RETIREMENT_PENDING_TAG="retirement-pending"
+
 # Sonarr tags are series-level only.  The first tag means one or more seasons
 # of that series were unmonitored after a Plex deletion; it does NOT mean that
 # the entire series was deleted.  The second tag is added only if this script
@@ -74,6 +87,26 @@ PLEX_DELETED_SERIES_TAG="plex-deleted-series"
 # unmonitored the movie, matching Radarr's Unmonitor Deleted Movies behaviour.
 RADARR_REQUIRE_MOVIE_UNMONITORED=true
 PLEX_DELETED_MOVIE_TAG="plex-deleted"
+
+# Radarr remains authoritative for Unmonitor Deleted Movies. The watchdog can
+# request one item-specific rescan, then reports a movie that stays fileless and
+# monitored; it never unmonitors the movie itself.
+RADARR_MONITORED_FILELESS_WARNING_RUNS=2
+RADARR_MONITORED_FILELESS_WARNING_HOURS=24
+RADARR_MONITORED_FILELESS_RESCAN=false
+
+# A confirmed, unmonitored, fileless movie can be retired from Radarr after the
+# common hold period. The delete call never deletes files and adds an import
+# exclusion so Arr lists cannot add the title again automatically.
+RADARR_RETIRE_FULLY_DELETED_MOVIES=true
+RADARR_RETIREMENT_EXEMPT_TAG="keep-in-arr"
+RADARR_RETIREMENT_PENDING_TAG="retirement-pending"
+
+# Shared retirement and state-retention policy. Ninety days comfortably
+# outlives the current 45-day quarantine lifecycle.
+ARR_RETIREMENT_DAYS=90
+ARR_RETIREMENT_WARNING_DAYS=7
+STATE_PRUNE_ABSENT_DAYS=90
 
 # Kodi sidecar quarantine. While media exists, the script records recognized
 # NFO, artwork, and external subtitle files. After the whole movie or series is
@@ -110,6 +143,15 @@ CLEANUP_REMAINING_LOG_MAX_ITEMS=10
 DEFER_SIDECAR_CLEANUP_WHILE_MOVER=true
 MAX_SIDECAR_SIZE_MB=100
 
+# Personal metadata extensions that are safe to treat like other sidecars.
+# Files outside the built-in and configured sets are never moved; they become
+# classified folder blockers. Keep this comma-separated and extension-only.
+EXTRA_SIDECAR_EXTENSIONS="xml,json,txt,sfv,md5,sha1,sha256,url,webp"
+
+# An unchanged blocker is notified once, when its contents change, when it is
+# resolved, and at this low-frequency reminder interval.
+FOLDER_BLOCKER_REMINDER_DAYS=14
+
 # One notification is rendered after both application workflows finish. A run
 # with no actions or attention items sends nothing. Unchanged folder blockers
 # are state-suppressed until their contents change or cleanup resolves.
@@ -128,7 +170,7 @@ MAX_LOG_FILES=5
 HTTP_CONNECT_TIMEOUT=10
 HTTP_MAX_TIME=90
 HTTP_RETRIES=2
-USER_AGENT="Arr-Delete-Sync-Tag/1.6"
+USER_AGENT="Arr-Delete-Sync-Tag/2.0"
 
 ###############################################################################
 # END CONFIGURATION
@@ -175,6 +217,20 @@ CLEANUP_LATE_CANDIDATE_COUNT=0
 CLEANUP_LATE_CONFIRMED_COUNT=0
 CLEANUP_BLOCKER_COUNT=0
 CLEANUP_BLOCKER_DETAILS=""
+CLEANUP_BLOCKER_SUMMARY=""
+CLEANUP_BLOCKER_SIGNATURE=""
+CLEANUP_BLOCKER_STABLE_RUNS=0
+CLEANUP_BLOCKERS_JSON='[]'
+CLEANUP_PRESERVE_MANIFEST=false
+
+SONARR_QUEUE_JSON='{"records":[]}'
+SONARR_QUEUE_AVAILABLE=false
+RADARR_QUEUE_JSON='{"records":[]}'
+RADARR_QUEUE_AVAILABLE=false
+STATE_PRUNED=0
+RETIREMENTS_STARTED=0
+RETIREMENTS_CANCELLED=0
+ARR_REMOVALS=0
 
 log() {
     local level="$1"
@@ -284,12 +340,80 @@ queue_attention_notification() {
     append_notification_record attention "$severity" "$app_name" "" "" "$title" "$detail"
 }
 
+timestamp_to_epoch() {
+    local timestamp="$1"
+    local normalized
+
+    [[ -n "$timestamp" ]] || return 1
+    date -d "$timestamp" +%s 2>/dev/null && return 0
+
+    # BSD date fallback keeps local development checks usable; Unraid uses the
+    # GNU path above. Convert +0800 to a colon-free format accepted by %z.
+    normalized="${timestamp/T/ }"
+    date -j -f '%Y-%m-%d %H:%M:%S%z' "$normalized" +%s 2>/dev/null
+}
+
+notification_reminder_due() {
+    local last_notified_at="$1"
+    local reminder_days="$2"
+    local last_epoch now_epoch
+
+    [[ "$reminder_days" =~ ^[1-9][0-9]*$ ]] || return 1
+    last_epoch="$(timestamp_to_epoch "$last_notified_at" || true)"
+    [[ "$last_epoch" =~ ^[0-9]+$ ]] || return 0
+    now_epoch="$(date +%s)"
+    (( now_epoch - last_epoch >= reminder_days * 86400 ))
+}
+
+queue_stateful_attention_notification() {
+    local severity="$1"
+    local app_name="$2"
+    local key="$3"
+    local signature="$4"
+    local title="$5"
+    local detail="$6"
+    local reminder_days="$7"
+    local previous previous_at
+
+    [[ "$SEND_GROUPED_NOTIFICATIONS" == true ]] || return 0
+    [[ -n "$NOTIFICATION_BATCH" && -f "$NOTIFICATION_BATCH" ]] || return 0
+
+    previous="$(jq -r --arg key "$key" '.attention[$key].signature // ""' \
+        "$NOTIFICATION_STATE_FILE" 2>/dev/null || true)"
+    previous_at="$(jq -r --arg key "$key" '.attention[$key].lastNotifiedAt // ""' \
+        "$NOTIFICATION_STATE_FILE" 2>/dev/null || true)"
+
+    if [[ "$previous" == "$signature" ]] &&
+       ! notification_reminder_due "$previous_at" "$reminder_days"; then
+        return 0
+    fi
+    if jq -e --arg key "$key" 'select(.key == $key)' "$NOTIFICATION_BATCH" \
+        >/dev/null 2>&1; then
+        return 0
+    fi
+
+    append_notification_record attention "$severity" "$app_name" "$key" \
+        "$signature" "$title" "$detail"
+}
+
+queue_stateful_resolution_notification() {
+    local app_name="$1"
+    local key="$2"
+    local title="$3"
+    local detail="$4"
+
+    [[ "$SEND_GROUPED_NOTIFICATIONS" == true ]] || return 0
+    jq -e --arg key "$key" '.attention[$key] != null' "$NOTIFICATION_STATE_FILE" \
+        >/dev/null 2>&1 || return 0
+    append_notification_record resolved INFO "$app_name" "$key" "" "$title" "$detail"
+}
+
 queue_folder_blocker_notification() {
     local app_name="$1"
     local item_id="$2"
     local title="$3"
     local media_path="$4"
-    local key signature previous
+    local key signature
     local detail
 
     [[ "$SEND_GROUPED_NOTIFICATIONS" == true ]] || return 0
@@ -298,22 +422,15 @@ queue_folder_blocker_notification() {
     key="folder:${app_name,,}:${item_id}"
     detail="Directory: ${media_path}"$'\n'
     detail+="Blocking entries: ${CLEANUP_BLOCKER_COUNT}"
+    [[ -n "$CLEANUP_BLOCKER_SUMMARY" ]] && detail+=$'\n'"Types: ${CLEANUP_BLOCKER_SUMMARY}"
+    detail+=$'\n'"Stable cleanup runs: ${CLEANUP_BLOCKER_STABLE_RUNS}"
     if (( CLEANUP_LATE_CANDIDATE_COUNT > 0 )); then
         detail+=$'\n'"Recognized late sidecars awaiting next-run confirmation: ${CLEANUP_LATE_CANDIDATE_COUNT}"
     fi
     [[ -n "$CLEANUP_BLOCKER_DETAILS" ]] && detail+=$'\n'"${CLEANUP_BLOCKER_DETAILS}"
-    signature="$(notification_hash "$media_path|$CLEANUP_BLOCKER_COUNT|$CLEANUP_LATE_CANDIDATE_COUNT|$CLEANUP_BLOCKER_DETAILS")"
-    previous="$(jq -r --arg key "$key" '.attention[$key].signature // ""' \
-        "$NOTIFICATION_STATE_FILE" 2>/dev/null || true)"
-
-    [[ "$previous" != "$signature" ]] || return 0
-    if jq -e --arg key "$key" 'select(.key == $key)' "$NOTIFICATION_BATCH" \
-        >/dev/null 2>&1; then
-        return 0
-    fi
-
-    append_notification_record attention WARNING "$app_name" "$key" \
-        "$signature" "$title" "$detail"
+    signature="${CLEANUP_BLOCKER_SIGNATURE:-$(notification_hash "$media_path|$CLEANUP_BLOCKER_COUNT|$CLEANUP_LATE_CANDIDATE_COUNT|$CLEANUP_BLOCKER_DETAILS")}"
+    queue_stateful_attention_notification WARNING "$app_name" "$key" \
+        "$signature" "$title" "$detail" "$FOLDER_BLOCKER_REMINDER_DAYS"
 }
 
 queue_folder_resolution_notification() {
@@ -567,6 +684,65 @@ valid_relative_path() {
        "$relative" != *$'\n'* ]]
 }
 
+extension_in_configured_list() {
+    local extension="${1,,}"
+    [[ ",${EXTRA_SIDECAR_EXTENSIONS,,}," == *",${extension},"* ]]
+}
+
+is_video_extension() {
+    case "${1,,}" in
+        mkv|mp4|m4v|avi|mov|wmv|ts|m2ts|mts|mpg|mpeg|webm|vob|iso|strm)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+classify_cleanup_entry() {
+    local app_name="$1"
+    local relative="$2"
+    local entry="$3"
+    local lower="${relative,,}"
+    local name="${lower##*/}"
+    local extension="${name##*.}"
+
+    if [[ -L "$entry" ]]; then
+        printf 'symlink'
+        return
+    fi
+    if [[ ! -f "$entry" ]]; then
+        printf 'special-entry'
+        return
+    fi
+    if is_video_extension "$extension"; then
+        printf 'remaining-video'
+        return
+    fi
+    if jq -e --arg relative "$relative" \
+        'any(.[]?; .relativePath == $relative)' \
+        >/dev/null 2>&1 <<< "$CLEANUP_LATE_CANDIDATES"; then
+        printf 'late-sidecar-confirmation'
+        return
+    fi
+    case "$extension" in
+        nfo|srt|ass|ssa|vtt|sub|idx|sup|smi|sami)
+            printf 'recognized-sidecar'
+            return
+            ;;
+    esac
+    if extension_in_configured_list "$extension"; then
+        printf 'configured-sidecar'
+        return
+    fi
+    if [[ "$name" =~ ^(poster|banner|fanart|clearart|characterart|discart|keyart|landscape|logo|backdrop|clearlogo|folder|thumb)\.(jpg|jpeg|png|webp)$ ]] ||
+       [[ "$app_name" == sonarr &&
+          "$name" =~ ^season([0-9]{2,}|-all|-specials)-(poster|banner|fanart|landscape|thumb)\.(jpg|jpeg|png|webp)$ ]]; then
+        printf 'recognized-artwork'
+        return
+    fi
+    printf 'unknown-file'
+}
+
 normalize_quarantine_permissions() {
     local target="$1"
     local quarantine_real target_real
@@ -735,6 +911,9 @@ capture_kodi_sidecars() {
                     eligible=true
                     ;;
             esac
+            if [[ "$eligible" == false ]] && extension_in_configured_list "$extension"; then
+                eligible=true
+            fi
         fi
         [[ "$eligible" == true ]] || continue
 
@@ -870,24 +1049,58 @@ remove_empty_media_dirs() {
 log_media_cleanup_blockers() {
     local app_name="$1"
     local media_path="$2"
-    local entry relative
+    local manifest="${3:-null}"
+    local entry relative classification size mtime
     local remaining=0 shown=0 additional
     local entry_word="entries"
+    local previous_signature previous_runs
 
     CLEANUP_BLOCKER_COUNT=0
     CLEANUP_BLOCKER_DETAILS=""
+    CLEANUP_BLOCKER_SUMMARY=""
+    CLEANUP_BLOCKER_SIGNATURE=""
+    CLEANUP_BLOCKER_STABLE_RUNS=0
+    CLEANUP_BLOCKERS_JSON='[]'
 
     while IFS= read -r -d '' entry; do
         ((remaining += 1))
+        relative="${entry#"$media_path"/}"
+        relative="${relative//$'\n'/ }"
+        classification="$(classify_cleanup_entry "$app_name" "$relative" "$entry")"
+        size="$(file_size_bytes "$entry" 2>/dev/null || printf -- '-1')"
+        mtime="$(stat -c '%Y' -- "$entry" 2>/dev/null || stat -f '%m' -- "$entry" 2>/dev/null || printf 0)"
+        [[ "$size" =~ ^-?[0-9]+$ ]] || size=-1
+        [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+        CLEANUP_BLOCKERS_JSON="$(jq \
+            --arg relative "$relative" \
+            --arg classification "$classification" \
+            --argjson size "$size" \
+            --argjson mtime "$mtime" \
+            '. + [{relativePath:$relative,type:$classification,size:$size,mtime:$mtime}]' \
+            <<< "$CLEANUP_BLOCKERS_JSON")" || return 1
         if (( shown < CLEANUP_REMAINING_LOG_MAX_ITEMS )); then
-            relative="${entry#"$media_path"/}"
-            relative="${relative//$'\n'/ }"
-            log WARNING "$app_name folder cleanup blocker: $relative"
+            log WARNING "$app_name folder cleanup blocker [$classification]: $relative"
             [[ -z "$CLEANUP_BLOCKER_DETAILS" ]] || CLEANUP_BLOCKER_DETAILS+=$'\n'
-            CLEANUP_BLOCKER_DETAILS+="- $relative"
+            CLEANUP_BLOCKER_DETAILS+="- $relative [$classification]"
             ((shown += 1))
         fi
     done < <(find "$media_path" -mindepth 1 ! -type d -print0 2>/dev/null)
+
+    CLEANUP_BLOCKER_SUMMARY="$(jq -r '
+        group_by(.type)
+        | map((.[0].type) + "=" + (length | tostring))
+        | join(", ")
+        ' <<< "$CLEANUP_BLOCKERS_JSON")" || return 1
+    CLEANUP_BLOCKER_SIGNATURE="$(notification_hash "$(jq -cS . <<< "$CLEANUP_BLOCKERS_JSON")")"
+    previous_signature="$(jq -r '.folderBlockers.signature // ""' <<< "$manifest" 2>/dev/null || true)"
+    previous_runs="$(jq -r '.folderBlockers.stableRuns // 0' <<< "$manifest" 2>/dev/null || true)"
+    [[ "$previous_runs" =~ ^[0-9]+$ ]] || previous_runs=0
+    if [[ -n "$CLEANUP_BLOCKER_SIGNATURE" &&
+          "$CLEANUP_BLOCKER_SIGNATURE" == "$previous_signature" ]]; then
+        CLEANUP_BLOCKER_STABLE_RUNS=$((previous_runs + 1))
+    else
+        CLEANUP_BLOCKER_STABLE_RUNS=1
+    fi
 
     if (( remaining == 0 )); then
         log WARNING "$app_name media directory still exists, but no remaining non-directory entry could be enumerated; permissions, a mount, or a concurrent writer may be preventing removal: $media_path"
@@ -900,7 +1113,7 @@ log_media_cleanup_blockers() {
     entry_word="entries"
     [[ "$remaining" == 1 ]] && entry_word="entry"
     CLEANUP_BLOCKER_COUNT="$remaining"
-    log WARNING "$app_name media directory remains with $remaining blocking $entry_word; folder cleanup stays pending and will be retried: $media_path"
+    log WARNING "$app_name media directory remains with $remaining blocking $entry_word ($CLEANUP_BLOCKER_SUMMARY); folder cleanup stays pending and will be retried: $media_path"
 }
 
 # Return the captured manifest, a safe rmdir-only manifest when no sidecars
@@ -1000,7 +1213,12 @@ mark_sidecar_folder_cleanup_pending() {
         --argjson quarantined "$total_quarantined" \
         --argjson native_missing "$total_native_missing" \
         --argjson folders_removed "$total_folders_removed" \
-        --argjson late_candidates "$CLEANUP_LATE_CANDIDATES" '
+        --argjson late_candidates "$CLEANUP_LATE_CANDIDATES" \
+        --argjson blockers "$CLEANUP_BLOCKERS_JSON" \
+        --arg blocker_signature "$CLEANUP_BLOCKER_SIGNATURE" \
+        --arg blocker_summary "$CLEANUP_BLOCKER_SUMMARY" \
+        --argjson blocker_stable_runs "$CLEANUP_BLOCKER_STABLE_RUNS" \
+        --argjson preserve_manifest "$CLEANUP_PRESERVE_MANIFEST" '
         (.sidecarManifests[$key] // {}) as $old_manifest
         | (.sidecarCleanupActions[$key] // {}) as $old_action
         | .sidecarManifests[$key] = {
@@ -1008,7 +1226,7 @@ mark_sidecar_folder_cleanup_pending() {
             mediaRoot: $media_root,
             bucket: $bucket,
             capturedAt: ($old_manifest.capturedAt // $old_action.completedAt // $now),
-            files: [],
+            files: (if $preserve_manifest then ($old_manifest.files // []) else [] end),
             lateSidecarCandidates: $late_candidates,
             lateSidecarCandidateAt: (
                 if ($late_candidates | length) > 0
@@ -1024,6 +1242,19 @@ mark_sidecar_folder_cleanup_pending() {
                 quarantinedFiles: $quarantined,
                 nativeMissingFiles: $native_missing,
                 foldersRemoved: $folders_removed
+            },
+            folderBlockers: {
+                signature: $blocker_signature,
+                summary: $blocker_summary,
+                firstSeenAt: (
+                    if ($old_manifest.folderBlockers.signature // "") == $blocker_signature
+                    then ($old_manifest.folderBlockers.firstSeenAt // $now)
+                    else $now
+                    end
+                ),
+                lastSeenAt: $now,
+                stableRuns: $blocker_stable_runs,
+                entries: $blockers
             }
           }
         | del(.sidecarCleanupActions[$key])
@@ -1067,6 +1298,11 @@ quarantine_recorded_sidecars() {
     CLEANUP_LATE_CONFIRMED_COUNT=0
     CLEANUP_BLOCKER_COUNT=0
     CLEANUP_BLOCKER_DETAILS=""
+    CLEANUP_BLOCKER_SUMMARY=""
+    CLEANUP_BLOCKER_SIGNATURE=""
+    CLEANUP_BLOCKER_STABLE_RUNS=0
+    CLEANUP_BLOCKERS_JSON='[]'
+    CLEANUP_PRESERVE_MANIFEST=false
 
     [[ "$QUARANTINE_RUN_ID" =~ ^[0-9]{8}_[0-9]{6}_[0-9]+$ ]] || return 1
     [[ ! -L "$QUARANTINE_ROOT" ]] || return 1
@@ -1118,6 +1354,9 @@ quarantine_recorded_sidecars() {
     fi
     if contains_video_files "$media_real"; then
         log WARNING "$app_name cleanup was deferred because a video file still exists below $media_real."
+        CLEANUP_PRESERVE_MANIFEST=true
+        CLEANUP_FOLDER_PENDING=true
+        log_media_cleanup_blockers "$app_name" "$media_real" "$manifest" || return 1
         return 0
     fi
     if [[ "$DEFER_SIDECAR_CLEANUP_WHILE_MOVER" == true ]] && unraid_mover_running; then
@@ -1249,7 +1488,12 @@ quarantine_recorded_sidecars() {
             log INFO "DRY RUN: would attempt rmdir-only cleanup below $media_real after quarantining sidecars."
         return 0
     fi
-    (( CLEANUP_CHANGED == 0 )) || return 0
+    if (( CLEANUP_CHANGED > 0 )); then
+        CLEANUP_PRESERVE_MANIFEST=true
+        CLEANUP_FOLDER_PENDING=true
+        log_media_cleanup_blockers "$app_name" "$media_real" "$manifest" || return 1
+        return 0
+    fi
 
     if (( CLEANUP_LATE_CANDIDATE_COUNT > 0 )) &&
        [[ "$REMOVE_EMPTY_MEDIA_FOLDERS" != true ]]; then
@@ -1262,7 +1506,7 @@ quarantine_recorded_sidecars() {
         remove_empty_media_dirs "$media_real"
         if [[ -e "$media_real" || -L "$media_real" ]]; then
             CLEANUP_FOLDER_PENDING=true
-            log_media_cleanup_blockers "$app_name" "$media_real"
+            log_media_cleanup_blockers "$app_name" "$media_real" "$manifest" || return 1
             return 0
         fi
     fi
@@ -1298,7 +1542,7 @@ api_request() {
                 --output "$body" --write-out '%{http_code}' \
                 "$ARR_URL$endpoint" 2>"$err"
         )"
-    else
+    elif [[ -n "$payload" ]]; then
         http_status="$(
             curl --silent --show-error \
                 --connect-timeout "$HTTP_CONNECT_TIMEOUT" \
@@ -1310,6 +1554,19 @@ api_request() {
                 --header 'Content-Type: application/json' \
                 --header "User-Agent: $ARR_USER_AGENT" \
                 --data-binary "$payload" \
+                --output "$body" --write-out '%{http_code}' \
+                "$ARR_URL$endpoint" 2>"$err"
+        )"
+    else
+        http_status="$(
+            curl --silent --show-error \
+                --connect-timeout "$HTTP_CONNECT_TIMEOUT" \
+                --max-time "$HTTP_MAX_TIME" \
+                --retry "$HTTP_RETRIES" --retry-all-errors \
+                --request "$method" \
+                --header "X-Api-Key: $ARR_API_KEY" \
+                --header 'Accept: application/json' \
+                --header "User-Agent: $ARR_USER_AGENT" \
                 --output "$body" --write-out '%{http_code}' \
                 "$ARR_URL$endpoint" 2>"$err"
         )"
@@ -1348,6 +1605,72 @@ api_post_json() {
     api_request POST "$1" "$2"
 }
 
+api_delete() {
+    api_request DELETE "$1" "" >/dev/null
+}
+
+age_at_least_hours() {
+    local timestamp="$1"
+    local hours="$2"
+    local then_epoch now_epoch
+
+    [[ "$hours" =~ ^[0-9]+$ ]] || return 1
+    then_epoch="$(timestamp_to_epoch "$timestamp" || true)"
+    [[ "$then_epoch" =~ ^[0-9]+$ ]] || return 1
+    now_epoch="$(date +%s)"
+    (( now_epoch - then_epoch >= hours * 3600 ))
+}
+
+age_at_least_days() {
+    local timestamp="$1"
+    local days="$2"
+    age_at_least_hours "$timestamp" "$((days * 24))"
+}
+
+load_arr_queue() {
+    local kind="$1"
+    local queue
+    local endpoint
+
+    if [[ "$kind" == sonarr ]]; then
+        endpoint='/api/v3/queue?page=1&pageSize=10000&includeUnknownSeriesItems=true&includeSeries=true&includeEpisode=true'
+    else
+        endpoint='/api/v3/queue?page=1&pageSize=10000&includeUnknownMovieItems=true&includeMovie=true'
+    fi
+    queue="$(api_get_json "$endpoint")" || return 1
+    jq -e 'type == "object" and (.records | type == "array")' \
+        >/dev/null 2>&1 <<< "$queue" || {
+        log ERROR "$ARR_NAME queue response did not contain a records array."
+        return 1
+    }
+
+    if [[ "$kind" == sonarr ]]; then
+        SONARR_QUEUE_JSON="$queue"
+        SONARR_QUEUE_AVAILABLE=true
+    else
+        RADARR_QUEUE_JSON="$queue"
+        RADARR_QUEUE_AVAILABLE=true
+    fi
+}
+
+sonarr_queue_has_series() {
+    local series_id="$1"
+    jq -e --argjson series_id "$series_id" '
+        any(.records[]?;
+            (.seriesId // .episode.seriesId // .series.id // 0) == $series_id
+        )
+    ' >/dev/null 2>&1 <<< "$SONARR_QUEUE_JSON"
+}
+
+radarr_queue_has_movie() {
+    local movie_id="$1"
+    jq -e --argjson movie_id "$movie_id" '
+        any(.records[]?;
+            (.movieId // .movie.id // 0) == $movie_id
+        )
+    ' >/dev/null 2>&1 <<< "$RADARR_QUEUE_JSON"
+}
+
 # Load one application's tag catalogue into its isolated workflow context.
 load_tag_catalog() {
     local tags
@@ -1357,6 +1680,13 @@ load_tag_catalog() {
         return 1
     fi
     TAG_CATALOG="$tags"
+}
+
+tag_id_by_label() {
+    local label="$1"
+    jq -r --arg label "$label" \
+        'first(.[] | select(.label == $label) | .id) // empty' \
+        <<< "$TAG_CATALOG"
 }
 
 # Set the named variable to an existing tag ID or create the tag.
@@ -1465,6 +1795,7 @@ sonarr_apply_snapshot() {
         | ($sidecar_source[0] // null) as $sidecar_files
         | .episodes //= {}
         | .sidecarManifests //= {}
+        | .seriesRetirements //= {}
         | if $sidecar_files != null then
             .sidecarManifests[($series_id | tostring)] = {
                 mediaPath: $series_path,
@@ -1835,6 +2166,343 @@ sonarr_mark_series_action() {
     mv -f -- "$next" "$WORK_STATE"
 }
 
+sonarr_cleanup_complete_for_retirement() {
+    local series_id="$1"
+
+    if [[ "$QUARANTINE_KODI_SIDECARS" != true ]]; then
+        return 0
+    fi
+    jq -e --arg key "$series_id" '
+        (.sidecarCleanupActions[$key] != null)
+        and (.sidecarManifests[$key] == null)
+    ' "$WORK_STATE" >/dev/null 2>&1
+}
+
+sonarr_mark_retirement_started() {
+    local series_id="$1"
+    local title="$2"
+    local status="$3"
+    local next
+
+    next="$(mktemp "$STATE_DIR/.state-retirement.XXXXXX")" || return 1
+    if ! jq --arg key "$series_id" \
+        --argjson series_id "$series_id" \
+        --arg title "$title" \
+        --arg status "$status" \
+        --arg now "$RUN_AT" '
+        .seriesRetirements //= {}
+        | .seriesRetirements[$key] = {
+            seriesId: $series_id,
+            title: $title,
+            seriesStatus: $status,
+            startedAt: $now,
+            lastValidatedAt: $now,
+            suppressed: false,
+            removedFromArrAt: null
+          }
+    ' "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$WORK_STATE"
+}
+
+sonarr_touch_retirement() {
+    local series_id="$1"
+    local next
+
+    next="$(mktemp "$STATE_DIR/.state-retirement-touch.XXXXXX")" || return 1
+    if ! jq --arg key "$series_id" --arg now "$RUN_AT" '
+        .seriesRetirements[$key].lastValidatedAt = $now
+    ' "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$WORK_STATE"
+}
+
+sonarr_cancel_retirement() {
+    local series_id="$1"
+    local reason="$2"
+    local next
+
+    next="$(mktemp "$STATE_DIR/.state-retirement-cancel.XXXXXX")" || return 1
+    if ! jq --arg key "$series_id" --arg now "$RUN_AT" --arg reason "$reason" '
+        .seriesRetirements //= {}
+        | .seriesRetirements[$key] = ((.seriesRetirements[$key] // {}) + {
+            startedAt: null,
+            lastValidatedAt: $now,
+            cancelledAt: $now,
+            cancellationReason: $reason,
+            suppressed: true
+          })
+    ' "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$WORK_STATE"
+    ((RETIREMENTS_CANCELLED += 1))
+}
+
+sonarr_clear_retirement() {
+    local series_id="$1"
+    local next
+
+    next="$(mktemp "$STATE_DIR/.state-retirement-clear.XXXXXX")" || return 1
+    if ! jq --arg key "$series_id" 'del(.seriesRetirements[$key])' \
+        "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$WORK_STATE"
+    ((RETIREMENTS_CANCELLED += 1))
+}
+
+sonarr_mark_removed_from_arr() {
+    local series_id="$1"
+    local next
+
+    next="$(mktemp "$STATE_DIR/.state-retirement-removed.XXXXXX")" || return 1
+    if ! jq --arg key "$series_id" --arg now "$RUN_AT" '
+        .seriesRetirements[$key].removedFromArrAt = $now
+        | .seriesRetirements[$key].lastValidatedAt = $now
+    ' "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$WORK_STATE"
+}
+
+# Return 0 when no retirement action was taken, 10 when the caller should skip
+# ordinary season/series processing for this item, and non-zero on failure.
+sonarr_process_full_retirement() {
+    local series_id="$1"
+    local series_title="$2"
+    local series_item="$3"
+    local episodes_file="$4"
+    local key status existing started_at suppressed fully_deleted
+    local exempt_id required_id pending_id deleted_id
+    local has_exempt=false has_required=false is_continuing=false
+    local monitored_episode_count monitored_season_count series_monitored
+    local current_file_count
+    local episode_ids payload detail tag_ids warning_threshold
+
+    [[ "$SONARR_RETIRE_FULLY_DELETED_SERIES" == true ]] || return 0
+    key="$series_id"
+    status="$(jq -r '.status // "unknown"' <<< "$series_item")"
+    [[ "$status" == ended ]] || is_continuing=true
+    existing="$(jq -c --arg key "$key" '.seriesRetirements[$key] // null' "$WORK_STATE")" || return 1
+    started_at="$(jq -r '.startedAt // empty' <<< "$existing")"
+    suppressed="$(jq -r '.suppressed // false' <<< "$existing")"
+
+    exempt_id="$(tag_id_by_label "$SONARR_RETIREMENT_EXEMPT_TAG")"
+    required_id="$(tag_id_by_label "$SONARR_RETIREMENT_REQUIRED_TAG")"
+    if [[ "$exempt_id" =~ ^[0-9]+$ ]] &&
+       jq -e --argjson id "$exempt_id" '(.tags // []) | index($id) != null' \
+           >/dev/null <<< "$series_item"; then
+        has_exempt=true
+    fi
+    if [[ "$required_id" =~ ^[0-9]+$ ]] &&
+       jq -e --argjson id "$required_id" '(.tags // []) | index($id) != null' \
+           >/dev/null <<< "$series_item"; then
+        has_required=true
+    fi
+
+    fully_deleted="$(sonarr_series_cleanup_eligible "$series_id" "$episodes_file")" || return 1
+    monitored_episode_count="$(jq '[.[] | select(.monitored == true)] | length' "$episodes_file")" || return 1
+    current_file_count="$(jq '[.[] | select(.hasFile == true)] | length' "$episodes_file")" || return 1
+    monitored_season_count="$(jq '[.seasons[]? | select(.monitored == true)] | length' <<< "$series_item")" || return 1
+    series_monitored="$(jq -r '.monitored == true' <<< "$series_item")"
+
+    if [[ -n "$started_at" ]]; then
+        if (( current_file_count > 0 )); then
+            sonarr_clear_retirement "$series_id" || return 1
+            queue_stateful_resolution_notification Sonarr \
+                "retirement:sonarr:${series_id}:upcoming" \
+                "$series_title retirement hold cancelled" \
+                "Episode media returned before automatic removal."
+            queue_action_notification Sonarr "$series_title retirement cancelled" \
+                "Episode media returned; the previous retirement hold was cleared and a future complete deletion may start a new hold."
+            return 10
+        fi
+        if [[ "$fully_deleted" != true ]]; then
+            sonarr_cancel_retirement "$series_id" "A file returned or the complete-deletion evidence no longer qualifies." || return 1
+            queue_stateful_resolution_notification Sonarr \
+                "retirement:sonarr:${series_id}:upcoming" \
+                "$series_title retirement hold cancelled" \
+                "Complete-deletion evidence no longer qualifies."
+            queue_action_notification Sonarr "$series_title retirement cancelled" \
+                "Complete-series deletion evidence no longer qualifies; automatic Arr removal was cancelled."
+            return 10
+        fi
+        if [[ "$has_exempt" == true || "$series_monitored" == true ||
+              "$monitored_episode_count" != 0 || "$monitored_season_count" != 0 ]]; then
+            sonarr_cancel_retirement "$series_id" \
+                "Monitoring was restored or the retirement exemption tag was applied." || return 1
+            queue_stateful_resolution_notification Sonarr \
+                "retirement:sonarr:${series_id}:upcoming" \
+                "$series_title retirement hold cancelled" \
+                "Monitoring was restored or a retirement exemption was applied."
+            queue_action_notification Sonarr "$series_title retirement cancelled" \
+                "Monitoring was restored or tag '$SONARR_RETIREMENT_EXEMPT_TAG' was applied; automatic Arr removal was cancelled."
+            return 10
+        fi
+
+        sonarr_touch_retirement "$series_id" || return 1
+        warning_threshold=$((ARR_RETIREMENT_DAYS - ARR_RETIREMENT_WARNING_DAYS))
+        (( warning_threshold < 0 )) && warning_threshold=0
+        if age_at_least_days "$started_at" "$warning_threshold" &&
+           ! age_at_least_days "$started_at" "$ARR_RETIREMENT_DAYS"; then
+            queue_stateful_attention_notification WARNING Sonarr \
+                "retirement:sonarr:${series_id}:upcoming" "$started_at" \
+                "$series_title scheduled for Arr removal" \
+                "The fully deleted series will be removed from Sonarr after ${ARR_RETIREMENT_DAYS} days unless media or monitoring returns. Started: $started_at" \
+                "$ARR_RETIREMENT_DAYS"
+        fi
+        if ! age_at_least_days "$started_at" "$ARR_RETIREMENT_DAYS"; then
+            return 10
+        fi
+        if [[ "$SONARR_QUEUE_AVAILABLE" != true ]]; then
+            log WARNING "Retirement removal for $series_title is due, but Sonarr queue status is unavailable."
+            return 10
+        fi
+        if sonarr_queue_has_series "$series_id"; then
+            log WARNING "Retirement removal for $series_title is due, but Sonarr still has queue activity."
+            return 10
+        fi
+
+        if [[ "$DRY_RUN" == true ]]; then
+            log INFO "DRY RUN: would remove retired series $series_title from Sonarr and add an import-list exclusion."
+            queue_action_notification Sonarr "$series_title retirement removal" \
+                "Would remove from Sonarr with deleteFiles=false and addImportListExclusion=true."
+            return 10
+        fi
+        if api_delete "/api/v3/series/${series_id}?deleteFiles=false&addImportListExclusion=true"; then
+            sonarr_mark_removed_from_arr "$series_id" || return 1
+            queue_stateful_resolution_notification Sonarr \
+                "retirement:sonarr:${series_id}:upcoming" \
+                "$series_title retirement hold completed" \
+                "The 90-day hold completed and the series was removed from Sonarr."
+            queue_action_notification Sonarr "$series_title removed from Sonarr" \
+                "The fully deleted series completed its ${ARR_RETIREMENT_DAYS}-day hold; files were not deleted and an import-list exclusion was added."
+            log INFO "Removed retired series $series_title from Sonarr and added an import-list exclusion."
+            ((ARR_REMOVALS += 1))
+            return 10
+        fi
+        log ERROR "Could not remove retired series $series_title from Sonarr; it will be retried."
+        queue_attention_notification ERROR Sonarr "$series_title retirement removal failed" \
+            "The series remains in Sonarr and will be retried next run."
+        return 1
+    fi
+
+    [[ "$suppressed" != true && "$fully_deleted" == true ]] || return 0
+    [[ "$has_exempt" != true ]] || return 0
+    if [[ "$is_continuing" == true && "$SONARR_RETIRE_CONTINUING_SERIES" != true &&
+          "$has_required" != true ]]; then
+        log INFO "Fully fileless continuing series $series_title was not retired; add tag '$SONARR_RETIREMENT_REQUIRED_TAG' to confirm that future episodes should be abandoned."
+        return 0
+    fi
+    sonarr_cleanup_complete_for_retirement "$series_id" || {
+        log INFO "Full-series retirement for $series_title is waiting for sidecar and folder cleanup to complete."
+        return 0
+    }
+    if [[ "$SONARR_QUEUE_AVAILABLE" != true ]]; then
+        log WARNING "Full-series retirement for $series_title is waiting because Sonarr queue status is unavailable."
+        return 0
+    fi
+    if sonarr_queue_has_series "$series_id"; then
+        log INFO "Full-series retirement for $series_title is waiting for Sonarr queue activity to finish."
+        return 0
+    fi
+
+    episode_ids="$(jq '[.[].id] | unique' "$episodes_file")" || return 1
+    if [[ "$DRY_RUN" == true ]]; then
+        log INFO "DRY RUN: would unmonitor every episode, season, and the series for full-series retirement: $series_title."
+        queue_action_notification Sonarr "$series_title full-series retirement" \
+            "Would unmonitor all hierarchy levels and start the ${ARR_RETIREMENT_DAYS}-day hold."
+        return 10
+    fi
+
+    if (( $(jq length <<< "$episode_ids") > 0 )); then
+        payload="$(jq -cn --argjson ids "$episode_ids" '{episodeIds:$ids,monitored:false}')" || return 1
+        api_put_json '/api/v3/episode/monitor' "$payload" || return 1
+    fi
+    detail="$(api_get_json "/api/v3/series/$series_id")" || return 1
+    ensure_tag_id "$PLEX_DELETED_SERIES_TAG" deleted_id || return 1
+    ensure_tag_id "$SONARR_RETIREMENT_PENDING_TAG" pending_id || return 1
+    tag_ids="$(jq -cn --argjson deleted "$deleted_id" --argjson pending "$pending_id" \
+        '[$deleted,$pending]')" || return 1
+    payload="$(jq --argjson tags "$tag_ids" '
+        .monitored = false
+        | .seasons |= map(.monitored = false)
+        | .tags //= []
+        | .tags |= ((. + $tags) | unique)
+    ' <<< "$detail")" || return 1
+    api_put_json "/api/v3/series/$series_id" "$payload" || return 1
+    sonarr_mark_retirement_started "$series_id" "$series_title" "$status" || return 1
+    sonarr_mark_series_action "$series_id" || return 1
+    queue_action_notification Sonarr "$series_title full-series retirement started" \
+        "All episodes, seasons, and the series were unmonitored; the ${ARR_RETIREMENT_DAYS}-day removal hold has started."
+    log INFO "Started full-series retirement for $series_title; removal hold is ${ARR_RETIREMENT_DAYS} days."
+    ((RETIREMENTS_STARTED += 1))
+    return 10
+}
+
+sonarr_prune_state() {
+    local series_json="$1"
+    local now_epoch cutoff next pruned
+
+    now_epoch="$(date +%s)"
+    cutoff=$((now_epoch - STATE_PRUNE_ABSENT_DAYS * 86400))
+    next="$(mktemp "$STATE_DIR/.state-prune.XXXXXX")" || return 1
+    if ! jq --arg now "$RUN_AT" \
+        --argjson now_epoch "$now_epoch" \
+        --argjson cutoff "$cutoff" \
+        --slurpfile current_source <(printf '%s' "$series_json") '
+        (($current_source[0] // []) | map(.id | tostring)) as $present
+        | .episodes //= {}
+        | .seriesRetirements //= {}
+        | .seriesActions //= {}
+        | .seasonActions //= {}
+        | .sidecarManifests //= {}
+        | .sidecarCleanupActions //= {}
+        | reduce (.episodes | to_entries[]) as $entry (.;
+            ($entry.value.seriesId | tostring) as $series_key
+            | if ($present | index($series_key)) != null then
+                del(.episodes[$entry.key].absentFromArrAt, .episodes[$entry.key].absentFromArrEpoch)
+              else
+                .episodes[$entry.key].absentFromArrAt //= $now
+                | .episodes[$entry.key].absentFromArrEpoch //= $now_epoch
+              end
+          )
+        | . as $state
+        | [
+            $state.episodes | to_entries[]
+            | (.value.seriesId | tostring) as $series_key
+            | select(
+                (.value.absentFromArrEpoch // $now_epoch) <= $cutoff
+                and $state.sidecarManifests[$series_key] == null
+              )
+            | .key
+          ] as $episode_keys
+        | ([$episode_keys[] as $key | .episodes[$key].seriesId] | unique) as $series_ids
+        | reduce $episode_keys[] as $key (.; del(.episodes[$key]))
+        | reduce $series_ids[] as $series_id (.;
+            ($series_id | tostring) as $series_key
+            | del(.seriesRetirements[$series_key], .seriesActions[$series_key], .sidecarCleanupActions[$series_key])
+            | .seasonActions |= with_entries(select(.value.seriesId != $series_id))
+          )
+        | .lastPrunedCount = ($episode_keys | length)
+    ' "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    pruned="$(jq -r '.lastPrunedCount // 0' "$next")"
+    mv -f -- "$next" "$WORK_STATE"
+    ((STATE_PRUNED += pruned))
+    (( pruned == 0 )) || log INFO "Pruned $pruned Sonarr episode state record(s) absent for at least $STATE_PRUNE_ABSENT_DAYS days."
+}
+
 sonarr_commit_state() {
     local final backup had_errors
     final="$(mktemp "$STATE_DIR/.state-final.XXXXXX")" || return 1
@@ -1842,12 +2510,15 @@ sonarr_commit_state() {
     (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )) && had_errors=true
 
     if ! jq --arg now "$RUN_AT" --argjson had_errors "$had_errors" '
-        .version = 6
+        .version = 7
         | .lastRun = $now
         | .lastRunHadApiErrors = $had_errors
         | .episodes //= {}
         | .sidecarManifests //= {}
         | .sidecarCleanupActions //= {}
+        | .seriesRetirements //= {}
+        | .seasonActions //= {}
+        | .seriesActions //= {}
     ' "$WORK_STATE" > "$final" ||
        ! jq -e 'type == "object" and (.episodes | type == "object")' "$final" >/dev/null; then
         rm -f -- "$final"
@@ -1909,6 +2580,12 @@ FOLDERS_REMOVED=0
 FOLDER_CLEANUP_PENDING=0
 MOVER_DEFERRALS=0
 MOVER_GUARD_NOTICE_LOGGED=false
+STATE_PRUNED=0
+RETIREMENTS_STARTED=0
+RETIREMENTS_CANCELLED=0
+ARR_REMOVALS=0
+SONARR_QUEUE_JSON='{"records":[]}'
+SONARR_QUEUE_AVAILABLE=false
 TAG_CATALOG=''
 PLEX_DELETED_SEASON_TAG_ID=''
 PLEX_DELETED_SERIES_TAG_ID=''
@@ -1927,6 +2604,10 @@ trap 'exit 130' INT TERM
     die "PLEX_DELETED_SEASON_TAG may contain only lowercase letters, numbers, and hyphens."
 [[ "$PLEX_DELETED_SERIES_TAG" =~ ^[a-z0-9-]+$ ]] ||
     die "PLEX_DELETED_SERIES_TAG may contain only lowercase letters, numbers, and hyphens."
+[[ "$SONARR_RETIREMENT_REQUIRED_TAG" =~ ^[a-z0-9-]+$ &&
+   "$SONARR_RETIREMENT_EXEMPT_TAG" =~ ^[a-z0-9-]+$ &&
+   "$SONARR_RETIREMENT_PENDING_TAG" =~ ^[a-z0-9-]+$ ]] ||
+    die "Sonarr retirement tags may contain only lowercase letters, numbers, and hyphens."
 [[ "$PLEX_DELETED_SEASON_TAG" != "$PLEX_DELETED_SERIES_TAG" ]] ||
     die "PLEX_DELETED_SEASON_TAG and PLEX_DELETED_SERIES_TAG must be different."
 [[ "$PROGRESS_LOG_EVERY" =~ ^[1-9][0-9]*$ ]] ||
@@ -1935,7 +2616,7 @@ trap 'exit 130' INT TERM
 if [[ ! -f "$STATE_FILE" ]]; then
     INITIAL_STATE="$(mktemp "$STATE_DIR/.state-initial.XXXXXX")" ||
         die "Cannot create initial state file."
-    printf '%s\n' '{"version":6,"lastRun":null,"lastRunHadApiErrors":false,"episodes":{},"sidecarManifests":{},"sidecarCleanupActions":{}}' > "$INITIAL_STATE" &&
+    printf '%s\n' '{"version":7,"lastRun":null,"lastRunHadApiErrors":false,"episodes":{},"sidecarManifests":{},"sidecarCleanupActions":{},"seriesRetirements":{}}' > "$INITIAL_STATE" &&
         mv -f -- "$INITIAL_STATE" "$STATE_FILE" || {
             rm -f -- "$INITIAL_STATE"
             die "Cannot create state file."
@@ -1968,12 +2649,10 @@ if ! jq -e '.appName == "Sonarr"' >/dev/null 2>&1 <<< "$SYSTEM"; then
 fi
 log INFO "Connected to Sonarr $(jq -r '.version // "unknown"' <<< "$SYSTEM")."
 
-if [[ "$DRY_RUN" == false ]]; then
-    load_tag_catalog || {
-        ((API_FAILURES += 1))
-        die "Could not load Sonarr tags; state was not changed."
-    }
-fi
+load_tag_catalog || {
+    ((API_FAILURES += 1))
+    die "Could not load Sonarr tags; state was not changed."
+}
 
 if [[ "$TRIGGER_LIBRARY_RESCAN" == true ]]; then
     RESCAN_ID="$(start_arr_command '{"name":"RescanSeries"}')" || {
@@ -1995,12 +2674,28 @@ jq -e 'type == "array"' >/dev/null <<< "$SERIES" ||
     die "Sonarr /series did not return an array."
 SERIES_LISTED="$(jq length <<< "$SERIES")"
 
+if [[ "$SONARR_RETIRE_FULLY_DELETED_SERIES" == true ]]; then
+    if load_arr_queue sonarr; then
+        queue_stateful_resolution_notification Sonarr "queue:sonarr:retirement" \
+            "Sonarr retirement queue check restored" \
+            "Queue status is available again; eligible retirement work may continue."
+    else
+        log WARNING "Sonarr queue status is unavailable; retirement starts and removals are deferred."
+        queue_stateful_attention_notification WARNING Sonarr \
+            "queue:sonarr:retirement" unavailable \
+            "Sonarr retirement queue check unavailable" \
+            "Normal delete-sync work continues, but no series retirement will start or complete until queue status is available." \
+            "$FOLDER_BLOCKER_REMINDER_DAYS"
+    fi
+fi
+
 # Every monitored series is scanned once, plus a series holding a pending
 # candidate. No episode-file lookups, refresh commands, or same-run waits occur.
 while IFS= read -r SERIES_ID; do
     [[ -n "$SERIES_ID" ]] || continue
-    SERIES_TITLE="$(jq -r --argjson id "$SERIES_ID" '.[] | select(.id == $id) | .title // empty' <<< "$SERIES")"
-    SERIES_API_PATH="$(jq -r --argjson id "$SERIES_ID" '.[] | select(.id == $id) | .path // empty' <<< "$SERIES")"
+    SERIES_ITEM="$(jq -c --argjson id "$SERIES_ID" '.[] | select(.id == $id)' <<< "$SERIES")"
+    SERIES_TITLE="$(jq -r '.title // empty' <<< "$SERIES_ITEM")"
+    SERIES_API_PATH="$(jq -r '.path // empty' <<< "$SERIES_ITEM")"
     SERIES_PATH=""
     if [[ -n "$SERIES_API_PATH" ]]; then
         SERIES_PATH="$(map_arr_media_path "$SERIES_API_PATH" "$SONARR_API_SERIES_ROOT" "$SERIES_ROOT" || true)"
@@ -2209,6 +2904,22 @@ while IFS= read -r SERIES_ID; do
         fi
     fi
 
+    RETIREMENT_RC=0
+    sonarr_process_full_retirement "$SERIES_ID" "$SERIES_TITLE" \
+        "$SERIES_ITEM" "$CURRENT_SNAPSHOT_FILE" || RETIREMENT_RC=$?
+    case "$RETIREMENT_RC" in
+        0) ;;
+        10) continue ;;
+        *)
+            ((API_FAILURES += 1))
+            log ERROR "Full-series retirement processing failed for $SERIES_TITLE; it will be retried."
+            queue_attention_notification ERROR Sonarr \
+                "$SERIES_TITLE retirement processing failed" \
+                "No retirement removal occurred; the workflow will retry next run."
+            continue
+            ;;
+    esac
+
     # Build independent season and series plans.  The series plan is default
     # off and still needs a fresh series-detail check below.
     SEASONS='[]'
@@ -2371,12 +3082,13 @@ done < <(
     } | sort -nu
 )
 
+sonarr_prune_state "$SERIES" || die "Could not prune stale Sonarr state safely."
 sonarr_commit_state || die "Could not atomically save state."
 WORK_STATE=""
 
 ACTION_LABEL=applied
 [[ "$DRY_RUN" == true ]] && ACTION_LABEL=would-apply
-log INFO "Summary: series-listed=$SERIES_LISTED, series-scanned=$SERIES_SCANNED, episodes=$EPISODES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$EPISODES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, episode-actions-$ACTION_LABEL=$EPISODE_ACTIONS, season-actions-$ACTION_LABEL=$SEASON_ACTIONS, series-actions-$ACTION_LABEL=$SERIES_ACTIONS, tagged-series-$ACTION_LABEL=$TAGGED_SERIES_ACTIONS, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, late-sidecar-candidates=$SIDECARS_LATE_CANDIDATES, late-sidecars-confirmed-$ACTION_LABEL=$SIDECARS_LATE_CONFIRMED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, folder-cleanup-pending=$FOLDER_CLEANUP_PENDING, mover-deferrals=$MOVER_DEFERRALS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
+log INFO "Summary: series-listed=$SERIES_LISTED, series-scanned=$SERIES_SCANNED, episodes=$EPISODES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$EPISODES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, episode-actions-$ACTION_LABEL=$EPISODE_ACTIONS, season-actions-$ACTION_LABEL=$SEASON_ACTIONS, series-actions-$ACTION_LABEL=$SERIES_ACTIONS, tagged-series-$ACTION_LABEL=$TAGGED_SERIES_ACTIONS, retirements-started=$RETIREMENTS_STARTED, retirements-cancelled=$RETIREMENTS_CANCELLED, arr-removals=$ARR_REMOVALS, state-pruned=$STATE_PRUNED, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, late-sidecar-candidates=$SIDECARS_LATE_CANDIDATES, late-sidecars-confirmed-$ACTION_LABEL=$SIDECARS_LATE_CONFIRMED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, folder-cleanup-pending=$FOLDER_CLEANUP_PENDING, mover-deferrals=$MOVER_DEFERRALS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
 
 if (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )); then
     FAILURE_SEVERITY=WARNING
@@ -2433,6 +3145,18 @@ validate_common_configuration() {
         die "SEND_GROUPED_NOTIFICATIONS must be true or false."
     [[ "$NOTIFY_DRY_RUN" == true || "$NOTIFY_DRY_RUN" == false ]] ||
         die "NOTIFY_DRY_RUN must be true or false."
+    [[ "$SONARR_RETIRE_FULLY_DELETED_SERIES" == true ||
+       "$SONARR_RETIRE_FULLY_DELETED_SERIES" == false ]] ||
+        die "SONARR_RETIRE_FULLY_DELETED_SERIES must be true or false."
+    [[ "$SONARR_RETIRE_CONTINUING_SERIES" == true ||
+       "$SONARR_RETIRE_CONTINUING_SERIES" == false ]] ||
+        die "SONARR_RETIRE_CONTINUING_SERIES must be true or false."
+    [[ "$RADARR_MONITORED_FILELESS_RESCAN" == true ||
+       "$RADARR_MONITORED_FILELESS_RESCAN" == false ]] ||
+        die "RADARR_MONITORED_FILELESS_RESCAN must be true or false."
+    [[ "$RADARR_RETIRE_FULLY_DELETED_MOVIES" == true ||
+       "$RADARR_RETIRE_FULLY_DELETED_MOVIES" == false ]] ||
+        die "RADARR_RETIRE_FULLY_DELETED_MOVIES must be true or false."
     [[ "$INSPECT_DELETE_HISTORY" == true || "$REQUIRE_DELETE_HISTORY_EVENT" == false ]] ||
         die "REQUIRE_DELETE_HISTORY_EVENT=true requires INSPECT_DELETE_HISTORY=true."
     [[ "$CONFIRMATION_RUNS" =~ ^[0-9]+$ ]] && (( CONFIRMATION_RUNS >= 2 )) ||
@@ -2441,6 +3165,21 @@ validate_common_configuration() {
         die "MAX_HISTORY_INSPECTIONS_PER_RUN must be a positive integer."
     [[ "$MAX_SIDECAR_SIZE_MB" =~ ^[1-9][0-9]*$ ]] ||
         die "MAX_SIDECAR_SIZE_MB must be a positive integer."
+    [[ "$RADARR_MONITORED_FILELESS_WARNING_RUNS" =~ ^[0-9]+$ ]] &&
+       (( RADARR_MONITORED_FILELESS_WARNING_RUNS >= 2 )) ||
+        die "RADARR_MONITORED_FILELESS_WARNING_RUNS must be at least 2."
+    [[ "$RADARR_MONITORED_FILELESS_WARNING_HOURS" =~ ^[1-9][0-9]*$ ]] ||
+        die "RADARR_MONITORED_FILELESS_WARNING_HOURS must be a positive integer."
+    [[ "$ARR_RETIREMENT_DAYS" =~ ^[1-9][0-9]*$ &&
+       "$ARR_RETIREMENT_WARNING_DAYS" =~ ^[0-9]+$ ]] &&
+       (( ARR_RETIREMENT_WARNING_DAYS < ARR_RETIREMENT_DAYS )) ||
+        die "Retirement days must be positive and warning days smaller than the hold."
+    [[ "$STATE_PRUNE_ABSENT_DAYS" =~ ^[1-9][0-9]*$ ]] ||
+        die "STATE_PRUNE_ABSENT_DAYS must be a positive integer."
+    [[ "$FOLDER_BLOCKER_REMINDER_DAYS" =~ ^[1-9][0-9]*$ ]] ||
+        die "FOLDER_BLOCKER_REMINDER_DAYS must be a positive integer."
+    [[ "$EXTRA_SIDECAR_EXTENSIONS" =~ ^[a-z0-9]+(,[a-z0-9]+)*$ ]] ||
+        die "EXTRA_SIDECAR_EXTENSIONS must be a comma-separated lowercase extension list."
     [[ "$CLEANUP_REMAINING_LOG_MAX_ITEMS" =~ ^[1-9][0-9]*$ ]] ||
         die "CLEANUP_REMAINING_LOG_MAX_ITEMS must be a positive integer."
     [[ "$NOTIFICATION_MAX_ITEMS" =~ ^[1-9][0-9]*$ &&
@@ -2609,6 +3348,7 @@ radarr_apply_snapshot() {
         --slurpfile source "$movies_file" '($source[0] // []) as $movies
         | (($sidecar_source | add) // {}) as $sidecar_manifests
         | .movies //= {}
+        | .movieRetirements //= {}
         | .sidecarManifests = ((.sidecarManifests // {}) * $sidecar_manifests)
         | reduce $movies[] as $movie (.;
             ($movie.id | tostring) as $key
@@ -2628,7 +3368,10 @@ radarr_apply_snapshot() {
                         lastKnownMovieFileId: ($movie.movieFileId // 0),
                         lastSeenWithFileAt: $now,
                         missingSince: null,
-                        missingRuns: 0
+                        missingRuns: 0,
+                        monitoredFilelessSince: null,
+                        monitoredFilelessRuns: 0,
+                        lastMonitoredFilelessRescanAt: null
                     }
                 )
               elif $old.everHadFile == true then
@@ -2637,12 +3380,17 @@ radarr_apply_snapshot() {
                     (if (($require_unmonitored | not) or ($movie.monitored != true)) then
                         {
                             missingSince: ($old.missingSince // $now),
-                            missingRuns: (($old.missingRuns // 0) + 1)
+                            missingRuns: (($old.missingRuns // 0) + 1),
+                            monitoredFilelessSince: null,
+                            monitoredFilelessRuns: 0,
+                            lastMonitoredFilelessRescanAt: null
                         }
                      else
                         {
                             missingSince: null,
-                            missingRuns: 0
+                            missingRuns: 0,
+                            monitoredFilelessSince: ($old.monitoredFilelessSince // $now),
+                            monitoredFilelessRuns: (($old.monitoredFilelessRuns // 0) + 1)
                         }
                      end)
                 )
@@ -2820,6 +3568,363 @@ radarr_mark_tag_actions() {
     mv -f -- "$next" "$WORK_STATE"
 }
 
+radarr_mark_watchdog_rescan() {
+    local movie_id="$1"
+    local next
+
+    next="$(mktemp "$STATE_DIR/.state-watchdog.XXXXXX")" || return 1
+    if ! jq --argjson movie_id "$movie_id" --arg now "$RUN_AT" '
+        .movies[($movie_id | tostring)].lastMonitoredFilelessRescanAt = $now
+    ' "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$WORK_STATE"
+}
+
+radarr_process_monitored_fileless_watchdog() {
+    local movies_file="$1"
+    local candidates movie movie_id title since runs signature command_id
+    local key key_movie_id still_active
+
+    candidates="$(jq --slurpfile source "$movies_file" \
+        --argjson needed "$RADARR_MONITORED_FILELESS_WARNING_RUNS" '
+        ($source[0] // []) as $movies
+        | .movies as $state
+        | [
+            $movies[]
+            | select(.hasFile != true and .monitored == true)
+            | . as $movie
+            | ($movie.id | tostring) as $key
+            | ($state[$key] // {}) as $record
+            | select(
+                $record.everHadFile == true
+                and ($record.monitoredFilelessRuns // 0) >= $needed
+              )
+            | {
+                id: $movie.id,
+                title: ($movie.title // "Unknown"),
+                year: ($movie.year // null),
+                since: ($record.monitoredFilelessSince // ""),
+                runs: ($record.monitoredFilelessRuns // 0),
+                lastRescanAt: ($record.lastMonitoredFilelessRescanAt // null)
+              }
+          ]
+    ' "$WORK_STATE")" || return 1
+
+    while IFS= read -r movie; do
+        [[ -n "$movie" ]] || continue
+        movie_id="$(jq -r '.id' <<< "$movie")"
+        title="$(jq -r '"\(.title)\(if .year == null then "" else " (\(.year))" end)"' <<< "$movie")"
+        since="$(jq -r '.since' <<< "$movie")"
+        runs="$(jq -r '.runs' <<< "$movie")"
+        age_at_least_hours "$since" "$RADARR_MONITORED_FILELESS_WARNING_HOURS" || continue
+
+        if [[ "$RADARR_MONITORED_FILELESS_RESCAN" == true ]] &&
+           [[ "$(jq -r '.lastRescanAt == null' <<< "$movie")" == true ]]; then
+            command_id="$(start_arr_command "$(jq -cn --argjson id "$movie_id" '{name:"RescanMovie",movieIds:[$id]}')")" || return 1
+            radarr_mark_watchdog_rescan "$movie_id" || return 1
+            log INFO "Requested one Radarr rescan for monitored, fileless movie $title (command $command_id)."
+            continue
+        fi
+
+        signature="$(notification_hash "$movie_id|$since")"
+        queue_stateful_attention_notification WARNING Radarr \
+            "watchdog:radarr:${movie_id}" "$signature" \
+            "$title remains monitored after file deletion" \
+            "Radarr still reports hasFile=false and monitored=true after $runs successful runs. Verify Unmonitor Deleted Movies and Radarr's folder-rescan policy. The script did not unmonitor it." \
+            "$FOLDER_BLOCKER_REMINDER_DAYS"
+    done < <(jq -c '.[]' <<< "$candidates")
+
+    while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
+        key_movie_id="${key##*:}"
+        still_active="$(jq --argjson id "$key_movie_id" \
+            'any(.[]; .id == $id and .hasFile != true and .monitored == true)' \
+            "$movies_file")" || still_active=false
+        [[ "$still_active" == true ]] && continue
+        queue_stateful_resolution_notification Radarr "$key" \
+            "Radarr monitored-fileless condition resolved" \
+            "Movie ID $key_movie_id either returned or became unmonitored."
+    done < <(jq -r '.attention | keys[]? | select(startswith("watchdog:radarr:"))' \
+        "$NOTIFICATION_STATE_FILE" 2>/dev/null || true)
+}
+
+radarr_cleanup_complete_for_retirement() {
+    local movie_id="$1"
+
+    if [[ "$QUARANTINE_KODI_SIDECARS" != true ]]; then
+        return 0
+    fi
+    jq -e --arg key "$movie_id" '
+        (.sidecarCleanupActions[$key] != null)
+        and (.sidecarManifests[$key] == null)
+    ' "$WORK_STATE" >/dev/null 2>&1
+}
+
+radarr_mark_retirement_started() {
+    local movie_id="$1"
+    local title="$2"
+    local year="$3"
+    local next
+
+    next="$(mktemp "$STATE_DIR/.state-retirement.XXXXXX")" || return 1
+    if ! jq --arg key "$movie_id" \
+        --argjson movie_id "$movie_id" \
+        --arg title "$title" \
+        --arg year "$year" \
+        --arg now "$RUN_AT" '
+        .movieRetirements //= {}
+        | .movieRetirements[$key] = {
+            movieId: $movie_id,
+            title: $title,
+            year: (if $year == "" then null else ($year | tonumber) end),
+            startedAt: $now,
+            lastValidatedAt: $now,
+            suppressed: false,
+            removedFromArrAt: null
+          }
+    ' "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$WORK_STATE"
+}
+
+radarr_touch_retirement() {
+    local movie_id="$1"
+    local next
+    next="$(mktemp "$STATE_DIR/.state-retirement-touch.XXXXXX")" || return 1
+    if ! jq --arg key "$movie_id" --arg now "$RUN_AT" '
+        .movieRetirements[$key].lastValidatedAt = $now
+    ' "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$WORK_STATE"
+}
+
+radarr_cancel_retirement() {
+    local movie_id="$1"
+    local reason="$2"
+    local next
+    next="$(mktemp "$STATE_DIR/.state-retirement-cancel.XXXXXX")" || return 1
+    if ! jq --arg key "$movie_id" --arg now "$RUN_AT" --arg reason "$reason" '
+        .movieRetirements //= {}
+        | .movieRetirements[$key] = ((.movieRetirements[$key] // {}) + {
+            startedAt: null,
+            lastValidatedAt: $now,
+            cancelledAt: $now,
+            cancellationReason: $reason,
+            suppressed: true
+          })
+    ' "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$WORK_STATE"
+    ((RETIREMENTS_CANCELLED += 1))
+}
+
+radarr_clear_retirement() {
+    local movie_id="$1"
+    local next
+    next="$(mktemp "$STATE_DIR/.state-retirement-clear.XXXXXX")" || return 1
+    if ! jq --arg key "$movie_id" 'del(.movieRetirements[$key])' \
+        "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$WORK_STATE"
+    ((RETIREMENTS_CANCELLED += 1))
+}
+
+radarr_mark_removed_from_arr() {
+    local movie_id="$1"
+    local next
+    next="$(mktemp "$STATE_DIR/.state-retirement-removed.XXXXXX")" || return 1
+    if ! jq --arg key "$movie_id" --arg now "$RUN_AT" '
+        .movieRetirements[$key].removedFromArrAt = $now
+        | .movieRetirements[$key].lastValidatedAt = $now
+    ' "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    mv -f -- "$next" "$WORK_STATE"
+}
+
+radarr_process_retirements() {
+    local movies_file="$1"
+    local movie movie_id title year monitored has_file tags record started_at suppressed
+    local exempt_id pending_id plex_id has_exempt=false tagged=false warning_threshold payload
+
+    [[ "$RADARR_RETIRE_FULLY_DELETED_MOVIES" == true ]] || return 0
+    while IFS= read -r movie; do
+        [[ -n "$movie" ]] || continue
+        movie_id="$(jq -r '.id' <<< "$movie")"
+        title="$(jq -r '.title // "Unknown"' <<< "$movie")"
+        year="$(jq -r '.year // empty' <<< "$movie")"
+        monitored="$(jq -r '.monitored == true' <<< "$movie")"
+        has_file="$(jq -r '.hasFile == true' <<< "$movie")"
+        tags="$(jq -c '.tags // []' <<< "$movie")"
+        record="$(jq -c --arg key "$movie_id" '.movieRetirements[$key] // null' "$WORK_STATE")" || return 1
+        started_at="$(jq -r '.startedAt // empty' <<< "$record")"
+        suppressed="$(jq -r '.suppressed // false' <<< "$record")"
+        has_exempt=false
+        tagged=false
+
+        exempt_id="$(tag_id_by_label "$RADARR_RETIREMENT_EXEMPT_TAG")"
+        plex_id="$(tag_id_by_label "$PLEX_DELETED_MOVIE_TAG")"
+        if [[ "$exempt_id" =~ ^[0-9]+$ ]] &&
+           jq -e --argjson id "$exempt_id" 'index($id) != null' >/dev/null <<< "$tags"; then
+            has_exempt=true
+        fi
+        if [[ "$plex_id" =~ ^[0-9]+$ ]] &&
+           jq -e --argjson id "$plex_id" 'index($id) != null' >/dev/null <<< "$tags"; then
+            tagged=true
+        elif jq -e --arg key "$movie_id" '.movies[$key].lastPlexDeletedTagAppliedAt != null' \
+            "$WORK_STATE" >/dev/null 2>&1; then
+            tagged=true
+        fi
+
+        if [[ -n "$started_at" ]]; then
+            if [[ "$has_file" == true ]]; then
+                radarr_clear_retirement "$movie_id" || return 1
+                queue_stateful_resolution_notification Radarr \
+                    "retirement:radarr:${movie_id}:upcoming" \
+                    "$title retirement hold cancelled" \
+                    "Movie media returned before automatic removal."
+                queue_action_notification Radarr "$title retirement cancelled" \
+                    "Movie media returned; the previous retirement hold was cleared and a future deletion may start a new hold."
+                continue
+            fi
+            if [[ "$monitored" == true || "$has_exempt" == true ]]; then
+                radarr_cancel_retirement "$movie_id" \
+                    "A file or monitoring returned, or the retirement exemption tag was applied." || return 1
+                queue_stateful_resolution_notification Radarr \
+                    "retirement:radarr:${movie_id}:upcoming" \
+                    "$title retirement hold cancelled" \
+                    "Monitoring was restored or a retirement exemption was applied."
+                queue_action_notification Radarr "$title retirement cancelled" \
+                    "Automatic Arr removal was cancelled because media or monitoring returned, or tag '$RADARR_RETIREMENT_EXEMPT_TAG' was applied."
+                continue
+            fi
+            radarr_touch_retirement "$movie_id" || return 1
+            warning_threshold=$((ARR_RETIREMENT_DAYS - ARR_RETIREMENT_WARNING_DAYS))
+            (( warning_threshold < 0 )) && warning_threshold=0
+            if age_at_least_days "$started_at" "$warning_threshold" &&
+               ! age_at_least_days "$started_at" "$ARR_RETIREMENT_DAYS"; then
+                queue_stateful_attention_notification WARNING Radarr \
+                    "retirement:radarr:${movie_id}:upcoming" "$started_at" \
+                    "$title scheduled for Arr removal" \
+                    "The fully deleted movie will be removed from Radarr after ${ARR_RETIREMENT_DAYS} days unless media or monitoring returns. Started: $started_at" \
+                    "$ARR_RETIREMENT_DAYS"
+            fi
+            age_at_least_days "$started_at" "$ARR_RETIREMENT_DAYS" || continue
+            if [[ "$RADARR_QUEUE_AVAILABLE" != true ]] || radarr_queue_has_movie "$movie_id"; then
+                log WARNING "Retirement removal for $title is due, but Radarr queue status is unavailable or active."
+                continue
+            fi
+            if [[ "$DRY_RUN" == true ]]; then
+                log INFO "DRY RUN: would remove retired movie $title from Radarr and add an import exclusion."
+                queue_action_notification Radarr "$title retirement removal" \
+                    "Would remove from Radarr with deleteFiles=false and addImportExclusion=true."
+                continue
+            fi
+            if api_delete "/api/v3/movie/${movie_id}?deleteFiles=false&addImportExclusion=true"; then
+                radarr_mark_removed_from_arr "$movie_id" || return 1
+                queue_stateful_resolution_notification Radarr \
+                    "retirement:radarr:${movie_id}:upcoming" \
+                    "$title retirement hold completed" \
+                    "The 90-day hold completed and the movie was removed from Radarr."
+                queue_action_notification Radarr "$title removed from Radarr" \
+                    "The fully deleted movie completed its ${ARR_RETIREMENT_DAYS}-day hold; files were not deleted and an import exclusion was added."
+                log INFO "Removed retired movie $title from Radarr and added an import exclusion."
+                ((ARR_REMOVALS += 1))
+            else
+                log ERROR "Could not remove retired movie $title from Radarr; it will be retried."
+                queue_attention_notification ERROR Radarr "$title retirement removal failed" \
+                    "The movie remains in Radarr and will be retried next run."
+                return 1
+            fi
+            continue
+        fi
+
+        [[ "$suppressed" != true && "$has_file" != true && "$monitored" != true &&
+           "$has_exempt" != true && "$tagged" == true ]] || continue
+        jq -e --arg key "$movie_id" --argjson needed "$CONFIRMATION_RUNS" '
+            (.movies[$key].everHadFile == true)
+            and ((.movies[$key].missingRuns // 0) >= $needed)
+        ' "$WORK_STATE" >/dev/null 2>&1 || continue
+        radarr_cleanup_complete_for_retirement "$movie_id" || continue
+        if [[ "$RADARR_QUEUE_AVAILABLE" != true ]] || radarr_queue_has_movie "$movie_id"; then
+            continue
+        fi
+        if [[ "$DRY_RUN" == true ]]; then
+            log INFO "DRY RUN: would start the ${ARR_RETIREMENT_DAYS}-day retirement hold for $title."
+            queue_action_notification Radarr "$title retirement hold" \
+                "Would add '$RADARR_RETIREMENT_PENDING_TAG' and start the ${ARR_RETIREMENT_DAYS}-day hold."
+            continue
+        fi
+        ensure_tag_id "$RADARR_RETIREMENT_PENDING_TAG" pending_id || return 1
+        payload="$(jq -cn --argjson movie_id "$movie_id" --argjson tag_id "$pending_id" \
+            '{movieIds:[$movie_id],tags:[$tag_id],applyTags:"add"}')" || return 1
+        api_put_json '/api/v3/movie/editor' "$payload" || return 1
+        radarr_mark_retirement_started "$movie_id" "$title" "$year" || return 1
+        queue_action_notification Radarr "$title retirement hold started" \
+            "The confirmed deleted movie is unmonitored and clean; the ${ARR_RETIREMENT_DAYS}-day removal hold has started."
+        log INFO "Started movie retirement for $title; removal hold is ${ARR_RETIREMENT_DAYS} days."
+        ((RETIREMENTS_STARTED += 1))
+    done < <(jq -c '.[]' "$movies_file")
+}
+
+radarr_prune_state() {
+    local movies_file="$1"
+    local now_epoch cutoff next pruned
+
+    now_epoch="$(date +%s)"
+    cutoff=$((now_epoch - STATE_PRUNE_ABSENT_DAYS * 86400))
+    next="$(mktemp "$STATE_DIR/.state-prune.XXXXXX")" || return 1
+    if ! jq --arg now "$RUN_AT" \
+        --argjson now_epoch "$now_epoch" \
+        --argjson cutoff "$cutoff" \
+        --slurpfile source "$movies_file" '
+        ($source[0] | map(.id | tostring)) as $present
+        | .movies //= {}
+        | .movieRetirements //= {}
+        | .sidecarManifests //= {}
+        | .sidecarCleanupActions //= {}
+        | reduce (.movies | keys[]) as $key (.;
+            if ($present | index($key)) != null then
+                del(.movies[$key].absentFromArrAt, .movies[$key].absentFromArrEpoch)
+              else
+                .movies[$key].absentFromArrAt //= $now
+                | .movies[$key].absentFromArrEpoch //= $now_epoch
+              end
+          )
+        | . as $state
+        | [
+            $state.movies | to_entries[]
+            | select(
+                (.value.absentFromArrEpoch // $now_epoch) <= $cutoff
+                and $state.sidecarManifests[.key] == null
+              )
+            | .key
+          ] as $keys
+        | reduce $keys[] as $key (.;
+            del(.movies[$key], .movieRetirements[$key], .sidecarCleanupActions[$key])
+          )
+        | .lastPrunedCount = ($keys | length)
+    ' "$WORK_STATE" > "$next"; then
+        rm -f -- "$next"
+        return 1
+    fi
+    pruned="$(jq -r '.lastPrunedCount // 0' "$next")"
+    mv -f -- "$next" "$WORK_STATE"
+    ((STATE_PRUNED += pruned))
+    (( pruned == 0 )) || log INFO "Pruned $pruned Radarr movie state record(s) absent for at least $STATE_PRUNE_ABSENT_DAYS days."
+}
+
 radarr_commit_state() {
     local final backup had_errors
     final="$(mktemp "$STATE_DIR/.state-final.XXXXXX")" || return 1
@@ -2827,12 +3932,13 @@ radarr_commit_state() {
     (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )) && had_errors=true
 
     if ! jq --arg now "$RUN_AT" --argjson had_errors "$had_errors" '
-        .version = 4
+        .version = 5
         | .lastRun = $now
         | .lastRunHadApiErrors = $had_errors
         | .movies //= {}
         | .sidecarManifests //= {}
         | .sidecarCleanupActions //= {}
+        | .movieRetirements //= {}
     ' "$WORK_STATE" > "$final" ||
        ! jq -e 'type == "object" and (.movies | type == "object")' "$final" >/dev/null; then
         rm -f -- "$final"
@@ -2895,6 +4001,12 @@ FOLDERS_REMOVED=0
 FOLDER_CLEANUP_PENDING=0
 MOVER_DEFERRALS=0
 MOVER_GUARD_NOTICE_LOGGED=false
+STATE_PRUNED=0
+RETIREMENTS_STARTED=0
+RETIREMENTS_CANCELLED=0
+ARR_REMOVALS=0
+RADARR_QUEUE_JSON='{"records":[]}'
+RADARR_QUEUE_AVAILABLE=false
 TAG_CATALOG=''
 PLEX_DELETED_MOVIE_TAG_ID=''
 
@@ -2908,11 +4020,14 @@ trap 'exit 130' INT TERM
     die "RADARR_REQUIRE_MOVIE_UNMONITORED must be true or false."
 [[ "$PLEX_DELETED_MOVIE_TAG" =~ ^[a-z0-9-]+$ ]] ||
     die "PLEX_DELETED_MOVIE_TAG may contain only lowercase letters, numbers, and hyphens."
+[[ "$RADARR_RETIREMENT_EXEMPT_TAG" =~ ^[a-z0-9-]+$ &&
+   "$RADARR_RETIREMENT_PENDING_TAG" =~ ^[a-z0-9-]+$ ]] ||
+    die "Radarr retirement tags may contain only lowercase letters, numbers, and hyphens."
 
 if [[ ! -f "$STATE_FILE" ]]; then
     INITIAL_STATE="$(mktemp "$STATE_DIR/.state-initial.XXXXXX")" ||
         die "Cannot create initial state file."
-    printf '%s\n' '{"version":4,"lastRun":null,"lastRunHadApiErrors":false,"movies":{},"sidecarManifests":{},"sidecarCleanupActions":{}}' > "$INITIAL_STATE" &&
+    printf '%s\n' '{"version":5,"lastRun":null,"lastRunHadApiErrors":false,"movies":{},"sidecarManifests":{},"sidecarCleanupActions":{},"movieRetirements":{}}' > "$INITIAL_STATE" &&
         mv -f -- "$INITIAL_STATE" "$STATE_FILE" || {
             rm -f -- "$INITIAL_STATE"
             die "Cannot create state file."
@@ -2944,6 +4059,11 @@ if ! jq -e '.appName == "Radarr"' >/dev/null 2>&1 <<< "$SYSTEM"; then
     die "Configured RADARR_URL did not identify itself as Radarr."
 fi
 log INFO "Connected to Radarr $(jq -r '.version // "unknown"' <<< "$SYSTEM")."
+
+load_tag_catalog || {
+    ((API_FAILURES += 1))
+    die "Could not load Radarr tags; state was not changed."
+}
 
 if [[ "$TRIGGER_LIBRARY_RESCAN" == true ]]; then
     RESCAN_ID="$(start_arr_command '{"name":"RescanMovie"}')" || {
@@ -3026,6 +4146,28 @@ radarr_apply_snapshot "$CURRENT_SNAPSHOT_FILE" "$SIDECAR_BATCH_FILE" ||
 rm -f -- "$SIDECAR_BATCH_FILE"
 SIDECAR_BATCH_FILE=""
 
+if [[ "$RADARR_RETIRE_FULLY_DELETED_MOVIES" == true ]]; then
+    if load_arr_queue radarr; then
+        queue_stateful_resolution_notification Radarr "queue:radarr:retirement" \
+            "Radarr retirement queue check restored" \
+            "Queue status is available again; eligible retirement work may continue."
+    else
+        log WARNING "Radarr queue status is unavailable; retirement starts and removals are deferred."
+        queue_stateful_attention_notification WARNING Radarr \
+            "queue:radarr:retirement" unavailable \
+            "Radarr retirement queue check unavailable" \
+            "Normal delete-sync work continues, but no movie retirement will start or complete until queue status is available." \
+            "$FOLDER_BLOCKER_REMINDER_DAYS"
+    fi
+fi
+
+radarr_process_monitored_fileless_watchdog "$CURRENT_SNAPSHOT_FILE" || {
+    ((API_FAILURES += 1))
+    log ERROR "Radarr monitored-fileless watchdog failed."
+    queue_attention_notification ERROR Radarr "Monitored-fileless watchdog failed" \
+        "The main workflow continues, but watchdog state could not be evaluated."
+}
+
 FIRST_MISSING="$(radarr_new_candidate_count)"
 (( FIRST_MISSING == 0 )) || radarr_log_new_candidates
 
@@ -3034,11 +4176,7 @@ CONFIRMED="$(radarr_confirmed_movies "$CURRENT_SNAPSHOT_FILE")" ||
 MOVIES_CONFIRMED="$(jq length <<< "$CONFIRMED")"
 
 if (( MOVIES_CONFIRMED > 0 )); then
-    if ! load_tag_catalog; then
-        ((API_FAILURES += 1))
-        log ERROR "Could not load Radarr tags; confirmed movies will be retried next run."
-    else
-        PLEX_DELETED_MOVIE_TAG_ID="$(jq -r --arg label "$PLEX_DELETED_MOVIE_TAG" 'first(.[] | select(.label == $label) | .id) // empty' <<< "$TAG_CATALOG")"
+    PLEX_DELETED_MOVIE_TAG_ID="$(jq -r --arg label "$PLEX_DELETED_MOVIE_TAG" 'first(.[] | select(.label == $label) | .id) // empty' <<< "$TAG_CATALOG")"
         ACTION_CANDIDATES="$(radarr_movies_missing_tag "$CONFIRMED" "$PLEX_DELETED_MOVIE_TAG_ID")" ||
             die "Could not calculate movies that need the '$PLEX_DELETED_MOVIE_TAG' tag."
         ACTION_CANDIDATE_COUNT="$(jq length <<< "$ACTION_CANDIDATES")"
@@ -3144,7 +4282,6 @@ if (( MOVIES_CONFIRMED > 0 )); then
                 fi
             fi
         fi
-    fi
 fi
 
 if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( MOVIES_CONFIRMED > 0 )); then
@@ -3211,12 +4348,19 @@ if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( MOVIES_CONFIRMED > 0 )); then
     done < <(jq -c '.[]' <<< "$CONFIRMED")
 fi
 
+radarr_process_retirements "$CURRENT_SNAPSHOT_FILE" || {
+    ((API_FAILURES += 1))
+    log ERROR "Radarr retirement processing failed; unfinished work will be retried."
+    queue_attention_notification ERROR Radarr "Radarr retirement processing failed" \
+        "No unsafe removal was attempted; unfinished retirement work will be retried next run."
+}
+radarr_prune_state "$CURRENT_SNAPSHOT_FILE" || die "Could not prune stale Radarr state safely."
 radarr_commit_state || die "Could not atomically save state."
 WORK_STATE=""
 
 ACTION_LABEL=applied
 [[ "$DRY_RUN" == true ]] && ACTION_LABEL=would-apply
-log INFO "Summary: movies-listed=$MOVIES_LISTED, movies-scanned=$MOVIES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$MOVIES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, tag-actions-$ACTION_LABEL=$TAG_ACTIONS, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, late-sidecar-candidates=$SIDECARS_LATE_CANDIDATES, late-sidecars-confirmed-$ACTION_LABEL=$SIDECARS_LATE_CONFIRMED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, folder-cleanup-pending=$FOLDER_CLEANUP_PENDING, mover-deferrals=$MOVER_DEFERRALS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
+log INFO "Summary: movies-listed=$MOVIES_LISTED, movies-scanned=$MOVIES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$MOVIES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, tag-actions-$ACTION_LABEL=$TAG_ACTIONS, retirements-started=$RETIREMENTS_STARTED, retirements-cancelled=$RETIREMENTS_CANCELLED, arr-removals=$ARR_REMOVALS, state-pruned=$STATE_PRUNED, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, late-sidecar-candidates=$SIDECARS_LATE_CANDIDATES, late-sidecars-confirmed-$ACTION_LABEL=$SIDECARS_LATE_CONFIRMED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, folder-cleanup-pending=$FOLDER_CLEANUP_PENDING, mover-deferrals=$MOVER_DEFERRALS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
 
 if (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )); then
     FAILURE_SEVERITY=WARNING
