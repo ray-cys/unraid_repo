@@ -1,178 +1,189 @@
 #!/bin/bash
 
 ###############################################################################
-# Unraid Boot Device Backup v2.0
+# Unraid Boot Device Backup v3.0
 #
-# Designed for Unraid 7.4+
+# Designed for Unraid 7.4+ while remaining resilient to future changes in the
+# private WebGUI backup helper.
 #
-# Unraid 7.4 changed its native flash_backup helper to stream ZIP data to
-# standard output. This script writes that stream directly into a hidden file
-# on the configured SSD pool, verifies the completed ZIP, and atomically
-# publishes it. Previous backups are pruned only after a new backup succeeds.
+# BACKENDS
+# --------
+#   auto    Prefer the native streaming helper when its current capabilities
+#           are detected. Fall back to a direct /boot ZIP when the helper is
+#           missing, incompatible, times out, or produces an invalid archive.
+#   native  Require the native streaming helper and never fall back.
+#   direct  Build the ZIP directly from the boot device.
+#
+# Every backend uses the same safety gates: destination mount validation,
+# timeout protection, full ZIP verification, archive-path validation, minimum
+# content checks, SHA-256 sidecar creation, atomic publication, and retention
+# only after the new generation and persistent state are complete.
 ###############################################################################
 
 set -uo pipefail
+
+readonly SCRIPT_VERSION="3.0"
 
 ###############################################################################
 # CONFIGURATION
 ###############################################################################
 
-BACKUP_DIR="/mnt/vault/backup/flash"
-POOL_PATH="/mnt/vault"
+BACKUP_DIR="${BACKUP_DIR:-/mnt/vault/backup/flash}"
+POOL_PATH="${POOL_PATH:-/mnt/vault}"
+BOOT_SOURCE="${BOOT_SOURCE:-/boot}"
 
-MAX_BACKUPS=2
-COMPRESSION_LEVEL=6
+# auto, native, or direct
+BACKUP_BACKEND="${BACKUP_BACKEND:-auto}"
 
-HELPER="/usr/local/emhttp/webGui/scripts/flash_backup"
-NOTIFY="/usr/local/emhttp/webGui/scripts/notify"
+MAX_BACKUPS="${MAX_BACKUPS:-2}"
+COMPRESSION_LEVEL="${COMPRESSION_LEVEL:-6}"
+MIN_ARCHIVE_FILES="${MIN_ARCHIVE_FILES:-10}"
 
-LOCKFILE="/tmp/flash_backup.lock"
+SIZE_TIMEOUT_SECONDS="${SIZE_TIMEOUT_SECONDS:-300}"
+BACKUP_TIMEOUT_SECONDS="${BACKUP_TIMEOUT_SECONDS:-3600}"
 
-LOG_DIR="/mnt/user/cloud/logs/script/flash_backup"
-LOG_FILE="${LOG_DIR}/flash_backup.log"
-LOG_MAX_BYTES=$((2 * 1024 * 1024))
-LOG_KEEP=3
+HELPER="${HELPER:-/usr/local/emhttp/webGui/scripts/flash_backup}"
+NOTIFY="${NOTIFY:-/usr/local/emhttp/webGui/scripts/notify}"
+TIMEOUT_BIN="${TIMEOUT_BIN:-timeout}"
+
+LOCKFILE="${LOCKFILE:-/tmp/flash_backup.lock}"
+
+LOG_DIR="${LOG_DIR:-/mnt/user/cloud/logs/script/flash_backup}"
+LOG_FILE="${LOG_FILE:-${LOG_DIR}/flash_backup.log}"
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-$((2 * 1024 * 1024))}"
+LOG_KEEP="${LOG_KEEP:-3}"
+
+STATE_FILE="${STATE_FILE:-${BACKUP_DIR}/.flash_backup_state.json}"
+
+RECOMMENDED_ARCHIVE_PATHS=(
+    "config/super.dat"
+    "config/ident.cfg"
+)
 
 ###############################################################################
-# INITIALIZATION
+# RUNTIME STATE
 ###############################################################################
 
 START_TIME=$(date +%s)
 
 HELPER_LOG=""
+ARCHIVE_LIST_FILE=""
 TEMP_FILE=""
+TEMP_CHECKSUM=""
 WRITE_TEST=""
 
 LOG_READY=false
 LOG_FAILURE_REPORTED=false
+
+SELECTED_BACKEND=""
+ESTIMATED_SOURCE_BYTES=0
+GENERATED_SIZE=0
+ARCHIVE_FILE_COUNT=0
+ARCHIVE_SHA256=""
+ARCHIVE_WARNING_TEXT=""
+BACKEND_FAILURE_REASON=""
+NATIVE_FAILURE_REASON=""
+
+FALLBACK_USED=false
+PLATFORM_CHANGE_DETECTED=false
+PLATFORM_CHANGE_SUMMARY=""
+
+SERVER_NAME=""
+OS_VERSION=""
+SERVER_SLUG=""
+VERSION_SLUG=""
+HELPER_SHA256="missing"
+
+BACKUP_NAME=""
+BACKUP_FILE=""
+CHECKSUM_FILE=""
+
+DIRECT_ITEMS=()
+ARCHIVE_WARNINGS=()
+PLATFORM_CHANGES=()
 
 ###############################################################################
 # GENERAL HELPERS
 ###############################################################################
 
 log() {
-
     local line
-
     line="$(date '+%Y/%m/%d %T') : $*"
-
     printf '%s\n' "$line"
 
     if [ "$LOG_READY" = true ]; then
-
         if ! printf '%s\n' "$line" >>"$LOG_FILE"; then
-
             LOG_READY=false
-
             if [ "$LOG_FAILURE_REPORTED" = false ]; then
-
                 LOG_FAILURE_REPORTED=true
-
                 printf '%s : WARNING: Persistent log became unavailable: %s\n' \
-                    "$(date '+%Y/%m/%d %T')" \
-                    "$LOG_FILE" \
-                    >&2
-
+                    "$(date '+%Y/%m/%d %T')" "$LOG_FILE" >&2
             fi
         fi
     fi
-
 }
 
 rotate_logs() {
-
     [ -f "$LOG_FILE" ] || return 0
 
-    local size
-    local i
-
+    local size i
     size=$(stat -c '%s' "$LOG_FILE" 2>/dev/null || echo 0)
-
     [[ "$size" =~ ^[0-9]+$ ]] || size=0
-
     (( size >= LOG_MAX_BYTES )) || return 0
 
     if (( LOG_KEEP <= 0 )); then
-
         : >"$LOG_FILE"
         return $?
-
     fi
 
     rm -f -- "${LOG_FILE}.${LOG_KEEP}" 2>/dev/null || return 1
-
     for ((i=LOG_KEEP-1; i>=1; i--)); do
-
         if [ -f "${LOG_FILE}.${i}" ]; then
-
-            mv -f -- \
-                "${LOG_FILE}.${i}" \
+            mv -f -- "${LOG_FILE}.${i}" \
                 "${LOG_FILE}.$((i + 1))" || return 1
-
         fi
     done
-
     mv -f -- "$LOG_FILE" "${LOG_FILE}.1"
-
 }
 
 initialize_logging() {
-
     local rotation_ok=true
 
     if ! [[ "$LOG_MAX_BYTES" =~ ^[0-9]+$ ]] ||
        ! [[ "$LOG_KEEP" =~ ^[0-9]+$ ]] ||
        (( LOG_MAX_BYTES <= 0 ))
     then
-
         log "WARNING: Invalid log rotation configuration; persistent logging disabled"
         return 0
-
     fi
 
     if ! mkdir -p -- "$LOG_DIR" 2>/dev/null; then
-
         log "WARNING: Persistent log directory unavailable: $LOG_DIR"
         return 0
-
     fi
 
     rotate_logs || rotation_ok=false
-
     if ! : >>"$LOG_FILE"; then
-
         log "WARNING: Persistent log is not writable: $LOG_FILE"
         return 0
-
     fi
 
     LOG_READY=true
-
-    if [ "$rotation_ok" = false ]; then
-
+    [ "$rotation_ok" = true ] || \
         log "WARNING: Log rotation failed; continuing with the current log"
-
-    fi
-
     log "Persistent log: $LOG_FILE"
-
 }
 
 runtime() {
-
     local seconds=$(( $(date +%s) - START_TIME ))
-
     printf '%dh:%dm:%ds' \
         $((seconds / 3600)) \
         $(((seconds % 3600) / 60)) \
         $((seconds % 60))
-
 }
 
 bytes_human() {
-
     local bytes="${1:-0}"
-
     awk -v b="$bytes" '
         BEGIN {
             if (b >= 1099511627776)
@@ -187,556 +198,830 @@ bytes_human() {
                 printf "%d B", b
         }
     '
-
 }
 
 notify() {
-
-    local importance="$1"
-    local description="$2"
-    local message="$3"
+    local importance="$1" description="$2" message="$3"
 
     if [ "$LOG_READY" = true ]; then
-
         message+=$'\n\n'"Log: $LOG_FILE"
-
     else
-
-        message+=$'\n\n'"Persistent log unavailable; see the User Scripts output or Unraid system log."
-
+        message+=$'\n\n'"Persistent log unavailable; see the User Scripts output."
     fi
 
     if [ ! -x "$NOTIFY" ]; then
-
         log "WARNING: Unraid notify command not found"
         return 0
-
     fi
 
-    "$NOTIFY" \
-        -i "$importance" \
-        -s "Boot Device Backup" \
-        -d "$description" \
-        -m "$message" \
-        >/dev/null 2>&1 || \
+    "$NOTIFY" -i "$importance" -s "Boot Device Backup" \
+        -d "$description" -m "$message" >/dev/null 2>&1 || \
         log "WARNING: Notification command failed"
-
 }
 
-# Invoked indirectly by the EXIT trap below.
 # shellcheck disable=SC2329
 cleanup() {
-
-    local exit_code=$?
-    local file
-
+    local exit_code=$? file
     trap - EXIT
 
-    for file in "$HELPER_LOG" "$TEMP_FILE" "$WRITE_TEST"; do
-
+    for file in \
+        "$HELPER_LOG" \
+        "$ARCHIVE_LIST_FILE" \
+        "$TEMP_FILE" \
+        "$TEMP_CHECKSUM" \
+        "$WRITE_TEST"
+    do
         [ -n "$file" ] || continue
         [ -e "$file" ] || continue
-
-        if ! rm -f -- "$file"; then
-
+        rm -f -- "$file" || \
             log "WARNING: Unable to remove temporary file: $file"
-
-        fi
     done
 
     return "$exit_code"
+}
 
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || {
+        log "ERROR: Required command not found: $1"
+        return 1
+    }
+}
+
+run_with_timeout() {
+    local seconds="$1"
+    shift
+    "$TIMEOUT_BIN" --signal=TERM --kill-after=30s "${seconds}s" "$@"
 }
 
 log_helper_diagnostics() {
-
     [ -s "$HELPER_LOG" ] || return 0
-
-    log "Native helper diagnostics follow:"
-
+    log "Backend diagnostics follow:"
     while IFS= read -r line; do
-
-        log "HELPER: $line"
-
+        log "BACKEND: $line"
     done <"$HELPER_LOG"
-
 }
 
 read_unraid_value() {
-
-    local key="$1"
-    local fallback="$2"
-    local value
-
+    local key="$1" fallback="$2" value
     value=$(
         awk -v wanted="$key" '
             {
                 separator = index($0, "=")
-
-                if (separator <= 1)
-                    next
-
+                if (separator <= 1) next
                 name = substr($0, 1, separator - 1)
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
-
-                if (name != wanted)
-                    next
-
+                if (name != wanted) next
                 result = substr($0, separator + 1)
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", result)
-
                 if (result ~ /^".*"$/)
                     result = substr(result, 2, length(result) - 2)
-
                 print result
                 exit
             }
         ' /var/local/emhttp/var.ini 2>/dev/null
     )
-
     printf '%s' "${value:-$fallback}"
-
 }
 
 filename_component() {
-
     printf '%s' "$1" |
         tr '[:upper:] ' '[:lower:]_' |
-        sed -E \
-            's/[^a-z0-9._-]+/_/g; s/^[_ .-]+//; s/[_ .-]+$//'
-
-}
-
-verify_zip() {
-
-    local file="$1"
-
-    [ -f "$file" ] || return 1
-    [ -s "$file" ] || return 1
-
-    if command -v unzip >/dev/null 2>&1; then
-
-        unzip -tq "$file" >/dev/null 2>&1
-        return $?
-
-    fi
-
-    local sig
-
-    sig=$(head -c 4 "$file" 2>/dev/null || true)
-
-    case "$sig" in
-        $'PK\003\004'|$'PK\005\006'|$'PK\007\008')
-            return 0
-            ;;
-    esac
-
-    return 1
-
+        sed -E 's/[^a-z0-9._-]+/_/g; s/^[_ .-]+//; s/[_ .-]+$//'
 }
 
 available_bytes() {
-
     local value
-
     value=$(
         df -B1 --output=avail "$BACKUP_DIR" 2>/dev/null |
-        tail -n 1 |
-        tr -d ' '
+        tail -n 1 | tr -d ' '
     )
+    [[ "$value" =~ ^[0-9]+$ ]] && printf '%s' "$value" || printf '0'
+}
 
-    if [[ "$value" =~ ^[0-9]+$ ]]; then
+join_array() {
+    local separator="$1"
+    shift
+    local result="" value
+    for value in "$@"; do
+        [ -n "$result" ] && result+="$separator"
+        result+="$value"
+    done
+    printf '%s' "$result"
+}
 
-        printf '%s' "$value"
+###############################################################################
+# PLATFORM AND STATE
+###############################################################################
 
-    else
+initialize_identity() {
+    local host_fallback
+    host_fallback=$(hostname -s 2>/dev/null || printf 'tower')
+    SERVER_NAME=$(read_unraid_value "NAME" "$host_fallback")
+    OS_VERSION=$(read_unraid_value "version" "unknown")
+    SERVER_SLUG=$(filename_component "$SERVER_NAME")
+    VERSION_SLUG=$(filename_component "$OS_VERSION")
+    [ -n "$SERVER_SLUG" ] || SERVER_SLUG="tower"
+    [ -n "$VERSION_SLUG" ] || VERSION_SLUG="unknown"
 
-        printf '0'
+    if [ -f "$HELPER" ]; then
+        HELPER_SHA256=$(sha256sum "$HELPER" 2>/dev/null | awk '{print $1}')
+        [ -n "$HELPER_SHA256" ] || HELPER_SHA256="unreadable"
+    fi
+}
 
+detect_platform_changes() {
+    [ -f "$STATE_FILE" ] || return 0
+
+    if ! jq -e . "$STATE_FILE" >/dev/null 2>&1; then
+        PLATFORM_CHANGE_DETECTED=true
+        PLATFORM_CHANGES+=("previous state file is unreadable")
+        PLATFORM_CHANGE_SUMMARY=$(join_array "; " "${PLATFORM_CHANGES[@]}")
+        return 0
     fi
 
+    local old_version old_helper_hash
+    old_version=$(jq -r '.unraidVersion // ""' "$STATE_FILE")
+    old_helper_hash=$(jq -r '.helperSha256 // ""' "$STATE_FILE")
+
+    if [ -n "$old_version" ] && [ "$old_version" != "$OS_VERSION" ]; then
+        PLATFORM_CHANGES+=("Unraid ${old_version} -> ${OS_VERSION}")
+    fi
+    if [ -n "$old_helper_hash" ] && [ "$old_helper_hash" != "$HELPER_SHA256" ]; then
+        PLATFORM_CHANGES+=("native helper changed")
+    fi
+
+    if (( ${#PLATFORM_CHANGES[@]} > 0 )); then
+        PLATFORM_CHANGE_DETECTED=true
+        PLATFORM_CHANGE_SUMMARY=$(join_array "; " "${PLATFORM_CHANGES[@]}")
+        log "Platform change detected: $PLATFORM_CHANGE_SUMMARY"
+        log "Full integrity and archive-content validation will be required"
+    fi
+}
+
+write_state() {
+    local now tmp
+    now=$(date +%s)
+    tmp="${STATE_FILE}.tmp.$$"
+
+    if ! jq -n \
+        --argjson schemaVersion 1 \
+        --arg scriptVersion "$SCRIPT_VERSION" \
+        --arg unraidVersion "$OS_VERSION" \
+        --arg helperPath "$HELPER" \
+        --arg helperSha256 "$HELPER_SHA256" \
+        --arg backend "$SELECTED_BACKEND" \
+        --argjson fallbackUsed "$FALLBACK_USED" \
+        --arg backupFile "$BACKUP_FILE" \
+        --arg archiveSha256 "$ARCHIVE_SHA256" \
+        --arg archiveWarnings "$ARCHIVE_WARNING_TEXT" \
+        --arg platformChange "$PLATFORM_CHANGE_SUMMARY" \
+        --argjson archiveBytes "$GENERATED_SIZE" \
+        --argjson archiveFiles "$ARCHIVE_FILE_COUNT" \
+        --argjson successfulAt "$now" \
+        '{
+            schemaVersion: $schemaVersion,
+            scriptVersion: $scriptVersion,
+            unraidVersion: $unraidVersion,
+            helperPath: $helperPath,
+            helperSha256: $helperSha256,
+            backend: $backend,
+            fallbackUsed: $fallbackUsed,
+            backupFile: $backupFile,
+            archiveSha256: $archiveSha256,
+            archiveBytes: $archiveBytes,
+            archiveFiles: $archiveFiles,
+            archiveWarnings: $archiveWarnings,
+            platformChange: $platformChange,
+            successfulAt: $successfulAt
+        }' >"$tmp"
+    then
+        rm -f -- "$tmp"
+        return 1
+    fi
+
+    chmod 0644 "$tmp" 2>/dev/null || true
+    if ! mv -f -- "$tmp" "$STATE_FILE"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+###############################################################################
+# BACKEND CAPABILITY AND GENERATION
+###############################################################################
+
+native_size_estimate() {
+    local output rc
+    [ -x "$HELPER" ] || {
+        NATIVE_FAILURE_REASON="native helper is missing or not executable"
+        return 1
+    }
+
+    : >"$HELPER_LOG"
+    output=$(run_with_timeout "$SIZE_TIMEOUT_SECONDS" \
+        "$HELPER" size 2>"$HELPER_LOG")
+    rc=$?
+    output=${output//[[:space:]]/}
+
+    if (( rc == 124 || rc == 137 )); then
+        NATIVE_FAILURE_REASON="native size query timed out"
+        return 1
+    fi
+    if (( rc != 0 )); then
+        NATIVE_FAILURE_REASON="native size query failed with exit code $rc"
+        return 1
+    fi
+    if ! [[ "$output" =~ ^[0-9]+$ ]] || (( output <= 0 )); then
+        NATIVE_FAILURE_REASON="native helper does not support a numeric size query"
+        return 1
+    fi
+
+    ESTIMATED_SOURCE_BYTES="$output"
+    return 0
+}
+
+build_direct_items() {
+    local path base
+    DIRECT_ITEMS=()
+
+    [ -d "$BOOT_SOURCE" ] && [ -r "$BOOT_SOURCE" ] || {
+        BACKEND_FAILURE_REASON="boot source is unavailable: $BOOT_SOURCE"
+        return 1
+    }
+
+    shopt -s nullglob dotglob
+    for path in "$BOOT_SOURCE"/*; do
+        base=${path##*/}
+        case "$base" in
+            prev|previous|System\ Volume\ Information|.Trash-0|.Trashes|\
+            .Spotlight-V100|.fseventsd|.TemporaryItems)
+                continue
+                ;;
+            *-boot-backup-*.zip|*-flash-backup-*.zip)
+                continue
+                ;;
+        esac
+        DIRECT_ITEMS+=("./$base")
+    done
+    shopt -u dotglob
+
+    if (( ${#DIRECT_ITEMS[@]} == 0 )); then
+        BACKEND_FAILURE_REASON="boot source contains no eligible backup content"
+        return 1
+    fi
+}
+
+direct_size_estimate() {
+    local output rc
+    build_direct_items || return 1
+    require_command zip || {
+        BACKEND_FAILURE_REASON="zip is unavailable for the direct backend"
+        return 1
+    }
+    require_command du || {
+        BACKEND_FAILURE_REASON="du is unavailable for the direct backend"
+        return 1
+    }
+
+    : >"$HELPER_LOG"
+    output=$(
+        cd "$BOOT_SOURCE" || exit 1
+        run_with_timeout "$SIZE_TIMEOUT_SECONDS" \
+            du -sbc "${DIRECT_ITEMS[@]}" 2>>"$HELPER_LOG" |
+            awk 'END {print $1}'
+    )
+    rc=$?
+    output=${output//[[:space:]]/}
+
+    if (( rc == 124 || rc == 137 )); then
+        BACKEND_FAILURE_REASON="direct size query timed out"
+        return 1
+    fi
+    if (( rc != 0 )) || ! [[ "$output" =~ ^[0-9]+$ ]] || (( output <= 0 )); then
+        BACKEND_FAILURE_REASON="direct backend could not calculate source size"
+        return 1
+    fi
+
+    ESTIMATED_SOURCE_BYTES="$output"
+    return 0
+}
+
+select_backend() {
+    case "$BACKUP_BACKEND" in
+        native)
+            native_size_estimate || {
+                BACKEND_FAILURE_REASON="$NATIVE_FAILURE_REASON"
+                return 1
+            }
+            SELECTED_BACKEND="native"
+            ;;
+
+        direct)
+            direct_size_estimate || return 1
+            SELECTED_BACKEND="direct"
+            ;;
+
+        auto)
+            if native_size_estimate; then
+                SELECTED_BACKEND="native"
+            else
+                FALLBACK_USED=true
+                log "WARNING: $NATIVE_FAILURE_REASON"
+                log "Switching to the self-contained direct ZIP backend"
+                log_helper_diagnostics
+                direct_size_estimate || return 1
+                SELECTED_BACKEND="direct"
+            fi
+            ;;
+
+        *)
+            BACKEND_FAILURE_REASON="BACKUP_BACKEND must be auto, native, or direct"
+            return 1
+            ;;
+    esac
+}
+
+create_native_archive() {
+    local rc
+    : >"$HELPER_LOG"
+    run_with_timeout "$BACKUP_TIMEOUT_SECONDS" \
+        "$HELPER" "$COMPRESSION_LEVEL" \
+        >"$TEMP_FILE" 2>"$HELPER_LOG"
+    rc=$?
+
+    if (( rc == 124 || rc == 137 )); then
+        BACKEND_FAILURE_REASON="native backup generation timed out"
+        return 1
+    fi
+    if (( rc != 0 )); then
+        BACKEND_FAILURE_REASON="native helper exited with code $rc"
+        return 1
+    fi
+}
+
+create_direct_archive() {
+    local rc
+    local -a zip_command=(
+        zip "-${COMPRESSION_LEVEL}" -qr - "${DIRECT_ITEMS[@]}"
+    )
+
+    if command -v ionice >/dev/null 2>&1; then
+        zip_command=(ionice -c2 -n7 "${zip_command[@]}")
+    fi
+    if command -v nice >/dev/null 2>&1; then
+        zip_command=(nice -n 19 "${zip_command[@]}")
+    fi
+
+    : >"$HELPER_LOG"
+    (
+        cd "$BOOT_SOURCE" || exit 1
+        run_with_timeout "$BACKUP_TIMEOUT_SECONDS" "${zip_command[@]}"
+    ) >"$TEMP_FILE" 2>"$HELPER_LOG"
+    rc=$?
+
+    if (( rc == 124 || rc == 137 )); then
+        BACKEND_FAILURE_REASON="direct backup generation timed out"
+        return 1
+    fi
+    if (( rc != 0 )); then
+        BACKEND_FAILURE_REASON="direct ZIP backend exited with code $rc"
+        return 1
+    fi
+}
+
+create_selected_archive() {
+    case "$SELECTED_BACKEND" in
+        native) create_native_archive ;;
+        direct) create_direct_archive ;;
+        *)
+            BACKEND_FAILURE_REASON="no backup backend was selected"
+            return 1
+            ;;
+    esac
+}
+
+###############################################################################
+# ARCHIVE VALIDATION
+###############################################################################
+
+archive_has_path() {
+    local wanted="$1"
+    awk -v wanted="$wanted" '
+        {
+            value=$0
+            sub(/^\.\//, "", value)
+            sub(/\/$/, "", value)
+            if (value == wanted) found=1
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$ARCHIVE_LIST_FILE"
+}
+
+validate_archive() {
+    local file="$1" recommended
+    ARCHIVE_WARNINGS=()
+    ARCHIVE_WARNING_TEXT=""
+
+    [ -s "$file" ] || {
+        BACKEND_FAILURE_REASON="$SELECTED_BACKEND backend produced an empty archive"
+        return 1
+    }
+
+    if ! unzip -tq "$file" >/dev/null 2>&1; then
+        BACKEND_FAILURE_REASON="$SELECTED_BACKEND backend produced an invalid ZIP"
+        return 1
+    fi
+
+    if ! unzip -Z1 "$file" >"$ARCHIVE_LIST_FILE" 2>"$HELPER_LOG"; then
+        BACKEND_FAILURE_REASON="unable to list the generated ZIP"
+        return 1
+    fi
+
+    if ! awk '
+        {
+            path=$0
+            gsub(/\\/, "/", path)
+            if (path ~ /^\// || path ~ /^[A-Za-z]:\// ||
+                path ~ /(^|\/)\.\.(\/|$)/) bad=1
+        }
+        END { exit(bad ? 1 : 0) }
+    ' "$ARCHIVE_LIST_FILE"
+    then
+        BACKEND_FAILURE_REASON="generated ZIP contains an unsafe path"
+        return 1
+    fi
+
+    ARCHIVE_FILE_COUNT=$(
+        awk 'substr($0, length($0), 1) != "/" {count++}
+             END {print count+0}' "$ARCHIVE_LIST_FILE"
+    )
+    if ! [[ "$ARCHIVE_FILE_COUNT" =~ ^[0-9]+$ ]] ||
+       (( ARCHIVE_FILE_COUNT < MIN_ARCHIVE_FILES ))
+    then
+        BACKEND_FAILURE_REASON="generated ZIP contains only ${ARCHIVE_FILE_COUNT:-0} files; minimum is $MIN_ARCHIVE_FILES"
+        return 1
+    fi
+
+    if ! awk '
+        {
+            path=$0
+            sub(/^\.\//, "", path)
+            if (path == "config" || path ~ /^config\//) found=1
+        }
+        END {exit(found ? 0 : 1)}
+    ' "$ARCHIVE_LIST_FILE"
+    then
+        BACKEND_FAILURE_REASON="generated ZIP does not contain the config tree"
+        return 1
+    fi
+
+    for recommended in "${RECOMMENDED_ARCHIVE_PATHS[@]}"; do
+        archive_has_path "$recommended" || \
+            ARCHIVE_WARNINGS+=("missing recommended path: $recommended")
+    done
+
+    if ! awk '
+        {
+            path=$0
+            sub(/^\.\//, "", path)
+            if (path ~ /^config\/[^/]+\.key$/) found=1
+        }
+        END {exit(found ? 0 : 1)}
+    ' "$ARCHIVE_LIST_FILE"
+    then
+        ARCHIVE_WARNINGS+=("no config/*.key license file found; this can be normal with TPM or internal-boot licensing")
+    fi
+
+    if (( ${#ARCHIVE_WARNINGS[@]} > 0 )); then
+        ARCHIVE_WARNING_TEXT=$(join_array "; " "${ARCHIVE_WARNINGS[@]}")
+        log "Archive content warning: $ARCHIVE_WARNING_TEXT"
+    fi
+
+    GENERATED_SIZE=$(stat -c '%s' "$file" 2>/dev/null || echo 0)
+    if ! [[ "$GENERATED_SIZE" =~ ^[0-9]+$ ]] || (( GENERATED_SIZE <= 0 )); then
+        BACKEND_FAILURE_REASON="unable to read generated archive size"
+        return 1
+    fi
+
+    ARCHIVE_SHA256=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
+    [[ "$ARCHIVE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || {
+        BACKEND_FAILURE_REASON="unable to calculate archive SHA-256"
+        return 1
+    }
+
+    log "Archive integrity and content validation passed"
+    log "Archive files: $ARCHIVE_FILE_COUNT"
+    log "Archive SHA-256: $ARCHIVE_SHA256"
+}
+
+check_destination_space() {
+    local available required
+    available=$(available_bytes)
+    required=$((
+        ESTIMATED_SOURCE_BYTES +
+        ESTIMATED_SOURCE_BYTES / 10 +
+        1048576
+    ))
+
+    log "Estimated source content: $(bytes_human "$ESTIMATED_SOURCE_BYTES")"
+    log "Destination free space: $(bytes_human "$available")"
+    log "Conservative required space: $(bytes_human "$required")"
+
+    if (( available < required )); then
+        BACKEND_FAILURE_REASON="insufficient destination space: required $(bytes_human "$required"), available $(bytes_human "$available")"
+        return 1
+    fi
+}
+
+generate_with_fallback() {
+    log "Selected backend: $SELECTED_BACKEND"
+    check_destination_space || return 1
+
+    rm -f -- "$TEMP_FILE"
+    if create_selected_archive && validate_archive "$TEMP_FILE"; then
+        return 0
+    fi
+
+    log "WARNING: $BACKEND_FAILURE_REASON"
+    log_helper_diagnostics
+
+    if [ "$BACKUP_BACKEND" != "auto" ] || [ "$SELECTED_BACKEND" != "native" ]; then
+        return 1
+    fi
+
+    NATIVE_FAILURE_REASON="$BACKEND_FAILURE_REASON"
+    FALLBACK_USED=true
+    rm -f -- "$TEMP_FILE"
+
+    log "Retrying with the self-contained direct ZIP backend"
+    direct_size_estimate || return 1
+    SELECTED_BACKEND="direct"
+    check_destination_space || return 1
+
+    if ! create_direct_archive || ! validate_archive "$TEMP_FILE"; then
+        return 1
+    fi
+
+    return 0
+}
+
+###############################################################################
+# FINALIZATION AND RETENTION
+###############################################################################
+
+prepare_checksum_sidecar() {
+    TEMP_CHECKSUM="$BACKUP_DIR/.${BACKUP_NAME}.sha256.tmp.$$"
+    printf '%s  %s\n' "$ARCHIVE_SHA256" "$BACKUP_NAME" \
+        >"$TEMP_CHECKSUM" || return 1
+    chmod 0644 "$TEMP_CHECKSUM" 2>/dev/null || true
+}
+
+finalize_backup() {
+    prepare_checksum_sidecar || {
+        BACKEND_FAILURE_REASON="unable to prepare SHA-256 sidecar"
+        return 1
+    }
+
+    if ! mv -f -- "$TEMP_FILE" "$BACKUP_FILE"; then
+        BACKEND_FAILURE_REASON="unable to atomically publish the backup ZIP"
+        return 1
+    fi
+    TEMP_FILE=""
+
+    if ! mv -f -- "$TEMP_CHECKSUM" "$CHECKSUM_FILE"; then
+        BACKEND_FAILURE_REASON="backup ZIP was published but its SHA-256 sidecar could not be finalized"
+        rm -f -- "$BACKUP_FILE" || true
+        return 1
+    fi
+    TEMP_CHECKSUM=""
+
+    chown nobody:users "$BACKUP_FILE" "$CHECKSUM_FILE" 2>/dev/null || \
+        log "WARNING: Unable to set backup ownership"
+    chmod 0644 "$BACKUP_FILE" "$CHECKSUM_FILE" 2>/dev/null || \
+        log "WARNING: Unable to set backup permissions"
+
+    log "Backup and SHA-256 sidecar finalized successfully"
 }
 
 prune_backups() {
-
     local -a files=()
-    local entry
-    local count
-    local i
+    local entry count i checksum
 
     while IFS= read -r -d '' entry; do
-
         files+=("${entry#*|}")
-
     done < <(
-        find "$BACKUP_DIR" \
-            -maxdepth 1 \
-            -type f \
-            \( \
-                -name '*-boot-backup-*.zip' \
-                -o -name '*-flash-backup-*.zip' \
-            \) \
+        find "$BACKUP_DIR" -maxdepth 1 -type f \
+            \( -name '*-boot-backup-*.zip' -o -name '*-flash-backup-*.zip' \) \
             -printf '%T@|%p\0' 2>/dev/null |
             sort -z -t'|' -k1,1nr
     )
 
     count=${#files[@]}
-
     if (( count <= MAX_BACKUPS )); then
-
         log "Backup retention: ${count}/${MAX_BACKUPS}; nothing to prune"
         return 0
-
     fi
 
     for ((i=MAX_BACKUPS; i<count; i++)); do
-
+        checksum="${files[$i]}.sha256"
         log "Deleting old backup: ${files[$i]}"
-
-        if ! rm -f -- "${files[$i]}"; then
-
+        if rm -f -- "${files[$i]}"; then
+            [ ! -e "$checksum" ] || rm -f -- "$checksum" || \
+                log "WARNING: Unable to delete old checksum: $checksum"
+        else
             log "WARNING: Unable to delete old boot backup: ${files[$i]}"
-
         fi
     done
-
 }
 
 ###############################################################################
-# LOCK AND LOGGING
+# VALIDATION
 ###############################################################################
 
-exec 9>"$LOCKFILE"
+validate_configuration() {
+    local value
 
-if ! flock -n 9; then
+    for value in \
+        "$MAX_BACKUPS" \
+        "$COMPRESSION_LEVEL" \
+        "$MIN_ARCHIVE_FILES" \
+        "$SIZE_TIMEOUT_SECONDS" \
+        "$BACKUP_TIMEOUT_SECONDS" \
+        "$LOG_MAX_BYTES" \
+        "$LOG_KEEP"
+    do
+        [[ "$value" =~ ^[0-9]+$ ]] || {
+            BACKEND_FAILURE_REASON="numeric configuration contains an invalid value: $value"
+            return 1
+        }
+    done
 
-    log "Another boot-device backup is already running."
-    exit 1
-
-fi
-
-initialize_logging
-trap cleanup EXIT
-
-###############################################################################
-# PRE-FLIGHT CHECKS
-###############################################################################
-
-log "Starting Unraid boot-device backup"
-
-if [ ! -d "$POOL_PATH" ]; then
-
-    log "ERROR: Pool path does not exist: $POOL_PATH"
-
-    notify alert \
-        "Backup - POOL UNAVAILABLE" \
-        "Destination pool is unavailable."$'\n\n'"Pool: $POOL_PATH"$'\n'"Runtime: $(runtime)"
-
-    exit 2
-
-fi
-
-if command -v findmnt >/dev/null 2>&1; then
-
-    MOUNT_TARGET=$(
-        findmnt -rn -T "$POOL_PATH" -o TARGET 2>/dev/null || true
-    )
-
-    if [ "$MOUNT_TARGET" != "$POOL_PATH" ]; then
-
-        log "ERROR: $POOL_PATH is not an active mount point"
-        log "Detected mount target: ${MOUNT_TARGET:-<none>}"
-
-        notify alert \
-            "Backup - POOL NOT MOUNTED" \
-            "$POOL_PATH is not mounted."$'\n\n'"Backup aborted to prevent writing into RAM."$'\n'"Runtime: $(runtime)"
-
-        exit 2
-
-    fi
-
-fi
-
-case "$BACKUP_DIR" in
-    "$POOL_PATH"|"$POOL_PATH"/*)
-        ;;
-
-    *)
-        log "ERROR: Backup directory is outside the protected pool path"
-        log "Pool: $POOL_PATH"
-        log "Backup directory: $BACKUP_DIR"
-
-        notify alert \
-            "Backup - CONFIGURATION ERROR" \
-            "Backup directory is outside the configured pool."$'\n\n'"Pool: $POOL_PATH"$'\n'"Directory: $BACKUP_DIR"$'\n'"Runtime: $(runtime)"
-
-        exit 2
-        ;;
-esac
-
-if [ ! -x "$HELPER" ]; then
-
-    log "ERROR: Native Unraid backup helper not found: $HELPER"
-
-    notify alert \
-        "Backup - HELPER MISSING" \
-        "Unable to locate:"$'\n'"$HELPER"$'\n\n'"Runtime: $(runtime)"
-
-    exit 127
-
-fi
-
-if ! [[ "$COMPRESSION_LEVEL" =~ ^[0-9]+$ ]] ||
-   (( COMPRESSION_LEVEL < 0 || COMPRESSION_LEVEL > 9 ))
-then
-
-    log "ERROR: Compression level must be an integer from 0 through 9"
-    log "Configured value: $COMPRESSION_LEVEL"
-
-    notify alert \
-        "Backup - CONFIGURATION ERROR" \
-        "Invalid compression level: $COMPRESSION_LEVEL"$'\n\n'"Use a value from 0 through 9."$'\n'"Runtime: $(runtime)"
-
-    exit 2
-
-fi
-
-if ! [[ "$MAX_BACKUPS" =~ ^[0-9]+$ ]] || (( MAX_BACKUPS < 1 )); then
-
-    log "ERROR: MAX_BACKUPS must be a positive integer"
-    exit 2
-
-fi
-
-###############################################################################
-# DESTINATION
-###############################################################################
-
-if [ ! -d "$BACKUP_DIR" ]; then
-
-    log "Creating backup directory: $BACKUP_DIR"
-
-    if ! mkdir -p -- "$BACKUP_DIR"; then
-
-        log "ERROR: Unable to create $BACKUP_DIR"
-
-        notify alert \
-            "Backup - DIRECTORY ERROR" \
-            "Unable to create:"$'\n'"$BACKUP_DIR"$'\n\n'"Runtime: $(runtime)"
-
-        exit 3
-
-    fi
-fi
-
-chmod 0775 "$BACKUP_DIR" 2>/dev/null || true
-
-WRITE_TEST="$BACKUP_DIR/.flash_backup_write_test.$$"
-
-if ! touch "$WRITE_TEST" 2>/dev/null; then
-
-    log "ERROR: Destination is not writable: $BACKUP_DIR"
-
-    notify alert \
-        "Backup - NOT WRITABLE" \
-        "Backup destination is not writable:"$'\n'"$BACKUP_DIR"$'\n\n'"Runtime: $(runtime)"
-
-    exit 3
-
-fi
-
-rm -f -- "$WRITE_TEST"
-WRITE_TEST=""
-
-###############################################################################
-# BACKUP IDENTITY AND SPACE ESTIMATE
-###############################################################################
-
-HELPER_LOG=$(mktemp /tmp/flash_backup_helper.XXXXXX) || {
-
-    log "ERROR: Unable to create helper diagnostics file"
-    exit 4
-
+    (( MAX_BACKUPS >= 1 )) || return 1
+    (( COMPRESSION_LEVEL >= 0 && COMPRESSION_LEVEL <= 9 )) || return 1
+    (( MIN_ARCHIVE_FILES >= 1 )) || return 1
+    (( SIZE_TIMEOUT_SECONDS >= 1 && BACKUP_TIMEOUT_SECONDS >= 1 )) || return 1
+    case "$BACKUP_BACKEND" in auto|native|direct) ;; *) return 1 ;; esac
 }
 
-HOST_FALLBACK=$(hostname -s 2>/dev/null || printf 'tower')
-SERVER_NAME=$(read_unraid_value "NAME" "$HOST_FALLBACK")
-OS_VERSION=$(read_unraid_value "version" "unknown")
+validate_environment() {
+    local required
+    for required in \
+        awk df find findmnt flock grep head jq sed sha256sum sort stat tail tr \
+        unzip "$TIMEOUT_BIN"
+    do
+        require_command "$required" || return 1
+    done
 
-SERVER_SLUG=$(filename_component "$SERVER_NAME")
-VERSION_SLUG=$(filename_component "$OS_VERSION")
+    [ -d "$POOL_PATH" ] || {
+        BACKEND_FAILURE_REASON="pool path does not exist: $POOL_PATH"
+        return 1
+    }
 
-[ -n "$SERVER_SLUG" ] || SERVER_SLUG="tower"
-[ -n "$VERSION_SLUG" ] || VERSION_SLUG="unknown"
+    local mount_target
+    mount_target=$(findmnt -rn -T "$POOL_PATH" -o TARGET 2>/dev/null || true)
+    [ "$mount_target" = "$POOL_PATH" ] || {
+        BACKEND_FAILURE_REASON="$POOL_PATH is not an active mount point; detected ${mount_target:-none}"
+        return 1
+    }
 
-BACKUP_NAME="${SERVER_SLUG}-v${VERSION_SLUG}-boot-backup-$(date '+%Y%m%d-%H%M%S').zip"
-BACKUP_FILE="$BACKUP_DIR/$BACKUP_NAME"
-TEMP_FILE="$BACKUP_DIR/.${BACKUP_NAME}.tmp.$$"
+    case "$BACKUP_DIR" in
+        "$POOL_PATH"|"$POOL_PATH"/*) ;;
+        *)
+            BACKEND_FAILURE_REASON="backup directory is outside the protected pool path"
+            return 1
+            ;;
+    esac
+}
 
-log "Compression level: $COMPRESSION_LEVEL"
-log "Reading native backup size estimate"
+prepare_destination() {
+    [ -d "$BACKUP_DIR" ] || mkdir -p -- "$BACKUP_DIR" || return 1
+    chmod 0775 "$BACKUP_DIR" 2>/dev/null || true
 
-ESTIMATED_SOURCE_BYTES=$("$HELPER" size 2>"$HELPER_LOG")
-SIZE_RC=$?
-ESTIMATED_SOURCE_BYTES=${ESTIMATED_SOURCE_BYTES//[[:space:]]/}
-
-if (( SIZE_RC != 0 )) ||
-   ! [[ "$ESTIMATED_SOURCE_BYTES" =~ ^[0-9]+$ ]] ||
-   (( ESTIMATED_SOURCE_BYTES <= 0 ))
-then
-
-    log "ERROR: Native helper could not calculate the backup size"
-    log "Exit code: $SIZE_RC"
-    log_helper_diagnostics
-
-    notify alert \
-        "Backup - SIZE CHECK FAILED" \
-        "The native Unraid helper could not calculate the boot-device backup size."$'\n\n'"Exit code: $SIZE_RC"$'\n'"Runtime: $(runtime)"
-
-    exit 5
-
-fi
-
-log "Estimated uncompressed content: $(bytes_human "$ESTIMATED_SOURCE_BYTES")"
-
-AVAILABLE_BYTES=$(available_bytes)
-REQUIRED_BYTES=$((
-    ESTIMATED_SOURCE_BYTES +
-    ESTIMATED_SOURCE_BYTES / 10 +
-    1048576
-))
-
-log "Destination free space: $(bytes_human "$AVAILABLE_BYTES")"
-log "Conservative required space: $(bytes_human "$REQUIRED_BYTES")"
-
-if (( AVAILABLE_BYTES < REQUIRED_BYTES )); then
-
-    log "ERROR: Insufficient destination space"
-
-    notify alert \
-        "Backup - NO SPACE" \
-        "Insufficient destination space."$'\n\n'"Required: $(bytes_human "$REQUIRED_BYTES")"$'\n'"Available: $(bytes_human "$AVAILABLE_BYTES")"$'\n'"Destination: $BACKUP_DIR"$'\n'"Runtime: $(runtime)"
-
-    exit 7
-
-fi
+    WRITE_TEST="$BACKUP_DIR/.flash_backup_write_test.$$"
+    touch "$WRITE_TEST" 2>/dev/null || return 1
+    rm -f -- "$WRITE_TEST"
+    WRITE_TEST=""
+}
 
 ###############################################################################
-# STREAM UNRAID 7.4 BACKUP
+# MAIN
 ###############################################################################
 
-: >"$HELPER_LOG"
+main() {
+    local available runtime_value notification_message notification_description
 
-log "Streaming native Unraid backup to the SSD"
-log "Temporary destination: $TEMP_FILE"
+    exec 9>"$LOCKFILE"
+    if ! flock -n 9; then
+        log "Another boot-device backup is already running"
+        return 1
+    fi
 
-"$HELPER" "$COMPRESSION_LEVEL" >"$TEMP_FILE" 2>"$HELPER_LOG"
-HELPER_RC=$?
+    initialize_logging
+    trap cleanup EXIT
+    log "Starting Unraid boot-device backup v$SCRIPT_VERSION"
 
-if (( HELPER_RC != 0 )); then
+    if ! validate_configuration; then
+        log "ERROR: ${BACKEND_FAILURE_REASON:-Invalid backup configuration}"
+        notify alert "Backup - CONFIGURATION ERROR" \
+            "${BACKEND_FAILURE_REASON:-Invalid backup configuration}."$'\n'"Runtime: $(runtime)"
+        return 2
+    fi
 
-    log "ERROR: Native backup helper exited with code $HELPER_RC"
-    log_helper_diagnostics
+    if ! validate_environment; then
+        log "ERROR: $BACKEND_FAILURE_REASON"
+        notify alert "Backup - ENVIRONMENT ERROR" \
+            "$BACKEND_FAILURE_REASON"$'\n'"Runtime: $(runtime)"
+        return 2
+    fi
 
-    HELPER_EXCERPT=$(tail -n 20 "$HELPER_LOG" 2>/dev/null || true)
-    [ -n "$HELPER_EXCERPT" ] || HELPER_EXCERPT="No helper diagnostics were produced."
+    if ! prepare_destination; then
+        log "ERROR: Backup destination is unavailable or not writable: $BACKUP_DIR"
+        notify alert "Backup - DESTINATION ERROR" \
+            "Backup destination is unavailable or not writable:"$'\n'"$BACKUP_DIR"$'\n'"Runtime: $(runtime)"
+        return 3
+    fi
 
-    notify alert \
-        "Backup - FAILED" \
-        "Native Unraid backup helper failed."$'\n\n'"Exit code: $HELPER_RC"$'\n\n'"${HELPER_EXCERPT}"$'\n\n'"Runtime: $(runtime)"
+    HELPER_LOG=$(mktemp /tmp/flash_backup_backend.XXXXXX) || return 4
+    ARCHIVE_LIST_FILE=$(mktemp /tmp/flash_backup_archive.XXXXXX) || return 4
 
-    exit 6
+    initialize_identity
+    detect_platform_changes
 
-fi
+    BACKUP_NAME="${SERVER_SLUG}-v${VERSION_SLUG}-boot-backup-$(date '+%Y%m%d-%H%M%S').zip"
+    BACKUP_FILE="$BACKUP_DIR/$BACKUP_NAME"
+    CHECKSUM_FILE="${BACKUP_FILE}.sha256"
+    TEMP_FILE="$BACKUP_DIR/.${BACKUP_NAME}.tmp.$$"
 
-if [ -s "$HELPER_LOG" ]; then
+    log "Unraid version: $OS_VERSION"
+    log "Configured backend: $BACKUP_BACKEND"
+    log "Compression level: $COMPRESSION_LEVEL"
 
-    log "WARNING: Native helper completed with diagnostic output"
-    log_helper_diagnostics
+    if ! select_backend; then
+        log "ERROR: $BACKEND_FAILURE_REASON"
+        log_helper_diagnostics
+        notify alert "Backup - BACKEND ERROR" \
+            "$BACKEND_FAILURE_REASON"$'\n'"Runtime: $(runtime)"
+        return 5
+    fi
 
-fi
+    if ! generate_with_fallback; then
+        log "ERROR: $BACKEND_FAILURE_REASON"
+        log_helper_diagnostics
+        notify alert "Backup - GENERATION FAILED" \
+            "$BACKEND_FAILURE_REASON"$'\n\n'"Backend: $SELECTED_BACKEND"$'\n'"Runtime: $(runtime)"
+        return 6
+    fi
 
-GENERATED_SIZE=$(stat -c '%s' "$TEMP_FILE" 2>/dev/null || echo 0)
+    if ! finalize_backup; then
+        log "ERROR: $BACKEND_FAILURE_REASON"
+        notify alert "Backup - FINALIZE FAILED" \
+            "$BACKEND_FAILURE_REASON"$'\n'"Runtime: $(runtime)"
+        return 7
+    fi
 
-if ! [[ "$GENERATED_SIZE" =~ ^[0-9]+$ ]] || (( GENERATED_SIZE <= 0 )); then
+    if ! write_state; then
+        log "ERROR: Backup is valid, but persistent compatibility state could not be updated"
+        notify warning "Backup - STATE WARNING" \
+            "Backup and checksum were created, but compatibility state could not be updated."$'\n\n'"File: $BACKUP_FILE"$'\n'"No older backup was pruned."$'\n'"Runtime: $(runtime)"
+        return 8
+    fi
 
-    log "ERROR: Native helper produced an empty backup stream"
+    prune_backups
 
-    notify alert \
-        "Backup - EMPTY ARCHIVE" \
-        "The native Unraid helper completed without producing backup data."$'\n\n'"Runtime: $(runtime)"
+    available=$(available_bytes)
+    runtime_value=$(runtime)
 
-    exit 8
+    log "Boot-device backup completed successfully"
+    log "File: $BACKUP_NAME"
+    log "Backend: $SELECTED_BACKEND"
+    log "Size: $(bytes_human "$GENERATED_SIZE")"
+    log "Runtime: $runtime_value"
 
-fi
+    notification_description="Backup - OK"
+    notification_message="Boot-device backup completed successfully."
+    notification_message+=$'\n\n'"File: $BACKUP_NAME"
+    notification_message+=$'\n'"Backend: $SELECTED_BACKEND"
+    notification_message+=$'\n'"Size: $(bytes_human "$GENERATED_SIZE")"
+    notification_message+=$'\n'"Files verified: $ARCHIVE_FILE_COUNT"
+    notification_message+=$'\n'"SHA-256: $ARCHIVE_SHA256"
+    notification_message+=$'\n'"Destination: $BACKUP_DIR"
+    notification_message+=$'\n'"Free space: $(bytes_human "$available")"
+    notification_message+=$'\n'"Retention: $MAX_BACKUPS backups"
+    notification_message+=$'\n'"Runtime: $runtime_value"
 
-log "Generated archive size: $(bytes_human "$GENERATED_SIZE")"
-log "Verifying generated ZIP archive"
+    if [ "$FALLBACK_USED" = true ]; then
+        notification_description="Backup - OK WITH FALLBACK"
+        notification_message+=$'\n\n'"Native backend fallback: ${NATIVE_FAILURE_REASON:-native helper was unavailable or incompatible}"
+    fi
+    if [ "$PLATFORM_CHANGE_DETECTED" = true ]; then
+        notification_message+=$'\n\n'"Platform change verified: $PLATFORM_CHANGE_SUMMARY"
+    fi
+    if [ -n "$ARCHIVE_WARNING_TEXT" ]; then
+        notification_message+=$'\n\n'"Content warning: $ARCHIVE_WARNING_TEXT"
+    fi
 
-if ! verify_zip "$TEMP_FILE"; then
+    notify normal "$notification_description" "$notification_message"
+    return 0
+}
 
-    log "ERROR: Generated ZIP verification failed"
-
-    notify alert \
-        "Backup - CORRUPT ARCHIVE" \
-        "Unraid created a backup stream that failed ZIP integrity verification."$'\n\n'"File: $BACKUP_NAME"$'\n'"Size: $(bytes_human "$GENERATED_SIZE")"$'\n'"Runtime: $(runtime)"
-
-    exit 9
-
-fi
-
-log "Generated ZIP verification passed"
-
-###############################################################################
-# ATOMIC FINALIZATION
-###############################################################################
-
-if ! mv -f -- "$TEMP_FILE" "$BACKUP_FILE"; then
-
-    log "ERROR: Unable to finalize destination archive"
-
-    notify alert \
-        "Backup - FINALIZE FAILED" \
-        "Backup was generated but could not be finalized."$'\n\n'"Destination: $BACKUP_FILE"$'\n'"Runtime: $(runtime)"
-
-    exit 10
-
-fi
-
-TEMP_FILE=""
-
-log "Backup finalized successfully"
-
-chown nobody:users "$BACKUP_FILE" 2>/dev/null || \
-    log "WARNING: Unable to set backup ownership: $BACKUP_FILE"
-
-chmod 0644 "$BACKUP_FILE" 2>/dev/null || \
-    log "WARNING: Unable to set backup permissions: $BACKUP_FILE"
-
-###############################################################################
-# RETENTION
-###############################################################################
-
-# This deliberately runs only after generation, integrity verification, and
-# finalization have all succeeded.
-prune_backups
-
-###############################################################################
-# SUCCESS
-###############################################################################
-
-BACKUP_SIZE=$(stat -c '%s' "$BACKUP_FILE" 2>/dev/null || echo 0)
-AVAILABLE_BYTES=$(available_bytes)
-RUNTIME=$(runtime)
-
-log "Boot-device backup completed successfully"
-log "File: $BACKUP_NAME"
-log "Size: $(bytes_human "$BACKUP_SIZE")"
-log "Destination: $BACKUP_DIR"
-log "Runtime: $RUNTIME"
-
-notify normal \
-    "Backup - OK" \
-    "Boot-device backup completed successfully."$'\n\n'"File: $BACKUP_NAME"$'\n'"Size: $(bytes_human "$BACKUP_SIZE")"$'\n'"Destination: $BACKUP_DIR"$'\n'"Free space: $(bytes_human "$AVAILABLE_BYTES")"$'\n'"Retention: $MAX_BACKUPS backups"$'\n'"Runtime: $RUNTIME"
-
-exit 0
+main "$@"

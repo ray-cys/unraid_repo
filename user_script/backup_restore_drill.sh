@@ -11,36 +11,40 @@
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.0"
+readonly SCRIPT_VERSION="1.1"
 
 ###############################################################################
 # CONFIGURATION
 ###############################################################################
 
-APPDATA_BACKUP_ROOT="/mnt/vault/backup/cache"
-FLASH_BACKUP_ROOT="/mnt/vault/backup/flash"
-DRILL_ROOT="/mnt/vault/restore_drill"
+VAULT_MOUNT="${VAULT_MOUNT:-/mnt/vault}"
+APPDATA_BACKUP_ROOT="${APPDATA_BACKUP_ROOT:-/mnt/vault/backup/cache}"
+FLASH_BACKUP_ROOT="${FLASH_BACKUP_ROOT:-/mnt/vault/backup/flash}"
+DRILL_ROOT="${DRILL_ROOT:-/mnt/vault/restore_drill}"
 
 # Empty means extract every appdata archive in the newest successful backup.
 # Otherwise use archive base names without .tar.gz.
 APPDATA_ARCHIVE_ALLOWLIST=()
 
-MAX_APPDATA_ARCHIVES=0
-CHECK_SQLITE_DATABASES=true
-SQLITE_MAX_FILES=200
+MAX_APPDATA_ARCHIVES="${MAX_APPDATA_ARCHIVES:-0}"
+CHECK_SQLITE_DATABASES="${CHECK_SQLITE_DATABASES:-true}"
+SQLITE_MAX_FILES="${SQLITE_MAX_FILES:-200}"
+
+REQUIRE_FLASH_CHECKSUM="${REQUIRE_FLASH_CHECKSUM:-true}"
+MIN_FLASH_ARCHIVE_FILES="${MIN_FLASH_ARCHIVE_FILES:-10}"
 
 # Compressed input size multiplied by this factor for extraction-space checks.
-EXTRACT_SPACE_MULTIPLIER=4
-EXTRA_FREE_MARGIN_BYTES=$((5 * 1024 * 1024 * 1024))
+EXTRACT_SPACE_MULTIPLIER="${EXTRACT_SPACE_MULTIPLIER:-4}"
+EXTRA_FREE_MARGIN_BYTES="${EXTRA_FREE_MARGIN_BYTES:-$((5 * 1024 * 1024 * 1024))}"
 
-MAX_SUCCESSFUL_DRILLS=2
-KEEP_FAILED_DRILL=false
+MAX_SUCCESSFUL_DRILLS="${MAX_SUCCESSFUL_DRILLS:-2}"
+KEEP_FAILED_DRILL="${KEEP_FAILED_DRILL:-false}"
 
-LOG_DIR="/mnt/vault/cloud/logs/backup_restore_drill"
-MAX_LOGS=5
-STATUS_DIR="/mnt/vault/cloud/logs/user_scripts_status"
-NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
-LOCK_FILE="/run/backup_restore_drill.lock"
+LOG_DIR="${LOG_DIR:-/mnt/vault/cloud/logs/backup_restore_drill}"
+MAX_LOGS="${MAX_LOGS:-5}"
+STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/user_scripts_status}"
+NOTIFY_BIN="${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}"
+LOCK_FILE="${LOCK_FILE:-/run/backup_restore_drill.lock}"
 
 ###############################################################################
 # RUNTIME
@@ -59,6 +63,8 @@ WORK_PROMOTED=0
 
 APPDATA_BACKUP=""
 FLASH_BACKUP=""
+FLASH_CHECKSUM_STATUS="NOT_CHECKED"
+FLASH_ARCHIVE_FILES=0
 ARCHIVES_CHECKED=0
 ARCHIVES_EXTRACTED=0
 DATABASES_CHECKED=0
@@ -131,11 +137,20 @@ cleanup() {
     trap - EXIT
     exit "$rc"
 }
-trap cleanup EXIT
 
 latest_entry() {
     local root="$1" type="$2" pattern="$3"
     find "$root" -mindepth 1 -maxdepth 1 -type "$type" -name "$pattern" \
+        ! -name '*.partial' ! -name '*.failed' \
+        -printf '%T@|%p\n' 2>/dev/null |
+        sort -rn |
+        head -n 1 |
+        cut -d'|' -f2-
+}
+
+latest_flash_backup() {
+    find "$FLASH_BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type f \
+        \( -name '*-boot-backup-*.zip' -o -name '*-flash-backup-*.zip' \) \
         ! -name '*.partial' ! -name '*.failed' \
         -printf '%T@|%p\n' 2>/dev/null |
         sort -rn |
@@ -160,6 +175,19 @@ validate_archive_paths() {
             /(^|\/)\.\.(\/|$)/ { bad=1 }
             END { exit bad }
         '
+}
+
+validate_zip_paths() {
+    local list_file="$1"
+    awk '
+        {
+            path=$0
+            gsub(/\\/, "/", path)
+            if (path ~ /^\// || path ~ /^[A-Za-z]:\// ||
+                path ~ /(^|\/)\.\.(\/|$)/) bad=1
+        }
+        END { exit(bad ? 1 : 0) }
+    ' "$list_file"
 }
 
 file_bytes() {
@@ -202,13 +230,51 @@ prune_drills() {
 ###############################################################################
 
 validate_environment() {
-    local command
-    for command in find sort gzip tar unzip sha256sum flock awk stat; do
+    local command numeric
+    for command in find sort gzip tar unzip sha256sum flock awk stat grep; do
         command -v "$command" >/dev/null 2>&1 || {
             log ERROR "Required command not found: $command"
             return 1
         }
     done
+
+    [[ "$REQUIRE_FLASH_CHECKSUM" == true ||
+       "$REQUIRE_FLASH_CHECKSUM" == false ]] || {
+        log ERROR "REQUIRE_FLASH_CHECKSUM must be true or false"
+        return 1
+    }
+    [[ "$CHECK_SQLITE_DATABASES" == true ||
+       "$CHECK_SQLITE_DATABASES" == false ]] || {
+        log ERROR "CHECK_SQLITE_DATABASES must be true or false"
+        return 1
+    }
+    [[ "$KEEP_FAILED_DRILL" == true ||
+       "$KEEP_FAILED_DRILL" == false ]] || {
+        log ERROR "KEEP_FAILED_DRILL must be true or false"
+        return 1
+    }
+
+    for numeric in \
+        "$MAX_APPDATA_ARCHIVES" \
+        "$SQLITE_MAX_FILES" \
+        "$EXTRA_FREE_MARGIN_BYTES" \
+        "$MAX_SUCCESSFUL_DRILLS" \
+        "$MAX_LOGS"
+    do
+        [[ "$numeric" =~ ^[0-9]+$ ]] || {
+            log ERROR "Numeric restore-drill configuration is invalid: $numeric"
+            return 1
+        }
+    done
+    [[ "$EXTRACT_SPACE_MULTIPLIER" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+        log ERROR "EXTRACT_SPACE_MULTIPLIER must be a positive number"
+        return 1
+    }
+    if ! [[ "$MIN_FLASH_ARCHIVE_FILES" =~ ^[0-9]+$ ]] ||
+       (( MIN_FLASH_ARCHIVE_FILES < 1 )); then
+        log ERROR "MIN_FLASH_ARCHIVE_FILES must be a positive integer"
+        return 1
+    fi
 
     [[ -d "$APPDATA_BACKUP_ROOT" ]] || {
         log ERROR "Appdata backup root unavailable: $APPDATA_BACKUP_ROOT"
@@ -218,13 +284,14 @@ validate_environment() {
         log ERROR "Flash backup root unavailable: $FLASH_BACKUP_ROOT"
         return 1
     }
-    [[ "$DRILL_ROOT" == /mnt/vault/* && "$DRILL_ROOT" != "/mnt/vault/" ]] || {
+    [[ "$DRILL_ROOT" == "$VAULT_MOUNT"/* &&
+       "$DRILL_ROOT" != "$VAULT_MOUNT/" ]] || {
         log ERROR "Unsafe DRILL_ROOT: $DRILL_ROOT"
         return 1
     }
 
     APPDATA_BACKUP="$(latest_entry "$APPDATA_BACKUP_ROOT" d 'backup_[0-9]*_[0-9]*')"
-    FLASH_BACKUP="$(latest_entry "$FLASH_BACKUP_ROOT" f '*.zip')"
+    FLASH_BACKUP="$(latest_flash_backup)"
     [[ -n "$APPDATA_BACKUP" ]] || {
         log ERROR "No successful appdata backup generation found"
         return 1
@@ -308,13 +375,56 @@ drill_appdata() {
 }
 
 drill_flash() {
-    local required found
+    local required found checksum_file checksum_dir checksum_name list_file
     log INFO "Testing boot-device backup: $FLASH_BACKUP"
+
+    checksum_file="${FLASH_BACKUP}.sha256"
+    if [[ -f "$checksum_file" ]]; then
+        checksum_dir="$(dirname "$checksum_file")"
+        checksum_name="$(basename "$checksum_file")"
+        if ! (cd "$checksum_dir" && sha256sum -c --status "$checksum_name"); then
+            FLASH_CHECKSUM_STATUS="FAILED"
+            log ERROR "Boot-device SHA-256 verification failed: $checksum_file"
+            return 1
+        fi
+        FLASH_CHECKSUM_STATUS="VERIFIED"
+        log INFO "Boot-device SHA-256 verification passed"
+    elif [[ "$REQUIRE_FLASH_CHECKSUM" == true ]]; then
+        FLASH_CHECKSUM_STATUS="MISSING"
+        log ERROR "Boot-device checksum sidecar is missing: $checksum_file"
+        return 1
+    else
+        FLASH_CHECKSUM_STATUS="MISSING_ALLOWED"
+        log WARN "Boot-device checksum sidecar is missing; continuing by configuration"
+    fi
+
     unzip -tq "$FLASH_BACKUP" >/dev/null || {
         log ERROR "Boot-device ZIP integrity failed"
         return 1
     }
+
     mkdir -p -- "$WORK_DIR/flash" || return 1
+
+    list_file="$WORK_DIR/flash-archive-list.txt"
+    unzip -Z1 "$FLASH_BACKUP" >"$list_file" || {
+        log ERROR "Boot-device ZIP listing failed"
+        return 1
+    }
+    validate_zip_paths "$list_file" || {
+        log ERROR "Boot-device ZIP contains an unsafe path"
+        return 1
+    }
+
+    FLASH_ARCHIVE_FILES=$(
+        awk 'substr($0, length($0), 1) != "/" {count++}
+             END {print count+0}' "$list_file"
+    )
+    [[ "$FLASH_ARCHIVE_FILES" =~ ^[0-9]+$ ]] || FLASH_ARCHIVE_FILES=0
+    if (( FLASH_ARCHIVE_FILES < MIN_FLASH_ARCHIVE_FILES )); then
+        log ERROR "Boot-device ZIP contains only $FLASH_ARCHIVE_FILES files; minimum is $MIN_FLASH_ARCHIVE_FILES"
+        return 1
+    fi
+
     unzip -q "$FLASH_BACKUP" -d "$WORK_DIR/flash" || return 1
     sha256sum "$FLASH_BACKUP" >>"$WORK_DIR/archive-sha256.txt" || return 1
 
@@ -328,6 +438,8 @@ drill_flash() {
             return 1
         }
     done
+
+    log INFO "Boot-device restore verified $FLASH_ARCHIVE_FILES files"
 }
 
 check_sqlite_databases() {
@@ -369,6 +481,8 @@ promote_drill() {
         printf 'completed=%s\n' "$(date -Iseconds)"
         printf 'appdata_backup=%s\n' "$APPDATA_BACKUP"
         printf 'flash_backup=%s\n' "$FLASH_BACKUP"
+        printf 'flash_checksum_status=%s\n' "$FLASH_CHECKSUM_STATUS"
+        printf 'flash_archive_files=%s\n' "$FLASH_ARCHIVE_FILES"
         printf 'archives_extracted=%s\n' "$ARCHIVES_EXTRACTED"
         printf 'databases_checked=%s\n' "$DATABASES_CHECKED"
     } >"$WORK_DIR/result.txt" || return 1
@@ -382,8 +496,10 @@ promote_drill() {
 ###############################################################################
 
 main() {
-    if ! mountpoint -q /mnt/vault; then
-        printf 'Vault pool is not mounted: /mnt/vault\n' >&2
+    trap cleanup EXIT
+
+    if ! mountpoint -q "$VAULT_MOUNT"; then
+        printf 'Vault pool is not mounted: %s\n' "$VAULT_MOUNT" >&2
         return 1
     fi
     mkdir -p -- "$LOG_DIR" "$DRILL_ROOT" || return 1
@@ -419,11 +535,13 @@ main() {
     }
 
     RESULT_STATUS="OK"
-    RESULT_SUMMARY="${ARCHIVES_EXTRACTED} appdata archives restored; ${DATABASES_CHECKED} SQLite databases checked; boot ZIP restored"
+    RESULT_SUMMARY="${ARCHIVES_EXTRACTED} appdata archives restored; ${DATABASES_CHECKED} SQLite databases checked; boot ZIP restored with ${FLASH_ARCHIVE_FILES} files and checksum ${FLASH_CHECKSUM_STATUS}"
     log INFO "$RESULT_SUMMARY"
     write_receipt "$RESULT_STATUS" "$RESULT_SUMMARY"
     notify_unraid normal "Restore drill passed" \
         "$RESULT_SUMMARY"$'\n'"Staging result: $FINAL_DIR"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
