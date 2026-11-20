@@ -75,10 +75,11 @@ LOG_DIR="${LOG_DIR:-/mnt/vault/cloud/logs/script/appdata_backup}"
 # When the vault cannot safely hold the old and new generations together, the
 # replacement is built and verified here first. The staged generation remains
 # a valid recovery copy until the final vault copy has also been verified.
-# Ensure the Unraid "backup" share is configured to use array or pool storage
-# other than /mnt/vault; otherwise choose an explicit path on another device.
+# The default uses the cache pool selected by the latest repository setting.
+# Choose another mounted device if independent staging failure protection is
+# required in addition to temporary capacity relief.
 STAGING_DIR="${STAGING_DIR:-/mnt/cache/staging}"
-STAGING_MOUNT_ROOT="${STAGING_MOUNT_ROOT:-/mnt/user}"
+STAGING_MOUNT_ROOT="${STAGING_MOUNT_ROOT:-/mnt/cache}"
 
 # Prevent an unavailable mount from being replaced by an ordinary directory on
 # the Unraid root filesystem. Fixture tests may explicitly disable this guard.
