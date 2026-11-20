@@ -20,6 +20,8 @@ readonly SCRIPT_VERSION="1.0"
 
 # container|optional HTTP endpoint|restart allowed (0/1)
 SERVICE_SPECS=(
+    # Pi-hole is intentionally owned by dns_redundancy_watchdog.sh so DNS
+    # recovery and notifications are not duplicated here.
     "plex-media-server||0"
     "plex-media||0"
     "sonarr|http://192.168.50.4:8989/ping|0"

@@ -10,7 +10,7 @@
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.1"
+readonly SCRIPT_VERSION="1.2"
 
 ###############################################################################
 # CONFIGURATION
@@ -24,6 +24,7 @@ RECEIPT_RULES=(
     "backup_restore_drill|192|1"
     "mover_audit|30|1"
     "docker_service_watchdog|1|1"
+    "dns_redundancy_watchdog|1|1"
     "quarantine_lifecycle|30|1"
     "pre_post_reboot_audit|720|0"
 )
