@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Appdata + Optional Shares Backup v2.0
+# Appdata + Optional Shares Backup v3.0
 #
 # PURPOSE
 # -------
@@ -11,17 +11,19 @@
 # Appdata workflow:
 #
 #   1. Validate source/destination
-#   2. Validate available destination space while retaining the last good backup
-#   3. Create and verify the replacement backup
+#   2. Estimate compressed size from the last verified generation
+#   3. Select the vault or an alternate verified staging location
 #   4. Record currently-running Docker containers
 #   5. Stop selected running containers
 #   6. Compress each top-level appdata directory
-#   7. Verify every archive
-#   8. Promote the .partial backup only when the entire appdata backup succeeds
-#   9. Prune the previous successful backup only after promotion succeeds
-#  10. Restart only containers that were running before the backup
-#  11. Optionally mirror additional shares with rsync
-#  12. Prune logs and send one consolidated Unraid notification
+#   7. Verify every archive and write a checksum-protected size manifest
+#   8. Promote the .partial backup only when the entire generation succeeds
+#   9. If staged, retain it while retiring the old vault generation, then copy
+#      it to the vault and verify the vault copy again
+#  10. Prune the previous successful backup only after a verified replacement
+#  11. Restart only containers that were running before the backup
+#  12. Optionally mirror additional shares with rsync
+#  13. Prune logs and send one consolidated Unraid notification
 #
 #
 # SAFETY
@@ -31,12 +33,17 @@
 # - An EXIT/signal trap attempts to restart containers if the script exits
 #   unexpectedly after stopping them.
 # - The previous successful backup is retained until the new backup has been
-#   completely created, verified, and promoted from its .partial directory.
+#   completely created and verified. In staging mode, the verified staged copy
+#   becomes the safety generation before the old vault generation is removed.
 # - If there is not enough free space to hold both generations temporarily,
 #   the run aborts without deleting the previous successful backup.
 # - New backups remain ".partial" until all archives pass verification.
 # - Individual archives are written to ".tmp" first and promoted only after
 #   gzip/tar integrity checks pass.
+# - A checksum manifest is verified before promotion and again after a staged
+#   generation is copied to the vault.
+# - Compression diagnostics are held under /tmp so a full vault cannot erase
+#   the failure reason.
 #
 #
 # SCHEDULING
@@ -48,6 +55,8 @@
 
 set -uo pipefail
 
+readonly SCRIPT_VERSION="3.0"
+
 
 ###############################################################################
 # CONFIGURATION
@@ -57,10 +66,28 @@ set -uo pipefail
 # Appdata paths
 # ---------------------------------------------------------------------------
 
-SRC_DIR="/mnt/cache/appdata"
-DEST_DIR="/mnt/vault/backup/cache"
+SRC_DIR="${SRC_DIR:-/mnt/cache/appdata}"
+DEST_DIR="${DEST_DIR:-/mnt/vault/backup/cache}"
+DEST_MOUNT_ROOT="${DEST_MOUNT_ROOT:-/mnt/vault}"
 
-LOG_DIR="/mnt/vault/cloud/logs/script/appdata_backup"
+LOG_DIR="${LOG_DIR:-/mnt/vault/cloud/logs/script/appdata_backup}"
+
+# When the vault cannot safely hold the old and new generations together, the
+# replacement is built and verified here first. The staged generation remains
+# a valid recovery copy until the final vault copy has also been verified.
+# Ensure the Unraid "backup" share is configured to use array or pool storage
+# other than /mnt/vault; otherwise choose an explicit path on another device.
+STAGING_DIR="${STAGING_DIR:-/mnt/user/backup/appdata_staging}"
+STAGING_MOUNT_ROOT="${STAGING_MOUNT_ROOT:-/mnt/user}"
+
+# Prevent an unavailable mount from being replaced by an ordinary directory on
+# the Unraid root filesystem. Fixture tests may explicitly disable this guard.
+REQUIRE_MOUNT_GUARDS="${REQUIRE_MOUNT_GUARDS:-true}"
+
+# auto        = use the vault when it fits, otherwise use verified staging
+# destination = require the vault to fit both generations
+# staging     = always build through STAGING_DIR
+BACKUP_STORAGE_MODE="${BACKUP_STORAGE_MODE:-auto}"
 
 
 # ---------------------------------------------------------------------------
@@ -94,26 +121,26 @@ SKIP_APPDATA_DIRS=(
 # has been promoted. With MAX_BACKUPS=1, the previous generation remains
 # available for the entire backup operation.
 #
-MAX_BACKUPS=1
+MAX_BACKUPS="${MAX_BACKUPS:-1}"
 
 # Number of failed/incomplete ".partial" backup directories to retain.
 #
-MAX_PARTIAL_BACKUPS=1
+MAX_PARTIAL_BACKUPS="${MAX_PARTIAL_BACKUPS:-0}"
 
 # Number of per-run log files to retain.
 #
-MAX_LOGS=2
+MAX_LOGS="${MAX_LOGS:-2}"
 
 # Keep successfully-created archives from a failed/incomplete backup.
 #
 # true  = retain backup_TIMESTAMP.partial
 # false = remove the incomplete backup directory
 #
-KEEP_PARTIAL=true
+KEEP_PARTIAL="${KEEP_PARTIAL:-false}"
 
 # Keep individual compression stderr files after the final report is built.
 #
-KEEP_TEMP_ERR=false
+KEEP_TEMP_ERR="${KEEP_TEMP_ERR:-false}"
 
 
 # ---------------------------------------------------------------------------
@@ -122,11 +149,11 @@ KEEP_TEMP_ERR=false
 
 # Number of compression attempts for each appdata directory.
 #
-RETRIES=3
+RETRIES="${RETRIES:-3}"
 
 # Delay between retries.
 #
-RETRY_DELAY=5
+RETRY_DELAY="${RETRY_DELAY:-5}"
 
 # pigz worker threads.
 #
@@ -134,7 +161,7 @@ RETRY_DELAY=5
 #
 # If pigz is unavailable, gzip is used automatically.
 #
-PIGZ_THREADS=0
+PIGZ_THREADS="${PIGZ_THREADS:-4}"
 
 # Optional additional GNU tar arguments.
 #
@@ -153,11 +180,11 @@ TAR_OPTIONS=()
 
 # Apply nice/ionice to compression and rsync operations when available.
 #
-USE_LOW_PRIORITY_IO=true
+USE_LOW_PRIORITY_IO="${USE_LOW_PRIORITY_IO:-true}"
 
-IONICE_CLASS=2
-IONICE_PRIORITY=7
-NICE_LEVEL=10
+IONICE_CLASS="${IONICE_CLASS:-2}"
+IONICE_PRIORITY="${IONICE_PRIORITY:-7}"
+NICE_LEVEL="${NICE_LEVEL:-10}"
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +197,14 @@ NICE_LEVEL=10
 #
 # This is an estimate only. Actual compression ratio varies between apps.
 #
-REQUIRED_RATIO=0.60
+REQUIRED_RATIO="${REQUIRED_RATIO:-0.60}"
+
+# Historical estimates are scaled by the current raw-size change and then
+# receive this additional growth allowance.
+ESTIMATE_GROWTH_PERCENT="${ESTIMATE_GROWTH_PERCENT:-20}"
+
+# Preserve this much usable space after the replacement is written.
+MIN_FREE_RESERVE_BYTES="${MIN_FREE_RESERVE_BYTES:-10737418240}"
 
 # Additional number of bytes added to the preflight requirement.
 #
@@ -180,14 +214,19 @@ REQUIRED_RATIO=0.60
 #   10737418240    = 10 GiB
 #   21474836480    = 20 GiB
 #
-LOW_SPACE_MARGIN=0
+LOW_SPACE_MARGIN="${LOW_SPACE_MARGIN:-0}"
 
 # Behavior if estimated required space exceeds currently available space.
 #
 #   abort = do not stop containers; terminate before backup begins
 #   warn  = log warning and continue
 #
-LOW_SPACE_ACTION="abort"
+LOW_SPACE_ACTION="${LOW_SPACE_ACTION:-abort}"
+
+# Exclude only regenerable Plex data. Databases, Metadata, Media artwork, and
+# preferences remain in the backup.
+EXCLUDE_REGENERABLE_PLEX_DATA="${EXCLUDE_REGENERABLE_PLEX_DATA:-true}"
+PLEX_APPDATA_DIR="${PLEX_APPDATA_DIR:-plex-media-server}"
 
 
 # ---------------------------------------------------------------------------
@@ -223,15 +262,15 @@ ADD_RSYNC_BASE_ARGS=(
 # Notification
 # ---------------------------------------------------------------------------
 
-NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
-NOTIFY_SUBJECT="Scheduled Backup"
+NOTIFY_BIN="${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}"
+NOTIFY_SUBJECT="${NOTIFY_SUBJECT:-Scheduled Backup}"
 
 
 # ---------------------------------------------------------------------------
 # Lock
 # ---------------------------------------------------------------------------
 
-LOCK_FILE="/tmp/appdata_backup.lock"
+LOCK_FILE="${LOCK_FILE:-/tmp/appdata_backup.lock}"
 
 
 ###############################################################################
@@ -245,8 +284,13 @@ RUN_STAMP="$(date '+%Y%m%d_%H%M%S')"
 
 LOG_FILE="${LOG_DIR}/${SRC_NAME}-${RUN_STAMP}.log"
 
-WORK_DIR="${DEST_DIR}/backup_${RUN_STAMP}.partial"
+WORK_ROOT=""
+WORK_DIR=""
 FINAL_DIR="${DEST_DIR}/backup_${RUN_STAMP}"
+STAGED_DIR="${STAGING_DIR}/backup_${RUN_STAMP}.staged"
+BACKUP_MODE="destination"
+TEMP_DIR=""
+MANIFEST_DATA_FILE=""
 
 START_TIME=0
 
@@ -255,11 +299,19 @@ declare -a APPDATA_DIRS=()
 declare -a RUNNING_CONTAINERS=()
 declare -a TARGET_CONTAINERS=()
 declare -a PRIORITY_PREFIX=()
+declare -A CURRENT_RAW_BYTES=()
+declare -A PREVIOUS_RAW_BYTES=()
+declare -A PREVIOUS_ARCHIVE_BYTES=()
+declare -A PREDICTED_ARCHIVE_BYTES=()
 
 CONTAINERS_NEED_RESTART=false
 
 RAW_TOTAL_BYTES=0
+ESTIMATED_BACKUP_BYTES=0
 ESTIMATED_REQUIRED_BYTES=0
+REMAINING_ESTIMATED_BYTES=0
+ESTIMATE_METHOD="fallback ratio"
+LATEST_SUCCESS_DIR=""
 
 DEST_TOTAL_BYTES=0
 DEST_USED_BYTES=0
@@ -276,6 +328,10 @@ APPDATA_FINALIZE_FAILED=0
 RETENTION_FAILED=0
 APPDATA_REPORT=""
 APPDATA_BACKUP_PATH=""
+LAST_COMPRESSION_REASON=""
+LAST_COMPRESSION_FATAL=false
+LAST_COMPRESSION_ATTEMPTS=0
+STAGED_RECOVERY_PENDING=false
 
 RESTART_FAILED=0
 
@@ -285,20 +341,6 @@ SHARES_FAILED=0
 SHARES_SKIPPED=0
 SHARES_TOTAL_BYTES=0
 SHARES_REPORT=""
-
-
-###############################################################################
-# LOCKING
-###############################################################################
-
-exec 9>"$LOCK_FILE"
-
-if ! flock -n 9; then
-    printf '%s %s\n' \
-        "$(date '+%Y-%m-%d %H:%M:%S')" \
-        "Another appdata_backup.sh run is active, exiting (lock: $LOCK_FILE)"
-    exit 1
-fi
 
 
 ###############################################################################
@@ -316,6 +358,21 @@ ensure_dir() {
 }
 
 
+path_is_within_root() {
+    local path="${1%/}/"
+    local root="${2%/}/"
+
+    [[ "$path" == "$root"* ]]
+}
+
+
+is_exact_mountpoint() {
+    local path="${1%/}"
+
+    [ -d "$path" ] && mountpoint -q -- "$path" 2>/dev/null
+}
+
+
 log() {
     local category="$1"
     local level="$2"
@@ -323,12 +380,17 @@ log() {
 
     local message="$*"
 
-    printf '%s [%s][%s] %s\n' \
+    local line=""
+
+    printf -v line '%s [%s][%s] %s' \
         "$(date '+%Y-%m-%d %H:%M:%S')" \
         "$category" \
         "$level" \
-        "$message" |
-        tee -a "$LOG_FILE"
+        "$message"
+
+    printf '%s\n' "$line"
+    [ -n "$LOG_FILE" ] &&
+        printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null || true
 }
 
 
@@ -436,6 +498,10 @@ file_size_bytes() {
 
     size="$(stat -c '%s' -- "$path" 2>/dev/null || true)"
 
+    if ! [[ "$size" =~ ^[0-9]+$ ]]; then
+        size="$(stat -f '%z' "$path" 2>/dev/null || true)"
+    fi
+
     if [[ "$size" =~ ^[0-9]+$ ]]; then
         printf '%s\n' "$size"
     else
@@ -444,14 +510,174 @@ file_size_bytes() {
 }
 
 
+file_mtime_epoch() {
+    local path="$1"
+    local value=""
+
+    value="$(stat -c '%Y' -- "$path" 2>/dev/null || true)"
+
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        value="$(stat -f '%m' "$path" 2>/dev/null || true)"
+    fi
+
+    [[ "$value" =~ ^[0-9]+$ ]] || value=0
+    printf '%s\n' "$value"
+}
+
+
+filesystem_device_id() {
+    local path="$1"
+    local value=""
+
+    value="$(stat -c '%d' -- "$path" 2>/dev/null || true)"
+
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        value="$(stat -f '%d' "$path" 2>/dev/null || true)"
+    fi
+
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$value"
+}
+
+
+list_paths_by_mtime() {
+    local root="$1"
+    local entry_type="$2"
+    local pattern="$3"
+    local exclude_suffix="${4:-}"
+    local path=""
+    local base=""
+
+    [ -d "$root" ] || return 0
+
+    while IFS= read -r -d '' path; do
+        base="$(basename "$path")"
+
+        if [ -n "$exclude_suffix" ] && [[ "$base" == *"$exclude_suffix" ]]; then
+            continue
+        fi
+
+        printf '%s\t%s\n' "$(file_mtime_epoch "$path")" "$path"
+    done < <(
+        find "$root" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type "$entry_type" \
+            -name "$pattern" \
+            -print0 2>/dev/null
+    ) | sort -n | cut -f2-
+}
+
+
+available_bytes_for_path() {
+    local path="$1"
+    local available=""
+
+    available="$(
+        df -P -B1 -- "$path" 2>/dev/null |
+            awk 'NR == 2 {print $4}'
+    )"
+
+    if ! [[ "$available" =~ ^[0-9]+$ ]]; then
+        available="$(
+            df -Pk -- "$path" 2>/dev/null |
+                awk 'NR == 2 {printf "%.0f", $4 * 1024}'
+        )"
+    fi
+
+    if [[ "$available" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$available"
+        return 0
+    fi
+
+    printf '0\n'
+    return 1
+}
+
+
+exit_status_description() {
+    local status="${1:-1}"
+    local signal_number=0
+    local signal_name=""
+
+    if [ "$status" -ge 128 ] && [ "$status" -le 255 ]; then
+        signal_number=$((status - 128))
+        signal_name="$(kill -l "$signal_number" 2>/dev/null || true)"
+
+        if [ -n "$signal_name" ]; then
+            printf '%s (signal %s/%s)' "$status" "$signal_number" "$signal_name"
+            return 0
+        fi
+    fi
+
+    printf '%s' "$status"
+}
+
+
+acquire_lock() {
+    exec 9>"$LOCK_FILE"
+
+    if flock -n 9; then
+        return 0
+    fi
+
+    printf '%s %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "Another appdata_backup.sh run is active, exiting (lock: $LOCK_FILE)"
+    return 1
+}
+
+
 ###############################################################################
 # CONFIGURATION / PREFLIGHT
 ###############################################################################
 
 validate_configuration() {
+    local required_command=""
+
+    for required_command in \
+        awk df find flock gzip rsync sha256sum sort stat tar
+    do
+        if ! command -v "$required_command" >/dev/null 2>&1; then
+            log "PREFLIGHT" "ERROR" \
+                "Required command is unavailable: $required_command"
+            return 1
+        fi
+    done
+
     if [ ! -d "$SRC_DIR" ]; then
         log "PREFLIGHT" "ERROR" "Source directory does not exist: $SRC_DIR"
         return 1
+    fi
+
+    case "$REQUIRE_MOUNT_GUARDS" in
+        true|false)
+            ;;
+        *)
+            log "PREFLIGHT" "ERROR" \
+                "REQUIRE_MOUNT_GUARDS must be true or false"
+            return 1
+            ;;
+    esac
+
+    if [ "$REQUIRE_MOUNT_GUARDS" = "true" ]; then
+        if ! command -v mountpoint >/dev/null 2>&1; then
+            log "PREFLIGHT" "ERROR" \
+                "mountpoint is required while mount guards are enabled"
+            return 1
+        fi
+
+        if ! path_is_within_root "$DEST_DIR" "$DEST_MOUNT_ROOT"; then
+            log "PREFLIGHT" "ERROR" \
+                "Destination is outside DEST_MOUNT_ROOT: $DEST_DIR"
+            return 1
+        fi
+
+        if ! is_exact_mountpoint "$DEST_MOUNT_ROOT"; then
+            log "PREFLIGHT" "ERROR" \
+                "Vault mount is not active at: $DEST_MOUNT_ROOT"
+            return 1
+        fi
     fi
 
     if ! ensure_dir "$DEST_DIR"; then
@@ -489,6 +715,18 @@ validate_configuration() {
         return 1
     fi
 
+    if ! [[ "$ESTIMATE_GROWTH_PERCENT" =~ ^[0-9]+$ ]]; then
+        log "PREFLIGHT" "ERROR" \
+            "ESTIMATE_GROWTH_PERCENT must be a non-negative integer"
+        return 1
+    fi
+
+    if ! [[ "$MIN_FREE_RESERVE_BYTES" =~ ^[0-9]+$ ]]; then
+        log "PREFLIGHT" "ERROR" \
+            "MIN_FREE_RESERVE_BYTES must be specified in bytes"
+        return 1
+    fi
+
     if ! [[ "$LOW_SPACE_MARGIN" =~ ^[0-9]+$ ]]; then
         log "PREFLIGHT" "ERROR" "LOW_SPACE_MARGIN must be specified in bytes"
         return 1
@@ -508,6 +746,49 @@ validate_configuration() {
         *)
             log "PREFLIGHT" "ERROR" \
                 "LOW_SPACE_ACTION must be 'abort' or 'warn'"
+            return 1
+            ;;
+    esac
+
+    case "$BACKUP_STORAGE_MODE" in
+        auto|destination|staging)
+            ;;
+        *)
+            log "PREFLIGHT" "ERROR" \
+                "BACKUP_STORAGE_MODE must be 'auto', 'destination', or 'staging'"
+            return 1
+            ;;
+    esac
+
+    if [ "$BACKUP_STORAGE_MODE" != "destination" ]; then
+        if [ -z "$STAGING_DIR" ] || [ "$STAGING_DIR" = "/" ]; then
+            log "PREFLIGHT" "ERROR" "STAGING_DIR is unsafe or empty"
+            return 1
+        fi
+
+        case "${STAGING_DIR%/}/" in
+            "${DEST_DIR%/}/"*|"${SRC_DIR%/}/"*)
+                log "PREFLIGHT" "ERROR" \
+                    "STAGING_DIR must not be inside the source or vault destination"
+                return 1
+                ;;
+        esac
+
+        case "${DEST_DIR%/}/" in
+            "${STAGING_DIR%/}/"*)
+                log "PREFLIGHT" "ERROR" \
+                    "Vault destination must not be inside STAGING_DIR"
+                return 1
+                ;;
+        esac
+    fi
+
+    case "$EXCLUDE_REGENERABLE_PLEX_DATA" in
+        true|false)
+            ;;
+        *)
+            log "PREFLIGHT" "ERROR" \
+                "EXCLUDE_REGENERABLE_PLEX_DATA must be true or false"
             return 1
             ;;
     esac
@@ -553,6 +834,15 @@ refresh_destination_space() {
     )"
 
     if [ -z "$values" ]; then
+        values="$(
+            df -Pk -- "$DEST_DIR" 2>/dev/null |
+                awk 'NR == 2 {
+                    printf "%.0f %.0f %.0f", $2 * 1024, $3 * 1024, $4 * 1024
+                }'
+        )"
+    fi
+
+    if [ -z "$values" ]; then
         DEST_TOTAL_BYTES=0
         DEST_USED_BYTES=0
         DEST_FREE_BYTES=0
@@ -591,6 +881,7 @@ collect_appdata_directories() {
     local size=0
 
     APPDATA_DIRS=()
+    CURRENT_RAW_BYTES=()
 
     RAW_TOTAL_BYTES=0
     APPDATA_TOTAL=0
@@ -602,6 +893,12 @@ collect_appdata_directories() {
 
         name="$(basename "$directory")"
 
+        if [[ "$name" == *$'\t'* || "$name" == *$'\n'* ]]; then
+            log "PREFLIGHT" "ERROR" \
+                "Appdata directory names containing tabs or newlines are unsupported: $directory"
+            return 1
+        fi
+
         if array_contains "$name" "${SKIP_APPDATA_DIRS[@]}"; then
             continue
         fi
@@ -611,8 +908,10 @@ collect_appdata_directories() {
         size="$(safe_size_bytes "$directory")"
 
         if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -gt 0 ]; then
+            CURRENT_RAW_BYTES["$name"]="$size"
             RAW_TOTAL_BYTES=$((RAW_TOTAL_BYTES + size))
         else
+            CURRENT_RAW_BYTES["$name"]=0
             log "PREFLIGHT" "WARN" \
                 "Unable to determine size for appdata directory: $directory"
         fi
@@ -644,47 +943,242 @@ collect_appdata_directories() {
 }
 
 
-assess_destination_space() {
-    local free_human=""
-    local required_human=""
+find_latest_successful_backup() {
+    list_paths_by_mtime \
+        "$DEST_DIR" \
+        d \
+        'backup_[0-9]*_[0-9]*' \
+        '.partial' |
+        tail -n 1
+}
 
-    ESTIMATED_REQUIRED_BYTES="$(
-        awk \
-            -v raw="$RAW_TOTAL_BYTES" \
-            -v ratio="$REQUIRED_RATIO" \
-            -v margin="$LOW_SPACE_MARGIN" \
-            'BEGIN { printf "%.0f", (raw * ratio) + margin }'
-    )"
 
-    if ! refresh_destination_space; then
+manifest_checksum_valid() {
+    local directory="$1"
+
+    [ -f "${directory}/backup_manifest.tsv" ] &&
+        [ -f "${directory}/backup_manifest.tsv.sha256" ] &&
+        (
+            cd "$directory" &&
+                sha256sum -c -- backup_manifest.tsv.sha256 >/dev/null 2>&1
+        )
+}
+
+
+load_previous_backup_metrics() {
+    local raw_bytes=""
+    local archive_bytes=""
+    local checksum=""
+    local name=""
+    local archive=""
+    local loaded=0
+
+    PREVIOUS_RAW_BYTES=()
+    PREVIOUS_ARCHIVE_BYTES=()
+    LATEST_SUCCESS_DIR="$(find_latest_successful_backup)"
+    ESTIMATE_METHOD="fallback ratio"
+
+    [ -n "$LATEST_SUCCESS_DIR" ] || return 0
+
+    if manifest_checksum_valid "$LATEST_SUCCESS_DIR"; then
+        while IFS=$'\t' read -r raw_bytes archive_bytes checksum name; do
+            [[ "$raw_bytes" == \#* ]] && continue
+            [ -n "$name" ] || continue
+
+            if [[ "$raw_bytes" =~ ^[0-9]+$ ]] &&
+               [[ "$archive_bytes" =~ ^[0-9]+$ ]] &&
+               [[ "$checksum" =~ ^[[:xdigit:]]{64}$ ]]
+            then
+                PREVIOUS_RAW_BYTES["$name"]="$raw_bytes"
+                PREVIOUS_ARCHIVE_BYTES["$name"]="$archive_bytes"
+                loaded=$((loaded + 1))
+            fi
+        done <"${LATEST_SUCCESS_DIR}/backup_manifest.tsv"
+
+        if [ "$loaded" -gt 0 ]; then
+            ESTIMATE_METHOD="verified manifest history"
+            return 0
+        fi
+    fi
+
+    for archive in "$LATEST_SUCCESS_DIR"/*.tar.gz; do
+        [ -f "$archive" ] || continue
+        name="$(basename "$archive" .tar.gz)"
+        PREVIOUS_ARCHIVE_BYTES["$name"]="$(file_size_bytes "$archive")"
+        loaded=$((loaded + 1))
+    done
+
+    if [ "$loaded" -gt 0 ]; then
+        ESTIMATE_METHOD="archive-size history"
+    fi
+}
+
+
+calculate_space_estimate() {
+    local directory=""
+    local name=""
+    local current_raw=0
+    local previous_raw=0
+    local previous_archive=0
+    local predicted=0
+
+    PREDICTED_ARCHIVE_BYTES=()
+    ESTIMATED_BACKUP_BYTES=0
+
+    load_previous_backup_metrics
+
+    for directory in "${APPDATA_DIRS[@]}"; do
+        name="$(basename "$directory")"
+
+        if array_contains "$name" "${SKIP_APPDATA_DIRS[@]}"; then
+            continue
+        fi
+
+        current_raw="${CURRENT_RAW_BYTES[$name]:-0}"
+        previous_raw="${PREVIOUS_RAW_BYTES[$name]:-0}"
+        previous_archive="${PREVIOUS_ARCHIVE_BYTES[$name]:-0}"
+
+        if [ "$previous_archive" -gt 0 ]; then
+            if [ "$previous_raw" -gt 0 ] && [ "$current_raw" -gt 0 ]; then
+                predicted="$(
+                    awk \
+                        -v old_archive="$previous_archive" \
+                        -v old_raw="$previous_raw" \
+                        -v current_raw="$current_raw" \
+                        -v growth="$ESTIMATE_GROWTH_PERCENT" \
+                        'BEGIN {
+                            scaled = old_archive * (current_raw / old_raw)
+                            printf "%.0f", scaled * ((100 + growth) / 100)
+                        }'
+                )"
+            else
+                predicted=$((
+                    previous_archive * (100 + ESTIMATE_GROWTH_PERCENT) / 100
+                ))
+            fi
+        else
+            predicted="$(
+                awk \
+                    -v raw="$current_raw" \
+                    -v ratio="$REQUIRED_RATIO" \
+                    'BEGIN { printf "%.0f", raw * ratio }'
+            )"
+        fi
+
+        [ "$predicted" -gt 0 ] || predicted=1
+        PREDICTED_ARCHIVE_BYTES["$name"]="$predicted"
+        ESTIMATED_BACKUP_BYTES=$((ESTIMATED_BACKUP_BYTES + predicted))
+    done
+
+    ESTIMATED_REQUIRED_BYTES=$((
+        ESTIMATED_BACKUP_BYTES + LOW_SPACE_MARGIN + MIN_FREE_RESERVE_BYTES
+    ))
+    REMAINING_ESTIMATED_BYTES="$ESTIMATED_BACKUP_BYTES"
+
+    log "SPACE" "INFO" \
+        "Raw=$(bytes_to_human "$RAW_TOTAL_BYTES"), estimate=$(bytes_to_human "$ESTIMATED_BACKUP_BYTES"), reserve=$(bytes_to_human "$MIN_FREE_RESERVE_BYTES"), required=$(bytes_to_human "$ESTIMATED_REQUIRED_BYTES"), method=${ESTIMATE_METHOD}"
+
+    if [ -n "$LATEST_SUCCESS_DIR" ]; then
+        log "SPACE" "INFO" \
+            "Estimate baseline: $LATEST_SUCCESS_DIR"
+    fi
+}
+
+
+validate_staging_location() {
+    if [ "$REQUIRE_MOUNT_GUARDS" = "true" ]; then
+        if ! path_is_within_root "$STAGING_DIR" "$STAGING_MOUNT_ROOT"; then
+            log "SPACE" "ERROR" \
+                "Staging path is outside STAGING_MOUNT_ROOT: $STAGING_DIR"
+            return 1
+        fi
+
+        if ! is_exact_mountpoint "$STAGING_MOUNT_ROOT"; then
+            log "SPACE" "ERROR" \
+                "Staging mount is not active at: $STAGING_MOUNT_ROOT"
+            return 1
+        fi
+    fi
+
+    if ! ensure_dir "$STAGING_DIR"; then
         log "SPACE" "ERROR" \
-            "Unable to determine filesystem capacity for: $DEST_DIR"
+            "Unable to create staging directory: $STAGING_DIR"
         return 1
     fi
 
-    free_human="$(bytes_to_human "$DEST_FREE_BYTES")"
-    required_human="$(bytes_to_human "$ESTIMATED_REQUIRED_BYTES")"
+    return 0
+}
 
-    log "SPACE" "INFO" \
-        "Raw=$(bytes_to_human "$RAW_TOTAL_BYTES"), ratio=${REQUIRED_RATIO}, estimated required=${required_human}, available=${free_human}"
 
-    if [ "$DEST_FREE_BYTES" -ge "$ESTIMATED_REQUIRED_BYTES" ]; then
+select_backup_workspace() {
+    local destination_free=0
+    local staging_free=0
+    local destination_device=""
+    local staging_device=""
+
+    destination_free="$(available_bytes_for_path "$DEST_DIR")" || return 1
+    DEST_FREE_BYTES="$destination_free"
+
+    if [ "$BACKUP_STORAGE_MODE" != "staging" ] &&
+       [ "$destination_free" -ge "$ESTIMATED_REQUIRED_BYTES" ]
+    then
+        BACKUP_MODE="destination"
+        WORK_ROOT="$DEST_DIR"
+        WORK_DIR="${DEST_DIR}/backup_${RUN_STAMP}.partial"
+
+        log "SPACE" "INFO" \
+            "Using vault directly: available=$(bytes_to_human "$destination_free")"
         return 0
     fi
 
-    case "$LOW_SPACE_ACTION" in
-        abort)
-            log "SPACE" "ERROR" \
-                "Insufficient estimated space: required=${required_human}, available=${free_human}"
-            return 1
-            ;;
-
-        warn)
+    if [ "$BACKUP_STORAGE_MODE" = "destination" ]; then
+        if [ "$LOW_SPACE_ACTION" = "warn" ]; then
+            BACKUP_MODE="destination"
+            WORK_ROOT="$DEST_DIR"
+            WORK_DIR="${DEST_DIR}/backup_${RUN_STAMP}.partial"
             log "SPACE" "WARN" \
-                "Estimated space is insufficient, but LOW_SPACE_ACTION=warn; continuing"
+                "Vault estimate exceeds available space, but LOW_SPACE_ACTION=warn"
             return 0
-            ;;
-    esac
+        fi
+
+        log "SPACE" "ERROR" \
+            "Vault cannot safely fit the replacement: required=$(bytes_to_human "$ESTIMATED_REQUIRED_BYTES"), available=$(bytes_to_human "$destination_free")"
+        return 1
+    fi
+
+    validate_staging_location || return 1
+
+    destination_device="$(filesystem_device_id "$DEST_DIR" || true)"
+    staging_device="$(filesystem_device_id "$STAGING_DIR" || true)"
+
+    if [ -n "$destination_device" ] &&
+       [ "$destination_device" = "$staging_device" ]
+    then
+        log "SPACE" "WARN" \
+            "Staging and vault report the same filesystem device; staging will not provide independent capacity protection"
+    fi
+
+    staging_free="$(available_bytes_for_path "$STAGING_DIR")" || return 1
+
+    if [ "$staging_free" -lt "$ESTIMATED_REQUIRED_BYTES" ]; then
+        log "SPACE" "ERROR" \
+            "Neither vault nor staging has sufficient estimated space: vault=$(bytes_to_human "$destination_free"), staging=$(bytes_to_human "$staging_free"), required=$(bytes_to_human "$ESTIMATED_REQUIRED_BYTES")"
+        return 1
+    fi
+
+    BACKUP_MODE="staging"
+    WORK_ROOT="$STAGING_DIR"
+    WORK_DIR="${STAGING_DIR}/backup_${RUN_STAMP}.partial"
+
+    if [ "$BACKUP_STORAGE_MODE" = "staging" ]; then
+        log "SPACE" "INFO" \
+            "Verified staging was explicitly selected with $(bytes_to_human "$staging_free") available"
+    else
+        log "SPACE" "WARN" \
+            "Vault has $(bytes_to_human "$destination_free"); using verified staging with $(bytes_to_human "$staging_free") available"
+    fi
+
+    return 0
 }
 
 
@@ -699,14 +1193,10 @@ prune_logs() {
     [ -d "$LOG_DIR" ] || return 0
 
     mapfile -t logs < <(
-        find "$LOG_DIR" \
-            -mindepth 1 \
-            -maxdepth 1 \
-            -type f \
-            -name "${SRC_NAME}-*.log" \
-            -printf '%T@\t%p\n' 2>/dev/null |
-            sort -n |
-            cut -f2-
+        list_paths_by_mtime \
+            "$LOG_DIR" \
+            f \
+            "${SRC_NAME}-*.log"
     )
 
     while [ "${#logs[@]}" -gt "$MAX_LOGS" ]; do
@@ -729,15 +1219,11 @@ prune_successful_backups() {
     [ -d "$DEST_DIR" ] || return 0
 
     mapfile -t backups < <(
-        find "$DEST_DIR" \
-            -mindepth 1 \
-            -maxdepth 1 \
-            -type d \
-            -name 'backup_[0-9]*_[0-9]*' \
-            ! -name '*.partial' \
-            -printf '%T@\t%p\n' 2>/dev/null |
-            sort -n |
-            cut -f2-
+        list_paths_by_mtime \
+            "$DEST_DIR" \
+            d \
+            'backup_[0-9]*_[0-9]*' \
+            '.partial'
     )
 
     while [ "${#backups[@]}" -gt "$keep_count" ]; do
@@ -759,37 +1245,39 @@ prune_successful_backups() {
 
 
 prune_partial_backups() {
-    local keep_count="${1:-$MAX_PARTIAL_BACKUPS}"
+    local root="${1:-$DEST_DIR}"
+    local keep_count="${2:-$MAX_PARTIAL_BACKUPS}"
     local -a partials=()
     local removed=0
+    local reclaimed=0
+    local partial_size=0
 
-    [ -d "$DEST_DIR" ] || return 0
+    [ -d "$root" ] || return 0
 
     mapfile -t partials < <(
-        find "$DEST_DIR" \
-            -mindepth 1 \
-            -maxdepth 1 \
-            -type d \
-            -name 'backup_*.partial' \
-            -printf '%T@\t%p\n' 2>/dev/null |
-            sort -n |
-            cut -f2-
+        list_paths_by_mtime \
+            "$root" \
+            d \
+            'backup_*.partial'
     )
 
     while [ "${#partials[@]}" -gt "$keep_count" ]; do
+        partial_size="$(safe_size_bytes "${partials[0]}")"
+
         if ! rm -rf -- "${partials[0]}"; then
             log "CLEANUP" "ERROR" \
                 "Unable to remove old partial backup: ${partials[0]}"
             return 1
         fi
 
+        reclaimed=$((reclaimed + partial_size))
         partials=("${partials[@]:1}")
         removed=$((removed + 1))
     done
 
     if [ "$removed" -gt 0 ]; then
         log "CLEANUP" "INFO" \
-            "Partial-backup retention removed ${removed} old partial backup(s)"
+            "Partial-backup retention removed ${removed} old partial backup(s), approximately $(bytes_to_human "$reclaimed")"
     fi
 
     return 0
@@ -974,9 +1462,14 @@ handle_exit() {
 
     if [ "$exit_code" -ne 0 ] &&
        [ "$KEEP_PARTIAL" != "true" ] &&
+       [ -n "$WORK_DIR" ] &&
        [ -d "$WORK_DIR" ]
     then
         rm -rf -- "$WORK_DIR" 2>/dev/null || true
+    fi
+
+    if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
+        rm -rf -- "$TEMP_DIR" 2>/dev/null || true
     fi
 }
 
@@ -1007,16 +1500,243 @@ verify_archive() {
 }
 
 
+check_remaining_capacity() {
+    local name="$1"
+    local error_file="$2"
+    local available=0
+    local required=0
+
+    available="$(available_bytes_for_path "$WORK_ROOT")" || available=0
+    required=$((
+        REMAINING_ESTIMATED_BYTES +
+        LOW_SPACE_MARGIN +
+        MIN_FREE_RESERVE_BYTES
+    ))
+
+    if [ "$available" -ge "$required" ]; then
+        return 0
+    fi
+
+    LAST_COMPRESSION_REASON="capacity guard: remaining estimate $(bytes_to_human "$REMAINING_ESTIMATED_BYTES") plus reserve $(bytes_to_human "$MIN_FREE_RESERVE_BYTES") exceeds $(bytes_to_human "$available") available"
+    LAST_COMPRESSION_FATAL=true
+
+    printf 'Capacity guard stopped [%s]: %s\n' \
+        "$name" \
+        "$LAST_COMPRESSION_REASON" \
+        >>"$error_file"
+
+    log "SPACE" "ERROR" "[${name}] ${LAST_COMPRESSION_REASON}"
+    return 1
+}
+
+
+create_backup_manifest() {
+    local manifest="${WORK_DIR}/backup_manifest.tsv"
+    local checksum_file="${WORK_DIR}/backup_manifest.tsv.sha256"
+    local archive_count=0
+
+    [ -s "$MANIFEST_DATA_FILE" ] || return 1
+
+    archive_count="$(wc -l <"$MANIFEST_DATA_FILE" | tr -d '[:space:]')"
+
+    {
+        printf '# schema=1\n'
+        printf '# script_version=%s\n' "$SCRIPT_VERSION"
+        printf '# created=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+        printf '# source=%s\n' "$SRC_DIR"
+        printf '# archive_count=%s\n' "$archive_count"
+        printf '# fields=raw_bytes\\tarchive_bytes\\tsha256\\tname\n'
+        LC_ALL=C sort -t $'\t' -k4,4 "$MANIFEST_DATA_FILE"
+    } >"$manifest" || return 1
+
+    (
+        cd "$WORK_DIR" &&
+            sha256sum -- backup_manifest.tsv >backup_manifest.tsv.sha256
+    ) || return 1
+
+    [ -s "$checksum_file" ]
+}
+
+
+verify_backup_directory() {
+    local directory="$1"
+    local error_file="${2:-${TEMP_DIR}/generation-verify.err}"
+    local expected_count=""
+    local raw_bytes=""
+    local archive_bytes=""
+    local expected_checksum=""
+    local name=""
+    local archive=""
+    local actual_bytes=0
+    local actual_checksum=""
+    local verified_count=0
+    local archive_count=0
+
+    : >"$error_file"
+
+    if ! manifest_checksum_valid "$directory"; then
+        printf 'Manifest checksum is missing or invalid\n' >>"$error_file"
+        return 1
+    fi
+
+    if find "$directory" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -type l \
+        -print -quit 2>/dev/null |
+        grep -q .
+    then
+        printf 'Generation contains an unexpected symbolic link\n' \
+            >>"$error_file"
+        return 1
+    fi
+
+    expected_count="$(
+        sed -n 's/^# archive_count=//p' \
+            "${directory}/backup_manifest.tsv" |
+            tail -n 1
+    )"
+
+    if ! [[ "$expected_count" =~ ^[0-9]+$ ]] || [ "$expected_count" -lt 1 ]; then
+        printf 'Manifest archive count is invalid: %s\n' "$expected_count" \
+            >>"$error_file"
+        return 1
+    fi
+
+    while IFS=$'\t' read -r raw_bytes archive_bytes expected_checksum name; do
+        [[ "$raw_bytes" == \#* ]] && continue
+        [ -n "$name" ] || continue
+
+        if [ "$name" = "." ] || [ "$name" = ".." ] || [[ "$name" == */* ]]; then
+            printf 'Unsafe archive name in manifest: %s\n' "$name" \
+                >>"$error_file"
+            return 1
+        fi
+
+        if ! [[ "$raw_bytes" =~ ^[0-9]+$ ]] ||
+           ! [[ "$archive_bytes" =~ ^[0-9]+$ ]] ||
+           ! [[ "$expected_checksum" =~ ^[[:xdigit:]]{64}$ ]]
+        then
+            printf 'Invalid manifest row for: %s\n' "$name" >>"$error_file"
+            return 1
+        fi
+
+        archive="${directory}/${name}.tar.gz"
+
+        if [ ! -f "$archive" ] || [ -L "$archive" ]; then
+            printf 'Archive is missing or is a symlink: %s\n' "$archive" \
+                >>"$error_file"
+            return 1
+        fi
+
+        actual_bytes="$(file_size_bytes "$archive")"
+        if [ "$actual_bytes" -ne "$archive_bytes" ]; then
+            printf 'Archive size mismatch for %s: expected=%s actual=%s\n' \
+                "$name" "$archive_bytes" "$actual_bytes" >>"$error_file"
+            return 1
+        fi
+
+        actual_checksum="$(sha256sum -- "$archive" | awk '{print $1}')"
+        if [ "$actual_checksum" != "$expected_checksum" ]; then
+            printf 'Archive checksum mismatch for: %s\n' "$name" \
+                >>"$error_file"
+            return 1
+        fi
+
+        if ! verify_archive "$archive" "$error_file"; then
+            printf 'Archive content verification failed for: %s\n' "$name" \
+                >>"$error_file"
+            return 1
+        fi
+
+        verified_count=$((verified_count + 1))
+    done <"${directory}/backup_manifest.tsv"
+
+    archive_count=0
+    while IFS= read -r -d '' archive; do
+        archive_count=$((archive_count + 1))
+    done < <(
+        find "$directory" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type f \
+            -name '*.tar.gz' \
+            -print0 2>/dev/null
+    )
+
+    if [ "$verified_count" -ne "$expected_count" ] ||
+       [ "$archive_count" -ne "$expected_count" ]
+    then
+        printf 'Archive count mismatch: manifest=%s verified=%s present=%s\n' \
+            "$expected_count" "$verified_count" "$archive_count" \
+            >>"$error_file"
+        return 1
+    fi
+
+    return 0
+}
+
+
+record_archive_manifest_row() {
+    local name="$1"
+    local archive="$2"
+    local raw_bytes="${CURRENT_RAW_BYTES[$name]:-0}"
+    local archive_bytes=0
+    local checksum=""
+
+    archive_bytes="$(file_size_bytes "$archive")"
+    checksum="$(sha256sum -- "$archive" | awk '{print $1}')"
+
+    [[ "$checksum" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+
+    printf '%s\t%s\t%s\t%s\n' \
+        "$raw_bytes" \
+        "$archive_bytes" \
+        "$checksum" \
+        "$name" \
+        >>"$MANIFEST_DATA_FILE"
+}
+
+
 compress_directory() {
     local name="$1"
 
     local archive="${WORK_DIR}/${name}.tar.gz"
     local archive_tmp="${archive}.tmp"
-    local error_file="${WORK_DIR}/${name}.err"
+    local error_file="${TEMP_DIR}/${name}.err"
 
     local attempt=0
+    local tar_status=0
+    local compressor_status=0
+    local available_after=0
+    local temp_bytes=0
+    local non_retryable=false
+    local verification_failed=false
+    local manifest_record_failed=false
 
     local -a compressor=()
+    local -a pipeline_status=()
+    local -a effective_tar_options=("${TAR_OPTIONS[@]}")
+
+    LAST_COMPRESSION_REASON=""
+    LAST_COMPRESSION_FATAL=false
+    LAST_COMPRESSION_ATTEMPTS=0
+
+    if [ "$EXCLUDE_REGENERABLE_PLEX_DATA" = "true" ] &&
+       [ "$name" = "$PLEX_APPDATA_DIR" ]
+    then
+        effective_tar_options+=(
+            "--exclude=${name}/Library/Application Support/Plex Media Server/Cache"
+            "--exclude=${name}/Library/Application Support/Plex Media Server/Codecs"
+            "--exclude=${name}/Library/Application Support/Plex Media Server/Crash Reports"
+            "--exclude=${name}/Library/Application Support/Plex Media Server/Logs"
+            "--exclude=${name}/Library/Application Support/Plex Media Server/Updates"
+            "--exclude=${name}/Library/Application Support/Plex Media Server/Plug-in Support/Caches"
+        )
+
+        log "BACKUP" "INFO" \
+            "[${name}] Excluding regenerable Plex caches, codecs, crash reports, logs, and updates"
+    fi
 
     if command -v pigz >/dev/null 2>&1; then
         if [ "$PIGZ_THREADS" -gt 0 ]; then
@@ -1040,8 +1760,15 @@ compress_directory() {
 
     : >"$error_file"
 
+    if ! check_remaining_capacity "$name" "$error_file"; then
+        return 1
+    fi
+
     for ((attempt = 1; attempt <= RETRIES; attempt++)); do
+        LAST_COMPRESSION_ATTEMPTS="$attempt"
         rm -f -- "$archive_tmp"
+        verification_failed=false
+        manifest_record_failed=false
 
         printf '\n=== Compression attempt %d/%d ===\n' \
             "$attempt" \
@@ -1051,42 +1778,270 @@ compress_directory() {
         log "DOCKER" "INFO" \
             "[${name}] Compression attempt ${attempt}/${RETRIES}"
 
-        if "${PRIORITY_PREFIX[@]}" \
-                tar \
-                -C "$SRC_DIR" \
-                -cf - \
-                "${TAR_OPTIONS[@]}" \
-                -- "$name" \
-                2>>"$error_file" |
-           "${PRIORITY_PREFIX[@]}" \
+        "${PRIORITY_PREFIX[@]}" \
+            tar \
+            -C "$SRC_DIR" \
+            -cf - \
+            "${effective_tar_options[@]}" \
+            -- "$name" \
+            2>>"$error_file" |
+            "${PRIORITY_PREFIX[@]}" \
                 "${compressor[@]}" \
                 2>>"$error_file" \
                 >"$archive_tmp"
-        then
+
+        pipeline_status=("${PIPESTATUS[@]}")
+        tar_status="${pipeline_status[0]:-1}"
+        compressor_status="${pipeline_status[1]:-1}"
+
+        temp_bytes="$(file_size_bytes "$archive_tmp")"
+        available_after="$(available_bytes_for_path "$WORK_ROOT")" || available_after=0
+
+        printf 'Pipeline status: tar=%s, compressor=%s, temporary=%s, available=%s\n' \
+            "$(exit_status_description "$tar_status")" \
+            "$(exit_status_description "$compressor_status")" \
+            "$(bytes_to_human "$temp_bytes")" \
+            "$(bytes_to_human "$available_after")" \
+            >>"$error_file"
+
+        if [ "$tar_status" -eq 0 ] && [ "$compressor_status" -eq 0 ]; then
             if verify_archive "$archive_tmp" "$error_file"; then
                 if mv -f -- "$archive_tmp" "$archive"; then
                     log "VERIFY" "INFO" \
                         "[${name}] Archive passed gzip and tar verification"
-                    return 0
-                fi
+                    if record_archive_manifest_row "$name" "$archive"; then
+                        return 0
+                    fi
 
-                printf 'Failed to promote temporary archive to final archive\n' \
-                    >>"$error_file"
+                    manifest_record_failed=true
+                    printf 'Failed to record archive in the generation manifest\n' \
+                        >>"$error_file"
+                else
+                    printf 'Failed to promote temporary archive to final archive\n' \
+                        >>"$error_file"
+                fi
             else
+                verification_failed=true
                 log "VERIFY" "ERROR" \
                     "[${name}] Archive verification failed on attempt ${attempt}"
             fi
         else
             log "DOCKER" "ERROR" \
-                "[${name}] Compression pipeline failed on attempt ${attempt}"
+                "[${name}] Compression pipeline failed on attempt ${attempt}: tar=$(exit_status_description "$tar_status"), compressor=$(exit_status_description "$compressor_status")"
         fi
 
+        non_retryable=false
+
+        if grep -Eqi 'no space left|disk quota exceeded' "$error_file" ||
+           [ "$available_after" -lt "$MIN_FREE_RESERVE_BYTES" ]
+        then
+            LAST_COMPRESSION_REASON="destination capacity exhausted while creating ${name}"
+            LAST_COMPRESSION_FATAL=true
+            non_retryable=true
+        elif [ "$tar_status" -eq 137 ] || [ "$compressor_status" -eq 137 ]; then
+            LAST_COMPRESSION_REASON="compression was killed by SIGKILL; probable memory pressure"
+            LAST_COMPRESSION_FATAL=true
+            non_retryable=true
+        elif [ "$tar_status" -ge 128 ] || [ "$compressor_status" -ge 128 ]; then
+            LAST_COMPRESSION_REASON="compression process terminated by a signal"
+            non_retryable=true
+        elif [ "$manifest_record_failed" = "true" ]; then
+            LAST_COMPRESSION_REASON="archive succeeded but its checksum manifest could not be updated"
+            LAST_COMPRESSION_FATAL=true
+            non_retryable=true
+        elif [ "$verification_failed" = "true" ]; then
+            LAST_COMPRESSION_REASON="temporary archive failed gzip or tar verification"
+        else
+            LAST_COMPRESSION_REASON="tar or compressor returned a non-zero status"
+        fi
+
+        printf 'Classified failure: %s\n' "$LAST_COMPRESSION_REASON" \
+            >>"$error_file"
+
         rm -f -- "$archive_tmp"
+
+        if [ "$non_retryable" = "true" ]; then
+            log "BACKUP" "ERROR" \
+                "[${name}] Non-retryable failure: $LAST_COMPRESSION_REASON"
+            break
+        fi
 
         if [ "$attempt" -lt "$RETRIES" ]; then
             sleep "$RETRY_DELAY"
         fi
     done
+
+    return 1
+}
+
+
+successful_backup_bytes() {
+    local directory=""
+    local total=0
+    local size=0
+
+    while IFS= read -r -d '' directory; do
+        size="$(safe_size_bytes "$directory")"
+        total=$((total + size))
+    done < <(
+        find "$DEST_DIR" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -name 'backup_[0-9]*_[0-9]*' \
+            ! -name '*.partial' \
+            -print0 2>/dev/null
+    )
+
+    printf '%s\n' "$total"
+}
+
+
+transfer_staged_backup() {
+    local staged_directory="$1"
+    local generation_name=""
+    local destination_partial=""
+    local destination_final=""
+    local staged_bytes=0
+    local destination_free=0
+    local reclaimable_bytes=0
+    local required_bytes=0
+    local transfer_log="${TEMP_DIR}/staging-transfer.log"
+    local verify_log="${TEMP_DIR}/staging-transfer-verify.err"
+
+    generation_name="$(basename "$staged_directory" .staged)"
+    destination_partial="${DEST_DIR}/${generation_name}.partial"
+    destination_final="${DEST_DIR}/${generation_name}"
+
+    if ! verify_backup_directory \
+        "$staged_directory" \
+        "${TEMP_DIR}/staged-generation-verify.err"
+    then
+        log "STAGING" "ERROR" \
+            "Staged generation failed verification and was preserved: $staged_directory"
+        return 1
+    fi
+
+    staged_bytes="$(safe_size_bytes "$staged_directory")"
+    destination_free="$(available_bytes_for_path "$DEST_DIR")" || destination_free=0
+    reclaimable_bytes="$(successful_backup_bytes)"
+    required_bytes=$((staged_bytes + MIN_FREE_RESERVE_BYTES))
+
+    if [ $((destination_free + reclaimable_bytes)) -lt "$required_bytes" ]; then
+        log "STAGING" "ERROR" \
+            "Verified staged backup cannot fit on vault even after retiring the old generation: staged=$(bytes_to_human "$staged_bytes"), current free=$(bytes_to_human "$destination_free"), reclaimable=$(bytes_to_human "$reclaimable_bytes"), reserve=$(bytes_to_human "$MIN_FREE_RESERVE_BYTES")"
+        APPDATA_BACKUP_PATH="$staged_directory"
+        STAGED_RECOVERY_PENDING=true
+        return 1
+    fi
+
+    # A complete, checksum-verified replacement now exists on staging. It is
+    # safe to retire the old vault generation while this copy remains intact.
+    if ! prune_successful_backups 0; then
+        RETENTION_FAILED=1
+        APPDATA_BACKUP_PATH="$staged_directory"
+        STAGED_RECOVERY_PENDING=true
+        return 1
+    fi
+
+    destination_free="$(available_bytes_for_path "$DEST_DIR")" || destination_free=0
+    if [ "$destination_free" -lt "$required_bytes" ]; then
+        log "STAGING" "ERROR" \
+            "Vault still lacks room after old-generation cleanup; verified staged backup was preserved: required=$(bytes_to_human "$required_bytes"), available=$(bytes_to_human "$destination_free")"
+        APPDATA_BACKUP_PATH="$staged_directory"
+        STAGED_RECOVERY_PENDING=true
+        return 1
+    fi
+
+    if [ -e "$destination_partial" ] || [ -e "$destination_final" ]; then
+        log "STAGING" "ERROR" \
+            "Destination generation path already exists: $destination_partial or $destination_final"
+        APPDATA_BACKUP_PATH="$staged_directory"
+        STAGED_RECOVERY_PENDING=true
+        return 1
+    fi
+
+    if ! mkdir -p -- "$destination_partial"; then
+        log "STAGING" "ERROR" \
+            "Unable to create vault transfer directory: $destination_partial"
+        APPDATA_BACKUP_PATH="$staged_directory"
+        STAGED_RECOVERY_PENDING=true
+        return 1
+    fi
+
+    if ! "${PRIORITY_PREFIX[@]}" \
+        rsync \
+        -aH \
+        --delete-delay \
+        -- \
+        "${staged_directory}/" \
+        "${destination_partial}/" \
+        >"$transfer_log" 2>&1
+    then
+        log "STAGING" "ERROR" \
+            "Copy to vault failed; staged generation remains verified at: $staged_directory"
+        APPDATA_BACKUP_PATH="$staged_directory"
+        STAGED_RECOVERY_PENDING=true
+        return 1
+    fi
+
+    if ! verify_backup_directory "$destination_partial" "$verify_log"; then
+        log "STAGING" "ERROR" \
+            "Vault copy failed checksum or archive verification; staged generation was preserved"
+        APPDATA_BACKUP_PATH="$staged_directory"
+        STAGED_RECOVERY_PENDING=true
+        return 1
+    fi
+
+    if ! mv -- "$destination_partial" "$destination_final"; then
+        log "STAGING" "ERROR" \
+            "Verified vault copy could not be promoted: $destination_partial"
+        APPDATA_BACKUP_PATH="$staged_directory"
+        STAGED_RECOVERY_PENDING=true
+        return 1
+    fi
+
+    FINAL_DIR="$destination_final"
+    APPDATA_BACKUP_PATH="$destination_final"
+    STAGED_RECOVERY_PENDING=false
+
+    if ! rm -rf -- "$staged_directory"; then
+        log "STAGING" "WARN" \
+            "Vault backup is valid, but the redundant staged generation could not be removed: $staged_directory"
+    fi
+
+    log "STAGING" "INFO" \
+        "Verified staged generation copied, re-verified, and promoted on vault: $destination_final"
+
+    return 0
+}
+
+
+find_pending_staged_backup() {
+    [ -d "$STAGING_DIR" ] || return 0
+
+    list_paths_by_mtime \
+        "$STAGING_DIR" \
+        d \
+        'backup_*.staged' |
+        tail -n 1
+}
+
+
+recover_pending_staged_backup() {
+    local pending=""
+
+    pending="$(find_pending_staged_backup)"
+    [ -n "$pending" ] || return 2
+
+    log "STAGING" "WARN" \
+        "Found a completed staged generation from an earlier run: $pending"
+
+    if transfer_staged_backup "$pending"; then
+        log "STAGING" "INFO" \
+            "Earlier staged generation was recovered to the vault; no new archive run is needed"
+        return 0
+    fi
 
     return 1
 }
@@ -1104,6 +2059,8 @@ run_appdata_backup() {
     local archive_human=""
     local error_file=""
     local excerpt=""
+    local predicted_bytes=0
+    local generation_error="${TEMP_DIR}/generation-verify.err"
 
     APPDATA_OK=0
     APPDATA_FAILED=0
@@ -1147,13 +2104,21 @@ run_appdata_backup() {
             log "DOCKER" "INFO" \
                 "[${name}] Backup complete: ${archive_human}"
 
-            if [ "$KEEP_TEMP_ERR" != "true" ]; then
-                rm -f -- "${WORK_DIR}/${name}.err"
+            predicted_bytes="${PREDICTED_ARCHIVE_BYTES[$name]:-0}"
+            REMAINING_ESTIMATED_BYTES=$((
+                REMAINING_ESTIMATED_BYTES - predicted_bytes
+            ))
+            [ "$REMAINING_ESTIMATED_BYTES" -ge 0 ] ||
+                REMAINING_ESTIMATED_BYTES=0
+
+            if [ "$KEEP_TEMP_ERR" = "true" ]; then
+                cp -f -- "${TEMP_DIR}/${name}.err" \
+                    "${WORK_DIR}/${name}.err" 2>/dev/null || true
             fi
         else
             APPDATA_FAILED=$((APPDATA_FAILED + 1))
 
-            error_file="${WORK_DIR}/${name}.err"
+            error_file="${TEMP_DIR}/${name}.err"
 
             excerpt="$(
                 tail \
@@ -1163,7 +2128,7 @@ run_appdata_backup() {
                     true
             )"
 
-            APPDATA_REPORT+="[FAILED] [${name}]"$'\n'
+            APPDATA_REPORT+="[FAILED] [${name}] ${LAST_COMPRESSION_REASON:-unclassified compression failure}"$'\n'
 
             if [ -n "$excerpt" ]; then
                 APPDATA_REPORT+="---- stderr excerpt ----"$'\n'
@@ -1172,44 +2137,80 @@ run_appdata_backup() {
             fi
 
             log "DOCKER" "ERROR" \
-                "[${name}] Backup failed after ${RETRIES} attempt(s)"
+                "[${name}] Backup failed after ${LAST_COMPRESSION_ATTEMPTS} attempt(s)"
+
+            if [ "$KEEP_TEMP_ERR" = "true" ]; then
+                cp -f -- "$error_file" "${WORK_DIR}/${name}.err" \
+                    2>/dev/null || true
+            fi
+
+            if [ "$LAST_COMPRESSION_FATAL" = "true" ]; then
+                log "BACKUP" "ERROR" \
+                    "Stopping the archive phase after a fatal capacity or process failure"
+                break
+            fi
         fi
     done
 
     if [ "$APPDATA_FAILED" -eq 0 ]; then
-        if mv -- "$WORK_DIR" "$FINAL_DIR"; then
-            APPDATA_BACKUP_PATH="$FINAL_DIR"
+        if ! create_backup_manifest; then
+            APPDATA_FINALIZE_FAILED=1
+            log "VERIFY" "ERROR" \
+                "Unable to create the checksum-protected backup manifest"
+        elif ! verify_backup_directory "$WORK_DIR" "$generation_error"; then
+            APPDATA_FINALIZE_FAILED=1
+            excerpt="$(tail -n 20 "$generation_error" 2>/dev/null || true)"
+            APPDATA_REPORT+="[FAILED] Generation verification"$'\n'
+            [ -n "$excerpt" ] && APPDATA_REPORT+="${excerpt}"$'\n'
+            log "VERIFY" "ERROR" \
+                "Completed generation failed full checksum/archive verification"
+        elif [ "$BACKUP_MODE" = "destination" ]; then
+            if mv -- "$WORK_DIR" "$FINAL_DIR"; then
+                APPDATA_BACKUP_PATH="$FINAL_DIR"
 
-            log "BACKUP" "INFO" \
-                "Appdata backup verified and finalized: $FINAL_DIR"
+                log "BACKUP" "INFO" \
+                    "Appdata backup verified and finalized: $FINAL_DIR"
 
-            # The previous successful generation is deliberately retained
-            # until this new verified generation has been promoted.
-            if ! prune_successful_backups; then
-                RETENTION_FAILED=1
-                log "BACKUP" "ERROR" \
-                    "New backup is valid, but old successful backup pruning failed"
+                # The previous successful generation is deliberately retained
+                # until this new verified generation has been promoted.
+                if ! prune_successful_backups; then
+                    RETENTION_FAILED=1
+                    log "BACKUP" "ERROR" \
+                        "New backup is valid, but old successful backup pruning failed"
+                fi
+
+                return 0
             fi
 
-            return 0
+            APPDATA_FINALIZE_FAILED=1
+            log "BACKUP" "ERROR" \
+                "Unable to promote partial backup directory to final backup directory"
+        else
+            if mv -- "$WORK_DIR" "$STAGED_DIR"; then
+                APPDATA_BACKUP_PATH="$STAGED_DIR"
+                log "STAGING" "INFO" \
+                    "Replacement completed and verified on staging: $STAGED_DIR"
+
+                if transfer_staged_backup "$STAGED_DIR"; then
+                    return 0
+                fi
+
+                APPDATA_FINALIZE_FAILED=1
+                return 1
+            fi
+
+            APPDATA_FINALIZE_FAILED=1
+            log "STAGING" "ERROR" \
+                "Unable to promote partial staging directory: $WORK_DIR"
         fi
-
-        APPDATA_FINALIZE_FAILED=1
-
-        log "BACKUP" "ERROR" \
-            "Unable to promote partial backup directory to final backup directory"
-
-        APPDATA_BACKUP_PATH="$WORK_DIR"
-
-        return 1
     fi
 
-    if [ "$KEEP_PARTIAL" = "true" ]; then
+    if [ "$KEEP_PARTIAL" = "true" ] && [ -d "$WORK_DIR" ]; then
         APPDATA_BACKUP_PATH="$WORK_DIR"
 
         log "BACKUP" "WARN" \
             "Keeping incomplete appdata backup for inspection: $WORK_DIR"
-    else
+    elif [ -d "$WORK_DIR" ]; then
         rm -rf -- "$WORK_DIR"
         APPDATA_BACKUP_PATH="Removed"
 
@@ -1217,7 +2218,7 @@ run_appdata_backup() {
             "Removed incomplete appdata backup because KEEP_PARTIAL=false"
     fi
 
-    prune_partial_backups
+    prune_partial_backups "$WORK_ROOT"
 
     return 1
 }
@@ -1464,9 +2465,12 @@ build_space_block() {
         output+="  Total: $(bytes_to_human "$DEST_TOTAL_BYTES")"$'\n'
         output+="  Used:  $(bytes_to_human "$DEST_USED_BYTES")"$'\n'
         output+="  Free:  $(bytes_to_human "$DEST_FREE_BYTES") (${DEST_FREE_PERCENT}%)"$'\n'
-        output+="  Estimated appdata requirement: $(bytes_to_human "$ESTIMATED_REQUIRED_BYTES")"$'\n'
+        output+="  Estimated archive size: $(bytes_to_human "$ESTIMATED_BACKUP_BYTES")"$'\n'
+        output+="  Reserved free space: $(bytes_to_human "$MIN_FREE_RESERVE_BYTES")"$'\n'
+        output+="  Estimated total requirement: $(bytes_to_human "$ESTIMATED_REQUIRED_BYTES")"$'\n'
         output+="  Raw appdata measured: $(bytes_to_human "$RAW_TOTAL_BYTES")"$'\n'
-        output+="  Estimated compression ratio: ${REQUIRED_RATIO}"$'\n'
+        output+="  Estimate method: ${ESTIMATE_METHOD}"$'\n'
+        output+="  Backup path mode: ${BACKUP_MODE}"$'\n'
     else
         output+="Destination space: unavailable"$'\n'
     fi
@@ -1548,6 +2552,10 @@ send_final_notification() {
         body+="  Path: ${APPDATA_BACKUP_PATH}"$'\n'
     fi
 
+    if [ "$STAGED_RECOVERY_PENDING" = "true" ]; then
+        body+="  Recovery: verified staged generation preserved for the next run"$'\n'
+    fi
+
     body+=$'\n'
     body+="${APPDATA_REPORT}"
 
@@ -1588,6 +2596,11 @@ main() {
     local runtime_seconds=0
     local runtime_human=""
     local final_exit=0
+    local recovery_status=0
+
+    if ! acquire_lock; then
+        return 1
+    fi
 
     # -----------------------------------------------------------------------
     # Logging initialization
@@ -1606,6 +2619,14 @@ main() {
             "$LOG_FILE"
         return 1
     fi
+
+    TEMP_DIR="$(mktemp -d "/tmp/appdata_backup.${RUN_STAMP}.XXXXXX")" || {
+        printf '%s ERROR: Unable to create runtime diagnostic directory\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')"
+        return 1
+    }
+    MANIFEST_DATA_FILE="${TEMP_DIR}/manifest.data"
+    : >"$MANIFEST_DATA_FILE"
 
     trap 'exit_code=$?; handle_exit "$exit_code"' EXIT
     trap 'handle_signal INT' INT
@@ -1645,6 +2666,76 @@ ${LOG_FILE}"
 
     build_priority_prefix
 
+    # Incomplete directories never compete with a new backup. Diagnostics are
+    # held under /tmp, so failed partial data can be reclaimed immediately.
+    if ! prune_partial_backups "$DEST_DIR" 0; then
+        notify_unraid \
+            "alert" \
+            "Backup FAILED - Cleanup" \
+            "Unable to remove an old vault partial backup.
+Destination: ${DEST_DIR}
+See log:
+${LOG_FILE}"
+        return 1
+    fi
+
+    if [ "$BACKUP_STORAGE_MODE" != "destination" ] &&
+       [ -e "$STAGING_DIR" ] &&
+       ! validate_staging_location
+    then
+        notify_unraid \
+            "alert" \
+            "Backup FAILED - Staging" \
+            "The alternate staging location is unavailable or unsafe.
+Staging: ${STAGING_DIR}
+Mount root: ${STAGING_MOUNT_ROOT}
+See log:
+${LOG_FILE}"
+        return 1
+    fi
+
+    if [ -d "$STAGING_DIR" ] &&
+       ! prune_partial_backups "$STAGING_DIR" 0
+    then
+        notify_unraid \
+            "alert" \
+            "Backup FAILED - Cleanup" \
+            "Unable to remove an old staging partial backup.
+Staging: ${STAGING_DIR}
+See log:
+${LOG_FILE}"
+        return 1
+    fi
+
+    # A .staged directory is not partial data: it is a completed, verified
+    # generation retained because an earlier vault transfer could not finish.
+    if [ "$BACKUP_STORAGE_MODE" != "destination" ]; then
+        recover_pending_staged_backup
+        recovery_status=$?
+
+        if [ "$recovery_status" -eq 0 ]; then
+            notify_unraid \
+                "normal" \
+                "Backup staging recovery complete" \
+                "A previously verified appdata generation was copied to the vault and verified again.
+Path: ${APPDATA_BACKUP_PATH}"
+            prune_logs
+            return 0
+        fi
+
+        if [ "$recovery_status" -eq 1 ]; then
+            notify_unraid \
+                "alert" \
+                "Backup FAILED - Staging Recovery" \
+                "A verified or pending staged generation could not be finalized.
+It was preserved at:
+${APPDATA_BACKUP_PATH:-${STAGING_DIR}}
+See log:
+${LOG_FILE}"
+            return 1
+        fi
+    fi
+
     if ! collect_appdata_directories; then
         notify_unraid \
             "alert" \
@@ -1656,29 +2747,18 @@ ${SRC_DIR}"
         return 1
     fi
 
-    # Old partials are incomplete and are not allowed to compete with a new
-    # run. The previous successful generation is never removed here; capacity
-    # assessment must prove the destination can temporarily hold both the old
-    # and replacement generations.
-    if ! prune_partial_backups 0; then
-        notify_unraid \
-            "alert" \
-            "Backup FAILED - Cleanup" \
-            "Unable to remove an old partial backup before starting the new backup.
-Destination: ${DEST_DIR}
-See log:
-${LOG_FILE}"
+    calculate_space_estimate
 
-        return 1
-    fi
-
-    if ! assess_destination_space; then
+    if ! select_backup_workspace; then
         notify_unraid \
             "alert" \
             "Backup FAILED - Low Space" \
-            "Available: $(bytes_to_human "$DEST_FREE_BYTES")
-Estimated required: $(bytes_to_human "$ESTIMATED_REQUIRED_BYTES")
-Destination: ${DEST_DIR}"
+            "Vault available: $(bytes_to_human "$DEST_FREE_BYTES")
+Estimated backup: $(bytes_to_human "$ESTIMATED_BACKUP_BYTES")
+Reserve: $(bytes_to_human "$MIN_FREE_RESERVE_BYTES")
+Estimated total required: $(bytes_to_human "$ESTIMATED_REQUIRED_BYTES")
+Vault: ${DEST_DIR}
+Staging: ${STAGING_DIR}"
 
         return 1
     fi
@@ -1789,29 +2869,8 @@ ${LOG_FILE}"
     # Temporary error-file cleanup
     # -----------------------------------------------------------------------
 
-    if [ "$KEEP_TEMP_ERR" != "true" ]; then
-        if [ -d "$FINAL_DIR" ]; then
-            find "$FINAL_DIR" \
-                -maxdepth 1 \
-                -type f \
-                -name '*.err' \
-                -delete \
-                2>/dev/null ||
-                true
-        fi
-
-        if [ -d "$WORK_DIR" ]; then
-            find "$WORK_DIR" \
-                -maxdepth 1 \
-                -type f \
-                -name '*.err' \
-                -delete \
-                2>/dev/null ||
-                true
-        fi
-    fi
-
-    prune_partial_backups
+    prune_partial_backups "$DEST_DIR"
+    [ -d "$STAGING_DIR" ] && prune_partial_backups "$STAGING_DIR"
     prune_logs
 
     return "$final_exit"
@@ -1822,4 +2881,6 @@ ${LOG_FILE}"
 # ENTRY POINT
 ###############################################################################
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
