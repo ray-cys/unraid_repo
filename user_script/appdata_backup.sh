@@ -77,7 +77,7 @@ LOG_DIR="${LOG_DIR:-/mnt/vault/cloud/logs/script/appdata_backup}"
 # a valid recovery copy until the final vault copy has also been verified.
 # Ensure the Unraid "backup" share is configured to use array or pool storage
 # other than /mnt/vault; otherwise choose an explicit path on another device.
-STAGING_DIR="${STAGING_DIR:-/mnt/user/backup/appdata_staging}"
+STAGING_DIR="${STAGING_DIR:-/mnt/cache/staging}"
 STAGING_MOUNT_ROOT="${STAGING_MOUNT_ROOT:-/mnt/user}"
 
 # Prevent an unavailable mount from being replaced by an ordinary directory on
