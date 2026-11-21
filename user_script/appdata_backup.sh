@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Appdata + Optional Shares Backup v3.0
+# Appdata + Optional Shares Backup v3.1
 #
 # PURPOSE
 # -------
@@ -11,7 +11,8 @@
 # Appdata workflow:
 #
 #   1. Validate source/destination
-#   2. Estimate compressed size from the last verified generation
+#   2. Estimate compressed size from the last verified generation, measuring
+#      only applications that do not have usable archive history
 #   3. Select the vault or an alternate verified staging location
 #   4. Record currently-running Docker containers
 #   5. Stop selected running containers
@@ -55,7 +56,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="3.0"
+readonly SCRIPT_VERSION="3.1"
 
 
 ###############################################################################
@@ -200,9 +201,21 @@ NICE_LEVEL="${NICE_LEVEL:-10}"
 #
 REQUIRED_RATIO="${REQUIRED_RATIO:-0.60}"
 
-# Historical estimates are scaled by the current raw-size change and then
-# receive this additional growth allowance.
+# Historical estimates receive this growth allowance. Full inventory mode may
+# additionally raise the estimate when measured raw-size growth is larger.
 ESTIMATE_GROWTH_PERCENT="${ESTIMATE_GROWTH_PERCENT:-20}"
+
+# Source-size inventory mode:
+#
+#   history = use each application's last verified compressed archive size,
+#             plus ESTIMATE_GROWTH_PERCENT. Only new/history-less applications
+#             receive a recursive source-size scan.
+#   full    = recursively measure every application and scale historical
+#             archive sizes by the measured raw-size change.
+#
+# History mode avoids repeatedly walking large application trees such as Plex
+# metadata. Runtime free-space checks still run before every archive.
+PREFLIGHT_SIZE_MODE="${PREFLIGHT_SIZE_MODE:-history}"
 
 # Preserve this much usable space after the replacement is written.
 MIN_FREE_RESERVE_BYTES="${MIN_FREE_RESERVE_BYTES:-10737418240}"
@@ -308,6 +321,8 @@ declare -A PREDICTED_ARCHIVE_BYTES=()
 CONTAINERS_NEED_RESTART=false
 
 RAW_TOTAL_BYTES=0
+RAW_MEASURED_COUNT=0
+HISTORY_ESTIMATE_COUNT=0
 ESTIMATED_BACKUP_BYTES=0
 ESTIMATED_REQUIRED_BYTES=0
 REMAINING_ESTIMATED_BYTES=0
@@ -637,7 +652,7 @@ validate_configuration() {
     local required_command=""
 
     for required_command in \
-        awk df find flock gzip rsync sha256sum sort stat tar
+        awk df du find flock gzip rsync sha256sum sort stat tar
     do
         if ! command -v "$required_command" >/dev/null 2>&1; then
             log "PREFLIGHT" "ERROR" \
@@ -721,6 +736,16 @@ validate_configuration() {
             "ESTIMATE_GROWTH_PERCENT must be a non-negative integer"
         return 1
     fi
+
+    case "$PREFLIGHT_SIZE_MODE" in
+        history|full)
+            ;;
+        *)
+            log "PREFLIGHT" "ERROR" \
+                "PREFLIGHT_SIZE_MODE must be 'history' or 'full'"
+            return 1
+            ;;
+    esac
 
     if ! [[ "$MIN_FREE_RESERVE_BYTES" =~ ^[0-9]+$ ]]; then
         log "PREFLIGHT" "ERROR" \
@@ -879,12 +904,13 @@ refresh_destination_space() {
 collect_appdata_directories() {
     local directory=""
     local name=""
-    local size=0
 
     APPDATA_DIRS=()
     CURRENT_RAW_BYTES=()
 
     RAW_TOTAL_BYTES=0
+    RAW_MEASURED_COUNT=0
+    HISTORY_ESTIMATE_COUNT=0
     APPDATA_TOTAL=0
     APPDATA_ELIGIBLE=0
 
@@ -905,18 +931,6 @@ collect_appdata_directories() {
         fi
 
         APPDATA_ELIGIBLE=$((APPDATA_ELIGIBLE + 1))
-
-        size="$(safe_size_bytes "$directory")"
-
-        if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -gt 0 ]; then
-            CURRENT_RAW_BYTES["$name"]="$size"
-            RAW_TOTAL_BYTES=$((RAW_TOTAL_BYTES + size))
-        else
-            CURRENT_RAW_BYTES["$name"]=0
-            log "PREFLIGHT" "WARN" \
-                "Unable to determine size for appdata directory: $directory"
-        fi
-
     done < <(
         find "$SRC_DIR" \
             -mindepth 1 \
@@ -926,7 +940,7 @@ collect_appdata_directories() {
     )
 
     log "PREFLIGHT" "INFO" \
-        "Found ${APPDATA_TOTAL} top-level appdata directories; ${APPDATA_ELIGIBLE} eligible for backup"
+        "Found ${APPDATA_TOTAL} top-level appdata directories; ${APPDATA_ELIGIBLE} eligible for backup; size mode=${PREFLIGHT_SIZE_MODE}"
 
     if [ "$APPDATA_TOTAL" -eq 0 ]; then
         log "PREFLIGHT" "ERROR" \
@@ -1022,11 +1036,21 @@ calculate_space_estimate() {
     local previous_raw=0
     local previous_archive=0
     local predicted=0
+    local measure_started=0
+    local measure_elapsed=0
+    local history_source="fallback ratio"
 
     PREDICTED_ARCHIVE_BYTES=()
     ESTIMATED_BACKUP_BYTES=0
+    RAW_TOTAL_BYTES=0
+    RAW_MEASURED_COUNT=0
+    HISTORY_ESTIMATE_COUNT=0
 
     load_previous_backup_metrics
+    history_source="$ESTIMATE_METHOD"
+
+    log "PREFLIGHT" "INFO" \
+        "Preparing capacity estimate for ${APPDATA_ELIGIBLE} application(s)"
 
     for directory in "${APPDATA_DIRS[@]}"; do
         name="$(basename "$directory")"
@@ -1035,12 +1059,47 @@ calculate_space_estimate() {
             continue
         fi
 
-        current_raw="${CURRENT_RAW_BYTES[$name]:-0}"
         previous_raw="${PREVIOUS_RAW_BYTES[$name]:-0}"
         previous_archive="${PREVIOUS_ARCHIVE_BYTES[$name]:-0}"
 
-        if [ "$previous_archive" -gt 0 ]; then
-            if [ "$previous_raw" -gt 0 ] && [ "$current_raw" -gt 0 ]; then
+        if [ "$PREFLIGHT_SIZE_MODE" = "history" ] &&
+           [ "$previous_archive" -gt 0 ]
+        then
+            # Retain the last measured raw size for diagnostics without
+            # traversing the source tree again. Capacity estimation is based
+            # on the immediately previous verified archive, not this value.
+            CURRENT_RAW_BYTES["$name"]="$previous_raw"
+            predicted=$((
+                previous_archive * (100 + ESTIMATE_GROWTH_PERCENT) / 100
+            ))
+            HISTORY_ESTIMATE_COUNT=$((HISTORY_ESTIMATE_COUNT + 1))
+        else
+            measure_started="$(date +%s)"
+            log "PREFLIGHT" "INFO" \
+                "[${name}] Measuring source size (no usable archive history or full scan requested)"
+
+            current_raw="$(safe_size_bytes "$directory")"
+            measure_elapsed=$(($(date +%s) - measure_started))
+
+            if [[ "$current_raw" =~ ^[0-9]+$ ]] &&
+               [ "$current_raw" -gt 0 ]
+            then
+                CURRENT_RAW_BYTES["$name"]="$current_raw"
+                RAW_TOTAL_BYTES=$((RAW_TOTAL_BYTES + current_raw))
+                RAW_MEASURED_COUNT=$((RAW_MEASURED_COUNT + 1))
+                log "PREFLIGHT" "INFO" \
+                    "[${name}] Source size $(bytes_to_human "$current_raw") measured in $(format_duration "$measure_elapsed")"
+            else
+                CURRENT_RAW_BYTES["$name"]=0
+                current_raw=0
+                log "PREFLIGHT" "WARN" \
+                    "[${name}] Unable to determine source size after $(format_duration "$measure_elapsed")"
+            fi
+
+            if [ "$previous_archive" -gt 0 ] &&
+               [ "$previous_raw" -gt 0 ] &&
+               [ "$current_raw" -gt 0 ]
+            then
                 predicted="$(
                     awk \
                         -v old_archive="$previous_archive" \
@@ -1052,18 +1111,18 @@ calculate_space_estimate() {
                             printf "%.0f", scaled * ((100 + growth) / 100)
                         }'
                 )"
-            else
+            elif [ "$previous_archive" -gt 0 ]; then
                 predicted=$((
                     previous_archive * (100 + ESTIMATE_GROWTH_PERCENT) / 100
                 ))
+            else
+                predicted="$(
+                    awk \
+                        -v raw="$current_raw" \
+                        -v ratio="$REQUIRED_RATIO" \
+                        'BEGIN { printf "%.0f", raw * ratio }'
+                )"
             fi
-        else
-            predicted="$(
-                awk \
-                    -v raw="$current_raw" \
-                    -v ratio="$REQUIRED_RATIO" \
-                    'BEGIN { printf "%.0f", raw * ratio }'
-            )"
         fi
 
         [ "$predicted" -gt 0 ] || predicted=1
@@ -1071,13 +1130,25 @@ calculate_space_estimate() {
         ESTIMATED_BACKUP_BYTES=$((ESTIMATED_BACKUP_BYTES + predicted))
     done
 
+    if [ "$HISTORY_ESTIMATE_COUNT" -gt 0 ] &&
+       [ "$RAW_MEASURED_COUNT" -gt 0 ]
+    then
+        ESTIMATE_METHOD="${history_source} + measured new/history-less applications"
+    elif [ "$HISTORY_ESTIMATE_COUNT" -gt 0 ]; then
+        ESTIMATE_METHOD="$history_source"
+    elif [ "$RAW_MEASURED_COUNT" -gt 0 ]; then
+        ESTIMATE_METHOD="measured fallback ratio"
+    else
+        ESTIMATE_METHOD="fallback ratio"
+    fi
+
     ESTIMATED_REQUIRED_BYTES=$((
         ESTIMATED_BACKUP_BYTES + LOW_SPACE_MARGIN + MIN_FREE_RESERVE_BYTES
     ))
     REMAINING_ESTIMATED_BYTES="$ESTIMATED_BACKUP_BYTES"
 
     log "SPACE" "INFO" \
-        "Raw=$(bytes_to_human "$RAW_TOTAL_BYTES"), estimate=$(bytes_to_human "$ESTIMATED_BACKUP_BYTES"), reserve=$(bytes_to_human "$MIN_FREE_RESERVE_BYTES"), required=$(bytes_to_human "$ESTIMATED_REQUIRED_BYTES"), method=${ESTIMATE_METHOD}"
+        "Measured raw=$(bytes_to_human "$RAW_TOTAL_BYTES") across ${RAW_MEASURED_COUNT} app(s), history=${HISTORY_ESTIMATE_COUNT} app(s), estimate=$(bytes_to_human "$ESTIMATED_BACKUP_BYTES"), reserve=$(bytes_to_human "$MIN_FREE_RESERVE_BYTES"), required=$(bytes_to_human "$ESTIMATED_REQUIRED_BYTES"), method=${ESTIMATE_METHOD}"
 
     if [ -n "$LATEST_SUCCESS_DIR" ]; then
         log "SPACE" "INFO" \
@@ -1546,6 +1617,7 @@ create_backup_manifest() {
         printf '# created=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
         printf '# source=%s\n' "$SRC_DIR"
         printf '# archive_count=%s\n' "$archive_count"
+        printf '# raw_bytes_note=last measured source size; may be carried forward in history mode\n'
         printf '# fields=raw_bytes\\tarchive_bytes\\tsha256\\tname\n'
         LC_ALL=C sort -t $'\t' -k4,4 "$MANIFEST_DATA_FILE"
     } >"$manifest" || return 1
@@ -2469,7 +2541,8 @@ build_space_block() {
         output+="  Estimated archive size: $(bytes_to_human "$ESTIMATED_BACKUP_BYTES")"$'\n'
         output+="  Reserved free space: $(bytes_to_human "$MIN_FREE_RESERVE_BYTES")"$'\n'
         output+="  Estimated total requirement: $(bytes_to_human "$ESTIMATED_REQUIRED_BYTES")"$'\n'
-        output+="  Raw appdata measured: $(bytes_to_human "$RAW_TOTAL_BYTES")"$'\n'
+        output+="  Raw source measured: $(bytes_to_human "$RAW_TOTAL_BYTES") across ${RAW_MEASURED_COUNT} app(s)"$'\n'
+        output+="  History-based estimates: ${HISTORY_ESTIMATE_COUNT} app(s)"$'\n'
         output+="  Estimate method: ${ESTIMATE_METHOD}"$'\n'
         output+="  Backup path mode: ${BACKUP_MODE}"$'\n'
     else

@@ -217,6 +217,8 @@ assert_not_contains "$DIRECT_ROOT/plex.list" "Cache/cache.bin"
 
 sleep 1
 printf 'new data\n' >>"$DIRECT_ROOT/source/app-one/data.txt"
+mkdir -p "$DIRECT_ROOT/source/app-two"
+printf 'new application data\n' >"$DIRECT_ROOT/source/app-two/data.txt"
 
 run_backup "$DIRECT_ROOT" staging "$DIRECT_ROOT/staging.out" ||
     fail "verified staging backup failed"
@@ -229,6 +231,14 @@ if find "$DIRECT_ROOT/staging" -mindepth 1 -print -quit | grep -q .; then
 fi
 
 assert_contains "$DIRECT_ROOT/staging.out" "method=verified manifest history"
+assert_contains "$DIRECT_ROOT/staging.out" \
+    "history=2 app(s)"
+assert_contains "$DIRECT_ROOT/staging.out" \
+    "[app-two] Measuring source size (no usable archive history or full scan requested)"
+assert_not_contains "$DIRECT_ROOT/staging.out" \
+    "[app-one] Measuring source size"
+assert_not_contains "$DIRECT_ROOT/staging.out" \
+    "[plex-media-server] Measuring source size"
 assert_contains "$DIRECT_ROOT/staging.out" \
     "Verified staged generation copied, re-verified, and promoted on vault"
 
