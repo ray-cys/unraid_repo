@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.8.0
+# ARR Health / Download / Import Monitor v3.9.0
 #
 # PURPOSE
 # -------
@@ -125,6 +125,20 @@
 # per dismissed download. Every preview also writes a readable TSV report and
 # an ACK-only text file that can be passed directly to --ack-file. Run --help
 # for complete examples and safeguards.
+#
+#
+# LOGGING BEHAVIOR
+# ----------------
+# At the default LOG_LEVEL=INFO, an unchanged scheduled run prints one compact
+# status line and does not append routine data to the persistent log. A full
+# report is emitted after a pipeline-status or lifecycle change (including a
+# newly detected monitor degradation) and as a six-hour heartbeat. Warnings,
+# errors, issue transitions, resolutions, and notification results remain
+# visible.
+#
+# Temporarily set LOG_LEVEL=DEBUG to restore per-phase, per-item, retry, cache,
+# threshold, and suppression detail while troubleshooting. Persistent logs are
+# bounded by both size/generation rotation and a numbered-backup age limit.
 #
 #
 # ARR-SIDE DETECTION
@@ -637,15 +651,26 @@ BATCH_DISMISS_AUDIT_RETENTION_DAYS=30
 
 LOG_FILE="${STATE_DIR}/arr_health_activity.log"
 
-# Rotate after approximately 10 MiB.
-LOG_MAX_SIZE_MB=10
+# Routine runs stay compact. DEBUG temporarily restores phase, checkpoint,
+# pagination/cache, suppression, and other troubleshooting messages.
+LOG_LEVEL="INFO"
+
+# Emit a full health report on change and as a periodic healthy heartbeat.
+HEALTH_HEARTBEAT_HOURS=6
+
+# Rotate after approximately 5 MiB.
+LOG_MAX_SIZE_MB=5
 
 # Keep:
 #   arr_health_activity.log
 #   arr_health_activity.log.1
 #   arr_health_activity.log.2
-#   arr_health_activity.log.3
-LOG_BACKUPS=3
+# Keep the active log plus two numbered backups (approximately 15 MiB total).
+LOG_BACKUPS=2
+
+# A quiet backup can otherwise remain indefinitely because rotation is
+# size-based. Remove numbered backups older than this age as a second bound.
+LOG_RETENTION_DAYS=30
 
 # ---------------------------------------------------------------------------
 # Recent activity audit - v2.5
@@ -990,6 +1015,9 @@ SAB_AUDIT_WINDOW_INCOMPLETE=false
 
 PIPELINE_STATUS="UNKNOWN"
 PIPELINE_REASON="Not assessed"
+DETAILED_SUMMARY_DUE=false
+DETAILED_SUMMARY_REASON="not evaluated"
+ACTIVE_ISSUE_COUNT=0
 
 ###############################################################################
 # ACTIVITY FLOW ANOMALY - v2.6
@@ -1016,8 +1044,69 @@ FLOW_ANALYSIS_REASON="Not evaluated"
 # BASIC FUNCTIONS
 ###############################################################################
 
+log_level_rank() {
+
+    case "${1^^}" in
+        ERROR)
+            printf '0\n'
+            ;;
+
+        WARNING)
+            printf '1\n'
+            ;;
+
+        INFO)
+            printf '2\n'
+            ;;
+
+        DEBUG)
+            printf '3\n'
+            ;;
+
+        *)
+            printf '2\n'
+            ;;
+    esac
+}
+
+log_level_enabled() {
+
+    local requested="$1"
+    local configured_rank
+    local requested_rank
+
+    configured_rank=$(log_level_rank "$LOG_LEVEL")
+    requested_rank=$(log_level_rank "$requested")
+
+    (( requested_rank <= configured_rank ))
+}
+
 log() {
-    printf '%s : %s\n' "$(date '+%Y/%m/%d %T')" "$*"
+
+    local message="$*"
+    local level="INFO"
+
+    case "$message" in
+        ERROR:*)
+            level="ERROR"
+            ;;
+
+        WARNING:*)
+            level="WARNING"
+            ;;
+
+        DEBUG:*)
+            level="DEBUG"
+            message="${message#DEBUG: }"
+            ;;
+    esac
+
+    log_level_enabled "$level" || return 0
+    printf '%s : %s\n' "$(date '+%Y/%m/%d %T')" "$message"
+}
+
+debug_log() {
+    log "DEBUG: $*"
 }
 
 ###############################################################################
@@ -1028,6 +1117,10 @@ persistent_log() {
 
     local level="$1"
     shift
+
+    if [ "$level" = "DEBUG" ] && ! log_level_enabled DEBUG; then
+        return
+    fi
 
     if [ -z "$LOG_FILE" ]; then
         return
@@ -1042,6 +1135,26 @@ persistent_log() {
 
         log "WARNING: Unable to write persistent log: $LOG_FILE"
     fi
+}
+
+prune_persistent_logs_by_age() {
+
+    local find_mtime
+
+    [ -d "$STATE_DIR" ] || return 0
+    [[ "$LOG_RETENTION_DAYS" =~ ^[0-9]+$ ]] || return 0
+    (( LOG_RETENTION_DAYS > 0 )) || return 0
+
+    # find rounds file ages down to complete 24-hour periods. Subtract one so
+    # a setting of 30 removes backups once they have reached 30 days old.
+    find_mtime=$((LOG_RETENTION_DAYS - 1))
+
+    find "$STATE_DIR" \
+        -maxdepth 1 \
+        -type f \
+        -name 'arr_health_activity.log.*' \
+        -mtime "+${find_mtime}" \
+        -delete 2>/dev/null || true
 }
 
 ###############################################################################
@@ -1527,7 +1640,7 @@ http_json_get() {
         (( delay > HTTP_RETRY_MAX_DELAY_SECONDS )) && \
             delay="$HTTP_RETRY_MAX_DELAY_SECONDS"
 
-        log "Temporary HTTP failure for ${safe_url}: ${HTTP_LAST_ERROR}; retrying in ${delay}s (${attempt}/${HTTP_RETRY_COUNT})"
+        debug_log "Temporary HTTP failure for ${safe_url}: ${HTTP_LAST_ERROR}; retrying in ${delay}s (${attempt}/${HTTP_RETRY_COUNT})"
         sleep "$delay"
 
         ((attempt++)) || true
@@ -2084,7 +2197,7 @@ discover_arr_api() {
     esac
 
     store_arr_api_capability "$app" "$root" "$discovered" || return 1
-    log "${app} API capability detected: ${discovered}"
+    debug_log "${app} API capability detected: ${discovered}"
     return 0
 }
 
@@ -2275,7 +2388,7 @@ fetch_sab_history() {
                     SAB_AUDIT_WINDOW_INCOMPLETE=true
                 fi
 
-                log "SABnzbd history unchanged; reused persistent history cache"
+                debug_log "SABnzbd history unchanged; reused persistent history cache"
                 update_sab_history_cursor "$output" || return 1
                 return 0
             fi
@@ -3371,7 +3484,7 @@ validate_state_schema() {
 
     jq -e '
         (.version | type) == "number"
-        and (.version >= 16)
+        and (.version >= 17)
         and (.issues | type) == "object"
         and (.sabProgress | type) == "object"
         and (.downloadLedger | type) == "object"
@@ -3380,6 +3493,7 @@ validate_state_schema() {
         and (.apiCapabilities | type) == "object"
         and (.historyCursors | type) == "object"
         and (.monitor | type) == "object"
+        and ((.monitor.lastDetailedSummaryAt // 0) | type) == "number"
         and (.monitor.notification | type) == "object"
         and (.telemetry | type) == "object"
         and (.telemetry.patterns | type) == "object"
@@ -3475,7 +3589,7 @@ create_initial_state() {
 
     if ! cat >"$initial_tmp" <<'EOF'
 {
-  "version": 16,
+  "version": 17,
   "issues": {},
   "sabProgress": {},
   "downloadLedger": {},
@@ -3490,6 +3604,7 @@ create_initial_state() {
     "lastExitCode": 0,
     "lastPhase": "startup",
     "lastError": "",
+    "lastDetailedSummaryAt": 0,
     "phaseTimings": {},
     "notification": {
       "failed": false,
@@ -3529,7 +3644,7 @@ restore_valid_state_backup() {
         if [ -f "$candidate" ] &&
            { validate_state_schema "$candidate" ||
              jq -e \
-                'type == "object" and ((.version // 0) < 16)' \
+                'type == "object" and ((.version // 0) < 17)' \
                 "$candidate" >/dev/null 2>&1; }
         then
             restore_tmp=$(mktemp "${STATE_DIR}/.state-restore.XXXXXX") || return 1
@@ -3572,7 +3687,7 @@ commit_state_transaction() {
     fi
 
     STATE_TRANSACTION_DIRTY=false
-    log "State checkpoint committed: $checkpoint"
+    debug_log "State checkpoint committed: $checkpoint"
 }
 
 initialize_state() {
@@ -3606,7 +3721,7 @@ initialize_state() {
     fi
 
     ###########################################################################
-    # STATE MIGRATION - v3.8
+    # STATE MIGRATION - v3.9
     #
     # Existing state is upgraded in place. Completion-only ledger records that
     # predate the discovery window are not enrolled. Any active historical
@@ -3622,7 +3737,7 @@ initialize_state() {
         --argjson migrationNow "$START_TIME" \
         --argjson discoverySeconds "$((DOWNLOAD_LEDGER_DISCOVERY_HOURS * 3600))" \
         '
-        .version = 16
+        .version = 17
         |
         .issues = (.issues // {})
         |
@@ -3871,6 +3986,7 @@ initialize_state() {
                 lastExitCode: 0,
                 lastPhase: "startup",
                 lastError: "",
+                lastDetailedSummaryAt: 0,
                 phaseTimings: {},
                 notification: {
                     failed: false,
@@ -3897,6 +4013,10 @@ initialize_state() {
         .monitor.lastPhase = (.monitor.lastPhase // "startup")
         |
         .monitor.lastError = (.monitor.lastError // "")
+        |
+        .monitor.lastDetailedSummaryAt = (
+            .monitor.lastDetailedSummaryAt // 0
+        )
         |
         .monitor.phaseTimings = (.monitor.phaseTimings // {})
         |
@@ -3934,7 +4054,7 @@ initialize_state() {
 
     else
 
-        log "ERROR: Unable to migrate state file to schema version 16"
+        log "ERROR: Unable to migrate state file to schema version 17"
         exit 3
     fi
 }
@@ -4008,7 +4128,7 @@ begin_monitor_run() {
     jq \
         --argjson now "$now" \
         '
-        .version = 16
+        .version = 17
         |
         .monitor.lastStartedAt = $now
         |
@@ -4071,7 +4191,7 @@ start_monitor_phase() {
 
     MONITOR_CURRENT_PHASE="$1"
     MONITOR_PHASE_STARTED_AT=$(date +%s)
-    log "Phase started: ${MONITOR_CURRENT_PHASE}"
+    debug_log "Phase started: ${MONITOR_CURRENT_PHASE}"
 }
 
 end_monitor_phase() {
@@ -4092,7 +4212,7 @@ end_monitor_phase() {
             >>"$MONITOR_PHASE_TIMINGS_FILE" || true
     fi
 
-    log "Phase completed: ${phase} (${seconds}s)"
+    debug_log "Phase completed: ${phase} (${seconds}s)"
 }
 
 runtime_budget_allows_optional_phase() {
@@ -4508,7 +4628,7 @@ record_arr_telemetry() {
         --argjson maxIssueKeys "$ARR_TELEMETRY_MAX_ISSUE_KEYS" \
         --argjson maxExamples "$ARR_TELEMETRY_MAX_EXAMPLES" \
         '
-        .version = 16
+        .version = 17
         |
         .telemetry = (
             .telemetry
@@ -4935,7 +5055,7 @@ update_issue_state() {
         --argjson flapThreshold "$FLAP_TRANSITION_THRESHOLD" \
         --argjson flapSuppressionSeconds "$flap_suppression_seconds" \
         '
-        .version = 16
+        .version = 17
         |
         (.issues[$key] // {}) as $old
         |
@@ -6246,7 +6366,7 @@ batch_dismiss_downloads() {
         --argjson now "$now" \
         --argjson count "$count" \
         '
-        .version = 16
+        .version = 17
         |
         .downloadDismissalBatches = (.downloadDismissalBatches // {})
         |
@@ -6409,7 +6529,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.8.0 lifecycle commands' \
+        'ARR Health Monitor v3.9.0 lifecycle commands' \
         '' \
         'Always invoke the Unraid User Scripts copy through /bin/bash:' \
         '  /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script COMMAND' \
@@ -6628,7 +6748,7 @@ source_can_resolve() {
 
 resolve_missing_issues() {
 
-    log "Checking previously active issues for resolution"
+    debug_log "Checking previously active issues for resolution"
 
     local active_records
 
@@ -6641,7 +6761,7 @@ resolve_missing_issues() {
     )
 
     [ -n "$active_records" ] || {
-        log "No previously active issues require resolution checking"
+        debug_log "No previously active issues require resolution checking"
         return
     }
 
@@ -6698,7 +6818,7 @@ resolve_missing_issues() {
 
         if ! source_can_resolve "$source" "$issue_key"; then
 
-            log "Resolution deferred for $issue_key because required source scan was unavailable"
+            debug_log "Resolution deferred for $issue_key because required source scan was unavailable"
 
             continue
         fi
@@ -6734,13 +6854,13 @@ resolve_missing_issues() {
 
                 ((FLAPPING_SUPPRESSED_COUNT++)) || true
                 ((NOTIFICATIONS_SUPPRESSED++)) || true
-                log "Resolution notification suppressed during flapping episode: $issue_key"
+                debug_log "Resolution notification suppressed during flapping episode: $issue_key"
 
             elif [ "$automatic_reconciliation" = true ]; then
 
                 # A richer, one-time AUTO-RECONCILED record is already queued.
                 # Suppress the generic "condition no longer present" duplicate.
-                log "Generic resolution notification replaced by automatic reconciliation detail: $issue_key"
+                debug_log "Generic resolution notification replaced by automatic reconciliation detail: $issue_key"
 
             elif [ "$notification_policy_mode" = "once" ]; then
 
@@ -6754,7 +6874,7 @@ resolve_missing_issues() {
                     ((NOTIFICATIONS_SUPPRESSED++)) || true
                 fi
 
-                log "Resolution notification suppressed for notification-once event: $issue_key"
+                debug_log "Resolution notification suppressed for notification-once event: $issue_key"
 
             elif [ "$SEND_RESOLUTION_NOTIFICATIONS" = true ] &&
                  [ -n "$notified_signature" ]; then
@@ -7292,8 +7412,8 @@ record_normalized_issue() {
 
     if (( occurrences < notify_runs || elapsed_minutes < minimum_minutes )); then
 
-        log "Notification pending threshold: $issue_key"
-        log "Observations: ${occurrences}/${notify_runs}; active minutes: ${elapsed_minutes}/${minimum_minutes}"
+        debug_log "Notification pending threshold: $issue_key"
+        debug_log "Observations: ${occurrences}/${notify_runs}; active minutes: ${elapsed_minutes}/${minimum_minutes}"
 
         return 0
     fi
@@ -7312,7 +7432,7 @@ record_normalized_issue() {
 
     else
 
-        log "Notification suppressed: normalized issue already reported"
+        debug_log "Notification suppressed: normalized issue already reported"
     fi
 }
 
@@ -7395,7 +7515,7 @@ process_arr_native_health() {
             detail+="Help: ${wiki_url}"
         fi
 
-        log "${app} native health issue: ${health_source} (${health_type})"
+        debug_log "${app} native health issue: ${health_source} (${health_type})"
 
         record_normalized_issue \
             "${app}:health:${issue_hash}" \
@@ -7788,9 +7908,9 @@ log_cf_details() {
 
         difference=$(( new_score - existing_score ))
 
-        log "New CF score: $new_score"
-        log "Existing CF score: $existing_score"
-        log "CF score difference: $difference"
+        debug_log "New CF score: $new_score"
+        debug_log "Existing CF score: $existing_score"
+        debug_log "CF score difference: $difference"
     fi
 
     if [ -n "$new_formats" ] &&
@@ -7802,19 +7922,19 @@ log_cf_details() {
 
         if [ -n "$gained" ]; then
 
-            log "CFs only in downloaded release:"
+            debug_log "CFs only in downloaded release:"
 
             while IFS= read -r cf; do
-                [ -n "$cf" ] && log "  + $cf"
+                [ -n "$cf" ] && debug_log "  + $cf"
             done <<<"$gained"
         fi
 
         if [ -n "$missing" ]; then
 
-            log "CFs only in existing media:"
+            debug_log "CFs only in existing media:"
 
             while IFS= read -r cf; do
-                [ -n "$cf" ] && log "  + $cf"
+                [ -n "$cf" ] && debug_log "  + $cf"
             done <<<"$missing"
         fi
     fi
@@ -7902,7 +8022,7 @@ process_queue() {
 
     if ! jq -e '(.records // [] | length) > 0' "$queue_file" >/dev/null 2>&1; then
 
-        log "$app queue: no entries"
+        debug_log "$app queue: no entries"
 
         return
     fi
@@ -8007,7 +8127,7 @@ process_queue() {
         if [ -n "$download_id" ] &&
            sab_primary_download_exists "$download_id"
         then
-            log "$app queue symptom suppressed by primary SAB issue: $download_id"
+            debug_log "$app queue symptom suppressed by primary SAB issue: $download_id"
             continue
         fi
 
@@ -8044,10 +8164,10 @@ process_queue() {
 
                 if is_promoted_classification "$promoted_classification"; then
 
-                    log "Arr generic classification promoted"
-                    log "Application: $app"
-                    log "From: $classification"
-                    log "To: $promoted_classification"
+                    debug_log "Arr generic classification promoted"
+                    debug_log "Application: $app"
+                    debug_log "From: $classification"
+                    debug_log "To: $promoted_classification"
 
                     classification="$promoted_classification"
                     severity=$(classification_severity "$classification" "$age")
@@ -8207,23 +8327,23 @@ process_queue() {
         # LOG
         #######################################################################
 
-        log "------------------------------------------------------------"
-        log "$app issue detected"
-        log "Media: $media_name"
-        log "Release: $release"
-        log "Classification: $classification"
-        log "Severity: $severity"
-        log "Reason: $reason"
-        log "Queue age: ${age}h"
-        log "Arr status: $status"
-        log "Tracked status: $tracked_status"
-        log "Tracked state: $tracked_state"
+        debug_log "------------------------------------------------------------"
+        debug_log "$app issue detected"
+        debug_log "Media: $media_name"
+        debug_log "Release: $release"
+        debug_log "Classification: $classification"
+        debug_log "Severity: $severity"
+        debug_log "Reason: $reason"
+        debug_log "Queue age: ${age}h"
+        debug_log "Arr status: $status"
+        debug_log "Tracked status: $tracked_status"
+        debug_log "Tracked state: $tracked_state"
 
         [ -n "$download_id" ] &&
-            log "Download ID: $download_id"
+            debug_log "Download ID: $download_id"
 
         [ "$sab_status" != "Unknown" ] &&
-            log "SAB status: $sab_status"
+            debug_log "SAB status: $sab_status"
 
         if jq -e \
             'any(.reasons[]?; .classification | startswith("CF_REJECT"))' \
@@ -8233,10 +8353,10 @@ process_queue() {
         fi
 
         if [ -n "$reason_detail" ]; then
-            log "Classified queue reasons:"
+            debug_log "Classified queue reasons:"
 
             while IFS= read -r detail_line; do
-                [ -n "$detail_line" ] && log "  ${detail_line}"
+                [ -n "$detail_line" ] && debug_log "  ${detail_line}"
             done <<<"$reason_detail"
         fi
 
@@ -8342,7 +8462,7 @@ process_queue() {
 
         else
 
-            log "Notification suppressed: issue already reported"
+            debug_log "Notification suppressed: issue already reported"
         fi
 
     done < <(jq -c '.records[]?' "$queue_file")
@@ -9374,7 +9494,7 @@ process_sab_queue_health() {
 
         if [ "$classification" = "SAB_QUEUE_PAUSED" ] && sab_pause_allowed_now; then
 
-            log "SABnzbd queue pause is inside an allowed pause window"
+            debug_log "SABnzbd queue pause is inside an allowed pause window"
 
         else
 
@@ -10213,10 +10333,10 @@ process_sab_orphans() {
     [ -n "$SAB_HISTORY" ] || return
     [ -f "$SAB_HISTORY" ] || return
 
-    log "Checking SABnzbd completed jobs for stranded downloads"
+    debug_log "Checking SABnzbd completed jobs for stranded downloads"
 
     if ! jq -e '(.history.slots // [] | length) > 0' "$SAB_HISTORY" >/dev/null 2>&1; then
-        log "SABnzbd history contains no jobs"
+        debug_log "SABnzbd history contains no jobs"
         return
     fi
 
@@ -10276,7 +10396,7 @@ process_sab_orphans() {
 
                 if [ "$SONARR_SCAN_OK" != true ]; then
 
-                    log "Skipping SAB orphan check for '$name': Sonarr scan unavailable"
+                    debug_log "Skipping SAB orphan check for '$name': Sonarr scan unavailable"
 
                     continue
                 fi
@@ -10286,7 +10406,7 @@ process_sab_orphans() {
 
                 if [ "$RADARR_SCAN_OK" != true ]; then
 
-                    log "Skipping SAB orphan check for '$name': Radarr scan unavailable"
+                    debug_log "Skipping SAB orphan check for '$name': Radarr scan unavailable"
 
                     continue
                 fi
@@ -10397,14 +10517,14 @@ process_sab_orphans() {
 
             ((SAB_EMPTY_COUNT++)) || true
 
-            log "------------------------------------------------------------"
-            log "SAB empty leftover"
-            log "Expected owner: $owner"
-            log "Category: $category"
-            log "Release: $name"
-            log "Age: ${age}h"
-            log "Path: $completed_path"
-            log "Action: log only"
+            debug_log "------------------------------------------------------------"
+            debug_log "SAB empty leftover"
+            debug_log "Expected owner: $owner"
+            debug_log "Category: $category"
+            debug_log "Release: $name"
+            debug_log "Age: ${age}h"
+            debug_log "Path: $completed_path"
+            debug_log "Action: log only"
 
             continue
         fi
@@ -10430,16 +10550,16 @@ process_sab_orphans() {
                 ((SAB_SAMPLE_RESIDUE_COUNT++)) || true
                 ((SAB_RESIDUE_COUNT++)) || true
 
-                log "------------------------------------------------------------"
-                log "SAB sample residue"
-                log "Expected owner: $owner"
-                log "Category: $category"
-                log "Release: $name"
-                log "Age: ${age}h"
-                log "Path: $completed_path"
-                log "Samples: $sample_files"
-                log "Remaining size: $(bytes_human "$total_bytes")"
-                log "Action: log only"
+                debug_log "------------------------------------------------------------"
+                debug_log "SAB sample residue"
+                debug_log "Expected owner: $owner"
+                debug_log "Category: $category"
+                debug_log "Release: $name"
+                debug_log "Age: ${age}h"
+                debug_log "Path: $completed_path"
+                debug_log "Samples: $sample_files"
+                debug_log "Remaining size: $(bytes_human "$total_bytes")"
+                debug_log "Action: log only"
 
                 continue
                 ;;
@@ -10448,18 +10568,18 @@ process_sab_orphans() {
 
                 ((SAB_RESIDUE_COUNT++)) || true
 
-                log "------------------------------------------------------------"
-                log "SAB cleanup residue"
-                log "Expected owner: $owner"
-                log "Category: $category"
-                log "Release: $name"
-                log "Age: ${age}h"
-                log "Path: $completed_path"
-                log "Repair files: $repair_files"
-                log "Metadata files: $metadata_files"
-                log "Other files: $other_files"
-                log "Remaining size: $(bytes_human "$total_bytes")"
-                log "Action: log only"
+                debug_log "------------------------------------------------------------"
+                debug_log "SAB cleanup residue"
+                debug_log "Expected owner: $owner"
+                debug_log "Category: $category"
+                debug_log "Release: $name"
+                debug_log "Age: ${age}h"
+                debug_log "Path: $completed_path"
+                debug_log "Repair files: $repair_files"
+                debug_log "Metadata files: $metadata_files"
+                debug_log "Other files: $other_files"
+                debug_log "Remaining size: $(bytes_human "$total_bytes")"
+                debug_log "Action: log only"
 
                 continue
                 ;;
@@ -10524,33 +10644,33 @@ process_sab_orphans() {
         # LOG
         #######################################################################
 
-        log "------------------------------------------------------------"
-        log "SAB stranded download detected"
-        log "Expected owner: $owner"
-        log "Category: $category"
-        log "Release: $name"
-        log "Classification: $classification"
-        log "Severity: $severity"
-        log "Stage: $stage"
-        log "Reason: $reason"
-        log "SAB status: $status"
-        log "Completed age: ${age}h"
-        log "$owner queue: Not found"
+        debug_log "------------------------------------------------------------"
+        debug_log "SAB stranded download detected"
+        debug_log "Expected owner: $owner"
+        debug_log "Category: $category"
+        debug_log "Release: $name"
+        debug_log "Classification: $classification"
+        debug_log "Severity: $severity"
+        debug_log "Stage: $stage"
+        debug_log "Reason: $reason"
+        debug_log "SAB status: $status"
+        debug_log "Completed age: ${age}h"
+        debug_log "$owner queue: Not found"
 
         [ -n "$nzo_id" ] &&
-            log "Download ID: $nzo_id"
+            debug_log "Download ID: $nzo_id"
 
-        log "Completed path: $completed_path"
+        debug_log "Completed path: $completed_path"
 
-        log "Total files: $total_files"
-        log "Total size: $(bytes_human "$total_bytes")"
+        debug_log "Total files: $total_files"
+        debug_log "Total size: $(bytes_human "$total_bytes")"
 
-        log "Media files: $media_files ($(bytes_human "$media_bytes"))"
-        log "Archive files: $archive_files"
-        log "Sample files: $sample_files"
-        log "Repair files: $repair_files"
-        log "Metadata files: $metadata_files"
-        log "Other files: $other_files ($(bytes_human "$other_bytes"))"
+        debug_log "Media files: $media_files ($(bytes_human "$media_bytes"))"
+        debug_log "Archive files: $archive_files"
+        debug_log "Sample files: $sample_files"
+        debug_log "Repair files: $repair_files"
+        debug_log "Metadata files: $metadata_files"
+        debug_log "Other files: $other_files ($(bytes_human "$other_bytes"))"
 
         #######################################################################
         # STATE
@@ -10613,7 +10733,7 @@ process_sab_orphans() {
 
         if [ "$stage" = "candidate" ]; then
 
-            log "Candidate only: $classification notification threshold is ${warn_after}h"
+            debug_log "Candidate only: $classification notification threshold is ${warn_after}h"
 
             continue
         fi
@@ -10659,7 +10779,7 @@ process_sab_orphans() {
 
         else
 
-            log "Notification suppressed: stranded issue already reported"
+            debug_log "Notification suppressed: stranded issue already reported"
         fi
 
     done < <(jq -c '.history.slots[]?' "$SAB_HISTORY")
@@ -10731,7 +10851,7 @@ prepare_sab_filesystem_scan() {
         SAB_FILESYSTEM_SCAN_REASON="Unraid mover is active"
         ((SAB_FILESYSTEM_SCAN_DEFERRED_COUNT++)) || true
 
-        log "SAB filesystem orphan/residue scan deferred while Unraid mover is active"
+        debug_log "SAB filesystem orphan/residue scan deferred while Unraid mover is active"
         persistent_log \
             "DEFERRED" \
             "SAB filesystem scan | reason=Unraid mover active"
@@ -12219,7 +12339,7 @@ record_arr_reconciliation_not_found() {
     local object_label="$3"
     local object_id="$4"
 
-    log "${app} reconciliation: ${object_label} ${object_id} no longer exists in Arr (HTTP 404); download ${download_id} remains unresolved"
+    debug_log "${app} reconciliation: ${object_label} ${object_id} no longer exists in Arr (HTTP 404); download ${download_id} remains unresolved"
 
     write_download_reconciliation_result \
         "$download_id" \
@@ -13298,7 +13418,7 @@ process_download_ledger_issues() {
         # but do not send a reminder that would race the pending reconciliation.
         if (( reconciliation_candidate_runs > 0 )); then
             mark_seen "FLOW:DOWNLOAD:${download_id}"
-            log "Automatic reconciliation pending ${reconciliation_candidate_runs}/${DOWNLOAD_LEDGER_RECONCILE_CONFIRM_RUNS}: ${app} ${download_id}"
+            debug_log "Automatic reconciliation pending ${reconciliation_candidate_runs}/${DOWNLOAD_LEDGER_RECONCILE_CONFIRM_RUNS}: ${app} ${download_id}"
             continue
         fi
 
@@ -13709,10 +13829,76 @@ assess_pipeline_health() {
 }
 
 ###############################################################################
-# WRITE COMPACT PERSISTENT AUDIT RECORD - v2.5
+# SUMMARY AND PERSISTENT AUDIT POLICY - v3.9
 ###############################################################################
 
+determine_detailed_summary_policy() {
+
+    local now
+    local last_detailed
+    local heartbeat_seconds=$((HEALTH_HEARTBEAT_HOURS * 3600))
+
+    now=$(date +%s)
+    last_detailed=$(jq -r \
+        '.monitor.lastDetailedSummaryAt // 0' \
+        "$STATE_FILE")
+    [[ "$last_detailed" =~ ^[0-9]+$ ]] || last_detailed=0
+
+    ACTIVE_ISSUE_COUNT=$(jq \
+        '[.issues[]? | select((.active // false) == true)] | length' \
+        "$STATE_FILE" 2>/dev/null || echo 0)
+    [[ "$ACTIVE_ISSUE_COUNT" =~ ^[0-9]+$ ]] || ACTIVE_ISSUE_COUNT=0
+
+    DETAILED_SUMMARY_DUE=false
+    DETAILED_SUMMARY_REASON="unchanged"
+
+    if [ "${LOG_LEVEL^^}" = "DEBUG" ]; then
+        DETAILED_SUMMARY_DUE=true
+        DETAILED_SUMMARY_REASON="debug logging enabled"
+    elif [ "$PREVIOUS_RUN_STATUS" = "unknown" ] ||
+       [ "$PREVIOUS_RUN_STATUS" != "$PIPELINE_STATUS" ]; then
+        DETAILED_SUMMARY_DUE=true
+        DETAILED_SUMMARY_REASON="pipeline status changed"
+    elif (( BATCHED_NOTIFICATION_ITEMS > 0 || RESOLVED_COUNT > 0 ||
+            DOWNLOAD_LEDGER_RECONCILED_COUNT > 0 ||
+            DOWNLOAD_LEDGER_MANUAL_DISMISSAL_NOTIFICATION_COUNT > 0 ||
+            DOWNLOAD_LEDGER_BATCH_DISMISSAL_NOTIFICATION_COUNT > 0 )); then
+        DETAILED_SUMMARY_DUE=true
+        DETAILED_SUMMARY_REASON="lifecycle activity"
+    elif (( last_detailed <= 0 ||
+            now - last_detailed >= heartbeat_seconds )); then
+        DETAILED_SUMMARY_DUE=true
+        DETAILED_SUMMARY_REASON="${HEALTH_HEARTBEAT_HOURS}-hour heartbeat"
+    fi
+}
+
+record_detailed_summary_emitted() {
+
+    local tmp="${TMP_DIR}/state.summary-emitted.json"
+    local now
+
+    now=$(date +%s)
+
+    jq \
+        --argjson now "$now" \
+        '.monitor.lastDetailedSummaryAt = $now' \
+        "$STATE_FILE" >"$tmp" || return 1
+
+    save_state "$tmp"
+}
+
+write_compact_console_summary() {
+
+    local runtime_value="$1"
+
+    log "${PIPELINE_STATUS} | Sonarr=$SONARR_API_OK | Radarr=$RADARR_API_OK | SAB=$SAB_API_OK | active=${ACTIVE_ISSUE_COUNT} | runtime=${runtime_value}"
+}
+
 write_persistent_activity_summary() {
+
+    persistent_log \
+        "HEARTBEAT" \
+        "reason=${DETAILED_SUMMARY_REASON} | status=${PIPELINE_STATUS} | active=${ACTIVE_ISSUE_COUNT} | runtime=$(runtime)"
 
     persistent_log \
         "API" \
@@ -14162,14 +14348,14 @@ record_activity_flow_anomaly() {
     # CURRENT RUN LOG
     ###########################################################################
 
-    log ""
-    log "Activity flow anomaly detected"
-    log "Application: $app"
-    log "Media type: $kind"
-    log "Flow window: ${FLOW_ANOMALY_LOOKBACK_HOURS}h"
-    log "SAB completed jobs: $sab_completed"
-    log "Arr successful imports: $arr_imports"
-    log "Stage: $stage"
+    debug_log ""
+    debug_log "Activity flow anomaly detected"
+    debug_log "Application: $app"
+    debug_log "Media type: $kind"
+    debug_log "Flow window: ${FLOW_ANOMALY_LOOKBACK_HOURS}h"
+    debug_log "SAB completed jobs: $sab_completed"
+    debug_log "Arr successful imports: $arr_imports"
+    debug_log "Stage: $stage"
 
     ###########################################################################
     # PERSIST ONLY NEW / CHANGED / RETURNED ISSUE
@@ -14196,7 +14382,7 @@ record_activity_flow_anomaly() {
 
     else
 
-        log "Notification suppressed: activity-flow issue already reported"
+        debug_log "Notification suppressed: activity-flow issue already reported"
     fi
 }
 
@@ -14342,8 +14528,8 @@ assess_activity_flow() {
 
                 ((FLOW_ANOMALY_SUPPRESSED_COUNT++)) || true
 
-                log "Sonarr flow anomaly candidate suppressed"
-                log "Reason: ${FLOW_SONARR_EXPLANATIONS} active Sonarr/SAB issue(s) already tracked"
+                debug_log "Sonarr flow anomaly candidate suppressed"
+                debug_log "Reason: ${FLOW_SONARR_EXPLANATIONS} active Sonarr/SAB issue(s) already tracked"
             fi
         fi
 
@@ -14390,8 +14576,8 @@ assess_activity_flow() {
 
                 ((FLOW_ANOMALY_SUPPRESSED_COUNT++)) || true
 
-                log "Radarr flow anomaly candidate suppressed"
-                log "Reason: ${FLOW_RADARR_EXPLANATIONS} active Radarr/SAB issue(s) already tracked"
+                debug_log "Radarr flow anomaly candidate suppressed"
+                debug_log "Reason: ${FLOW_RADARR_EXPLANATIONS} active Radarr/SAB issue(s) already tracked"
             fi
         fi
 
@@ -14747,26 +14933,27 @@ end_monitor_phase "startup"
 ###############################################################################
 
 rotate_persistent_log
+prune_persistent_logs_by_age
 
 persistent_log \
-    "START" \
-    "ARR Health Monitor v3.8.0"
+    "DEBUG" \
+    "START | ARR Health Monitor v3.9.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
     initialize_activity_audit_window
 
-    log "Activity audit window: last ${ACTIVITY_AUDIT_LOOKBACK_HOURS}h"
+    debug_log "Activity audit window: last ${ACTIVITY_AUDIT_LOOKBACK_HOURS}h"
 fi
 
 ###############################################################################
 # START
 ###############################################################################
 
-log "Starting ARR Health Monitor v3.8.0"
-log "Recommended schedule: every five minutes"
-log "Notifications enabled: $SEND_NOTIFICATIONS"
-log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
+debug_log "Starting ARR Health Monitor v3.9.0"
+debug_log "Recommended schedule: every five minutes"
+debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
+debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
 
 preflight_notification_command
 record_monitor_schedule_issue
@@ -14780,7 +14967,7 @@ start_monitor_phase "service-collection"
 
 if [ "$SAB_ENABLED" = true ]; then
 
-    log "Connecting to SABnzbd"
+    debug_log "Connecting to SABnzbd"
 
     SAB_HISTORY="$TMP_DIR/sab_history.json"
     SAB_QUEUE="$TMP_DIR/sab_queue.json"
@@ -14799,7 +14986,7 @@ if [ "$SAB_ENABLED" = true ]; then
             echo 0
         )
 
-        log "SABnzbd history records loaded: $SAB_COUNT"
+        debug_log "SABnzbd history records loaded: $SAB_COUNT"
 
     else
 
@@ -14816,7 +15003,7 @@ if [ "$SAB_ENABLED" = true ]; then
     if fetch_sab_queue "$SAB_QUEUE"; then
 
         SAB_QUEUE_OK=true
-        log "SABnzbd queue entries: $(jq '.queue.slots // [] | length' "$SAB_QUEUE")"
+        debug_log "SABnzbd queue entries: $(jq '.queue.slots // [] | length' "$SAB_QUEUE")"
 
     else
 
@@ -14870,7 +15057,7 @@ if [ "$SAB_ENABLED" = true ]; then
 
         SAB_SERVER_STATS_OK=false
         SAB_SERVER_STATS=""
-        log "WARNING: Unable to retrieve optional SABnzbd provider statistics: ${API_LAST_ERROR}"
+        debug_log "Unable to retrieve optional SABnzbd provider statistics: ${API_LAST_ERROR}"
     fi
 
     SAB_API_OK=false
@@ -14890,7 +15077,7 @@ fi
 
 if [ "$SONARR_ENABLED" = true ]; then
 
-    log "Checking Sonarr health and queue"
+    debug_log "Checking Sonarr health and queue"
 
     if ! discover_arr_api \
         "Sonarr" \
@@ -14901,7 +15088,7 @@ if [ "$SONARR_ENABLED" = true ]; then
             "$SONARR_API_FAILURES" \
             "api-discovery" \
             "$API_LAST_ERROR")
-        log "WARNING: Sonarr API discovery failed; using compatibility fallback ${SONARR_API_ROOT}"
+        debug_log "Sonarr API discovery failed; using compatibility fallback ${SONARR_API_ROOT}"
     fi
 
     SONARR_QUEUE="$TMP_DIR/sonarr_queue.json"
@@ -14924,7 +15111,7 @@ if [ "$SONARR_ENABLED" = true ]; then
             echo 0
         )
 
-        log "Sonarr queue entries: $SONARR_COUNT"
+        debug_log "Sonarr queue entries: $SONARR_COUNT"
 
     else
 
@@ -14964,7 +15151,7 @@ if [ "$SONARR_ENABLED" = true ]; then
         "${SONARR_API_ROOT%/}/system/status"
     then
         SONARR_STATUS_OK=true
-        log "Connected to Sonarr $(jq -r '.version // "unknown"' "$SONARR_SYSTEM_STATUS")"
+        debug_log "Connected to Sonarr $(jq -r '.version // "unknown"' "$SONARR_SYSTEM_STATUS")"
     else
         SONARR_STATUS_OK=false
         SONARR_SYSTEM_STATUS=""
@@ -14990,7 +15177,7 @@ fi
 
 if [ "$RADARR_ENABLED" = true ]; then
 
-    log "Checking Radarr health and queue"
+    debug_log "Checking Radarr health and queue"
 
     if ! discover_arr_api \
         "Radarr" \
@@ -15001,7 +15188,7 @@ if [ "$RADARR_ENABLED" = true ]; then
             "$RADARR_API_FAILURES" \
             "api-discovery" \
             "$API_LAST_ERROR")
-        log "WARNING: Radarr API discovery failed; using compatibility fallback ${RADARR_API_ROOT}"
+        debug_log "Radarr API discovery failed; using compatibility fallback ${RADARR_API_ROOT}"
     fi
 
     RADARR_QUEUE="$TMP_DIR/radarr_queue.json"
@@ -15024,7 +15211,7 @@ if [ "$RADARR_ENABLED" = true ]; then
             echo 0
         )
 
-        log "Radarr queue entries: $RADARR_COUNT"
+        debug_log "Radarr queue entries: $RADARR_COUNT"
 
     else
 
@@ -15064,7 +15251,7 @@ if [ "$RADARR_ENABLED" = true ]; then
         "${RADARR_API_ROOT%/}/system/status"
     then
         RADARR_STATUS_OK=true
-        log "Connected to Radarr $(jq -r '.version // "unknown"' "$RADARR_SYSTEM_STATUS")"
+        debug_log "Connected to Radarr $(jq -r '.version // "unknown"' "$RADARR_SYSTEM_STATUS")"
     else
         RADARR_STATUS_OK=false
         RADARR_SYSTEM_STATUS=""
@@ -15141,7 +15328,7 @@ then
 
     start_monitor_phase "activity-audit"
 
-    log "Running recent operational activity audit"
+    debug_log "Running recent operational activity audit"
 
     ###########################################################################
     # SABNZBD
@@ -15321,7 +15508,12 @@ prune_state
 
 assess_pipeline_health
 
-write_persistent_activity_summary
+determine_detailed_summary_policy
+
+if [ "$DETAILED_SUMMARY_DUE" = true ]; then
+    write_persistent_activity_summary
+    record_detailed_summary_emitted || exit 3
+fi
 
 ###############################################################################
 # SUMMARY
@@ -15329,8 +15521,11 @@ write_persistent_activity_summary
 
 RUNTIME=$(runtime)
 
+if [ "$DETAILED_SUMMARY_DUE" = true ]; then
+
 log "============================================================"
-log "ARR Health Monitor v3.8.0 completed"
+log "ARR Health Monitor v3.9.0 completed"
+log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""
 log "SCAN HEALTH"
@@ -15481,7 +15676,6 @@ if [ "$ARR_TELEMETRY_ENABLED" = true ]; then
     log "Telemetry retention: ${ARR_TELEMETRY_RETENTION_DAYS} days"
     log "Review candidates: $PROMOTION_CANDIDATES"
     log "Promotion-rule matches this run: $PROMOTION_RULE_MATCHES"
-    log "Telemetry retention: ${ARR_TELEMETRY_RETENTION_DAYS} days"
 
 else
 
@@ -15547,8 +15741,13 @@ log "Runtime: $RUNTIME"
 log "============================================================"
 
 persistent_log \
-    "END" \
-    "runtime=${RUNTIME} | active_issues=${TOTAL_ISSUES} | info=${INFO_COUNT} | warnings=${WARNING_COUNT} | errors=${ERROR_COUNT} | reminders=${REMINDER_NOTIFICATION_COUNT} | event_repeats_suppressed=${EVENT_REPEAT_SUPPRESSED_COUNT} | event_expiry_suppressed=${EVENT_RESOLUTION_SUPPRESSED_COUNT} | bounded_limits_reached=${BOUNDED_REMINDER_SUPPRESSED_COUNT} | flapping=${FLAPPING_NOTIFICATION_COUNT} | acknowledged_suppressed=${ACKNOWLEDGED_SUPPRESSED_COUNT}"
+    "SUMMARY" \
+    "reason=${DETAILED_SUMMARY_REASON} | runtime=${RUNTIME} | active_issues=${TOTAL_ISSUES} | info=${INFO_COUNT} | warnings=${WARNING_COUNT} | errors=${ERROR_COUNT} | reminders=${REMINDER_NOTIFICATION_COUNT} | event_repeats_suppressed=${EVENT_REPEAT_SUPPRESSED_COUNT} | event_expiry_suppressed=${EVENT_RESOLUTION_SUPPRESSED_COUNT} | bounded_limits_reached=${BOUNDED_REMINDER_SUPPRESSED_COUNT} | flapping=${FLAPPING_NOTIFICATION_COUNT} | acknowledged_suppressed=${ACKNOWLEDGED_SUPPRESSED_COUNT}"
+
+else
+
+    write_compact_console_summary "$RUNTIME"
+fi
 
 end_monitor_phase "finalization"
 
