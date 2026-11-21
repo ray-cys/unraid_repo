@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Appdata + Optional Shares Backup v3.3
+# Appdata + Optional Shares Backup v3.4
 #
 # PURPOSE
 # -------
@@ -59,7 +59,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="3.3"
+readonly SCRIPT_VERSION="3.4"
 
 
 ###############################################################################
@@ -188,25 +188,10 @@ TAR_OPTIONS=()
 # Format: "top-level-appdata-directory|relative/path"
 #
 # Application names are exact and paths deliberately do not support wildcards.
-# Databases, configuration, queue state, torrent state, and backup folders are
-# not excluded. Add or remove entries to match locally-installed applications.
+# Databases, configuration, queue state, and torrent state are not excluded.
+# Backup folders are retained unless explicitly listed below. Add or remove
+# entries to match locally-installed applications.
 APPDATA_EXCLUDES=(
-    "plex-media-server|Library/Application Support/Plex Media Server/Cache"
-    "plex-media-server|Library/Application Support/Plex Media Server/Codecs"
-    "plex-media-server|Library/Application Support/Plex Media Server/Crash Reports"
-    "plex-media-server|Library/Application Support/Plex Media Server/Diagnostics"
-    "plex-media-server|Library/Application Support/Plex Media Server/Logs"
-    "plex-media-server|Library/Application Support/Plex Media Server/Media"
-    "plex-media-server|Library/Application Support/Plex Media Server/Updates"
-    "plex-media-server|Library/Application Support/Plex Media Server/Plug-in Support/Caches"
-    "plex-media|Library/Application Support/Plex Media Server/Cache"
-    "plex-media|Library/Application Support/Plex Media Server/Codecs"
-    "plex-media|Library/Application Support/Plex Media Server/Crash Reports"
-    "plex-media|Library/Application Support/Plex Media Server/Diagnostics"
-    "plex-media|Library/Application Support/Plex Media Server/Logs"
-    "plex-media|Library/Application Support/Plex Media Server/Media"
-    "plex-media|Library/Application Support/Plex Media Server/Updates"
-    "plex-media|Library/Application Support/Plex Media Server/Plug-in Support/Caches"
     "sonarr|logs"
     "sonarr|MediaCover"
     "sonarr|logs.db"
@@ -235,7 +220,6 @@ APPDATA_EXCLUDES=(
     "sabnzbd|logs"
     "kometa|logs"
     "kometa|cache"
-    "sabnzbd|logs"
     "bazarr|cache"
     "bazarr|log"
     "tautulli|cache"
@@ -244,6 +228,34 @@ APPDATA_EXCLUDES=(
     "photoprism|cache"
     "metafusion|logs"
     "qbittorrent|qBittorrent/logs"
+)
+
+# Plex instances:
+#
+# Format: "label|top-level-appdata-directory|database-backup-host-path"
+#
+# The label becomes part of the verified archive name. Each instance receives
+# the same conservative list of regenerable exclusions, while Metadata,
+# preferences, plug-ins, scanners, and live databases remain protected.
+PLEX_HUBBLE_APPDATA_DIR="${PLEX_HUBBLE_APPDATA_DIR:-plex-media-server}"
+PLEX_NODE_APPDATA_DIR="${PLEX_NODE_APPDATA_DIR:-plex-media}"
+PLEX_HUBBLE_DATABASE_BACKUP_PATH="${PLEX_HUBBLE_DATABASE_BACKUP_PATH-/mnt/vault/backup/plex_db/hubble}"
+PLEX_NODE_DATABASE_BACKUP_PATH="${PLEX_NODE_DATABASE_BACKUP_PATH-/mnt/vault/backup/plex_db/node}"
+
+PLEX_INSTANCES=(
+    "hubble|${PLEX_HUBBLE_APPDATA_DIR}|${PLEX_HUBBLE_DATABASE_BACKUP_PATH}"
+    "node|${PLEX_NODE_APPDATA_DIR}|${PLEX_NODE_DATABASE_BACKUP_PATH}"
+)
+
+PLEX_REGENERABLE_PATHS=(
+    "Library/Application Support/Plex Media Server/Cache"
+    "Library/Application Support/Plex Media Server/Codecs"
+    "Library/Application Support/Plex Media Server/Crash Reports"
+    "Library/Application Support/Plex Media Server/Diagnostics"
+    "Library/Application Support/Plex Media Server/Logs"
+    "Library/Application Support/Plex Media Server/Media"
+    "Library/Application Support/Plex Media Server/Updates"
+    "Library/Application Support/Plex Media Server/Plug-in Support/Caches"
 )
 
 # Alternate host paths that expose the same appdata tree as SRC_DIR. This lets
@@ -261,17 +273,26 @@ APPDATA_PATH_ALIASES=(
 # The owner field links the additional source to the same Docker container
 # lifecycle as its appdata directory. This is intended for data deliberately
 # bind-mounted outside SRC_DIR, such as Plex scheduled database backups.
-PLEX_DATABASE_BACKUP_PATH="${PLEX_DATABASE_BACKUP_PATH-/mnt/vault/backup/plex_db/hubble}"
 
 EXTRA_ARCHIVE_SOURCES=(
     # "another-archive|owning-appdata-directory|/absolute/source/path"
 )
 
-if [ -n "$PLEX_DATABASE_BACKUP_PATH" ]; then
-    EXTRA_ARCHIVE_SOURCES+=(
-        "plex-database-backups|plex-media-server|${PLEX_DATABASE_BACKUP_PATH}"
-    )
-fi
+for plex_instance in "${PLEX_INSTANCES[@]}"; do
+    IFS='|' read -r plex_label plex_appdata plex_database_path \
+        <<<"$plex_instance"
+
+    for plex_relative_path in "${PLEX_REGENERABLE_PATHS[@]}"; do
+        APPDATA_EXCLUDES+=("${plex_appdata}|${plex_relative_path}")
+    done
+
+    if [ -n "$plex_database_path" ]; then
+        EXTRA_ARCHIVE_SOURCES+=(
+            "plex-${plex_label}-database-backups|${plex_appdata}|${plex_database_path}"
+        )
+    fi
+done
+unset plex_instance plex_label plex_appdata plex_database_path plex_relative_path
 
 
 # ---------------------------------------------------------------------------

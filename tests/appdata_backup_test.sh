@@ -5,7 +5,8 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="${REPO_ROOT}/user_script/appdata_backup.sh"
 TEST_ROOT="$(mktemp -d /tmp/appdata_backup_test.XXXXXX)"
-TEST_PLEX_DATABASE_BACKUP_PATH=""
+TEST_PLEX_HUBBLE_DATABASE_BACKUP_PATH=""
+TEST_PLEX_NODE_DATABASE_BACKUP_PATH=""
 
 cleanup() {
     case "$TEST_ROOT" in
@@ -125,7 +126,8 @@ run_backup() {
         LOCK_FILE="$root/appdata.lock" \
         NOTIFY_BIN="$root/bin/notify" \
         MOCK_NOTIFY_LOG="$root/notify.log" \
-        PLEX_DATABASE_BACKUP_PATH="$TEST_PLEX_DATABASE_BACKUP_PATH" \
+        PLEX_HUBBLE_DATABASE_BACKUP_PATH="$TEST_PLEX_HUBBLE_DATABASE_BACKUP_PATH" \
+        PLEX_NODE_DATABASE_BACKUP_PATH="$TEST_PLEX_NODE_DATABASE_BACKUP_PATH" \
         "$@" \
         bash "$SCRIPT" >"$output" 2>&1
 }
@@ -165,7 +167,8 @@ count_generations() {
 
 (
     unset PIGZ_THREADS PIGZ_LEVEL USE_LOW_PRIORITY_IO \
-        PLEX_DATABASE_BACKUP_PATH
+        PLEX_HUBBLE_DATABASE_BACKUP_PATH \
+        PLEX_NODE_DATABASE_BACKUP_PATH
 
     # shellcheck disable=SC1090
     source "$SCRIPT"
@@ -173,7 +176,8 @@ count_generations() {
     [ "$PIGZ_THREADS" -eq 6 ]
     [ "$PIGZ_LEVEL" -eq 3 ]
     [ "$USE_LOW_PRIORITY_IO" = "false" ]
-    [ "$PLEX_DATABASE_BACKUP_PATH" = "/mnt/vault/backup/plex_db/hubble" ]
+    [ "$PLEX_HUBBLE_DATABASE_BACKUP_PATH" = "/mnt/vault/backup/plex_db/hubble" ]
+    [ "$PLEX_NODE_DATABASE_BACKUP_PATH" = "/mnt/vault/backup/plex_db/node" ]
 ) || fail "performance-oriented compression defaults are incorrect"
 
 
@@ -345,10 +349,15 @@ mkdir -p \
     "$DIRECT_ROOT/source/plex-media-server/Library/Application Support/Plex Media Server/Cache" \
     "$DIRECT_ROOT/source/plex-media-server/Library/Application Support/Plex Media Server/Media" \
     "$DIRECT_ROOT/source/plex-media-server/Library/Application Support/Plex Media Server/Metadata" \
+    "$DIRECT_ROOT/source/plex-media/Library/Application Support/Plex Media Server/Cache" \
+    "$DIRECT_ROOT/source/plex-media/Library/Application Support/Plex Media Server/Media" \
+    "$DIRECT_ROOT/source/plex-media/Library/Application Support/Plex Media Server/Metadata" \
     "$DIRECT_ROOT/source/radarr/logs" \
-    "$DIRECT_ROOT/plex-db"
+    "$DIRECT_ROOT/plex-db-hubble" \
+    "$DIRECT_ROOT/plex-db-node"
 
-TEST_PLEX_DATABASE_BACKUP_PATH="$DIRECT_ROOT/plex-db"
+TEST_PLEX_HUBBLE_DATABASE_BACKUP_PATH="$DIRECT_ROOT/plex-db-hubble"
+TEST_PLEX_NODE_DATABASE_BACKUP_PATH="$DIRECT_ROOT/plex-db-node"
 
 printf 'application data\n' >"$DIRECT_ROOT/source/app-one/data.txt"
 printf 'regenerable cache\n' \
@@ -357,10 +366,18 @@ printf 'regenerable preview thumbnail\n' \
     >"$DIRECT_ROOT/source/plex-media-server/Library/Application Support/Plex Media Server/Media/preview.bif"
 printf 'required metadata\n' \
     >"$DIRECT_ROOT/source/plex-media-server/Library/Application Support/Plex Media Server/Metadata/metadata.db"
+printf 'node regenerable cache\n' \
+    >"$DIRECT_ROOT/source/plex-media/Library/Application Support/Plex Media Server/Cache/cache.bin"
+printf 'node regenerable preview thumbnail\n' \
+    >"$DIRECT_ROOT/source/plex-media/Library/Application Support/Plex Media Server/Media/preview.bif"
+printf 'node required metadata\n' \
+    >"$DIRECT_ROOT/source/plex-media/Library/Application Support/Plex Media Server/Metadata/metadata.db"
 printf 'required configuration\n' >"$DIRECT_ROOT/source/radarr/config.xml"
 printf 'regenerable log\n' >"$DIRECT_ROOT/source/radarr/logs/radarr.txt"
 printf 'scheduled plex database backup\n' \
-    >"$DIRECT_ROOT/plex-db/com.plexapp.plugins.library.db-2026-11-21"
+    >"$DIRECT_ROOT/plex-db-hubble/com.plexapp.plugins.library.db-2026-11-21"
+printf 'scheduled node plex database backup\n' \
+    >"$DIRECT_ROOT/plex-db-node/com.plexapp.plugins.library.db-2026-11-21"
 
 run_backup "$DIRECT_ROOT" destination "$DIRECT_ROOT/direct.out" ||
     fail "direct backup failed"
@@ -371,22 +388,31 @@ mapfile -t DIRECT_ARCHIVE_ORDER < <(
         "$DIRECT_ROOT/direct.out"
 )
 
-PLEX_ORDER_VALID=false
+PLEX_HUBBLE_ORDER_VALID=false
+PLEX_NODE_ORDER_VALID=false
 for ((i = 0; i < ${#DIRECT_ARCHIVE_ORDER[@]} - 1; i++)); do
     if [ "${DIRECT_ARCHIVE_ORDER[$i]}" = "plex-media-server" ] &&
-       [ "${DIRECT_ARCHIVE_ORDER[$((i + 1))]}" = "plex-database-backups" ]
+       [ "${DIRECT_ARCHIVE_ORDER[$((i + 1))]}" = "plex-hubble-database-backups" ]
     then
-        PLEX_ORDER_VALID=true
-        break
+        PLEX_HUBBLE_ORDER_VALID=true
+    fi
+
+    if [ "${DIRECT_ARCHIVE_ORDER[$i]}" = "plex-media" ] &&
+       [ "${DIRECT_ARCHIVE_ORDER[$((i + 1))]}" = "plex-node-database-backups" ]
+    then
+        PLEX_NODE_ORDER_VALID=true
     fi
 done
-[ "$PLEX_ORDER_VALID" = "true" ] ||
-    fail "Plex database backup archive was not adjacent to its owner"
+[ "$PLEX_HUBBLE_ORDER_VALID" = "true" ] ||
+    fail "Hubble Plex database backup archive was not adjacent to its owner"
+[ "$PLEX_NODE_ORDER_VALID" = "true" ] ||
+    fail "Node Plex database backup archive was not adjacent to its owner"
 
 DIRECT_GENERATION="$(newest_generation "$DIRECT_ROOT")"
 assert_file "$DIRECT_GENERATION/backup_manifest.tsv"
 assert_file "$DIRECT_GENERATION/backup_manifest.tsv.sha256"
-assert_file "$DIRECT_GENERATION/plex-database-backups.tar.gz"
+assert_file "$DIRECT_GENERATION/plex-hubble-database-backups.tar.gz"
+assert_file "$DIRECT_GENERATION/plex-node-database-backups.tar.gz"
 
 (
     cd "$DIRECT_GENERATION" &&
@@ -399,14 +425,25 @@ assert_contains "$DIRECT_ROOT/plex.list" "Metadata/metadata.db"
 assert_not_contains "$DIRECT_ROOT/plex.list" "Cache/cache.bin"
 assert_not_contains "$DIRECT_ROOT/plex.list" "Media/preview.bif"
 
+tar -tzf "$DIRECT_GENERATION/plex-media.tar.gz" \
+    >"$DIRECT_ROOT/plex-node.list"
+assert_contains "$DIRECT_ROOT/plex-node.list" "Metadata/metadata.db"
+assert_not_contains "$DIRECT_ROOT/plex-node.list" "Cache/cache.bin"
+assert_not_contains "$DIRECT_ROOT/plex-node.list" "Media/preview.bif"
+
 tar -tzf "$DIRECT_GENERATION/radarr.tar.gz" >"$DIRECT_ROOT/radarr.list"
 assert_contains "$DIRECT_ROOT/radarr.list" "radarr/config.xml"
 assert_not_contains "$DIRECT_ROOT/radarr.list" "radarr/logs/radarr.txt"
 
-tar -tzf "$DIRECT_GENERATION/plex-database-backups.tar.gz" \
-    >"$DIRECT_ROOT/plex-db.list"
-assert_contains "$DIRECT_ROOT/plex-db.list" \
-    "plex-db/com.plexapp.plugins.library.db-2026-11-21"
+tar -tzf "$DIRECT_GENERATION/plex-hubble-database-backups.tar.gz" \
+    >"$DIRECT_ROOT/plex-db-hubble.list"
+assert_contains "$DIRECT_ROOT/plex-db-hubble.list" \
+    "plex-db-hubble/com.plexapp.plugins.library.db-2026-11-21"
+
+tar -tzf "$DIRECT_GENERATION/plex-node-database-backups.tar.gz" \
+    >"$DIRECT_ROOT/plex-db-node.list"
+assert_contains "$DIRECT_ROOT/plex-db-node.list" \
+    "plex-db-node/com.plexapp.plugins.library.db-2026-11-21"
 
 
 ###############################################################################
@@ -430,13 +467,15 @@ fi
 
 assert_contains "$DIRECT_ROOT/staging.out" "method=verified manifest history"
 assert_contains "$DIRECT_ROOT/staging.out" \
-    "history=4 app(s)"
+    "history=6 app(s)"
 assert_contains "$DIRECT_ROOT/staging.out" \
     "[app-two] Measuring source size (no usable archive history or full scan requested)"
 assert_not_contains "$DIRECT_ROOT/staging.out" \
     "[app-one] Measuring source size"
 assert_not_contains "$DIRECT_ROOT/staging.out" \
     "[plex-media-server] Measuring source size"
+assert_not_contains "$DIRECT_ROOT/staging.out" \
+    "[plex-media] Measuring source size"
 assert_contains "$DIRECT_ROOT/staging.out" \
     "Verified staged generation copied, re-verified, and promoted on vault"
 
@@ -522,7 +561,8 @@ run_backup "$DIRECT_ROOT" auto "$DIRECT_ROOT/checksum-recovery.out" ||
 # Silent SIGKILL is classified, not retried, and leaves no partial backup
 ###############################################################################
 
-TEST_PLEX_DATABASE_BACKUP_PATH=""
+TEST_PLEX_HUBBLE_DATABASE_BACKUP_PATH=""
+TEST_PLEX_NODE_DATABASE_BACKUP_PATH=""
 
 FAIL_ROOT="${TEST_ROOT}/pipeline-failure"
 make_layout "$FAIL_ROOT"
