@@ -1,18 +1,18 @@
 #!/bin/bash
 
 ###############################################################################
-# Plex DBRepair Scheduler Wrapper v3.0
+# Plex DBRepair Scheduler Wrapper v3.1
 #
 # Unraid 7.4-focused scheduler for the current standalone DBRepair executable.
 # It verifies the official GitHub release, stages updates safely inside each
 # Plex Docker container, runs unattended maintenance, restores the container's
-# original state, records a structured receipt, and sends one plain-language
+# original state, records a structured receipt, and sends one operational
 # grouped notification only when something changed or needs attention.
 ###############################################################################
 
 set -uo pipefail
 
-readonly VERSION="3.0"
+readonly VERSION="3.1"
 
 ###############################################################################
 # CONFIGURATION
@@ -553,14 +553,32 @@ install_or_resolve_dbrepair() {
 # OUTPUT CLASSIFICATION
 ###############################################################################
 
+# Keep recognition and notification excerpts on the same input. Exclude only
+# known routine progress/clean-result lines; preserve unknown messages and
+# explicit WARNING/ERROR lines for review. Strip ANSI escapes before matching.
+classification_output() {
+    sed -E $'s/\033\\[[0-9;]*[[:alpha:]]//g' "$1" |
+        awk '{
+            line = $0
+            sub(/^[[:space:]]*\[[0-9][0-9][0-9][0-9]-[^]]*\][[:space:]]*/, "", line)
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            normalized = tolower(line)
+            if (normalized ~ /^checking (main|blobs) (db|database) for orphaned media items[.]*$/) next
+            if (normalized ~ /^(no|0) orphaned media items found[.]*$/) next
+            print $0
+        }'
+}
+
 output_has() {
     local file="$1" expression="$2"
-    grep -Eiq -- "$expression" "$file"
+    # Drain the stream to avoid SIGPIPE under pipefail for large tool output.
+    classification_output "$file" | grep -Ei -- "$expression" >/dev/null
 }
 
 extract_notable_output() {
     local file="$1"
-    sed -E $'s/\033\[[0-9;]*[[:alpha:]]//g' "$file" |
+    classification_output "$file" |
         grep -Ei 'NOTICE|WARNING|ERROR|FAIL|damaged|unrecoverable|requires repair|ghost entr|NULL title|orphan|revert|rollback' |
         sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' |
         awk 'NF && !seen[$0]++ {print "- " $0; count++} count >= 8 {exit}' || true
@@ -628,8 +646,9 @@ classify_container_output() {
         RUN_HAS_REPAIR=1
         CONTAINERS_REPAIRED=$((CONTAINERS_REPAIRED + 1))
         if (( notices == 1 || orphan == 1 )); then
-            RESULT_CLASS["$container"]="NOTICE"
-            RESULT_ACTION["$container"]+=" DBRepair also reported an advisory that may need review."
+            RESULT_CLASS["$container"]="WARNING"
+            (( orphan == 0 )) || RESULT_FINDING["$container"]+=" Orphaned media records were reported."
+            RESULT_ACTION["$container"]+=" Review the diagnostic messages for remaining findings."
             RUN_HAS_ISSUE=1
             raise_severity warning
         fi
@@ -638,12 +657,13 @@ classify_container_output() {
 
     if (( main_ok == 1 && blobs_ok == 1 && damage == 0 )); then
         RESULT_CLASS["$container"]="HEALTHY"
-        RESULT_FINDING["$container"]="Both Plex databases passed DBRepair's checks."
-        RESULT_ACTION["$container"]="No database files were changed."
+        RESULT_FINDING["$container"]="Main OK; Blobs OK."
+        RESULT_ACTION["$container"]="No repair required."
         CONTAINERS_HEALTHY=$((CONTAINERS_HEALTHY + 1))
         if (( notices == 1 || orphan == 1 )); then
-            RESULT_CLASS["$container"]="NOTICE"
-            RESULT_ACTION["$container"]+=" DBRepair reported an advisory that may need review."
+            RESULT_CLASS["$container"]="WARNING"
+            (( orphan == 0 )) || RESULT_FINDING["$container"]+=" Orphaned media records were reported."
+            RESULT_ACTION["$container"]="No verified correction reported for the advisory; review the diagnostic messages."
             RUN_HAS_ISSUE=1
             raise_severity warning
         fi
@@ -712,7 +732,7 @@ restore_container_state() {
     fi
 
     if wait_plex_process "$container"; then
-        RESULT_FINAL_STATE["$container"]="Docker container is running and the Plex Media Server process is present."
+        RESULT_FINAL_STATE["$container"]="Container running; server process detected."
         return 0
     fi
 
@@ -724,7 +744,7 @@ restore_container_state() {
         RESULT_ACTION["$container"]+=" The wrapper restarted the Docker container to restore Plex service."
         RESULT_FINAL_STATE["$container"]="Plex service was recovered and is running after a container restart."
         [[ "$class" == HEALTHY || "$class" == REPAIRED ]] && \
-            RESULT_CLASS["$container"]="NOTICE"
+            RESULT_CLASS["$container"]="WARNING"
         RUN_HAS_ISSUE=1
         raise_severity warning
         return 0
@@ -839,14 +859,14 @@ build_summary_text() {
     text+="Containers: ${#CONTAINERS[@]} configured; ${CONTAINERS_SUCCESSFUL} successful; ${CONTAINERS_FAILED} failed; ${CONTAINERS_REPAIRED} repaired; ${CONTAINERS_HEALTHY} healthy."$'\n\n'
     for container in "${RESULT_ORDER[@]}"; do
         text+="[${container}] ${RESULT_CLASS[$container]}"$'\n'
-        text+="What was found: ${RESULT_FINDING[$container]}"$'\n'
-        text+="What was done: ${RESULT_ACTION[$container]}"$'\n'
-        text+="Final state: ${RESULT_FINAL_STATE[$container]}"$'\n'
-        text+="DBRepair version: ${RESULT_VERSION[$container]}; exit: ${RESULT_RC[$container]}"$'\n'
+        text+="Database checks: ${RESULT_FINDING[$container]}"$'\n'
+        text+="Maintenance: ${RESULT_ACTION[$container]}"$'\n'
+        text+="Plex status: ${RESULT_FINAL_STATE[$container]}"$'\n'
+        text+="DBRepair: ${RESULT_VERSION[$container]}; exit code: ${RESULT_RC[$container]}"$'\n'
         text+="Update: ${RESULT_UPDATE[$container]}"$'\n'
         details="${RESULT_DETAILS[$container]}"
         if [[ -n "$details" ]]; then
-            text+="Notable DBRepair messages:"$'\n'"${details}"$'\n'
+            text+="Diagnostics:"$'\n'"${details}"$'\n'
         fi
         text+="DBRepair log in container: ${DBREPAIR_INSTALL_DIR}/DBRepair.log"$'\n\n'
     done

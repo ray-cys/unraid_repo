@@ -83,7 +83,7 @@ reset_results() {
 set_result_fields() {
     local container="$1"
     RESULT_ORDER+=("$container")
-    RESULT_FINAL_STATE["$container"]="Docker container is running and the Plex Media Server process is present."
+    RESULT_FINAL_STATE["$container"]="Container running; server process detected."
     RESULT_VERSION["$container"]="99.12.34"
     RESULT_UPDATE["$container"]="DBRepair 99.12.34 was already current"
 }
@@ -259,10 +259,42 @@ Checking the PMS databases...
   Blobs DB is OK.
 Starting PMS.
 Started PMS.
+[2026-11-21 20.09.54] Checking Main DB for orphaned media items
+[2026-11-21 20.09.54] No orphaned media items found
 EOF
 classify_container_output healthy "$HEALTHY_OUTPUT" 0
 [[ "${RESULT_CLASS[healthy]}" == HEALTHY ]] || fail "healthy output was misclassified"
+[[ -z "${RESULT_DETAILS[healthy]}" ]] || fail "routine orphan checks leaked into diagnostics"
+[[ "$RUN_HAS_ISSUE" -eq 0 ]] || fail "routine orphan checks raised an issue"
 
+# Check normalization with terminal colors and the alternative zero-count form.
+printf '\033[32m[2026-11-21 20.09.54] 0 orphaned media items found.\033[0m\n' >>"$HEALTHY_OUTPUT"
+classify_container_output healthy "$HEALTHY_OUTPUT" 0
+[[ "${RESULT_CLASS[healthy]}" == HEALTHY ]] || fail "colored clean output was misclassified"
+[[ -z "${RESULT_DETAILS[healthy]}" ]] || fail "colored clean output leaked into diagnostics"
+
+# Positive findings and unknown explicit warnings must still require review.
+ORPHAN_OUTPUT="${TEST_ROOT}/orphan.out"
+cp "$HEALTHY_OUTPUT" "$ORPHAN_OUTPUT"
+printf 'Found 12 orphaned media items\n' >>"$ORPHAN_OUTPUT"
+reset_results
+classify_container_output orphan "$ORPHAN_OUTPUT" 0
+[[ "${RESULT_CLASS[orphan]}" == WARNING ]] || fail "real orphan finding was suppressed"
+assert_contains <(printf '%s' "${RESULT_DETAILS[orphan]}") 'Found 12 orphaned media items'
+assert_contains <(printf '%s' "${RESULT_FINDING[orphan]}") 'Orphaned media records were reported'
+
+WARNING_OUTPUT="${TEST_ROOT}/warning.out"
+cp "$HEALTHY_OUTPUT" "$WARNING_OUTPUT"
+printf 'WARNING: Database maintenance requires manual review\n' >>"$WARNING_OUTPUT"
+reset_results
+classify_container_output warning "$WARNING_OUTPUT" 0
+[[ "${RESULT_CLASS[warning]}" == WARNING ]] || fail "explicit warning was suppressed"
+assert_contains <(printf '%s' "${RESULT_DETAILS[warning]}") 'WARNING: Database maintenance requires manual review'
+printf '[WARNING] No orphaned media items found\n' >>"$WARNING_OUTPUT"
+classify_container_output warning "$WARNING_OUTPUT" 0
+assert_contains <(printf '%s' "${RESULT_DETAILS[warning]}") '[WARNING] No orphaned media items found'
+
+reset_results
 REPAIRED_OUTPUT="${TEST_ROOT}/repaired.out"
 cat >"$REPAIRED_OUTPUT" <<'EOF'
 Main Database is damaged: Rowid out of order
@@ -271,6 +303,8 @@ Blobs DB rebuild and verification complete.
 Making DB(s) active
 Swap complete. Live databases updated.
 Started PMS.
+[2026-11-21 20.09.54] Checking Main DB for orphaned media items
+[2026-11-21 20.09.54] No orphaned media items found
 EOF
 classify_container_output repaired "$REPAIRED_OUTPUT" 0
 [[ "${RESULT_CLASS[repaired]}" == REPAIRED ]] || fail "repair output was misclassified"
@@ -290,7 +324,7 @@ classify_container_output failed "$FAILED_OUTPUT" 1
 [[ "${RESULT_CLASS[failed]}" == FAILED ]] || fail "failed output was misclassified"
 
 ###############################################################################
-# Grouped layman report, notification deduplication, and resolution
+# Grouped operational report, notification deduplication, and resolution
 ###############################################################################
 
 initialize_notification_state || fail "notification state initialization failed"
@@ -309,9 +343,10 @@ write_run_report || fail "structured run report failed"
 update_notifications
 [[ "$(wc -l <"$MOCK_NOTIFY_COUNT" | tr -d '[:space:]')" -eq 1 ]] ||
     fail "successful repair did not send exactly one notification"
-assert_contains "$MOCK_NOTIFY_LOG" "What was found:"
-assert_contains "$MOCK_NOTIFY_LOG" "What was done:"
-assert_contains "$MOCK_NOTIFY_LOG" "Final state:"
+assert_contains "$MOCK_NOTIFY_LOG" "Database checks:"
+assert_contains "$MOCK_NOTIFY_LOG" "Maintenance:"
+assert_contains "$MOCK_NOTIFY_LOG" "Plex status: Container running; server process detected."
+assert_contains "$MOCK_NOTIFY_LOG" "DBRepair: 99.12.34; exit code: 0"
 assert_contains "$RUN_REPORT_FILE" "Plex DBRepair run report"
 
 : >"$MOCK_NOTIFY_LOG"
@@ -347,6 +382,16 @@ update_notifications
 [[ "$(wc -l <"$MOCK_NOTIFY_COUNT" | tr -d '[:space:]')" -eq 2 ]] ||
     fail "warning resolution notification was not sent"
 assert_contains "$MOCK_NOTIFY_LOG" "previously reported Plex DBRepair issues are resolved"
+
+# Subsequent clean runs stay silent, including the real-world orphan-check
+# output that originally generated false NOTICE emails.
+reset_results
+set_result_fields plex-media-server
+classify_container_output plex-media-server "$HEALTHY_OUTPUT" 0
+CONTAINERS_SUCCESSFUL=1
+update_notifications
+[[ "$(wc -l <"$MOCK_NOTIFY_COUNT" | tr -d '[:space:]')" -eq 2 ]] ||
+    fail "clean orphan-check output generated a routine notification"
 
 assert_contains "$SCRIPT" 'DBREPAIR_ARGS=("automatic" "exit")'
 # shellcheck disable=SC2016
