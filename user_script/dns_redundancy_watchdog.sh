@@ -78,7 +78,7 @@ LOG_MAX_BYTES="${LOG_MAX_BYTES:-5242880}"
 # Create maintenance/all, maintenance/primary, or maintenance/fallback to
 # suppress notifications and recovery for planned work on that target.
 
-STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/user_scripts_status}"
+STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 NOTIFY_BIN="${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}"
 LOCK_FILE="${LOCK_FILE:-/run/dns_redundancy_watchdog.lock}"
 REQUIRE_VAULT_MOUNT="${REQUIRE_VAULT_MOUNT:-true}"
