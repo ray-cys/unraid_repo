@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Plex DBRepair Scheduler Wrapper v3.2
+# Plex DBRepair Scheduler Wrapper v3.3
 #
 # Unraid 7.4-focused scheduler for the current standalone DBRepair executable.
 # It verifies the official GitHub release, stages updates safely inside each
@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-readonly VERSION="3.2"
+readonly VERSION="3.3"
 
 ###############################################################################
 # CONFIGURATION
@@ -47,6 +47,8 @@ NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
 
 STATUS_DIR="/mnt/vault/cloud/logs/script/user_scripts_status"
 LOCK_FILE="/run/plex_dbrepair.lock"
+DOCKER_MAINTENANCE_DIR="${DOCKER_MAINTENANCE_DIR:-/run/docker-service-maintenance}"
+ACTIVE_MAINTENANCE_CONTAINER=""
 
 CONTAINER_START_TIMEOUT_SECONDS=90
 PLEX_START_TIMEOUT_SECONDS=90
@@ -170,6 +172,9 @@ extract_version() {
 
 cleanup() {
     local rc=$?
+    if [[ -n "$ACTIVE_MAINTENANCE_CONTAINER" ]]; then
+        rm -f -- "$DOCKER_MAINTENANCE_DIR/$ACTIVE_MAINTENANCE_CONTAINER.dbrepair.json"
+    fi
     if [[ -n "$RUNTIME_DIR" && "$RUNTIME_DIR" == /tmp/plex_dbrepair.* ]]; then
         rm -rf -- "$RUNTIME_DIR"
     fi
@@ -757,7 +762,49 @@ restore_container_state() {
     return 1
 }
 
+plex_maintenance_begin() {
+    local name="$1" fd tmp boot ttl process_start
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 1
+    mkdir -p -- "$DOCKER_MAINTENANCE_DIR" || return 1
+    exec {fd}>"$DOCKER_MAINTENANCE_DIR/$name.lock" || return 1
+    flock -w 120 "$fd" || { exec {fd}>&-; return 1; }
+    tmp="$(mktemp "$DOCKER_MAINTENANCE_DIR/.dbrepair.XXXXXX")" || { exec {fd}>&-; return 1; }
+    boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf unknown)"
+    process_start="$(sed 's/.*) //' "/proc/$$/stat" 2>/dev/null | awk '{print $20}')"
+    ttl=$((DBREPAIR_TIMEOUT_SECONDS + 3600))
+    (( ttl <= 86400 )) || ttl=86400
+    printf '{"boot":"%s","pid":%s,"processStart":"%s","expires":%s,"reason":"Plex DBRepair"}\n' \
+        "$boot" "$$" "$process_start" "$(( $(date +%s) + ttl ))" >"$tmp"
+    mv -f -- "$tmp" "$DOCKER_MAINTENANCE_DIR/$name.dbrepair.json"
+    local rc=$?
+    exec {fd}>&-
+    return "$rc"
+}
+
 process_container() {
+    local container="$1" rc
+    if ! plex_maintenance_begin "$container"; then
+        RESULT_ORDER+=("$container")
+        RESULT_CLASS["$container"]=FAILED
+        RESULT_FINDING["$container"]="Watchdog maintenance lease unavailable."
+        RESULT_ACTION["$container"]="Maintenance skipped; inspect shared lease directory permissions."
+        RESULT_FINAL_STATE["$container"]="Not modified."
+        RESULT_VERSION["$container"]=unknown
+        RESULT_RC["$container"]=not-run
+        RESULT_DETAILS["$container"]=""
+        RESULT_UPDATE["$container"]="Not attempted."
+        CONTAINERS_FAILED=$((CONTAINERS_FAILED + 1))
+        error "[$container] Maintenance lease creation failed"
+        return 1
+    fi
+    ACTIVE_MAINTENANCE_CONTAINER="$container"
+    process_container_impl "$container"; rc=$?
+    rm -f -- "$DOCKER_MAINTENANCE_DIR/$container.dbrepair.json"
+    ACTIVE_MAINTENANCE_CONTAINER=""
+    return "$rc"
+}
+
+process_container_impl() {
     local container="$1" originally_running=false output_file rc=1
     local safe_container
 

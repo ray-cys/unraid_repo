@@ -7,6 +7,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="${REPO_ROOT}/user_script/plex_dbrepair.sh"
 TEST_ROOT="$(mktemp -d /tmp/plex_dbrepair_test.XXXXXX)"
+export DOCKER_MAINTENANCE_DIR="$TEST_ROOT/maintenance"
 
 test_cleanup() {
     case "${RUNTIME_DIR:-}" in
@@ -397,5 +398,21 @@ assert_contains "$SCRIPT" 'DBREPAIR_ARGS=("automatic" "exit")'
 # shellcheck disable=SC2016
 assert_contains "$SCRIPT" 'docker exec -u 0 -i -w "$DBREPAIR_INSTALL_DIR"'
 assert_contains "$SCRIPT" 'docker restart -t 30'
+
+# A real lease is created before maintenance, with a bounded lifetime and an
+# owner identity. The wrapper removes it even when processing returns failure.
+# shellcheck disable=SC2329
+flock() { return 0; }
+plex_maintenance_begin plex-media-server || fail "Plex maintenance lease failed"
+jq -e --argjson now "$(date +%s)" '.pid > 0 and (.processStart | type == "string") and
+    .expires > $now and .expires <= ($now + 86400)' \
+    "$DOCKER_MAINTENANCE_DIR/plex-media-server.dbrepair.json" >/dev/null || fail "invalid Plex maintenance lease"
+# shellcheck disable=SC2329
+process_container_impl() {
+    [[ -f "$DOCKER_MAINTENANCE_DIR/$1.dbrepair.json" ]] || fail "maintenance began without lease"
+    return 1
+}
+if process_container plex-media-server; then fail "processing failure was hidden"; fi
+[[ ! -e "$DOCKER_MAINTENANCE_DIR/plex-media-server.dbrepair.json" ]] || fail "Plex lease leaked after processing"
 
 printf 'plex_dbrepair fixture tests passed\n'

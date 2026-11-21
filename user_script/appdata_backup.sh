@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Appdata + Optional Shares Backup v3.5
+# Appdata + Optional Shares Backup v3.6
 #
 # PURPOSE
 # -------
@@ -59,7 +59,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="3.5"
+readonly SCRIPT_VERSION="3.6"
 
 
 ###############################################################################
@@ -405,6 +405,8 @@ NOTIFY_SUBJECT="${NOTIFY_SUBJECT:-Scheduled Backup}"
 # ---------------------------------------------------------------------------
 
 LOCK_FILE="${LOCK_FILE:-/tmp/appdata_backup.lock}"
+# Shared expiring leases prevent watchdog alerts/recovery during owned downtime.
+DOCKER_MAINTENANCE_DIR="${DOCKER_MAINTENANCE_DIR:-/run/docker-service-maintenance}"
 
 
 ###############################################################################
@@ -1940,6 +1942,23 @@ discover_target_containers() {
 }
 
 
+backup_maintenance_begin() {
+    local name="$1" fd tmp boot process_start
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 1
+    mkdir -p -- "$DOCKER_MAINTENANCE_DIR" || return 1
+    exec {fd}>"$DOCKER_MAINTENANCE_DIR/$name.lock" || return 1
+    flock -w 120 "$fd" || { exec {fd}>&-; return 1; }
+    tmp="$(mktemp "$DOCKER_MAINTENANCE_DIR/.appdata.XXXXXX")" || { exec {fd}>&-; return 1; }
+    boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf unknown)"
+    process_start="$(sed 's/.*) //' "/proc/$$/stat" 2>/dev/null | awk '{print $20}')"
+    printf '{"boot":"%s","pid":%s,"processStart":"%s","expires":%s,"reason":"appdata backup"}\n' \
+        "$boot" "$$" "$process_start" "$(( $(date +%s) + 86400 ))" >"$tmp"
+    mv -f -- "$tmp" "$DOCKER_MAINTENANCE_DIR/$name.appdata.json"
+    local rc=$?
+    exec {fd}>&-
+    return "$rc"
+}
+
 stop_containers_for_app() {
     local app_name="$1"
     local container=""
@@ -1955,6 +1974,12 @@ stop_containers_for_app() {
 
     for container in $owners; do
         [ "${CONTAINER_STOPPED[$container]:-false}" = "true" ] && continue
+
+        if ! backup_maintenance_begin "$container"; then
+            log "DOCKER" "ERROR" "Unable to establish watchdog maintenance lease: $container; stop skipped"
+            failed=1
+            continue
+        fi
 
         # Mark before stopping so the EXIT trap can recover if interruption
         # occurs during docker stop or its subsequent state inspection.
@@ -2007,6 +2032,7 @@ start_container_with_retry() {
 
         if [ "$running_state" = "true" ]; then
             CONTAINER_STOPPED["$container"]=false
+            rm -f -- "$DOCKER_MAINTENANCE_DIR/$container.appdata.json"
             log "DOCKER" "INFO" "Started container: $container"
             return 0
         fi
@@ -2067,6 +2093,7 @@ emergency_restart_containers() {
     for container in "${TARGET_CONTAINERS[@]}"; do
         [ "${CONTAINER_STOPPED[$container]:-false}" = "true" ] || continue
         docker start "$container" >/dev/null 2>&1 || true
+        rm -f -- "$DOCKER_MAINTENANCE_DIR/$container.appdata.json"
     done
 }
 

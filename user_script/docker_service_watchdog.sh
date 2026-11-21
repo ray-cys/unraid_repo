@@ -1,444 +1,463 @@
 #!/bin/bash
-
-###############################################################################
-# Docker Service Watchdog
-#
-# Stateful health and availability monitoring for this personal Unraid Docker
-# stack. Automatic restarts are opt-in, require consecutive failures, respect a
-# per-container maintenance marker, and never restart stopped containers unless
-# explicitly enabled.
-###############################################################################
-
+# Docker Service Watchdog v2.0 -- Unraid service availability and bounded recovery.
+# Optional schedule: every five minutes. Pi-hole and application-specific health
+# remain owned by the DNS and Arr monitors. All recovery is disabled by default.
 set -uo pipefail
 umask 077
-
-readonly SCRIPT_VERSION="1.0"
+readonly SCRIPT_VERSION="2.0"
 
 ###############################################################################
 # CONFIGURATION
 ###############################################################################
-
-# container|optional HTTP endpoint|restart allowed (0/1)
+# name|HTTP endpoint (optional)|always/on-demand|restart permission (0/1)
+# on-demand containers may be stopped or absent without an availability alert.
 SERVICE_SPECS=(
-    # Pi-hole is intentionally owned by dns_redundancy_watchdog.sh so DNS
-    # recovery and notifications are not duplicated here.
-    "plex-media-server||0"
-    "plex-media||0"
-    "sonarr|http://192.168.50.4:8989/ping|0"
-    "radarr|http://192.168.50.4:7878/ping|0"
-    "sabnzbd|http://192.168.50.4:8080/|0"
-    "qbittorrent||0"
-    "kometa||0"
-    "recyclarr||0"
+    "plex-media-server||always|0"
+    "plex-media||always|0"
+    "sonarr|http://192.168.50.4:8989/ping|always|0"
+    "radarr|http://192.168.50.4:7878/ping|always|0"
+    "sabnzbd|http://192.168.50.4:8080/|always|0"
+    "qbittorrent||always|0"
+    "kometa||on-demand|0"
+    "recyclarr||on-demand|0"
 )
-
+VAULT_MOUNT="/mnt/vault"
+STATE_DIR="/mnt/vault/cloud/logs/docker_service_watchdog"
+STATE_FILE="$STATE_DIR/state.json"
+STATUS_DIR="/mnt/vault/cloud/logs/user_scripts_status"
+LOG_FILE="$STATE_DIR/docker-service-watchdog.log"
+LOG_MAX_BYTES=$((1024 * 1024))
+LOCK_FILE="/run/docker_service_watchdog.lock"
+NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
+COMMAND_TIMEOUT_SECONDS=20
 HTTP_CONNECT_TIMEOUT=4
 HTTP_MAX_TIME=10
-
+BOOT_GRACE_SECONDS=300
+CONTAINER_GRACE_SECONDS=120
+FAILURE_CONFIRM_SCANS=2
+RECOVERY_CONFIRM_SCANS=2
 CHECK_LOG_SIZE=true
 LOG_SIZE_WARNING_BYTES=$((1024 * 1024 * 1024))
-
+# A maintenance lease suppresses availability observations AND restart actions.
+# appdata_backup.sh and plex_dbrepair.sh write independent leases here. A shared
+# per-container lock serializes lease creation against watchdog recovery.
+DOCKER_MAINTENANCE_DIR="${DOCKER_MAINTENANCE_DIR:-/run/docker-service-maintenance}"
+MAX_MAINTENANCE_SECONDS=86400
 AUTO_RESTART=false
 RESTART_STOPPED_CONTAINERS=false
 CONSECUTIVE_FAILURES_BEFORE_RESTART=3
-RESTART_COOLDOWN_SECONDS=$((6 * 60 * 60))
-POST_RESTART_WAIT_SECONDS=10
-
-# Create STATE_DIR/maintenance/<container> to suppress restart actions.
-STATE_DIR="/mnt/vault/cloud/logs/docker_service_watchdog"
-STATE_FILE="${STATE_DIR}/state.json"
-MAINTENANCE_DIR="${STATE_DIR}/maintenance"
-LOG_FILE="${STATE_DIR}/docker-service-watchdog.log"
-LOG_MAX_BYTES=$((5 * 1024 * 1024))
-
-STATUS_DIR="/mnt/vault/cloud/logs/user_scripts_status"
-NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
-NOTIFY_COOLDOWN_HOURS=6
-LOCK_FILE="/run/docker_service_watchdog.lock"
+RESTART_COOLDOWN_SECONDS=21600
+RESTART_BUDGET_WINDOW_SECONDS=86400
+MAX_RESTART_ATTEMPTS=2
+RECOVERY_TIMEOUT_SECONDS=90
+RECOVERY_POLL_SECONDS=5
 
 ###############################################################################
-# RUNTIME
+# RUNTIME AND DURABLE STATE
 ###############################################################################
-
-START_EPOCH="$(date +%s)"
-RESULT_STATUS="FAILED"
-RESULT_SUMMARY="Docker watchdog exited before completion"
-RECEIPT_WRITTEN=0
-
-STATE_WORK=""
+NOW="$(date +%s)"
+BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf unknown)"
 TMP_DIR=""
-
-SERVICES_CHECKED=0
-SERVICES_HEALTHY=0
-WARNING_COUNT=0
-CRITICAL_COUNT=0
-RESTART_ACTIONS=0
-
-FINDINGS=()
-CURRENT_SIGNATURE=""
-
-###############################################################################
-# HELPERS
-###############################################################################
+STATE_WORK=""
+RECOVERY_SAFE=true
+declare -A SEEN=() FROZEN=() RECOVERY_BLOCKED=()
 
 log() {
-    local level="$1"
+    local level="$1" line size
+    local LC_ALL=C
     shift
-    local line
-    printf -v line '%s [%s] %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*"
+    line="$(date '+%Y-%m-%d %H:%M:%S') [$level] $*"
+    (( ${#line} <= 4096 )) || line="${line:0:4070} ... [line truncated]"
     printf '%s\n' "$line"
-    [[ -d "$STATE_DIR" ]] && printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null || true
+    size="$(stat -c %s "$LOG_FILE" 2>/dev/null || printf 0)"
+    if (( size + ${#line} + 1 > LOG_MAX_BYTES )); then
+        mv -f -- "$LOG_FILE" "$LOG_FILE.1" || return 1
+    fi
+    printf '%s\n' "$line" >>"$LOG_FILE"
 }
 
-rotate_log() {
-    local size
-    [[ -f "$LOG_FILE" ]] || return 0
-    size="$(stat -c '%s' "$LOG_FILE" 2>/dev/null || printf 0)"
-    (( size < LOG_MAX_BYTES )) || {
-        mv -f -- "$LOG_FILE" "${LOG_FILE}.1"
-        : >"$LOG_FILE"
-    }
+docker_cmd() { timeout --signal=TERM --kill-after=5 "$COMMAND_TIMEOUT_SECONDS" docker "$@"; }
+cleanup() { [[ -z "$TMP_DIR" ]] || rm -rf -- "$TMP_DIR"; }
+
+bound_existing_logs() {
+    local file size tmp
+    for file in "$LOG_FILE" "$LOG_FILE.1"; do
+        [[ -f "$file" ]] || continue
+        size="$(stat -c %s "$file")" || return 1
+        if (( size > LOG_MAX_BYTES )); then
+            tmp="$(mktemp "$STATE_DIR/.log-tail.XXXXXX")" || return 1
+            tail -c "$LOG_MAX_BYTES" -- "$file" >"$tmp" && mv -f -- "$tmp" "$file" || { rm -f -- "$tmp"; return 1; }
+        fi
+    done
 }
 
-notify_unraid() {
-    local importance="$1" description="$2" message="$3"
-    [[ -x "$NOTIFY_BIN" ]] || return 1
-    "$NOTIFY_BIN" -i "$importance" -s "Docker Service Watchdog" \
-        -d "$description" -m "$message" >/dev/null 2>&1
+state_valid() {
+    jq -e '.version == 2 and (.services | type == "object" and all(.[];
+            (.id | type == "string") and (.oom | type == "boolean") and
+            (.restartCount | type == "number" and . >= 0 and . == floor) and
+            (.failures | type == "number" and . >= 0 and . == floor))) and
+        (.recovery | type == "object" and all(.[];
+            (.attempts | type == "number" and . >= 0 and . == floor) and
+            (.last | type == "number" and . >= 0 and . == floor) and
+            (.window | type == "number" and . >= 0 and . == floor))) and
+        (.observations | type == "object" and all(.[];
+            (.bad | type == "number" and . >= 0 and . == floor) and
+            (.good | type == "number" and . >= 0 and . == floor) and
+            (.first | type == "number" and . >= 0 and . == floor) and
+            (.active | type == "boolean") and (.message | type == "string") and
+            (.severity == "CRITICAL" or .severity == "WARNING"))) and
+        (.notification | type == "object") and
+        (.notification.issues | type == "object" and all(.[]; . == "CRITICAL" or . == "WARNING"))' "$1" >/dev/null 2>&1
 }
 
-human_bytes() {
-    awk -v b="${1:-0}" 'BEGIN {
-        split("B KiB MiB GiB TiB", u, " ")
-        i=1
-        while (b >= 1024 && i < 5) { b/=1024; i++ }
-        printf "%.2f %s", b, u[i]
-    }'
+save_state() {
+    local next
+    next="$(mktemp "$STATE_DIR/.state.XXXXXX")" || return 1
+    cp -- "$STATE_WORK" "$next" && state_valid "$next" && mv -f -- "$next" "$STATE_FILE" || { rm -f -- "$next"; return 1; }
 }
 
-write_receipt() {
-    local status="$1" summary="$2" now tmp
-    now="$(date +%s)"
-    mkdir -p -- "$STATUS_DIR" 2>/dev/null || return 0
-    tmp="$(mktemp "${STATUS_DIR}/.docker_service_watchdog.XXXXXX")" || return 0
-    if jq -n \
-        --arg name "docker_service_watchdog" \
-        --arg status "$status" \
-        --arg summary "$summary" \
-        --arg log "$LOG_FILE" \
-        --argjson epoch "$now" \
-        --argjson duration "$((now - START_EPOCH))" \
-        '{name:$name,status:$status,summary:$summary,log:$log,epoch:$epoch,duration_seconds:$duration}' \
-        >"$tmp"
-    then
-        mv -f -- "$tmp" "${STATUS_DIR}/docker_service_watchdog.json"
-        RECEIPT_WRITTEN=1
+mutate() {
+    local next="$TMP_DIR/next.json"
+    jq "$@" "$STATE_WORK" >"$next" && mv -f -- "$next" "$STATE_WORK"
+}
+
+load_state() {
+    if state_valid "$STATE_FILE"; then
+        cp -- "$STATE_FILE" "$STATE_WORK" || return 1
+        cp -- "$STATE_FILE" "$STATE_FILE.bak" || return 1
+    elif [[ -e "$STATE_FILE" ]]; then
+        RECOVERY_SAFE=false
+        cp -- "$STATE_FILE" "$STATE_FILE.invalid" || return 1
+        if state_valid "$STATE_FILE.bak"; then
+            cp -- "$STATE_FILE.bak" "$STATE_WORK" || return 1
+        else
+            printf '{"version":2,"services":{},"recovery":{},"observations":{},"notification":{"issues":{}}}\n' >"$STATE_WORK"
+        fi
+        observe monitor:state WARNING "State invalid or legacy schema; recovery disabled for this run; prior file retained as state.json.invalid" 1
     else
-        rm -f -- "$tmp"
+        RECOVERY_SAFE=false
+        printf '{"version":2,"services":{},"recovery":{},"observations":{},"notification":{"issues":{}}}\n' >"$STATE_WORK"
+    fi
+    # Never carry scan counters or monotonic Docker restart counts across boots.
+    if [[ "$(jq -r '.bootId // ""' "$STATE_WORK")" != "$BOOT_ID" ]]; then
+        RECOVERY_SAFE=false
+        mutate --arg boot "$BOOT_ID" '.bootId=$boot | .services={} | .observations |= with_entries(.value.bad=0 | .value.good=0)' || return 1
     fi
 }
 
-cleanup() {
+# Stable keys exclude counters, age, changing log size, and message text.
+observe() {
+    local key="$1" severity="$2" message="$3" threshold="${4:-$FAILURE_CONFIRM_SCANS}"
+    SEEN["$key"]=1
+    log "$severity" "$key: $message" || return 1
+    mutate --arg key "$key" --arg severity "$severity" --arg message "$message" --argjson now "$NOW" --argjson threshold "$threshold" '
+        .observations[$key] = ((.observations[$key] // {bad:0,good:0,active:false,first:$now}) |
+            .bad += 1 | .good=0 | .severity=$severity | .message=$message |
+            .active = (.active or .bad >= $threshold))'
+}
+
+finish_observations() {
+    local key service
+    while IFS= read -r key; do
+        [[ -z "${SEEN[$key]+yes}" ]] || continue
+        service="${key%%:*}"
+        [[ -z "${FROZEN[$service]+yes}" ]] || continue
+        mutate --arg key "$key" --argjson threshold "$RECOVERY_CONFIRM_SCANS" '
+            .observations[$key].bad=0 | .observations[$key].good += 1 |
+            if .observations[$key].good >= $threshold then del(.observations[$key]) else . end' || return 1
+    done < <(jq -r '.observations | keys[]' "$STATE_WORK")
+}
+
+###############################################################################
+# EXPIRING MAINTENANCE LEASES
+###############################################################################
+maintenance_active() {
+    local name="$1" lease expires pid boot active=1 wall_now process_start actual_start owner_alive=false
+    wall_now="$(date +%s)"
+    for lease in "$DOCKER_MAINTENANCE_DIR/$name."*.json; do
+        [[ -f "$lease" && ! -L "$lease" ]] || continue
+        if ! jq -e '(.expires | type == "number" and . == floor) and
+            (.pid | type == "number" and . >= 0 and . == floor) and (.boot | type == "string")' "$lease" >/dev/null 2>&1; then
+            observe "$name:maintenance-invalid" WARNING "Invalid lease: $lease; suppression disabled" 1 || return 2
+            RECOVERY_BLOCKED["$name"]=1
+            continue
+        fi
+        read -r expires pid boot < <(jq -r '[.expires,.pid,.boot] | @tsv' "$lease")
+        owner_alive=false
+        if (( pid > 0 )) && [[ "$boot" == "$BOOT_ID" ]] && kill -0 "$pid" 2>/dev/null; then
+            process_start="$(jq -r '.processStart // ""' "$lease")"
+            actual_start="$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')"
+            if [[ -n "$actual_start" && "$process_start" == "$actual_start" ]]; then owner_alive=true; fi
+        fi
+        if [[ "$boot" == "$BOOT_ID" ]] && (( expires > wall_now && expires <= wall_now + MAX_MAINTENANCE_SECONDS )) &&
+            { (( pid == 0 )) || [[ "$owner_alive" == true ]]; }; then
+            active=0
+        elif [[ "$owner_alive" == true ]]; then
+            # An overlong backup must become visible, but never restart a
+            # database while its verified maintenance process still owns it.
+            RECOVERY_BLOCKED["$name"]=1
+            observe "$name:maintenance-overrun" WARNING "Maintenance lease exceeded its limit; owner still active; recovery prohibited" 1 || return 2
+        elif [[ "$lease" == *.manual.json ]]; then
+            observe "$name:maintenance-expired" WARNING "Manual maintenance lease expired or invalid for this boot: $lease; suppression disabled" 1 || return 2
+        fi
+    done
+    return "$active"
+}
+
+set_manual_maintenance() {
+    local name="$1" minutes="$2" reason="$3" fd tmp
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ && "$minutes" =~ ^[1-9][0-9]*$ ]] &&
+        (( minutes <= MAX_MAINTENANCE_SECONDS / 60 )) || return 2
+    mkdir -p -- "$DOCKER_MAINTENANCE_DIR" || return 1
+    exec {fd}>"$DOCKER_MAINTENANCE_DIR/$name.lock" || return 1
+    flock -w 30 "$fd" || { exec {fd}>&-; return 1; }
+    tmp="$(mktemp "$DOCKER_MAINTENANCE_DIR/.lease.XXXXXX")" || { exec {fd}>&-; return 1; }
+    jq -n --arg boot "$BOOT_ID" --arg reason "$reason" --argjson expires "$((NOW + minutes * 60))" \
+        '{boot:$boot,pid:0,expires:$expires,reason:$reason}' >"$tmp" &&
+        mv -f -- "$tmp" "$DOCKER_MAINTENANCE_DIR/$name.manual.json"
     local rc=$?
-    [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && rm -rf -- "$TMP_DIR"
-    if (( RECEIPT_WRITTEN == 0 )); then
-        write_receipt "$RESULT_STATUS" "$RESULT_SUMMARY"
-    fi
-    trap - EXIT
-    exit "$rc"
-}
-trap cleanup EXIT
-
-add_finding() {
-    local severity="$1"
-    shift
-    FINDINGS+=("$severity|$*")
-    case "$severity" in
-        CRITICAL) CRITICAL_COUNT=$((CRITICAL_COUNT + 1)) ;;
-        WARNING) WARNING_COUNT=$((WARNING_COUNT + 1)) ;;
-    esac
+    exec {fd}>&-
+    return "$rc"
 }
 
-state_value() {
-    local name="$1" field="$2" default="$3"
-    jq -r --arg name "$name" --arg field "$field" --arg default "$default" '
-        .services[$name][$field] // $default
-    ' "$STATE_WORK"
-}
-
-state_set_service() {
-    local name="$1" failures="$2" restart_count="$3" last_restart="$4"
-    local status="$5" reason="$6" next
-    next="$(mktemp "${TMP_DIR}/state.XXXXXX")" || return 1
-    if jq \
-        --arg name "$name" \
-        --arg status "$status" \
-        --arg reason "$reason" \
-        --argjson failures "$failures" \
-        --argjson restart_count "$restart_count" \
-        --argjson last_restart "$last_restart" \
-        --argjson checked "$(date +%s)" '
-        .services //= {}
-        | .services[$name] = {
-            consecutive_failures:$failures,
-            restart_count:$restart_count,
-            last_restart_epoch:$last_restart,
-            last_status:$status,
-            last_reason:$reason,
-            checked_epoch:$checked
-          }
-    ' "$STATE_WORK" >"$next"
-    then
-        mv -f -- "$next" "$STATE_WORK"
-    else
-        rm -f -- "$next"
-        return 1
-    fi
-}
-
+###############################################################################
+# SERVICE OBSERVATION AND RECOVERY
+###############################################################################
 endpoint_healthy() {
-    local url="$1" code
-    [[ -n "$url" ]] || return 0
-    code="$(curl --silent --show-error --output /dev/null \
-        --connect-timeout "$HTTP_CONNECT_TIMEOUT" \
-        --max-time "$HTTP_MAX_TIME" \
-        --write-out '%{http_code}' "$url" 2>/dev/null)" || return 1
+    local code
+    [[ -n "$1" ]] || return 0
+    code="$(curl --silent --output /dev/null --connect-timeout "$HTTP_CONNECT_TIMEOUT" --max-time "$HTTP_MAX_TIME" --write-out '%{http_code}' "$1")" || return 1
     [[ "$code" =~ ^[23][0-9][0-9]$ || "$code" == 401 || "$code" == 403 ]]
 }
 
-###############################################################################
-# SERVICE CHECK
-###############################################################################
+inspect_valid() {
+    jq -e 'type == "array" and length == 1 and (.[0].State.Status | type == "string") and
+        (.[0].State.OOMKilled | type == "boolean") and
+        ((.[0].State.Health.Status // "none") | type == "string") and
+        (.[0].RestartCount | type == "number" and . >= 0 and . == floor) and
+        (.[0].Id | type == "string")' <<<"$1" >/dev/null 2>&1
+}
+
+verify_service() {
+    local info
+    info="$(docker_cmd inspect "$1" 2>/dev/null)" && inspect_valid "$info" || return 1
+    jq -e '.[0].State | .Status == "running" and ((.Health.Status // "none") == "none" or .Health.Status == "healthy")' <<<"$info" >/dev/null && endpoint_healthy "$2"
+}
+
+attempt_recovery() {
+    local name="$1" url="$2" status="$3" permitted="$4" count last window attempts fd elapsed=0 latest lease_rc
+    [[ "$AUTO_RESTART" == true && "$RECOVERY_SAFE" == true && "$permitted" == 1 ]] || return 0
+    [[ -z "${RECOVERY_BLOCKED[$name]+yes}" ]] || return 0
+    [[ "$status" == running || "$RESTART_STOPPED_CONTAINERS" == true ]] || return 0
+    count="$(jq -r --arg name "$name" '.services[$name].failures // 0' "$STATE_WORK")"
+    (( count >= CONSECUTIVE_FAILURES_BEFORE_RESTART )) || return 0
+    read -r last window attempts < <(jq -r --arg name "$name" '(.recovery[$name] // {last:0,window:0,attempts:0}) | [.last,.window,.attempts] | @tsv' "$STATE_WORK")
+    if (( NOW - window >= RESTART_BUDGET_WINDOW_SECONDS )); then window="$NOW"; attempts=0; fi
+    if (( attempts >= MAX_RESTART_ATTEMPTS )); then
+        observe "$name:recovery-budget" CRITICAL "Automatic recovery budget exhausted ($attempts attempts); operator action required" 1
+        return
+    fi
+    (( NOW - last >= RESTART_COOLDOWN_SECONDS )) || return 0
+    exec {fd}>"$DOCKER_MAINTENANCE_DIR/$name.lock" || return 1
+    flock -n "$fd" || { exec {fd}>&-; return 0; }
+    # Recheck under the same lock used by lease writers to close the
+    # maintenance-vs-restart race. Never act on an old inspection alone.
+    maintenance_active "$name"; lease_rc=$?
+    if (( lease_rc == 0 )); then exec {fd}>&-; return 0; fi
+    if (( lease_rc != 1 )); then exec {fd}>&-; return 1; fi
+    [[ -z "${RECOVERY_BLOCKED[$name]+yes}" ]] || { exec {fd}>&-; return 0; }
+    latest="$(docker_cmd inspect "$name" 2>/dev/null)" && inspect_valid "$latest" || { exec {fd}>&-; return 0; }
+    # A service may have been stopped manually since the observation.
+    if [[ "$(jq -r '.[0].State.Status' <<<"$latest")" != running && "$RESTART_STOPPED_CONTAINERS" != true ]]; then exec {fd}>&-; return 0; fi
+    if verify_service "$name" "$url"; then exec {fd}>&-; return 0; fi
+    mutate --arg name "$name" --argjson now "$NOW" --argjson window "$window" --argjson attempts "$((attempts + 1))" \
+        '.recovery[$name]={last:$now,window:$window,attempts:$attempts}' && save_state || { exec {fd}>&-; return 1; }
+    # Reserve the attempt durably BEFORE executing Docker, even on timeout or
+    # failure. An interrupted watchdog cannot create an unlimited restart loop.
+    if docker_cmd restart "$name" >/dev/null 2>&1; then
+        while (( elapsed <= RECOVERY_TIMEOUT_SECONDS )); do
+            if verify_service "$name" "$url"; then
+                observe "$name:recovery-action" WARNING "Container restarted; Docker health and configured endpoint verified; awaiting stable recovery scans" 1
+                exec {fd}>&-
+                return 0
+            fi
+            sleep "$RECOVERY_POLL_SECONDS"
+            elapsed=$((elapsed + RECOVERY_POLL_SECONDS))
+        done
+    fi
+    observe "$name:recovery-failed" CRITICAL "Restart failed or service did not pass post-restart verification; attempt budget consumed" 1
+    exec {fd}>&-
+}
 
 check_service() {
-    local spec="$1" name url restart_allowed
-    local inspect status health oom restart_count log_path log_size
-    local previous_failures previous_restart previous_action_epoch
-    local failures=0 reason="" service_status="OK"
-    local can_restart=0
-
-    IFS='|' read -r name url restart_allowed <<<"$spec"
-    SERVICES_CHECKED=$((SERVICES_CHECKED + 1))
-
-    inspect="$(docker inspect "$name" 2>/dev/null)" || {
-        previous_failures="$(state_value "$name" consecutive_failures 0)"
-        failures=$((previous_failures + 1))
-        reason="container not found"
-        add_finding CRITICAL "$name: $reason"
-        state_set_service "$name" "$failures" 0 0 "CRITICAL" "$reason"
-        log ERROR "$name: $reason"
+    local name url expected allowed info status health id previous_id previous_count count oom previous_oom
+    local started epoch uptime log_path size failures bad=false missing rc
+    IFS='|' read -r name url expected allowed <<<"$1"
+    maintenance_active "$name"; rc=$?
+    if (( rc == 0 )); then
+        FROZEN["$name"]=1
+        log INFO "$name: maintenance active; availability/recovery suspended"
         return
-    }
-
-    status="$(jq -r '.[0].State.Status // "unknown"' <<<"$inspect")"
-    health="$(jq -r '.[0].State.Health.Status // "none"' <<<"$inspect")"
-    oom="$(jq -r '.[0].State.OOMKilled // false' <<<"$inspect")"
-    restart_count="$(jq -r '.[0].RestartCount // 0' <<<"$inspect")"
-    log_path="$(jq -r '.[0].LogPath // empty' <<<"$inspect")"
-
-    previous_failures="$(state_value "$name" consecutive_failures 0)"
-    previous_restart="$(state_value "$name" restart_count "$restart_count")"
-    previous_action_epoch="$(state_value "$name" last_restart_epoch 0)"
-
-    if [[ "$status" != "running" ]]; then
-        service_status="CRITICAL"
-        reason="container state=$status"
-    elif [[ "$health" == "unhealthy" ]]; then
-        service_status="CRITICAL"
-        reason="Docker health=unhealthy"
-    elif [[ "$oom" == "true" ]]; then
-        service_status="CRITICAL"
-        reason="OOMKilled=true"
-    elif ! endpoint_healthy "$url"; then
-        service_status="CRITICAL"
-        reason="endpoint unavailable: $url"
     fi
-
-    if [[ "$service_status" == "CRITICAL" ]]; then
-        failures=$((previous_failures + 1))
-        add_finding CRITICAL "$name: $reason (failure ${failures}/${CONSECUTIVE_FAILURES_BEFORE_RESTART})"
-        log ERROR "$name: $reason"
-    else
-        failures=0
-        SERVICES_HEALTHY=$((SERVICES_HEALTHY + 1))
-        log INFO "$name: running, health=$health"
-    fi
-
-    if [[ "$restart_count" =~ ^[0-9]+$ &&
-          "$previous_restart" =~ ^[0-9]+$ &&
-          "$restart_count" -gt "$previous_restart" ]]; then
-        add_finding WARNING "$name: restart count increased from $previous_restart to $restart_count"
-    fi
-
-    if [[ "$CHECK_LOG_SIZE" == true && -n "$log_path" && -f "$log_path" ]]; then
-        log_size="$(stat -c '%s' "$log_path" 2>/dev/null || printf 0)"
-        if (( log_size >= LOG_SIZE_WARNING_BYTES )); then
-            add_finding WARNING "$name: Docker log is $(human_bytes "$log_size")"
-        fi
-    fi
-
-    if [[ "$AUTO_RESTART" == true &&
-          "$restart_allowed" == 1 &&
-          "$service_status" == "CRITICAL" &&
-          "$failures" -ge "$CONSECUTIVE_FAILURES_BEFORE_RESTART" &&
-          ! -e "${MAINTENANCE_DIR}/${name}" &&
-          $((START_EPOCH - previous_action_epoch)) -ge RESTART_COOLDOWN_SECONDS ]]; then
-        if [[ "$status" == "running" || "$RESTART_STOPPED_CONTAINERS" == true ]]; then
-            can_restart=1
-        fi
-    fi
-
-    if (( can_restart == 1 )); then
-        log WARN "Restarting $name after $failures consecutive failures"
-        if docker restart "$name" >/dev/null 2>&1; then
-            RESTART_ACTIONS=$((RESTART_ACTIONS + 1))
-            previous_action_epoch="$START_EPOCH"
-            sleep "$POST_RESTART_WAIT_SECONDS"
-            add_finding WARNING "$name: automatic restart action completed"
+    (( rc == 1 )) || return 1
+    info="$(docker_cmd inspect "$name" 2>/dev/null)"; rc=$?
+    if (( rc != 0 )); then
+        missing="$(docker_cmd container ls -a --filter "name=^/${name}$" --format '{{.Names}}' 2>/dev/null)"; rc=$?
+        if (( rc == 0 )) && [[ -z "$missing" ]]; then
+            [[ "$expected" != on-demand ]] || return 0
+            observe "$name:missing" CRITICAL "Configured always-running container not found"
         else
-            add_finding CRITICAL "$name: automatic restart action failed"
-        fi
-    fi
-
-    state_set_service "$name" "$failures" "$restart_count" \
-        "$previous_action_epoch" "$service_status" "${reason:-healthy}"
-}
-
-###############################################################################
-# NOTIFICATION LIFECYCLE
-###############################################################################
-
-build_findings_body() {
-    local item body=""
-    for item in "${FINDINGS[@]}"; do
-        body+="[${item%%|*}] ${item#*|}"$'\n'
-    done
-    printf '%s' "$body"
-}
-
-notification_due() {
-    local previous_signature previous_epoch now
-    previous_signature="$(jq -r '.notification.signature // ""' "$STATE_WORK")"
-    previous_epoch="$(jq -r '.notification.epoch // 0' "$STATE_WORK")"
-    now="$(date +%s)"
-
-    [[ "$CURRENT_SIGNATURE" != "$previous_signature" ]] && return 0
-    (( now - previous_epoch >= NOTIFY_COOLDOWN_HOURS * 3600 ))
-}
-
-commit_notification_state() {
-    local next
-    next="$(mktemp "${TMP_DIR}/notify.XXXXXX")" || return 1
-    jq --arg signature "$CURRENT_SIGNATURE" --argjson epoch "$(date +%s)" '
-        .notification = {signature:$signature,epoch:$epoch}
-    ' "$STATE_WORK" >"$next" &&
-        mv -f -- "$next" "$STATE_WORK"
-}
-
-send_lifecycle_notification() {
-    local previous_signature body importance description
-    previous_signature="$(jq -r '.notification.signature // ""' "$STATE_WORK")"
-
-    if (( ${#FINDINGS[@]} == 0 )); then
-        CURRENT_SIGNATURE=""
-        if [[ -n "$previous_signature" ]]; then
-            notify_unraid normal "Docker services recovered" \
-                "All ${SERVICES_CHECKED} configured services are healthy." &&
-                commit_notification_state
+            observe "$name:inspection" CRITICAL "Container inspection failed or timed out; recovery prohibited"
         fi
         return
     fi
-
-    CURRENT_SIGNATURE="$(
-        printf '%s\n' "${FINDINGS[@]}" | sort | sha256sum | awk '{print $1}'
-    )"
-    notification_due || return 0
-
-    body="$(build_findings_body)"
-    if (( CRITICAL_COUNT > 0 )); then
-        importance="alert"
-        description="Docker service failures"
-    else
-        importance="warning"
-        description="Docker service warnings"
+    if ! inspect_valid "$info"; then
+        observe "$name:inspection" CRITICAL "Malformed Docker inspection; recovery prohibited"
+        return
     fi
-    if notify_unraid "$importance" "$description" "$body"; then
-        commit_notification_state
+    read -r status health count oom id < <(jq -r '.[0] | [.State.Status,(.State.Health.Status // "none"),.RestartCount,.State.OOMKilled,.Id] | @tsv' <<<"$info")
+    if [[ "$expected" == on-demand && ( "$status" == exited || "$status" == created ) ]]; then
+        log INFO "$name: expected on-demand stop"
+        return
     fi
+    started="$(jq -r '.[0].State.StartedAt // ""' <<<"$info")"
+    epoch="$(date -d "$started" +%s 2>/dev/null || printf 0)"
+    uptime=$((NOW - epoch))
+    if [[ "$status" == running ]] && (( epoch > 0 && uptime >= 0 && uptime < CONTAINER_GRACE_SECONDS )); then
+        FROZEN["$name"]=1
+        log INFO "$name: startup grace (${uptime}s)"
+        return
+    fi
+    previous_id="$(jq -r --arg name "$name" '.services[$name].id // ""' "$STATE_WORK")"
+    previous_count="$(jq -r --arg name "$name" '.services[$name].restartCount // 0' "$STATE_WORK")"
+    previous_oom="$(jq -r --arg name "$name" '.services[$name].oom // false' "$STATE_WORK")"
+    if [[ "$id" == "$previous_id" ]] && (( count > previous_count )); then
+        observe "$name:restart-event" WARNING "Docker restart count increased ($previous_count -> $count)" 1 || return 1
+    fi
+    if [[ "$oom" == true && ( "$id" != "$previous_id" || "$previous_oom" != true ) ]]; then
+        observe "$name:oom-event" WARNING "Docker recorded an out-of-memory termination; inspect memory limits and workload" 1 || return 1
+    fi
+    if [[ "$status" != running ]]; then
+        observe "$name:availability" CRITICAL "Container status=$status" || return 1; bad=true
+    elif [[ "$health" != healthy && "$health" != none ]]; then
+        observe "$name:availability" CRITICAL "Docker health=$health after startup grace" || return 1; bad=true
+    elif ! endpoint_healthy "$url"; then
+        observe "$name:availability" CRITICAL "HTTP endpoint unavailable: $url" || return 1; bad=true
+    fi
+    log_path="$(jq -r '.[0].LogPath // ""' <<<"$info")"
+    if [[ "$CHECK_LOG_SIZE" == true && -n "$log_path" && -f "$log_path" ]]; then
+        size="$(stat -c %s "$log_path" 2>/dev/null || printf 0)"
+        if (( size >= LOG_SIZE_WARNING_BYTES )); then
+            observe "$name:log-size" WARNING "Docker log exceeds limit (${size} bytes); configure Docker log rotation" || return 1
+        fi
+    fi
+    failures="$(jq -r --arg name "$name" '.services[$name].failures // 0' "$STATE_WORK")"
+    if [[ "$id" != "$previous_id" ]]; then failures=0; fi
+    if [[ "$bad" == true ]]; then failures=$((failures + 1)); else failures=0; fi
+    mutate --arg name "$name" --arg id "$id" --argjson count "$count" --argjson oom "$oom" --argjson failures "$failures" \
+        '.services[$name]={id:$id,restartCount:$count,oom:$oom,failures:$failures}' || return 1
+    [[ "$bad" != true ]] || attempt_recovery "$name" "$url" "$status" "$allowed"
 }
 
 ###############################################################################
-# MAIN
+# GROUPED NOTIFICATIONS AND MAIN
 ###############################################################################
+notify_changes() {
+    local current previous body importance=normal description
+    current="$(jq -cS '.observations | with_entries(select(.value.active)) | map_values(.severity)' "$STATE_WORK")" || return 1
+    previous="$(jq -cS '.notification.issues' "$STATE_WORK")" || return 1
+    [[ "$current" != "$previous" ]] || return 0
+    description="Docker watchdog UPDATED"
+    [[ "$current" != '{}' ]] || description="Docker watchdog RESOLVED"
+    if jq -e 'any(.[]; . == "CRITICAL")' <<<"$current" >/dev/null; then importance=alert
+    elif [[ "$current" != '{}' ]]; then importance=warning; fi
+    body="$(jq -r --argjson now "$NOW" '.observations | to_entries[] | select(.value.active) |
+        "[\(.value.severity)] \(.key)\n  Condition: \(.value.message)\n  Observed duration: \(($now - .value.first) / 60 | floor)m; consecutive failures: \(.value.bad)"' "$STATE_WORK")"
+    body+=$'\n'"$(jq -nr --argjson current "$current" --argjson previous "$previous" \
+        '($previous | keys) - ($current | keys) | .[] | "Resolved: " + .')"
+    body+=$'\n'"State: $STATE_FILE; log: $LOG_FILE"
+    if [[ ! -x "$NOTIFY_BIN" ]] || ! timeout 30 "$NOTIFY_BIN" -i "$importance" -s "Docker Service Watchdog" -d "$description" -m "$body"; then
+        log ERROR "Notification failed; delivery checkpoint unchanged"
+        return 1
+    fi
+    mutate --argjson current "$current" '.notification.issues=$current'
+}
+
+write_receipt() {
+    local status="$1" tmp
+    tmp="$(mktemp "$STATUS_DIR/.docker-watchdog.XXXXXX")" || return 1
+    jq -n --arg name docker_service_watchdog --arg status "$status" --arg version "$SCRIPT_VERSION" \
+        --arg summary "Watchdog execution complete; status=$status; recovery_enabled=$AUTO_RESTART" --arg log "$LOG_FILE" --argjson epoch "$NOW" \
+        '{name:$name,status:$status,scriptVersion:$version,summary:$summary,log:$log,epoch:$epoch}' >"$tmp" &&
+        mv -f -- "$tmp" "$STATUS_DIR/docker_service_watchdog.json"
+}
 
 main() {
-    local spec
-    if ! mountpoint -q /mnt/vault; then
-        printf 'Vault pool is not mounted: /mnt/vault\n' >&2
-        return 1
-    fi
-    mkdir -p -- "$STATE_DIR" "$MAINTENANCE_DIR" || return 1
-    rotate_log
-    touch "$LOG_FILE" || return 1
-
-    exec 9>"$LOCK_FILE"
-    if ! flock -n 9; then
-        RESULT_SUMMARY="Another Docker watchdog run is active"
-        log ERROR "$RESULT_SUMMARY"
-        return 1
-    fi
-
-    for command in docker jq curl flock sha256sum; do
-        command -v "$command" >/dev/null 2>&1 || {
-            log ERROR "Required command not found: $command"
-            return 1
-        }
-    done
-    if ! docker info >/dev/null 2>&1; then
-        RESULT_STATUS="CRITICAL"
-        RESULT_SUMMARY="Docker service is unavailable"
-        add_finding CRITICAL "$RESULT_SUMMARY"
-        log ERROR "$RESULT_SUMMARY"
-        notify_unraid alert "Docker service unavailable" "$RESULT_SUMMARY"
-        write_receipt "$RESULT_STATUS" "$RESULT_SUMMARY"
-        return 1
-    fi
-
-    TMP_DIR="$(mktemp -d /tmp/docker-watchdog.XXXXXX)" || return 1
-    log INFO "Starting Docker service watchdog v$SCRIPT_VERSION"
-    STATE_WORK="${TMP_DIR}/state.json"
-    if [[ -s "$STATE_FILE" ]] && jq -e . "$STATE_FILE" >/dev/null 2>&1; then
-        cp -- "$STATE_FILE" "$STATE_WORK"
-    else
-        printf '{"services":{},"notification":{"signature":"","epoch":0}}\n' >"$STATE_WORK"
-    fi
-
+    local spec name url expected allowed uptime status=OK failed=false command
+    case "${1:-}" in
+        --help|-h) printf '%s\n' 'Usage: bash docker_service_watchdog.sh [--version|--maintenance CONTAINER MINUTES REASON]'
+            printf '%s\n' 'Schedule every five minutes. Recovery requires global AND per-service permission.' \
+                'Maintenance suppresses availability checks/restarts, freezes active findings, and expires within 24h.' \
+                'Remove /run/docker-service-maintenance/CONTAINER.manual.json to end a manual lease early.' \
+                'Healthy/unchanged runs stay silent. Failures and recovery require consecutive scans.'; return 0 ;;
+        --version) printf 'docker_service_watchdog.sh %s\n' "$SCRIPT_VERSION"; return 0 ;;
+        --maintenance) [[ $# == 4 ]] || return 2; set_manual_maintenance "$2" "$3" "$4"; return $? ;;
+        '') ;;
+        *) return 2 ;;
+    esac
+    for command in docker jq curl flock timeout sha256sum date stat; do command -v "$command" >/dev/null || return 1; done
+    local -A configured=()
     for spec in "${SERVICE_SPECS[@]}"; do
-        check_service "$spec" || {
-            add_finding CRITICAL "Internal watchdog state update failed"
-            break
-        }
+        IFS='|' read -r name url expected allowed <<<"$spec"
+        [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ && ( "$expected" == always || "$expected" == on-demand ) && "$allowed" =~ ^[01]$ ]] || return 2
+        [[ -z "$url" || "$url" =~ ^https?:// ]] || return 2
+        [[ -z "${configured[$name]+yes}" ]] || return 2
+        configured["$name"]=1
     done
-
-    send_lifecycle_notification
-
-    if ! cp -- "$STATE_WORK" "${STATE_FILE}.tmp" ||
-       ! mv -f -- "${STATE_FILE}.tmp" "$STATE_FILE"; then
-        log ERROR "Unable to commit watchdog state"
-        return 1
+    local number flag
+    for number in "$COMMAND_TIMEOUT_SECONDS" "$HTTP_CONNECT_TIMEOUT" "$HTTP_MAX_TIME" "$FAILURE_CONFIRM_SCANS" "$RECOVERY_CONFIRM_SCANS" \
+        "$CONSECUTIVE_FAILURES_BEFORE_RESTART" "$RESTART_COOLDOWN_SECONDS" "$RESTART_BUDGET_WINDOW_SECONDS" "$MAX_RESTART_ATTEMPTS" \
+        "$RECOVERY_TIMEOUT_SECONDS" "$RECOVERY_POLL_SECONDS" "$MAX_MAINTENANCE_SECONDS" "$LOG_MAX_BYTES"; do
+        [[ "$number" =~ ^[1-9][0-9]*$ ]] || return 2
+    done
+    for number in "$BOOT_GRACE_SECONDS" "$CONTAINER_GRACE_SECONDS" "$LOG_SIZE_WARNING_BYTES"; do [[ "$number" =~ ^[0-9]+$ ]] || return 2; done
+    for flag in "$AUTO_RESTART" "$RESTART_STOPPED_CONTAINERS" "$CHECK_LOG_SIZE"; do [[ "$flag" == true || "$flag" == false ]] || return 2; done
+    mountpoint -q "$VAULT_MOUNT" || return 1
+    exec 9>"$LOCK_FILE" || return 1
+    flock -n 9 || return 0
+    mkdir -p -- "$STATE_DIR" "$STATUS_DIR" "$DOCKER_MAINTENANCE_DIR" || return 1
+    bound_existing_logs || return 1
+    TMP_DIR="$(mktemp -d /tmp/docker-watchdog.XXXXXX)" || return 1
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    STATE_WORK="$TMP_DIR/state.json"
+    load_state || return 1
+    read -r uptime _ </proc/uptime
+    if (( ${uptime%%.*} < BOOT_GRACE_SECONDS )); then
+        log INFO "Boot grace active; checks deferred"
+        write_receipt WARNING
+        return 0
     fi
-
-    if (( CRITICAL_COUNT > 0 )); then
-        RESULT_STATUS="CRITICAL"
-    elif (( WARNING_COUNT > 0 )); then
-        RESULT_STATUS="WARNING"
+    if docker_cmd info >/dev/null 2>&1; then
+        for spec in "${SERVICE_SPECS[@]}"; do check_service "$spec" || { failed=true; break; }; done
     else
-        RESULT_STATUS="OK"
+        RECOVERY_SAFE=false
+        for spec in "${SERVICE_SPECS[@]}"; do FROZEN["${spec%%|*}"]=1; done
+        observe monitor:docker CRITICAL "Docker daemon unavailable or timed out; container recovery prohibited" || return 1
     fi
-    RESULT_SUMMARY="${SERVICES_HEALTHY}/${SERVICES_CHECKED} healthy; critical=${CRITICAL_COUNT}, warnings=${WARNING_COUNT}, restarts=${RESTART_ACTIONS}"
-    log INFO "$RESULT_SUMMARY"
-    write_receipt "$RESULT_STATUS" "$RESULT_SUMMARY"
-    (( CRITICAL_COUNT == 0 ))
+    if [[ "$failed" == true ]]; then
+        observe monitor:execution CRITICAL "Monitoring/state operation failed; remaining service observations deferred" 1 || return 1
+        for spec in "${SERVICE_SPECS[@]}"; do FROZEN["${spec%%|*}"]=1; done
+    fi
+    finish_observations || return 1
+    notify_changes || failed=true
+    if jq -e 'any(.observations[]; .active and .severity == "CRITICAL")' "$STATE_WORK" >/dev/null; then status=CRITICAL
+    elif jq -e 'any(.observations[]; .active)' "$STATE_WORK" >/dev/null; then status=WARNING; fi
+    [[ "$failed" != true ]] || status=FAILED
+    save_state && write_receipt "$status" || return 1
+    log INFO "Watchdog v$SCRIPT_VERSION complete; status=$status"
+    [[ "$status" != CRITICAL && "$status" != FAILED ]]
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

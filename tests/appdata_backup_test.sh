@@ -5,6 +5,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="${REPO_ROOT}/user_script/appdata_backup.sh"
 TEST_ROOT="$(mktemp -d /tmp/appdata_backup_test.XXXXXX)"
+export DOCKER_MAINTENANCE_DIR="$TEST_ROOT/maintenance"
 TEST_PLEX_HUBBLE_DATABASE_BACKUP_PATH=""
 TEST_PLEX_NODE_DATABASE_BACKUP_PATH=""
 
@@ -174,6 +175,7 @@ count_generations() {
     # shellcheck disable=SC1090
     source "$SCRIPT"
 
+
     # Called indirectly by resolve_pigz_threads from the sourced script.
     # shellcheck disable=SC2329
     nproc() {
@@ -208,6 +210,10 @@ mkdir -p \
 # shellcheck disable=SC2030,SC2031,SC2034,SC2154,SC2329
 (
     export SRC_DIR="$LIFECYCLE_ROOT/source"
+
+    # Production supplies flock; this fixture executes one lifecycle at a time.
+    # shellcheck disable=SC2329
+    flock() { return 0; }
 
     # shellcheck disable=SC1090
     source "$SCRIPT"
@@ -296,11 +302,15 @@ mkdir -p \
     [ "${MOCK_RUNNING[unrelated-container]}" = "true" ]
 
     stop_containers_for_app app-one
+    [ -f "$DOCKER_MAINTENANCE_DIR/app-one-container.appdata.json" ]
+    [ -f "$DOCKER_MAINTENANCE_DIR/shared-container.appdata.json" ]
     [ "${MOCK_RUNNING[app-one-container]}" = "false" ]
     [ "${MOCK_RUNNING[shared-container]}" = "false" ]
     [ "${MOCK_RUNNING[unrelated-container]}" = "true" ]
 
     complete_container_scope_for_app app-one
+    [ ! -e "$DOCKER_MAINTENANCE_DIR/app-one-container.appdata.json" ]
+    [ -f "$DOCKER_MAINTENANCE_DIR/shared-container.appdata.json" ]
     [ "${MOCK_RUNNING[app-one-container]}" = "true" ]
     [ "${MOCK_RUNNING[shared-container]}" = "false" ]
 
@@ -310,6 +320,7 @@ mkdir -p \
 
     stop_containers_for_app app-two-backups
     complete_container_scope_for_app app-two-backups
+    [ ! -e "$DOCKER_MAINTENANCE_DIR/shared-container.appdata.json" ]
     [ "${MOCK_RUNNING[shared-container]}" = "true" ]
     [ "$CONTAINERS_NEED_RESTART" = "false" ]
 ) >"$LIFECYCLE_ROOT/lifecycle.out" 2>&1 ||
