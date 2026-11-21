@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.9.0
+# ARR Health / Download / Import Monitor v3.9.1
 #
 # PURPOSE
 # -------
@@ -451,6 +451,12 @@ SAB_SIGNIFICANT_OTHER_BYTES=$((100 * 1024 * 1024))
 # Failed movie/TV jobs remain actionable for this many hours. SAB history is
 # persistent, so the monitor intentionally treats older failures as resolved.
 SAB_FAILED_ACTIVE_HOURS=24
+
+# SAB's warnings API is a bounded event log, not a live-condition endpoint.
+# Ignore entries older than this window so old GUI warnings cannot keep the
+# pipeline unhealthy indefinitely. Current disk, server, queue, and
+# authentication conditions are monitored separately below.
+SAB_WARNING_ACTIVE_HOURS=24
 
 # A paused queue with monitored jobs must remain paused this long before it is
 # reported. Disk/quota pauses and native SAB errors remain immediate.
@@ -905,6 +911,8 @@ TOTAL_ISSUES=0
 INFO_COUNT=0
 WARNING_COUNT=0
 ERROR_COUNT=0
+EVENT_ONLY_ERROR_COUNT=0
+PIPELINE_LIVE_ERROR_COUNT=0
 
 CF_REJECT_COUNT=0
 UPGRADE_REJECT_COUNT=0
@@ -999,9 +1007,12 @@ SAB_AUDIT_OK=false
 
 SONARR_AUDIT_IMPORTED=0
 SONARR_AUDIT_DOWNLOAD_FAILED=0
+SONARR_AUDIT_DOWNLOAD_FAILED_RECOVERED=0
 
 RADARR_AUDIT_IMPORTED=0
 RADARR_AUDIT_DOWNLOAD_FAILED=0
+RADARR_AUDIT_DOWNLOAD_FAILED_RECOVERED=0
+ARR_HISTORY_FAILURE_RECOVERED_COUNT=0
 
 SAB_AUDIT_MOVIE_COMPLETED=0
 SAB_AUDIT_TV_COMPLETED=0
@@ -5282,6 +5293,19 @@ reminder_policy_for_classification() {
     printf '%s\t%s\t%s\n' "$mode" "$interval_hours" "$maximum"
 }
 
+classification_is_event_only_error() {
+
+    case "$1" in
+        ARR_DOWNLOAD_FAILED_HISTORY|SAB_DOWNLOAD_FAILED_*|SAB_ERROR|SAB_WARNING)
+            return 0
+            ;;
+
+        *)
+            return 1
+            ;;
+    esac
+}
+
 should_notify() {
 
     local issue_key="$1"
@@ -6529,7 +6553,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.9.0 lifecycle commands' \
+        'ARR Health Monitor v3.9.1 lifecycle commands' \
         '' \
         'Always invoke the Unraid User Scripts copy through /bin/bash:' \
         '  /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script COMMAND' \
@@ -7400,6 +7424,10 @@ record_normalized_issue() {
 
         ERROR)
             ((ERROR_COUNT++)) || true
+
+            if classification_is_event_only_error "$classification"; then
+                ((EVENT_ONLY_ERROR_COUNT++)) || true
+            fi
             ;;
     esac
 
@@ -8554,10 +8582,27 @@ process_sab_warnings() {
         local classification
         local notify_runs
         local issue_hash
+        local warning_epoch
+        local warning_age=""
 
         warning_type=$(jq -r '.type // "WARNING"' <<<"$record")
         warning_text=$(jq -r '.text // .message // "SABnzbd warning without detail"' <<<"$record")
         warning_origin=$(jq -r '.origin // "SABnzbd"' <<<"$record")
+        warning_epoch=$(jq -r '
+            (.time // 0)
+            | if type == "number" then floor
+              elif type == "string" then (tonumber? // 0 | floor)
+              else 0
+              end
+            ' <<<"$record")
+
+        if [[ "$warning_epoch" =~ ^[0-9]+$ ]] && (( warning_epoch > 0 )); then
+            warning_age=$(( ($(date +%s) - warning_epoch) / 3600 ))
+            (( warning_age >= 0 )) || warning_age=0
+            (( warning_age <= SAB_WARNING_ACTIVE_HOURS )) || continue
+        else
+            warning_age=""
+        fi
 
         case "${warning_type^^}" in
 
@@ -8592,7 +8637,7 @@ process_sab_warnings() {
             "$severity" \
             "active" \
             "$warning_text" \
-            "" \
+            "$warning_age" \
             "$warning_text" \
             "$notify_runs" \
             0 \
@@ -11179,6 +11224,109 @@ fetch_arr_activity_history() {
 # PROCESS RECENT ARR ACTIVITY - v2.5
 ###############################################################################
 
+arr_history_failure_has_terminal_recovery() {
+
+    local app="$1"
+    local failure="$2"
+    local history_file="$3"
+    local failure_date failure_epoch download_id identity
+    local series_id=0 episode_id=0 movie_id=0
+    local recovery recovery_epoch
+
+    failure_date=$(jq -r '.date // ""' <<<"$failure")
+    failure_epoch=$(date_to_epoch "$failure_date")
+    (( failure_epoch > 0 )) || return 1
+
+    download_id=$(jq -r \
+        '.downloadId // .data.downloadId // .data.downloadClientId // ""' \
+        <<<"$failure")
+    identity=$(arr_download_ledger_identity "$app" "$failure" "history")
+
+    case "$app" in
+        Sonarr)
+            series_id=$(jq -r '.seriesId // 0' <<<"$identity")
+            episode_id=$(jq -r '.episodeId // 0' <<<"$identity")
+            ;;
+
+        Radarr)
+            movie_id=$(jq -r '.movieId // 0' <<<"$identity")
+            ;;
+    esac
+
+    [[ "$series_id" =~ ^[0-9]+$ ]] || series_id=0
+    [[ "$episode_id" =~ ^[0-9]+$ ]] || episode_id=0
+    [[ "$movie_id" =~ ^[0-9]+$ ]] || movie_id=0
+
+    while IFS= read -r recovery; do
+        [ -n "$recovery" ] || continue
+
+        recovery_epoch=$(date_to_epoch "$(jq -r '.date // ""' <<<"$recovery")")
+        if (( recovery_epoch > failure_epoch )); then
+            return 0
+        fi
+    done < <(
+        jq -c \
+            --arg app "$app" \
+            --arg downloadId "${download_id,,}" \
+            --argjson seriesId "$series_id" \
+            --argjson episodeId "$episode_id" \
+            --argjson movieId "$movie_id" \
+            '
+            .[]?
+            | select(
+                .eventType == "downloadFolderImported"
+                or .eventType == "downloadIgnored"
+            )
+            | select(
+                (
+                    $downloadId != ""
+                    and
+                    (
+                        .downloadId
+                        // .data.downloadId
+                        // .data.downloadClientId
+                        // ""
+                        | ascii_downcase
+                    ) == $downloadId
+                )
+                or
+                (
+                    $app == "Sonarr"
+                    and $seriesId > 0
+                    and $episodeId > 0
+                    and
+                    (
+                        .seriesId
+                        // .episode.seriesId
+                        // .series.id
+                        // 0
+                    ) == $seriesId
+                    and
+                    (
+                        .episodeId
+                        // .episode.id
+                        // 0
+                    ) == $episodeId
+                )
+                or
+                (
+                    $app == "Radarr"
+                    and $movieId > 0
+                    and
+                    (
+                        .movieId
+                        // .movie.id
+                        // 0
+                    ) == $movieId
+                )
+            )
+            ' \
+            "$history_file" 2>/dev/null
+    )
+
+    return 1
+}
+
 process_arr_activity_audit() {
 
     local app="$1"
@@ -11200,17 +11348,25 @@ process_arr_activity_audit() {
             echo 0
     )
 
-    failed=$(
-        jq \
-            '[
-                .[]?
-                | select(
-                    .eventType == "downloadFailed"
-                )
-            ]
-            | length' \
-            "$history_file" 2>/dev/null ||
-            echo 0
+    failed=0
+    local recovered=0 failure
+
+    while IFS= read -r failure; do
+        [ -n "$failure" ] || continue
+
+        if arr_history_failure_has_terminal_recovery \
+            "$app" \
+            "$failure" \
+            "$history_file"
+        then
+            ((recovered++)) || true
+        else
+            ((failed++)) || true
+        fi
+    done < <(
+        jq -c \
+            '.[]? | select(.eventType == "downloadFailed")' \
+            "$history_file" 2>/dev/null
     )
 
     case "$app" in
@@ -11219,12 +11375,14 @@ process_arr_activity_audit() {
 
             SONARR_AUDIT_IMPORTED="$imported"
             SONARR_AUDIT_DOWNLOAD_FAILED="$failed"
+            SONARR_AUDIT_DOWNLOAD_FAILED_RECOVERED="$recovered"
             ;;
 
         Radarr)
 
             RADARR_AUDIT_IMPORTED="$imported"
             RADARR_AUDIT_DOWNLOAD_FAILED="$failed"
+            RADARR_AUDIT_DOWNLOAD_FAILED_RECOVERED="$recovered"
             ;;
     esac
 
@@ -11430,20 +11588,12 @@ process_arr_history_failures() {
             continue
         fi
 
-        if [ -n "$download_id" ] &&
-           jq -e \
-                --arg id "$download_id" \
-                'any(
-                    .[]?;
-                    .eventType == "downloadFolderImported"
-                    and
-                    (
-                        (.downloadId // .data.downloadId // .data.downloadClientId // "")
-                        == $id
-                    )
-                )' \
-                "$history_file" >/dev/null 2>&1
+        if arr_history_failure_has_terminal_recovery \
+            "$app" \
+            "$item" \
+            "$history_file"
         then
+            ((ARR_HISTORY_FAILURE_RECOVERED_COUNT++)) || true
             continue
         fi
 
@@ -13695,6 +13845,9 @@ assess_pipeline_health() {
     local recent_failure_signals=0
     local recent_activity=0
 
+    PIPELINE_LIVE_ERROR_COUNT=$((ERROR_COUNT - EVENT_ONLY_ERROR_COUNT))
+    (( PIPELINE_LIVE_ERROR_COUNT >= 0 )) || PIPELINE_LIVE_ERROR_COUNT=0
+
     recent_failure_signals=$((
         SAB_AUDIT_MOVIE_FAILED
         + SAB_AUDIT_TV_FAILED
@@ -13752,10 +13905,10 @@ assess_pipeline_health() {
     # ACTIVE ERROR
     ###########################################################################
 
-    if (( ERROR_COUNT > 0 )); then
+    if (( PIPELINE_LIVE_ERROR_COUNT > 0 )); then
 
         PIPELINE_STATUS="DEGRADED"
-        PIPELINE_REASON="${ERROR_COUNT} active error-level issue(s) detected"
+        PIPELINE_REASON="${PIPELINE_LIVE_ERROR_COUNT} active live error-level issue(s) detected"
 
         return
     fi
@@ -13767,7 +13920,23 @@ assess_pipeline_health() {
     if (( WARNING_COUNT > 0 )); then
 
         PIPELINE_STATUS="ATTENTION"
-        PIPELINE_REASON="${WARNING_COUNT} active warning-level issue(s) detected"
+        PIPELINE_REASON="${WARNING_COUNT} warning-level issue/event(s) detected"
+
+        if (( EVENT_ONLY_ERROR_COUNT > 0 )); then
+            PIPELINE_REASON+="; ${EVENT_ONLY_ERROR_COUNT} recent error event(s) retained for review"
+        fi
+
+        return
+    fi
+
+    ###########################################################################
+    # RECENT ERROR EVENTS WITHOUT A CURRENT LIVE FAILURE
+    ###########################################################################
+
+    if (( EVENT_ONLY_ERROR_COUNT > 0 )); then
+
+        PIPELINE_STATUS="ATTENTION"
+        PIPELINE_REASON="${EVENT_ONLY_ERROR_COUNT} recent error event(s) retained for review; no current live error detected"
 
         return
     fi
@@ -13908,7 +14077,7 @@ write_persistent_activity_summary() {
 
         persistent_log \
             "AUDIT" \
-            "lookback=${ACTIVITY_AUDIT_LOOKBACK_HOURS}h | SAB movie_completed=${SAB_AUDIT_MOVIE_COMPLETED} tv_completed=${SAB_AUDIT_TV_COMPLETED} failed=$((SAB_AUDIT_MOVIE_FAILED + SAB_AUDIT_TV_FAILED)) | Sonarr imports=${SONARR_AUDIT_IMPORTED} failed=${SONARR_AUDIT_DOWNLOAD_FAILED} | Radarr imports=${RADARR_AUDIT_IMPORTED} failed=${RADARR_AUDIT_DOWNLOAD_FAILED}"
+            "lookback=${ACTIVITY_AUDIT_LOOKBACK_HOURS}h | SAB movie_completed=${SAB_AUDIT_MOVIE_COMPLETED} tv_completed=${SAB_AUDIT_TV_COMPLETED} failed=$((SAB_AUDIT_MOVIE_FAILED + SAB_AUDIT_TV_FAILED)) | Sonarr imports=${SONARR_AUDIT_IMPORTED} failed=${SONARR_AUDIT_DOWNLOAD_FAILED} recovered=${SONARR_AUDIT_DOWNLOAD_FAILED_RECOVERED} | Radarr imports=${RADARR_AUDIT_IMPORTED} failed=${RADARR_AUDIT_DOWNLOAD_FAILED} recovered=${RADARR_AUDIT_DOWNLOAD_FAILED_RECOVERED}"
     fi
 
     if [ "$FLOW_ANOMALY_ENABLED" = true ]; then
@@ -14937,7 +15106,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.9.0"
+    "START | ARR Health Monitor v3.9.1"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -14950,7 +15119,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.9.0"
+debug_log "Starting ARR Health Monitor v3.9.1"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -15524,7 +15693,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.9.0 completed"
+log "ARR Health Monitor v3.9.1 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""
@@ -15552,6 +15721,7 @@ log "SAB degraded servers: $SAB_SERVER_DEGRADED_COUNT"
 log "SAB low-success providers: $SAB_SERVER_LOW_SUCCESS_COUNT"
 log "SAB proactive capacity issues: $SAB_CAPACITY_ISSUE_COUNT"
 log "SAB unknown-category jobs: $SAB_UNKNOWN_CATEGORY_COUNT"
+log "SAB warning event window: ${SAB_WARNING_ACTIVE_HOURS}h"
 log "SAB history cache reused: $SAB_HISTORY_CACHE_HIT"
 
 log ""
@@ -15587,12 +15757,14 @@ if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
     log ""
     log "Sonarr"
     log "Successful import events: $SONARR_AUDIT_IMPORTED"
-    log "Download-failed events: $SONARR_AUDIT_DOWNLOAD_FAILED"
+    log "Unreconciled download-failed events: $SONARR_AUDIT_DOWNLOAD_FAILED"
+    log "Download failures reconciled by later terminal events: $SONARR_AUDIT_DOWNLOAD_FAILED_RECOVERED"
 
     log ""
     log "Radarr"
     log "Successful import events: $RADARR_AUDIT_IMPORTED"
-    log "Download-failed events: $RADARR_AUDIT_DOWNLOAD_FAILED"
+    log "Unreconciled download-failed events: $RADARR_AUDIT_DOWNLOAD_FAILED"
+    log "Download failures reconciled by later terminal events: $RADARR_AUDIT_DOWNLOAD_FAILED_RECOVERED"
 
 else
 
@@ -15621,6 +15793,7 @@ log "Automatic reconciliation checks: $DOWNLOAD_LEDGER_RECONCILIATION_CHECKED_CO
 log "Reconciliation awaiting confirmation: $DOWNLOAD_LEDGER_RECONCILIATION_PENDING_COUNT"
 log "Automatically reconciled this run: $DOWNLOAD_LEDGER_RECONCILED_COUNT"
 log "Reconciliation API checks failed: $DOWNLOAD_LEDGER_RECONCILIATION_FAILED_COUNT"
+log "Historical failure events reconciled this run: $ARR_HISTORY_FAILURE_RECOVERED_COUNT"
 log "Manual dismissal notices queued: $DOWNLOAD_LEDGER_MANUAL_DISMISSAL_NOTIFICATION_COUNT"
 log "Batch dismissal summaries queued: $DOWNLOAD_LEDGER_BATCH_DISMISSAL_NOTIFICATION_COUNT"
 
@@ -15660,6 +15833,8 @@ log "Active issues detected this run: $TOTAL_ISSUES"
 log "Informational: $INFO_COUNT"
 log "Warnings: $WARNING_COUNT"
 log "Errors: $ERROR_COUNT"
+log "  Live errors affecting pipeline health: $PIPELINE_LIVE_ERROR_COUNT"
+log "  Recent event-only errors retained for review: $EVENT_ONLY_ERROR_COUNT"
 
 log ""
 log "ARR MESSAGE TELEMETRY"
@@ -15742,7 +15917,7 @@ log "============================================================"
 
 persistent_log \
     "SUMMARY" \
-    "reason=${DETAILED_SUMMARY_REASON} | runtime=${RUNTIME} | active_issues=${TOTAL_ISSUES} | info=${INFO_COUNT} | warnings=${WARNING_COUNT} | errors=${ERROR_COUNT} | reminders=${REMINDER_NOTIFICATION_COUNT} | event_repeats_suppressed=${EVENT_REPEAT_SUPPRESSED_COUNT} | event_expiry_suppressed=${EVENT_RESOLUTION_SUPPRESSED_COUNT} | bounded_limits_reached=${BOUNDED_REMINDER_SUPPRESSED_COUNT} | flapping=${FLAPPING_NOTIFICATION_COUNT} | acknowledged_suppressed=${ACKNOWLEDGED_SUPPRESSED_COUNT}"
+    "reason=${DETAILED_SUMMARY_REASON} | runtime=${RUNTIME} | active_issues=${TOTAL_ISSUES} | info=${INFO_COUNT} | warnings=${WARNING_COUNT} | errors=${ERROR_COUNT} | live_errors=${PIPELINE_LIVE_ERROR_COUNT} | event_only_errors=${EVENT_ONLY_ERROR_COUNT} | history_failures_reconciled=${ARR_HISTORY_FAILURE_RECOVERED_COUNT} | reminders=${REMINDER_NOTIFICATION_COUNT} | event_repeats_suppressed=${EVENT_REPEAT_SUPPRESSED_COUNT} | event_expiry_suppressed=${EVENT_RESOLUTION_SUPPRESSED_COUNT} | bounded_limits_reached=${BOUNDED_REMINDER_SUPPRESSED_COUNT} | flapping=${FLAPPING_NOTIFICATION_COUNT} | acknowledged_suppressed=${ACKNOWLEDGED_SUPPRESSED_COUNT}"
 
 else
 
