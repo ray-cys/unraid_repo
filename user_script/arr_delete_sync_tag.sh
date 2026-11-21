@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Sonarr + Radarr - Plex Delete Sync and Tagger
+# Sonarr + Radarr - Plex Delete Sync and Tagger v2.1.0
 #
 # Once-daily, persistent-state deletion confirmation for Sonarr and Radarr.
 # Sonarr unmonitors confirmed deleted episodes/seasons and can retire a fully
@@ -11,6 +11,11 @@
 set -uo pipefail
 IFS=$'\n\t'
 umask 077
+
+# Release version for logs, notifications, and the HTTP User-Agent. State-file
+# version fields below are independent schema versions and must not be changed
+# merely when this release version changes.
+readonly SCRIPT_VERSION="2.1.0"
 
 ###############################################################################
 # CONFIGURATION
@@ -165,12 +170,29 @@ NOTIFICATION_ITEM_MAX_CHARS=600
 # a long library inspection is visibly active without filling the log.
 PROGRESS_LOG_EVERY=25
 
-MAX_LOG_SIZE_MB=10
-MAX_LOG_FILES=5
+# ---------------------------------------------------------------------------
+# Persistent logging
+# ---------------------------------------------------------------------------
+# Storage is strictly bounded while the script is running, not only when the
+# next daily run begins. With the defaults below, storage is approximately:
+#
+#   active log      1 MiB
+#   two backups     2 MiB
+#   total maximum   3 MiB
+#
+# Existing backups that exceed the per-file limit, numbered generations beyond
+# the retained count, and expired backups are removed automatically. A runaway
+# active log is discarded instead of being copied into a huge backup.
+LOG_MAX_BYTES=$((1 * 1024 * 1024)) # Maximum size of each log file: 1 MiB.
+LOG_BACKUP_FILES=2                 # Keep .1 and .2 in addition to the active log.
+LOG_RETENTION_DAYS=30              # Also remove backups older than 30 days; 0 disables age cleanup.
+LOG_LINE_MAX_BYTES=4096            # Truncate a single unusually large message at 4 KiB.
+LOG_RUNAWAY_MULTIPLIER=4           # Discard an inherited active log above 4x the normal limit.
+
 HTTP_CONNECT_TIMEOUT=10
 HTTP_MAX_TIME=90
 HTTP_RETRIES=2
-USER_AGENT="Arr-Delete-Sync-Tag/2.0"
+USER_AGENT="Arr-Delete-Sync-Tag/$SCRIPT_VERSION"
 
 ###############################################################################
 # END CONFIGURATION
@@ -189,6 +211,10 @@ ARR_TEMP_PREFIX=""
 ARR_USER_AGENT=""
 QUARANTINE_RUN_ID=""
 NOTIFICATION_BATCH=""
+LOG_READY=false
+LOG_FAILURE_REPORTED=false
+LOG_CLEANED_FILES=0
+LOG_CLEANED_BYTES=0
 
 SIDECARS_CAPTURED=0
 SIDECARS_QUARANTINED=0
@@ -234,10 +260,29 @@ ARR_REMOVALS=0
 
 log() {
     local level="$1"
+    local message line
+    local LC_ALL=C
     shift
-    printf '[%s] [%s] [%s] %s\n' \
-        "$(date '+%Y-%m-%d %H:%M:%S')" "$APP_CONTEXT" "$level" "$*" |
-        tee -a "$LOG_FILE" >&2
+
+    message="$*"
+    if [[ "$LOG_LINE_MAX_BYTES" =~ ^[0-9]+$ ]] &&
+       (( LOG_LINE_MAX_BYTES > 0 )) &&
+       (( ${#message} > LOG_LINE_MAX_BYTES ));
+    then
+        message="${message:0:LOG_LINE_MAX_BYTES} ... [line truncated]"
+    fi
+
+    line="[$(date '+%Y-%m-%d %H:%M:%S')] [$APP_CONTEXT] [$level] $message"
+    printf '%s\n' "$line" >&2
+
+    if [[ "$LOG_READY" == true ]] && ! append_persistent_log "$line"; then
+        LOG_READY=false
+        if [[ "$LOG_FAILURE_REPORTED" == false ]]; then
+            LOG_FAILURE_REPORTED=true
+            printf '[%s] [MAIN] [WARNING] Persistent log became unavailable: %s\n' \
+                "$(date '+%Y-%m-%d %H:%M:%S')" "$LOG_FILE" >&2
+        fi
+    fi
 }
 
 notification_hash() {
@@ -627,20 +672,125 @@ cleanup_main() {
     exit "$status"
 }
 
-rotate_log() {
-    local bytes i
-    [[ -f "$LOG_FILE" ]] || return 0
-    bytes="$(stat -c '%s' "$LOG_FILE" 2>/dev/null ||
-        stat -f '%z' "$LOG_FILE" 2>/dev/null || printf 0)"
-    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
-    (( bytes >= MAX_LOG_SIZE_MB * 1024 * 1024 )) || return 0
+log_file_size() {
+    stat -c '%s' "$1" 2>/dev/null ||
+        stat -f '%z' "$1" 2>/dev/null ||
+        printf '0\n'
+}
 
-    rm -f -- "$LOG_FILE.$MAX_LOG_FILES"
-    for (( i=MAX_LOG_FILES-1; i>=1; i-- )); do
-        [[ -f "$LOG_FILE.$i" ]] && mv -f -- "$LOG_FILE.$i" "$LOG_FILE.$((i + 1))"
+log_file_mtime() {
+    stat -c '%Y' "$1" 2>/dev/null ||
+        stat -f '%m' "$1" 2>/dev/null ||
+        printf '0\n'
+}
+
+rotate_log() {
+    local force="${1:-false}" bytes i
+    [[ -f "$LOG_FILE" ]] || return 0
+
+    bytes="$(log_file_size "$LOG_FILE")"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    if [[ "$force" != true ]] && (( bytes < LOG_MAX_BYTES )); then
+        return 0
+    fi
+
+    rm -f -- "$LOG_FILE.$LOG_BACKUP_FILES" || return 1
+    for (( i=LOG_BACKUP_FILES-1; i>=1; i-- )); do
+        [[ -f "$LOG_FILE.$i" ]] || continue
+        mv -f -- "$LOG_FILE.$i" "$LOG_FILE.$((i + 1))" || return 1
     done
-    mv -f -- "$LOG_FILE" "$LOG_FILE.1"
+    mv -f -- "$LOG_FILE" "$LOG_FILE.1" || return 1
     : > "$LOG_FILE"
+}
+
+append_persistent_log() {
+    local line="$1" current_size line_size
+
+    current_size="$(log_file_size "$LOG_FILE")"
+    line_size="$(printf '%s\n' "$line" | wc -c | tr -d ' ')"
+    [[ "$current_size" =~ ^[0-9]+$ ]] || current_size=0
+    [[ "$line_size" =~ ^[0-9]+$ ]] || line_size=0
+
+    if (( current_size > 0 && current_size + line_size > LOG_MAX_BYTES )); then
+        rotate_log true || return 1
+    fi
+
+    printf '%s\n' "$line" >> "$LOG_FILE"
+}
+
+record_removed_log() {
+    local file="$1" size
+    size="$(log_file_size "$file")"
+    [[ "$size" =~ ^[0-9]+$ ]] || size=0
+
+    if rm -f -- "$file"; then
+        ((LOG_CLEANED_FILES += 1))
+        ((LOG_CLEANED_BYTES += size))
+        return 0
+    fi
+
+    return 1
+}
+
+cleanup_existing_logs() {
+    local file suffix size modified now cutoff runaway_limit
+    local nullglob_was_set=false
+    local -a generations
+
+    now="$(date +%s)"
+    cutoff=$((now - LOG_RETENTION_DAYS * 86400))
+    runaway_limit=$((LOG_MAX_BYTES * LOG_RUNAWAY_MULTIPLIER))
+
+    if [[ -f "$LOG_FILE" ]]; then
+        size="$(log_file_size "$LOG_FILE")"
+        [[ "$size" =~ ^[0-9]+$ ]] || size=0
+
+        if (( size > runaway_limit )) && : > "$LOG_FILE"; then
+            ((LOG_CLEANED_FILES += 1))
+            ((LOG_CLEANED_BYTES += size))
+        fi
+    fi
+
+    shopt -q nullglob && nullglob_was_set=true
+    shopt -s nullglob
+    generations=("${LOG_FILE}".*)
+    [[ "$nullglob_was_set" == true ]] || shopt -u nullglob
+
+    for file in "${generations[@]}"; do
+        [[ -f "$file" ]] || continue
+        suffix="${file##*.}"
+        [[ "$suffix" =~ ^[0-9]+$ ]] || continue
+
+        size="$(log_file_size "$file")"
+        modified="$(log_file_mtime "$file")"
+        [[ "$size" =~ ^[0-9]+$ ]] || size=0
+        [[ "$modified" =~ ^[0-9]+$ ]] || modified=0
+
+        if (( suffix > LOG_BACKUP_FILES ||
+              size > LOG_MAX_BYTES ||
+              (LOG_RETENTION_DAYS > 0 && modified > 0 && modified <= cutoff) ));
+        then
+            record_removed_log "$file" || true
+        fi
+    done
+}
+
+initialize_logging() {
+    LOG_CLEANED_FILES=0
+    LOG_CLEANED_BYTES=0
+
+    cleanup_existing_logs
+    rotate_log || return 1
+    # A legacy active log between the normal limit and runaway threshold was
+    # just moved to .1. Re-apply cleanup so every retained generation obeys the
+    # current per-file cap from the first run of this release onward.
+    cleanup_existing_logs
+    : >> "$LOG_FILE" || return 1
+    LOG_READY=true
+
+    if (( LOG_CLEANED_FILES > 0 )); then
+        log INFO "Cleaned $LOG_CLEANED_FILES oversized, expired, or obsolete log item(s); reclaimed $LOG_CLEANED_BYTES byte(s)."
+    fi
 }
 
 # Temporary files live beside the state files so replacement stays atomic.
@@ -3114,7 +3264,7 @@ validate_common_configuration() {
         printf 'Unsafe RUNTIME_DIR: %s\n' "$RUNTIME_DIR" >&2
         return 1
     }
-    for command in curl jq mktemp stat tee sort cut tr cp mv find grep pgrep chown chmod \
+    for command in curl jq mktemp stat sort cut tr cp mv find grep pgrep chown chmod wc \
         realpath sha256sum dirname rmdir; do
         command -v "$command" >/dev/null 2>&1 || {
             printf 'Required command not found: %s\n' "$command" >&2
@@ -3185,8 +3335,25 @@ validate_common_configuration() {
     [[ "$NOTIFICATION_MAX_ITEMS" =~ ^[1-9][0-9]*$ &&
        "$NOTIFICATION_ITEM_MAX_CHARS" =~ ^[1-9][0-9]*$ ]] ||
         die "Notification item limits must be positive integers."
-    [[ "$MAX_LOG_SIZE_MB" =~ ^[1-9][0-9]*$ && "$MAX_LOG_FILES" =~ ^[1-9][0-9]*$ ]] ||
-        die "MAX_LOG_SIZE_MB and MAX_LOG_FILES must be positive integers."
+    if [[ ! "$LOG_MAX_BYTES" =~ ^[0-9]+$ ]] || (( LOG_MAX_BYTES < 4096 )); then
+        die "LOG_MAX_BYTES must be an integer of at least 4096 bytes."
+    fi
+    if [[ ! "$LOG_BACKUP_FILES" =~ ^[1-9][0-9]*$ ]]; then
+        die "LOG_BACKUP_FILES must be a positive integer."
+    fi
+    if [[ ! "$LOG_RETENTION_DAYS" =~ ^[0-9]+$ ]]; then
+        die "LOG_RETENTION_DAYS must be zero or a positive integer."
+    fi
+    if [[ ! "$LOG_LINE_MAX_BYTES" =~ ^[0-9]+$ ]] ||
+       (( LOG_LINE_MAX_BYTES < 256 || LOG_LINE_MAX_BYTES >= LOG_MAX_BYTES ));
+    then
+        die "LOG_LINE_MAX_BYTES must be at least 256 and smaller than LOG_MAX_BYTES."
+    fi
+    if [[ ! "$LOG_RUNAWAY_MULTIPLIER" =~ ^[0-9]+$ ]] ||
+       (( LOG_RUNAWAY_MULTIPLIER < 2 ));
+    then
+        die "LOG_RUNAWAY_MULTIPLIER must be an integer of at least 2."
+    fi
     [[ "$HTTP_CONNECT_TIMEOUT" =~ ^[1-9][0-9]*$ &&
        "$HTTP_MAX_TIME" =~ ^[1-9][0-9]*$ &&
        "$HTTP_RETRIES" =~ ^[0-9]+$ ]] ||
@@ -3251,8 +3418,12 @@ main() {
 
     case "$mode" in
         all|sonarr|radarr) ;;
+        --version|-V)
+            printf 'arr_delete_sync_tag.sh %s\n' "$SCRIPT_VERSION"
+            return 0
+            ;;
         *)
-            printf 'Usage: %s [all|sonarr|radarr]\n' "$0" >&2
+            printf 'Usage: %s [all|sonarr|radarr|--version]\n' "$0" >&2
             return 2
             ;;
     esac
@@ -3271,8 +3442,14 @@ main() {
         printf 'RUNTIME_DIR must not be a symlink: %s\n' "$RUNTIME_DIR" >&2
         return 1
     }
-    touch "$LOG_FILE" || return 1
-    rotate_log
+    [[ ! -L "$LOG_FILE" ]] || {
+        printf 'LOG_FILE must not be a symlink: %s\n' "$LOG_FILE" >&2
+        return 1
+    }
+    initialize_logging || {
+        printf 'Could not initialize persistent logging: %s\n' "$LOG_FILE" >&2
+        return 1
+    }
 
     trap cleanup_main EXIT
     trap 'exit 130' INT TERM
@@ -3298,7 +3475,7 @@ main() {
     [[ "$QUARANTINE_RUN_ID" =~ ^[0-9]{8}_[0-9]{6}_[0-9]+$ ]] ||
         die "Could not create a valid quarantine run ID."
 
-    log INFO "Starting unified Arr delete workflow (mode=$mode, dry-run=$DRY_RUN)."
+    log INFO "Starting unified Arr delete workflow v$SCRIPT_VERSION (mode=$mode, dry-run=$DRY_RUN)."
 
     if [[ "$mode" == all || "$mode" == sonarr ]]; then
         run_sonarr || sonarr_rc=$?
@@ -4374,4 +4551,6 @@ fi
 log INFO "Completed successfully."
 )
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
