@@ -15,7 +15,7 @@
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.1"
+readonly SCRIPT_VERSION="1.2"
 readonly REQUIRED_PURGE_CONFIRMATION="DELETE_EXPIRED_QUARANTINE"
 
 ###############################################################################
@@ -53,6 +53,13 @@ INDEX_FILE="${LOG_DIR}/quarantine-index.tsv"
 NOTIFICATION_STATE_FILE="${LOG_DIR}/notification-state.json"
 LOG_MAX_BYTES=$((5 * 1024 * 1024))
 
+# A purge receipt is committed to the vault before its corresponding run is
+# deleted. The notification stays bounded while the receipt preserves every
+# purged path for later review.
+PURGE_RECEIPT_DIR="${LOG_DIR}/purge-receipts"
+PURGE_RECEIPT_RETENTION_DAYS=365
+PURGE_NOTIFICATION_FILE_LIMIT=10
+
 STATUS_DIR="/mnt/vault/cloud/logs/script/user_scripts_status"
 NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
 LOCK_FILE="/run/quarantine_lifecycle.lock"
@@ -72,11 +79,21 @@ FILES_SCANNED=0
 TOTAL_BYTES=0
 PURGED_RUNS=0
 PURGED_BYTES=0
+PURGED_FILES=0
 UNMANAGED_ENTRIES=0
 SCAN_ERRORS=0
 PURGE_LIMIT_REACHED=0
 PURGE_DEFERRED_REASON=""
 REMAINING_EXPIRED_RUNS=0
+PURGE_RECEIPT_FILE=""
+PURGE_RUN_DETAILS=""
+PURGE_FILE_CANDIDATES=""
+RUNTIME_DIR=""
+
+INVENTORY_FILE_COUNT=0
+INVENTORY_BYTE_COUNT=0
+INVENTORY_MOVIE_FILES=0
+INVENTORY_SERIES_FILES=0
 
 QUARANTINE_REAL=""
 MOVIES_REAL=""
@@ -193,6 +210,188 @@ tree_files() {
     find "$1" -xdev -type f -printf '.' 2>/dev/null | wc -c
 }
 
+escape_tsv_field() {
+    local value="$1"
+
+    value="${value//\\/\\\\}"
+    value="${value//$'\t'/\\t}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\n'/\\n}"
+    printf '%s' "$value"
+}
+
+initialize_purge_receipt() {
+    local tmp stamp
+
+    [[ -n "$PURGE_RECEIPT_FILE" ]] && return 0
+    mkdir -p -- "$PURGE_RECEIPT_DIR" 2>/dev/null || return 1
+    stamp="$(date '+%Y%m%d_%H%M%S')"
+    PURGE_RECEIPT_FILE="${PURGE_RECEIPT_DIR}/purge-${stamp}_$$.tsv"
+    [[ ! -e "$PURGE_RECEIPT_FILE" ]] || return 1
+
+    tmp="$(mktemp "${PURGE_RECEIPT_DIR}/.purge-receipt.XXXXXX")" || return 1
+    if ! printf '%s\n' \
+        $'record_type\tevent_time\trun_id\tage_days\tbucket\trelative_path\titem_type\tsize_bytes\tdeletion_status\tdetails' \
+        >"$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    mv -f -- "$tmp" "$PURGE_RECEIPT_FILE"
+}
+
+append_purge_receipt_block() {
+    local block="$1" tmp
+
+    [[ -f "$PURGE_RECEIPT_FILE" && -f "$block" ]] || return 1
+    tmp="$(mktemp "${PURGE_RECEIPT_DIR}/.purge-receipt.XXXXXX")" || return 1
+    if ! cat -- "$PURGE_RECEIPT_FILE" "$block" >"$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    mv -f -- "$tmp" "$PURGE_RECEIPT_FILE"
+}
+
+prune_purge_receipts() {
+    local receipt removed=0
+
+    mkdir -p -- "$PURGE_RECEIPT_DIR" 2>/dev/null || return 1
+    while IFS= read -r -d '' receipt; do
+        [[ "$receipt" == "$PURGE_RECEIPT_DIR"/purge-*.tsv ]] || continue
+        rm -f -- "$receipt" || return 1
+        removed=$((removed + 1))
+    done < <(
+        find "$PURGE_RECEIPT_DIR" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type f \
+            -name 'purge-*.tsv' \
+            -mtime "+${PURGE_RECEIPT_RETENTION_DAYS}" \
+            -print0 2>/dev/null
+    )
+
+    (( removed == 0 )) || \
+        log INFO "Removed $removed purge receipt(s) older than $PURGE_RECEIPT_RETENTION_DAYS days"
+}
+
+write_run_inventory() {
+    local run="$1" run_id="$2" age_days="$3"
+    local item_file="$4" candidate_file="$5"
+    local event_time record relative_entry item_type item_bytes
+    local bucket relative_path escaped_path
+
+    INVENTORY_FILE_COUNT=0
+    INVENTORY_BYTE_COUNT=0
+    INVENTORY_MOVIE_FILES=0
+    INVENTORY_SERIES_FILES=0
+    event_time="$(date -Iseconds)"
+    : >"$item_file" || return 1
+    : >"$candidate_file" || return 1
+
+    while IFS= read -r -d '' record; do
+        item_bytes="${record##*$'\t'}"
+        record="${record%$'\t'*}"
+        item_type="${record##*$'\t'}"
+        relative_entry="${record%$'\t'*}"
+        [[ "$item_bytes" =~ ^[0-9]+$ ]] || return 1
+
+        bucket="${relative_entry%%/*}"
+        relative_path="${relative_entry#*/}"
+        [[ "$bucket" == movies || "$bucket" == series ]] || return 1
+        [[ "$relative_path" != "$relative_entry" ]] || return 1
+        escaped_path="$(escape_tsv_field "$relative_path")"
+
+        printf 'FILE\t%s\t%s\t%s\t%s\t%s\t%s\t%s\trecorded_before_delete\tawait RUN_RESULT\n' \
+            "$event_time" "$run_id" "$age_days" "$bucket" \
+            "$escaped_path" "$item_type" "$item_bytes" \
+            >>"$item_file" || return 1
+
+        if [[ "$item_type" == f ]]; then
+            INVENTORY_FILE_COUNT=$((INVENTORY_FILE_COUNT + 1))
+            INVENTORY_BYTE_COUNT=$((INVENTORY_BYTE_COUNT + item_bytes))
+            if [[ "$bucket" == movies ]]; then
+                INVENTORY_MOVIE_FILES=$((INVENTORY_MOVIE_FILES + 1))
+            else
+                INVENTORY_SERIES_FILES=$((INVENTORY_SERIES_FILES + 1))
+            fi
+            printf '%s\t%s\t%s/%s\n' \
+                "$item_bytes" "$run_id" "$bucket" "$escaped_path" \
+                >>"$candidate_file" || return 1
+        fi
+    done < <(
+        find "$run" -xdev -mindepth 1 ! -type d \
+            -printf '%P\t%y\t%s\0' 2>/dev/null | sort -z
+    )
+}
+
+persist_run_inventory_before_delete() {
+    local run="$1" run_id="$2" age_days="$3"
+    local expected_files="$4" expected_bytes="$5"
+    local items candidates block checksum event_time
+
+    items="${RUNTIME_DIR}/${run_id}.items.tsv"
+    candidates="${RUNTIME_DIR}/${run_id}.candidates.tsv"
+    block="${RUNTIME_DIR}/${run_id}.inventory-block.tsv"
+
+    write_run_inventory \
+        "$run" "$run_id" "$age_days" "$items" "$candidates" || return 1
+    if (( INVENTORY_FILE_COUNT != expected_files ||
+          INVENTORY_BYTE_COUNT != expected_bytes )); then
+        log ERROR "Receipt inventory changed while scanning $run_id; refusing purge"
+        return 1
+    fi
+
+    initialize_purge_receipt || return 1
+    checksum="$(sha256sum -- "$items" | awk '{print $1}')" || return 1
+    [[ "$checksum" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+    event_time="$(date -Iseconds)"
+    {
+        printf 'RUN_INVENTORY\t%s\t%s\t%s\t-\t-\t-\t%s\trecorded_before_delete\tfiles=%s movies=%s series=%s inventory_sha256=%s\n' \
+            "$event_time" "$run_id" "$age_days" "$expected_bytes" \
+            "$expected_files" "$INVENTORY_MOVIE_FILES" \
+            "$INVENTORY_SERIES_FILES" "$checksum"
+        cat -- "$items"
+    } >"$block" || return 1
+
+    append_purge_receipt_block "$block" || return 1
+    grep -Fq -- "inventory_sha256=${checksum}" "$PURGE_RECEIPT_FILE" || return 1
+}
+
+record_run_purge_result() {
+    local run_id="$1" age_days="$2" files="$3" bytes="$4"
+    local block event_time
+
+    block="${RUNTIME_DIR}/${run_id}.result-block.tsv"
+    event_time="$(date -Iseconds)"
+    printf 'RUN_RESULT\t%s\t%s\t%s\t-\t-\t-\t%s\tpurged_and_absence_verified\tfiles=%s\n' \
+        "$event_time" "$run_id" "$age_days" "$bytes" "$files" \
+        >"$block" || return 1
+    append_purge_receipt_block "$block"
+}
+
+build_purge_detail() {
+    local detail="" item_bytes run_id path shown=0 total_files=0
+
+    detail+="Purged runs:"$'\n'
+    detail+="$PURGE_RUN_DETAILS"
+    if [[ -s "$PURGE_FILE_CANDIDATES" ]]; then
+        total_files="$(wc -l <"$PURGE_FILE_CANDIDATES" | tr -d '[:space:]')"
+        detail+=$'\n'"Largest purged files:"$'\n'
+        while IFS=$'\t' read -r item_bytes run_id path; do
+            [[ "$item_bytes" =~ ^[0-9]+$ && -n "$path" ]] || continue
+            (( shown < PURGE_NOTIFICATION_FILE_LIMIT )) || break
+            shown=$((shown + 1))
+            detail+="- ${path} - $(human_bytes "$item_bytes") (run ${run_id})"$'\n'
+        done < <(
+            LC_ALL=C sort -t $'\t' -k1,1nr "$PURGE_FILE_CANDIDATES"
+        )
+        if (( total_files > shown )); then
+            detail+="- ...and $((total_files - shown)) more file(s)"$'\n'
+        fi
+    fi
+    detail+=$'\n'"Full receipt: $PURGE_RECEIPT_FILE"
+    printf '%s' "$detail"
+}
+
 write_receipt() {
     local status="$1" summary="$2" now tmp
     now="$(date +%s)"
@@ -221,16 +420,20 @@ cleanup() {
     if (( RECEIPT_WRITTEN == 0 )); then
         write_receipt "$RESULT_STATUS" "$RESULT_SUMMARY"
     fi
+    if [[ -n "$RUNTIME_DIR" &&
+          "$RUNTIME_DIR" == /tmp/quarantine_lifecycle.* ]]; then
+        rm -rf -- "$RUNTIME_DIR"
+    fi
     trap - EXIT
     exit "$rc"
 }
-trap cleanup EXIT
 
 validate_configuration() {
     local command boolean_name boolean_value
 
-    for command in awk basename date dirname find flock jq mkdir mktemp \
-        mountpoint mv pgrep readlink realpath rm sort stat touch wc; do
+    for command in awk basename cat date dirname find flock grep jq mkdir \
+        mktemp mountpoint mv pgrep readlink realpath rm sha256sum sort stat \
+        touch tr wc; do
         command -v "$command" >/dev/null 2>&1 || {
             log ERROR "Required command not found: $command"
             return 1
@@ -259,6 +462,14 @@ validate_configuration() {
     }
     [[ "$LOG_MAX_BYTES" =~ ^[1-9][0-9]*$ ]] || {
         log ERROR "LOG_MAX_BYTES must be a positive integer"
+        return 1
+    }
+    [[ "$PURGE_RECEIPT_RETENTION_DAYS" =~ ^[1-9][0-9]*$ ]] || {
+        log ERROR "PURGE_RECEIPT_RETENTION_DAYS must be a positive integer"
+        return 1
+    }
+    [[ "$PURGE_NOTIFICATION_FILE_LIMIT" =~ ^[1-9][0-9]*$ ]] || {
+        log ERROR "PURGE_NOTIFICATION_FILE_LIMIT must be a positive integer"
         return 1
     }
 
@@ -380,8 +591,19 @@ valid_relative_path() {
 # AUDIT
 ###############################################################################
 
+reset_audit_counters() {
+    RUNS_SCANNED=0
+    EXPIRED_RUNS=0
+    FILES_SCANNED=0
+    TOTAL_BYTES=0
+    UNMANAGED_ENTRIES=0
+    SCAN_ERRORS=0
+    REMAINING_EXPIRED_RUNS=0
+}
+
 audit_quarantine() {
     local tmp run run_id created age_days files bytes expired
+    reset_audit_counters
     log INFO "Starting quarantine lifecycle audit v$SCRIPT_VERSION"
     tmp="$(mktemp "${LOG_DIR}/.quarantine-index.XXXXXX")" || return 1
     printf 'run_id\tcreated_epoch\tage_days\tfiles\tbytes\texpired\n' >"$tmp"
@@ -503,7 +725,7 @@ restore_item() {
 ###############################################################################
 
 purge_expired() {
-    local run run_id created age_days bytes
+    local run run_id created age_days files bytes
 
     [[ "$PURGE_ENABLED" == true ]] || {
         log ERROR "Purge is disabled; set PURGE_ENABLED=true after reviewing $INDEX_FILE"
@@ -549,12 +771,27 @@ purge_expired() {
             log ERROR "Invalid byte count for expired quarantine run: $run_id"
             return 1
         }
+        files="$(tree_files "$run")" || {
+            log ERROR "Unable to count files in expired quarantine run: $run_id"
+            return 1
+        }
+        files="${files//[[:space:]]/}"
+        [[ "$files" =~ ^[0-9]+$ ]] || {
+            log ERROR "Invalid file count for expired quarantine run: $run_id"
+            return 1
+        }
 
         if (( PURGED_RUNS >= MAX_PURGE_RUNS_PER_EXECUTION ||
               PURGED_BYTES + bytes > MAX_PURGE_BYTES_PER_EXECUTION )); then
             PURGE_LIMIT_REACHED=1
             log WARN "Per-run purge limit reached before $run_id; remaining expired runs will be retried"
             break
+        fi
+
+        if ! persist_run_inventory_before_delete \
+            "$run" "$run_id" "$age_days" "$files" "$bytes"; then
+            log ERROR "Could not commit a complete purge receipt for $run_id; run was preserved"
+            return 1
         fi
 
         log WARN "Purging expired quarantine run: $run_id"
@@ -566,23 +803,39 @@ purge_expired() {
             log ERROR "Expired quarantine run still exists after purge: $run_id"
             return 1
         }
+        if ! record_run_purge_result \
+            "$run_id" "$age_days" "$files" "$bytes"; then
+            log ERROR "Run $run_id was purged, but its verified result could not be appended to $PURGE_RECEIPT_FILE"
+            return 1
+        fi
+        if ! cat -- "${RUNTIME_DIR}/${run_id}.candidates.tsv" \
+            >>"$PURGE_FILE_CANDIDATES"; then
+            log WARN "Run $run_id was purged, but its largest-file notification summary could not be prepared; the full receipt remains available"
+        fi
         PURGED_RUNS=$((PURGED_RUNS + 1))
+        PURGED_FILES=$((PURGED_FILES + files))
         PURGED_BYTES=$((PURGED_BYTES + bytes))
+        PURGE_RUN_DETAILS+="- ${run_id} (${age_days} days): ${files} file(s), $(human_bytes "$bytes"); movies=${INVENTORY_MOVIE_FILES}, series=${INVENTORY_SERIES_FILES}"$'\n'
     done < <(
         find "$QUARANTINE_REAL" -mindepth 1 -maxdepth 1 -type d -print0 \
             2>/dev/null | sort -z
     )
 
-    REMAINING_EXPIRED_RUNS=$((EXPIRED_RUNS - PURGED_RUNS))
-    (( REMAINING_EXPIRED_RUNS < 0 )) && REMAINING_EXPIRED_RUNS=0
-    TOTAL_BYTES=$((TOTAL_BYTES - PURGED_BYTES))
-    (( TOTAL_BYTES < 0 )) && TOTAL_BYTES=0
+    if (( PURGED_RUNS > 0 )); then
+        log INFO "Refreshing quarantine index after purge"
+        audit_quarantine || {
+            log ERROR "Purge completed, but the remaining quarantine index could not be refreshed"
+            return 1
+        }
+    else
+        REMAINING_EXPIRED_RUNS="$EXPIRED_RUNS"
+    fi
     if (( PURGE_LIMIT_REACHED == 1 )); then
         RESULT_STATUS="WARNING"
-        RESULT_SUMMARY="Purged $PURGED_RUNS run(s) and $(human_bytes "$PURGED_BYTES"); $REMAINING_EXPIRED_RUNS expired run(s) remain after reaching the execution limit"
+        RESULT_SUMMARY="Purged $PURGED_RUNS run(s), $PURGED_FILES file(s), and $(human_bytes "$PURGED_BYTES"); $REMAINING_EXPIRED_RUNS expired run(s) remain after reaching the execution limit"
     else
         RESULT_STATUS="OK"
-        RESULT_SUMMARY="Purged $PURGED_RUNS run(s) and $(human_bytes "$PURGED_BYTES")"
+        RESULT_SUMMARY="Purged $PURGED_RUNS run(s), $PURGED_FILES file(s), and $(human_bytes "$PURGED_BYTES")"
     fi
     log INFO "$RESULT_SUMMARY"
 }
@@ -614,9 +867,10 @@ update_lifecycle_notifications() {
         signature+="purge-limit;"
         detail+="Per-execution purge limit reached; remaining runs will be retried."$'\n'
     fi
-    detail+="Index: $INDEX_FILE"
+    detail+="Current index: $INDEX_FILE"
 
     if (( PURGED_RUNS > 0 )); then
+        detail="$(build_purge_detail)"$'\n\n'"$detail"
         [[ -z "$signature" ]] && importance="normal"
         notify_unraid "$importance" "Quarantine purge completed" \
             "$RESULT_SUMMARY"$'\n'"$detail"
@@ -637,7 +891,8 @@ update_lifecycle_notifications() {
 ###############################################################################
 
 main() {
-    local mode="${1:-$DEFAULT_MODE}"
+    local mode="${1:-$DEFAULT_MODE}" failure_detail=""
+    trap cleanup EXIT
     if ! mountpoint -q /mnt/vault || ! mountpoint -q /mnt/user; then
         printf 'Required mounts are unavailable: /mnt/vault and/or /mnt/user\n' >&2
         return 1
@@ -646,6 +901,13 @@ main() {
     rotate_log
     touch "$LOG_FILE" || return 1
     validate_configuration || return 1
+    prune_purge_receipts || {
+        log ERROR "Unable to apply purge receipt retention"
+        return 1
+    }
+    RUNTIME_DIR="$(mktemp -d /tmp/quarantine_lifecycle.XXXXXX)" || return 1
+    PURGE_FILE_CANDIDATES="${RUNTIME_DIR}/purge-candidates.tsv"
+    : >"$PURGE_FILE_CANDIDATES" || return 1
 
     exec 9>"$LOCK_FILE"
     if ! flock -n 9; then
@@ -678,10 +940,18 @@ main() {
             audit_quarantine || return 1
             if ! purge_expired; then
                 RESULT_STATUS="FAILED"
-                RESULT_SUMMARY="Quarantine purge failed; no unsafe fallback was attempted"
+                RESULT_SUMMARY="Quarantine purge stopped after a safety or deletion failure"
+                failure_detail="$RESULT_SUMMARY"
+                if (( PURGED_RUNS > 0 )); then
+                    failure_detail+=$'\n'"Completed before failure: $PURGED_RUNS run(s), $PURGED_FILES file(s), $(human_bytes "$PURGED_BYTES")"
+                fi
+                if [[ -n "$PURGE_RECEIPT_FILE" ]]; then
+                    failure_detail+=$'\n'"Receipt: $PURGE_RECEIPT_FILE"
+                fi
+                failure_detail+=$'\n'"Log: $LOG_FILE"
                 notify_attention_once "purge-failed;" \
                     "Quarantine purge failed" \
-                    "$RESULT_SUMMARY"$'\n'"Log: $LOG_FILE" || true
+                    "$failure_detail" || true
                 return 1
             fi
             update_lifecycle_notifications || return 1
@@ -702,4 +972,6 @@ main() {
     write_receipt "$RESULT_STATUS" "$RESULT_SUMMARY"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
