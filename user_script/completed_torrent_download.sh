@@ -159,6 +159,7 @@ RENAME_LITERALS=(
     "uncensored"
     "-C_X1080X"
     "4k688.com@"
+    "-LTX"
 )
 
 
