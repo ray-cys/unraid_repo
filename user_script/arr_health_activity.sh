@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.7.0
+# ARR Health / Download / Import Monitor v3.7.1
 #
 # PURPOSE
 # -------
@@ -122,7 +122,9 @@
 # ACK-ID file, and at least one additional narrowing filter. A timestamped
 # state backup and JSON manifest are created before one atomic state update.
 # The next normal monitor run sends one batch summary rather than one notice
-# per dismissed download. Run --help for complete examples and safeguards.
+# per dismissed download. Every preview also writes a readable TSV report and
+# an ACK-only text file that can be passed directly to --ack-file. Run --help
+# for complete examples and safeguards.
 #
 #
 # ARR-SIDE DETECTION
@@ -615,13 +617,14 @@ STATE_FILE="${STATE_DIR}/state.json"
 STATE_BACKUP="${STATE_DIR}/state.json.bak"
 SAB_HISTORY_CACHE="${STATE_DIR}/sab_history_cache.json"
 BATCH_DISMISS_MANIFEST_DIR="${STATE_DIR}/batch-dismissals"
+BATCH_DISMISS_PREVIEW_DIR="${BATCH_DISMISS_MANIFEST_DIR}/previews"
 
 # Resolved historical issues older than this are removed from state.
 STATE_RETENTION_DAYS=30
 
-# Keep batch-dismissal manifests and their pre-change state backups long enough
-# for review or recovery without allowing one-time cleanup artifacts to grow
-# forever.
+# Keep batch-dismissal preview files, execution manifests, and pre-change state
+# backups long enough for review or recovery without allowing one-time cleanup
+# artifacts to grow forever.
 BATCH_DISMISS_AUDIT_RETENTION_DAYS=30
 
 # ---------------------------------------------------------------------------
@@ -858,6 +861,8 @@ DOWNLOAD_LEDGER_RECONCILIATION_FAILED_COUNT=0
 DOWNLOAD_LEDGER_MANUAL_DISMISSAL_NOTIFICATION_COUNT=0
 DOWNLOAD_LEDGER_BATCH_DISMISSAL_NOTIFICATION_COUNT=0
 DOWNLOAD_LEDGER_RECONCILIATION_RESULTS_FILE=""
+BATCH_PREVIEW_TSV=""
+BATCH_PREVIEW_ACK_FILE=""
 REMINDER_NOTIFICATION_COUNT=0
 EVENT_REPEAT_SUPPRESSED_COUNT=0
 EVENT_RESOLUTION_SUPPRESSED_COUNT=0
@@ -4792,6 +4797,88 @@ dismiss_download_flow_issue() {
         "$issue_key"
 }
 
+write_batch_dismiss_preview() {
+
+    local matches_file="$1"
+    local count="$2"
+    local source="$3"
+    local classification="$4"
+    local title_contains="$5"
+    local older_than_hours="$6"
+    local before_value="$7"
+    local input_ack_file="$8"
+    local timestamp
+    local preview_hash
+    local preview_id
+    local tsv_tmp
+    local ack_tmp
+
+    BATCH_PREVIEW_TSV=""
+    BATCH_PREVIEW_ACK_FILE=""
+
+    mkdir -p -- "$BATCH_DISMISS_PREVIEW_DIR" || {
+        log "ERROR: Unable to create batch-dismissal preview directory"
+        return 1
+    }
+
+    timestamp=$(date '+%Y%m%d-%H%M%S')
+    preview_hash=$(printf '%s' \
+        "${START_TIME}|${source}|${classification}|${title_contains}|${older_than_hours}|${before_value}|${input_ack_file}|${count}|$$" |
+        sha256sum |
+        awk '{print substr($1, 1, 10)}')
+    preview_id="${timestamp}-${preview_hash}"
+
+    BATCH_PREVIEW_TSV="${BATCH_DISMISS_PREVIEW_DIR}/batch-preview-${preview_id}.tsv"
+    BATCH_PREVIEW_ACK_FILE="${BATCH_DISMISS_PREVIEW_DIR}/batch-preview-${preview_id}-ack-ids.txt"
+
+    tsv_tmp=$(mktemp "${BATCH_DISMISS_PREVIEW_DIR}/.batch-preview.XXXXXX") || return 1
+    ack_tmp=$(mktemp "${BATCH_DISMISS_PREVIEW_DIR}/.batch-preview-ack.XXXXXX") || {
+        rm -f -- "$tsv_tmp"
+        return 1
+    }
+
+    if ! {
+        printf 'ACK_ID\tSOURCE\tSEVERITY\tAGE_HOURS\tLEDGER\tCLASSIFICATION\tTITLE\tDOWNLOAD_ID\tARR_QUEUE_STATUS\tSAB_STATUS\tFIRST_SEEN_EPOCH\n'
+        jq -r '
+            [
+                .ackId,
+                .source,
+                .severity,
+                (.ageHours | tostring),
+                (if .ledgerPresent then "yes" else "NO" end),
+                .classification,
+                .title,
+                .downloadId,
+                .arrQueueStatus,
+                .sabStatus,
+                (.firstSeen | tostring)
+            ]
+            | @tsv
+            ' "$matches_file"
+    } >"$tsv_tmp"
+    then
+        rm -f -- "$tsv_tmp" "$ack_tmp"
+        log "ERROR: Unable to write batch-dismissal TSV preview"
+        return 1
+    fi
+
+    if ! jq -r '.ackId' "$matches_file" >"$ack_tmp"; then
+        rm -f -- "$tsv_tmp" "$ack_tmp"
+        log "ERROR: Unable to write batch-dismissal ACK-ID preview"
+        return 1
+    fi
+
+    mv -f -- "$tsv_tmp" "$BATCH_PREVIEW_TSV" || {
+        rm -f -- "$tsv_tmp" "$ack_tmp"
+        return 1
+    }
+
+    mv -f -- "$ack_tmp" "$BATCH_PREVIEW_ACK_FILE" || {
+        rm -f -- "$ack_tmp"
+        return 1
+    }
+}
+
 batch_dismiss_downloads() {
 
     local source=""
@@ -5127,8 +5214,32 @@ batch_dismiss_downloads() {
     fi
 
     if [ "$execute" != true ]; then
+        write_batch_dismiss_preview \
+            "$matches_file" \
+            "$count" \
+            "$source" \
+            "$classification" \
+            "$title_contains" \
+            "$older_than_hours" \
+            "$before_value" \
+            "$ack_file" || return 1
+
         printf '\nPreview only: no issues were dismissed and no Arr, SABnzbd, or media changes were made.\n'
-        printf 'Review every row, then repeat the command with --execute, --confirm-count %s, and --reason.\n' "$count"
+        printf 'Review table: %s\n' "$BATCH_PREVIEW_TSV"
+        printf 'ACK-ID selection: %s\n' "$BATCH_PREVIEW_ACK_FILE"
+
+        if (( count > 0 )); then
+            printf '\nPreview this exact saved selection again:\n'
+            printf '  /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script \\\n'
+            printf '    --batch-dismiss-downloads --ack-file "%s"\n' "$BATCH_PREVIEW_ACK_FILE"
+            printf '\nDismiss this exact saved selection after review:\n'
+            printf '  /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script \\\n'
+            printf '    --batch-dismiss-downloads --ack-file "%s" \\\n' "$BATCH_PREVIEW_ACK_FILE"
+            printf '    --execute --confirm-count %s --reason "YOUR REVIEWED REASON"\n' "$count"
+        else
+            printf 'The ACK-ID file is empty because no eligible issues matched.\n'
+        fi
+
         return 0
     fi
 
@@ -5392,7 +5503,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.7 lifecycle commands' \
+        'ARR Health Monitor v3.7.1 lifecycle commands' \
         '' \
         'Always invoke the Unraid User Scripts copy through /bin/bash:' \
         '  /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script COMMAND' \
@@ -5435,6 +5546,18 @@ print_lifecycle_command_help() {
         "      --classification DOWNLOAD_FLOW_SAB_VANISHED \\" \
         '      --title-contains "NCIS" --older-than-hours 24' \
         '' \
+        '  Every preview writes two files and prints their exact paths:' \
+        '    batch-preview-TIMESTAMP.tsv' \
+        '        Full human-readable table for review.' \
+        '    batch-preview-TIMESTAMP-ack-ids.txt' \
+        '        ACK IDs only; accepted directly by --ack-file.' \
+        '' \
+        '  Use the generated ACK-only file as an exact saved selection:' \
+        "    --batch-dismiss-downloads \\" \
+        "      --ack-file \"/mnt/vault/cloud/logs/script/arr_health_activity/batch-dismissals/previews/FILE-ack-ids.txt\" \\" \
+        "      --execute --confirm-count PREVIEW_COUNT \\" \
+        '      --reason "Reviewed intentional removals"' \
+        '' \
         '  After reviewing every preview row, execute with the exact count:' \
         "    --batch-dismiss-downloads --source Sonarr \\" \
         "      --classification DOWNLOAD_FLOW_SAB_VANISHED \\" \
@@ -5447,6 +5570,7 @@ print_lifecycle_command_help() {
         '  - Requires at least one additional narrowing filter.' \
         '  - Refuses a changed preview count or a missing ledger record.' \
         '  - Creates a timestamped state backup and detailed JSON manifest.' \
+        '  - Saves preview TSV and ACK-only files for 30 days.' \
         '  - Updates monitor state atomically and sends one later summary.' \
         '  - Never changes Sonarr, Radarr, SABnzbd, or any media file.' \
         '' \
@@ -13191,6 +13315,15 @@ prune_state() {
             -delete 2>/dev/null || true
     fi
 
+    if [ -d "$BATCH_DISMISS_PREVIEW_DIR" ]; then
+        find "$BATCH_DISMISS_PREVIEW_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name 'batch-preview-*' \
+            -mtime "+${BATCH_DISMISS_AUDIT_RETENTION_DAYS}" \
+            -delete 2>/dev/null || true
+    fi
+
     find "$STATE_DIR" \
         -maxdepth 1 \
         -type f \
@@ -13329,7 +13462,7 @@ rotate_persistent_log
 
 persistent_log \
     "START" \
-    "ARR Health Monitor v3.7.0"
+    "ARR Health Monitor v3.7.1"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -13342,7 +13475,7 @@ fi
 # START
 ###############################################################################
 
-log "Starting ARR Health Monitor v3.7.0"
+log "Starting ARR Health Monitor v3.7.1"
 log "Recommended schedule: every five minutes"
 log "Notifications enabled: $SEND_NOTIFICATIONS"
 log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -13828,7 +13961,7 @@ write_persistent_activity_summary
 RUNTIME=$(runtime)
 
 log "============================================================"
-log "ARR Health Monitor v3.7.0 completed"
+log "ARR Health Monitor v3.7.1 completed"
 
 log ""
 log "SCAN HEALTH"
