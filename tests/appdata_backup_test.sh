@@ -166,15 +166,27 @@ count_generations() {
 ###############################################################################
 
 (
-    unset PIGZ_THREADS PIGZ_LEVEL USE_LOW_PRIORITY_IO \
+    unset PIGZ_THREADS PIGZ_AUTO_RESERVE PIGZ_AUTO_MIN PIGZ_AUTO_MAX \
+        PIGZ_LEVEL REPORT_LARGEST_ARCHIVES USE_LOW_PRIORITY_IO \
         PLEX_HUBBLE_DATABASE_BACKUP_PATH \
         PLEX_NODE_DATABASE_BACKUP_PATH
 
     # shellcheck disable=SC1090
     source "$SCRIPT"
 
-    [ "$PIGZ_THREADS" -eq 6 ]
+    # Called indirectly by resolve_pigz_threads from the sourced script.
+    # shellcheck disable=SC2329
+    nproc() {
+        printf '8\n'
+    }
+
+    LOG_FILE=""
+    resolve_pigz_threads
+
+    [ "$PIGZ_THREADS" = "auto" ]
+    [ "$EFFECTIVE_PIGZ_THREADS" -eq 6 ]
     [ "$PIGZ_LEVEL" -eq 3 ]
+    [ "$REPORT_LARGEST_ARCHIVES" -eq 10 ]
     [ "$USE_LOW_PRIORITY_IO" = "false" ]
     [ "$PLEX_HUBBLE_DATABASE_BACKUP_PATH" = "/mnt/vault/backup/plex_db/hubble" ]
     [ "$PLEX_NODE_DATABASE_BACKUP_PATH" = "/mnt/vault/backup/plex_db/node" ]
@@ -381,6 +393,12 @@ printf 'scheduled node plex database backup\n' \
 
 run_backup "$DIRECT_ROOT" destination "$DIRECT_ROOT/direct.out" ||
     fail "direct backup failed"
+
+assert_contains "$DIRECT_ROOT/direct.out" "Compression threads: auto="
+assert_contains "$DIRECT_ROOT/direct.out" "Largest archives (top 10):"
+assert_contains "$DIRECT_ROOT/direct.out" "change new, compress "
+assert_contains "$DIRECT_ROOT/direct.out" "verify "
+assert_contains "$DIRECT_ROOT/direct.out" "exclusions "
 
 mapfile -t DIRECT_ARCHIVE_ORDER < <(
     sed -n \

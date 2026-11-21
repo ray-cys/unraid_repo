@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Appdata + Optional Shares Backup v3.4
+# Appdata + Optional Shares Backup v3.5
 #
 # PURPOSE
 # -------
@@ -59,7 +59,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="3.4"
+readonly SCRIPT_VERSION="3.5"
 
 
 ###############################################################################
@@ -160,18 +160,25 @@ RETRIES="${RETRIES:-3}"
 #
 RETRY_DELAY="${RETRY_DELAY:-5}"
 
-# pigz worker threads. Six is a balanced default for an idle backup window;
-# lower this if the server has fewer CPU cores or must remain responsive.
+# pigz worker threads.
 #
-# 0 = allow pigz to choose automatically.
+# auto = online CPU threads minus the reserve, clamped to the configured range
+# 0    = allow pigz itself to choose
+# N    = use exactly N worker threads
 #
 # If pigz is unavailable, gzip is used automatically.
 #
-PIGZ_THREADS="${PIGZ_THREADS:-6}"
+PIGZ_THREADS="${PIGZ_THREADS:-auto}"
+PIGZ_AUTO_RESERVE="${PIGZ_AUTO_RESERVE:-2}"
+PIGZ_AUTO_MIN="${PIGZ_AUTO_MIN:-2}"
+PIGZ_AUTO_MAX="${PIGZ_AUTO_MAX:-12}"
 
 # Compression level used by both pigz and the gzip fallback.
 # Level 3 favors backup speed while retaining useful compression.
 PIGZ_LEVEL="${PIGZ_LEVEL:-3}"
+
+# Number of largest archives included in the final performance report.
+REPORT_LARGEST_ARCHIVES="${REPORT_LARGEST_ARCHIVES:-10}"
 
 # Optional additional GNU tar arguments.
 #
@@ -438,8 +445,13 @@ declare -A CURRENT_RAW_BYTES=()
 declare -A PREVIOUS_RAW_BYTES=()
 declare -A PREVIOUS_ARCHIVE_BYTES=()
 declare -A PREDICTED_ARCHIVE_BYTES=()
+declare -A APP_ARCHIVE_BYTES=()
+declare -A APP_COMPRESSION_SECONDS=()
+declare -A APP_VERIFICATION_SECONDS=()
+declare -A APP_EXCLUSION_COUNTS=()
 
 CONTAINERS_NEED_RESTART=false
+EFFECTIVE_PIGZ_THREADS=0
 
 RAW_TOTAL_BYTES=0
 RAW_MEASURED_COUNT=0
@@ -468,6 +480,9 @@ APPDATA_BACKUP_PATH=""
 LAST_COMPRESSION_REASON=""
 LAST_COMPRESSION_FATAL=false
 LAST_COMPRESSION_ATTEMPTS=0
+LAST_COMPRESSION_SECONDS=0
+LAST_VERIFICATION_SECONDS=0
+LAST_EXCLUSION_COUNT=0
 STAGED_RECOVERY_PENDING=false
 
 RESTART_FAILED=0
@@ -586,6 +601,22 @@ format_duration() {
         $((seconds / 3600)) \
         $(((seconds % 3600) / 60)) \
         $((seconds % 60))
+}
+
+
+format_archive_change() {
+    local current="${1:-0}"
+    local previous="${2:-0}"
+
+    if [ "$previous" -le 0 ]; then
+        printf 'new'
+        return 0
+    fi
+
+    awk \
+        -v current="$current" \
+        -v previous="$previous" \
+        'BEGIN { printf "%+.1f%%", ((current - previous) * 100) / previous }'
 }
 
 
@@ -924,7 +955,7 @@ validate_configuration() {
     local required_command=""
 
     for required_command in \
-        awk df du find flock gzip rsync sha256sum sort stat tar
+        awk df du find flock gzip rsync sha256sum sort stat tar tee
     do
         if ! command -v "$required_command" >/dev/null 2>&1; then
             log "PREFLIGHT" "ERROR" \
@@ -998,14 +1029,36 @@ validate_configuration() {
         return 1
     fi
 
-    if ! [[ "$PIGZ_THREADS" =~ ^[0-9]+$ ]]; then
-        log "PREFLIGHT" "ERROR" "PIGZ_THREADS must be a non-negative integer"
+    if [ "$PIGZ_THREADS" != "auto" ] &&
+       ! [[ "$PIGZ_THREADS" =~ ^[0-9]+$ ]]
+    then
+        log "PREFLIGHT" "ERROR" \
+            "PIGZ_THREADS must be 'auto' or a non-negative integer"
+        return 1
+    fi
+
+    if ! [[ "$PIGZ_AUTO_RESERVE" =~ ^[0-9]+$ ]] ||
+       ! [[ "$PIGZ_AUTO_MIN" =~ ^[0-9]+$ ]] ||
+       ! [[ "$PIGZ_AUTO_MAX" =~ ^[0-9]+$ ]] ||
+       [ "$PIGZ_AUTO_MIN" -lt 1 ] ||
+       [ "$PIGZ_AUTO_MAX" -lt "$PIGZ_AUTO_MIN" ]
+    then
+        log "PREFLIGHT" "ERROR" \
+            "PIGZ auto-thread settings must be valid non-negative integers with min >= 1 and max >= min"
         return 1
     fi
 
     if ! [[ "$PIGZ_LEVEL" =~ ^[1-9]$ ]]; then
         log "PREFLIGHT" "ERROR" \
             "PIGZ_LEVEL must be an integer from 1 through 9"
+        return 1
+    fi
+
+    if ! [[ "$REPORT_LARGEST_ARCHIVES" =~ ^[0-9]+$ ]] ||
+       [ "$REPORT_LARGEST_ARCHIVES" -lt 1 ]
+    then
+        log "PREFLIGHT" "ERROR" \
+            "REPORT_LARGEST_ARCHIVES must be an integer >= 1"
         return 1
     fi
 
@@ -1100,6 +1153,39 @@ validate_configuration() {
     fi
 
     return 0
+}
+
+
+resolve_pigz_threads() {
+    local cpu_count=""
+    local selected=0
+
+    if [ "$PIGZ_THREADS" != "auto" ]; then
+        EFFECTIVE_PIGZ_THREADS="$PIGZ_THREADS"
+        log "PREFLIGHT" "INFO" \
+            "Compression threads: configured=${EFFECTIVE_PIGZ_THREADS}, level=${PIGZ_LEVEL}"
+        return 0
+    fi
+
+    if command -v nproc >/dev/null 2>&1; then
+        cpu_count="$(nproc --all 2>/dev/null || true)"
+    fi
+
+    if ! [[ "$cpu_count" =~ ^[0-9]+$ ]] || [ "$cpu_count" -lt 1 ]; then
+        cpu_count="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+    fi
+
+    [[ "$cpu_count" =~ ^[0-9]+$ ]] && [ "$cpu_count" -gt 0 ] || cpu_count=2
+
+    selected=$((cpu_count - PIGZ_AUTO_RESERVE))
+    [ "$selected" -ge "$PIGZ_AUTO_MIN" ] || selected="$PIGZ_AUTO_MIN"
+    [ "$selected" -le "$PIGZ_AUTO_MAX" ] || selected="$PIGZ_AUTO_MAX"
+    [ "$selected" -le "$cpu_count" ] || selected="$cpu_count"
+    [ "$selected" -ge 1 ] || selected=1
+
+    EFFECTIVE_PIGZ_THREADS="$selected"
+    log "PREFLIGHT" "INFO" \
+        "Compression threads: auto=${EFFECTIVE_PIGZ_THREADS}, online CPUs=${cpu_count}, reserve=${PIGZ_AUTO_RESERVE}, range=${PIGZ_AUTO_MIN}-${PIGZ_AUTO_MAX}, level=${PIGZ_LEVEL}"
 }
 
 
@@ -2251,12 +2337,11 @@ verify_backup_directory() {
 record_archive_manifest_row() {
     local name="$1"
     local archive="$2"
+    local checksum="$3"
     local raw_bytes="${CURRENT_RAW_BYTES[$name]:-0}"
     local archive_bytes=0
-    local checksum=""
 
     archive_bytes="$(file_size_bytes "$archive")"
-    checksum="$(sha256sum -- "$archive" | awk '{print $1}')"
 
     [[ "$checksum" =~ ^[[:xdigit:]]{64}$ ]] || return 1
 
@@ -2276,19 +2361,27 @@ compress_directory() {
     local archive="${WORK_DIR}/${name}.tar.gz"
     local archive_tmp="${archive}.tmp"
     local error_file="${TEMP_DIR}/${name}.err"
+    local checksum_tmp="${TEMP_DIR}/${name}.sha256.tmp"
     local source_parent=""
     local source_entry=""
 
     local attempt=0
     local tar_status=0
     local compressor_status=0
+    local tee_status=0
+    local checksum_status=0
     local available_after=0
     local temp_bytes=0
     local non_retryable=false
     local verification_failed=false
     local manifest_record_failed=false
+    local checksum_failed=false
     local exclusion_path=""
     local exclusion_summary=""
+    local streamed_checksum=""
+    local compression_started=0
+    local verification_started=0
+    local elapsed=0
 
     local -a compressor=()
     local -a exclusion_paths=()
@@ -2298,6 +2391,9 @@ compress_directory() {
     LAST_COMPRESSION_REASON=""
     LAST_COMPRESSION_FATAL=false
     LAST_COMPRESSION_ATTEMPTS=0
+    LAST_COMPRESSION_SECONDS=0
+    LAST_VERIFICATION_SECONDS=0
+    LAST_EXCLUSION_COUNT=0
 
     source_parent="$(dirname "$source_directory")"
     source_entry="$(basename "$source_directory")"
@@ -2315,12 +2411,13 @@ compress_directory() {
         log "BACKUP" "INFO" \
             "[${name}] Excluding ${#exclusion_paths[@]} regenerable path(s): ${exclusion_summary}"
     fi
+    LAST_EXCLUSION_COUNT="${#exclusion_paths[@]}"
 
     if command -v pigz >/dev/null 2>&1; then
-        if [ "$PIGZ_THREADS" -gt 0 ]; then
+        if [ "$EFFECTIVE_PIGZ_THREADS" -gt 0 ]; then
             compressor=(
                 pigz
-                -p "$PIGZ_THREADS"
+                -p "$EFFECTIVE_PIGZ_THREADS"
                 -"$PIGZ_LEVEL"
                 -c
             )
@@ -2347,9 +2444,11 @@ compress_directory() {
 
     for ((attempt = 1; attempt <= RETRIES; attempt++)); do
         LAST_COMPRESSION_ATTEMPTS="$attempt"
-        rm -f -- "$archive_tmp"
+        rm -f -- "$archive_tmp" "$checksum_tmp"
         verification_failed=false
         manifest_record_failed=false
+        checksum_failed=false
+        streamed_checksum=""
 
         printf '\n=== Compression attempt %d/%d ===\n' \
             "$attempt" \
@@ -2359,6 +2458,7 @@ compress_directory() {
         log "DOCKER" "INFO" \
             "[${name}] Compression attempt ${attempt}/${RETRIES}"
 
+        compression_started="$(date +%s)"
         "${PRIORITY_PREFIX[@]}" \
             tar \
             -C "$source_parent" \
@@ -2368,29 +2468,54 @@ compress_directory() {
             2>>"$error_file" |
             "${PRIORITY_PREFIX[@]}" \
                 "${compressor[@]}" \
-                2>>"$error_file" \
-                >"$archive_tmp"
+                2>>"$error_file" |
+            "${PRIORITY_PREFIX[@]}" \
+                tee "$archive_tmp" \
+                2>>"$error_file" |
+            "${PRIORITY_PREFIX[@]}" \
+                sha256sum \
+                >"$checksum_tmp" \
+                2>>"$error_file"
 
         pipeline_status=("${PIPESTATUS[@]}")
+        elapsed=$(($(date +%s) - compression_started))
+        LAST_COMPRESSION_SECONDS=$((LAST_COMPRESSION_SECONDS + elapsed))
         tar_status="${pipeline_status[0]:-1}"
         compressor_status="${pipeline_status[1]:-1}"
+        tee_status="${pipeline_status[2]:-1}"
+        checksum_status="${pipeline_status[3]:-1}"
+        streamed_checksum="$(awk 'NR == 1 {print $1}' "$checksum_tmp" 2>/dev/null || true)"
 
         temp_bytes="$(file_size_bytes "$archive_tmp")"
         available_after="$(available_bytes_for_path "$WORK_ROOT")" || available_after=0
 
-        printf 'Pipeline status: tar=%s, compressor=%s, temporary=%s, available=%s\n' \
+        printf 'Pipeline status: tar=%s, compressor=%s, tee=%s, checksum=%s, temporary=%s, available=%s\n' \
             "$(exit_status_description "$tar_status")" \
             "$(exit_status_description "$compressor_status")" \
+            "$(exit_status_description "$tee_status")" \
+            "$(exit_status_description "$checksum_status")" \
             "$(bytes_to_human "$temp_bytes")" \
             "$(bytes_to_human "$available_after")" \
             >>"$error_file"
 
-        if [ "$tar_status" -eq 0 ] && [ "$compressor_status" -eq 0 ]; then
+        if [ "$tar_status" -eq 0 ] &&
+           [ "$compressor_status" -eq 0 ] &&
+           [ "$tee_status" -eq 0 ] &&
+           [ "$checksum_status" -eq 0 ] &&
+           [[ "$streamed_checksum" =~ ^[[:xdigit:]]{64}$ ]]
+        then
+            verification_started="$(date +%s)"
             if verify_archive "$archive_tmp" "$error_file"; then
+                elapsed=$(($(date +%s) - verification_started))
+                LAST_VERIFICATION_SECONDS=$((LAST_VERIFICATION_SECONDS + elapsed))
                 if mv -f -- "$archive_tmp" "$archive"; then
                     log "VERIFY" "INFO" \
                         "[${name}] Archive passed compressed tar structure verification"
-                    if record_archive_manifest_row "$name" "$archive"; then
+                    if record_archive_manifest_row \
+                        "$name" \
+                        "$archive" \
+                        "$streamed_checksum"
+                    then
                         return 0
                     fi
 
@@ -2402,13 +2527,20 @@ compress_directory() {
                         >>"$error_file"
                 fi
             else
+                elapsed=$(($(date +%s) - verification_started))
+                LAST_VERIFICATION_SECONDS=$((LAST_VERIFICATION_SECONDS + elapsed))
                 verification_failed=true
                 log "VERIFY" "ERROR" \
                     "[${name}] Archive verification failed on attempt ${attempt}"
             fi
         else
+            if [ "$checksum_status" -ne 0 ] ||
+               ! [[ "$streamed_checksum" =~ ^[[:xdigit:]]{64}$ ]]
+            then
+                checksum_failed=true
+            fi
             log "DOCKER" "ERROR" \
-                "[${name}] Compression pipeline failed on attempt ${attempt}: tar=$(exit_status_description "$tar_status"), compressor=$(exit_status_description "$compressor_status")"
+                "[${name}] Compression pipeline failed on attempt ${attempt}: tar=$(exit_status_description "$tar_status"), compressor=$(exit_status_description "$compressor_status"), tee=$(exit_status_description "$tee_status"), checksum=$(exit_status_description "$checksum_status")"
         fi
 
         non_retryable=false
@@ -2419,11 +2551,19 @@ compress_directory() {
             LAST_COMPRESSION_REASON="destination capacity exhausted while creating ${name}"
             LAST_COMPRESSION_FATAL=true
             non_retryable=true
-        elif [ "$tar_status" -eq 137 ] || [ "$compressor_status" -eq 137 ]; then
+        elif [ "$tar_status" -eq 137 ] ||
+             [ "$compressor_status" -eq 137 ] ||
+             [ "$tee_status" -eq 137 ] ||
+             [ "$checksum_status" -eq 137 ]
+        then
             LAST_COMPRESSION_REASON="compression was killed by SIGKILL; probable memory pressure"
             LAST_COMPRESSION_FATAL=true
             non_retryable=true
-        elif [ "$tar_status" -ge 128 ] || [ "$compressor_status" -ge 128 ]; then
+        elif [ "$tar_status" -ge 128 ] ||
+             [ "$compressor_status" -ge 128 ] ||
+             [ "$tee_status" -ge 128 ] ||
+             [ "$checksum_status" -ge 128 ]
+        then
             LAST_COMPRESSION_REASON="compression process terminated by a signal"
             non_retryable=true
         elif [ "$manifest_record_failed" = "true" ]; then
@@ -2432,6 +2572,8 @@ compress_directory() {
             non_retryable=true
         elif [ "$verification_failed" = "true" ]; then
             LAST_COMPRESSION_REASON="temporary archive failed gzip or tar verification"
+        elif [ "$checksum_failed" = "true" ]; then
+            LAST_COMPRESSION_REASON="streaming archive checksum generation failed"
         else
             LAST_COMPRESSION_REASON="tar or compressor returned a non-zero status"
         fi
@@ -2439,7 +2581,7 @@ compress_directory() {
         printf 'Classified failure: %s\n' "$LAST_COMPRESSION_REASON" \
             >>"$error_file"
 
-        rm -f -- "$archive_tmp"
+        rm -f -- "$archive_tmp" "$checksum_tmp"
 
         if [ "$non_retryable" = "true" ]; then
             log "BACKUP" "ERROR" \
@@ -2638,6 +2780,9 @@ run_appdata_backup() {
     local archive=""
     local archive_bytes=0
     local archive_human=""
+    local previous_bytes=0
+    local previous_human=""
+    local change_label=""
     local error_file=""
     local excerpt=""
     local predicted_bytes=0
@@ -2652,6 +2797,10 @@ run_appdata_backup() {
     RETENTION_FAILED=0
     APPDATA_REPORT=""
     APPDATA_BACKUP_PATH=""
+    APP_ARCHIVE_BYTES=()
+    APP_COMPRESSION_SECONDS=()
+    APP_VERIFICATION_SECONDS=()
+    APP_EXCLUSION_COUNTS=()
 
     log "BACKUP" "INFO" \
         "Starting appdata archive phase"
@@ -2689,11 +2838,19 @@ run_appdata_backup() {
 
             APPDATA_OK=$((APPDATA_OK + 1))
             APPDATA_TOTAL_BYTES=$((APPDATA_TOTAL_BYTES + archive_bytes))
+            APP_ARCHIVE_BYTES["$name"]="$archive_bytes"
+            APP_COMPRESSION_SECONDS["$name"]="$LAST_COMPRESSION_SECONDS"
+            APP_VERIFICATION_SECONDS["$name"]="$LAST_VERIFICATION_SECONDS"
+            APP_EXCLUSION_COUNTS["$name"]="$LAST_EXCLUSION_COUNT"
+
+            previous_bytes="${PREVIOUS_ARCHIVE_BYTES[$name]:-0}"
+            previous_human="$(bytes_to_human "$previous_bytes")"
+            change_label="$(format_archive_change "$archive_bytes" "$previous_bytes")"
 
             APPDATA_REPORT+="[OK] [${name}] ${archive_human}"$'\n'
 
             log "DOCKER" "INFO" \
-                "[${name}] Backup complete: ${archive_human}"
+                "[${name}] Backup complete: size=${archive_human}, previous=${previous_human}, change=${change_label}, compression=$(format_duration "$LAST_COMPRESSION_SECONDS"), verification=$(format_duration "$LAST_VERIFICATION_SECONDS"), exclusions=${LAST_EXCLUSION_COUNT}"
 
             predicted_bytes="${PREDICTED_ARCHIVE_BYTES[$name]:-0}"
             REMAINING_ESTIMATED_BYTES=$((
@@ -3074,6 +3231,52 @@ run_shares_backup() {
 # FINAL REPORTING
 ###############################################################################
 
+build_largest_archives_report() {
+    local name=""
+    local archive_bytes=0
+    local previous_bytes=0
+    local count=0
+    local output=""
+
+    [ "${#APP_ARCHIVE_BYTES[@]}" -gt 0 ] || return 0
+
+    output+="Largest archives (top ${REPORT_LARGEST_ARCHIVES}):"$'\n'
+
+    while IFS=$'\t' read -r archive_bytes name; do
+        [ -n "$name" ] || continue
+        count=$((count + 1))
+        [ "$count" -le "$REPORT_LARGEST_ARCHIVES" ] || break
+
+        previous_bytes="${PREVIOUS_ARCHIVE_BYTES[$name]:-0}"
+        output+="  ${name}: $(bytes_to_human "$archive_bytes")"
+        output+=" (previous $(bytes_to_human "$previous_bytes"), change $(format_archive_change "$archive_bytes" "$previous_bytes"),"
+        output+=" compress $(format_duration "${APP_COMPRESSION_SECONDS[$name]:-0}"),"
+        output+=" verify $(format_duration "${APP_VERIFICATION_SECONDS[$name]:-0}"),"
+        output+=" exclusions ${APP_EXCLUSION_COUNTS[$name]:-0})"$'\n'
+    done < <(
+        for name in "${!APP_ARCHIVE_BYTES[@]}"; do
+            printf '%s\t%s\n' "${APP_ARCHIVE_BYTES[$name]}" "$name"
+        done | LC_ALL=C sort -t $'\t' -k1,1nr
+    )
+
+    printf '%s' "$output"
+}
+
+
+log_largest_archives_report() {
+    local report=""
+    local line=""
+
+    report="$(build_largest_archives_report)"
+    [ -n "$report" ] || return 0
+
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        log "REPORT" "INFO" "$line"
+    done <<<"$report"
+}
+
+
 build_space_block() {
     local output=""
 
@@ -3176,6 +3379,11 @@ send_final_notification() {
 
     body+=$'\n'
     body+="${APPDATA_REPORT}"
+
+    if [ "${#APP_ARCHIVE_BYTES[@]}" -gt 0 ]; then
+        body+=$'\n'
+        body+="$(build_largest_archives_report)"
+    fi
 
     body+=$'\n'
     body+="Container restart: ${restart_status}"$'\n'
@@ -3282,6 +3490,7 @@ ${LOG_FILE}"
         return 1
     fi
 
+    resolve_pigz_threads
     build_priority_prefix
 
     # Incomplete directories never compete with a new backup. Diagnostics are
@@ -3435,6 +3644,7 @@ ${LOG_FILE}"
     # -----------------------------------------------------------------------
 
     run_appdata_backup || final_exit=1
+    log_largest_archives_report
 
 
     # -----------------------------------------------------------------------
