@@ -79,8 +79,8 @@ LOG_DIR="${LOG_DIR:-/mnt/vault/cloud/logs/script/appdata_backup}"
 # The default uses the cache pool selected by the latest repository setting.
 # Choose another mounted device if independent staging failure protection is
 # required in addition to temporary capacity relief.
-STAGING_DIR="${STAGING_DIR:-/mnt/cache/staging}"
-STAGING_MOUNT_ROOT="${STAGING_MOUNT_ROOT:-/mnt/cache}"
+STAGING_DIR="${STAGING_DIR:-/mnt/user/staging}"
+STAGING_MOUNT_ROOT="${STAGING_MOUNT_ROOT:-/mnt/user}"
 
 # Prevent an unavailable mount from being replaced by an ordinary directory on
 # the Unraid root filesystem. Fixture tests may explicitly disable this guard.
