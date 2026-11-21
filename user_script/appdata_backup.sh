@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Appdata + Optional Shares Backup v3.1
+# Appdata + Optional Shares Backup v3.2
 #
 # PURPOSE
 # -------
@@ -56,7 +56,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="3.1"
+readonly SCRIPT_VERSION="3.2"
 
 
 ###############################################################################
@@ -157,13 +157,18 @@ RETRIES="${RETRIES:-3}"
 #
 RETRY_DELAY="${RETRY_DELAY:-5}"
 
-# pigz worker threads.
+# pigz worker threads. Six is a balanced default for an idle backup window;
+# lower this if the server has fewer CPU cores or must remain responsive.
 #
 # 0 = allow pigz to choose automatically.
 #
 # If pigz is unavailable, gzip is used automatically.
 #
-PIGZ_THREADS="${PIGZ_THREADS:-4}"
+PIGZ_THREADS="${PIGZ_THREADS:-6}"
+
+# Compression level used by both pigz and the gzip fallback.
+# Level 3 favors backup speed while retaining useful compression.
+PIGZ_LEVEL="${PIGZ_LEVEL:-3}"
 
 # Optional additional GNU tar arguments.
 #
@@ -175,6 +180,45 @@ PIGZ_THREADS="${PIGZ_THREADS:-4}"
 #
 TAR_OPTIONS=()
 
+# Exact, per-application regenerable paths to exclude.
+#
+# Format: "top-level-appdata-directory|relative/path"
+#
+# Application names are exact and paths deliberately do not support wildcards.
+# Databases, configuration, queue state, torrent state, and backup folders are
+# not excluded. Add or remove entries to match locally-installed applications.
+APPDATA_EXCLUDES=(
+    "sonarr|logs"
+    "sonarr|MediaCover"
+    "sonarr|logs.db"
+    "sonarr|logs.db-shm"
+    "sonarr|logs.db-wal"
+    "radarr|logs"
+    "radarr|MediaCover"
+    "radarr|logs.db"
+    "radarr|logs.db-shm"
+    "radarr|logs.db-wal"
+    "prowlarr|logs"
+    "prowlarr|MediaCover"
+    "prowlarr|logs.db"
+    "prowlarr|logs.db-shm"
+    "prowlarr|logs.db-wal"
+    "lidarr|logs"
+    "lidarr|MediaCover"
+    "lidarr|logs.db"
+    "lidarr|logs.db-shm"
+    "lidarr|logs.db-wal"
+    "readarr|logs"
+    "readarr|MediaCover"
+    "readarr|logs.db"
+    "readarr|logs.db-shm"
+    "readarr|logs.db-wal"
+    "sabnzbd|logs"
+    "kometa|logs"
+    "kometa|cache"
+    "qbittorrent|qBittorrent/logs"
+)
+
 
 # ---------------------------------------------------------------------------
 # Process priority
@@ -182,7 +226,7 @@ TAR_OPTIONS=()
 
 # Apply nice/ionice to compression and rsync operations when available.
 #
-USE_LOW_PRIORITY_IO="${USE_LOW_PRIORITY_IO:-true}"
+USE_LOW_PRIORITY_IO="${USE_LOW_PRIORITY_IO:-false}"
 
 IONICE_CLASS="${IONICE_CLASS:-2}"
 IONICE_PRIORITY="${IONICE_PRIORITY:-7}"
@@ -484,6 +528,74 @@ array_contains() {
 }
 
 
+configured_exclusions_for_app() {
+    local name="$1"
+    local rule=""
+    local exclusion_app=""
+    local exclusion_path=""
+
+    if [ "$EXCLUDE_REGENERABLE_PLEX_DATA" = "true" ] &&
+       [ "$name" = "$PLEX_APPDATA_DIR" ]
+    then
+        printf '%s\0' \
+            "Library/Application Support/Plex Media Server/Cache" \
+            "Library/Application Support/Plex Media Server/Codecs" \
+            "Library/Application Support/Plex Media Server/Crash Reports" \
+            "Library/Application Support/Plex Media Server/Logs" \
+            "Library/Application Support/Plex Media Server/Updates" \
+            "Library/Application Support/Plex Media Server/Plug-in Support/Caches"
+    fi
+
+    for rule in "${APPDATA_EXCLUDES[@]}"; do
+        IFS='|' read -r exclusion_app exclusion_path <<<"$rule"
+        [ "$exclusion_app" = "$name" ] || continue
+        printf '%s\0' "$exclusion_path"
+    done
+}
+
+
+validate_appdata_exclusions() {
+    local rule=""
+    local remainder=""
+    local exclusion_app=""
+    local exclusion_path=""
+
+    for rule in "${APPDATA_EXCLUDES[@]}"; do
+        remainder="${rule#*|}"
+
+        if [ "$remainder" = "$rule" ] || [[ "$remainder" == *"|"* ]]; then
+            log "PREFLIGHT" "ERROR" \
+                "Invalid APPDATA_EXCLUDES entry; expected app|relative/path: $rule"
+            return 1
+        fi
+
+        IFS='|' read -r exclusion_app exclusion_path <<<"$rule"
+
+        if [ -z "$exclusion_app" ] || [ -z "$exclusion_path" ] ||
+           [[ "$exclusion_app" == */* ]] ||
+           [[ "$exclusion_app" == *$'\t'* ]] ||
+           [[ "$exclusion_app" == *$'\n'* ]] ||
+           [[ "$exclusion_path" == *$'\t'* ]] ||
+           [[ "$exclusion_path" == *$'\n'* ]]
+        then
+            log "PREFLIGHT" "ERROR" \
+                "Unsafe APPDATA_EXCLUDES entry: $rule"
+            return 1
+        fi
+
+        case "$exclusion_path" in
+            /*|.|..|./*|../*|*/.|*/..|*/./*|*/../*|*'*'*|*'?'*|*'['*)
+                log "PREFLIGHT" "ERROR" \
+                    "APPDATA_EXCLUDES paths must be exact, relative, and traversal-free: $rule"
+                return 1
+                ;;
+        esac
+    done
+
+    return 0
+}
+
+
 safe_size_bytes() {
     local path="$1"
     local size=""
@@ -731,6 +843,12 @@ validate_configuration() {
         return 1
     fi
 
+    if ! [[ "$PIGZ_LEVEL" =~ ^[1-9]$ ]]; then
+        log "PREFLIGHT" "ERROR" \
+            "PIGZ_LEVEL must be an integer from 1 through 9"
+        return 1
+    fi
+
     if ! [[ "$ESTIMATE_GROWTH_PERCENT" =~ ^[0-9]+$ ]]; then
         log "PREFLIGHT" "ERROR" \
             "ESTIMATE_GROWTH_PERCENT must be a non-negative integer"
@@ -818,6 +936,10 @@ validate_configuration() {
             return 1
             ;;
     esac
+
+    if ! validate_appdata_exclusions; then
+        return 1
+    fi
 
     return 0
 }
@@ -1554,16 +1676,9 @@ verify_archive() {
     local archive="$1"
     local error_file="$2"
 
-    if command -v pigz >/dev/null 2>&1; then
-        if ! pigz -t "$archive" >/dev/null 2>>"$error_file"; then
-            return 1
-        fi
-    else
-        if ! gzip -t "$archive" >/dev/null 2>>"$error_file"; then
-            return 1
-        fi
-    fi
-
+    # A successful compressed tar listing reads the complete gzip stream,
+    # validates its checksum, and confirms that tar can parse the archive.
+    # A separate pigz/gzip test would repeat the same full decompression.
     if ! tar -tzf "$archive" >/dev/null 2>>"$error_file"; then
         return 1
     fi
@@ -1716,12 +1831,6 @@ verify_backup_directory() {
             return 1
         fi
 
-        if ! verify_archive "$archive" "$error_file"; then
-            printf 'Archive content verification failed for: %s\n' "$name" \
-                >>"$error_file"
-            return 1
-        fi
-
         verified_count=$((verified_count + 1))
     done <"${directory}/backup_manifest.tsv"
 
@@ -1786,8 +1895,11 @@ compress_directory() {
     local non_retryable=false
     local verification_failed=false
     local manifest_record_failed=false
+    local exclusion_path=""
+    local exclusion_summary=""
 
     local -a compressor=()
+    local -a exclusion_paths=()
     local -a pipeline_status=()
     local -a effective_tar_options=("${TAR_OPTIONS[@]}")
 
@@ -1795,20 +1907,18 @@ compress_directory() {
     LAST_COMPRESSION_FATAL=false
     LAST_COMPRESSION_ATTEMPTS=0
 
-    if [ "$EXCLUDE_REGENERABLE_PLEX_DATA" = "true" ] &&
-       [ "$name" = "$PLEX_APPDATA_DIR" ]
-    then
-        effective_tar_options+=(
-            "--exclude=${name}/Library/Application Support/Plex Media Server/Cache"
-            "--exclude=${name}/Library/Application Support/Plex Media Server/Codecs"
-            "--exclude=${name}/Library/Application Support/Plex Media Server/Crash Reports"
-            "--exclude=${name}/Library/Application Support/Plex Media Server/Logs"
-            "--exclude=${name}/Library/Application Support/Plex Media Server/Updates"
-            "--exclude=${name}/Library/Application Support/Plex Media Server/Plug-in Support/Caches"
-        )
+    while IFS= read -r -d '' exclusion_path; do
+        effective_tar_options+=("--exclude=${name}/${exclusion_path}")
+        exclusion_paths+=("$exclusion_path")
+    done < <(configured_exclusions_for_app "$name")
+
+    if [ "${#exclusion_paths[@]}" -gt 0 ]; then
+        for exclusion_path in "${exclusion_paths[@]}"; do
+            exclusion_summary+="${exclusion_summary:+, }${exclusion_path}"
+        done
 
         log "BACKUP" "INFO" \
-            "[${name}] Excluding regenerable Plex caches, codecs, crash reports, logs, and updates"
+            "[${name}] Excluding ${#exclusion_paths[@]} regenerable path(s): ${exclusion_summary}"
     fi
 
     if command -v pigz >/dev/null 2>&1; then
@@ -1816,17 +1926,20 @@ compress_directory() {
             compressor=(
                 pigz
                 -p "$PIGZ_THREADS"
+                -"$PIGZ_LEVEL"
                 -c
             )
         else
             compressor=(
                 pigz
+                -"$PIGZ_LEVEL"
                 -c
             )
         fi
     else
         compressor=(
             gzip
+            -"$PIGZ_LEVEL"
             -c
         )
     fi
@@ -1881,7 +1994,7 @@ compress_directory() {
             if verify_archive "$archive_tmp" "$error_file"; then
                 if mv -f -- "$archive_tmp" "$archive"; then
                     log "VERIFY" "INFO" \
-                        "[${name}] Archive passed gzip and tar verification"
+                        "[${name}] Archive passed compressed tar structure verification"
                     if record_archive_manifest_row "$name" "$archive"; then
                         return 0
                     fi
@@ -2060,7 +2173,7 @@ transfer_staged_backup() {
 
     if ! verify_backup_directory "$destination_partial" "$verify_log"; then
         log "STAGING" "ERROR" \
-            "Vault copy failed checksum or archive verification; staged generation was preserved"
+            "Vault copy failed checksum or manifest verification; staged generation was preserved"
         APPDATA_BACKUP_PATH="$staged_directory"
         STAGED_RECOVERY_PENDING=true
         return 1
@@ -2230,15 +2343,15 @@ run_appdata_backup() {
             APPDATA_FINALIZE_FAILED=1
             log "VERIFY" "ERROR" \
                 "Unable to create the checksum-protected backup manifest"
-        elif ! verify_backup_directory "$WORK_DIR" "$generation_error"; then
-            APPDATA_FINALIZE_FAILED=1
-            excerpt="$(tail -n 20 "$generation_error" 2>/dev/null || true)"
-            APPDATA_REPORT+="[FAILED] Generation verification"$'\n'
-            [ -n "$excerpt" ] && APPDATA_REPORT+="${excerpt}"$'\n'
-            log "VERIFY" "ERROR" \
-                "Completed generation failed full checksum/archive verification"
         elif [ "$BACKUP_MODE" = "destination" ]; then
-            if mv -- "$WORK_DIR" "$FINAL_DIR"; then
+            if ! verify_backup_directory "$WORK_DIR" "$generation_error"; then
+                APPDATA_FINALIZE_FAILED=1
+                excerpt="$(tail -n 20 "$generation_error" 2>/dev/null || true)"
+                APPDATA_REPORT+="[FAILED] Generation checksum verification"$'\n'
+                [ -n "$excerpt" ] && APPDATA_REPORT+="${excerpt}"$'\n'
+                log "VERIFY" "ERROR" \
+                    "Completed generation failed checksum or manifest verification"
+            elif mv -- "$WORK_DIR" "$FINAL_DIR"; then
                 APPDATA_BACKUP_PATH="$FINAL_DIR"
 
                 log "BACKUP" "INFO" \
@@ -2253,17 +2366,20 @@ run_appdata_backup() {
                 fi
 
                 return 0
+            else
+                APPDATA_FINALIZE_FAILED=1
+                log "BACKUP" "ERROR" \
+                    "Unable to promote partial backup directory to final backup directory"
             fi
-
-            APPDATA_FINALIZE_FAILED=1
-            log "BACKUP" "ERROR" \
-                "Unable to promote partial backup directory to final backup directory"
         else
             if mv -- "$WORK_DIR" "$STAGED_DIR"; then
                 APPDATA_BACKUP_PATH="$STAGED_DIR"
                 log "STAGING" "INFO" \
-                    "Replacement completed and verified on staging: $STAGED_DIR"
+                    "Replacement completed and archive-tested on staging: $STAGED_DIR"
 
+                # transfer_staged_backup performs the one complete staged
+                # checksum pass before the previous vault generation is
+                # retired, then verifies the copied vault generation once.
                 if transfer_staged_backup "$STAGED_DIR"; then
                     return 0
                 fi

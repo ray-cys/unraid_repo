@@ -62,7 +62,26 @@ if [ "${MOCK_RSYNC_FAIL:-0}" = "1" ]; then
     printf 'simulated rsync failure\n' >&2
     exit 23
 fi
-exec /usr/bin/rsync "$@"
+
+/usr/bin/rsync "$@" || exit $?
+
+if [ "${MOCK_RSYNC_CORRUPT:-0}" = "1" ]; then
+    destination=""
+    for argument do
+        destination="$argument"
+    done
+
+    archive="$(
+        find "$destination" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type f \
+            -name '*.tar.gz' \
+            -print \
+            -quit
+    )"
+    [ -n "$archive" ] && printf 'simulated corruption\n' >>"$archive"
+fi
 EOF
 
     chmod +x \
@@ -142,6 +161,17 @@ count_generations() {
 # Auto mode selects alternate staging when mocked vault capacity is too low
 ###############################################################################
 
+(
+    unset PIGZ_THREADS PIGZ_LEVEL USE_LOW_PRIORITY_IO
+
+    # shellcheck disable=SC1090
+    source "$SCRIPT"
+
+    [ "$PIGZ_THREADS" -eq 6 ]
+    [ "$PIGZ_LEVEL" -eq 3 ]
+    [ "$USE_LOW_PRIORITY_IO" = "false" ]
+) || fail "performance-oriented compression defaults are incorrect"
+
 AUTO_ROOT="${TEST_ROOT}/auto-selection"
 make_layout "$AUTO_ROOT"
 
@@ -185,13 +215,16 @@ make_layout "$DIRECT_ROOT"
 mkdir -p \
     "$DIRECT_ROOT/source/app-one" \
     "$DIRECT_ROOT/source/plex-media-server/Library/Application Support/Plex Media Server/Cache" \
-    "$DIRECT_ROOT/source/plex-media-server/Library/Application Support/Plex Media Server/Metadata"
+    "$DIRECT_ROOT/source/plex-media-server/Library/Application Support/Plex Media Server/Metadata" \
+    "$DIRECT_ROOT/source/radarr/logs"
 
 printf 'application data\n' >"$DIRECT_ROOT/source/app-one/data.txt"
 printf 'regenerable cache\n' \
     >"$DIRECT_ROOT/source/plex-media-server/Library/Application Support/Plex Media Server/Cache/cache.bin"
 printf 'required metadata\n' \
     >"$DIRECT_ROOT/source/plex-media-server/Library/Application Support/Plex Media Server/Metadata/metadata.db"
+printf 'required configuration\n' >"$DIRECT_ROOT/source/radarr/config.xml"
+printf 'regenerable log\n' >"$DIRECT_ROOT/source/radarr/logs/radarr.txt"
 
 run_backup "$DIRECT_ROOT" destination "$DIRECT_ROOT/direct.out" ||
     fail "direct backup failed"
@@ -209,6 +242,10 @@ tar -tzf "$DIRECT_GENERATION/plex-media-server.tar.gz" \
     >"$DIRECT_ROOT/plex.list"
 assert_contains "$DIRECT_ROOT/plex.list" "Metadata/metadata.db"
 assert_not_contains "$DIRECT_ROOT/plex.list" "Cache/cache.bin"
+
+tar -tzf "$DIRECT_GENERATION/radarr.tar.gz" >"$DIRECT_ROOT/radarr.list"
+assert_contains "$DIRECT_ROOT/radarr.list" "radarr/config.xml"
+assert_not_contains "$DIRECT_ROOT/radarr.list" "radarr/logs/radarr.txt"
 
 
 ###############################################################################
@@ -232,7 +269,7 @@ fi
 
 assert_contains "$DIRECT_ROOT/staging.out" "method=verified manifest history"
 assert_contains "$DIRECT_ROOT/staging.out" \
-    "history=2 app(s)"
+    "history=3 app(s)"
 assert_contains "$DIRECT_ROOT/staging.out" \
     "[app-two] Measuring source size (no usable archive history or full scan requested)"
 assert_not_contains "$DIRECT_ROOT/staging.out" \
@@ -282,6 +319,42 @@ assert_contains "$DIRECT_ROOT/staging-recovery.out" \
 
 [ "$(count_generations "$DIRECT_ROOT")" -eq 1 ] ||
     fail "staging recovery did not leave exactly one vault generation"
+
+
+###############################################################################
+# Post-copy checksum detects corruption without repeated decompression
+###############################################################################
+
+sleep 1
+printf 'checksum generation\n' >>"$DIRECT_ROOT/source/app-one/data.txt"
+
+if run_backup \
+    "$DIRECT_ROOT" \
+    staging \
+    "$DIRECT_ROOT/checksum-failure.out" \
+    MOCK_RSYNC_CORRUPT=1
+then
+    fail "corrupted staged transfer unexpectedly passed checksum verification"
+fi
+
+assert_contains "$DIRECT_ROOT/checksum-failure.out" \
+    "Vault copy failed checksum or manifest verification"
+
+PENDING_STAGED="$(
+    find "$DIRECT_ROOT/staging" \
+        -mindepth 1 \
+        -maxdepth 1 \
+        -type d \
+        -name 'backup_*.staged' \
+        -print |
+        head -n 1
+)"
+
+[ -n "$PENDING_STAGED" ] ||
+    fail "verified staged generation was not preserved after checksum failure"
+
+run_backup "$DIRECT_ROOT" auto "$DIRECT_ROOT/checksum-recovery.out" ||
+    fail "checksum-failed transfer was not recovered from verified staging"
 
 
 ###############################################################################
