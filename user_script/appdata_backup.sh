@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Appdata + Optional Shares Backup v3.2
+# Appdata + Optional Shares Backup v3.3
 #
 # PURPOSE
 # -------
@@ -14,10 +14,10 @@
 #   2. Estimate compressed size from the last verified generation, measuring
 #      only applications that do not have usable archive history
 #   3. Select the vault or an alternate verified staging location
-#   4. Record currently-running Docker containers
-#   5. Stop selected running containers
-#   6. Compress each top-level appdata directory
-#   7. Verify every archive and write a checksum-protected size manifest
+#   4. Map running containers to their mounted appdata directories
+#   5. Stop only the owner(s) of each appdata directory being archived
+#   6. Compress and verify that directory, then restart its owner(s)
+#   7. Write a checksum-protected generation manifest
 #   8. Promote the .partial backup only when the entire generation succeeds
 #   9. If staged, retain it while retiring the old vault generation, then copy
 #      it to the vault and verify the vault copy again
@@ -29,8 +29,11 @@
 #
 # SAFETY
 # ------
-# - Only containers that were running before the backup are restarted.
-# - A failed container stop aborts the appdata backup.
+# - Unrelated containers remain running. An appdata owner is stopped only for
+#   its archive and is restarted immediately afterward whenever possible.
+# - Shared or multi-directory owners remain stopped until all their mapped
+#   appdata directories have been archived.
+# - A failed owner stop prevents its live appdata from being archived.
 # - An EXIT/signal trap attempts to restart containers if the script exits
 #   unexpectedly after stopping them.
 # - The previous successful backup is retained until the new backup has been
@@ -56,7 +59,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="3.2"
+readonly SCRIPT_VERSION="3.3"
 
 
 ###############################################################################
@@ -188,6 +191,14 @@ TAR_OPTIONS=()
 # Databases, configuration, queue state, torrent state, and backup folders are
 # not excluded. Add or remove entries to match locally-installed applications.
 APPDATA_EXCLUDES=(
+    "plex-media-server|Library/Application Support/Plex Media Server/Cache"
+    "plex-media-server|Library/Application Support/Plex Media Server/Codecs"
+    "plex-media-server|Library/Application Support/Plex Media Server/Crash Reports"
+    "plex-media-server|Library/Application Support/Plex Media Server/Diagnostics"
+    "plex-media-server|Library/Application Support/Plex Media Server/Logs"
+    "plex-media-server|Library/Application Support/Plex Media Server/Media"
+    "plex-media-server|Library/Application Support/Plex Media Server/Updates"
+    "plex-media-server|Library/Application Support/Plex Media Server/Plug-in Support/Caches"
     "sonarr|logs"
     "sonarr|MediaCover"
     "sonarr|logs.db"
@@ -218,6 +229,33 @@ APPDATA_EXCLUDES=(
     "kometa|cache"
     "qbittorrent|qBittorrent/logs"
 )
+
+# Alternate host paths that expose the same appdata tree as SRC_DIR. This lets
+# Docker mounts using the Unraid user-share path map back to a source backed up
+# directly through its cache-pool path.
+APPDATA_PATH_ALIASES=(
+    "/mnt/user/appdata"
+)
+
+# Additional directories to include as independently verified archives in the
+# same backup generation.
+#
+# Format: "archive-name|owning-appdata-directory|absolute-source-path"
+#
+# The owner field links the additional source to the same Docker container
+# lifecycle as its appdata directory. This is intended for data deliberately
+# bind-mounted outside SRC_DIR, such as Plex scheduled database backups.
+PLEX_DATABASE_BACKUP_PATH="${PLEX_DATABASE_BACKUP_PATH-/mnt/vault/backup/plex_db/hubble}"
+
+EXTRA_ARCHIVE_SOURCES=(
+    # "another-archive|owning-appdata-directory|/absolute/source/path"
+)
+
+if [ -n "$PLEX_DATABASE_BACKUP_PATH" ]; then
+    EXTRA_ARCHIVE_SOURCES+=(
+        "plex-database-backups|plex-media-server|${PLEX_DATABASE_BACKUP_PATH}"
+    )
+fi
 
 
 # ---------------------------------------------------------------------------
@@ -280,12 +318,6 @@ LOW_SPACE_MARGIN="${LOW_SPACE_MARGIN:-0}"
 #   warn  = log warning and continue
 #
 LOW_SPACE_ACTION="${LOW_SPACE_ACTION:-abort}"
-
-# Exclude only regenerable Plex data. Databases, Metadata, Media artwork, and
-# preferences remain in the backup.
-EXCLUDE_REGENERABLE_PLEX_DATA="${EXCLUDE_REGENERABLE_PLEX_DATA:-true}"
-PLEX_APPDATA_DIR="${PLEX_APPDATA_DIR:-plex-media-server}"
-
 
 # ---------------------------------------------------------------------------
 # Optional additional share mirrors
@@ -357,6 +389,14 @@ declare -a APPDATA_DIRS=()
 declare -a RUNNING_CONTAINERS=()
 declare -a TARGET_CONTAINERS=()
 declare -a PRIORITY_PREFIX=()
+declare -A APP_CONTAINERS=()
+declare -A CONTAINER_APP_NAMES=()
+declare -A CONTAINER_PENDING_APPS=()
+declare -A CONTAINER_STOPPED=()
+declare -A ELIGIBLE_APPDATA=()
+declare -A NORMAL_APPDATA=()
+declare -A ARCHIVE_NAME_BY_PATH=()
+declare -A EXTRA_ARCHIVE_OWNER=()
 declare -A CURRENT_RAW_BYTES=()
 declare -A PREVIOUS_RAW_BYTES=()
 declare -A PREVIOUS_ARCHIVE_BYTES=()
@@ -528,23 +568,22 @@ array_contains() {
 }
 
 
+archive_name_for_directory() {
+    local directory="$1"
+
+    if [ -n "${ARCHIVE_NAME_BY_PATH[$directory]:-}" ]; then
+        printf '%s\n' "${ARCHIVE_NAME_BY_PATH[$directory]}"
+    else
+        basename "$directory"
+    fi
+}
+
+
 configured_exclusions_for_app() {
     local name="$1"
     local rule=""
     local exclusion_app=""
     local exclusion_path=""
-
-    if [ "$EXCLUDE_REGENERABLE_PLEX_DATA" = "true" ] &&
-       [ "$name" = "$PLEX_APPDATA_DIR" ]
-    then
-        printf '%s\0' \
-            "Library/Application Support/Plex Media Server/Cache" \
-            "Library/Application Support/Plex Media Server/Codecs" \
-            "Library/Application Support/Plex Media Server/Crash Reports" \
-            "Library/Application Support/Plex Media Server/Logs" \
-            "Library/Application Support/Plex Media Server/Updates" \
-            "Library/Application Support/Plex Media Server/Plug-in Support/Caches"
-    fi
 
     for rule in "${APPDATA_EXCLUDES[@]}"; do
         IFS='|' read -r exclusion_app exclusion_path <<<"$rule"
@@ -587,6 +626,90 @@ validate_appdata_exclusions() {
             /*|.|..|./*|../*|*/.|*/..|*/./*|*/../*|*'*'*|*'?'*|*'['*)
                 log "PREFLIGHT" "ERROR" \
                     "APPDATA_EXCLUDES paths must be exact, relative, and traversal-free: $rule"
+                return 1
+                ;;
+        esac
+    done
+
+    return 0
+}
+
+
+validate_appdata_path_aliases() {
+    local alias_path=""
+
+    for alias_path in "${APPDATA_PATH_ALIASES[@]}"; do
+        if [ -z "$alias_path" ] || [ "$alias_path" = "/" ] ||
+           [[ "$alias_path" != /* ]] ||
+           [[ "$alias_path" == *$'\t'* ]] ||
+           [[ "$alias_path" == *$'\n'* ]]
+        then
+            log "PREFLIGHT" "ERROR" \
+                "APPDATA_PATH_ALIASES entries must be safe absolute paths: $alias_path"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+
+validate_extra_archive_sources() {
+    local descriptor=""
+    local remainder=""
+    local archive_name=""
+    local owner_name=""
+    local source_path=""
+    local extra_field=""
+    local -A seen_names=()
+
+    for descriptor in "${EXTRA_ARCHIVE_SOURCES[@]}"; do
+        remainder="${descriptor#*|}"
+        if [ "$remainder" = "$descriptor" ] ||
+           [ "${remainder#*|}" = "$remainder" ] ||
+           [[ "${remainder#*|}" == *"|"* ]]
+        then
+            log "PREFLIGHT" "ERROR" \
+                "Invalid EXTRA_ARCHIVE_SOURCES entry; expected archive|owner|/absolute/path: $descriptor"
+            return 1
+        fi
+
+        IFS='|' read -r archive_name owner_name source_path extra_field \
+            <<<"$descriptor"
+
+        if [ -z "$archive_name" ] || [ -z "$owner_name" ] ||
+           [ -z "$source_path" ] || [ -n "$extra_field" ] ||
+           [ "$archive_name" = "." ] || [ "$archive_name" = ".." ] ||
+           [[ "$archive_name" == */* ]] ||
+           [[ "$owner_name" == */* ]] ||
+           [[ "$source_path" != /* ]] || [ "$source_path" = "/" ] ||
+           [[ "$descriptor" == *$'\t'* ]] ||
+           [[ "$descriptor" == *$'\n'* ]]
+        then
+            log "PREFLIGHT" "ERROR" \
+                "Unsafe EXTRA_ARCHIVE_SOURCES entry: $descriptor"
+            return 1
+        fi
+
+        if [ "${seen_names[$archive_name]:-0}" = "1" ]; then
+            log "PREFLIGHT" "ERROR" \
+                "Duplicate EXTRA_ARCHIVE_SOURCES archive name: $archive_name"
+            return 1
+        fi
+        seen_names["$archive_name"]=1
+
+        case "${source_path%/}/" in
+            "${SRC_DIR%/}/"*|"${DEST_DIR%/}/"*|"${STAGING_DIR%/}/"*)
+                log "PREFLIGHT" "ERROR" \
+                    "EXTRA_ARCHIVE_SOURCES path must be outside source, destination, and staging trees: $source_path"
+                return 1
+                ;;
+        esac
+
+        case "${DEST_DIR%/}/" in
+            "${source_path%/}/"*)
+                log "PREFLIGHT" "ERROR" \
+                    "EXTRA_ARCHIVE_SOURCES path must not contain the destination tree: $source_path"
                 return 1
                 ;;
         esac
@@ -927,17 +1050,15 @@ validate_configuration() {
         esac
     fi
 
-    case "$EXCLUDE_REGENERABLE_PLEX_DATA" in
-        true|false)
-            ;;
-        *)
-            log "PREFLIGHT" "ERROR" \
-                "EXCLUDE_REGENERABLE_PLEX_DATA must be true or false"
-            return 1
-            ;;
-    esac
-
     if ! validate_appdata_exclusions; then
+        return 1
+    fi
+
+    if ! validate_appdata_path_aliases; then
+        return 1
+    fi
+
+    if ! validate_extra_archive_sources; then
         return 1
     fi
 
@@ -1026,9 +1147,19 @@ refresh_destination_space() {
 collect_appdata_directories() {
     local directory=""
     local name=""
+    local descriptor=""
+    local owner_name=""
+    local source_path=""
+    local existing_name=""
+    local inserted=false
+    local -a ordered_directories=()
 
     APPDATA_DIRS=()
     CURRENT_RAW_BYTES=()
+    ELIGIBLE_APPDATA=()
+    NORMAL_APPDATA=()
+    ARCHIVE_NAME_BY_PATH=()
+    EXTRA_ARCHIVE_OWNER=()
 
     RAW_TOTAL_BYTES=0
     RAW_MEASURED_COUNT=0
@@ -1040,7 +1171,7 @@ collect_appdata_directories() {
         APPDATA_DIRS+=("$directory")
         APPDATA_TOTAL=$((APPDATA_TOTAL + 1))
 
-        name="$(basename "$directory")"
+        name="$(archive_name_for_directory "$directory")"
 
         if [[ "$name" == *$'\t'* || "$name" == *$'\n'* ]]; then
             log "PREFLIGHT" "ERROR" \
@@ -1053,6 +1184,8 @@ collect_appdata_directories() {
         fi
 
         APPDATA_ELIGIBLE=$((APPDATA_ELIGIBLE + 1))
+        ELIGIBLE_APPDATA["$name"]=1
+        NORMAL_APPDATA["$name"]=1
     done < <(
         find "$SRC_DIR" \
             -mindepth 1 \
@@ -1061,8 +1194,68 @@ collect_appdata_directories() {
             -print0
     )
 
+    for descriptor in "${EXTRA_ARCHIVE_SOURCES[@]}"; do
+        IFS='|' read -r name owner_name source_path <<<"$descriptor"
+        source_path="${source_path%/}"
+
+        if [ ! -d "$source_path" ] || [ ! -r "$source_path" ]; then
+            log "PREFLIGHT" "ERROR" \
+                "Additional archive source is unavailable or unreadable: $source_path"
+            return 1
+        fi
+
+        if [ "${ELIGIBLE_APPDATA[$name]:-0}" = "1" ]; then
+            log "PREFLIGHT" "ERROR" \
+                "Additional archive name conflicts with an appdata directory: $name"
+            return 1
+        fi
+
+        if [ "${NORMAL_APPDATA[$owner_name]:-0}" != "1" ]; then
+            log "PREFLIGHT" "ERROR" \
+                "Additional archive owner is not an eligible appdata directory: ${name} -> ${owner_name}"
+            return 1
+        fi
+
+        if [ -n "${ARCHIVE_NAME_BY_PATH[$source_path]:-}" ]; then
+            log "PREFLIGHT" "ERROR" \
+                "Additional archive source path is configured more than once: $source_path"
+            return 1
+        fi
+
+        ordered_directories=()
+        inserted=false
+
+        for directory in "${APPDATA_DIRS[@]}"; do
+            ordered_directories+=("$directory")
+            existing_name="$(archive_name_for_directory "$directory")"
+
+            if [ "$inserted" = "false" ] &&
+               [ "$existing_name" = "$owner_name" ]
+            then
+                ordered_directories+=("$source_path")
+                inserted=true
+            fi
+        done
+
+        if [ "$inserted" != "true" ]; then
+            log "PREFLIGHT" "ERROR" \
+                "Unable to place additional archive beside its owner: ${name} -> ${owner_name}"
+            return 1
+        fi
+
+        APPDATA_DIRS=("${ordered_directories[@]}")
+        APPDATA_TOTAL=$((APPDATA_TOTAL + 1))
+        APPDATA_ELIGIBLE=$((APPDATA_ELIGIBLE + 1))
+        ELIGIBLE_APPDATA["$name"]=1
+        ARCHIVE_NAME_BY_PATH["$source_path"]="$name"
+        EXTRA_ARCHIVE_OWNER["$name"]="$owner_name"
+
+        log "PREFLIGHT" "INFO" \
+            "Added external archive source: ${name} (${source_path}), owner=${owner_name}"
+    done
+
     log "PREFLIGHT" "INFO" \
-        "Found ${APPDATA_TOTAL} top-level appdata directories; ${APPDATA_ELIGIBLE} eligible for backup; size mode=${PREFLIGHT_SIZE_MODE}"
+        "Found ${APPDATA_TOTAL} backup source(s); ${APPDATA_ELIGIBLE} eligible for backup; size mode=${PREFLIGHT_SIZE_MODE}"
 
     if [ "$APPDATA_TOTAL" -eq 0 ]; then
         log "PREFLIGHT" "ERROR" \
@@ -1175,7 +1368,7 @@ calculate_space_estimate() {
         "Preparing capacity estimate for ${APPDATA_ELIGIBLE} application(s)"
 
     for directory in "${APPDATA_DIRS[@]}"; do
-        name="$(basename "$directory")"
+        name="$(archive_name_for_directory "$directory")"
 
         if array_contains "$name" "${SKIP_APPDATA_DIRS[@]}"; then
             continue
@@ -1482,12 +1675,80 @@ prune_partial_backups() {
 # DOCKER CONTAINER CONTROL
 ###############################################################################
 
+add_container_app_mapping() {
+    local container="$1"
+    local app_name="$2"
+    local mapped_container=""
+    local current="${APP_CONTAINERS[$app_name]:-}"
+
+    for mapped_container in $current; do
+        [ "$mapped_container" = "$container" ] && return 0
+    done
+
+    APP_CONTAINERS["$app_name"]="${current:+${current} }${container}"
+    CONTAINER_APP_NAMES["$container"]="${CONTAINER_APP_NAMES[$container]:+${CONTAINER_APP_NAMES[$container]} }${app_name}"
+    CONTAINER_PENDING_APPS["$container"]=$((${CONTAINER_PENDING_APPS[$container]:-0} + 1))
+}
+
+
+map_container_mount_source() {
+    local container="$1"
+    local mount_source="${2%/}"
+    local source_root=""
+    local relative=""
+    local app_name=""
+    local directory=""
+    local -a source_roots=("${SRC_DIR%/}" "${APPDATA_PATH_ALIASES[@]}")
+
+    [ -n "$mount_source" ] || return 1
+
+    for source_root in "${source_roots[@]}"; do
+        source_root="${source_root%/}"
+
+        if [ "$mount_source" = "$source_root" ]; then
+            for directory in "${APPDATA_DIRS[@]}"; do
+                app_name="$(archive_name_for_directory "$directory")"
+                [ "${NORMAL_APPDATA[$app_name]:-0}" = "1" ] || continue
+                add_container_app_mapping "$container" "$app_name"
+            done
+            return 0
+        fi
+
+        case "$mount_source" in
+            "${source_root}/"*)
+                relative="${mount_source#"${source_root}"/}"
+                app_name="${relative%%/*}"
+
+                if [ "${ELIGIBLE_APPDATA[$app_name]:-0}" = "1" ]; then
+                    add_container_app_mapping "$container" "$app_name"
+                    return 0
+                fi
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+
 discover_target_containers() {
     local docker_output=""
     local container=""
+    local mount_output=""
+    local mount_source=""
+    local _mount_destination=""
+    local pending_before=0
+    local inspect_failed=0
+    local extra_name=""
+    local owner_name=""
+    local mapped_container=""
 
     RUNNING_CONTAINERS=()
     TARGET_CONTAINERS=()
+    APP_CONTAINERS=()
+    CONTAINER_APP_NAMES=()
+    CONTAINER_PENDING_APPS=()
+    CONTAINER_STOPPED=()
 
     if ! docker_output="$(docker ps --format '{{.Names}}' 2>/dev/null)"; then
         log "DOCKER" "WARN" \
@@ -1506,32 +1767,79 @@ discover_target_containers() {
             continue
         fi
 
-        TARGET_CONTAINERS+=("$container")
+        if ! mount_output="$(
+            docker inspect \
+                -f '{{range .Mounts}}{{printf "%s\t%s\n" .Source .Destination}}{{end}}' \
+                "$container" \
+                2>/dev/null
+        )"
+        then
+            log "DOCKER" "ERROR" \
+                "Unable to inspect appdata mounts for running container: $container"
+            inspect_failed=1
+            continue
+        fi
+
+        pending_before="${CONTAINER_PENDING_APPS[$container]:-0}"
+
+        while IFS=$'\t' read -r mount_source _mount_destination; do
+            [ -n "$mount_source" ] || continue
+            map_container_mount_source "$container" "$mount_source" || true
+        done <<<"$mount_output"
+
+        for extra_name in "${!EXTRA_ARCHIVE_OWNER[@]}"; do
+            owner_name="${EXTRA_ARCHIVE_OWNER[$extra_name]}"
+
+            for mapped_container in ${APP_CONTAINERS[$owner_name]:-}; do
+                if [ "$mapped_container" = "$container" ]; then
+                    add_container_app_mapping "$container" "$extra_name"
+                    break
+                fi
+            done
+        done
+
+        if [ "${CONTAINER_PENDING_APPS[$container]:-0}" -gt "$pending_before" ]; then
+            TARGET_CONTAINERS+=("$container")
+            CONTAINER_STOPPED["$container"]=false
+            log "DOCKER" "INFO" \
+                "Container ownership: ${container} -> ${CONTAINER_APP_NAMES[$container]}"
+        else
+            log "DOCKER" "INFO" \
+                "Leaving unrelated container running: $container"
+        fi
 
     done <<<"$docker_output"
 
     log "DOCKER" "INFO" \
-        "Running containers=${#RUNNING_CONTAINERS[@]}, containers to stop=${#TARGET_CONTAINERS[@]}"
+        "Running containers=${#RUNNING_CONTAINERS[@]}, appdata-owned containers=${#TARGET_CONTAINERS[@]}"
+
+    [ "$inspect_failed" -eq 0 ]
 }
 
 
-stop_target_containers() {
+stop_containers_for_app() {
+    local app_name="$1"
     local container=""
     local running_state=""
     local failed=0
+    local owners="${APP_CONTAINERS[$app_name]:-}"
 
-    if [ "${#TARGET_CONTAINERS[@]}" -eq 0 ]; then
-        log "DOCKER" "INFO" "No running containers need to be stopped"
+    if [ -z "$owners" ]; then
+        log "DOCKER" "INFO" \
+            "[${app_name}] No running container owns this appdata directory"
         return 0
     fi
 
-    # Set before the first stop so the EXIT trap can recover from interruption
-    # during the stop sequence itself.
-    CONTAINERS_NEED_RESTART=true
+    for container in $owners; do
+        [ "${CONTAINER_STOPPED[$container]:-false}" = "true" ] && continue
 
-    for container in "${TARGET_CONTAINERS[@]}"; do
-        log "DOCKER" "INFO" "Stopping container: $container"
+        # Mark before stopping so the EXIT trap can recover if interruption
+        # occurs during docker stop or its subsequent state inspection.
+        CONTAINERS_NEED_RESTART=true
+        CONTAINER_STOPPED["$container"]=true
 
+        log "DOCKER" "INFO" \
+            "[${app_name}] Stopping owning container: $container"
         docker stop "$container" >/dev/null 2>&1 || true
 
         running_state="$(
@@ -1543,14 +1851,87 @@ stop_target_containers() {
         )"
 
         if [ "$running_state" = "false" ]; then
-            log "DOCKER" "INFO" "Stopped container: $container"
+            log "DOCKER" "INFO" \
+                "[${app_name}] Stopped owning container: $container"
         else
             log "DOCKER" "ERROR" \
-                "Container did not stop successfully: $container"
+                "[${app_name}] Container did not stop successfully: $container"
             failed=1
         fi
     done
 
+    return "$failed"
+}
+
+
+start_container_with_retry() {
+    local container="$1"
+    local running_state=""
+    local attempt=0
+
+    [ "${CONTAINER_STOPPED[$container]:-false}" = "true" ] || return 0
+
+    for attempt in 1 2; do
+        docker start "$container" >/dev/null 2>&1 || true
+
+        running_state="$(
+            docker inspect \
+                -f '{{.State.Running}}' \
+                "$container" \
+                2>/dev/null ||
+                true
+        )"
+
+        if [ "$running_state" = "true" ]; then
+            CONTAINER_STOPPED["$container"]=false
+            log "DOCKER" "INFO" "Started container: $container"
+            return 0
+        fi
+
+        [ "$attempt" -lt 2 ] && sleep 2
+    done
+
+    log "DOCKER" "ERROR" \
+        "Failed to restart container: $container"
+    return 1
+}
+
+
+refresh_restart_requirement() {
+    local container=""
+
+    CONTAINERS_NEED_RESTART=false
+
+    for container in "${TARGET_CONTAINERS[@]}"; do
+        if [ "${CONTAINER_STOPPED[$container]:-false}" = "true" ]; then
+            CONTAINERS_NEED_RESTART=true
+            return 0
+        fi
+    done
+}
+
+
+complete_container_scope_for_app() {
+    local app_name="$1"
+    local container=""
+    local pending=0
+    local failed=0
+    local owners="${APP_CONTAINERS[$app_name]:-}"
+
+    for container in $owners; do
+        pending="${CONTAINER_PENDING_APPS[$container]:-0}"
+        [ "$pending" -gt 0 ] && pending=$((pending - 1))
+        CONTAINER_PENDING_APPS["$container"]="$pending"
+
+        if [ "$pending" -eq 0 ]; then
+            start_container_with_retry "$container" || failed=1
+        else
+            log "DOCKER" "INFO" \
+                "[${app_name}] Keeping shared container stopped for ${pending} remaining appdata archive(s): $container"
+        fi
+    done
+
+    refresh_restart_requirement
     return "$failed"
 }
 
@@ -1561,6 +1942,7 @@ emergency_restart_containers() {
     [ "$CONTAINERS_NEED_RESTART" = "true" ] || return 0
 
     for container in "${TARGET_CONTAINERS[@]}"; do
+        [ "${CONTAINER_STOPPED[$container]:-false}" = "true" ] || continue
         docker start "$container" >/dev/null 2>&1 || true
     done
 }
@@ -1568,9 +1950,6 @@ emergency_restart_containers() {
 
 restart_target_containers() {
     local container=""
-    local running_state=""
-    local attempt=0
-    local started=0
 
     RESTART_FAILED=0
 
@@ -1580,44 +1959,17 @@ restart_target_containers() {
     fi
 
     log "DOCKER" "INFO" \
-        "Restarting ${#TARGET_CONTAINERS[@]} previously-running container(s)"
+        "Checking ${#TARGET_CONTAINERS[@]} appdata-owned container(s) for pending restart"
 
     for container in "${TARGET_CONTAINERS[@]}"; do
-        started=0
+        [ "${CONTAINER_STOPPED[$container]:-false}" = "true" ] || continue
 
-        for attempt in 1 2; do
-            docker start "$container" >/dev/null 2>&1 || true
-
-            running_state="$(
-                docker inspect \
-                    -f '{{.State.Running}}' \
-                    "$container" \
-                    2>/dev/null ||
-                    true
-            )"
-
-            if [ "$running_state" = "true" ]; then
-                started=1
-                break
-            fi
-
-            if [ "$attempt" -lt 2 ]; then
-                sleep 2
-            fi
-        done
-
-        if [ "$started" -eq 1 ]; then
-            log "DOCKER" "INFO" "Started container: $container"
-        else
+        if ! start_container_with_retry "$container"; then
             RESTART_FAILED=$((RESTART_FAILED + 1))
-            log "DOCKER" "ERROR" \
-                "Failed to restart container: $container"
         fi
     done
 
-    # Explicit recovery has completed. Unexpected exits before this function
-    # are handled by the EXIT trap.
-    CONTAINERS_NEED_RESTART=false
+    refresh_restart_requirement
 
     [ "$RESTART_FAILED" -eq 0 ]
 }
@@ -1882,10 +2234,13 @@ record_archive_manifest_row() {
 
 compress_directory() {
     local name="$1"
+    local source_directory="$2"
 
     local archive="${WORK_DIR}/${name}.tar.gz"
     local archive_tmp="${archive}.tmp"
     local error_file="${TEMP_DIR}/${name}.err"
+    local source_parent=""
+    local source_entry=""
 
     local attempt=0
     local tar_status=0
@@ -1907,8 +2262,11 @@ compress_directory() {
     LAST_COMPRESSION_FATAL=false
     LAST_COMPRESSION_ATTEMPTS=0
 
+    source_parent="$(dirname "$source_directory")"
+    source_entry="$(basename "$source_directory")"
+
     while IFS= read -r -d '' exclusion_path; do
-        effective_tar_options+=("--exclude=${name}/${exclusion_path}")
+        effective_tar_options+=("--exclude=${source_entry}/${exclusion_path}")
         exclusion_paths+=("$exclusion_path")
     done < <(configured_exclusions_for_app "$name")
 
@@ -1966,10 +2324,10 @@ compress_directory() {
 
         "${PRIORITY_PREFIX[@]}" \
             tar \
-            -C "$SRC_DIR" \
+            -C "$source_parent" \
             -cf - \
             "${effective_tar_options[@]}" \
-            -- "$name" \
+            -- "$source_entry" \
             2>>"$error_file" |
             "${PRIORITY_PREFIX[@]}" \
                 "${compressor[@]}" \
@@ -2246,6 +2604,7 @@ run_appdata_backup() {
     local error_file=""
     local excerpt=""
     local predicted_bytes=0
+    local stop_archive_phase=false
     local generation_error="${TEMP_DIR}/generation-verify.err"
 
     APPDATA_OK=0
@@ -2261,7 +2620,7 @@ run_appdata_backup() {
         "Starting appdata archive phase"
 
     for directory in "${APPDATA_DIRS[@]}"; do
-        name="$(basename "$directory")"
+        name="$(archive_name_for_directory "$directory")"
 
         if array_contains "$name" "${SKIP_APPDATA_DIRS[@]}"; then
             APPDATA_SKIPPED=$((APPDATA_SKIPPED + 1))
@@ -2274,10 +2633,19 @@ run_appdata_backup() {
             continue
         fi
 
+        if ! stop_containers_for_app "$name"; then
+            APPDATA_FAILED=$((APPDATA_FAILED + 1))
+            APPDATA_REPORT+="[FAILED] [${name}] owning container could not be stopped safely"$'\n'
+            log "DOCKER" "ERROR" \
+                "[${name}] Archive skipped because an owning container did not stop"
+            restart_target_containers || true
+            break
+        fi
+
         log "DOCKER" "INFO" \
             "[${name}] Creating archive"
 
-        if compress_directory "$name"; then
+        if compress_directory "$name" "$directory"; then
             archive="${WORK_DIR}/${name}.tar.gz"
             archive_bytes="$(file_size_bytes "$archive")"
             archive_human="$(bytes_to_human "$archive_bytes")"
@@ -2333,12 +2701,35 @@ run_appdata_backup() {
             if [ "$LAST_COMPRESSION_FATAL" = "true" ]; then
                 log "BACKUP" "ERROR" \
                     "Stopping the archive phase after a fatal capacity or process failure"
-                break
+                stop_archive_phase=true
             fi
         fi
+
+        if ! complete_container_scope_for_app "$name"; then
+            log "DOCKER" "ERROR" \
+                "[${name}] One or more owning containers remain stopped; final recovery will retry them"
+            APPDATA_FINALIZE_FAILED=1
+            APPDATA_REPORT+="[FAILED] Archive phase stopped for container recovery"$'\n'
+            stop_archive_phase=true
+        fi
+
+        [ "$stop_archive_phase" = "true" ] && break
     done
 
-    if [ "$APPDATA_FAILED" -eq 0 ]; then
+    # Normally every single-directory owner has already restarted immediately
+    # after its archive. This catches shared/multi-directory owners after an
+    # interrupted archive sequence and prevents staging transfer from extending
+    # their downtime.
+    if ! restart_target_containers; then
+        APPDATA_FINALIZE_FAILED=1
+        APPDATA_REPORT+="[FAILED] One or more containers could not be restarted"$'\n'
+        log "DOCKER" "ERROR" \
+            "Generation finalization skipped while appdata-owned containers remain stopped"
+    fi
+
+    if [ "$APPDATA_FAILED" -eq 0 ] &&
+       [ "$APPDATA_FINALIZE_FAILED" -eq 0 ]
+    then
         if ! create_backup_manifest; then
             APPDATA_FINALIZE_FAILED=1
             log "VERIFY" "ERROR" \
@@ -2981,25 +3372,19 @@ ${WORK_DIR}"
 
 
     # -----------------------------------------------------------------------
-    # Stop Docker containers
+    # Map running containers to their owned appdata directories
     # -----------------------------------------------------------------------
 
-    discover_target_containers
-
-    if ! stop_target_containers; then
+    if ! discover_target_containers; then
         log "DOCKER" "ERROR" \
-            "One or more containers failed to stop; appdata backup will not continue"
-
-        # Do an explicit restart before returning. The EXIT trap remains as a
-        # secondary safety mechanism.
-        restart_target_containers || true
+            "One or more running containers could not be inspected safely"
 
         rm -rf -- "$WORK_DIR" 2>/dev/null || true
 
         notify_unraid \
             "alert" \
-            "Backup FAILED - Docker Stop" \
-            "One or more Docker containers could not be stopped safely.
+            "Backup FAILED - Docker Inspection" \
+            "One or more running Docker containers could not be mapped to appdata safely.
 Appdata backup was not started.
 See log:
 ${LOG_FILE}"
@@ -3019,7 +3404,9 @@ ${LOG_FILE}"
     # Restart Docker containers
     # -----------------------------------------------------------------------
 
-    if ! restart_target_containers; then
+    if [ "$CONTAINERS_NEED_RESTART" = "true" ] &&
+       ! restart_target_containers
+    then
         final_exit=1
     fi
 

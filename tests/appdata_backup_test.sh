@@ -5,6 +5,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="${REPO_ROOT}/user_script/appdata_backup.sh"
 TEST_ROOT="$(mktemp -d /tmp/appdata_backup_test.XXXXXX)"
+TEST_PLEX_DATABASE_BACKUP_PATH=""
 
 cleanup() {
     case "$TEST_ROOT" in
@@ -124,6 +125,7 @@ run_backup() {
         LOCK_FILE="$root/appdata.lock" \
         NOTIFY_BIN="$root/bin/notify" \
         MOCK_NOTIFY_LOG="$root/notify.log" \
+        PLEX_DATABASE_BACKUP_PATH="$TEST_PLEX_DATABASE_BACKUP_PATH" \
         "$@" \
         bash "$SCRIPT" >"$output" 2>&1
 }
@@ -162,7 +164,8 @@ count_generations() {
 ###############################################################################
 
 (
-    unset PIGZ_THREADS PIGZ_LEVEL USE_LOW_PRIORITY_IO
+    unset PIGZ_THREADS PIGZ_LEVEL USE_LOW_PRIORITY_IO \
+        PLEX_DATABASE_BACKUP_PATH
 
     # shellcheck disable=SC1090
     source "$SCRIPT"
@@ -170,11 +173,136 @@ count_generations() {
     [ "$PIGZ_THREADS" -eq 6 ]
     [ "$PIGZ_LEVEL" -eq 3 ]
     [ "$USE_LOW_PRIORITY_IO" = "false" ]
+    [ "$PLEX_DATABASE_BACKUP_PATH" = "/mnt/vault/backup/plex_db/hubble" ]
 ) || fail "performance-oriented compression defaults are incorrect"
+
+
+###############################################################################
+# Volume ownership stops only app owners and restarts them at scope completion
+###############################################################################
+
+LIFECYCLE_ROOT="${TEST_ROOT}/container-lifecycle"
+mkdir -p \
+    "$LIFECYCLE_ROOT/source/app-one" \
+    "$LIFECYCLE_ROOT/source/app-two" \
+    "$LIFECYCLE_ROOT/external-app-two-backups" \
+    "$LIFECYCLE_ROOT/user-appdata"
+
+# The sourced script consumes these globals and the docker function indirectly.
+# shellcheck disable=SC2030,SC2031,SC2034,SC2154,SC2329
+(
+    export SRC_DIR="$LIFECYCLE_ROOT/source"
+
+    # shellcheck disable=SC1090
+    source "$SCRIPT"
+
+    APPDATA_DIRS=(
+        "$SRC_DIR/app-one"
+        "$SRC_DIR/app-two"
+        "$LIFECYCLE_ROOT/external-app-two-backups"
+    )
+    ELIGIBLE_APPDATA=(
+        ["app-one"]=1
+        ["app-two"]=1
+        ["app-two-backups"]=1
+    )
+    NORMAL_APPDATA=(
+        ["app-one"]=1
+        ["app-two"]=1
+    )
+    ARCHIVE_NAME_BY_PATH=(
+        ["$LIFECYCLE_ROOT/external-app-two-backups"]="app-two-backups"
+    )
+    EXTRA_ARCHIVE_OWNER=(
+        ["app-two-backups"]="app-two"
+    )
+    APPDATA_PATH_ALIASES=("$LIFECYCLE_ROOT/user-appdata")
+    SKIP_CONTAINERS=()
+    LOG_FILE=""
+
+    declare -A MOCK_RUNNING=(
+        [app-one-container]=true
+        [shared-container]=true
+        [unrelated-container]=true
+    )
+
+    docker() {
+        local operation="${1:-}"
+        local template="${3:-}"
+        local container="${4:-${2:-}}"
+        local name=""
+
+        case "$operation" in
+            ps)
+                for name in \
+                    app-one-container \
+                    shared-container \
+                    unrelated-container
+                do
+                    [ "${MOCK_RUNNING[$name]}" = "true" ] && printf '%s\n' "$name"
+                done
+                ;;
+            inspect)
+                if [[ "$template" == *'.Mounts'* ]]; then
+                    case "$container" in
+                        app-one-container)
+                            printf '%s\t/config\n' "$SRC_DIR/app-one"
+                            ;;
+                        shared-container)
+                            printf '%s\t/config-one\n' "$SRC_DIR/app-one"
+                            printf '%s\t/config-two\n' \
+                                "$LIFECYCLE_ROOT/user-appdata/app-two"
+                            ;;
+                        unrelated-container)
+                            printf '%s\t/data\n' "$LIFECYCLE_ROOT/unrelated"
+                            ;;
+                    esac
+                else
+                    printf '%s\n' "${MOCK_RUNNING[$container]}"
+                fi
+                ;;
+            stop)
+                container="${2:-}"
+                MOCK_RUNNING["$container"]=false
+                ;;
+            start)
+                container="${2:-}"
+                MOCK_RUNNING["$container"]=true
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    }
+
+    discover_target_containers
+    [ "${#TARGET_CONTAINERS[@]}" -eq 2 ]
+    [ "${MOCK_RUNNING[unrelated-container]}" = "true" ]
+
+    stop_containers_for_app app-one
+    [ "${MOCK_RUNNING[app-one-container]}" = "false" ]
+    [ "${MOCK_RUNNING[shared-container]}" = "false" ]
+    [ "${MOCK_RUNNING[unrelated-container]}" = "true" ]
+
+    complete_container_scope_for_app app-one
+    [ "${MOCK_RUNNING[app-one-container]}" = "true" ]
+    [ "${MOCK_RUNNING[shared-container]}" = "false" ]
+
+    stop_containers_for_app app-two
+    complete_container_scope_for_app app-two
+    [ "${MOCK_RUNNING[shared-container]}" = "false" ]
+
+    stop_containers_for_app app-two-backups
+    complete_container_scope_for_app app-two-backups
+    [ "${MOCK_RUNNING[shared-container]}" = "true" ]
+    [ "$CONTAINERS_NEED_RESTART" = "false" ]
+) >"$LIFECYCLE_ROOT/lifecycle.out" 2>&1 ||
+    fail "per-app container ownership lifecycle failed"
 
 AUTO_ROOT="${TEST_ROOT}/auto-selection"
 make_layout "$AUTO_ROOT"
 
+# shellcheck disable=SC2031
 (
     export SRC_DIR="$AUTO_ROOT/source"
     export DEST_DIR="$AUTO_ROOT/destination"
@@ -215,23 +343,50 @@ make_layout "$DIRECT_ROOT"
 mkdir -p \
     "$DIRECT_ROOT/source/app-one" \
     "$DIRECT_ROOT/source/plex-media-server/Library/Application Support/Plex Media Server/Cache" \
+    "$DIRECT_ROOT/source/plex-media-server/Library/Application Support/Plex Media Server/Media" \
     "$DIRECT_ROOT/source/plex-media-server/Library/Application Support/Plex Media Server/Metadata" \
-    "$DIRECT_ROOT/source/radarr/logs"
+    "$DIRECT_ROOT/source/radarr/logs" \
+    "$DIRECT_ROOT/plex-db"
+
+TEST_PLEX_DATABASE_BACKUP_PATH="$DIRECT_ROOT/plex-db"
 
 printf 'application data\n' >"$DIRECT_ROOT/source/app-one/data.txt"
 printf 'regenerable cache\n' \
     >"$DIRECT_ROOT/source/plex-media-server/Library/Application Support/Plex Media Server/Cache/cache.bin"
+printf 'regenerable preview thumbnail\n' \
+    >"$DIRECT_ROOT/source/plex-media-server/Library/Application Support/Plex Media Server/Media/preview.bif"
 printf 'required metadata\n' \
     >"$DIRECT_ROOT/source/plex-media-server/Library/Application Support/Plex Media Server/Metadata/metadata.db"
 printf 'required configuration\n' >"$DIRECT_ROOT/source/radarr/config.xml"
 printf 'regenerable log\n' >"$DIRECT_ROOT/source/radarr/logs/radarr.txt"
+printf 'scheduled plex database backup\n' \
+    >"$DIRECT_ROOT/plex-db/com.plexapp.plugins.library.db-2026-11-21"
 
 run_backup "$DIRECT_ROOT" destination "$DIRECT_ROOT/direct.out" ||
     fail "direct backup failed"
 
+mapfile -t DIRECT_ARCHIVE_ORDER < <(
+    sed -n \
+        's/.*\[DOCKER\]\[INFO\] \[\(.*\)\] Creating archive$/\1/p' \
+        "$DIRECT_ROOT/direct.out"
+)
+
+PLEX_ORDER_VALID=false
+for ((i = 0; i < ${#DIRECT_ARCHIVE_ORDER[@]} - 1; i++)); do
+    if [ "${DIRECT_ARCHIVE_ORDER[$i]}" = "plex-media-server" ] &&
+       [ "${DIRECT_ARCHIVE_ORDER[$((i + 1))]}" = "plex-database-backups" ]
+    then
+        PLEX_ORDER_VALID=true
+        break
+    fi
+done
+[ "$PLEX_ORDER_VALID" = "true" ] ||
+    fail "Plex database backup archive was not adjacent to its owner"
+
 DIRECT_GENERATION="$(newest_generation "$DIRECT_ROOT")"
 assert_file "$DIRECT_GENERATION/backup_manifest.tsv"
 assert_file "$DIRECT_GENERATION/backup_manifest.tsv.sha256"
+assert_file "$DIRECT_GENERATION/plex-database-backups.tar.gz"
 
 (
     cd "$DIRECT_GENERATION" &&
@@ -242,10 +397,16 @@ tar -tzf "$DIRECT_GENERATION/plex-media-server.tar.gz" \
     >"$DIRECT_ROOT/plex.list"
 assert_contains "$DIRECT_ROOT/plex.list" "Metadata/metadata.db"
 assert_not_contains "$DIRECT_ROOT/plex.list" "Cache/cache.bin"
+assert_not_contains "$DIRECT_ROOT/plex.list" "Media/preview.bif"
 
 tar -tzf "$DIRECT_GENERATION/radarr.tar.gz" >"$DIRECT_ROOT/radarr.list"
 assert_contains "$DIRECT_ROOT/radarr.list" "radarr/config.xml"
 assert_not_contains "$DIRECT_ROOT/radarr.list" "radarr/logs/radarr.txt"
+
+tar -tzf "$DIRECT_GENERATION/plex-database-backups.tar.gz" \
+    >"$DIRECT_ROOT/plex-db.list"
+assert_contains "$DIRECT_ROOT/plex-db.list" \
+    "plex-db/com.plexapp.plugins.library.db-2026-11-21"
 
 
 ###############################################################################
@@ -269,7 +430,7 @@ fi
 
 assert_contains "$DIRECT_ROOT/staging.out" "method=verified manifest history"
 assert_contains "$DIRECT_ROOT/staging.out" \
-    "history=3 app(s)"
+    "history=4 app(s)"
 assert_contains "$DIRECT_ROOT/staging.out" \
     "[app-two] Measuring source size (no usable archive history or full scan requested)"
 assert_not_contains "$DIRECT_ROOT/staging.out" \
@@ -360,6 +521,8 @@ run_backup "$DIRECT_ROOT" auto "$DIRECT_ROOT/checksum-recovery.out" ||
 ###############################################################################
 # Silent SIGKILL is classified, not retried, and leaves no partial backup
 ###############################################################################
+
+TEST_PLEX_DATABASE_BACKUP_PATH=""
 
 FAIL_ROOT="${TEST_ROOT}/pipeline-failure"
 make_layout "$FAIL_ROOT"
