@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.7.1
+# ARR Health / Download / Import Monitor v3.7.2
 #
 # PURPOSE
 # -------
@@ -726,6 +726,12 @@ DOWNLOAD_LEDGER_RECONCILE_ENABLED=true
 DOWNLOAD_LEDGER_RECONCILE_CONFIRM_RUNS=2
 DOWNLOAD_LEDGER_RECONCILE_MAX_RECORDS=50
 
+# Negative but successful API checks (no exact identity, object no longer in
+# Arr, stale file record, etc.) are retried on this slower interval. Positive
+# candidates still receive their required confirmation on the next run, while
+# transport/authentication failures remain eligible for an immediate retry.
+DOWNLOAD_LEDGER_RECONCILE_RETRY_MINUTES=60
+
 # Allow a small timestamp skew between SAB queue time and Arr file dateAdded.
 DOWNLOAD_LEDGER_RECONCILE_CLOCK_SKEW_SECONDS=300
 
@@ -738,6 +744,8 @@ LOCKFILE="/tmp/arr_health_activity.lock"
 QUEUE_PAGE_SIZE=1000
 SAB_HISTORY_LIMIT=500
 ARR_QUEUE_MAX_RECORDS=10000
+ARR_ACTIVITY_HISTORY_PAGE_SIZE=1000
+ARR_ACTIVITY_HISTORY_MAX_RECORDS=10000
 
 ###############################################################################
 # INITIALIZATION
@@ -794,6 +802,11 @@ RADARR_API_FAILURES=""
 SAB_API_FAILURES=""
 
 HTTP_LAST_ERROR=""
+HTTP_LAST_STATUS=""
+HTTP_LAST_URL=""
+API_LAST_ERROR=""
+API_LAST_HTTP_CODE=""
+API_LAST_ENDPOINT=""
 
 SAB_PRIMARY_DOWNLOADS_FILE=""
 SAB_PROGRESS_SEEN_FILE=""
@@ -1318,17 +1331,27 @@ http_json_get() {
     local delay=0
     local safe_url="${url%%\?*}"
     local header_file
+    local stderr_file
+
+    HTTP_LAST_ERROR=""
+    HTTP_LAST_STATUS=""
+    HTTP_LAST_URL="$safe_url"
 
     header_file=$(mktemp "${TMP_DIR}/http-headers.XXXXXX") || {
         HTTP_LAST_ERROR="unable to create HTTP response-header file"
         return 1
     }
 
-    HTTP_LAST_ERROR=""
+    stderr_file=$(mktemp "${TMP_DIR}/http-stderr.XXXXXX") || {
+        rm -f -- "$header_file" 2>/dev/null || true
+        HTTP_LAST_ERROR="unable to create HTTP error-capture file"
+        return 1
+    }
 
     while (( attempt <= max_attempts )); do
 
         : >"$header_file"
+        : >"$stderr_file"
         invalid_json=false
 
         http_code=$(curl \
@@ -1336,13 +1359,15 @@ http_json_get() {
             --dump-header "$header_file" \
             "$url" \
             -o "$output" \
-            --write-out '%{http_code}')
+            --write-out '%{http_code}' \
+            2>"$stderr_file")
         curl_rc=$?
+        HTTP_LAST_STATUS="$http_code"
 
         if (( curl_rc == 0 )); then
 
             if jq empty "$output" >/dev/null 2>&1; then
-                rm -f -- "$header_file" 2>/dev/null || true
+                rm -f -- "$header_file" "$stderr_file" 2>/dev/null || true
                 return 0
             fi
 
@@ -1393,7 +1418,7 @@ http_json_get() {
         ((attempt++)) || true
     done
 
-    rm -f -- "$header_file" 2>/dev/null || true
+    rm -f -- "$header_file" "$stderr_file" 2>/dev/null || true
 
     return 1
 }
@@ -1407,6 +1432,8 @@ api_get() {
     local -a request_args
 
     API_LAST_ERROR=""
+    API_LAST_HTTP_CODE=""
+    API_LAST_ENDPOINT="${url%%\?*}"
 
     request_args=(
         --silent \
@@ -1419,8 +1446,13 @@ api_get() {
 
     if ! http_json_get "$output" "$url" "${request_args[@]}"; then
         API_LAST_ERROR="$HTTP_LAST_ERROR"
+        API_LAST_HTTP_CODE="$HTTP_LAST_STATUS"
+        API_LAST_ENDPOINT="$HTTP_LAST_URL"
         return 1
     fi
+
+    API_LAST_HTTP_CODE="$HTTP_LAST_STATUS"
+    API_LAST_ENDPOINT="$HTTP_LAST_URL"
 
     return 0
 }
@@ -1437,6 +1469,8 @@ sab_get() {
     local -a request_args
 
     API_LAST_ERROR=""
+    API_LAST_HTTP_CODE=""
+    API_LAST_ENDPOINT="${url%%\?*}"
 
     request_args=(
         --silent
@@ -1477,8 +1511,13 @@ sab_get() {
 
     if ! http_json_get "$output" "$url" "${request_args[@]}"; then
         API_LAST_ERROR="$HTTP_LAST_ERROR"
+        API_LAST_HTTP_CODE="$HTTP_LAST_STATUS"
+        API_LAST_ENDPOINT="$HTTP_LAST_URL"
         return 1
     fi
+
+    API_LAST_HTTP_CODE="$HTTP_LAST_STATUS"
+    API_LAST_ENDPOINT="$HTTP_LAST_URL"
 
     if jq -e '
         (.status | type) == "boolean"
@@ -5503,7 +5542,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.7.1 lifecycle commands' \
+        'ARR Health Monitor v3.7.2 lifecycle commands' \
         '' \
         'Always invoke the Unraid User Scripts copy through /bin/bash:' \
         '  /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script COMMAND' \
@@ -9865,6 +9904,90 @@ initialize_activity_audit_window() {
 # FETCH RECENT ARR HISTORY - v2.5
 ###############################################################################
 
+fetch_arr_activity_history_paged() {
+
+    local app="$1"
+    local base_url="$2"
+    local api_key="$3"
+    local output="$4"
+    local include_query
+    local records_file="${TMP_DIR}/${app,,}-history-audit-records.jsonl"
+    local page_file
+    local endpoint
+    local page=1
+    local loaded=0
+    local count=0
+    local reached_cutoff=false
+
+    case "$app" in
+        Sonarr)
+            include_query="includeSeries=true&includeEpisode=true"
+            ;;
+
+        Radarr)
+            include_query="includeMovie=true"
+            ;;
+
+        *)
+            API_LAST_ERROR="unsupported Arr application"
+            API_LAST_HTTP_CODE=""
+            API_LAST_ENDPOINT=""
+            return 1
+            ;;
+    esac
+
+    : >"$records_file"
+
+    while (( loaded < ARR_ACTIVITY_HISTORY_MAX_RECORDS )); do
+        page_file="${TMP_DIR}/${app,,}-history-audit-page-${page}.json"
+        endpoint="${base_url%/}/api/v3/history?page=${page}&pageSize=${ARR_ACTIVITY_HISTORY_PAGE_SIZE}&sortKey=date&sortDirection=descending&${include_query}"
+
+        api_get "$endpoint" "$api_key" "$page_file" || return 1
+
+        if ! jq -e '(.records | type) == "array"' "$page_file" >/dev/null 2>&1; then
+            API_LAST_ERROR="paged history endpoint returned an unexpected JSON shape"
+            API_LAST_HTTP_CODE="200"
+            API_LAST_ENDPOINT="${endpoint%%\?*}"
+            return 1
+        fi
+
+        count=$(jq '.records | length' "$page_file")
+        [[ "$count" =~ ^[0-9]+$ ]] || count=0
+
+        jq -c \
+            --arg since "$AUDIT_SINCE_ISO" \
+            '.records[]? | select((.date // "") >= $since)' \
+            "$page_file" >>"$records_file" || return 1
+
+        if jq -e \
+            --arg since "$AUDIT_SINCE_ISO" \
+            'any(.records[]?; (.date // "") < $since)' \
+            "$page_file" >/dev/null 2>&1
+        then
+            reached_cutoff=true
+        fi
+
+        loaded=$((loaded + count))
+
+        if [ "$reached_cutoff" = true ] ||
+           (( count < ARR_ACTIVITY_HISTORY_PAGE_SIZE )); then
+            break
+        fi
+
+        ((page++)) || true
+    done
+
+    if [ "$reached_cutoff" != true ] &&
+       (( loaded >= ARR_ACTIVITY_HISTORY_MAX_RECORDS )); then
+        API_LAST_ERROR="paged history reached ARR_ACTIVITY_HISTORY_MAX_RECORDS=${ARR_ACTIVITY_HISTORY_MAX_RECORDS} before the audit cutoff"
+        API_LAST_HTTP_CODE="200"
+        API_LAST_ENDPOINT="${base_url%/}/api/v3/history"
+        return 1
+    fi
+
+    jq -s '.' "$records_file" >"$output" || return 1
+}
+
 fetch_arr_activity_history() {
 
     local app="$1"
@@ -9892,8 +10015,24 @@ fetch_arr_activity_history() {
             ;;
     esac
 
-    api_get \
-        "$endpoint" \
+    if api_get "$endpoint" "$api_key" "$output"; then
+        if jq -e 'type == "array"' "$output" >/dev/null 2>&1; then
+            return 0
+        fi
+
+        API_LAST_ERROR="history/since returned an unexpected JSON shape"
+        API_LAST_HTTP_CODE="200"
+        API_LAST_ENDPOINT="${endpoint%%\?*}"
+    elif [ "$API_LAST_HTTP_CODE" != 404 ]; then
+        return 1
+    fi
+
+    # Some Arr versions or reverse-proxy routes do not expose history/since.
+    # Fall back to the stable paged history collection and apply the same UTC
+    # cutoff locally. This preserves the audit without changing Arr or files.
+    fetch_arr_activity_history_paged \
+        "$app" \
+        "$base_url" \
         "$api_key" \
         "$output"
 }
@@ -11049,6 +11188,28 @@ arr_reconciliation_connection() {
     esac
 }
 
+record_arr_reconciliation_not_found() {
+
+    local download_id="$1"
+    local app="$2"
+    local object_label="$3"
+    local object_id="$4"
+
+    log "${app} reconciliation: ${object_label} ${object_id} no longer exists in Arr (HTTP 404); download ${download_id} remains unresolved"
+
+    write_download_reconciliation_result \
+        "$download_id" \
+        "$app" \
+        true \
+        false \
+        "" \
+        "" \
+        "INFO" \
+        "" \
+        "Exact Arr record no longer exists" \
+        "${object_label}: ${object_id}; HTTP 404. The issue remains active for review or intentional batch dismissal."
+}
+
 record_arr_database_file_reconciliation() {
 
     local download_id="$1"
@@ -11176,12 +11337,18 @@ record_arr_database_file_reconciliation() {
                     "$api_key" \
                     "$object_file"
                 then
+                    if [ "$API_LAST_HTTP_CODE" = 404 ]; then
+                        record_arr_reconciliation_not_found \
+                            "$download_id" "$app" "Episode ID" "$target_id"
+                        return 0
+                    fi
+
                     ((DOWNLOAD_LEDGER_RECONCILIATION_FAILED_COUNT++)) || true
                     write_download_reconciliation_result \
                         "$download_id" "$app" false false \
                         "" "" "INFO" "" \
                         "Sonarr episode API check failed" \
-                        "Episode ID: ${target_id}; ${API_LAST_ERROR}"
+                        "Episode ID: ${target_id}; endpoint: ${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
                     return 1
                 fi
 
@@ -11218,12 +11385,18 @@ record_arr_database_file_reconciliation() {
                     "$api_key" \
                     "$media_file"
                 then
+                    if [ "$API_LAST_HTTP_CODE" = 404 ]; then
+                        record_arr_reconciliation_not_found \
+                            "$download_id" "$app" "Episode file ID" "$file_id"
+                        return 0
+                    fi
+
                     ((DOWNLOAD_LEDGER_RECONCILIATION_FAILED_COUNT++)) || true
                     write_download_reconciliation_result \
                         "$download_id" "$app" false false \
                         "" "" "INFO" "" \
                         "Sonarr episode-file API check failed" \
-                        "Episode file ID: ${file_id}; ${API_LAST_ERROR}"
+                        "Episode file ID: ${file_id}; endpoint: ${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
                     return 1
                 fi
 
@@ -11253,12 +11426,18 @@ record_arr_database_file_reconciliation() {
                     "$api_key" \
                     "$object_file"
                 then
+                    if [ "$API_LAST_HTTP_CODE" = 404 ]; then
+                        record_arr_reconciliation_not_found \
+                            "$download_id" "$app" "Movie ID" "$target_id"
+                        return 0
+                    fi
+
                     ((DOWNLOAD_LEDGER_RECONCILIATION_FAILED_COUNT++)) || true
                     write_download_reconciliation_result \
                         "$download_id" "$app" false false \
                         "" "" "INFO" "" \
                         "Radarr movie API check failed" \
-                        "Movie ID: ${target_id}; ${API_LAST_ERROR}"
+                        "Movie ID: ${target_id}; endpoint: ${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
                     return 1
                 fi
 
@@ -11288,12 +11467,18 @@ record_arr_database_file_reconciliation() {
                     "$api_key" \
                     "$media_file"
                 then
+                    if [ "$API_LAST_HTTP_CODE" = 404 ]; then
+                        record_arr_reconciliation_not_found \
+                            "$download_id" "$app" "Movie file ID" "$file_id"
+                        return 0
+                    fi
+
                     ((DOWNLOAD_LEDGER_RECONCILIATION_FAILED_COUNT++)) || true
                     write_download_reconciliation_result \
                         "$download_id" "$app" false false \
                         "" "" "INFO" "" \
                         "Radarr movie-file API check failed" \
-                        "Movie file ID: ${file_id}; ${API_LAST_ERROR}"
+                        "Movie file ID: ${file_id}; endpoint: ${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
                     return 1
                 fi
 
@@ -11770,6 +11955,7 @@ perform_download_ledger_reconciliation() {
         --argjson importMinutes "$DOWNLOAD_LEDGER_IMPORT_WARN_MINUTES" \
         --argjson vanishedMinutes "$DOWNLOAD_LEDGER_SAB_VANISHED_WARN_MINUTES" \
         --argjson notReachedMinutes "$DOWNLOAD_LEDGER_GRAB_TO_SAB_WARN_MINUTES" \
+        --argjson retryMinutes "$DOWNLOAD_LEDGER_RECONCILE_RETRY_MINUTES" \
         --argjson maximum "$DOWNLOAD_LEDGER_RECONCILE_MAX_RECORDS" \
         '
         .issues as $issues
@@ -11785,6 +11971,11 @@ perform_download_ledger_reconciliation() {
             | select((.value.sabFailedAt // 0) <= 0)
             | select((.value.arrReconciledAt // 0) <= 0)
             | select((.value.manuallyDismissedAt // 0) <= 0)
+            | select(
+                (.value.reconciliationCandidateRuns // 0) > 0
+                or (.value.reconciliationLastCheckedAt // 0) <= 0
+                or (($now - (.value.reconciliationLastCheckedAt // 0)) / 60) >= $retryMinutes
+              )
             | (
                 if (.value.sabCompletedAt // 0) > 0
                 then (.value.sabCompletedAt // 0)
@@ -11849,12 +12040,12 @@ perform_download_ledger_reconciliation() {
             "$history_page"
         then
             ((DOWNLOAD_LEDGER_RECONCILIATION_FAILED_COUNT++)) || true
-            log "WARNING: ${app} exact history reconciliation failed for ${download_id}: ${API_LAST_ERROR}"
+            log "WARNING: ${app} exact history reconciliation failed for ${download_id}: endpoint=${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
             write_download_reconciliation_result \
                 "$download_id" "$app" false false \
                 "" "" "INFO" "" \
                 "Exact history API check failed" \
-                "$API_LAST_ERROR"
+                "Endpoint: ${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
             continue
         fi
 
@@ -13462,7 +13653,7 @@ rotate_persistent_log
 
 persistent_log \
     "START" \
-    "ARR Health Monitor v3.7.1"
+    "ARR Health Monitor v3.7.2"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -13475,7 +13666,7 @@ fi
 # START
 ###############################################################################
 
-log "Starting ARR Health Monitor v3.7.1"
+log "Starting ARR Health Monitor v3.7.2"
 log "Recommended schedule: every five minutes"
 log "Notifications enabled: $SEND_NOTIFICATIONS"
 log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -13839,11 +14030,11 @@ if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
             SONARR_AUDIT_OK=false
 
-            log "WARNING: Unable to retrieve recent Sonarr history"
+            log "WARNING: Unable to retrieve recent Sonarr history: endpoint=${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
 
             persistent_log \
                 "ERROR" \
-                "Unable to retrieve recent Sonarr history"
+                "Unable to retrieve recent Sonarr history: endpoint=${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
         fi
     fi
 
@@ -13877,11 +14068,11 @@ if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
             RADARR_AUDIT_OK=false
 
-            log "WARNING: Unable to retrieve recent Radarr history"
+            log "WARNING: Unable to retrieve recent Radarr history: endpoint=${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
 
             persistent_log \
                 "ERROR" \
-                "Unable to retrieve recent Radarr history"
+                "Unable to retrieve recent Radarr history: endpoint=${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
         fi
     fi
 fi
@@ -13961,7 +14152,7 @@ write_persistent_activity_summary
 RUNTIME=$(runtime)
 
 log "============================================================"
-log "ARR Health Monitor v3.7.1 completed"
+log "ARR Health Monitor v3.7.2 completed"
 
 log ""
 log "SCAN HEALTH"
