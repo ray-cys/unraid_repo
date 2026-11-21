@@ -227,6 +227,14 @@ APPDATA_EXCLUDES=(
     "sabnzbd|logs"
     "kometa|logs"
     "kometa|cache"
+    "sabnzbd|logs"
+    "bazarr|cache"
+    "bazarr|log"
+    "tautulli|cache"
+    "tautulli|logs"
+    "tautulli|backups"
+    "photoprism|cache"
+    "metafusion|logs"
     "qbittorrent|qBittorrent/logs"
 )
 
