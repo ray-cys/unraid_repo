@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Unraid Boot Device Backup v3.0
+# Unraid Boot Device Backup v3.1
 #
 # Designed for Unraid 7.4+ while remaining resilient to future changes in the
 # private WebGUI backup helper.
@@ -22,7 +22,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="3.0"
+readonly SCRIPT_VERSION="3.1"
 
 ###############################################################################
 # CONFIGURATION
@@ -50,8 +50,18 @@ LOCKFILE="${LOCKFILE:-/tmp/flash_backup.lock}"
 
 LOG_DIR="${LOG_DIR:-/mnt/user/cloud/logs/script/flash_backup}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/flash_backup.log}"
-LOG_MAX_BYTES="${LOG_MAX_BYTES:-$((2 * 1024 * 1024))}"
-LOG_KEEP="${LOG_KEEP:-3}"
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-$((256 * 1024))}"
+LOG_KEEP="${LOG_KEEP:-1}"
+LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"
+LOG_LINE_MAX_BYTES="${LOG_LINE_MAX_BYTES:-4096}"
+LOG_RUNAWAY_MULTIPLIER="${LOG_RUNAWAY_MULTIPLIER:-4}"
+
+# Backend stderr is drained completely so the helper cannot block, but only a
+# small prefix is retained for failure diagnosis. This is especially important
+# on Unraid because /tmp is RAM-backed and a misbehaving helper may emit binary
+# or archive-sized data on stderr.
+BACKEND_DIAGNOSTIC_MAX_BYTES="${BACKEND_DIAGNOSTIC_MAX_BYTES:-$((64 * 1024))}"
+BACKEND_DIAGNOSTIC_MAX_LINES="${BACKEND_DIAGNOSTIC_MAX_LINES:-100}"
 
 STATE_FILE="${STATE_FILE:-${BACKUP_DIR}/.flash_backup_state.json}"
 
@@ -67,6 +77,10 @@ RECOMMENDED_ARCHIVE_PATHS=(
 START_TIME=$(date +%s)
 
 HELPER_LOG=""
+HELPER_LOG_META=""
+HELPER_LOGGED_MARKER=""
+DIAGNOSTIC_FIFO=""
+DIAGNOSTIC_CAPTURE_PID=""
 ARCHIVE_LIST_FILE=""
 TEMP_FILE=""
 TEMP_CHECKSUM=""
@@ -74,6 +88,8 @@ WRITE_TEST=""
 
 LOG_READY=false
 LOG_FAILURE_REPORTED=false
+LOG_CLEANED_FILES=0
+LOG_CLEANED_BYTES=0
 
 SELECTED_BACKEND=""
 ESTIMATED_SOURCE_BYTES=0
@@ -107,12 +123,20 @@ PLATFORM_CHANGES=()
 ###############################################################################
 
 log() {
-    local line
-    line="$(date '+%Y/%m/%d %T') : $*"
+    local message="$*" line
+
+    if [[ "$LOG_LINE_MAX_BYTES" =~ ^[0-9]+$ ]] &&
+       (( LOG_LINE_MAX_BYTES > 0 )) &&
+       (( ${#message} > LOG_LINE_MAX_BYTES ))
+    then
+        message="${message:0:LOG_LINE_MAX_BYTES} ... [line truncated]"
+    fi
+
+    line="$(date '+%Y/%m/%d %T') : $message"
     printf '%s\n' "$line"
 
     if [ "$LOG_READY" = true ]; then
-        if ! printf '%s\n' "$line" >>"$LOG_FILE"; then
+        if ! append_persistent_log "$line"; then
             LOG_READY=false
             if [ "$LOG_FAILURE_REPORTED" = false ]; then
                 LOG_FAILURE_REPORTED=true
@@ -121,6 +145,22 @@ log() {
             fi
         fi
     fi
+}
+
+append_persistent_log() {
+    local line="$1" current_size line_size
+
+    current_size=$(stat -c '%s' "$LOG_FILE" 2>/dev/null || echo 0)
+    line_size=$(printf '%s\n' "$line" | wc -c | tr -d ' ')
+    [[ "$current_size" =~ ^[0-9]+$ ]] || current_size=0
+    [[ "$line_size" =~ ^[0-9]+$ ]] || line_size=0
+
+    if (( current_size > 0 && current_size + line_size > LOG_MAX_BYTES )); then
+        rotate_logs || return 1
+        : >>"$LOG_FILE" || return 1
+    fi
+
+    printf '%s\n' "$line" >>"$LOG_FILE"
 }
 
 rotate_logs() {
@@ -146,12 +186,70 @@ rotate_logs() {
     mv -f -- "$LOG_FILE" "${LOG_FILE}.1"
 }
 
+record_removed_log() {
+    local file="$1" size
+    size=$(stat -c '%s' "$file" 2>/dev/null || echo 0)
+    [[ "$size" =~ ^[0-9]+$ ]] || size=0
+
+    if rm -f -- "$file"; then
+        ((LOG_CLEANED_FILES++)) || true
+        ((LOG_CLEANED_BYTES+=size)) || true
+        return 0
+    fi
+
+    return 1
+}
+
+cleanup_existing_logs() {
+    local file suffix size modified now cutoff runaway_limit
+
+    now=$(date +%s)
+    cutoff=$((now - LOG_RETENTION_DAYS * 86400))
+    runaway_limit=$((LOG_MAX_BYTES * LOG_RUNAWAY_MULTIPLIER))
+
+    if [ -f "$LOG_FILE" ]; then
+        size=$(stat -c '%s' "$LOG_FILE" 2>/dev/null || echo 0)
+        [[ "$size" =~ ^[0-9]+$ ]] || size=0
+
+        if (( size > runaway_limit )); then
+            if : >"$LOG_FILE"; then
+                ((LOG_CLEANED_FILES++)) || true
+                ((LOG_CLEANED_BYTES+=size)) || true
+            fi
+        fi
+    fi
+
+    shopt -s nullglob
+    for file in "${LOG_FILE}".*; do
+        [ -f "$file" ] || continue
+        suffix=${file##*.}
+        [[ "$suffix" =~ ^[0-9]+$ ]] || continue
+
+        size=$(stat -c '%s' "$file" 2>/dev/null || echo 0)
+        modified=$(stat -c '%Y' "$file" 2>/dev/null || echo 0)
+        [[ "$size" =~ ^[0-9]+$ ]] || size=0
+        [[ "$modified" =~ ^[0-9]+$ ]] || modified=0
+
+        if (( suffix > LOG_KEEP ||
+              size > runaway_limit ||
+              (LOG_RETENTION_DAYS > 0 && modified > 0 && modified <= cutoff) ));
+        then
+            record_removed_log "$file" || true
+        fi
+    done
+    shopt -u nullglob
+}
+
 initialize_logging() {
     local rotation_ok=true
 
     if ! [[ "$LOG_MAX_BYTES" =~ ^[0-9]+$ ]] ||
        ! [[ "$LOG_KEEP" =~ ^[0-9]+$ ]] ||
-       (( LOG_MAX_BYTES <= 0 ))
+       ! [[ "$LOG_RETENTION_DAYS" =~ ^[0-9]+$ ]] ||
+       ! [[ "$LOG_LINE_MAX_BYTES" =~ ^[0-9]+$ ]] ||
+       ! [[ "$LOG_RUNAWAY_MULTIPLIER" =~ ^[0-9]+$ ]] ||
+       (( LOG_MAX_BYTES <= 0 || LOG_LINE_MAX_BYTES <= 0 ||
+          LOG_RUNAWAY_MULTIPLIER < 2 ))
     then
         log "WARNING: Invalid log rotation configuration; persistent logging disabled"
         return 0
@@ -162,6 +260,7 @@ initialize_logging() {
         return 0
     fi
 
+    cleanup_existing_logs
     rotate_logs || rotation_ok=false
     if ! : >>"$LOG_FILE"; then
         log "WARNING: Persistent log is not writable: $LOG_FILE"
@@ -172,6 +271,10 @@ initialize_logging() {
     [ "$rotation_ok" = true ] || \
         log "WARNING: Log rotation failed; continuing with the current log"
     log "Persistent log: $LOG_FILE"
+
+    if (( LOG_CLEANED_FILES > 0 )); then
+        log "Removed ${LOG_CLEANED_FILES} oversized, expired, or obsolete log file(s); reclaimed $(bytes_human "$LOG_CLEANED_BYTES")"
+    fi
 }
 
 runtime() {
@@ -224,8 +327,20 @@ cleanup() {
     local exit_code=$? file
     trap - EXIT
 
+    if [ -n "$DIAGNOSTIC_CAPTURE_PID" ] &&
+       kill -0 "$DIAGNOSTIC_CAPTURE_PID" 2>/dev/null;
+    then
+        kill "$DIAGNOSTIC_CAPTURE_PID" 2>/dev/null || true
+        wait "$DIAGNOSTIC_CAPTURE_PID" 2>/dev/null || true
+    fi
+    DIAGNOSTIC_CAPTURE_PID=""
+
+    [ -z "$DIAGNOSTIC_FIFO" ] || rm -f -- "$DIAGNOSTIC_FIFO" 2>/dev/null || true
+
     for file in \
         "$HELPER_LOG" \
+        "$HELPER_LOG_META" \
+        "$HELPER_LOGGED_MARKER" \
         "$ARCHIVE_LIST_FILE" \
         "$TEMP_FILE" \
         "$TEMP_CHECKSUM" \
@@ -253,12 +368,101 @@ run_with_timeout() {
     "$TIMEOUT_BIN" --signal=TERM --kill-after=30s "${seconds}s" "$@"
 }
 
+capture_bounded_diagnostics() {
+    local output_file="$1" meta_file="$2" limit="$3"
+    local captured limit_reached=false
+
+    # head retains only the bounded prefix. cat continues draining the pipe so
+    # a noisy helper cannot block or receive SIGPIPE after the limit is reached.
+    head -c "$limit" >"$output_file" 2>/dev/null || true
+    cat >/dev/null 2>&1 || true
+
+    captured=$(stat -c '%s' "$output_file" 2>/dev/null || echo 0)
+    [[ "$captured" =~ ^[0-9]+$ ]] || captured=0
+    (( captured >= limit )) && limit_reached=true
+
+    printf '%s\t%s\n' "$captured" "$limit_reached" >"$meta_file"
+}
+
+start_diagnostic_capture() {
+    DIAGNOSTIC_FIFO="${HELPER_LOG}.fifo.$$.$RANDOM"
+    rm -f -- "$DIAGNOSTIC_FIFO" "$HELPER_LOG_META" \
+        "$HELPER_LOGGED_MARKER" 2>/dev/null || true
+    : >"$HELPER_LOG" || return 1
+    mkfifo "$DIAGNOSTIC_FIFO" || return 1
+
+    capture_bounded_diagnostics \
+        "$HELPER_LOG" \
+        "$HELPER_LOG_META" \
+        "$BACKEND_DIAGNOSTIC_MAX_BYTES" \
+        <"$DIAGNOSTIC_FIFO" &
+    DIAGNOSTIC_CAPTURE_PID=$!
+}
+
+finish_diagnostic_capture() {
+    local capture_rc=0
+
+    if [ -n "$DIAGNOSTIC_CAPTURE_PID" ]; then
+        wait "$DIAGNOSTIC_CAPTURE_PID" || capture_rc=$?
+    fi
+
+    DIAGNOSTIC_CAPTURE_PID=""
+    rm -f -- "$DIAGNOSTIC_FIFO" 2>/dev/null || true
+    DIAGNOSTIC_FIFO=""
+    return "$capture_rc"
+}
+
+run_with_bounded_diagnostics() {
+    local rc
+
+    if ! start_diagnostic_capture; then
+        : >"$HELPER_LOG" 2>/dev/null || true
+        printf 'Backend diagnostic capture could not be initialized.\n' \
+            >"$HELPER_LOG" 2>/dev/null || true
+        "$@" 2>/dev/null
+        return $?
+    fi
+
+    "$@" 2>"$DIAGNOSTIC_FIFO"
+    rc=$?
+    finish_diagnostic_capture || true
+    return "$rc"
+}
+
 log_helper_diagnostics() {
+    local captured=0 limit_reached=false total_lines=0 shown=0 line
+
+    [ -e "$HELPER_LOGGED_MARKER" ] && return 0
     [ -s "$HELPER_LOG" ] || return 0
-    log "Backend diagnostics follow:"
-    while IFS= read -r line; do
+
+    : >"$HELPER_LOGGED_MARKER" 2>/dev/null || true
+
+    if [ -s "$HELPER_LOG_META" ]; then
+        IFS=$'\t' read -r captured limit_reached <"$HELPER_LOG_META" || true
+    fi
+    [[ "$captured" =~ ^[0-9]+$ ]] || \
+        captured=$(stat -c '%s' "$HELPER_LOG" 2>/dev/null || echo 0)
+
+    if ! LC_ALL=C grep -Iq '' "$HELPER_LOG"; then
+        log "Backend diagnostics omitted because the captured output is binary (${captured} bytes retained)"
+        [ "$limit_reached" != true ] || \
+            log "Backend diagnostic output reached the ${BACKEND_DIAGNOSTIC_MAX_BYTES}-byte capture limit; additional data was discarded"
+        return 0
+    fi
+
+    total_lines=$(awk 'END {print NR+0}' "$HELPER_LOG" 2>/dev/null || echo 0)
+    [[ "$total_lines" =~ ^[0-9]+$ ]] || total_lines=0
+
+    log "Backend diagnostics follow (bounded excerpt):"
+    while IFS= read -r line || [ -n "$line" ]; do
+        ((shown++)) || true
         log "BACKEND: $line"
-    done <"$HELPER_LOG"
+        (( shown >= BACKEND_DIAGNOSTIC_MAX_LINES )) && break
+    done < <(LC_ALL=C tr -cd '\11\12\15\40-\176' <"$HELPER_LOG")
+
+    if [ "$limit_reached" = true ] || (( total_lines > shown )); then
+        log "Backend diagnostics truncated after ${shown} line(s) and ${captured} captured byte(s)"
+    fi
 }
 
 read_unraid_value() {
@@ -417,9 +621,9 @@ native_size_estimate() {
         return 1
     }
 
-    : >"$HELPER_LOG"
-    output=$(run_with_timeout "$SIZE_TIMEOUT_SECONDS" \
-        "$HELPER" size 2>"$HELPER_LOG")
+    output=$(run_with_bounded_diagnostics \
+        run_with_timeout "$SIZE_TIMEOUT_SECONDS" \
+        "$HELPER" size)
     rc=$?
     output=${output//[[:space:]]/}
 
@@ -483,11 +687,11 @@ direct_size_estimate() {
         return 1
     }
 
-    : >"$HELPER_LOG"
     output=$(
         cd "$BOOT_SOURCE" || exit 1
-        run_with_timeout "$SIZE_TIMEOUT_SECONDS" \
-            du -sbc "${DIRECT_ITEMS[@]}" 2>>"$HELPER_LOG" |
+        run_with_bounded_diagnostics \
+            run_with_timeout "$SIZE_TIMEOUT_SECONDS" \
+            du -sbc "${DIRECT_ITEMS[@]}" |
             awk 'END {print $1}'
     )
     rc=$?
@@ -543,10 +747,10 @@ select_backend() {
 
 create_native_archive() {
     local rc
-    : >"$HELPER_LOG"
-    run_with_timeout "$BACKUP_TIMEOUT_SECONDS" \
+    run_with_bounded_diagnostics \
+        run_with_timeout "$BACKUP_TIMEOUT_SECONDS" \
         "$HELPER" "$COMPRESSION_LEVEL" \
-        >"$TEMP_FILE" 2>"$HELPER_LOG"
+        >"$TEMP_FILE"
     rc=$?
 
     if (( rc == 124 || rc == 137 )); then
@@ -572,11 +776,11 @@ create_direct_archive() {
         zip_command=(nice -n 19 "${zip_command[@]}")
     fi
 
-    : >"$HELPER_LOG"
     (
         cd "$BOOT_SOURCE" || exit 1
-        run_with_timeout "$BACKUP_TIMEOUT_SECONDS" "${zip_command[@]}"
-    ) >"$TEMP_FILE" 2>"$HELPER_LOG"
+        run_with_bounded_diagnostics \
+            run_with_timeout "$BACKUP_TIMEOUT_SECONDS" "${zip_command[@]}"
+    ) >"$TEMP_FILE"
     rc=$?
 
     if (( rc == 124 || rc == 137 )); then
@@ -632,7 +836,9 @@ validate_archive() {
         return 1
     fi
 
-    if ! unzip -Z1 "$file" >"$ARCHIVE_LIST_FILE" 2>"$HELPER_LOG"; then
+    if ! run_with_bounded_diagnostics \
+        unzip -Z1 "$file" >"$ARCHIVE_LIST_FILE";
+    then
         BACKEND_FAILURE_REASON="unable to list the generated ZIP"
         return 1
     fi
@@ -848,7 +1054,12 @@ validate_configuration() {
         "$SIZE_TIMEOUT_SECONDS" \
         "$BACKUP_TIMEOUT_SECONDS" \
         "$LOG_MAX_BYTES" \
-        "$LOG_KEEP"
+        "$LOG_KEEP" \
+        "$LOG_RETENTION_DAYS" \
+        "$LOG_LINE_MAX_BYTES" \
+        "$LOG_RUNAWAY_MULTIPLIER" \
+        "$BACKEND_DIAGNOSTIC_MAX_BYTES" \
+        "$BACKEND_DIAGNOSTIC_MAX_LINES"
     do
         [[ "$value" =~ ^[0-9]+$ ]] || {
             BACKEND_FAILURE_REASON="numeric configuration contains an invalid value: $value"
@@ -860,14 +1071,19 @@ validate_configuration() {
     (( COMPRESSION_LEVEL >= 0 && COMPRESSION_LEVEL <= 9 )) || return 1
     (( MIN_ARCHIVE_FILES >= 1 )) || return 1
     (( SIZE_TIMEOUT_SECONDS >= 1 && BACKUP_TIMEOUT_SECONDS >= 1 )) || return 1
+    (( LOG_MAX_BYTES >= 4096 && LOG_LINE_MAX_BYTES >= 256 )) || return 1
+    (( LOG_LINE_MAX_BYTES < LOG_MAX_BYTES )) || return 1
+    (( LOG_RUNAWAY_MULTIPLIER >= 2 )) || return 1
+    (( BACKEND_DIAGNOSTIC_MAX_BYTES >= 1024 )) || return 1
+    (( BACKEND_DIAGNOSTIC_MAX_LINES >= 1 )) || return 1
     case "$BACKUP_BACKEND" in auto|native|direct) ;; *) return 1 ;; esac
 }
 
 validate_environment() {
     local required
     for required in \
-        awk df find findmnt flock grep head jq sed sha256sum sort stat tail tr \
-        unzip "$TIMEOUT_BIN"
+        awk cat df find findmnt flock grep head jq mkfifo sed sha256sum \
+        sort stat tail tr unzip wc "$TIMEOUT_BIN"
     do
         require_command "$required" || return 1
     done
@@ -942,6 +1158,8 @@ main() {
     fi
 
     HELPER_LOG=$(mktemp /tmp/flash_backup_backend.XXXXXX) || return 4
+    HELPER_LOG_META="${HELPER_LOG}.meta"
+    HELPER_LOGGED_MARKER="${HELPER_LOG}.logged"
     ARCHIVE_LIST_FILE=$(mktemp /tmp/flash_backup_archive.XXXXXX) || return 4
 
     initialize_identity

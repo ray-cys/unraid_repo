@@ -130,6 +130,11 @@ case "${MOCK_FLASH_MODE:-valid}" in
         printf 'simulated helper failure\n' >&2
         exit 23
         ;;
+    diagnostic_flood)
+        printf 'partial data'
+        head -c "${MOCK_DIAGNOSTIC_BYTES:-1048576}" /dev/zero >&2
+        exit 23
+        ;;
     *)
         exit 99
         ;;
@@ -293,5 +298,42 @@ expect_failure 2 native "$mock_helper" valid 1073741824 "$test_root/not-mounted"
 [[ "$(zip_count)" -eq "$before_failure" ]]
 
 verify_generations
+
+###############################################################################
+# Backend diagnostics and legacy runaway logs remain strictly bounded
+###############################################################################
+
+export LOG_MAX_BYTES=32768
+export LOG_KEEP=1
+export LOG_RETENTION_DAYS=30
+export LOG_LINE_MAX_BYTES=1024
+export LOG_RUNAWAY_MULTIPLIER=4
+export BACKEND_DIAGNOSTIC_MAX_BYTES=8192
+export BACKEND_DIAGNOSTIC_MAX_LINES=10
+export MOCK_DIAGNOSTIC_BYTES=1048576
+
+expect_failure 6 native "$mock_helper" diagnostic_flood
+
+diagnostic_notice_count=$(
+    grep -h 'captured output is binary' "$log_dir"/flash_backup.log* 2>/dev/null |
+        awk 'END {print NR+0}'
+)
+[[ "$diagnostic_notice_count" -eq 1 ]]
+
+for bounded_log in "$log_dir"/flash_backup.log*; do
+    [[ -f "$bounded_log" ]] || continue
+    [[ "$("$test_real_stat" -c '%s' "$bounded_log")" -le "$LOG_MAX_BYTES" ]]
+done
+
+head -c 200000 /dev/zero >"$log_dir/flash_backup.log"
+cp "$log_dir/flash_backup.log" "$log_dir/flash_backup.log.1"
+cp "$log_dir/flash_backup.log" "$log_dir/flash_backup.log.2"
+
+run_backup native "$mock_helper" valid
+
+[[ ! -e "$log_dir/flash_backup.log.2" ]]
+[[ "$("$test_real_stat" -c '%s' "$log_dir/flash_backup.log")" -le "$LOG_MAX_BYTES" ]]
+grep -q 'oversized, expired, or obsolete log file' \
+    "$log_dir/flash_backup.log"
 
 printf 'flash_backup fixture tests passed\n'
