@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.6.0
+# ARR Health / Download / Import Monitor v3.7.0
 #
 # PURPOSE
 # -------
@@ -109,12 +109,20 @@
 #   script --ack ACK_ID "optional note"
 #   script --unack ACK_ID
 #   script --dismiss-download ACK_ID "manual removal reason"
+#   script --batch-dismiss-downloads [filters]
 #
 # Each notification includes the short ACK_ID needed by these commands.
 # Dismissing a download-flow issue records an explicit operator disposition,
 # resolves it immediately, and queues one informational item for the next
 # normal grouped notification. It does not change Sonarr, Radarr, SABnzbd, or
 # any media file.
+#
+# Batch dismissal is preview-only unless --execute is supplied. Execution also
+# requires a reason, the exact preview count, an exact classification or an
+# ACK-ID file, and at least one additional narrowing filter. A timestamped
+# state backup and JSON manifest are created before one atomic state update.
+# The next normal monitor run sends one batch summary rather than one notice
+# per dismissed download. Run --help for complete examples and safeguards.
 #
 #
 # ARR-SIDE DETECTION
@@ -216,11 +224,12 @@
 #   DOWNLOAD_FLOW_RECONCILED_*
 #   DOWNLOAD_FLOW_MANUALLY_DISMISSED
 #
-# Missing-import issues are reconciled automatically through Arr APIs. Exact
-# download history is checked first. If no terminal history is available, the
-# monitor verifies the exact Sonarr episode/Radarr movie and its Arr database
-# file record twice before closing the issue. Physical media paths are never
-# accessed, so this reconciliation does not wake array disks.
+# Missing-import, vanished-SAB, and never-reached-SAB issues are reconciled
+# automatically through Arr APIs. Exact download history is checked first. If
+# no terminal history is available, the monitor verifies the exact Sonarr
+# episode/Radarr movie and its Arr database file record twice before closing
+# the issue. Physical media paths are never accessed, so this reconciliation
+# does not wake array disks.
 #
 # MONITOR SELF-HEALTH
 # -------------------
@@ -555,7 +564,7 @@ GROUP_NOTIFICATION_MAX_BYTES=24000
 GROUP_NOTIFICATION_ITEM_MAX_CHARS=4000
 
 # ---------------------------------------------------------------------------
-# Notification lifecycle - v3.6
+# Notification lifecycle - v3.7
 # ---------------------------------------------------------------------------
 
 # Repeat unchanged active errors and warnings until they resolve or are
@@ -605,9 +614,15 @@ MOVER_PROCESS_PATTERN='(^|/)(mover|mover\.old)( |$)|mover\.php'
 STATE_FILE="${STATE_DIR}/state.json"
 STATE_BACKUP="${STATE_DIR}/state.json.bak"
 SAB_HISTORY_CACHE="${STATE_DIR}/sab_history_cache.json"
+BATCH_DISMISS_MANIFEST_DIR="${STATE_DIR}/batch-dismissals"
 
 # Resolved historical issues older than this are removed from state.
 STATE_RETENTION_DAYS=30
+
+# Keep batch-dismissal manifests and their pre-change state backups long enough
+# for review or recovery without allowing one-time cleanup artifacts to grow
+# forever.
+BATCH_DISMISS_AUDIT_RETENTION_DAYS=30
 
 # ---------------------------------------------------------------------------
 # Persistent operational log - v2.5
@@ -699,10 +714,11 @@ DOWNLOAD_LEDGER_ESCALATE_MINUTES=720
 DOWNLOAD_LEDGER_DISCOVERY_HOURS=24
 DOWNLOAD_LEDGER_RETENTION_DAYS=7
 
-# Automatically reconcile completed downloads that have no terminal event in
-# the normal activity-history window. All checks use Arr database APIs only.
-# The script never calls Arr filesystem/rescan endpoints and never stats media
-# paths on the Unraid host.
+# Automatically reconcile exact download-flow gaps that have no terminal event
+# in the normal activity-history window. This covers completed imports as well
+# as jobs that vanished from SAB or never became visible in SAB after an Arr
+# grab. All checks use Arr database APIs only. The script never calls Arr
+# filesystem/rescan endpoints and never stats media paths on the Unraid host.
 DOWNLOAD_LEDGER_RECONCILE_ENABLED=true
 DOWNLOAD_LEDGER_RECONCILE_CONFIRM_RUNS=2
 DOWNLOAD_LEDGER_RECONCILE_MAX_RECORDS=50
@@ -840,6 +856,7 @@ DOWNLOAD_LEDGER_RECONCILIATION_PENDING_COUNT=0
 DOWNLOAD_LEDGER_RECONCILED_COUNT=0
 DOWNLOAD_LEDGER_RECONCILIATION_FAILED_COUNT=0
 DOWNLOAD_LEDGER_MANUAL_DISMISSAL_NOTIFICATION_COUNT=0
+DOWNLOAD_LEDGER_BATCH_DISMISSAL_NOTIFICATION_COUNT=0
 DOWNLOAD_LEDGER_RECONCILIATION_RESULTS_FILE=""
 REMINDER_NOTIFICATION_COUNT=0
 EVENT_REPEAT_SUPPRESSED_COUNT=0
@@ -2712,10 +2729,11 @@ initialize_state() {
 
         cat >"$STATE_FILE" <<'EOF'
 {
-  "version": 14,
+  "version": 15,
   "issues": {},
   "sabProgress": {},
   "downloadLedger": {},
+  "downloadDismissalBatches": {},
   "sabServerStats": {},
   "monitor": {
     "lastStartedAt": 0,
@@ -2754,10 +2772,11 @@ EOF
 
             cat >"$STATE_FILE" <<'EOF'
 {
-  "version": 14,
+  "version": 15,
   "issues": {},
   "sabProgress": {},
   "downloadLedger": {},
+  "downloadDismissalBatches": {},
   "sabServerStats": {},
   "monitor": {
     "lastStartedAt": 0,
@@ -2779,7 +2798,7 @@ EOF
         fi
     fi
     ###########################################################################
-    # STATE MIGRATION - v3.6
+    # STATE MIGRATION - v3.7
     #
     # Existing state is upgraded in place. Completion-only ledger records that
     # predate the discovery window are not enrolled. Any active historical
@@ -2795,7 +2814,7 @@ EOF
         --argjson migrationNow "$START_TIME" \
         --argjson discoverySeconds "$((DOWNLOAD_LEDGER_DISCOVERY_HOURS * 3600))" \
         '
-        .version = 14
+        .version = 15
         |
         .issues = (.issues // {})
         |
@@ -2842,6 +2861,8 @@ EOF
         .sabProgress = (.sabProgress // {})
         |
         .downloadLedger = (.downloadLedger // {})
+        |
+        .downloadDismissalBatches = (.downloadDismissalBatches // {})
         |
         .issues as $issues
         |
@@ -2980,6 +3001,10 @@ EOF
                 .manualDismissalNotifiedAt = (
                     .manualDismissalNotifiedAt // 0
                 )
+                |
+                .manualDismissalBatchId = (
+                    .manualDismissalBatchId // ""
+                )
             )
         )
         |
@@ -3085,7 +3110,7 @@ EOF
 
     else
 
-        log "ERROR: Unable to migrate state file to schema version 14"
+        log "ERROR: Unable to migrate state file to schema version 15"
         exit 3
     fi
 }
@@ -3149,7 +3174,7 @@ begin_monitor_run() {
     jq \
         --argjson now "$now" \
         '
-        .version = 14
+        .version = 15
         |
         .monitor.lastStartedAt = $now
         |
@@ -3573,7 +3598,7 @@ record_arr_telemetry() {
         --argjson maxIssueKeys "$ARR_TELEMETRY_MAX_ISSUE_KEYS" \
         --argjson maxExamples "$ARR_TELEMETRY_MAX_EXAMPLES" \
         '
-        .version = 14
+        .version = 15
         |
         .telemetry = (
             .telemetry
@@ -4000,7 +4025,7 @@ update_issue_state() {
         --argjson flapThreshold "$FLAP_TRANSITION_THRESHOLD" \
         --argjson flapSuppressionSeconds "$flap_suppression_seconds" \
         '
-        .version = 14
+        .version = 15
         |
         (.issues[$key] // {}) as $old
         |
@@ -4374,7 +4399,22 @@ mark_notified() {
         --arg event "$event" \
         --argjson now "$now" \
         '
-        if $event == "dismissed" and ($key | startswith("FLOW:DOWNLOAD:"))
+        if $event == "batch-dismissed" and ($key | startswith("FLOW:BATCH-DISMISS:"))
+        then
+            ($key | ltrimstr("FLOW:BATCH-DISMISS:")) as $batchId
+            |
+            if .downloadDismissalBatches[$batchId]
+            then
+                .downloadDismissalBatches[$batchId].notifiedAt = (
+                    [
+                        $now,
+                        (.downloadDismissalBatches[$batchId].dismissedAt // 0)
+                    ]
+                    | max
+                )
+            else .
+            end
+        elif $event == "dismissed" and ($key | startswith("FLOW:DOWNLOAD:"))
         then
             ($key | ltrimstr("FLOW:DOWNLOAD:") | ascii_downcase) as $downloadId
             |
@@ -4527,7 +4567,7 @@ mark_issue_resolved() {
 }
 
 ###############################################################################
-# OPERATOR ACKNOWLEDGEMENT AND DOWNLOAD DISMISSAL - v3.6
+# OPERATOR ACKNOWLEDGEMENT AND DOWNLOAD DISMISSAL - v3.7
 ###############################################################################
 
 resolve_active_issue_selector() {
@@ -4752,6 +4792,521 @@ dismiss_download_flow_issue() {
         "$issue_key"
 }
 
+batch_dismiss_downloads() {
+
+    local source=""
+    local classification=""
+    local title_contains=""
+    local older_than_hours=""
+    local before_value=""
+    local before_epoch=0
+    local ack_file=""
+    local normalized_ack_file=""
+    local unmatched_ack_file=""
+    local requested_ack_count=0
+    local execute=false
+    local confirm_count=""
+    local reason=""
+    local matches_file="${TMP_DIR}/batch-dismiss-matches.jsonl"
+    local candidates_file="${TMP_DIR}/batch-dismiss-candidates.jsonl"
+    local count=0
+    local missing_ledger_count=0
+    local record
+    local issue_key
+    local ack_id
+    local batch_id
+    local batch_hash
+    local now
+    local timestamp
+    local state_backup
+    local manifest_file
+    local manifest_tmp
+    local state_tmp="${TMP_DIR}/state.batch-dismissed.json"
+
+    while (( $# > 0 )); do
+        case "$1" in
+            --source)
+                [ -n "${2:-}" ] || {
+                    log "ERROR: --source requires Sonarr or Radarr"
+                    return 2
+                }
+                source="$2"
+                shift 2
+                ;;
+
+            --classification)
+                [ -n "${2:-}" ] || {
+                    log "ERROR: --classification requires a value"
+                    return 2
+                }
+                classification="$2"
+                shift 2
+                ;;
+
+            --title-contains)
+                [ -n "${2:-}" ] || {
+                    log "ERROR: --title-contains requires literal text"
+                    return 2
+                }
+                title_contains="$2"
+                shift 2
+                ;;
+
+            --older-than-hours)
+                [ -n "${2:-}" ] || {
+                    log "ERROR: --older-than-hours requires an integer"
+                    return 2
+                }
+                older_than_hours="$2"
+                shift 2
+                ;;
+
+            --before)
+                [ -n "${2:-}" ] || {
+                    log "ERROR: --before requires a date or date/time"
+                    return 2
+                }
+                before_value="$2"
+                shift 2
+                ;;
+
+            --ack-file)
+                [ -n "${2:-}" ] || {
+                    log "ERROR: --ack-file requires a path"
+                    return 2
+                }
+                ack_file="$2"
+                shift 2
+                ;;
+
+            --execute)
+                execute=true
+                shift
+                ;;
+
+            --confirm-count)
+                [ -n "${2:-}" ] || {
+                    log "ERROR: --confirm-count requires an integer"
+                    return 2
+                }
+                confirm_count="$2"
+                shift 2
+                ;;
+
+            --reason)
+                [ -n "${2:-}" ] || {
+                    log "ERROR: --reason requires an explanation"
+                    return 2
+                }
+                reason="$2"
+                shift 2
+                ;;
+
+            --help|-h)
+                print_lifecycle_command_help
+                return 0
+                ;;
+
+            *)
+                log "ERROR: Unknown batch-dismiss option: $1"
+                print_lifecycle_command_help
+                return 2
+                ;;
+        esac
+    done
+
+    case "$source" in
+        ""|Sonarr|Radarr)
+            ;;
+        *)
+            log "ERROR: --source must be Sonarr or Radarr"
+            return 2
+            ;;
+    esac
+
+    case "$classification" in
+        ""|DOWNLOAD_FLOW_NOT_REACHED_SAB|DOWNLOAD_FLOW_SAB_VANISHED|DOWNLOAD_FLOW_IMPORT_MISSING)
+            ;;
+        *)
+            log "ERROR: Unsupported batch-dismiss classification: $classification"
+            log "Only exact unresolved download-flow classifications may be dismissed."
+            return 2
+            ;;
+    esac
+
+    if [ -n "$older_than_hours" ]; then
+        if ! [[ "$older_than_hours" =~ ^[0-9]+$ ]] ||
+           (( older_than_hours <= 0 )); then
+            log "ERROR: --older-than-hours must be a positive integer"
+            return 2
+        fi
+    fi
+
+    if [ -n "$before_value" ]; then
+        before_epoch=$(date -d "$before_value" '+%s' 2>/dev/null) || {
+            log "ERROR: Unable to parse --before value: $before_value"
+            return 2
+        }
+    fi
+
+    if [ -n "$ack_file" ]; then
+        [ -s "$ack_file" ] || {
+            log "ERROR: ACK-ID file is missing or empty: $ack_file"
+            return 2
+        }
+
+        normalized_ack_file="${TMP_DIR}/batch-dismiss-ack-ids.txt"
+        unmatched_ack_file="${TMP_DIR}/batch-dismiss-unmatched-ack-ids.txt"
+        awk 'NF {print tolower($1)}' "$ack_file" |
+            sort -u >"$normalized_ack_file"
+
+        if [ ! -s "$normalized_ack_file" ] ||
+           grep -Evq '^[0-9a-f]{12}$' "$normalized_ack_file"; then
+            log "ERROR: Every --ack-file entry must be one complete 12-character ACK ID"
+            return 2
+        fi
+
+        requested_ack_count=$(wc -l <"$normalized_ack_file" | tr -d ' ')
+    fi
+
+    # Preview may be broad because it is read-only. Execution must select an
+    # exact classification or an explicit ACK list, plus another narrowing
+    # filter, so a mistyped command cannot clear the whole ledger.
+    if [ "$execute" = true ]; then
+        if [ -z "$classification" ] && [ -z "$ack_file" ]; then
+            log "ERROR: Execution requires --classification or --ack-file"
+            return 2
+        fi
+
+        if [ -z "$ack_file" ] &&
+           [ -z "$source" ] &&
+           [ -z "$title_contains" ] &&
+           [ -z "$older_than_hours" ] &&
+           [ -z "$before_value" ]; then
+            log "ERROR: Execution requires an additional narrowing filter"
+            log "Use --source, --title-contains, --older-than-hours, --before, or --ack-file."
+            return 2
+        fi
+
+        if ! [[ "$confirm_count" =~ ^[0-9]+$ ]] ||
+           (( confirm_count <= 0 )); then
+            log "ERROR: Execution requires --confirm-count with the exact positive preview count"
+            return 2
+        fi
+
+        reason="${reason//$'\r'/ }"
+        reason="${reason//$'\n'/ }"
+        [ -n "$reason" ] || {
+            log "ERROR: Execution requires a non-empty --reason"
+            return 2
+        }
+    fi
+
+    : >"$matches_file"
+
+    jq -c \
+        --arg source "$source" \
+        --arg classification "$classification" \
+        --arg titleContains "${title_contains,,}" \
+        --argjson now "$START_TIME" \
+        --argjson olderHours "${older_than_hours:-0}" \
+        --argjson beforeEpoch "$before_epoch" \
+        '
+        (.downloadLedger // {}) as $ledger
+        |
+        .issues
+        // {}
+        | to_entries[]?
+        | select((.value.active // false) == true)
+        | select(.key | startswith("FLOW:DOWNLOAD:"))
+        | select(
+            (.value.classification // "") == "DOWNLOAD_FLOW_NOT_REACHED_SAB"
+            or (.value.classification // "") == "DOWNLOAD_FLOW_SAB_VANISHED"
+            or (.value.classification // "") == "DOWNLOAD_FLOW_IMPORT_MISSING"
+          )
+        | select($source == "" or (.value.app // "") == $source)
+        | select(
+            $classification == ""
+            or (.value.classification // "") == $classification
+          )
+        | select(
+            $titleContains == ""
+            or ((.value.title // "") | ascii_downcase | contains($titleContains))
+          )
+        | select(
+            $olderHours == 0
+            or (($now - (.value.firstSeen // $now)) >= ($olderHours * 3600))
+          )
+        | select(
+            $beforeEpoch == 0
+            or ((.value.firstSeen // 0) > 0 and (.value.firstSeen // 0) <= $beforeEpoch)
+          )
+        | (.key | ltrimstr("FLOW:DOWNLOAD:") | ascii_downcase) as $downloadId
+        | {
+            issueKey: .key,
+            downloadId: $downloadId,
+            ackId: (.value.ackId // ""),
+            source: (.value.app // "Unknown"),
+            severity: (.value.severity // "ERROR"),
+            classification: (.value.classification // "UNKNOWN"),
+            title: (.value.title // "Unknown"),
+            firstSeen: (.value.firstSeen // 0),
+            ageHours: (
+                if (.value.firstSeen // 0) > 0
+                then (($now - .value.firstSeen) / 3600 | floor)
+                else 0
+                end
+            ),
+            ledgerPresent: ($ledger[$downloadId] != null),
+            arrQueueStatus: ($ledger[$downloadId].arrQueueStatus // "not observed"),
+            sabStatus: ($ledger[$downloadId].sabStatus // "not observed")
+          }
+        ' "$STATE_FILE" >"$candidates_file" || return 1
+
+    while IFS= read -r record; do
+        [ -n "$record" ] || continue
+
+        issue_key=$(jq -r '.issueKey' <<<"$record")
+        ack_id=$(jq -r '.ackId // ""' <<<"$record")
+        [ -n "$ack_id" ] || ack_id=$(issue_ack_id "$issue_key")
+
+        if [ -n "$normalized_ack_file" ] &&
+           ! grep -Fxiq -- "$ack_id" "$normalized_ack_file"; then
+            continue
+        fi
+
+        jq -c --arg ackId "$ack_id" '.ackId = $ackId' <<<"$record" \
+            >>"$matches_file" || return 1
+    done <"$candidates_file"
+
+    count=$(wc -l <"$matches_file" | tr -d ' ')
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+
+    if [ -n "$normalized_ack_file" ]; then
+        jq -r '.ackId' "$matches_file" |
+            sort -u >"${TMP_DIR}/batch-dismiss-matched-ack-ids.txt"
+        comm -23 \
+            "$normalized_ack_file" \
+            "${TMP_DIR}/batch-dismiss-matched-ack-ids.txt" \
+            >"$unmatched_ack_file"
+    fi
+
+    printf 'Batch download-flow dismissal %s\n' \
+        "$([ "$execute" = true ] && printf 'execution' || printf 'preview')"
+    printf 'Matches: %s\n' "$count"
+    printf 'Source filter: %s\n' "${source:-any}"
+    printf 'Classification filter: %s\n' "${classification:-any exact flow issue}"
+    printf 'Title contains: %s\n' "${title_contains:-not set}"
+    if [ -n "$older_than_hours" ]; then
+        printf 'Older than: %sh\n' "$older_than_hours"
+    else
+        printf 'Older than: not set\n'
+    fi
+    printf 'Before: %s\n' "${before_value:-not set}"
+    printf 'ACK-ID file: %s\n\n' "${ack_file:-not set}"
+
+    if [ -n "$unmatched_ack_file" ] && [ -s "$unmatched_ack_file" ]; then
+        printf 'WARNING: These requested ACK IDs did not match an eligible active issue:\n'
+        sed 's/^/  /' "$unmatched_ack_file"
+        printf '\n'
+    fi
+
+    if (( count > 0 )); then
+        printf 'ACK ID       SOURCE   AGE(h)  LEDGER  CLASSIFICATION                     TITLE\n'
+        jq -r '
+            [
+                .ackId,
+                .source,
+                (.ageHours | tostring),
+                (if .ledgerPresent then "yes" else "NO" end),
+                .classification,
+                .title
+            ]
+            | @tsv
+            ' "$matches_file"
+    fi
+
+    if [ "$execute" != true ]; then
+        printf '\nPreview only: no issues were dismissed and no Arr, SABnzbd, or media changes were made.\n'
+        printf 'Review every row, then repeat the command with --execute, --confirm-count %s, and --reason.\n' "$count"
+        return 0
+    fi
+
+    if [ -n "$unmatched_ack_file" ] && [ -s "$unmatched_ack_file" ]; then
+        log "ERROR: The ACK-ID file requested ${requested_ack_count} issue(s), but one or more did not match"
+        log "Batch dismissal was refused; nothing was changed."
+        return 2
+    fi
+
+    (( count > 0 )) || {
+        log "ERROR: No active download-flow issues matched; nothing was changed"
+        return 2
+    }
+
+    if (( confirm_count != count )); then
+        log "ERROR: --confirm-count ${confirm_count} does not match the current preview count ${count}"
+        log "Run the preview again; nothing was changed."
+        return 2
+    fi
+
+    missing_ledger_count=$(jq -s '[.[] | select(.ledgerPresent != true)] | length' "$matches_file")
+    if (( missing_ledger_count > 0 )); then
+        log "ERROR: ${missing_ledger_count} matching issue(s) have no download-ledger record"
+        log "Batch dismissal was refused; nothing was changed."
+        return 2
+    fi
+
+    now=$(date +%s)
+    timestamp=$(date '+%Y%m%d-%H%M%S')
+    batch_hash=$(printf '%s' \
+        "${now}|${source}|${classification}|${title_contains}|${older_than_hours}|${before_value}|${reason}|${count}" |
+        sha256sum |
+        awk '{print substr($1, 1, 10)}')
+    batch_id="${timestamp}-${batch_hash}"
+
+    mkdir -p -- "$BATCH_DISMISS_MANIFEST_DIR" || {
+        log "ERROR: Unable to create batch-dismissal manifest directory"
+        return 1
+    }
+
+    state_backup="${STATE_FILE}.pre-batch-dismiss.${batch_id}.bak"
+    cp -p -- "$STATE_FILE" "$state_backup" || {
+        log "ERROR: Unable to create pre-dismissal state backup: $state_backup"
+        return 1
+    }
+
+    manifest_file="${BATCH_DISMISS_MANIFEST_DIR}/batch-dismiss-${batch_id}.json"
+    manifest_tmp=$(mktemp "${BATCH_DISMISS_MANIFEST_DIR}/.batch-dismiss.XXXXXX") || return 1
+
+    if ! jq -s \
+        --arg batchId "$batch_id" \
+        --arg source "$source" \
+        --arg classification "$classification" \
+        --arg titleContains "$title_contains" \
+        --arg olderHours "$older_than_hours" \
+        --arg before "$before_value" \
+        --arg ackFile "$ack_file" \
+        --arg reason "$reason" \
+        --arg stateBackup "$state_backup" \
+        --argjson dismissedAt "$now" \
+        '{
+            version: 1,
+            batchId: $batchId,
+            dismissedAt: $dismissedAt,
+            reason: $reason,
+            stateBackup: $stateBackup,
+            filters: {
+                source: $source,
+                classification: $classification,
+                titleContains: $titleContains,
+                olderThanHours: $olderHours,
+                before: $before,
+                ackFile: $ackFile
+            },
+            count: length,
+            items: .
+          }' "$matches_file" >"$manifest_tmp"
+    then
+        rm -f -- "$manifest_tmp"
+        log "ERROR: Unable to build batch-dismissal manifest"
+        return 1
+    fi
+
+    mv -f -- "$manifest_tmp" "$manifest_file" || return 1
+
+    if ! jq \
+        --slurpfile matches "$matches_file" \
+        --arg batchId "$batch_id" \
+        --arg source "$source" \
+        --arg classification "$classification" \
+        --arg titleContains "$title_contains" \
+        --arg olderHours "$older_than_hours" \
+        --arg before "$before_value" \
+        --arg ackFile "$ack_file" \
+        --arg reason "$reason" \
+        --arg manifest "$manifest_file" \
+        --arg stateBackup "$state_backup" \
+        --argjson now "$now" \
+        --argjson count "$count" \
+        '
+        .version = 15
+        |
+        .downloadDismissalBatches = (.downloadDismissalBatches // {})
+        |
+        .downloadDismissalBatches[$batchId] = {
+            batchId: $batchId,
+            dismissedAt: $now,
+            notifiedAt: 0,
+            count: $count,
+            reason: $reason,
+            manifest: $manifest,
+            stateBackup: $stateBackup,
+            filters: {
+                source: $source,
+                classification: $classification,
+                titleContains: $titleContains,
+                olderThanHours: $olderHours,
+                before: $before,
+                ackFile: $ackFile
+            }
+          }
+        |
+        reduce $matches[] as $match (
+            .;
+            ($match.downloadId | ascii_downcase) as $id
+            | ($match.issueKey) as $key
+            | .downloadLedger[$id] |= (
+                .manuallyDismissedAt = $now
+                | .manualDismissalReason = $reason
+                | .manualDismissalAckId = $match.ackId
+                | .manualDismissalPreviousClassification = $match.classification
+                | .manualDismissalNotifiedAt = $now
+                | .manualDismissalBatchId = $batchId
+                | .reconciliationCandidateFingerprint = ""
+                | .reconciliationCandidateRuns = 0
+                | .reconciliationCandidateFirstSeenAt = 0
+                | .reconciliationCandidateLastSeenAt = 0
+                | .lastSeen = ([ (.lastSeen // 0), $now ] | max)
+              )
+            | .issues[$key] |= (
+                .active = false
+                | .resolvedAt = $now
+                | .lastSeen = $now
+                | .manuallyDismissedAt = $now
+                | .manualDismissalReason = $reason
+                | .manualDismissalBatchId = $batchId
+                | .transitionTimestamps = (
+                    ((.transitionTimestamps // []) + [$now])
+                    | map(select(type == "number"))
+                    | unique
+                    | sort
+                  )
+                | .acknowledgedSignature = ""
+                | .acknowledgedAt = 0
+                | .acknowledgementNote = ""
+              )
+          )
+        ' "$STATE_FILE" >"$state_tmp"
+    then
+        log "ERROR: Unable to prepare atomic batch-dismissal state update"
+        return 1
+    fi
+
+    save_state "$state_tmp" || return 1
+
+    persistent_log \
+        "BATCH_DISMISSED" \
+        "batch_id=${batch_id} | count=${count} | source=${source:-any} | classification=${classification:-ack-list} | reason=${reason} | manifest=${manifest_file}"
+
+    printf '\nBatch dismissal completed.\n'
+    printf 'Dismissed: %s\n' "$count"
+    printf 'Batch ID: %s\n' "$batch_id"
+    printf 'State backup: %s\n' "$state_backup"
+    printf 'Manifest: %s\n' "$manifest_file"
+    printf 'No Sonarr, Radarr, SABnzbd, or media changes were made.\n'
+    printf 'One summary notification will be queued by the next normal monitor run.\n'
+}
+
 unacknowledge_active_issue() {
 
     local selector="$1"
@@ -4837,11 +5392,63 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor lifecycle commands:' \
+        'ARR Health Monitor v3.7 lifecycle commands' \
+        '' \
+        'Always invoke the Unraid User Scripts copy through /bin/bash:' \
+        '  /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script COMMAND' \
+        '' \
+        'Inspect and manage one issue:' \
         '  --list-active' \
+        '      List active issues and their 12-character ACK IDs.' \
+        '' \
         '  --ack ACK_ID [note]' \
+        '      Suppress reminders for the current unchanged issue signature.' \
+        '      Acknowledgement does not resolve the issue or improve pipeline health.' \
+        '' \
         '  --unack ACK_ID' \
+        '      Remove an acknowledgement from an active issue.' \
+        '' \
         '  --dismiss-download ACK_ID [reason]' \
+        '      Close one intentionally abandoned exact download-flow issue.' \
+        '' \
+        'Preview or execute a guarded batch dismissal:' \
+        '  --batch-dismiss-downloads [filters] [execution options]' \
+        '' \
+        '  Filters:' \
+        '    --source Sonarr|Radarr' \
+        '    --classification DOWNLOAD_FLOW_NOT_REACHED_SAB' \
+        '    --classification DOWNLOAD_FLOW_SAB_VANISHED' \
+        '    --classification DOWNLOAD_FLOW_IMPORT_MISSING' \
+        '    --title-contains LITERAL_TEXT' \
+        '    --older-than-hours POSITIVE_INTEGER' \
+        '    --before DATE_OR_DATETIME' \
+        '    --ack-file PATH' \
+        '        One complete 12-character ACK ID per line.' \
+        '' \
+        '  Execution options:' \
+        '    --execute' \
+        '    --confirm-count EXACT_PREVIEW_COUNT' \
+        '    --reason "operator explanation"' \
+        '' \
+        '  Preview is the default and never dismisses issues:' \
+        "    --batch-dismiss-downloads --source Sonarr \\" \
+        "      --classification DOWNLOAD_FLOW_SAB_VANISHED \\" \
+        '      --title-contains "NCIS" --older-than-hours 24' \
+        '' \
+        '  After reviewing every preview row, execute with the exact count:' \
+        "    --batch-dismiss-downloads --source Sonarr \\" \
+        "      --classification DOWNLOAD_FLOW_SAB_VANISHED \\" \
+        "      --title-contains \"NCIS\" --older-than-hours 24 \\" \
+        "      --execute --confirm-count 64 \\" \
+        '      --reason "One-time cleanup of intentionally removed downloads"' \
+        '' \
+        'Batch execution safeguards:' \
+        '  - Requires an exact classification or an explicit ACK-ID file.' \
+        '  - Requires at least one additional narrowing filter.' \
+        '  - Refuses a changed preview count or a missing ledger record.' \
+        '  - Creates a timestamped state backup and detailed JSON manifest.' \
+        '  - Updates monitor state atomically and sends one later summary.' \
+        '  - Never changes Sonarr, Radarr, SABnzbd, or any media file.' \
         '' \
         'Acknowledgements apply only to the current issue signature and clear on resolution or material change.' \
         'Download dismissal closes an intentional manual abandonment in monitor state only; it does not change Arr, SABnzbd, or media.'
@@ -5245,6 +5852,8 @@ notification_record_text() {
                 then " [RESOLVED]"
                 elif $event == "reconciled"
                 then " [" + (.severity // "INFO") + "] [AUTO-RECONCILED]"
+                elif $event == "batch-dismissed"
+                then " [" + (.severity // "INFO") + "] [BATCH DISMISSED]"
                 elif $event == "dismissed"
                 then " [" + (.severity // "INFO") + "] [MANUALLY DISMISSED]"
                 elif $event == "reminder"
@@ -5338,7 +5947,7 @@ send_notification_page() {
         '[.[] | select(.event == "reconciled")] | length' \
         "$page_file")
     dismissed=$(jq -s \
-        '[.[] | select(.event == "dismissed")] | length' \
+        '[.[] | select(.event == "dismissed" or .event == "batch-dismissed")] | length' \
         "$page_file")
     reminders=$(jq -s \
         '[.[] | select(.event == "reminder")] | length' \
@@ -9955,7 +10564,8 @@ update_download_ledger_state() {
                 manualDismissalReason: "",
                 manualDismissalAckId: "",
                 manualDismissalPreviousClassification: "",
-                manualDismissalNotifiedAt: 0
+                manualDismissalNotifiedAt: 0,
+                manualDismissalBatchId: ""
             }) as $old
             | (
                 ($item.kind == "arrGrabbed")
@@ -10793,6 +11403,7 @@ queue_download_reconciliation_notifications() {
         local original_warning
         local queue_status
         local original_ack_id
+        local original_classification
         local issue_key
         local signature
         local detail
@@ -10809,6 +11420,10 @@ queue_download_reconciliation_notifications() {
         original_warning=$(jq -r '.originalWarning // "not captured"' <<<"$record")
         queue_status=$(jq -r '.arrQueueStatus // "not observed"' <<<"$record")
         original_ack_id=$(issue_ack_id "FLOW:DOWNLOAD:${download_id}")
+        original_classification=$(jq -r \
+            --arg key "FLOW:DOWNLOAD:${download_id}" \
+            '.issues[$key].classification // "DOWNLOAD_FLOW_UNKNOWN"' \
+            "$STATE_FILE")
         issue_key="FLOW:RECONCILIATION:${download_id}"
 
         detail="Download ID: ${download_id}"$'\n'
@@ -10818,9 +11433,10 @@ queue_download_reconciliation_notifications() {
         [ -n "$reconciliation_detail" ] && \
             detail+="${reconciliation_detail}"$'\n'
         detail+="Original queue state: ${queue_status}"$'\n'
+        detail+="Original classification: ${original_classification}"$'\n'
         detail+="Original warning: ${original_warning:-not captured}"$'\n'
         detail+="Original Ack ID: ${original_ack_id}"$'\n'
-        detail+="Action taken: closed the monitor's missing-terminal-event issue automatically"$'\n'
+        detail+="Action taken: closed the monitor's exact download-flow issue automatically"$'\n'
         detail+="Arr/SAB/media changes: none"$'\n'
         detail+="Reconciliation verification: Arr API database records only"$'\n'
         detail+="Reconciliation media-path access: none"
@@ -10853,6 +11469,84 @@ queue_download_reconciliation_notifications() {
         fi
 
     done <"$records_file"
+}
+
+queue_download_batch_dismissal_notifications() {
+
+    local batches_file="${TMP_DIR}/download-batch-dismissals.jsonl"
+
+    jq -c '
+        .downloadDismissalBatches
+        // {}
+        | to_entries[]?
+        | .value
+        | select((.dismissedAt // 0) > 0)
+        | select((.notifiedAt // 0) < (.dismissedAt // 0))
+        ' "$STATE_FILE" >"$batches_file" || return 1
+
+    while IFS= read -r record; do
+        [ -n "$record" ] || continue
+
+        local batch_id
+        local count
+        local source
+        local classification
+        local title_contains
+        local older_hours
+        local before
+        local ack_file
+        local reason
+        local manifest
+        local issue_key
+        local signature
+        local detail
+
+        batch_id=$(jq -r '.batchId' <<<"$record")
+        count=$(jq -r '.count // 0' <<<"$record")
+        source=$(jq -r '.filters.source // ""' <<<"$record")
+        classification=$(jq -r '.filters.classification // ""' <<<"$record")
+        title_contains=$(jq -r '.filters.titleContains // ""' <<<"$record")
+        older_hours=$(jq -r '.filters.olderThanHours // ""' <<<"$record")
+        before=$(jq -r '.filters.before // ""' <<<"$record")
+        ack_file=$(jq -r '.filters.ackFile // ""' <<<"$record")
+        reason=$(jq -r '.reason // "No reason recorded"' <<<"$record")
+        manifest=$(jq -r '.manifest // "not recorded"' <<<"$record")
+        issue_key="FLOW:BATCH-DISMISS:${batch_id}"
+
+        detail="Dismissed issues: ${count}"$'\n'
+        detail+="Source filter: ${source:-any}"$'\n'
+        detail+="Classification filter: ${classification:-explicit ACK list}"$'\n'
+        [ -n "$title_contains" ] && detail+="Title contained: ${title_contains}"$'\n'
+        [ -n "$older_hours" ] && detail+="Older than: ${older_hours} hour(s)"$'\n'
+        [ -n "$before" ] && detail+="First seen before: ${before}"$'\n'
+        [ -n "$ack_file" ] && detail+="ACK-ID selection file: ${ack_file}"$'\n'
+        detail+="Reason: ${reason}"$'\n'
+        detail+="Action taken: closed the selected monitor-state issues"$'\n'
+        detail+="Arr/SAB/media changes: none"$'\n'
+        detail+="Manifest: ${manifest}"
+
+        signature=$(issue_signature \
+            "Monitor" \
+            "$issue_key" \
+            "DOWNLOAD_FLOW_BATCH_DISMISSED" \
+            "INFO" \
+            "dismissed" \
+            "${batch_id}|${count}|${reason}")
+
+        queue_group_notification \
+            "$issue_key" \
+            "$signature" \
+            "Monitor" \
+            "${count} exact download-flow issue(s)" \
+            "DOWNLOAD_FLOW_BATCH_DISMISSED" \
+            "INFO" \
+            "0" \
+            "$detail" \
+            "batch-dismissed"
+
+        ((DOWNLOAD_LEDGER_BATCH_DISMISSAL_NOTIFICATION_COUNT++)) || true
+
+    done <"$batches_file"
 }
 
 queue_download_manual_dismissal_notifications() {
@@ -10949,7 +11643,9 @@ perform_download_ledger_reconciliation() {
 
     jq -c \
         --argjson now "$START_TIME" \
-        --argjson minimumMinutes "$DOWNLOAD_LEDGER_IMPORT_WARN_MINUTES" \
+        --argjson importMinutes "$DOWNLOAD_LEDGER_IMPORT_WARN_MINUTES" \
+        --argjson vanishedMinutes "$DOWNLOAD_LEDGER_SAB_VANISHED_WARN_MINUTES" \
+        --argjson notReachedMinutes "$DOWNLOAD_LEDGER_GRAB_TO_SAB_WARN_MINUTES" \
         --argjson maximum "$DOWNLOAD_LEDGER_RECONCILE_MAX_RECORDS" \
         '
         .issues as $issues
@@ -10959,18 +11655,40 @@ perform_download_ledger_reconciliation() {
             // {}
             | to_entries[]?
             | select((.value.flowEnrolled // false) == true)
-            | select((.value.sabCompletedAt // 0) > 0)
             | select((.value.arrImportedAt // 0) <= 0)
             | select((.value.arrFailedAt // 0) <= 0)
             | select((.value.arrIgnoredAt // 0) <= 0)
             | select((.value.sabFailedAt // 0) <= 0)
             | select((.value.arrReconciledAt // 0) <= 0)
             | select((.value.manuallyDismissedAt // 0) <= 0)
+            | (
+                if (.value.sabCompletedAt // 0) > 0
+                then (.value.sabCompletedAt // 0)
+                elif (.value.sabQueueLastSeen // 0) > 0
+                then (.value.sabQueueLastSeen // 0)
+                else (.value.arrGrabbedAt // 0)
+                end
+              ) as $candidateEpoch
             | select(
-                (($now - (.value.sabCompletedAt // $now)) / 60)
-                >= $minimumMinutes
+                (
+                    (.value.sabCompletedAt // 0) > 0
+                    and (($now - (.value.sabCompletedAt // $now)) / 60) >= $importMinutes
+                )
+                or
+                (
+                    (.value.sabQueuedAt // 0) > 0
+                    and (.value.sabCompletedAt // 0) <= 0
+                    and (.value.sabFailedAt // 0) <= 0
+                    and (.value.sabQueueLastSeen // 0) > 0
+                    and (($now - (.value.sabQueueLastSeen // $now)) / 60) >= $vanishedMinutes
+                )
+                or
+                (
+                    (.value.arrGrabbedAt // 0) > 0
+                    and (.value.sabQueuedAt // 0) <= 0
+                    and (($now - (.value.arrGrabbedAt // $now)) / 60) >= $notReachedMinutes
+                )
             )
-            | . as $entry
             | {
                 activeRank: (
                     if ($issues["FLOW:DOWNLOAD:" + .key].active // false)
@@ -10978,11 +11696,11 @@ perform_download_ledger_reconciliation() {
                     else 1
                     end
                 ),
-                completedAt: (.value.sabCompletedAt // 0),
+                candidateEpoch: $candidateEpoch,
                 record: .value
             }
         ]
-        | sort_by(.activeRank, .completedAt)
+        | sort_by(.activeRank, .candidateEpoch)
         | .[:$maximum]
         | .[].record
         ' "$STATE_FILE" >"$candidates_file" || return 1
@@ -11262,6 +11980,11 @@ process_exact_download_ledger() {
 
     if ! perform_download_ledger_reconciliation; then
         log "ERROR: Unable to complete automatic download reconciliation"
+        return 1
+    fi
+
+    if ! queue_download_batch_dismissal_notifications; then
+        log "ERROR: Unable to queue batch download-dismissal notifications"
         return 1
     fi
 
@@ -12400,6 +13123,15 @@ prune_state() {
 
         |
 
+        .downloadDismissalBatches = (
+            (.downloadDismissalBatches // {})
+            | with_entries(
+                select((.value.dismissedAt // 0) >= $issueCutoff)
+            )
+        )
+
+        |
+
         .sabServerStats = (
             (.sabServerStats // {})
             | with_entries(
@@ -12449,6 +13181,22 @@ prune_state() {
         "$STATE_FILE" >"$tmp" || return
 
     save_state "$tmp"
+
+    if [ -d "$BATCH_DISMISS_MANIFEST_DIR" ]; then
+        find "$BATCH_DISMISS_MANIFEST_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name 'batch-dismiss-*.json' \
+            -mtime "+${BATCH_DISMISS_AUDIT_RETENTION_DAYS}" \
+            -delete 2>/dev/null || true
+    fi
+
+    find "$STATE_DIR" \
+        -maxdepth 1 \
+        -type f \
+        -name 'state.json.pre-batch-dismiss.*.bak' \
+        -mtime "+${BATCH_DISMISS_AUDIT_RETENTION_DAYS}" \
+        -delete 2>/dev/null || true
 }
 
 ###############################################################################
@@ -12557,6 +13305,11 @@ case "${1:-}" in
         exit 0
         ;;
 
+    --batch-dismiss-downloads)
+        batch_dismiss_downloads "${@:2}"
+        exit $?
+        ;;
+
     --help|--lifecycle-help)
         print_lifecycle_command_help
         exit 0
@@ -12576,7 +13329,7 @@ rotate_persistent_log
 
 persistent_log \
     "START" \
-    "ARR Health Monitor v3.6.0"
+    "ARR Health Monitor v3.7.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -12589,7 +13342,7 @@ fi
 # START
 ###############################################################################
 
-log "Starting ARR Health Monitor v3.6.0"
+log "Starting ARR Health Monitor v3.7.0"
 log "Recommended schedule: every five minutes"
 log "Notifications enabled: $SEND_NOTIFICATIONS"
 log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -13075,7 +13828,7 @@ write_persistent_activity_summary
 RUNTIME=$(runtime)
 
 log "============================================================"
-log "ARR Health Monitor v3.6.0 completed"
+log "ARR Health Monitor v3.7.0 completed"
 
 log ""
 log "SCAN HEALTH"
@@ -13167,6 +13920,7 @@ log "Reconciliation awaiting confirmation: $DOWNLOAD_LEDGER_RECONCILIATION_PENDI
 log "Automatically reconciled this run: $DOWNLOAD_LEDGER_RECONCILED_COUNT"
 log "Reconciliation API checks failed: $DOWNLOAD_LEDGER_RECONCILIATION_FAILED_COUNT"
 log "Manual dismissal notices queued: $DOWNLOAD_LEDGER_MANUAL_DISMISSAL_NOTIFICATION_COUNT"
+log "Batch dismissal summaries queued: $DOWNLOAD_LEDGER_BATCH_DISMISSAL_NOTIFICATION_COUNT"
 
 log ""
 log "SAB CROSS-APP"
