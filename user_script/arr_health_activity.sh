@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.7.2
+# ARR Health / Download / Import Monitor v3.8.0
 #
 # PURPOSE
 # -------
@@ -144,7 +144,7 @@
 #   WARNING
 #   ERROR
 #
-# Native /api/v3/health entries are also mirrored dynamically, so newly added
+# Native Arr health entries are also mirrored dynamically, so newly added
 # Sonarr/Radarr health sources are not silently missed by a fixed message list.
 # Error, warning, and notice types map to ERROR, WARNING, and INFO respectively;
 # an unfamiliar future type is retained and conservatively treated as WARNING.
@@ -615,7 +615,11 @@ MOVER_PROCESS_PATTERN='(^|/)(mover|mover\.old)( |$)|mover\.php'
 
 STATE_FILE="${STATE_DIR}/state.json"
 STATE_BACKUP="${STATE_DIR}/state.json.bak"
+STATE_BACKUP_GENERATIONS=3
 SAB_HISTORY_CACHE="${STATE_DIR}/sab_history_cache.json"
+ARR_HISTORY_CACHE_DIR="${STATE_DIR}/arr-history-cache"
+SONARR_HISTORY_CACHE="${ARR_HISTORY_CACHE_DIR}/sonarr.json"
+RADARR_HISTORY_CACHE="${ARR_HISTORY_CACHE_DIR}/radarr.json"
 BATCH_DISMISS_MANIFEST_DIR="${STATE_DIR}/batch-dismissals"
 BATCH_DISMISS_PREVIEW_DIR="${BATCH_DISMISS_MANIFEST_DIR}/previews"
 
@@ -735,11 +739,27 @@ DOWNLOAD_LEDGER_RECONCILE_RETRY_MINUTES=60
 # Allow a small timestamp skew between SAB queue time and Arr file dateAdded.
 DOWNLOAD_LEDGER_RECONCILE_CLOCK_SKEW_SECONDS=300
 
+# Durable Arr history cursors use a small overlap so delayed history events are
+# not lost at a run boundary. The persistent cache retains the complete audit
+# window while only the incremental range needs to be requested normally.
+ARR_HISTORY_CURSOR_OVERLAP_MINUTES=10
+
 # ---------------------------------------------------------------------------
 # Runtime
 # ---------------------------------------------------------------------------
 
 LOCKFILE="/tmp/arr_health_activity.lock"
+
+# Keep a five-minute scheduled run below four minutes. Once the remaining
+# reserve is reached, optional audit/reconciliation/filesystem phases are
+# deferred without resolving any issue that depends on them.
+MONITOR_RUNTIME_BUDGET_SECONDS=240
+MONITOR_RUNTIME_RESERVE_SECONDS=20
+
+# Stop repeatedly calling one service during the same run after consecutive
+# transport/server failures. Authentication failures open the circuit
+# immediately; ordinary endpoint 404 responses do not.
+SERVICE_CIRCUIT_FAILURE_THRESHOLD=2
 
 QUEUE_PAGE_SIZE=1000
 SAB_HISTORY_LIMIT=500
@@ -808,6 +828,37 @@ API_LAST_ERROR=""
 API_LAST_HTTP_CODE=""
 API_LAST_ENDPOINT=""
 
+SONARR_API_ROOT=""
+RADARR_API_ROOT=""
+SONARR_API_VERSION=""
+RADARR_API_VERSION=""
+
+SONARR_CIRCUIT_FAILURES=0
+RADARR_CIRCUIT_FAILURES=0
+SAB_CIRCUIT_FAILURES=0
+SONARR_CIRCUIT_OPEN=false
+RADARR_CIRCUIT_OPEN=false
+SAB_CIRCUIT_OPEN=false
+SONARR_CIRCUIT_REASON=""
+RADARR_CIRCUIT_REASON=""
+SAB_CIRCUIT_REASON=""
+
+STATE_STORAGE_FILE=""
+STATE_WORK_FILE=""
+STATE_TRANSACTION_ACTIVE=false
+STATE_TRANSACTION_DIRTY=false
+MONITOR_RUN_ACTIVE=false
+MONITOR_RUN_FINALIZED=false
+MONITOR_EXIT_SIGNAL=""
+MONITOR_CURRENT_PHASE="startup"
+MONITOR_PHASE_STARTED_AT=0
+MONITOR_PHASE_TIMINGS_FILE=""
+MONITOR_RUNTIME_DEFERRED=false
+MONITOR_RUNTIME_DEFERRED_PHASES=""
+
+SONARR_LEDGER_HISTORY=""
+RADARR_LEDGER_HISTORY=""
+
 SAB_PRIMARY_DOWNLOADS_FILE=""
 SAB_PROGRESS_SEEN_FILE=""
 SAB_PROGRESS_OBSERVATIONS_FILE=""
@@ -818,6 +869,10 @@ PREVIOUS_RUN_STARTED_AT=0
 PREVIOUS_RUN_COMPLETED_AT=0
 PREVIOUS_RUN_INCOMPLETE=false
 PREVIOUS_RUN_GAP_MINUTES=0
+PREVIOUS_RUN_STATUS="unknown"
+PREVIOUS_RUN_EXIT_CODE=0
+PREVIOUS_RUN_PHASE="startup"
+PREVIOUS_RUN_ERROR=""
 
 TOTAL_QUEUE=0
 TOTAL_ISSUES=0
@@ -1083,7 +1138,64 @@ cleanup() {
     fi
 }
 
-trap 'cleanup' EXIT
+# Invoked indirectly by signal traps below.
+# shellcheck disable=SC2329
+handle_monitor_signal() {
+
+    MONITOR_EXIT_SIGNAL="$1"
+
+    case "$1" in
+        INT)
+            exit 130
+            ;;
+
+        TERM)
+            exit 143
+            ;;
+
+        HUP)
+            exit 129
+            ;;
+    esac
+}
+
+# Invoked indirectly by the EXIT trap below.
+# shellcheck disable=SC2329
+handle_monitor_exit() {
+
+    local exit_code=$?
+    local final_status="failed"
+    local final_error="Monitor exited before the completion checkpoint"
+
+    trap - EXIT
+
+    if [ "$MONITOR_RUN_ACTIVE" = true ] &&
+       [ "$MONITOR_RUN_FINALIZED" != true ]; then
+
+        if [ -n "$MONITOR_EXIT_SIGNAL" ]; then
+            final_status="interrupted"
+            final_error="Monitor received ${MONITOR_EXIT_SIGNAL} during ${MONITOR_CURRENT_PHASE}"
+        elif (( exit_code != 0 )); then
+            final_error="Monitor exited with code ${exit_code} during ${MONITOR_CURRENT_PHASE}"
+        else
+            exit_code=3
+        fi
+
+        complete_monitor_run \
+            "$final_status" \
+            "$exit_code" \
+            "$final_error" 2>/dev/null || true
+        commit_state_transaction "abnormal-exit" 2>/dev/null || true
+    fi
+
+    cleanup
+    exit "$exit_code"
+}
+
+trap 'handle_monitor_signal INT' INT
+trap 'handle_monitor_signal TERM' TERM
+trap 'handle_monitor_signal HUP' HUP
+trap 'handle_monitor_exit' EXIT
 
 required_mount_available() {
 
@@ -1366,7 +1478,10 @@ http_json_get() {
 
         if (( curl_rc == 0 )); then
 
-            if jq empty "$output" >/dev/null 2>&1; then
+            if jq -e \
+                'type == "object" or type == "array"' \
+                "$output" >/dev/null 2>&1
+            then
                 rm -f -- "$header_file" "$stderr_file" 2>/dev/null || true
                 return 0
             fi
@@ -1423,6 +1538,249 @@ http_json_get() {
     return 1
 }
 
+api_service_for_url() {
+
+    local url="$1"
+    local sonarr_base="${SONARR_URL%/}"
+    local radarr_base="${RADARR_URL%/}"
+    local sab_base="${SAB_URL%/}"
+    local service="Unknown"
+    local match_length=0
+
+    if [ -n "$sonarr_base" ] && [[ "$url" == "$sonarr_base"* ]]; then
+        service="Sonarr"
+        match_length=${#sonarr_base}
+    fi
+
+    if [ -n "$radarr_base" ] &&
+       [[ "$url" == "$radarr_base"* ]] &&
+       (( ${#radarr_base} > match_length )); then
+        service="Radarr"
+        match_length=${#radarr_base}
+    fi
+
+    if [ -n "$sab_base" ] &&
+       [[ "$url" == "$sab_base"* ]] &&
+       (( ${#sab_base} > match_length )); then
+        service="SABnzbd"
+    fi
+
+    printf '%s\n' "$service"
+}
+
+service_circuit_is_open() {
+
+    case "$1" in
+        Sonarr)
+            [ "$SONARR_CIRCUIT_OPEN" = true ]
+            ;;
+
+        Radarr)
+            [ "$RADARR_CIRCUIT_OPEN" = true ]
+            ;;
+
+        SABnzbd)
+            [ "$SAB_CIRCUIT_OPEN" = true ]
+            ;;
+
+        *)
+            return 1
+            ;;
+    esac
+}
+
+service_circuit_reason() {
+
+    case "$1" in
+        Sonarr)
+            printf '%s\n' "$SONARR_CIRCUIT_REASON"
+            ;;
+
+        Radarr)
+            printf '%s\n' "$RADARR_CIRCUIT_REASON"
+            ;;
+
+        SABnzbd)
+            printf '%s\n' "$SAB_CIRCUIT_REASON"
+            ;;
+    esac
+}
+
+service_circuit_note_success() {
+
+    case "$1" in
+        Sonarr)
+            SONARR_CIRCUIT_FAILURES=0
+            ;;
+
+        Radarr)
+            RADARR_CIRCUIT_FAILURES=0
+            ;;
+
+        SABnzbd)
+            SAB_CIRCUIT_FAILURES=0
+            ;;
+    esac
+}
+
+service_circuit_note_failure() {
+
+    local service="$1"
+    local http_code="$2"
+    local reason="$3"
+    local immediate=false
+    local count=0
+
+    if [[ "$http_code" =~ ^(401|403)$ ]] ||
+       grep -Eqi 'api key.*(incorrect|required)|authentication rejected|unauthorized|forbidden' <<<"$reason"
+    then
+        immediate=true
+    elif [[ "$http_code" =~ ^5[0-9][0-9]$ ]] ||
+         [[ "$http_code" =~ ^(000|408|425|429)$ ]] ||
+         grep -Eqi 'timed out|connection refused|could not resolve|empty response|connection failed|unexpected json contract' <<<"$reason"
+    then
+        immediate=false
+    else
+        return 0
+    fi
+
+    case "$service" in
+        Sonarr)
+            ((SONARR_CIRCUIT_FAILURES++)) || true
+            count="$SONARR_CIRCUIT_FAILURES"
+            if [ "$immediate" = true ] ||
+               (( count >= SERVICE_CIRCUIT_FAILURE_THRESHOLD )); then
+                SONARR_CIRCUIT_OPEN=true
+                SONARR_CIRCUIT_REASON="$reason"
+            fi
+            ;;
+
+        Radarr)
+            ((RADARR_CIRCUIT_FAILURES++)) || true
+            count="$RADARR_CIRCUIT_FAILURES"
+            if [ "$immediate" = true ] ||
+               (( count >= SERVICE_CIRCUIT_FAILURE_THRESHOLD )); then
+                RADARR_CIRCUIT_OPEN=true
+                RADARR_CIRCUIT_REASON="$reason"
+            fi
+            ;;
+
+        SABnzbd)
+            ((SAB_CIRCUIT_FAILURES++)) || true
+            count="$SAB_CIRCUIT_FAILURES"
+            if [ "$immediate" = true ] ||
+               (( count >= SERVICE_CIRCUIT_FAILURE_THRESHOLD )); then
+                SAB_CIRCUIT_OPEN=true
+                SAB_CIRCUIT_REASON="$reason"
+            fi
+            ;;
+    esac
+
+    if service_circuit_is_open "$service"; then
+        log "WARNING: ${service} circuit breaker opened: ${reason}"
+    fi
+}
+
+api_contract_failure() {
+
+    local service="$1"
+    local endpoint="$2"
+    local expected="$3"
+
+    API_LAST_HTTP_CODE="200"
+    API_LAST_ENDPOINT="${endpoint%%\?*}"
+    API_LAST_ERROR="unexpected JSON contract; expected ${expected}"
+    service_circuit_note_failure "$service" "200" "$API_LAST_ERROR"
+    return 1
+}
+
+validate_arr_payload() {
+
+    local service="$1"
+    local kind="$2"
+    local file="$3"
+    local endpoint="$4"
+    local filter
+    local expected
+
+    case "$kind" in
+        api-info)
+            filter='type == "object" and ((.current // "") | type) == "string"'
+            expected='an API information object with current version'
+            ;;
+
+        queue|history-page)
+            filter='type == "object" and (.records | type) == "array" and ((.totalRecords // (.records | length)) | type) == "number"'
+            expected='a paged object with records array and numeric totalRecords'
+            ;;
+
+        health|history-since)
+            filter='type == "array"'
+            expected='a JSON array'
+            ;;
+
+        system-status)
+            filter='type == "object" and ((.version // "") | type) == "string" and ((.version // "") | length) > 0'
+            expected='a system-status object with version'
+            ;;
+
+        episode|episode-file|movie|movie-file)
+            filter='type == "object" and ((.id // 0) | type) == "number" and (.id // 0) > 0'
+            expected='an Arr record object with numeric id'
+            ;;
+
+        *)
+            return 0
+            ;;
+    esac
+
+    jq -e "$filter" "$file" >/dev/null 2>&1 ||
+        api_contract_failure "$service" "$endpoint" "$expected"
+}
+
+validate_sab_payload() {
+
+    local kind="$1"
+    local file="$2"
+    local endpoint="$3"
+    local filter
+    local expected
+
+    case "$kind" in
+        history)
+            filter='(.history == false) or ((.history | type) == "object" and (.history.slots | type) == "array")'
+            expected='a history object with slots array or an unchanged-history marker'
+            ;;
+
+        queue)
+            filter='(.queue | type) == "object" and (.queue.slots | type) == "array"'
+            expected='a queue object with slots array'
+            ;;
+
+        warnings)
+            filter='((.warnings // .) | type) == "array"'
+            expected='a warnings array'
+            ;;
+
+        status)
+            filter='type == "object" and has("status") and (.status | type) == "object"'
+            expected='a status object'
+            ;;
+
+        server_stats)
+            filter='type == "object" and has("servers") and (.servers | type) == "object"'
+            expected='a provider-statistics object with servers'
+            ;;
+
+        *)
+            return 0
+            ;;
+    esac
+
+    jq -e "$filter" "$file" >/dev/null 2>&1 ||
+        api_contract_failure "SABnzbd" "$endpoint" "$expected"
+}
+
 api_get() {
 
     local url="$1"
@@ -1430,10 +1788,19 @@ api_get() {
     local output="$3"
 
     local -a request_args
+    local service
 
     API_LAST_ERROR=""
     API_LAST_HTTP_CODE=""
     API_LAST_ENDPOINT="${url%%\?*}"
+
+    service=$(api_service_for_url "$url")
+
+    if service_circuit_is_open "$service"; then
+        API_LAST_ERROR="request skipped because ${service} circuit breaker is open: $(service_circuit_reason "$service")"
+        API_LAST_HTTP_CODE=""
+        return 1
+    fi
 
     request_args=(
         --silent \
@@ -1448,11 +1815,16 @@ api_get() {
         API_LAST_ERROR="$HTTP_LAST_ERROR"
         API_LAST_HTTP_CODE="$HTTP_LAST_STATUS"
         API_LAST_ENDPOINT="$HTTP_LAST_URL"
+        service_circuit_note_failure \
+            "$service" \
+            "$API_LAST_HTTP_CODE" \
+            "$API_LAST_ERROR"
         return 1
     fi
 
     API_LAST_HTTP_CODE="$HTTP_LAST_STATUS"
     API_LAST_ENDPOINT="$HTTP_LAST_URL"
+    service_circuit_note_success "$service"
 
     return 0
 }
@@ -1471,6 +1843,12 @@ sab_get() {
     API_LAST_ERROR=""
     API_LAST_HTTP_CODE=""
     API_LAST_ENDPOINT="${url%%\?*}"
+
+    if service_circuit_is_open "SABnzbd"; then
+        API_LAST_ERROR="request skipped because SABnzbd circuit breaker is open: $(service_circuit_reason SABnzbd)"
+        API_LAST_HTTP_CODE=""
+        return 1
+    fi
 
     request_args=(
         --silent
@@ -1513,6 +1891,10 @@ sab_get() {
         API_LAST_ERROR="$HTTP_LAST_ERROR"
         API_LAST_HTTP_CODE="$HTTP_LAST_STATUS"
         API_LAST_ENDPOINT="$HTTP_LAST_URL"
+        service_circuit_note_failure \
+            "SABnzbd" \
+            "$API_LAST_HTTP_CODE" \
+            "$API_LAST_ERROR"
         return 1
     fi
 
@@ -1528,8 +1910,15 @@ sab_get() {
 
         API_LAST_ERROR=$(jq -r '.error // "SABnzbd API rejected the request"' "$output")
 
+        service_circuit_note_failure \
+            "SABnzbd" \
+            "$API_LAST_HTTP_CODE" \
+            "$API_LAST_ERROR"
+
         return 1
     fi
+
+    service_circuit_note_success "SABnzbd"
 
     return 0
 }
@@ -1547,6 +1936,158 @@ append_api_failure() {
     fi
 }
 
+store_arr_api_capability() {
+
+    local app="$1"
+    local root="$2"
+    local version="$3"
+    local previous_version
+    local tmp="${TMP_DIR}/state.api-capability.json"
+
+    previous_version=$(jq -r \
+        --arg app "$app" \
+        '.apiCapabilities[$app].version // ""' \
+        "$STATE_FILE")
+
+    jq \
+        --arg app "$app" \
+        --arg root "$root" \
+        --arg version "$version" \
+        --argjson now "$START_TIME" \
+        '
+        .apiCapabilities = (.apiCapabilities // {})
+        |
+        .apiCapabilities[$app] = {
+            root: $root,
+            version: $version,
+            detectedAt: $now
+        }
+        ' "$STATE_FILE" >"$tmp" || return 1
+
+    save_state "$tmp" || return 1
+
+    if [ -n "$previous_version" ] &&
+       [ "$previous_version" != "$version" ]; then
+        record_normalized_issue \
+            "${app}:api-version-change" \
+            "$app" \
+            "${app} API version changed" \
+            "ARR_API_VERSION_CHANGED" \
+            "INFO" \
+            "changed" \
+            "${app} API changed from ${previous_version} to ${version}" \
+            "" \
+            "Previous API: ${previous_version}"$'\n'"Current API: ${version}"$'\n'"Selected root: ${root}" \
+            1 \
+            0 \
+            0 \
+            "api-capability" \
+            "arr api version changed"
+    fi
+}
+
+discover_arr_api() {
+
+    local app="$1"
+    local base_url="$2"
+    local api_key="$3"
+    local info_file="${TMP_DIR}/${app,,}-api-info.json"
+    local probe_file="${TMP_DIR}/${app,,}-api-probe.json"
+    local discovered=""
+    local root=""
+    local candidate
+    local cached_version
+    local seen_candidates=""
+    local -a candidates=()
+
+    cached_version=$(jq -r \
+        --arg app "$app" \
+        '.apiCapabilities[$app].version // ""' \
+        "$STATE_FILE")
+
+    if api_get "${base_url%/}/api" "$api_key" "$info_file" &&
+       validate_arr_payload "$app" api-info "$info_file" "${base_url%/}/api"
+    then
+        discovered=$(jq -r '.current // ""' "$info_file")
+        discovered="${discovered#/api/}"
+        discovered="${discovered#api/}"
+        discovered="${discovered#/}"
+
+        if [[ "$discovered" =~ ^v[0-9]+$ ]]; then
+            root="${base_url%/}/api/${discovered}"
+        fi
+    fi
+
+    if [ -z "$root" ]; then
+        if [[ "$cached_version" =~ ^v[0-9]+$ ]]; then
+            candidates+=("$cached_version")
+        fi
+
+        case "$app" in
+            Sonarr)
+                candidates+=(v5 v3)
+                ;;
+
+            Radarr)
+                candidates+=(v3)
+                ;;
+        esac
+
+        for candidate in "${candidates[@]}"; do
+            if [[ " $seen_candidates " == *" $candidate "* ]]; then
+                continue
+            fi
+            seen_candidates+=" ${candidate}"
+
+            if api_get \
+                "${base_url%/}/api/${candidate}/system/status" \
+                "$api_key" \
+                "$probe_file" &&
+               validate_arr_payload \
+                "$app" \
+                system-status \
+                "$probe_file" \
+                "${base_url%/}/api/${candidate}/system/status"
+            then
+                discovered="$candidate"
+                root="${base_url%/}/api/${candidate}"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$root" ]; then
+        case "$app" in
+            Sonarr)
+                SONARR_API_VERSION="v3"
+                SONARR_API_ROOT="${base_url%/}/api/v3"
+                ;;
+
+            Radarr)
+                RADARR_API_VERSION="v3"
+                RADARR_API_ROOT="${base_url%/}/api/v3"
+                ;;
+        esac
+        return 1
+    fi
+
+    case "$app" in
+        Sonarr)
+            SONARR_API_VERSION="$discovered"
+            SONARR_API_ROOT="$root"
+            ;;
+
+        Radarr)
+            RADARR_API_VERSION="$discovered"
+            RADARR_API_ROOT="$root"
+            ;;
+    esac
+
+    store_arr_api_capability "$app" "$root" "$discovered" || return 1
+    log "${app} API capability detected: ${discovered}"
+    return 0
+}
+
 ###############################################################################
 # PAGED API FETCHERS
 ###############################################################################
@@ -1554,7 +2095,7 @@ append_api_failure() {
 fetch_arr_queue() {
 
     local app="$1"
-    local base_url="$2"
+    local api_root="$2"
     local api_key="$3"
     local output="$4"
 
@@ -1589,12 +2130,18 @@ fetch_arr_queue() {
         page_file="${TMP_DIR}/${app,,}_queue_page_${page}.json"
 
         if ! api_get \
-            "${base_url%/}/api/v3/queue?page=${page}&pageSize=${QUEUE_PAGE_SIZE}&${include_query}" \
+            "${api_root%/}/queue?page=${page}&pageSize=${QUEUE_PAGE_SIZE}&${include_query}" \
             "$api_key" \
             "$page_file"
         then
             return 1
         fi
+
+        validate_arr_payload \
+            "$app" \
+            queue \
+            "$page_file" \
+            "${api_root%/}/queue" || return 1
 
         page_files+=("$page_file")
 
@@ -1630,6 +2177,31 @@ fetch_arr_queue() {
     return 0
 }
 
+update_sab_history_cursor() {
+
+    local history_file="$1"
+    local cursor
+    local tmp="${TMP_DIR}/state.sab-history-cursor.json"
+
+    cursor=$(jq -r '.history.last_history_update // 0' "$history_file")
+    [[ "$cursor" =~ ^[0-9]+$ ]] || cursor=0
+    (( cursor > 0 )) || return 0
+
+    jq \
+        --argjson cursor "$cursor" \
+        --argjson now "$START_TIME" \
+        '
+        .historyCursors = (.historyCursors // {})
+        |
+        .historyCursors.SABnzbd = {
+            lastHistoryUpdate: $cursor,
+            updatedAt: $now
+        }
+        ' "$STATE_FILE" >"$tmp" || return 1
+
+    save_state "$tmp"
+}
+
 fetch_sab_history() {
 
     local output="$1"
@@ -1640,6 +2212,7 @@ fetch_sab_history() {
     local page_file
     local merged
     local last_history_update=0
+    local state_history_update=0
     local -a page_files=()
 
     SAB_HISTORY_CACHE_HIT=false
@@ -1652,6 +2225,18 @@ fetch_sab_history() {
             "$SAB_HISTORY_CACHE")
 
         [[ "$last_history_update" =~ ^[0-9]+$ ]] || last_history_update=0
+    fi
+
+    state_history_update=$(jq -r \
+        '.historyCursors.SABnzbd.lastHistoryUpdate // 0' \
+        "$STATE_FILE")
+    [[ "$state_history_update" =~ ^[0-9]+$ ]] || state_history_update=0
+    if (( state_history_update > last_history_update )); then
+        # The conditional SAB cursor is useful only with the exact cached
+        # payload it describes. A cursor/cache mismatch must force a full
+        # response rather than accepting history=false against stale data.
+        log "WARNING: SAB history cursor is newer than its cache; forcing full history refresh"
+        last_history_update=0
     fi
 
     while (( loaded < SAB_HISTORY_MAX_RECORDS )); do
@@ -1667,6 +2252,11 @@ fetch_sab_history() {
         then
             return 1
         fi
+
+        validate_sab_payload \
+            history \
+            "$page_file" \
+            "${SAB_URL%/}/api" || return 1
 
         if (( page == 0 )) &&
            jq -e '.history == false' "$page_file" >/dev/null 2>&1
@@ -1686,6 +2276,7 @@ fetch_sab_history() {
                 fi
 
                 log "SABnzbd history unchanged; reused persistent history cache"
+                update_sab_history_cursor "$output" || return 1
                 return 0
             fi
 
@@ -1702,6 +2293,11 @@ fetch_sab_history() {
             then
                 return 1
             fi
+
+            validate_sab_payload \
+                history \
+                "$page_file" \
+                "${SAB_URL%/}/api" || return 1
         fi
 
         page_files+=("$page_file")
@@ -1742,6 +2338,8 @@ fetch_sab_history() {
         log "WARNING: Unable to refresh SABnzbd history cache"
     fi
 
+    update_sab_history_cursor "$output" || return 1
+
     if (( loaded < total )); then
 
         log "WARNING: SAB history reached SAB_HISTORY_MAX_RECORDS=${SAB_HISTORY_MAX_RECORDS}"
@@ -1769,6 +2367,11 @@ fetch_sab_queue() {
         if ! sab_get queue "$page_file" "$start" "$SAB_HISTORY_LIMIT"; then
             return 1
         fi
+
+        validate_sab_payload \
+            queue \
+            "$page_file" \
+            "${SAB_URL%/}/api" || return 1
 
         page_files+=("$page_file")
 
@@ -2762,6 +3365,216 @@ classification_reason() {
 # STATE INITIALIZATION
 ###############################################################################
 
+validate_state_schema() {
+
+    local candidate="$1"
+
+    jq -e '
+        (.version | type) == "number"
+        and (.version >= 16)
+        and (.issues | type) == "object"
+        and (.sabProgress | type) == "object"
+        and (.downloadLedger | type) == "object"
+        and (.downloadDismissalBatches | type) == "object"
+        and (.sabServerStats | type) == "object"
+        and (.apiCapabilities | type) == "object"
+        and (.historyCursors | type) == "object"
+        and (.monitor | type) == "object"
+        and (.monitor.notification | type) == "object"
+        and (.telemetry | type) == "object"
+        and (.telemetry.patterns | type) == "object"
+        ' "$candidate" >/dev/null 2>&1
+}
+
+state_backup_path() {
+
+    local generation="$1"
+
+    if (( generation <= 1 )); then
+        printf '%s\n' "$STATE_BACKUP"
+    else
+        printf '%s.%s\n' "$STATE_BACKUP" "$generation"
+    fi
+}
+
+rotate_state_backups() {
+
+    local target="$1"
+    local generation
+    local previous
+    local destination
+    local backup_tmp
+
+    (( STATE_BACKUP_GENERATIONS > 0 )) || return 0
+
+    for ((generation=STATE_BACKUP_GENERATIONS; generation>=2; generation--)); do
+        previous=$(state_backup_path $((generation - 1)))
+        destination=$(state_backup_path "$generation")
+
+        if [ -f "$previous" ] && validate_state_schema "$previous"; then
+            backup_tmp=$(mktemp "${STATE_DIR}/.state-backup.XXXXXX") || return 1
+            cp -f -- "$previous" "$backup_tmp" || {
+                rm -f -- "$backup_tmp"
+                return 1
+            }
+            mv -f -- "$backup_tmp" "$destination" || return 1
+        fi
+    done
+
+    if [ -f "$target" ] && validate_state_schema "$target"; then
+        backup_tmp=$(mktemp "${STATE_DIR}/.state-backup.XXXXXX") || return 1
+        cp -f -- "$target" "$backup_tmp" || {
+            rm -f -- "$backup_tmp"
+            return 1
+        }
+        mv -f -- "$backup_tmp" "$STATE_BACKUP" || return 1
+    fi
+}
+
+atomic_replace_state() {
+
+    local source="$1"
+    local target="$2"
+    local state_tmp
+
+    validate_state_schema "$source" || {
+        log "ERROR: Refusing state commit with an invalid schema: $source"
+        return 1
+    }
+
+    state_tmp=$(mktemp "${STATE_DIR}/.state-commit.XXXXXX") || return 1
+
+    if ! cp -f -- "$source" "$state_tmp"; then
+        rm -f -- "$state_tmp"
+        return 1
+    fi
+
+    validate_state_schema "$state_tmp" || {
+        rm -f -- "$state_tmp"
+        return 1
+    }
+
+    if ! rotate_state_backups "$target"; then
+        rm -f -- "$state_tmp"
+        log "ERROR: Unable to rotate validated state backups"
+        return 1
+    fi
+
+    if command -v sync >/dev/null 2>&1; then
+        sync -f "$state_tmp" 2>/dev/null || true
+    fi
+
+    mv -f -- "$state_tmp" "$target"
+}
+
+create_initial_state() {
+
+    local initial_tmp
+
+    initial_tmp=$(mktemp "${STATE_DIR}/.state-initial.XXXXXX") || return 1
+
+    if ! cat >"$initial_tmp" <<'EOF'
+{
+  "version": 16,
+  "issues": {},
+  "sabProgress": {},
+  "downloadLedger": {},
+  "downloadDismissalBatches": {},
+  "sabServerStats": {},
+  "apiCapabilities": {},
+  "historyCursors": {},
+  "monitor": {
+    "lastStartedAt": 0,
+    "lastCompletedAt": 0,
+    "lastStatus": "unknown",
+    "lastExitCode": 0,
+    "lastPhase": "startup",
+    "lastError": "",
+    "phaseTimings": {},
+    "notification": {
+      "failed": false,
+      "reason": "",
+      "lastFailureAt": 0,
+      "lastSuccessAt": 0
+    }
+  },
+  "telemetry": {
+    "version": 1,
+    "patterns": {}
+  }
+}
+EOF
+    then
+        rm -f -- "$initial_tmp"
+        return 1
+    fi
+
+    if ! validate_state_schema "$initial_tmp"; then
+        rm -f -- "$initial_tmp"
+        return 1
+    fi
+
+    mv -f -- "$initial_tmp" "$STATE_FILE"
+}
+
+restore_valid_state_backup() {
+
+    local generation
+    local candidate
+    local restore_tmp
+
+    for ((generation=1; generation<=STATE_BACKUP_GENERATIONS; generation++)); do
+        candidate=$(state_backup_path "$generation")
+
+        if [ -f "$candidate" ] &&
+           { validate_state_schema "$candidate" ||
+             jq -e \
+                'type == "object" and ((.version // 0) < 16)' \
+                "$candidate" >/dev/null 2>&1; }
+        then
+            restore_tmp=$(mktemp "${STATE_DIR}/.state-restore.XXXXXX") || return 1
+            cp -f -- "$candidate" "$restore_tmp" || {
+                rm -f -- "$restore_tmp"
+                return 1
+            }
+            mv -f -- "$restore_tmp" "$STATE_FILE" || return 1
+            log "Restored state from readable backup generation ${generation}; schema migration will validate it"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+begin_state_transaction() {
+
+    STATE_STORAGE_FILE="$STATE_FILE"
+    STATE_WORK_FILE="${TMP_DIR}/state.working.json"
+
+    cp -f -- "$STATE_STORAGE_FILE" "$STATE_WORK_FILE" || return 1
+    validate_state_schema "$STATE_WORK_FILE" || return 1
+
+    STATE_FILE="$STATE_WORK_FILE"
+    STATE_TRANSACTION_ACTIVE=true
+    STATE_TRANSACTION_DIRTY=false
+}
+
+commit_state_transaction() {
+
+    local checkpoint="${1:-checkpoint}"
+
+    [ "$STATE_TRANSACTION_ACTIVE" = true ] || return 0
+    [ "$STATE_TRANSACTION_DIRTY" = true ] || return 0
+
+    if ! atomic_replace_state "$STATE_WORK_FILE" "$STATE_STORAGE_FILE"; then
+        log "ERROR: State transaction commit failed at checkpoint: $checkpoint"
+        return 1
+    fi
+
+    STATE_TRANSACTION_DIRTY=false
+    log "State checkpoint committed: $checkpoint"
+}
+
 initialize_state() {
 
     mkdir -p "$STATE_DIR" || {
@@ -2770,79 +3583,30 @@ initialize_state() {
     }
 
     if [ ! -f "$STATE_FILE" ]; then
-
-        cat >"$STATE_FILE" <<'EOF'
-{
-  "version": 15,
-  "issues": {},
-  "sabProgress": {},
-  "downloadLedger": {},
-  "downloadDismissalBatches": {},
-  "sabServerStats": {},
-  "monitor": {
-    "lastStartedAt": 0,
-    "lastCompletedAt": 0,
-    "lastStatus": "unknown",
-    "notification": {
-      "failed": false,
-      "reason": "",
-      "lastFailureAt": 0,
-      "lastSuccessAt": 0
-    }
-  },
-  "telemetry": {
-    "version": 1,
-    "patterns": {}
-  }
-}
-EOF
+        create_initial_state || {
+            log "ERROR: Unable to create initial monitor state"
+            exit 3
+        }
     fi
 
-    if ! jq empty "$STATE_FILE" >/dev/null 2>&1; then
+    if ! jq -e 'type == "object"' "$STATE_FILE" >/dev/null 2>&1; then
 
         log "WARNING: State file is invalid"
 
-        if [ -f "$STATE_BACKUP" ] &&
-           jq empty "$STATE_BACKUP" >/dev/null 2>&1
-        then
-
-            log "Restoring state from backup"
-
-            cp -f "$STATE_BACKUP" "$STATE_FILE"
-
-        else
-
-            log "Creating new state file"
-
-            cat >"$STATE_FILE" <<'EOF'
-{
-  "version": 15,
-  "issues": {},
-  "sabProgress": {},
-  "downloadLedger": {},
-  "downloadDismissalBatches": {},
-  "sabServerStats": {},
-  "monitor": {
-    "lastStartedAt": 0,
-    "lastCompletedAt": 0,
-    "lastStatus": "unknown",
-    "notification": {
-      "failed": false,
-      "reason": "",
-      "lastFailureAt": 0,
-      "lastSuccessAt": 0
-    }
-  },
-  "telemetry": {
-    "version": 1,
-    "patterns": {}
-  }
-}
-EOF
+        if ! restore_valid_state_backup; then
+            log "No usable state backup was found; creating new state"
+            create_initial_state || exit 3
         fi
     fi
+
+    # Schema migrations are one-time. Normal runs use the transaction working
+    # copy and should not rewrite the vault merely to reapply defaults.
+    if validate_state_schema "$STATE_FILE"; then
+        return 0
+    fi
+
     ###########################################################################
-    # STATE MIGRATION - v3.7
+    # STATE MIGRATION - v3.8
     #
     # Existing state is upgraded in place. Completion-only ledger records that
     # predate the discovery window are not enrolled. Any active historical
@@ -2858,7 +3622,7 @@ EOF
         --argjson migrationNow "$START_TIME" \
         --argjson discoverySeconds "$((DOWNLOAD_LEDGER_DISCOVERY_HOURS * 3600))" \
         '
-        .version = 15
+        .version = 16
         |
         .issues = (.issues // {})
         |
@@ -3095,11 +3859,19 @@ EOF
         |
         .sabServerStats = (.sabServerStats // {})
         |
+        .apiCapabilities = (.apiCapabilities // {})
+        |
+        .historyCursors = (.historyCursors // {})
+        |
         .monitor = (
             {
                 lastStartedAt: 0,
                 lastCompletedAt: 0,
                 lastStatus: "unknown",
+                lastExitCode: 0,
+                lastPhase: "startup",
+                lastError: "",
+                phaseTimings: {},
                 notification: {
                     failed: false,
                     reason: "",
@@ -3119,6 +3891,14 @@ EOF
             }
             * (.monitor.notification // {})
         )
+        |
+        .monitor.lastExitCode = (.monitor.lastExitCode // 0)
+        |
+        .monitor.lastPhase = (.monitor.lastPhase // "startup")
+        |
+        .monitor.lastError = (.monitor.lastError // "")
+        |
+        .monitor.phaseTimings = (.monitor.phaseTimings // {})
         |
         .telemetry = (
             .telemetry
@@ -3154,7 +3934,7 @@ EOF
 
     else
 
-        log "ERROR: Unable to migrate state file to schema version 15"
+        log "ERROR: Unable to migrate state file to schema version 16"
         exit 3
     fi
 }
@@ -3162,21 +3942,26 @@ EOF
 save_state() {
 
     local new_state="$1"
+    local display_state="${STATE_STORAGE_FILE:-$STATE_FILE}"
 
-    if ! jq empty "$new_state" >/dev/null 2>&1; then
+    if ! validate_state_schema "$new_state"; then
 
-        log "ERROR: Refusing to replace state with invalid JSON: $new_state"
+        log "ERROR: Refusing to replace state with invalid JSON or schema: $new_state"
 
         return 1
     fi
 
-    cp -f "$STATE_FILE" "$STATE_BACKUP" 2>/dev/null || true
-
-    if mv -f "$new_state" "$STATE_FILE"; then
+    if [ "$STATE_TRANSACTION_ACTIVE" = true ]; then
+        if mv -f -- "$new_state" "$STATE_WORK_FILE"; then
+            STATE_FILE="$STATE_WORK_FILE"
+            STATE_TRANSACTION_DIRTY=true
+            return 0
+        fi
+    elif atomic_replace_state "$new_state" "$STATE_FILE"; then
         return 0
     fi
 
-    log "ERROR: Unable to replace state file: $STATE_FILE"
+    log "ERROR: Unable to replace state file: $display_state"
     persistent_log "ERROR" "Unable to replace monitor state file"
 
     if [ "$STATE_WRITE_ALERT_SENT" != true ]; then
@@ -3186,7 +3971,7 @@ save_state() {
         notify \
             "alert" \
             "ARR Health Monitor - State Write Failed" \
-            "The monitor could not update ${STATE_FILE}. Issue lifecycle and notification deduplication may be stale."
+            "The monitor could not update ${display_state}. Issue lifecycle and notification deduplication may be stale."
     fi
 
     return 1
@@ -3203,9 +3988,14 @@ begin_monitor_run() {
 
     PREVIOUS_RUN_STARTED_AT=$(jq -r '.monitor.lastStartedAt // 0' "$STATE_FILE")
     PREVIOUS_RUN_COMPLETED_AT=$(jq -r '.monitor.lastCompletedAt // 0' "$STATE_FILE")
+    PREVIOUS_RUN_STATUS=$(jq -r '.monitor.lastStatus // "unknown"' "$STATE_FILE")
+    PREVIOUS_RUN_EXIT_CODE=$(jq -r '.monitor.lastExitCode // 0' "$STATE_FILE")
+    PREVIOUS_RUN_PHASE=$(jq -r '.monitor.lastPhase // "startup"' "$STATE_FILE")
+    PREVIOUS_RUN_ERROR=$(jq -r '.monitor.lastError // ""' "$STATE_FILE")
 
     [[ "$PREVIOUS_RUN_STARTED_AT" =~ ^[0-9]+$ ]] || PREVIOUS_RUN_STARTED_AT=0
     [[ "$PREVIOUS_RUN_COMPLETED_AT" =~ ^[0-9]+$ ]] || PREVIOUS_RUN_COMPLETED_AT=0
+    [[ "$PREVIOUS_RUN_EXIT_CODE" =~ ^[0-9]+$ ]] || PREVIOUS_RUN_EXIT_CODE=0
 
     if (( PREVIOUS_RUN_STARTED_AT > 0 && now > PREVIOUS_RUN_STARTED_AT )); then
         PREVIOUS_RUN_GAP_MINUTES=$(( (now - PREVIOUS_RUN_STARTED_AT) / 60 ))
@@ -3218,11 +4008,19 @@ begin_monitor_run() {
     jq \
         --argjson now "$now" \
         '
-        .version = 15
+        .version = 16
         |
         .monitor.lastStartedAt = $now
         |
         .monitor.lastStatus = "running"
+        |
+        .monitor.lastExitCode = 0
+        |
+        .monitor.lastPhase = "startup"
+        |
+        .monitor.lastError = ""
+        |
+        .monitor.phaseTimings = {}
         ' \
         "$STATE_FILE" >"$tmp" || return 1
 
@@ -3232,6 +4030,8 @@ begin_monitor_run() {
 complete_monitor_run() {
 
     local status="$1"
+    local exit_code="${2:-0}"
+    local error="${3:-}"
     local now
     local tmp="${TMP_DIR}/state.monitor-complete.json"
 
@@ -3239,15 +4039,81 @@ complete_monitor_run() {
 
     jq \
         --arg status "$status" \
+        --arg phase "$MONITOR_CURRENT_PHASE" \
+        --arg error "$error" \
+        --argjson exitCode "$exit_code" \
         --argjson now "$now" \
+        --slurpfile timings "$MONITOR_PHASE_TIMINGS_FILE" \
         '
         .monitor.lastCompletedAt = $now
         |
         .monitor.lastStatus = $status
+        |
+        .monitor.lastExitCode = $exitCode
+        |
+        .monitor.lastPhase = $phase
+        |
+        .monitor.lastError = $error
+        |
+        .monitor.phaseTimings = (
+            reduce $timings[] as $timing (
+                {};
+                .[$timing.phase] = $timing.seconds
+            )
+        )
         ' \
         "$STATE_FILE" >"$tmp" || return 1
 
     save_state "$tmp"
+}
+
+start_monitor_phase() {
+
+    MONITOR_CURRENT_PHASE="$1"
+    MONITOR_PHASE_STARTED_AT=$(date +%s)
+    log "Phase started: ${MONITOR_CURRENT_PHASE}"
+}
+
+end_monitor_phase() {
+
+    local phase="${1:-$MONITOR_CURRENT_PHASE}"
+    local finished
+    local seconds
+
+    finished=$(date +%s)
+    seconds=$((finished - MONITOR_PHASE_STARTED_AT))
+    (( seconds >= 0 )) || seconds=0
+
+    if [ -n "$MONITOR_PHASE_TIMINGS_FILE" ]; then
+        jq -nc \
+            --arg phase "$phase" \
+            --argjson seconds "$seconds" \
+            '{phase: $phase, seconds: $seconds}' \
+            >>"$MONITOR_PHASE_TIMINGS_FILE" || true
+    fi
+
+    log "Phase completed: ${phase} (${seconds}s)"
+}
+
+runtime_budget_allows_optional_phase() {
+
+    local phase="$1"
+    local elapsed=$(( $(date +%s) - START_TIME ))
+    local latest_start=$((
+        MONITOR_RUNTIME_BUDGET_SECONDS - MONITOR_RUNTIME_RESERVE_SECONDS
+    ))
+
+    if (( elapsed < latest_start )); then
+        return 0
+    fi
+
+    MONITOR_RUNTIME_DEFERRED=true
+    if [ -n "$MONITOR_RUNTIME_DEFERRED_PHASES" ]; then
+        MONITOR_RUNTIME_DEFERRED_PHASES+=", "
+    fi
+    MONITOR_RUNTIME_DEFERRED_PHASES+="$phase"
+    log "WARNING: Runtime budget deferred optional phase: ${phase} (${elapsed}s elapsed)"
+    return 1
 }
 
 set_monitor_notification_state() {
@@ -3642,7 +4508,7 @@ record_arr_telemetry() {
         --argjson maxIssueKeys "$ARR_TELEMETRY_MAX_ISSUE_KEYS" \
         --argjson maxExamples "$ARR_TELEMETRY_MAX_EXAMPLES" \
         '
-        .version = 15
+        .version = 16
         |
         .telemetry = (
             .telemetry
@@ -4069,7 +4935,7 @@ update_issue_state() {
         --argjson flapThreshold "$FLAP_TRANSITION_THRESHOLD" \
         --argjson flapSuppressionSeconds "$flap_suppression_seconds" \
         '
-        .version = 15
+        .version = 16
         |
         (.issues[$key] // {}) as $old
         |
@@ -4243,6 +5109,7 @@ reminder_policy_for_classification() {
         # remain inside an API history/warning window for several runs, but it
         # does not become more actionable because it was observed again.
         ARR_DOWNLOAD_FAILED_HISTORY|\
+        ARR_API_VERSION_CHANGED|\
         SAB_DOWNLOAD_FAILED_*|\
         SAB_ERROR|\
         SAB_WARNING|\
@@ -5319,7 +6186,7 @@ batch_dismiss_downloads() {
         return 1
     }
 
-    state_backup="${STATE_FILE}.pre-batch-dismiss.${batch_id}.bak"
+    state_backup="${STATE_STORAGE_FILE:-$STATE_FILE}.pre-batch-dismiss.${batch_id}.bak"
     cp -p -- "$STATE_FILE" "$state_backup" || {
         log "ERROR: Unable to create pre-dismissal state backup: $state_backup"
         return 1
@@ -5379,7 +6246,7 @@ batch_dismiss_downloads() {
         --argjson now "$now" \
         --argjson count "$count" \
         '
-        .version = 15
+        .version = 16
         |
         .downloadDismissalBatches = (.downloadDismissalBatches // {})
         |
@@ -5542,7 +6409,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.7.2 lifecycle commands' \
+        'ARR Health Monitor v3.8.0 lifecycle commands' \
         '' \
         'Always invoke the Unraid User Scripts copy through /bin/bash:' \
         '  /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script COMMAND' \
@@ -6681,9 +7548,17 @@ record_monitor_scan_issue() {
 
     if [ "$PREVIOUS_RUN_INCOMPLETE" = true ]; then
         failures+=("Previous monitor run did not reach its completion checkpoint")
+    elif [ "$PREVIOUS_RUN_STATUS" = "failed" ] ||
+         [ "$PREVIOUS_RUN_STATUS" = "interrupted" ]; then
+        failures+=("Previous monitor run ${PREVIOUS_RUN_STATUS} during ${PREVIOUS_RUN_PHASE}: ${PREVIOUS_RUN_ERROR:-exit code ${PREVIOUS_RUN_EXIT_CODE}}")
     fi
 
-    if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
+    if [ "$MONITOR_RUNTIME_DEFERRED" = true ]; then
+        failures+=("Runtime budget deferred optional phase(s): ${MONITOR_RUNTIME_DEFERRED_PHASES}")
+    fi
+
+    if [ "$ACTIVITY_AUDIT_ENABLED" = true ] &&
+       [[ "$MONITOR_RUNTIME_DEFERRED_PHASES" != *"activity-audit"* ]]; then
 
         if [ "$SONARR_ENABLED" = true ] &&
            [ "$SONARR_API_OK" = true ] &&
@@ -8669,6 +9544,12 @@ process_sab_server_stats() {
 
     if [ "$SAB_SERVER_STATS_OK" != true ] || [ ! -f "$SAB_SERVER_STATS" ]; then
 
+        # A core SAB API outage already owns the incident. Do not add a child
+        # provider-statistics alert that cannot be independently actioned.
+        if [ "$SAB_API_OK" != true ]; then
+            return 0
+        fi
+
         record_normalized_issue \
             "SABnzbd:server-stats-api" \
             "SABnzbd" \
@@ -9907,9 +10788,10 @@ initialize_activity_audit_window() {
 fetch_arr_activity_history_paged() {
 
     local app="$1"
-    local base_url="$2"
+    local api_root="$2"
     local api_key="$3"
     local output="$4"
+    local since_iso="${5:-$AUDIT_SINCE_ISO}"
     local include_query
     local records_file="${TMP_DIR}/${app,,}-history-audit-records.jsonl"
     local page_file
@@ -9940,27 +10822,26 @@ fetch_arr_activity_history_paged() {
 
     while (( loaded < ARR_ACTIVITY_HISTORY_MAX_RECORDS )); do
         page_file="${TMP_DIR}/${app,,}-history-audit-page-${page}.json"
-        endpoint="${base_url%/}/api/v3/history?page=${page}&pageSize=${ARR_ACTIVITY_HISTORY_PAGE_SIZE}&sortKey=date&sortDirection=descending&${include_query}"
+        endpoint="${api_root%/}/history?page=${page}&pageSize=${ARR_ACTIVITY_HISTORY_PAGE_SIZE}&sortKey=date&sortDirection=descending&${include_query}"
 
         api_get "$endpoint" "$api_key" "$page_file" || return 1
 
-        if ! jq -e '(.records | type) == "array"' "$page_file" >/dev/null 2>&1; then
-            API_LAST_ERROR="paged history endpoint returned an unexpected JSON shape"
-            API_LAST_HTTP_CODE="200"
-            API_LAST_ENDPOINT="${endpoint%%\?*}"
-            return 1
-        fi
+        validate_arr_payload \
+            "$app" \
+            history-page \
+            "$page_file" \
+            "$endpoint" || return 1
 
         count=$(jq '.records | length' "$page_file")
         [[ "$count" =~ ^[0-9]+$ ]] || count=0
 
         jq -c \
-            --arg since "$AUDIT_SINCE_ISO" \
+            --arg since "$since_iso" \
             '.records[]? | select((.date // "") >= $since)' \
             "$page_file" >>"$records_file" || return 1
 
         if jq -e \
-            --arg since "$AUDIT_SINCE_ISO" \
+            --arg since "$since_iso" \
             'any(.records[]?; (.date // "") < $since)' \
             "$page_file" >/dev/null 2>&1
         then
@@ -9981,32 +10862,129 @@ fetch_arr_activity_history_paged() {
        (( loaded >= ARR_ACTIVITY_HISTORY_MAX_RECORDS )); then
         API_LAST_ERROR="paged history reached ARR_ACTIVITY_HISTORY_MAX_RECORDS=${ARR_ACTIVITY_HISTORY_MAX_RECORDS} before the audit cutoff"
         API_LAST_HTTP_CODE="200"
-        API_LAST_ENDPOINT="${base_url%/}/api/v3/history"
+        API_LAST_ENDPOINT="${api_root%/}/history"
         return 1
     fi
 
     jq -s '.' "$records_file" >"$output" || return 1
 }
 
+arr_history_cache_for_app() {
+
+    case "$1" in
+        Sonarr)
+            printf '%s\n' "$SONARR_HISTORY_CACHE"
+            ;;
+
+        Radarr)
+            printf '%s\n' "$RADARR_HISTORY_CACHE"
+            ;;
+
+        *)
+            return 1
+            ;;
+    esac
+}
+
+atomic_replace_history_cache() {
+
+    local source="$1"
+    local target="$2"
+    local cache_tmp
+
+    jq -e 'type == "array"' "$source" >/dev/null 2>&1 || return 1
+    mkdir -p -- "$ARR_HISTORY_CACHE_DIR" || return 1
+    cache_tmp=$(mktemp "${ARR_HISTORY_CACHE_DIR}/.history-cache.XXXXXX") || return 1
+
+    cp -f -- "$source" "$cache_tmp" || {
+        rm -f -- "$cache_tmp"
+        return 1
+    }
+
+    mv -f -- "$cache_tmp" "$target"
+}
+
+update_arr_history_cursor() {
+
+    local app="$1"
+    local delta_file="$2"
+    local latest_date
+    local latest_id
+    local tmp="${TMP_DIR}/state.history-cursor.json"
+
+    latest_date=$(jq -r \
+        '[.[]? | select((.date // "") != "")] | max_by(.date // "") | .date // empty' \
+        "$delta_file")
+    latest_id=$(jq -r \
+        --arg date "$latest_date" \
+        '[.[]? | select((.date // "") == $date)] | max_by(.id // 0) | .id // ""' \
+        "$delta_file")
+
+    if [ -z "$latest_date" ]; then
+        latest_date=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+        latest_id=""
+    fi
+
+    jq \
+        --arg app "$app" \
+        --arg date "$latest_date" \
+        --arg id "$latest_id" \
+        --argjson now "$START_TIME" \
+        '
+        .historyCursors = (.historyCursors // {})
+        |
+        .historyCursors[$app] = {
+            lastDate: $date,
+            lastId: $id,
+            updatedAt: $now
+        }
+        ' "$STATE_FILE" >"$tmp" || return 1
+
+    save_state "$tmp"
+}
+
 fetch_arr_activity_history() {
 
     local app="$1"
-    local base_url="$2"
+    local api_root="$2"
     local api_key="$3"
     local output="$4"
-
+    local cache_file
+    local delta_file="${TMP_DIR}/${app,,}-history-delta.json"
+    local merged_file="${TMP_DIR}/${app,,}-history-cache-merged.json"
+    local cursor_date
+    local cursor_epoch=0
+    local overlap_epoch=0
+    local request_since="$AUDIT_SINCE_ISO"
     local endpoint
+
+    cache_file=$(arr_history_cache_for_app "$app") || return 1
+    cursor_date=$(jq -r \
+        --arg app "$app" \
+        '.historyCursors[$app].lastDate // ""' \
+        "$STATE_FILE")
+
+    if [ -f "$cache_file" ] &&
+       jq -e 'type == "array"' "$cache_file" >/dev/null 2>&1 &&
+       [ -n "$cursor_date" ]
+    then
+        cursor_epoch=$(date_to_epoch "$cursor_date")
+        if (( cursor_epoch > 0 )); then
+            overlap_epoch=$((
+                cursor_epoch - ARR_HISTORY_CURSOR_OVERLAP_MINUTES * 60
+            ))
+            request_since=$(date -u -d "@${overlap_epoch}" '+%Y-%m-%dT%H:%M:%SZ')
+        fi
+    fi
 
     case "$app" in
 
         Sonarr)
-
-            endpoint="${base_url%/}/api/v3/history/since?date=${AUDIT_SINCE_ISO}&includeSeries=true&includeEpisode=true"
+            endpoint="${api_root%/}/history/since?date=${request_since}&includeSeries=true&includeEpisode=true"
             ;;
 
         Radarr)
-
-            endpoint="${base_url%/}/api/v3/history/since?date=${AUDIT_SINCE_ISO}&includeMovie=true"
+            endpoint="${api_root%/}/history/since?date=${request_since}&includeMovie=true"
             ;;
 
         *)
@@ -10015,26 +10993,66 @@ fetch_arr_activity_history() {
             ;;
     esac
 
-    if api_get "$endpoint" "$api_key" "$output"; then
-        if jq -e 'type == "array"' "$output" >/dev/null 2>&1; then
-            return 0
-        fi
-
-        API_LAST_ERROR="history/since returned an unexpected JSON shape"
-        API_LAST_HTTP_CODE="200"
-        API_LAST_ENDPOINT="${endpoint%%\?*}"
+    if api_get "$endpoint" "$api_key" "$delta_file"; then
+        validate_arr_payload \
+            "$app" \
+            history-since \
+            "$delta_file" \
+            "$endpoint" || return 1
     elif [ "$API_LAST_HTTP_CODE" != 404 ]; then
         return 1
+    else
+        # Some Arr versions or reverse-proxy routes do not expose
+        # history/since. Fall back to stable paged history collection.
+        fetch_arr_activity_history_paged \
+            "$app" \
+            "$api_root" \
+            "$api_key" \
+            "$delta_file" \
+            "$request_since" || return 1
     fi
 
-    # Some Arr versions or reverse-proxy routes do not expose history/since.
-    # Fall back to the stable paged history collection and apply the same UTC
-    # cutoff locally. This preserves the audit without changing Arr or files.
-    fetch_arr_activity_history_paged \
-        "$app" \
-        "$base_url" \
-        "$api_key" \
-        "$output"
+    if [ -f "$cache_file" ] &&
+       jq -e 'type == "array"' "$cache_file" >/dev/null 2>&1
+    then
+        jq -s \
+            --arg cutoff "$AUDIT_SINCE_ISO" \
+            '
+            [ .[][]? ]
+            | unique_by(
+                [
+                    (.id // ""),
+                    (.date // ""),
+                    (.eventType // ""),
+                    (.downloadId // .data.downloadId // "")
+                ]
+                | @json
+            )
+            | map(select((.date // "") >= $cutoff))
+            | sort_by(.date // "")
+            ' "$cache_file" "$delta_file" >"$merged_file" || return 1
+    else
+        jq \
+            --arg cutoff "$AUDIT_SINCE_ISO" \
+            'map(select((.date // "") >= $cutoff)) | sort_by(.date // "")' \
+            "$delta_file" >"$merged_file" || return 1
+    fi
+
+    cp -f -- "$merged_file" "$output" || return 1
+    atomic_replace_history_cache "$merged_file" "$cache_file" || return 1
+    update_arr_history_cursor "$app" "$delta_file" || return 1
+
+    case "$app" in
+        Sonarr)
+            SONARR_LEDGER_HISTORY="$delta_file"
+            ;;
+
+        Radarr)
+            RADARR_LEDGER_HISTORY="$delta_file"
+            ;;
+    esac
+
+    return 0
 }
 
 ###############################################################################
@@ -11030,20 +12048,20 @@ fetch_arr_history_by_download_id() {
     local app="$1"
     local download_id="$2"
     local output="$3"
-    local base_url
+    local api_root
     local api_key
     local include_query
     local encoded_id
 
     case "$app" in
         Sonarr)
-            base_url="$SONARR_URL"
+            api_root="$SONARR_API_ROOT"
             api_key="$SONARR_API_KEY"
             include_query="includeSeries=true&includeEpisode=true"
             ;;
 
         Radarr)
-            base_url="$RADARR_URL"
+            api_root="$RADARR_API_ROOT"
             api_key="$RADARR_API_KEY"
             include_query="includeMovie=true"
             ;;
@@ -11057,9 +12075,15 @@ fetch_arr_history_by_download_id() {
     encoded_id=$(url_encode_query_value "$download_id")
 
     api_get \
-        "${base_url%/}/api/v3/history?page=1&pageSize=100&sortKey=date&sortDirection=descending&downloadId=${encoded_id}&${include_query}" \
+        "${api_root%/}/history?page=1&pageSize=100&sortKey=date&sortDirection=descending&downloadId=${encoded_id}&${include_query}" \
         "$api_key" \
-        "$output"
+        "$output" || return 1
+
+    validate_arr_payload \
+        "$app" \
+        history-page \
+        "$output" \
+        "${api_root%/}/history"
 }
 
 collect_targeted_history_identities() {
@@ -11175,11 +12199,11 @@ arr_reconciliation_connection() {
 
     case "$1" in
         Sonarr)
-            printf '%s\t%s\n' "$SONARR_URL" "$SONARR_API_KEY"
+            printf '%s\t%s\n' "$SONARR_API_ROOT" "$SONARR_API_KEY"
             ;;
 
         Radarr)
-            printf '%s\t%s\n' "$RADARR_URL" "$RADARR_API_KEY"
+            printf '%s\t%s\n' "$RADARR_API_ROOT" "$RADARR_API_KEY"
             ;;
 
         *)
@@ -11216,7 +12240,7 @@ record_arr_database_file_reconciliation() {
     local app="$2"
     local record="$3"
     local connection
-    local base_url
+    local api_root
     local api_key
     local start_epoch
     local targets_file
@@ -11253,7 +12277,7 @@ record_arr_database_file_reconciliation() {
         return 1
     }
 
-    IFS=$'\t' read -r base_url api_key <<<"$connection"
+    IFS=$'\t' read -r api_root api_key <<<"$connection"
 
     start_epoch=$(jq -r '
         if (.sabQueuedAt // 0) > 0
@@ -11333,7 +12357,7 @@ record_arr_database_file_reconciliation() {
                 object_file="${TMP_DIR}/sonarr-reconcile-episode-${target_id}.json"
 
                 if ! api_get \
-                    "${base_url%/}/api/v3/episode/${target_id}" \
+                    "${api_root%/}/episode/${target_id}" \
                     "$api_key" \
                     "$object_file"
                 then
@@ -11349,6 +12373,19 @@ record_arr_database_file_reconciliation() {
                         "" "" "INFO" "" \
                         "Sonarr episode API check failed" \
                         "Episode ID: ${target_id}; endpoint: ${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
+                    return 1
+                fi
+
+                if ! validate_arr_payload \
+                    "$app" episode "$object_file" \
+                    "${api_root%/}/episode/${target_id}"
+                then
+                    ((DOWNLOAD_LEDGER_RECONCILIATION_FAILED_COUNT++)) || true
+                    write_download_reconciliation_result \
+                        "$download_id" "$app" false false \
+                        "" "" "INFO" "" \
+                        "Sonarr episode response validation failed" \
+                        "Endpoint: ${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
                     return 1
                 fi
 
@@ -11381,7 +12418,7 @@ record_arr_database_file_reconciliation() {
                 media_file="${TMP_DIR}/sonarr-reconcile-episodefile-${file_id}.json"
 
                 if ! api_get \
-                    "${base_url%/}/api/v3/episodefile/${file_id}" \
+                    "${api_root%/}/episodefile/${file_id}" \
                     "$api_key" \
                     "$media_file"
                 then
@@ -11397,6 +12434,19 @@ record_arr_database_file_reconciliation() {
                         "" "" "INFO" "" \
                         "Sonarr episode-file API check failed" \
                         "Episode file ID: ${file_id}; endpoint: ${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
+                    return 1
+                fi
+
+                if ! validate_arr_payload \
+                    "$app" episode-file "$media_file" \
+                    "${api_root%/}/episodefile/${file_id}"
+                then
+                    ((DOWNLOAD_LEDGER_RECONCILIATION_FAILED_COUNT++)) || true
+                    write_download_reconciliation_result \
+                        "$download_id" "$app" false false \
+                        "" "" "INFO" "" \
+                        "Sonarr episode-file response validation failed" \
+                        "Endpoint: ${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
                     return 1
                 fi
 
@@ -11422,7 +12472,7 @@ record_arr_database_file_reconciliation() {
                 object_file="${TMP_DIR}/radarr-reconcile-movie-${target_id}.json"
 
                 if ! api_get \
-                    "${base_url%/}/api/v3/movie/${target_id}" \
+                    "${api_root%/}/movie/${target_id}" \
                     "$api_key" \
                     "$object_file"
                 then
@@ -11438,6 +12488,19 @@ record_arr_database_file_reconciliation() {
                         "" "" "INFO" "" \
                         "Radarr movie API check failed" \
                         "Movie ID: ${target_id}; endpoint: ${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
+                    return 1
+                fi
+
+                if ! validate_arr_payload \
+                    "$app" movie "$object_file" \
+                    "${api_root%/}/movie/${target_id}"
+                then
+                    ((DOWNLOAD_LEDGER_RECONCILIATION_FAILED_COUNT++)) || true
+                    write_download_reconciliation_result \
+                        "$download_id" "$app" false false \
+                        "" "" "INFO" "" \
+                        "Radarr movie response validation failed" \
+                        "Endpoint: ${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
                     return 1
                 fi
 
@@ -11463,7 +12526,7 @@ record_arr_database_file_reconciliation() {
                 media_file="${TMP_DIR}/radarr-reconcile-moviefile-${file_id}.json"
 
                 if ! api_get \
-                    "${base_url%/}/api/v3/moviefile/${file_id}" \
+                    "${api_root%/}/moviefile/${file_id}" \
                     "$api_key" \
                     "$media_file"
                 then
@@ -11479,6 +12542,19 @@ record_arr_database_file_reconciliation() {
                         "" "" "INFO" "" \
                         "Radarr movie-file API check failed" \
                         "Movie file ID: ${file_id}; endpoint: ${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
+                    return 1
+                fi
+
+                if ! validate_arr_payload \
+                    "$app" movie-file "$media_file" \
+                    "${api_root%/}/moviefile/${file_id}"
+                then
+                    ((DOWNLOAD_LEDGER_RECONCILIATION_FAILED_COUNT++)) || true
+                    write_download_reconciliation_result \
+                        "$download_id" "$app" false false \
+                        "" "" "INFO" "" \
+                        "Radarr movie-file response validation failed" \
+                        "Endpoint: ${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
                     return 1
                 fi
 
@@ -12275,14 +13351,14 @@ process_exact_download_ledger() {
     if [ "$SONARR_AUDIT_OK" = true ]; then
         collect_arr_download_ledger \
             "Sonarr" \
-            "$SONARR_AUDIT_HISTORY" \
+            "${SONARR_LEDGER_HISTORY:-$SONARR_AUDIT_HISTORY}" \
             "$SONARR_QUEUE"
     fi
 
     if [ "$RADARR_AUDIT_OK" = true ]; then
         collect_arr_download_ledger \
             "Radarr" \
-            "$RADARR_AUDIT_HISTORY" \
+            "${RADARR_LEDGER_HISTORY:-$RADARR_AUDIT_HISTORY}" \
             "$RADARR_QUEUE"
     fi
 
@@ -13575,6 +14651,7 @@ SAB_PROGRESS_OBSERVATIONS_FILE="${TMP_DIR}/sab_progress_observations.jsonl"
 DOWNLOAD_LEDGER_OBSERVATIONS_FILE="${TMP_DIR}/download_ledger_observations.jsonl"
 DOWNLOAD_LEDGER_ENROLLED_IDS_FILE="${TMP_DIR}/download_ledger_enrolled_ids.txt"
 DOWNLOAD_LEDGER_RECONCILIATION_RESULTS_FILE="${TMP_DIR}/download_ledger_reconciliation_results.jsonl"
+MONITOR_PHASE_TIMINGS_FILE="${TMP_DIR}/phase_timings.jsonl"
 
 : >"$NOTIFICATION_BATCH"
 : >"$SEEN_ISSUES_FILE"
@@ -13584,6 +14661,7 @@ DOWNLOAD_LEDGER_RECONCILIATION_RESULTS_FILE="${TMP_DIR}/download_ledger_reconcil
 : >"$DOWNLOAD_LEDGER_OBSERVATIONS_FILE"
 : >"$DOWNLOAD_LEDGER_ENROLLED_IDS_FILE"
 : >"$DOWNLOAD_LEDGER_RECONCILIATION_RESULTS_FILE"
+: >"$MONITOR_PHASE_TIMINGS_FILE"
 
 ###############################################################################
 # STATE
@@ -13592,6 +14670,11 @@ DOWNLOAD_LEDGER_RECONCILIATION_RESULTS_FILE="${TMP_DIR}/download_ledger_reconcil
 ensure_state_storage_ready
 
 initialize_state
+
+if ! begin_state_transaction; then
+    log "ERROR: Unable to begin monitor state transaction"
+    exit 3
+fi
 
 case "${1:-}" in
     --list-active)
@@ -13606,6 +14689,7 @@ case "${1:-}" in
         fi
 
         acknowledge_active_issue "$2" "${*:3}" || exit 2
+        commit_state_transaction "acknowledgement" || exit 3
         exit 0
         ;;
 
@@ -13616,6 +14700,7 @@ case "${1:-}" in
         fi
 
         unacknowledge_active_issue "$2" || exit 2
+        commit_state_transaction "unacknowledgement" || exit 3
         exit 0
         ;;
 
@@ -13626,12 +14711,17 @@ case "${1:-}" in
         fi
 
         dismiss_download_flow_issue "$2" "${*:3}" || exit 2
+        commit_state_transaction "manual-dismissal" || exit 3
         exit 0
         ;;
 
     --batch-dismiss-downloads)
         batch_dismiss_downloads "${@:2}"
-        exit $?
+        command_rc=$?
+        if (( command_rc == 0 )); then
+            commit_state_transaction "batch-dismissal" || exit 3
+        fi
+        exit "$command_rc"
         ;;
 
     --help|--lifecycle-help)
@@ -13640,10 +14730,17 @@ case "${1:-}" in
         ;;
 esac
 
+start_monitor_phase "startup"
+
 if ! begin_monitor_run; then
     log "ERROR: Unable to update monitor run-start heartbeat"
     persistent_log "ERROR" "Unable to update monitor run-start heartbeat"
+    exit 3
 fi
+
+MONITOR_RUN_ACTIVE=true
+commit_state_transaction "run-start" || exit 3
+end_monitor_phase "startup"
 
 ###############################################################################
 # v2.5 PERSISTENT LOG / ACTIVITY AUDIT INITIALIZATION
@@ -13653,7 +14750,7 @@ rotate_persistent_log
 
 persistent_log \
     "START" \
-    "ARR Health Monitor v3.7.2"
+    "ARR Health Monitor v3.8.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -13666,7 +14763,7 @@ fi
 # START
 ###############################################################################
 
-log "Starting ARR Health Monitor v3.7.2"
+log "Starting ARR Health Monitor v3.8.0"
 log "Recommended schedule: every five minutes"
 log "Notifications enabled: $SEND_NOTIFICATIONS"
 log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -13674,6 +14771,8 @@ log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
 preflight_notification_command
 record_monitor_schedule_issue
 record_monitor_notification_issue
+
+start_monitor_phase "service-collection"
 
 ###############################################################################
 # SABNZBD
@@ -13729,7 +14828,9 @@ if [ "$SAB_ENABLED" = true ]; then
             "$API_LAST_ERROR")
     fi
 
-    if sab_get warnings "$SAB_WARNINGS"; then
+    if sab_get warnings "$SAB_WARNINGS" &&
+       validate_sab_payload warnings "$SAB_WARNINGS" "${SAB_URL%/}/api"
+    then
 
         SAB_WARNINGS_OK=true
 
@@ -13743,7 +14844,9 @@ if [ "$SAB_ENABLED" = true ]; then
             "$API_LAST_ERROR")
     fi
 
-    if sab_get status "$SAB_STATUS"; then
+    if sab_get status "$SAB_STATUS" &&
+       validate_sab_payload status "$SAB_STATUS" "${SAB_URL%/}/api"
+    then
 
         SAB_STATUS_OK=true
 
@@ -13757,7 +14860,9 @@ if [ "$SAB_ENABLED" = true ]; then
             "$API_LAST_ERROR")
     fi
 
-    if sab_get server_stats "$SAB_SERVER_STATS"; then
+    if sab_get server_stats "$SAB_SERVER_STATS" &&
+       validate_sab_payload server_stats "$SAB_SERVER_STATS" "${SAB_URL%/}/api"
+    then
 
         SAB_SERVER_STATS_OK=true
 
@@ -13787,13 +14892,25 @@ if [ "$SONARR_ENABLED" = true ]; then
 
     log "Checking Sonarr health and queue"
 
+    if ! discover_arr_api \
+        "Sonarr" \
+        "$SONARR_URL" \
+        "$SONARR_API_KEY"
+    then
+        SONARR_API_FAILURES=$(append_api_failure \
+            "$SONARR_API_FAILURES" \
+            "api-discovery" \
+            "$API_LAST_ERROR")
+        log "WARNING: Sonarr API discovery failed; using compatibility fallback ${SONARR_API_ROOT}"
+    fi
+
     SONARR_QUEUE="$TMP_DIR/sonarr_queue.json"
     SONARR_HEALTH="$TMP_DIR/sonarr_health.json"
     SONARR_SYSTEM_STATUS="$TMP_DIR/sonarr_system_status.json"
 
     if fetch_arr_queue \
         "Sonarr" \
-        "$SONARR_URL" \
+        "$SONARR_API_ROOT" \
         "$SONARR_API_KEY" \
         "$SONARR_QUEUE"
     then
@@ -13822,9 +14939,11 @@ if [ "$SONARR_ENABLED" = true ]; then
     fi
 
     if api_get \
-        "${SONARR_URL%/}/api/v3/health" \
+        "${SONARR_API_ROOT%/}/health" \
         "$SONARR_API_KEY" \
-        "$SONARR_HEALTH"
+        "$SONARR_HEALTH" &&
+       validate_arr_payload \
+        "Sonarr" health "$SONARR_HEALTH" "${SONARR_API_ROOT%/}/health"
     then
         SONARR_HEALTH_OK=true
     else
@@ -13837,9 +14956,12 @@ if [ "$SONARR_ENABLED" = true ]; then
     fi
 
     if api_get \
-        "${SONARR_URL%/}/api/v3/system/status" \
+        "${SONARR_API_ROOT%/}/system/status" \
         "$SONARR_API_KEY" \
-        "$SONARR_SYSTEM_STATUS"
+        "$SONARR_SYSTEM_STATUS" &&
+       validate_arr_payload \
+        "Sonarr" system-status "$SONARR_SYSTEM_STATUS" \
+        "${SONARR_API_ROOT%/}/system/status"
     then
         SONARR_STATUS_OK=true
         log "Connected to Sonarr $(jq -r '.version // "unknown"' "$SONARR_SYSTEM_STATUS")"
@@ -13870,13 +14992,25 @@ if [ "$RADARR_ENABLED" = true ]; then
 
     log "Checking Radarr health and queue"
 
+    if ! discover_arr_api \
+        "Radarr" \
+        "$RADARR_URL" \
+        "$RADARR_API_KEY"
+    then
+        RADARR_API_FAILURES=$(append_api_failure \
+            "$RADARR_API_FAILURES" \
+            "api-discovery" \
+            "$API_LAST_ERROR")
+        log "WARNING: Radarr API discovery failed; using compatibility fallback ${RADARR_API_ROOT}"
+    fi
+
     RADARR_QUEUE="$TMP_DIR/radarr_queue.json"
     RADARR_HEALTH="$TMP_DIR/radarr_health.json"
     RADARR_SYSTEM_STATUS="$TMP_DIR/radarr_system_status.json"
 
     if fetch_arr_queue \
         "Radarr" \
-        "$RADARR_URL" \
+        "$RADARR_API_ROOT" \
         "$RADARR_API_KEY" \
         "$RADARR_QUEUE"
     then
@@ -13905,9 +15039,11 @@ if [ "$RADARR_ENABLED" = true ]; then
     fi
 
     if api_get \
-        "${RADARR_URL%/}/api/v3/health" \
+        "${RADARR_API_ROOT%/}/health" \
         "$RADARR_API_KEY" \
-        "$RADARR_HEALTH"
+        "$RADARR_HEALTH" &&
+       validate_arr_payload \
+        "Radarr" health "$RADARR_HEALTH" "${RADARR_API_ROOT%/}/health"
     then
         RADARR_HEALTH_OK=true
     else
@@ -13920,9 +15056,12 @@ if [ "$RADARR_ENABLED" = true ]; then
     fi
 
     if api_get \
-        "${RADARR_URL%/}/api/v3/system/status" \
+        "${RADARR_API_ROOT%/}/system/status" \
         "$RADARR_API_KEY" \
-        "$RADARR_SYSTEM_STATUS"
+        "$RADARR_SYSTEM_STATUS" &&
+       validate_arr_payload \
+        "Radarr" system-status "$RADARR_SYSTEM_STATUS" \
+        "${RADARR_API_ROOT%/}/system/status"
     then
         RADARR_STATUS_OK=true
         log "Connected to Radarr $(jq -r '.version // "unknown"' "$RADARR_SYSTEM_STATUS")"
@@ -13945,9 +15084,13 @@ if [ "$RADARR_ENABLED" = true ]; then
     fi
 fi
 
+end_monitor_phase "service-collection"
+
 ###############################################################################
 # UNIFIED HEALTH / QUEUE PROCESSING
 ###############################################################################
+
+start_monitor_phase "issue-evaluation"
 
 if [ "$SAB_ENABLED" = true ]; then
 
@@ -13986,11 +15129,17 @@ if [ "$RADARR_ENABLED" = true ]; then
     fi
 fi
 
+end_monitor_phase "issue-evaluation"
+
 ###############################################################################
 # RECENT ACTIVITY AUDIT - v2.5
 ###############################################################################
 
-if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
+if [ "$ACTIVITY_AUDIT_ENABLED" = true ] &&
+   runtime_budget_allows_optional_phase "activity-audit"
+then
+
+    start_monitor_phase "activity-audit"
 
     log "Running recent operational activity audit"
 
@@ -14011,7 +15160,7 @@ if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
         if fetch_arr_activity_history \
             "Sonarr" \
-            "$SONARR_URL" \
+            "$SONARR_API_ROOT" \
             "$SONARR_API_KEY" \
             "$SONARR_AUDIT_HISTORY"
         then
@@ -14049,7 +15198,7 @@ if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
         if fetch_arr_activity_history \
             "Radarr" \
-            "$RADARR_URL" \
+            "$RADARR_API_ROOT" \
             "$RADARR_API_KEY" \
             "$RADARR_AUDIT_HISTORY"
         then
@@ -14075,17 +15224,32 @@ if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
                 "Unable to retrieve recent Radarr history: endpoint=${API_LAST_ENDPOINT}; ${API_LAST_ERROR}"
         fi
     fi
+
+    end_monitor_phase "activity-audit"
 fi
 
-process_exact_download_ledger || true
+if runtime_budget_allows_optional_phase "download-ledger-reconciliation"; then
+    start_monitor_phase "download-ledger-reconciliation"
+    process_exact_download_ledger || true
+    end_monitor_phase "download-ledger-reconciliation"
+else
+    DOWNLOAD_LEDGER_SCAN_OK=false
+fi
 
 ###############################################################################
 # SAB CROSS-APP CHECK
 ###############################################################################
 
-prepare_sab_filesystem_scan || true
-
-process_sab_orphans
+if runtime_budget_allows_optional_phase "sab-filesystem-scan"; then
+    start_monitor_phase "sab-filesystem-scan"
+    prepare_sab_filesystem_scan || true
+    process_sab_orphans
+    end_monitor_phase "sab-filesystem-scan"
+else
+    SAB_FILESYSTEM_SCAN_OK=false
+    SAB_FILESYSTEM_SCAN_DEFERRED=true
+    SAB_FILESYSTEM_SCAN_REASON="Runtime budget deferred filesystem scan"
+fi
 
 prune_sab_progress_state
 
@@ -14106,7 +15270,9 @@ record_monitor_scan_issue
 # Done only after all current issues have been marked seen.
 ###############################################################################
 
+start_monitor_phase "lifecycle-resolution"
 resolve_missing_issues
+end_monitor_phase "lifecycle-resolution"
 
 ###############################################################################
 # SEND ONE GROUPED NOTIFICATION
@@ -14114,6 +15280,13 @@ resolve_missing_issues
 
 NOTIFICATION_ATTEMPTED=false
 NOTIFICATION_LAST_ERROR=""
+
+# Persist the complete observation/lifecycle transaction before sending. If a
+# notification command blocks or the process is interrupted, the underlying
+# issue state remains durable and no unavailable collector can resolve issues.
+commit_state_transaction "pre-notification" || exit 3
+
+start_monitor_phase "notifications"
 
 send_grouped_notification
 NOTIFICATION_SEND_RC=$?
@@ -14130,6 +15303,11 @@ if [ "$NOTIFICATION_ATTEMPTED" = true ]; then
         record_monitor_notification_issue
     fi
 fi
+
+end_monitor_phase "notifications"
+commit_state_transaction "post-notification" || exit 3
+
+start_monitor_phase "finalization"
 
 ###############################################################################
 # PRUNE OLD RESOLVED STATE
@@ -14152,16 +15330,17 @@ write_persistent_activity_summary
 RUNTIME=$(runtime)
 
 log "============================================================"
-log "ARR Health Monitor v3.7.2 completed"
+log "ARR Health Monitor v3.8.0 completed"
 
 log ""
 log "SCAN HEALTH"
 log "Sonarr API healthy: $SONARR_API_OK"
-log "  Queue: $SONARR_QUEUE_OK | Health: $SONARR_HEALTH_OK | Status: $SONARR_STATUS_OK"
+log "  API: ${SONARR_API_VERSION:-undetected} | Queue: $SONARR_QUEUE_OK | Health: $SONARR_HEALTH_OK | Status: $SONARR_STATUS_OK"
 log "Radarr API healthy: $RADARR_API_OK"
-log "  Queue: $RADARR_QUEUE_OK | Health: $RADARR_HEALTH_OK | Status: $RADARR_STATUS_OK"
+log "  API: ${RADARR_API_VERSION:-undetected} | Queue: $RADARR_QUEUE_OK | Health: $RADARR_HEALTH_OK | Status: $RADARR_STATUS_OK"
 log "SABnzbd API healthy: $SAB_API_OK"
 log "  History: $SAB_HISTORY_OK | Queue: $SAB_QUEUE_OK | Warnings: $SAB_WARNINGS_OK | Status: $SAB_STATUS_OK"
+log "Circuit breakers: Sonarr=$SONARR_CIRCUIT_OPEN | Radarr=$RADARR_CIRCUIT_OPEN | SABnzbd=$SAB_CIRCUIT_OPEN"
 
 log ""
 log "NATIVE HEALTH"
@@ -14187,6 +15366,10 @@ log "Repeated/incomplete scan issues: $MONITOR_SCAN_FAILURE_COUNT"
 log "Notification-command issues: $MONITOR_NOTIFICATION_FAILURE_COUNT"
 log "Previous start gap: ${PREVIOUS_RUN_GAP_MINUTES}m"
 log "Previous run incomplete: $PREVIOUS_RUN_INCOMPLETE"
+log "Previous run status: ${PREVIOUS_RUN_STATUS} | exit=${PREVIOUS_RUN_EXIT_CODE} | phase=${PREVIOUS_RUN_PHASE}"
+log "Runtime budget deferred work: $MONITOR_RUNTIME_DEFERRED"
+[ -n "$MONITOR_RUNTIME_DEFERRED_PHASES" ] && \
+    log "Deferred phases: $MONITOR_RUNTIME_DEFERRED_PHASES"
 
 log ""
 log "RECENT ACTIVITY - LAST ${ACTIVITY_AUDIT_LOOKBACK_HOURS}H"
@@ -14359,6 +15542,7 @@ fi
 
 log ""
 log "Recommended run interval: every five minutes"
+log "Phase timings: $(jq -sr 'map(.phase + "=" + (.seconds | tostring) + "s") | join(", ")' "$MONITOR_PHASE_TIMINGS_FILE")"
 log "Runtime: $RUNTIME"
 log "============================================================"
 
@@ -14366,9 +15550,16 @@ persistent_log \
     "END" \
     "runtime=${RUNTIME} | active_issues=${TOTAL_ISSUES} | info=${INFO_COUNT} | warnings=${WARNING_COUNT} | errors=${ERROR_COUNT} | reminders=${REMINDER_NOTIFICATION_COUNT} | event_repeats_suppressed=${EVENT_REPEAT_SUPPRESSED_COUNT} | event_expiry_suppressed=${EVENT_RESOLUTION_SUPPRESSED_COUNT} | bounded_limits_reached=${BOUNDED_REMINDER_SUPPRESSED_COUNT} | flapping=${FLAPPING_NOTIFICATION_COUNT} | acknowledged_suppressed=${ACKNOWLEDGED_SUPPRESSED_COUNT}"
 
-if ! complete_monitor_run "$PIPELINE_STATUS"; then
+end_monitor_phase "finalization"
+
+if ! complete_monitor_run "$PIPELINE_STATUS" 0 ""; then
     log "ERROR: Unable to update monitor completion heartbeat"
     persistent_log "ERROR" "Unable to update monitor completion heartbeat"
+    exit 3
 fi
-    
+
+commit_state_transaction "run-complete" || exit 3
+MONITOR_RUN_FINALIZED=true
+MONITOR_RUN_ACTIVE=false
+
 exit 0
