@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Plex DBRepair Scheduler Wrapper v3.1
+# Plex DBRepair Scheduler Wrapper v3.2
 #
 # Unraid 7.4-focused scheduler for the current standalone DBRepair executable.
 # It verifies the official GitHub release, stages updates safely inside each
@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-readonly VERSION="3.1"
+readonly VERSION="3.2"
 
 ###############################################################################
 # CONFIGURATION
@@ -66,7 +66,7 @@ LATEST_ASSET_NAME=""
 LATEST_ASSET_DIGEST=""
 STAGED_BINARY=""
 UPDATE_STATE="not-checked"
-UPDATE_DETAIL="Latest DBRepair release was not checked"
+UPDATE_DETAIL="Not performed."
 HOST_PACKAGE_ARCH=""
 
 WARNING_COUNT=0
@@ -320,7 +320,7 @@ release_fallback() {
     local message="$1"
     DOWNLOAD_READY=0
     UPDATE_STATE="fallback-existing"
-    UPDATE_DETAIL="$message; validated existing container executables will be used"
+    UPDATE_DETAIL="$message; fallback policy: use validated installed executables"
     RUN_HAS_ISSUE=1
     GLOBAL_ISSUE_KEY+="release-fallback;"
     raise_severity warning
@@ -472,7 +472,7 @@ install_or_resolve_dbrepair() {
     RESULT_UPDATE["$container"]=""
     docker exec -u 0 "$container" mkdir -p "$DBREPAIR_INSTALL_DIR" \
         >/dev/null 2>&1 || {
-        RESULT_UPDATE["$container"]="Could not create $DBREPAIR_INSTALL_DIR"
+        RESULT_UPDATE["$container"]="Installation directory creation failed: $DBREPAIR_INSTALL_DIR"
         return 1
     }
 
@@ -485,7 +485,7 @@ install_or_resolve_dbrepair() {
         if [[ "$container_arch" != "$HOST_PACKAGE_ARCH" ]]; then
             RESULT_UPDATE["$container"]="Container architecture does not match the verified ${HOST_PACKAGE_ARCH} package"
         elif [[ "$current_version" == "$LATEST_VERSION" ]]; then
-            RESULT_UPDATE["$container"]="DBRepair ${current_version} was already current"
+            RESULT_UPDATE["$container"]="DBRepair ${current_version} current; update not required"
         elif docker cp "$STAGED_BINARY" "$container:$staged_path" >/dev/null 2>&1 &&
              docker exec -u 0 "$container" chmod 0755 "$staged_path" >/dev/null 2>&1; then
             staged_version="$(read_container_tool_version "$container" "$staged_path" || true)"
@@ -608,8 +608,8 @@ classify_container_output() {
 
     if (( unrecoverable == 1 )); then
         RESULT_CLASS["$container"]="UNRECOVERABLE"
-        RESULT_FINDING["$container"]="DBRepair found database damage that automatic repair could not safely recover."
-        RESULT_ACTION["$container"]="No verified replacement was confirmed. Use DBRepair Replace with a verified Plex-generated backup."
+        RESULT_FINDING["$container"]="Unrecoverable database corruption reported."
+        RESULT_ACTION["$container"]="Verified replacement not confirmed. Manual recovery required: DBRepair Replace with a verified Plex database backup."
         RUN_HAS_ISSUE=1
         raise_severity alert
         return 0
@@ -618,18 +618,18 @@ classify_container_output() {
     if (( rc != 0 )); then
         RESULT_CLASS["$container"]="FAILED"
         if (( rc == 124 )); then
-            RESULT_FINDING["$container"]="DBRepair did not finish within the configured maintenance timeout."
+            RESULT_FINDING["$container"]="Maintenance timeout exceeded (${DBREPAIR_TIMEOUT_SECONDS}s)."
         elif (( damage == 1 )); then
-            RESULT_FINDING["$container"]="DBRepair reported database damage and then exited unsuccessfully."
+            RESULT_FINDING["$container"]="Database corruption reported; maintenance exited with code ${rc}."
         else
-            RESULT_FINDING["$container"]="DBRepair did not complete its automatic maintenance workflow."
+            RESULT_FINDING["$container"]="Automatic maintenance failed (exit code ${rc})."
         fi
         if (( promoted == 1 && reverted == 1 )); then
-            RESULT_ACTION["$container"]="Repaired databases were activated, then DBRepair reported restoring the prior databases. Review the detailed log."
+            RESULT_ACTION["$container"]="Database activation followed by reported rollback to prior databases. Verify rollback in DBRepair.log."
         elif (( promoted == 1 )); then
-            RESULT_ACTION["$container"]="Live database activation was reported before the failure; the final database state needs review."
+            RESULT_ACTION["$container"]="Database activation reported before failure; final database state unverified. Inspect DBRepair.log."
         else
-            RESULT_ACTION["$container"]="No live database replacement was reported. The wrapper restored Plex service where possible."
+            RESULT_ACTION["$container"]="Database replacement not reported. Service recovery status follows below."
         fi
         RUN_HAS_ISSUE=1
         raise_severity alert
@@ -638,17 +638,17 @@ classify_container_output() {
 
     if (( promoted == 1 && rebuilt == 1 )); then
         RESULT_CLASS["$container"]="REPAIRED"
-        RESULT_FINDING["$container"]="DBRepair found database maintenance or repair work was needed."
-        [[ $fts -eq 0 ]] || RESULT_FINDING["$container"]+=" Search-index damage was reported."
-        [[ $bloat -eq 0 ]] || RESULT_FINDING["$container"]+=" Fragmentation or database bloat was reported."
-        [[ $ghost -eq 0 ]] || RESULT_FINDING["$container"]+=" Ghost or invalid-title records were reported."
-        RESULT_ACTION["$container"]="Rebuilt the matched main and blobs databases, verified them, and activated the repaired copies."
+        RESULT_FINDING["$container"]="Database rebuild and activation confirmed."
+        [[ $fts -eq 0 ]] || RESULT_FINDING["$container"]+=" Search-index corruption detected."
+        [[ $bloat -eq 0 ]] || RESULT_FINDING["$container"]+=" Fragmentation or database bloat detected."
+        [[ $ghost -eq 0 ]] || RESULT_FINDING["$container"]+=" Ghost or invalid-title records detected."
+        RESULT_ACTION["$container"]="Main and blobs databases rebuilt, verified, and activated."
         RUN_HAS_REPAIR=1
         CONTAINERS_REPAIRED=$((CONTAINERS_REPAIRED + 1))
         if (( notices == 1 || orphan == 1 )); then
             RESULT_CLASS["$container"]="WARNING"
-            (( orphan == 0 )) || RESULT_FINDING["$container"]+=" Orphaned media records were reported."
-            RESULT_ACTION["$container"]+=" Review the diagnostic messages for remaining findings."
+            (( orphan == 0 )) || RESULT_FINDING["$container"]+=" Orphaned media records detected."
+            RESULT_ACTION["$container"]+=" Additional findings require diagnostic review."
             RUN_HAS_ISSUE=1
             raise_severity warning
         fi
@@ -662,8 +662,8 @@ classify_container_output() {
         CONTAINERS_HEALTHY=$((CONTAINERS_HEALTHY + 1))
         if (( notices == 1 || orphan == 1 )); then
             RESULT_CLASS["$container"]="WARNING"
-            (( orphan == 0 )) || RESULT_FINDING["$container"]+=" Orphaned media records were reported."
-            RESULT_ACTION["$container"]="No verified correction reported for the advisory; review the diagnostic messages."
+            (( orphan == 0 )) || RESULT_FINDING["$container"]+=" Orphaned media records detected."
+            RESULT_ACTION["$container"]="Advisory correction unverified; inspect diagnostics and DBRepair.log."
             RUN_HAS_ISSUE=1
             raise_severity warning
         fi
@@ -672,12 +672,12 @@ classify_container_output() {
 
     if (( damage == 1 )); then
         RESULT_CLASS["$container"]="WARNING"
-        RESULT_FINDING["$container"]="DBRepair reported a database problem but did not confirm activation of a verified repair."
-        RESULT_ACTION["$container"]="The live database replacement was not confirmed; review DBRepair.log before taking manual action."
+        RESULT_FINDING["$container"]="Database damage detected; verified repair activation not confirmed."
+        RESULT_ACTION["$container"]="Database replacement unverified. Inspect DBRepair.log before manual recovery."
     else
         RESULT_CLASS["$container"]="WARNING"
-        RESULT_FINDING["$container"]="DBRepair exited successfully, but its result could not be classified safely."
-        RESULT_ACTION["$container"]="No database change is being assumed; review the detailed output."
+        RESULT_FINDING["$container"]="Exit code 0; database verification outcome unrecognized."
+        RESULT_ACTION["$container"]="Database changes unverified. Inspect DBRepair.log."
     fi
     RUN_HAS_ISSUE=1
     raise_severity warning
@@ -705,14 +705,14 @@ restore_container_state() {
             log INFO "[$container] Restoring original stopped container state"
             if ! docker stop -t 30 "$container" >/dev/null 2>&1 ||
                container_is_running "$container"; then
-                RESULT_FINAL_STATE["$container"]="Failed to restore the container's original stopped state."
+                RESULT_FINAL_STATE["$container"]="Original stopped state not restored; container stop failed or container remains running."
                 RESULT_CLASS["$container"]="FAILED"
                 RUN_HAS_ISSUE=1
                 raise_severity alert
                 return 1
             fi
         fi
-        RESULT_FINAL_STATE["$container"]="Container restored to its original stopped state."
+        RESULT_FINAL_STATE["$container"]="Container stopped; original state restored."
         return 0
     fi
 
@@ -721,9 +721,9 @@ restore_container_state() {
         if docker start "$container" >/dev/null 2>&1 &&
            wait_container_running "$container"; then
             CONTAINERS_RECOVERED=$((CONTAINERS_RECOVERED + 1))
-            RESULT_ACTION["$container"]+=" The wrapper restarted the stopped Docker container."
+            RESULT_ACTION["$container"]+=" Recovery start completed for stopped container."
         else
-            RESULT_FINAL_STATE["$container"]="Container is stopped and automatic recovery failed."
+            RESULT_FINAL_STATE["$container"]="Container running state unconfirmed; recovery start failed."
             RESULT_CLASS["$container"]="FAILED"
             RUN_HAS_ISSUE=1
             raise_severity alert
@@ -741,8 +741,8 @@ restore_container_state() {
        wait_container_running "$container" &&
        wait_plex_process "$container"; then
         CONTAINERS_RECOVERED=$((CONTAINERS_RECOVERED + 1))
-        RESULT_ACTION["$container"]+=" The wrapper restarted the Docker container to restore Plex service."
-        RESULT_FINAL_STATE["$container"]="Plex service was recovered and is running after a container restart."
+        RESULT_ACTION["$container"]+=" Recovery restart completed."
+        RESULT_FINAL_STATE["$container"]="Container running; server process detected after recovery restart."
         [[ "$class" == HEALTHY || "$class" == REPAIRED ]] && \
             RESULT_CLASS["$container"]="WARNING"
         RUN_HAS_ISSUE=1
@@ -750,7 +750,7 @@ restore_container_state() {
         return 0
     fi
 
-    RESULT_FINAL_STATE["$container"]="Docker is running, but the Plex Media Server process could not be confirmed after recovery."
+    RESULT_FINAL_STATE["$container"]="Recovery failed to confirm both container running state and server process."
     RESULT_CLASS["$container"]="FAILED"
     RUN_HAS_ISSUE=1
     raise_severity alert
@@ -763,9 +763,9 @@ process_container() {
 
     RESULT_ORDER+=("$container")
     RESULT_CLASS["$container"]="FAILED"
-    RESULT_FINDING["$container"]="Container processing did not complete."
-    RESULT_ACTION["$container"]="No database action was confirmed."
-    RESULT_FINAL_STATE["$container"]="Not checked."
+    RESULT_FINDING["$container"]="Container workflow incomplete."
+    RESULT_ACTION["$container"]="Database operations unconfirmed."
+    RESULT_FINAL_STATE["$container"]="Not evaluated."
     RESULT_VERSION["$container"]="unknown"
     RESULT_RC["$container"]="not-run"
     RESULT_DETAILS["$container"]=""
@@ -773,8 +773,8 @@ process_container() {
 
     log INFO "[$container] Starting DBRepair workflow"
     if ! container_exists "$container"; then
-        RESULT_FINDING["$container"]="The configured Plex Docker container does not exist."
-        RESULT_ACTION["$container"]="No database work was attempted. Correct the container name."
+        RESULT_FINDING["$container"]="Configured Docker container not found."
+        RESULT_ACTION["$container"]="Maintenance skipped. Correct CONTAINERS configuration."
         RESULT_FINAL_STATE["$container"]="Container not found."
         CONTAINERS_FAILED=$((CONTAINERS_FAILED + 1))
         RUN_HAS_ISSUE=1
@@ -790,9 +790,9 @@ process_container() {
         if ! docker start "$container" >/dev/null 2>&1 ||
            ! wait_container_running "$container" ||
            ! wait_plex_process "$container"; then
-            RESULT_FINDING["$container"]="The stopped Plex container could not be prepared for maintenance."
-            RESULT_ACTION["$container"]="Database maintenance was not started."
-            RESULT_FINAL_STATE["$container"]="Container could not reach a usable running state."
+            RESULT_FINDING["$container"]="Temporary startup failed container or server-process verification."
+            RESULT_ACTION["$container"]="Maintenance skipped; container stop requested."
+            RESULT_FINAL_STATE["$container"]="Startup verification failed; final stopped state unverified."
             docker stop -t 30 "$container" >/dev/null 2>&1 || true
             CONTAINERS_FAILED=$((CONTAINERS_FAILED + 1))
             RUN_HAS_ISSUE=1
@@ -804,9 +804,9 @@ process_container() {
     fi
 
     if ! install_or_resolve_dbrepair "$container"; then
-        RESULT_FINDING["$container"]="No validated current DBRepair executable is available in the container."
-        RESULT_ACTION["$container"]="The obsolete DBRepair.sh was not used and no database work was attempted."
-        RESULT_FINAL_STATE["$container"]="Container state restoration is being attempted."
+        RESULT_FINDING["$container"]="Validated DBRepair executable unavailable."
+        RESULT_ACTION["$container"]="Maintenance skipped; legacy DBRepair.sh execution disabled."
+        RESULT_FINAL_STATE["$container"]="Container state restoration pending."
         restore_container_state "$container" "$originally_running" || true
         CONTAINERS_FAILED=$((CONTAINERS_FAILED + 1))
         RUN_HAS_ISSUE=1
@@ -827,9 +827,9 @@ process_container() {
         if docker restart -t 30 "$container" >/dev/null 2>&1 &&
            wait_container_running "$container"; then
             CONTAINERS_RECOVERED=$((CONTAINERS_RECOVERED + 1))
-            RESULT_ACTION["$container"]+=" The wrapper restarted the Docker container to stop the timed-out process and recover Plex service."
+            RESULT_ACTION["$container"]+=" Container restarted to terminate timed-out maintenance."
         else
-            RESULT_ACTION["$container"]+=" The wrapper could not restart the Docker container after the timeout."
+            RESULT_ACTION["$container"]+=" Post-timeout container restart failed."
         fi
     fi
     restore_container_state "$container" "$originally_running" || true
@@ -855,7 +855,7 @@ process_container() {
 build_summary_text() {
     local include_report_path="${1:-true}" container details text=""
 
-    text+="Tool update: ${UPDATE_DETAIL}"$'\n'
+    text+="Release verification: ${UPDATE_DETAIL}"$'\n'
     text+="Containers: ${#CONTAINERS[@]} configured; ${CONTAINERS_SUCCESSFUL} successful; ${CONTAINERS_FAILED} failed; ${CONTAINERS_REPAIRED} repaired; ${CONTAINERS_HEALTHY} healthy."$'\n\n'
     for container in "${RESULT_ORDER[@]}"; do
         text+="[${container}] ${RESULT_CLASS[$container]}"$'\n'
@@ -863,12 +863,12 @@ build_summary_text() {
         text+="Maintenance: ${RESULT_ACTION[$container]}"$'\n'
         text+="Plex status: ${RESULT_FINAL_STATE[$container]}"$'\n'
         text+="DBRepair: ${RESULT_VERSION[$container]}; exit code: ${RESULT_RC[$container]}"$'\n'
-        text+="Update: ${RESULT_UPDATE[$container]}"$'\n'
+        text+="Deployment: ${RESULT_UPDATE[$container]:-Not attempted.}"$'\n'
         details="${RESULT_DETAILS[$container]}"
         if [[ -n "$details" ]]; then
             text+="Diagnostics:"$'\n'"${details}"$'\n'
         fi
-        text+="DBRepair log in container: ${DBREPAIR_INSTALL_DIR}/DBRepair.log"$'\n\n'
+        text+="Container log: ${DBREPAIR_INSTALL_DIR}/DBRepair.log"$'\n\n'
     done
     text+="Wrapper log: ${LOG_FILE}"$'\n'
     if [[ "$include_report_path" == true && -n "$RUN_REPORT_FILE" ]]; then
@@ -984,8 +984,8 @@ update_notifications() {
         fi
         if (( should_notify == 1 )); then
             case "$RUN_HIGHEST_SEVERITY" in
-                alert) description="Database maintenance requires action" ;;
-                *) description="Database maintenance completed with a warning" ;;
+                alert) description="DBRepair FAILED - operator action required" ;;
+                *) description="DBRepair WARNING - diagnostic review required" ;;
             esac
             body="$(build_summary_text true)"
             notify_unraid "$RUN_HIGHEST_SEVERITY" "$description" "$body" || true
@@ -1005,10 +1005,10 @@ update_notifications() {
 
     if (( RUN_HAS_REPAIR == 1 )); then
         body="$(build_summary_text true)"
-        notify_unraid normal "Database repair completed successfully" "$body" || true
+        notify_unraid normal "DBRepair REPAIRED - database activation verified" "$body" || true
     elif (( previous_active == 1 )); then
-        body="All previously reported Plex DBRepair issues are resolved."$'\n\n'"$(build_summary_text true)"
-        notify_unraid normal "Database maintenance healthy" "$body" || true
+        body="Recovery: Previously reported DBRepair conditions are no longer detected."$'\n\n'"$(build_summary_text true)"
+        notify_unraid normal "DBRepair RESOLVED - no active conditions detected" "$body" || true
     else
         log INFO "All Plex databases were healthy; routine notification suppressed"
     fi
@@ -1036,14 +1036,14 @@ main() {
     touch "$LOG_FILE" || return 1
 
     if ! require_commands; then
-        notify_unraid alert "DBRepair wrapper cannot start" \
-            "One or more required Unraid commands are unavailable. Log: $LOG_FILE" || true
+        notify_unraid alert "DBRepair STARTUP FAILED - missing dependencies" \
+            "Validation: Required commands unavailable. Maintenance: Not started. Action: Install missing dependencies listed in $LOG_FILE." || true
         write_status_receipt FAILED "Required command validation failed"
         return 1
     fi
     if ! validate_configuration; then
-        notify_unraid alert "DBRepair wrapper cannot start" \
-            "Configuration validation or the Unraid Docker service failed. Log: $LOG_FILE" || true
+        notify_unraid alert "DBRepair STARTUP FAILED - configuration or Docker" \
+            "Validation: Configuration or Docker service check failed. Maintenance: Not started. Action: Inspect $LOG_FILE and correct configuration or restore Docker service." || true
         write_status_receipt FAILED "Configuration or Docker validation failed"
         return 1
     fi
@@ -1054,8 +1054,8 @@ main() {
     prune_reports || warn "Old DBRepair reports could not be pruned"
     initialize_notification_state || {
         error "Notification state could not be initialized"
-        notify_unraid alert "DBRepair wrapper cannot start" \
-            "Notification state could not be initialized. Log: $LOG_FILE" || true
+        notify_unraid alert "DBRepair STARTUP FAILED - notification state" \
+            "State initialization: Failed. Maintenance: Not started. Action: Check storage availability and permissions for $NOTIFICATION_STATE_FILE. Log: $LOG_FILE" || true
         return 1
     }
 

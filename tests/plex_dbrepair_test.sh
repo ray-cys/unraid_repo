@@ -85,7 +85,7 @@ set_result_fields() {
     RESULT_ORDER+=("$container")
     RESULT_FINAL_STATE["$container"]="Container running; server process detected."
     RESULT_VERSION["$container"]="99.12.34"
-    RESULT_UPDATE["$container"]="DBRepair 99.12.34 was already current"
+    RESULT_UPDATE["$container"]="DBRepair 99.12.34 current; update not required"
 }
 
 ###############################################################################
@@ -281,7 +281,7 @@ reset_results
 classify_container_output orphan "$ORPHAN_OUTPUT" 0
 [[ "${RESULT_CLASS[orphan]}" == WARNING ]] || fail "real orphan finding was suppressed"
 assert_contains <(printf '%s' "${RESULT_DETAILS[orphan]}") 'Found 12 orphaned media items'
-assert_contains <(printf '%s' "${RESULT_FINDING[orphan]}") 'Orphaned media records were reported'
+assert_contains <(printf '%s' "${RESULT_FINDING[orphan]}") 'Orphaned media records detected'
 
 WARNING_OUTPUT="${TEST_ROOT}/warning.out"
 cp "$HEALTHY_OUTPUT" "$WARNING_OUTPUT"
@@ -308,7 +308,7 @@ Started PMS.
 EOF
 classify_container_output repaired "$REPAIRED_OUTPUT" 0
 [[ "${RESULT_CLASS[repaired]}" == REPAIRED ]] || fail "repair output was misclassified"
-assert_contains <(printf '%s' "${RESULT_ACTION[repaired]}") "activated the repaired copies"
+assert_contains <(printf '%s' "${RESULT_ACTION[repaired]}") "Main and blobs databases rebuilt, verified, and activated."
 
 UNRECOVERABLE_OUTPUT="${TEST_ROOT}/unrecoverable.out"
 cat >"$UNRECOVERABLE_OUTPUT" <<'EOF'
@@ -331,8 +331,8 @@ initialize_notification_state || fail "notification state initialization failed"
 reset_results
 set_result_fields plex-media-server
 RESULT_CLASS["plex-media-server"]=REPAIRED
-RESULT_FINDING["plex-media-server"]="DBRepair found database repair work was needed."
-RESULT_ACTION["plex-media-server"]="Rebuilt and verified both databases, then activated the repaired copies."
+RESULT_FINDING["plex-media-server"]="Database rebuild and activation confirmed."
+RESULT_ACTION["plex-media-server"]="Main and blobs databases rebuilt, verified, and activated."
 RESULT_RC["plex-media-server"]=0
 RESULT_DETAILS["plex-media-server"]=""
 CONTAINERS=(plex-media-server)
@@ -355,8 +355,8 @@ clear_attention_state
 reset_results
 set_result_fields plex-media-server
 RESULT_CLASS["plex-media-server"]=WARNING
-RESULT_FINDING["plex-media-server"]="DBRepair result could not be classified safely."
-RESULT_ACTION["plex-media-server"]="No database change is being assumed."
+RESULT_FINDING["plex-media-server"]="Exit code 0; database verification outcome unrecognized."
+RESULT_ACTION["plex-media-server"]="Database changes unverified. Inspect DBRepair.log."
 RESULT_RC["plex-media-server"]=0
 RESULT_DETAILS["plex-media-server"]="- WARNING: Review DBRepair.log"
 CONTAINERS=(plex-media-server)
@@ -371,8 +371,8 @@ update_notifications
 reset_results
 set_result_fields plex-media-server
 RESULT_CLASS["plex-media-server"]=HEALTHY
-RESULT_FINDING["plex-media-server"]="Both Plex databases passed DBRepair's checks."
-RESULT_ACTION["plex-media-server"]="No database files were changed."
+RESULT_FINDING["plex-media-server"]="Main OK; Blobs OK."
+RESULT_ACTION["plex-media-server"]="No repair required."
 RESULT_RC["plex-media-server"]=0
 RESULT_DETAILS["plex-media-server"]=""
 CONTAINERS=(plex-media-server)
@@ -381,7 +381,7 @@ CONTAINERS_HEALTHY=1
 update_notifications
 [[ "$(wc -l <"$MOCK_NOTIFY_COUNT" | tr -d '[:space:]')" -eq 2 ]] ||
     fail "warning resolution notification was not sent"
-assert_contains "$MOCK_NOTIFY_LOG" "previously reported Plex DBRepair issues are resolved"
+assert_contains "$MOCK_NOTIFY_LOG" "Recovery: Previously reported DBRepair conditions are no longer detected."
 
 # Subsequent clean runs stay silent, including the real-world orphan-check
 # output that originally generated false NOTICE emails.
