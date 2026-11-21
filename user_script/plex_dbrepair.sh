@@ -1,920 +1,1080 @@
 #!/bin/bash
 
 ###############################################################################
-# Plex DBRepair Scheduler Wrapper v2.0
+# Plex DBRepair Scheduler Wrapper v3.0
 #
-# PURPOSE
-# -------
-# Scheduled wrapper for ChuckPa's Plex DBRepair script.
-#
-# For each configured Plex container this script:
-#
-#   1. Downloads and validates the latest DBRepair.sh when possible.
-#   2. Starts the container temporarily if it was originally stopped.
-#   3. Updates the in-container DBRepair.sh using a staged replacement.
-#   4. Runs DBRepair with the configured arguments.
-#   5. Restores the container to its original stopped state when applicable.
-#   6. Records DBRepair output and a concise run summary.
-#
-#
-# LOGGING
-# -------
-# Uses a rolling log rather than creating one log per run:
-#
-#   dbrepair.log
-#   dbrepair.log.1
-#   dbrepair.log.2
-#
-# Old timestamp-based logs from previous versions are automatically removed.
-#
-#
-# FAILURE BEHAVIOR
-# ----------------
-# Failure to download the latest DBRepair.sh does NOT stop the run.
-#
-# The script will instead attempt to use the existing DBRepair.sh already
-# present inside each Plex container.
-#
+# Unraid 7.4-focused scheduler for the current standalone DBRepair executable.
+# It verifies the official GitHub release, stages updates safely inside each
+# Plex Docker container, runs unattended maintenance, restores the container's
+# original state, records a structured receipt, and sends one plain-language
+# grouped notification only when something changed or needs attention.
 ###############################################################################
 
 set -uo pipefail
 
+readonly VERSION="3.0"
 
 ###############################################################################
 # CONFIGURATION
 ###############################################################################
 
-VERSION="2.0"
-
-
-# ---------------------------------------------------------------------------
-# Plex containers
-# ---------------------------------------------------------------------------
-
 CONTAINERS=(
-  "plex-media-server"
-  "plex-media"
+    "plex-media-server"
+    "plex-media"
 )
 
+DBREPAIR_INSTALL_DIR="/config/DBRepair"
+DBREPAIR_PATH="${DBREPAIR_INSTALL_DIR}/DBRepair"
+DBREPAIR_PREVIOUS_PATH="${DBREPAIR_INSTALL_DIR}/DBRepair.previous"
+LEGACY_DBREPAIR_PATH="${DBREPAIR_INSTALL_DIR}/DBRepair.sh"
+LEGACY_DBREPAIR_ARCHIVE="${DBREPAIR_INSTALL_DIR}/DBRepair.sh.legacy"
+DBREPAIR_ARGS=("automatic" "exit")
+DBREPAIR_TIMEOUT_SECONDS=14400
 
-# ---------------------------------------------------------------------------
-# DBRepair
-# ---------------------------------------------------------------------------
-
-REPAIR_PATHS=(
-  "/config/DBRepair/DBRepair.sh"
-)
-
-DBREPAIR_ARGS=(
-  "stop"
-  "auto"
-  "start"
-  "exit"
-)
-
-DOWNLOAD_URL="https://github.com/ChuckPa/DBRepair/releases/latest/download/DBRepair.sh"
-
-TMP_FILE="/tmp/DBRepair.sh"
-
-
-# ---------------------------------------------------------------------------
-# Logging
-#
-# LOG_KEEP=2 retains:
-#
-#   dbrepair.log
-#   dbrepair.log.1
-#   dbrepair.log.2
-#
-# Therefore a maximum of three rolling log files are normally retained.
-# ---------------------------------------------------------------------------
+GITHUB_RELEASE_API="https://api.github.com/repos/ChuckPa/DBRepair/releases/latest"
+GITHUB_API_ACCEPT="application/vnd.github+json"
 
 LOG_DIR="/mnt/vault/cloud/logs/script/plex_dbrepair"
-
 LOG_FILE="${LOG_DIR}/dbrepair.log"
-
 LOG_MAX_BYTES=$((2 * 1024 * 1024))
-
 LOG_KEEP=2
 
+REPORT_DIR="${LOG_DIR}/reports"
+REPORT_RETENTION_DAYS=180
+NOTIFICATION_STATE_FILE="${LOG_DIR}/notification-state.json"
+NOTIFICATION_REMINDER_DAYS=7
+NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
 
-# ---------------------------------------------------------------------------
-# Locking
-# ---------------------------------------------------------------------------
+STATUS_DIR="/mnt/vault/cloud/logs/script/user_scripts_status"
+LOCK_FILE="/run/plex_dbrepair.lock"
 
-LOCK_FILE="/tmp/plex_dbrepair.lock"
-
+CONTAINER_START_TIMEOUT_SECONDS=90
+PLEX_START_TIMEOUT_SECONDS=90
 
 ###############################################################################
-# INTERNAL STATE / COUNTERS
+# RUNTIME
 ###############################################################################
+
+START_EPOCH="$(date +%s)"
+RUN_STAMP="$(date '+%Y%m%d_%H%M%S')_$$"
+RUNTIME_DIR=""
+RUN_REPORT_FILE=""
 
 DOWNLOAD_READY=0
+LATEST_VERSION=""
+LATEST_ASSET_NAME=""
+LATEST_ASSET_DIGEST=""
+STAGED_BINARY=""
+UPDATE_STATE="not-checked"
+UPDATE_DETAIL="Latest DBRepair release was not checked"
+HOST_PACKAGE_ARCH=""
 
-LEGACY_LOGS_REMOVED=0
+WARNING_COUNT=0
+ERROR_COUNT=0
+NOTIFICATION_FAILED=0
 
 CONTAINERS_PROCESSED=0
 CONTAINERS_SUCCESSFUL=0
 CONTAINERS_FAILED=0
-CONTAINERS_SKIPPED=0
-
-CONTAINERS_TEMP_STARTED=0
+CONTAINERS_REPAIRED=0
+CONTAINERS_HEALTHY=0
 CONTAINERS_UPDATED=0
+CONTAINERS_TEMP_STARTED=0
+CONTAINERS_RECOVERED=0
 
-WARNING_COUNT=0
-ERROR_COUNT=0
+RUN_HAS_REPAIR=0
+RUN_HAS_ISSUE=0
+RUN_HIGHEST_SEVERITY="normal"
+GLOBAL_ISSUE_KEY=""
 
+declare -a RESULT_ORDER=()
+declare -A RESULT_CLASS=()
+declare -A RESULT_FINDING=()
+declare -A RESULT_ACTION=()
+declare -A RESULT_FINAL_STATE=()
+declare -A RESULT_VERSION=()
+declare -A RESULT_RC=()
+declare -A RESULT_DETAILS=()
+declare -A RESULT_UPDATE=()
 
 ###############################################################################
 # GENERAL HELPERS
 ###############################################################################
 
 timestamp() {
-  date '+%Y-%m-%d %H:%M:%S'
+    date '+%Y-%m-%d %H:%M:%S'
 }
-
 
 log() {
-  local level="$1"
-  shift
-
-  printf '%s [%s] [DBREPAIR] %s\n' \
-    "$(timestamp)" \
-    "$level" \
-    "$*" | tee -a "$LOG_FILE"
+    local level="$1"
+    shift
+    printf '%s [%s] [DBREPAIR] %s\n' \
+        "$(timestamp)" "$level" "$*" | tee -a "$LOG_FILE"
 }
-
 
 warn() {
-  log "WARN" "$*"
-
-  ((WARNING_COUNT+=1))
+    log WARN "$*"
+    WARNING_COUNT=$((WARNING_COUNT + 1))
+    RUN_HAS_ISSUE=1
+    GLOBAL_ISSUE_KEY+="warning:$*;"
+    raise_severity warning
 }
-
 
 error() {
-  log "ERROR" "$*" >&2
-
-  ((ERROR_COUNT+=1))
+    log ERROR "$*" >&2
+    ERROR_COUNT=$((ERROR_COUNT + 1))
+    RUN_HAS_ISSUE=1
+    GLOBAL_ISSUE_KEY+="error:$*;"
+    raise_severity alert
 }
 
-
-die() {
-  error "$*"
-
-  exit 1
+human_duration() {
+    local seconds="${1:-0}"
+    printf '%dh:%02dm:%02ds' \
+        $((seconds / 3600)) \
+        $(((seconds % 3600) / 60)) \
+        $((seconds % 60))
 }
 
-
-cleanup_temp() {
-  rm -f -- \
-    "$TMP_FILE" \
-    "${TMP_FILE}.download" \
-    2>/dev/null || true
+severity_rank() {
+    case "$1" in
+        alert) printf '3' ;;
+        warning) printf '2' ;;
+        *) printf '1' ;;
+    esac
 }
 
+raise_severity() {
+    local proposed="$1"
+    if (( $(severity_rank "$proposed") > $(severity_rank "$RUN_HIGHEST_SEVERITY") )); then
+        RUN_HIGHEST_SEVERITY="$proposed"
+    fi
+}
 
-trap cleanup_temp EXIT
+safe_name() {
+    printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
+}
 
+map_linux_arch() {
+    case "$1" in
+        x86_64|amd64) printf 'x86_64' ;;
+        aarch64|arm64) printf 'arm64' ;;
+        armv7l|armv7|armhf) printf 'arm32' ;;
+        *) return 1 ;;
+    esac
+}
+
+extract_version() {
+    grep -Eo '[0-9]{2}\.[0-9]{2}\.[0-9]+' | awk 'NR == 1 {print; exit}'
+}
+
+cleanup() {
+    local rc=$?
+    if [[ -n "$RUNTIME_DIR" && "$RUNTIME_DIR" == /tmp/plex_dbrepair.* ]]; then
+        rm -rf -- "$RUNTIME_DIR"
+    fi
+    trap - EXIT
+    exit "$rc"
+}
+
+notify_unraid() {
+    local importance="$1" description="$2" message="$3"
+    if [[ ! -x "$NOTIFY_BIN" ]]; then
+        error "Unraid notification command is unavailable: $NOTIFY_BIN"
+        NOTIFICATION_FAILED=1
+        return 1
+    fi
+    if ! "$NOTIFY_BIN" \
+        -i "$importance" \
+        -s "Plex DBRepair" \
+        -d "$description" \
+        -m "$message" \
+        >/dev/null 2>&1; then
+        error "Unraid notification command failed"
+        NOTIFICATION_FAILED=1
+        return 1
+    fi
+}
 
 ###############################################################################
-# LOCKING
-###############################################################################
-
-acquire_lock() {
-  exec 9>"$LOCK_FILE"
-
-  if ! flock -n 9; then
-    printf '%s [INFO] [DBREPAIR] Another Plex DBRepair run is active; exiting.\n' \
-      "$(timestamp)"
-
-    exit 0
-  fi
-}
-
-
-###############################################################################
-# LOG MAINTENANCE
+# LOGS, REPORTS, AND STATUS
 ###############################################################################
 
 rotate_log() {
-  [[ -f "$LOG_FILE" ]] || return 0
-
-  local size
-  local i
-
-  size="$(stat -c '%s' "$LOG_FILE" 2>/dev/null || printf '0')"
-
-  (( size >= LOG_MAX_BYTES )) || return 0
-
-
-  # If no historical logs are requested, simply clear the current log.
-
-  if (( LOG_KEEP <= 0 )); then
-    : > "$LOG_FILE"
-
-    return 0
-  fi
-
-
-  # Remove the oldest retained log.
-
-  rm -f -- \
-    "${LOG_FILE}.${LOG_KEEP}" \
-    2>/dev/null || true
-
-
-  # Shift existing rotated logs.
-
-  for ((i=LOG_KEEP-1; i>=1; i--)); do
-
-    if [[ -f "${LOG_FILE}.${i}" ]]; then
-
-      mv -f -- \
-        "${LOG_FILE}.${i}" \
-        "${LOG_FILE}.$((i + 1))"
-
+    local size=0 i
+    [[ -f "$LOG_FILE" ]] || return 0
+    size="$(stat -c '%s' "$LOG_FILE" 2>/dev/null || printf '0')"
+    (( size >= LOG_MAX_BYTES )) || return 0
+    if (( LOG_KEEP <= 0 )); then
+        : >"$LOG_FILE"
+        return 0
     fi
-
-  done
-
-
-  # Rotate the current log.
-
-  mv -f -- \
-    "$LOG_FILE" \
-    "${LOG_FILE}.1"
+    rm -f -- "${LOG_FILE}.${LOG_KEEP}" 2>/dev/null || true
+    for ((i = LOG_KEEP - 1; i >= 1; i--)); do
+        [[ -f "${LOG_FILE}.${i}" ]] || continue
+        mv -f -- "${LOG_FILE}.${i}" "${LOG_FILE}.$((i + 1))"
+    done
+    mv -f -- "$LOG_FILE" "${LOG_FILE}.1"
 }
-
 
 cleanup_legacy_logs() {
-  local old_log
-
-  while IFS= read -r -d '' old_log; do
-
-    if rm -f -- "$old_log"; then
-
-      ((LEGACY_LOGS_REMOVED+=1))
-
-    else
-
-      ((WARNING_COUNT+=1))
-
-    fi
-
-  done < <(
-    find "$LOG_DIR" \
-      -mindepth 1 \
-      -maxdepth 1 \
-      -type f \
-      -name 'dbrepair-[0-9]*_[0-9]*.log' \
-      -print0 \
-      2>/dev/null
-  )
+    local old_log removed=0
+    while IFS= read -r -d '' old_log; do
+        rm -f -- "$old_log" || continue
+        removed=$((removed + 1))
+    done < <(
+        find "$LOG_DIR" -mindepth 1 -maxdepth 1 -type f \
+            -name 'dbrepair-[0-9]*_[0-9]*.log' -print0 2>/dev/null
+    )
+    (( removed == 0 )) || log INFO "Removed $removed legacy timestamp log file(s)"
 }
 
+prune_reports() {
+    local report removed=0
+    mkdir -p -- "$REPORT_DIR" || return 1
+    while IFS= read -r -d '' report; do
+        [[ "$report" == "$REPORT_DIR"/dbrepair-*.txt ]] || continue
+        rm -f -- "$report" || return 1
+        removed=$((removed + 1))
+    done < <(
+        find "$REPORT_DIR" -mindepth 1 -maxdepth 1 -type f \
+            -name 'dbrepair-*.txt' \
+            -mtime "+${REPORT_RETENTION_DAYS}" -print0 2>/dev/null
+    )
+    (( removed == 0 )) || log INFO "Removed $removed DBRepair report(s) older than $REPORT_RETENTION_DAYS days"
+}
+
+write_status_receipt() {
+    local status="$1" summary="$2" now tmp
+    now="$(date +%s)"
+    mkdir -p -- "$STATUS_DIR" 2>/dev/null || return 0
+    tmp="$(mktemp "${STATUS_DIR}/.plex_dbrepair.XXXXXX")" || return 0
+    if jq -n \
+        --arg name "plex_dbrepair" \
+        --arg status "$status" \
+        --arg summary "$summary" \
+        --arg log "$LOG_FILE" \
+        --arg report "$RUN_REPORT_FILE" \
+        --argjson epoch "$now" \
+        --argjson duration "$((now - START_EPOCH))" \
+        '{name:$name,status:$status,summary:$summary,log:$log,report:$report,epoch:$epoch,duration_seconds:$duration}' \
+        >"$tmp"; then
+        mv -f -- "$tmp" "${STATUS_DIR}/plex_dbrepair.json"
+    else
+        rm -f -- "$tmp"
+    fi
+}
 
 ###############################################################################
-# VALIDATION
+# VALIDATION AND LOCKING
 ###############################################################################
 
 require_commands() {
-  local cmd
-  local missing=0
+    local command missing=0
+    for command in awk cat chmod date docker find flock grep jq mkdir mktemp \
+        mv rm sed sha256sum stat tee timeout tr uname; do
+        if ! command -v "$command" >/dev/null 2>&1; then
+            printf '%s [ERROR] [DBREPAIR] Required command not found: %s\n' \
+                "$(timestamp)" "$command" >&2
+            missing=1
+        fi
+    done
+    (( missing == 0 ))
+}
 
-  for cmd in \
-    docker \
-    flock \
-    find \
-    stat \
-    rm \
-    mv \
-    tee \
-    bash \
-    chmod
-  do
+validate_configuration() {
+    [[ ${#CONTAINERS[@]} -gt 0 ]] || {
+        error "No Plex containers are configured"
+        return 1
+    }
+    [[ "$DBREPAIR_INSTALL_DIR" == /config/* &&
+       "$DBREPAIR_INSTALL_DIR" != *$'\n'* ]] || {
+        error "DBREPAIR_INSTALL_DIR must be a safe path below /config"
+        return 1
+    }
+    [[ "$DBREPAIR_PATH" == "$DBREPAIR_INSTALL_DIR"/* ]] || return 1
+    [[ "$DBREPAIR_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "$REPORT_RETENTION_DAYS" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "$NOTIFICATION_REMINDER_DAYS" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "$CONTAINER_START_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "$PLEX_START_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || return 1
+    docker info >/dev/null 2>&1 || {
+        error "Docker is unavailable or the Unraid Docker service is not running"
+        return 1
+    }
+}
 
-    if ! command -v "$cmd" >/dev/null 2>&1; then
+acquire_lock() {
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        log INFO "Another Plex DBRepair run is active; exiting"
+        return 1
+    fi
+}
 
-      log "ERROR" "Required command not found: $cmd"
+###############################################################################
+# OFFICIAL RELEASE DISCOVERY AND VERIFICATION
+###############################################################################
 
-      missing=1
+release_fallback() {
+    local message="$1"
+    DOWNLOAD_READY=0
+    UPDATE_STATE="fallback-existing"
+    UPDATE_DETAIL="$message; validated existing container executables will be used"
+    RUN_HAS_ISSUE=1
+    GLOBAL_ISSUE_KEY+="release-fallback;"
+    raise_severity warning
+    warn "$UPDATE_DETAIL"
+}
 
+prepare_latest_release() {
+    local release_json asset_row asset_url asset_size expected_digest
+    local actual_size actual_digest version_output
+
+    if ! command -v curl >/dev/null 2>&1 ||
+       ! command -v unzip >/dev/null 2>&1; then
+        release_fallback "curl or unzip is unavailable for DBRepair updates"
+        return 0
     fi
 
-  done
+    HOST_PACKAGE_ARCH="$(map_linux_arch "$(uname -m 2>/dev/null || true)" || true)"
+    if [[ -z "$HOST_PACKAGE_ARCH" ]]; then
+        release_fallback "Unsupported Unraid host architecture: $(uname -m 2>/dev/null || printf unknown)"
+        return 0
+    fi
 
+    release_json="${RUNTIME_DIR}/release.json"
+    if ! curl --fail --silent --show-error --location \
+        --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 90 \
+        -H "Accept: ${GITHUB_API_ACCEPT}" \
+        "$GITHUB_RELEASE_API" -o "$release_json"; then
+        release_fallback "Could not query the official DBRepair release"
+        return 0
+    fi
 
-  if (( missing != 0 )); then
+    LATEST_VERSION="$(jq -r '.tag_name // ""' "$release_json" | sed 's/^v//')"
+    asset_row="$(jq -r --arg suffix "-Linux-${HOST_PACKAGE_ARCH}.zip" '
+        .assets[]?
+        | select(.name | endswith($suffix))
+        | [.name, .browser_download_url, (.digest // ""), (.size | tostring)]
+        | @tsv
+    ' "$release_json" | awk 'NR == 1 {print; exit}')"
+    IFS=$'\t' read -r LATEST_ASSET_NAME asset_url LATEST_ASSET_DIGEST asset_size \
+        <<<"$asset_row"
 
-    die "One or more required commands are unavailable."
+    if ! [[ "$LATEST_VERSION" =~ ^[0-9]{2}\.[0-9]{2}\.[0-9]+$ ]] ||
+       ! [[ "$LATEST_ASSET_NAME" =~ ^DBRepair-[A-Za-z0-9._-]+-Linux-${HOST_PACKAGE_ARCH}\.zip$ ]] ||
+       [[ "$asset_url" != https://github.com/ChuckPa/DBRepair/releases/* ]] ||
+       [[ "$LATEST_ASSET_DIGEST" != sha256:* ]] ||
+       ! [[ "$asset_size" =~ ^[1-9][0-9]*$ ]]; then
+        release_fallback "The official release metadata was incomplete or unsafe"
+        return 0
+    fi
 
-  fi
+    expected_digest="${LATEST_ASSET_DIGEST#sha256:}"
+    [[ "$expected_digest" =~ ^[[:xdigit:]]{64}$ ]] || {
+        release_fallback "The official release did not provide a valid SHA-256 digest"
+        return 0
+    }
+
+    log INFO "Downloading official DBRepair ${LATEST_VERSION} package for Linux ${HOST_PACKAGE_ARCH}"
+    if ! curl --fail --silent --show-error --location \
+        --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 300 \
+        "$asset_url" -o "${RUNTIME_DIR}/${LATEST_ASSET_NAME}"; then
+        release_fallback "DBRepair ${LATEST_VERSION} download failed"
+        return 0
+    fi
+
+    actual_size="$(stat -c '%s' "${RUNTIME_DIR}/${LATEST_ASSET_NAME}" 2>/dev/null || printf 0)"
+    actual_digest="$(sha256sum -- "${RUNTIME_DIR}/${LATEST_ASSET_NAME}" | awk '{print $1}')"
+    if [[ "$actual_size" != "$asset_size" || "$actual_digest" != "$expected_digest" ]]; then
+        release_fallback "DBRepair ${LATEST_VERSION} package size or SHA-256 verification failed"
+        return 0
+    fi
+    if ! unzip -tq "${RUNTIME_DIR}/${LATEST_ASSET_NAME}" >/dev/null 2>&1; then
+        release_fallback "DBRepair ${LATEST_VERSION} ZIP validation failed"
+        return 0
+    fi
+
+    mkdir -p -- "${RUNTIME_DIR}/release" || return 1
+    if ! unzip -q "${RUNTIME_DIR}/${LATEST_ASSET_NAME}" DBRepair \
+        -d "${RUNTIME_DIR}/release"; then
+        release_fallback "DBRepair ${LATEST_VERSION} executable could not be extracted"
+        return 0
+    fi
+    STAGED_BINARY="${RUNTIME_DIR}/release/DBRepair"
+    chmod 0755 "$STAGED_BINARY" || {
+        release_fallback "DBRepair ${LATEST_VERSION} executable could not be enabled"
+        return 0
+    }
+
+    if ! version_output="$(
+        cd "${RUNTIME_DIR}/release" && timeout 30 ./DBRepair --version 2>&1
+    )" ||
+       [[ "$(printf '%s\n' "$version_output" | extract_version)" != "$LATEST_VERSION" ]]; then
+        release_fallback "The downloaded DBRepair executable failed its version test"
+        return 0
+    fi
+
+    DOWNLOAD_READY=1
+    UPDATE_STATE="verified-latest"
+    UPDATE_DETAIL="Official DBRepair ${LATEST_VERSION} package passed size, SHA-256, ZIP and executable checks"
+    log INFO "$UPDATE_DETAIL"
 }
 
+###############################################################################
+# DOCKER AND DBREPAIR INSTALLATION
+###############################################################################
 
-validate_environment() {
-
-  [[ -w "$LOG_DIR" ]] || \
-    die "Log directory is not writable: $LOG_DIR"
-
-
-  if ! docker info >/dev/null 2>&1; then
-
-    die "Docker is unavailable or the Docker service is not running."
-
-  fi
-
-
-  if (( ${#CONTAINERS[@]} == 0 )); then
-
-    die "No Plex containers are configured."
-
-  fi
-
-
-  if (( ${#REPAIR_PATHS[@]} == 0 )); then
-
-    die "No DBRepair paths are configured."
-
-  fi
+container_exists() {
+    docker inspect "$1" >/dev/null 2>&1
 }
 
-
-###############################################################################
-# DBREPAIR DOWNLOAD
-###############################################################################
-
-download_latest_dbrepair() {
-  DOWNLOAD_READY=0
-
-
-  # Prevent a failed download from accidentally reusing an old temporary file.
-
-  rm -f -- \
-    "$TMP_FILE" \
-    "${TMP_FILE}.download" \
-    2>/dev/null || true
-
-
-  # curl is deliberately treated as optional.
-  #
-  # DBRepair can still run using the copy already installed inside the
-  # container if downloading the newest release is unavailable.
-
-  if ! command -v curl >/dev/null 2>&1; then
-
-    warn "curl is not available; using existing in-container DBRepair copies."
-
-    return 0
-  fi
-
-
-  log "INFO" "Downloading latest DBRepair script..."
-
-
-  if ! curl \
-      -fsSL \
-      --retry 2 \
-      --retry-delay 2 \
-      --connect-timeout 15 \
-      --max-time 90 \
-      "$DOWNLOAD_URL" \
-      -o "${TMP_FILE}.download"
-  then
-
-    rm -f -- \
-      "${TMP_FILE}.download" \
-      2>/dev/null || true
-
-    warn "Failed to download DBRepair; using existing in-container copies."
-
-    return 0
-  fi
-
-
-  # Make sure something was actually downloaded.
-
-  if [[ ! -s "${TMP_FILE}.download" ]]; then
-
-    rm -f -- \
-      "${TMP_FILE}.download" \
-      2>/dev/null || true
-
-    warn "Downloaded DBRepair file is empty; using existing in-container copies."
-
-    return 0
-  fi
-
-
-  # Validate Bash syntax before distributing the script to the Plex containers.
-
-  if ! bash -n "${TMP_FILE}.download" >/dev/null 2>&1; then
-
-    rm -f -- \
-      "${TMP_FILE}.download" \
-      2>/dev/null || true
-
-    warn "Downloaded DBRepair failed Bash syntax validation; existing copies will be used."
-
-    return 0
-  fi
-
-
-  if ! chmod +x "${TMP_FILE}.download"; then
-
-    rm -f -- \
-      "${TMP_FILE}.download" \
-      2>/dev/null || true
-
-    warn "Unable to mark downloaded DBRepair executable; existing copies will be used."
-
-    return 0
-  fi
-
-
-  if ! mv -f -- \
-      "${TMP_FILE}.download" \
-      "$TMP_FILE"
-  then
-
-    warn "Unable to stage downloaded DBRepair; existing copies will be used."
-
-    return 0
-  fi
-
-
-  DOWNLOAD_READY=1
-
-  log "INFO" "DBRepair download and syntax validation completed successfully."
+container_is_running() {
+    [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" == true ]]
 }
 
-
-###############################################################################
-# DBREPAIR INSTALLATION
-###############################################################################
-
-install_downloaded_dbrepair() {
-  local container="$1"
-
-  local target="${REPAIR_PATHS[0]}"
-
-  local target_dir="${target%/*}"
-
-  local staged="${target}.new"
-
-
-  (( DOWNLOAD_READY == 1 )) || return 1
-
-
-  # Ensure DBRepair directory exists.
-
-  if ! docker exec \
-      "$container" \
-      mkdir -p "$target_dir" \
-      >/dev/null 2>&1
-  then
-
+wait_container_running() {
+    local container="$1" deadline=$((SECONDS + CONTAINER_START_TIMEOUT_SECONDS))
+    while (( SECONDS < deadline )); do
+        container_is_running "$container" && return 0
+        sleep 2
+    done
     return 1
-  fi
-
-
-  # Remove any abandoned staging file from an earlier interrupted run.
-
-  docker exec \
-    "$container" \
-    rm -f "$staged" \
-    >/dev/null 2>&1 || true
-
-
-  # Copy to a staging location rather than immediately replacing the
-  # currently working DBRepair.sh.
-
-  if ! docker cp \
-      "$TMP_FILE" \
-      "$container:$staged" \
-      >/dev/null 2>&1
-  then
-
-    docker exec \
-      "$container" \
-      rm -f "$staged" \
-      >/dev/null 2>&1 || true
-
-    return 1
-  fi
-
-
-  if ! docker exec \
-      "$container" \
-      chmod +x "$staged" \
-      >/dev/null 2>&1
-  then
-
-    docker exec \
-      "$container" \
-      rm -f "$staged" \
-      >/dev/null 2>&1 || true
-
-    return 1
-  fi
-
-
-  # Replace DBRepair only after staging was successful.
-
-  if ! docker exec \
-      "$container" \
-      mv -f "$staged" "$target" \
-      >/dev/null 2>&1
-  then
-
-    docker exec \
-      "$container" \
-      rm -f "$staged" \
-      >/dev/null 2>&1 || true
-
-    return 1
-  fi
-
-
-  return 0
 }
 
+plex_process_running() {
+    local processes
+    processes="$(docker top "$1" -eo args 2>/dev/null || docker top "$1" 2>/dev/null)" || return 1
+    grep -Fq 'Plex Media Server' <<<"$processes"
+}
+
+wait_plex_process() {
+    local container="$1" deadline=$((SECONDS + PLEX_START_TIMEOUT_SECONDS))
+    while (( SECONDS < deadline )); do
+        plex_process_running "$container" && return 0
+        sleep 3
+    done
+    return 1
+}
+
+read_container_tool_version() {
+    local container="$1" path="$2" output
+    output="$(docker exec -u 0 -w "$DBREPAIR_INSTALL_DIR" \
+        "$container" "$path" --version 2>&1)" || return 1
+    printf '%s\n' "$output" | extract_version
+}
+
+install_or_resolve_dbrepair() {
+    local container="$1" container_arch current_version staged_version
+    local current_usable=0 staged_path="${DBREPAIR_PATH}.new"
+
+    RESULT_UPDATE["$container"]=""
+    docker exec -u 0 "$container" mkdir -p "$DBREPAIR_INSTALL_DIR" \
+        >/dev/null 2>&1 || {
+        RESULT_UPDATE["$container"]="Could not create $DBREPAIR_INSTALL_DIR"
+        return 1
+    }
+
+    current_version="$(read_container_tool_version "$container" "$DBREPAIR_PATH" || true)"
+    [[ -n "$current_version" ]] && current_usable=1
+
+    if (( DOWNLOAD_READY == 1 )); then
+        container_arch="$(docker exec -u 0 "$container" uname -m 2>/dev/null || true)"
+        container_arch="$(map_linux_arch "$container_arch" || true)"
+        if [[ "$container_arch" != "$HOST_PACKAGE_ARCH" ]]; then
+            RESULT_UPDATE["$container"]="Container architecture does not match the verified ${HOST_PACKAGE_ARCH} package"
+        elif [[ "$current_version" == "$LATEST_VERSION" ]]; then
+            RESULT_UPDATE["$container"]="DBRepair ${current_version} was already current"
+        elif docker cp "$STAGED_BINARY" "$container:$staged_path" >/dev/null 2>&1 &&
+             docker exec -u 0 "$container" chmod 0755 "$staged_path" >/dev/null 2>&1; then
+            staged_version="$(read_container_tool_version "$container" "$staged_path" || true)"
+            if [[ "$staged_version" == "$LATEST_VERSION" ]] &&
+               docker exec -u 0 "$container" sh -c '
+                   set -e
+                   target="$1"
+                   previous="$2"
+                   staged="$3"
+                   if [ -e "$target" ]; then cp -f "$target" "$previous"; fi
+                   mv -f "$staged" "$target"
+               ' sh "$DBREPAIR_PATH" "$DBREPAIR_PREVIOUS_PATH" "$staged_path" \
+               >/dev/null 2>&1; then
+                current_version="$staged_version"
+                current_usable=1
+                CONTAINERS_UPDATED=$((CONTAINERS_UPDATED + 1))
+                RESULT_UPDATE["$container"]="Installed verified DBRepair ${current_version}"
+                log INFO "[$container] Installed verified DBRepair ${current_version}"
+            else
+                docker exec -u 0 "$container" rm -f "$staged_path" >/dev/null 2>&1 || true
+                RESULT_UPDATE["$container"]="Verified release could not replace the existing executable; existing copy retained"
+            fi
+        else
+            docker exec -u 0 "$container" rm -f "$staged_path" >/dev/null 2>&1 || true
+            RESULT_UPDATE["$container"]="Verified release could not be copied into the container; existing copy retained"
+        fi
+    else
+        RESULT_UPDATE["$container"]="$UPDATE_DETAIL"
+    fi
+
+    case "${RESULT_UPDATE[$container]}" in
+        *"could not"*|*"does not match"*|*"retained"*)
+            warn "[$container] ${RESULT_UPDATE[$container]}"
+            RUN_HAS_ISSUE=1
+            GLOBAL_ISSUE_KEY+="${container}-update-fallback;"
+            raise_severity warning
+            ;;
+    esac
+
+    current_version="$(read_container_tool_version "$container" "$DBREPAIR_PATH" || true)"
+    if [[ -z "$current_version" ]]; then
+        RESULT_UPDATE["$container"]+="; no usable current DBRepair executable is installed"
+        return 1
+    fi
+    current_usable=1
+
+    docker exec -u 0 "$container" sh -c '
+        legacy="$1"
+        archive="$2"
+        if [ -f "$legacy" ]; then
+            if [ ! -e "$archive" ]; then
+                mv "$legacy" "$archive"
+            else
+                rm -f "$legacy"
+            fi
+        fi
+    ' sh "$LEGACY_DBREPAIR_PATH" "$LEGACY_DBREPAIR_ARCHIVE" \
+        >/dev/null 2>&1 || true
+
+    RESULT_VERSION["$container"]="$current_version"
+    (( current_usable == 1 ))
+}
+
+###############################################################################
+# OUTPUT CLASSIFICATION
+###############################################################################
+
+output_has() {
+    local file="$1" expression="$2"
+    grep -Eiq -- "$expression" "$file"
+}
+
+extract_notable_output() {
+    local file="$1"
+    sed -E $'s/\033\[[0-9;]*[[:alpha:]]//g' "$file" |
+        grep -Ei 'NOTICE|WARNING|ERROR|FAIL|damaged|unrecoverable|requires repair|ghost entr|NULL title|orphan|revert|rollback' |
+        sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' |
+        awk 'NF && !seen[$0]++ {print "- " $0; count++} count >= 8 {exit}' || true
+}
+
+classify_container_output() {
+    local container="$1" output_file="$2" rc="$3"
+    local main_ok=0 blobs_ok=0 damage=0 fts=0 bloat=0 ghost=0 orphan=0
+    local promoted=0 rebuilt=0 unrecoverable=0 reverted=0 notices=0 details=""
+
+    output_has "$output_file" 'Main([[:space:]]+Database|[[:space:]]+DB)[[:space:]]+is[[:space:]]+OK' && main_ok=1
+    output_has "$output_file" 'Blobs([[:space:]]+Database|[[:space:]]+DB)[[:space:]]+is[[:space:]]+OK' && blobs_ok=1
+    output_has "$output_file" 'damaged|malformed|corrupt|requires repair' && damage=1
+    output_has "$output_file" 'FTS.*(damaged|corrupt)|search index.*(damaged|corrupt)' && fts=1
+    output_has "$output_file" 'is[[:space:]]+bloated|database bloat|[1-9][0-9]*(\.[0-9]+)?% fragmented|requires.*(deflate|optimization)' && bloat=1
+    output_has "$output_file" 'ghost entr|NULL title' && ghost=1
+    output_has "$output_file" 'orphan|not connected to their parent' && orphan=1
+    output_has "$output_file" 'Swap complete|Live databases updated|Making DB.*active' && promoted=1
+    output_has "$output_file" 'rebuild and verification complete' && rebuilt=1
+    output_has "$output_file" 'unrecoverable|use .*Replace|cannot be repaired|unable to recover' && unrecoverable=1
+    output_has "$output_file" 'revert.*(complete|successful|prior)|restor.*prior.*database|rollback.*(complete|successful)' && reverted=1
+    output_has "$output_file" 'NOTICE|WARNING' && notices=1
+
+    details="$(extract_notable_output "$output_file")"
+    RESULT_DETAILS["$container"]="$details"
+    RESULT_RC["$container"]="$rc"
+
+    if (( unrecoverable == 1 )); then
+        RESULT_CLASS["$container"]="UNRECOVERABLE"
+        RESULT_FINDING["$container"]="DBRepair found database damage that automatic repair could not safely recover."
+        RESULT_ACTION["$container"]="No verified replacement was confirmed. Use DBRepair Replace with a verified Plex-generated backup."
+        RUN_HAS_ISSUE=1
+        raise_severity alert
+        return 0
+    fi
+
+    if (( rc != 0 )); then
+        RESULT_CLASS["$container"]="FAILED"
+        if (( rc == 124 )); then
+            RESULT_FINDING["$container"]="DBRepair did not finish within the configured maintenance timeout."
+        elif (( damage == 1 )); then
+            RESULT_FINDING["$container"]="DBRepair reported database damage and then exited unsuccessfully."
+        else
+            RESULT_FINDING["$container"]="DBRepair did not complete its automatic maintenance workflow."
+        fi
+        if (( promoted == 1 && reverted == 1 )); then
+            RESULT_ACTION["$container"]="Repaired databases were activated, then DBRepair reported restoring the prior databases. Review the detailed log."
+        elif (( promoted == 1 )); then
+            RESULT_ACTION["$container"]="Live database activation was reported before the failure; the final database state needs review."
+        else
+            RESULT_ACTION["$container"]="No live database replacement was reported. The wrapper restored Plex service where possible."
+        fi
+        RUN_HAS_ISSUE=1
+        raise_severity alert
+        return 0
+    fi
+
+    if (( promoted == 1 && rebuilt == 1 )); then
+        RESULT_CLASS["$container"]="REPAIRED"
+        RESULT_FINDING["$container"]="DBRepair found database maintenance or repair work was needed."
+        [[ $fts -eq 0 ]] || RESULT_FINDING["$container"]+=" Search-index damage was reported."
+        [[ $bloat -eq 0 ]] || RESULT_FINDING["$container"]+=" Fragmentation or database bloat was reported."
+        [[ $ghost -eq 0 ]] || RESULT_FINDING["$container"]+=" Ghost or invalid-title records were reported."
+        RESULT_ACTION["$container"]="Rebuilt the matched main and blobs databases, verified them, and activated the repaired copies."
+        RUN_HAS_REPAIR=1
+        CONTAINERS_REPAIRED=$((CONTAINERS_REPAIRED + 1))
+        if (( notices == 1 || orphan == 1 )); then
+            RESULT_CLASS["$container"]="NOTICE"
+            RESULT_ACTION["$container"]+=" DBRepair also reported an advisory that may need review."
+            RUN_HAS_ISSUE=1
+            raise_severity warning
+        fi
+        return 0
+    fi
+
+    if (( main_ok == 1 && blobs_ok == 1 && damage == 0 )); then
+        RESULT_CLASS["$container"]="HEALTHY"
+        RESULT_FINDING["$container"]="Both Plex databases passed DBRepair's checks."
+        RESULT_ACTION["$container"]="No database files were changed."
+        CONTAINERS_HEALTHY=$((CONTAINERS_HEALTHY + 1))
+        if (( notices == 1 || orphan == 1 )); then
+            RESULT_CLASS["$container"]="NOTICE"
+            RESULT_ACTION["$container"]+=" DBRepair reported an advisory that may need review."
+            RUN_HAS_ISSUE=1
+            raise_severity warning
+        fi
+        return 0
+    fi
+
+    if (( damage == 1 )); then
+        RESULT_CLASS["$container"]="WARNING"
+        RESULT_FINDING["$container"]="DBRepair reported a database problem but did not confirm activation of a verified repair."
+        RESULT_ACTION["$container"]="The live database replacement was not confirmed; review DBRepair.log before taking manual action."
+    else
+        RESULT_CLASS["$container"]="WARNING"
+        RESULT_FINDING["$container"]="DBRepair exited successfully, but its result could not be classified safely."
+        RESULT_ACTION["$container"]="No database change is being assumed; review the detailed output."
+    fi
+    RUN_HAS_ISSUE=1
+    raise_severity warning
+}
 
 ###############################################################################
 # CONTAINER PROCESSING
 ###############################################################################
 
-process_container() {
-  local container="$1"
-
-  local started_by_script=0
-
-  local found_path=""
-
-  local state=""
-
-  local rc=0
-
-  local p
-
-
-  log "INFO" "Processing container: $container"
-
-
-  # -------------------------------------------------------------------------
-  # Verify configured container exists
-  # -------------------------------------------------------------------------
-
-  if ! docker inspect "$container" >/dev/null 2>&1; then
-
-    error "Configured container not found: $container"
-
-    ((CONTAINERS_SKIPPED+=1))
-
-    ((CONTAINERS_FAILED+=1))
-
-    return 1
-  fi
-
-
-  ((CONTAINERS_PROCESSED+=1))
-
-
-  # -------------------------------------------------------------------------
-  # Determine original container state
-  # -------------------------------------------------------------------------
-
-  state="$(
-    docker inspect \
-      -f '{{.State.Running}}' \
-      "$container" \
-      2>/dev/null || printf 'false'
-  )"
-
-
-  # -------------------------------------------------------------------------
-  # Temporarily start container when required
-  # -------------------------------------------------------------------------
-
-  if [[ "$state" != "true" ]]; then
-
-    log "INFO" "Container is stopped; starting temporarily: $container"
-
-
-    if ! docker start "$container" >/dev/null 2>&1; then
-
-      error "Failed to start container: $container"
-
-      ((CONTAINERS_FAILED+=1))
-
-      return 1
-    fi
-
-
-    started_by_script=1
-
-    ((CONTAINERS_TEMP_STARTED+=1))
-
-
-    sleep 3
-
-
-    state="$(
-      docker inspect \
-        -f '{{.State.Running}}' \
-        "$container" \
-        2>/dev/null || printf 'false'
-    )"
-
-
-    if [[ "$state" != "true" ]]; then
-
-      error "Container did not reach running state after start: $container"
-
-      ((CONTAINERS_FAILED+=1))
-
-      return 1
-    fi
-
-  fi
-
-
-  # -------------------------------------------------------------------------
-  # Install freshly downloaded DBRepair
-  # -------------------------------------------------------------------------
-
-  if (( DOWNLOAD_READY == 1 )); then
-
-    if install_downloaded_dbrepair "$container"; then
-
-      ((CONTAINERS_UPDATED+=1))
-
-      log "INFO" "Updated DBRepair inside container: $container"
-
-    else
-
-      warn "Unable to update DBRepair inside $container; attempting existing copy instead."
-
-    fi
-
-  fi
-
-
-  # -------------------------------------------------------------------------
-  # Locate usable DBRepair script
-  # -------------------------------------------------------------------------
-
-  for p in "${REPAIR_PATHS[@]}"; do
-
-    if docker exec \
-        "$container" \
-        test -s "$p" \
-        >/dev/null 2>&1
-    then
-
-      found_path="$p"
-
-      break
-    fi
-
-  done
-
-
-  # -------------------------------------------------------------------------
-  # Execute DBRepair
-  # -------------------------------------------------------------------------
-
-  if [[ -z "$found_path" ]]; then
-
-    error "DBRepair script not found inside container: $container"
-
-    rc=1
-
-  else
-
-    log "INFO" \
-      "Executing DBRepair in $container: $found_path ${DBREPAIR_ARGS[*]}"
-
-
-    log "INFO" \
-      "----- DBRepair output begin: $container -----"
-
-
-    docker exec -i \
-      "$container" \
-      bash "$found_path" "${DBREPAIR_ARGS[@]}" \
-      2>&1 | tee -a "$LOG_FILE"
-
-
-    rc=${PIPESTATUS[0]}
-
-
-    log "INFO" \
-      "----- DBRepair output end: $container -----"
-
-
-    if (( rc == 0 )); then
-
-      log "INFO" \
-        "DBRepair completed successfully for: $container"
-
-    else
-
-      error \
-        "DBRepair returned exit code $rc for: $container"
-
-    fi
-
-  fi
-
-
-  # -------------------------------------------------------------------------
-  # Restore original container state
-  #
-  # A container which was stopped before this wrapper ran should remain
-  # stopped after DBRepair completes.
-  # -------------------------------------------------------------------------
-
-  if (( started_by_script == 1 )); then
-
-    log "INFO" \
-      "Restoring original container state; stopping: $container"
-
-
-    if ! docker stop \
-        "$container" \
-        >/dev/null 2>&1
-    then
-
-      error \
-        "Failed to restore stopped state for container: $container"
-
-      rc=1
-
-    fi
-
-  fi
-
-
-  # -------------------------------------------------------------------------
-  # Container result
-  # -------------------------------------------------------------------------
-
-  if (( rc == 0 )); then
-
-    ((CONTAINERS_SUCCESSFUL+=1))
-
-    return 0
-  fi
-
-
-  ((CONTAINERS_FAILED+=1))
-
-  return 1
+execute_dbrepair() {
+    local container="$1" output_file="$2"
+    timeout --signal=TERM --kill-after=60 "$DBREPAIR_TIMEOUT_SECONDS" \
+        docker exec -u 0 -i -w "$DBREPAIR_INSTALL_DIR" \
+        "$container" "$DBREPAIR_PATH" "${DBREPAIR_ARGS[@]}" \
+        2>&1 | tee -a "$LOG_FILE" "$output_file"
+    return "${PIPESTATUS[0]}"
 }
 
+restore_container_state() {
+    local container="$1" originally_running="$2" class
+    class="${RESULT_CLASS[$container]:-FAILED}"
+
+    if [[ "$originally_running" == false ]]; then
+        if container_is_running "$container"; then
+            log INFO "[$container] Restoring original stopped container state"
+            if ! docker stop -t 30 "$container" >/dev/null 2>&1 ||
+               container_is_running "$container"; then
+                RESULT_FINAL_STATE["$container"]="Failed to restore the container's original stopped state."
+                RESULT_CLASS["$container"]="FAILED"
+                RUN_HAS_ISSUE=1
+                raise_severity alert
+                return 1
+            fi
+        fi
+        RESULT_FINAL_STATE["$container"]="Container restored to its original stopped state."
+        return 0
+    fi
+
+    if ! container_is_running "$container"; then
+        warn "[$container] Container stopped unexpectedly; attempting recovery start"
+        if docker start "$container" >/dev/null 2>&1 &&
+           wait_container_running "$container"; then
+            CONTAINERS_RECOVERED=$((CONTAINERS_RECOVERED + 1))
+            RESULT_ACTION["$container"]+=" The wrapper restarted the stopped Docker container."
+        else
+            RESULT_FINAL_STATE["$container"]="Container is stopped and automatic recovery failed."
+            RESULT_CLASS["$container"]="FAILED"
+            RUN_HAS_ISSUE=1
+            raise_severity alert
+            return 1
+        fi
+    fi
+
+    if wait_plex_process "$container"; then
+        RESULT_FINAL_STATE["$container"]="Docker container is running and the Plex Media Server process is present."
+        return 0
+    fi
+
+    warn "[$container] Plex process was not detected; restarting the Docker container once"
+    if docker restart -t 30 "$container" >/dev/null 2>&1 &&
+       wait_container_running "$container" &&
+       wait_plex_process "$container"; then
+        CONTAINERS_RECOVERED=$((CONTAINERS_RECOVERED + 1))
+        RESULT_ACTION["$container"]+=" The wrapper restarted the Docker container to restore Plex service."
+        RESULT_FINAL_STATE["$container"]="Plex service was recovered and is running after a container restart."
+        [[ "$class" == HEALTHY || "$class" == REPAIRED ]] && \
+            RESULT_CLASS["$container"]="NOTICE"
+        RUN_HAS_ISSUE=1
+        raise_severity warning
+        return 0
+    fi
+
+    RESULT_FINAL_STATE["$container"]="Docker is running, but the Plex Media Server process could not be confirmed after recovery."
+    RESULT_CLASS["$container"]="FAILED"
+    RUN_HAS_ISSUE=1
+    raise_severity alert
+    return 1
+}
+
+process_container() {
+    local container="$1" originally_running=false output_file rc=1
+    local safe_container
+
+    RESULT_ORDER+=("$container")
+    RESULT_CLASS["$container"]="FAILED"
+    RESULT_FINDING["$container"]="Container processing did not complete."
+    RESULT_ACTION["$container"]="No database action was confirmed."
+    RESULT_FINAL_STATE["$container"]="Not checked."
+    RESULT_VERSION["$container"]="unknown"
+    RESULT_RC["$container"]="not-run"
+    RESULT_DETAILS["$container"]=""
+    RESULT_UPDATE["$container"]=""
+
+    log INFO "[$container] Starting DBRepair workflow"
+    if ! container_exists "$container"; then
+        RESULT_FINDING["$container"]="The configured Plex Docker container does not exist."
+        RESULT_ACTION["$container"]="No database work was attempted. Correct the container name."
+        RESULT_FINAL_STATE["$container"]="Container not found."
+        CONTAINERS_FAILED=$((CONTAINERS_FAILED + 1))
+        RUN_HAS_ISSUE=1
+        raise_severity alert
+        error "[$container] Configured container was not found"
+        return 1
+    fi
+    CONTAINERS_PROCESSED=$((CONTAINERS_PROCESSED + 1))
+
+    container_is_running "$container" && originally_running=true
+    if [[ "$originally_running" == false ]]; then
+        log INFO "[$container] Container was stopped; starting it temporarily"
+        if ! docker start "$container" >/dev/null 2>&1 ||
+           ! wait_container_running "$container" ||
+           ! wait_plex_process "$container"; then
+            RESULT_FINDING["$container"]="The stopped Plex container could not be prepared for maintenance."
+            RESULT_ACTION["$container"]="Database maintenance was not started."
+            RESULT_FINAL_STATE["$container"]="Container could not reach a usable running state."
+            docker stop -t 30 "$container" >/dev/null 2>&1 || true
+            CONTAINERS_FAILED=$((CONTAINERS_FAILED + 1))
+            RUN_HAS_ISSUE=1
+            raise_severity alert
+            error "[$container] Could not start Plex temporarily"
+            return 1
+        fi
+        CONTAINERS_TEMP_STARTED=$((CONTAINERS_TEMP_STARTED + 1))
+    fi
+
+    if ! install_or_resolve_dbrepair "$container"; then
+        RESULT_FINDING["$container"]="No validated current DBRepair executable is available in the container."
+        RESULT_ACTION["$container"]="The obsolete DBRepair.sh was not used and no database work was attempted."
+        RESULT_FINAL_STATE["$container"]="Container state restoration is being attempted."
+        restore_container_state "$container" "$originally_running" || true
+        CONTAINERS_FAILED=$((CONTAINERS_FAILED + 1))
+        RUN_HAS_ISSUE=1
+        raise_severity alert
+        error "[$container] No usable current DBRepair executable"
+        return 1
+    fi
+
+    safe_container="$(safe_name "$container")"
+    output_file="${RUNTIME_DIR}/${safe_container}.output.log"
+    : >"$output_file"
+    log INFO "[$container] Running DBRepair ${RESULT_VERSION[$container]}: ${DBREPAIR_ARGS[*]}"
+    execute_dbrepair "$container" "$output_file"
+    rc=$?
+    classify_container_output "$container" "$output_file" "$rc"
+    if (( rc == 124 )); then
+        warn "[$container] DBRepair timed out; restarting the Docker container to terminate the maintenance process safely"
+        if docker restart -t 30 "$container" >/dev/null 2>&1 &&
+           wait_container_running "$container"; then
+            CONTAINERS_RECOVERED=$((CONTAINERS_RECOVERED + 1))
+            RESULT_ACTION["$container"]+=" The wrapper restarted the Docker container to stop the timed-out process and recover Plex service."
+        else
+            RESULT_ACTION["$container"]+=" The wrapper could not restart the Docker container after the timeout."
+        fi
+    fi
+    restore_container_state "$container" "$originally_running" || true
+
+    case "${RESULT_CLASS[$container]}" in
+        FAILED|UNRECOVERABLE)
+            CONTAINERS_FAILED=$((CONTAINERS_FAILED + 1))
+            error "[$container] Completed with ${RESULT_CLASS[$container]} (exit $rc)"
+            return 1
+            ;;
+        *)
+            CONTAINERS_SUCCESSFUL=$((CONTAINERS_SUCCESSFUL + 1))
+            log INFO "[$container] Completed with ${RESULT_CLASS[$container]} (exit $rc)"
+            return 0
+            ;;
+    esac
+}
+
+###############################################################################
+# RUN REPORT AND NOTIFICATIONS
+###############################################################################
+
+build_summary_text() {
+    local include_report_path="${1:-true}" container details text=""
+
+    text+="Tool update: ${UPDATE_DETAIL}"$'\n'
+    text+="Containers: ${#CONTAINERS[@]} configured; ${CONTAINERS_SUCCESSFUL} successful; ${CONTAINERS_FAILED} failed; ${CONTAINERS_REPAIRED} repaired; ${CONTAINERS_HEALTHY} healthy."$'\n\n'
+    for container in "${RESULT_ORDER[@]}"; do
+        text+="[${container}] ${RESULT_CLASS[$container]}"$'\n'
+        text+="What was found: ${RESULT_FINDING[$container]}"$'\n'
+        text+="What was done: ${RESULT_ACTION[$container]}"$'\n'
+        text+="Final state: ${RESULT_FINAL_STATE[$container]}"$'\n'
+        text+="DBRepair version: ${RESULT_VERSION[$container]}; exit: ${RESULT_RC[$container]}"$'\n'
+        text+="Update: ${RESULT_UPDATE[$container]}"$'\n'
+        details="${RESULT_DETAILS[$container]}"
+        if [[ -n "$details" ]]; then
+            text+="Notable DBRepair messages:"$'\n'"${details}"$'\n'
+        fi
+        text+="DBRepair log in container: ${DBREPAIR_INSTALL_DIR}/DBRepair.log"$'\n\n'
+    done
+    text+="Wrapper log: ${LOG_FILE}"$'\n'
+    if [[ "$include_report_path" == true && -n "$RUN_REPORT_FILE" ]]; then
+        text+="Run report: ${RUN_REPORT_FILE}"$'\n'
+    fi
+    printf '%s' "$text"
+}
+
+write_run_report() {
+    local tmp
+    mkdir -p -- "$REPORT_DIR" || return 1
+    RUN_REPORT_FILE="${REPORT_DIR}/dbrepair-${RUN_STAMP}.txt"
+    tmp="$(mktemp "${REPORT_DIR}/.dbrepair-report.XXXXXX")" || return 1
+    {
+        printf 'Plex DBRepair run report\n'
+        printf 'Started epoch: %s\n' "$START_EPOCH"
+        printf 'Finished: %s\n' "$(timestamp)"
+        printf 'Wrapper version: %s\n' "$VERSION"
+        printf 'Duration: %s\n\n' "$(human_duration "$(($(date +%s) - START_EPOCH))")"
+        build_summary_text false
+    } >"$tmp" || {
+        rm -f -- "$tmp"
+        return 1
+    }
+    mv -f -- "$tmp" "$RUN_REPORT_FILE"
+}
+
+initialize_notification_state() {
+    local tmp
+    if [[ -f "$NOTIFICATION_STATE_FILE" ]] &&
+       jq -e 'type == "object" and ((.attention // {}) | type == "object")' \
+       "$NOTIFICATION_STATE_FILE" >/dev/null 2>&1; then
+        return 0
+    fi
+    tmp="$(mktemp "${LOG_DIR}/.notification-state.XXXXXX")" || return 1
+    printf '%s\n' '{"version":1,"attention":{}}' >"$tmp" || return 1
+    mv -f -- "$tmp" "$NOTIFICATION_STATE_FILE"
+}
+
+issue_signature_text() {
+    local container text=""
+    text+="$GLOBAL_ISSUE_KEY"
+    [[ "$UPDATE_STATE" == verified-latest ]] || text+="update:${UPDATE_STATE};"
+    for container in "${RESULT_ORDER[@]}"; do
+        case "${RESULT_CLASS[$container]}" in
+            HEALTHY|REPAIRED) ;;
+            *) text+="${container}:${RESULT_CLASS[$container]}:${RESULT_RC[$container]};" ;;
+        esac
+    done
+    printf '%s' "$text"
+}
+
+save_attention_state() {
+    local signature="$1" severity="$2" notified_epoch="$3"
+    local now tmp previous_raised previous_signature
+    now="$(date +%s)"
+    previous_signature="$(jq -r '.attention.signature // ""' "$NOTIFICATION_STATE_FILE")"
+    previous_raised="$(jq -r '.attention.raisedEpoch // 0' "$NOTIFICATION_STATE_FILE")"
+    [[ "$previous_raised" =~ ^[0-9]+$ ]] || previous_raised=0
+    [[ "$previous_signature" == "$signature" ]] || previous_raised=0
+    (( previous_raised > 0 )) || previous_raised="$now"
+    tmp="$(mktemp "${LOG_DIR}/.notification-state.XXXXXX")" || return 1
+    jq \
+        --arg signature "$signature" \
+        --arg severity "$severity" \
+        --argjson raised "$previous_raised" \
+        --argjson seen "$now" \
+        --argjson notified "$notified_epoch" '
+        .version = 1
+        | .attention = {
+            signature: $signature,
+            severity: $severity,
+            raisedEpoch: $raised,
+            lastSeenEpoch: $seen,
+            lastNotifiedEpoch: $notified
+          }
+    ' "$NOTIFICATION_STATE_FILE" >"$tmp" || {
+        rm -f -- "$tmp"
+        return 1
+    }
+    mv -f -- "$tmp" "$NOTIFICATION_STATE_FILE"
+}
+
+clear_attention_state() {
+    local tmp
+    tmp="$(mktemp "${LOG_DIR}/.notification-state.XXXXXX")" || return 1
+    jq '.version = 1 | .attention = {}' "$NOTIFICATION_STATE_FILE" >"$tmp" || {
+        rm -f -- "$tmp"
+        return 1
+    }
+    mv -f -- "$tmp" "$NOTIFICATION_STATE_FILE"
+}
+
+update_notifications() {
+    local signature_text signature="" previous_signature previous_severity
+    local last_notified=0 now description body should_notify=0 previous_active=0
+    now="$(date +%s)"
+    signature_text="$(issue_signature_text)"
+    [[ -z "$signature_text" ]] || \
+        signature="$(printf '%s' "$signature_text" | sha256sum | awk '{print $1}')"
+    previous_signature="$(jq -r '.attention.signature // ""' "$NOTIFICATION_STATE_FILE")"
+    previous_severity="$(jq -r '.attention.severity // ""' "$NOTIFICATION_STATE_FILE")"
+    last_notified="$(jq -r '.attention.lastNotifiedEpoch // 0' "$NOTIFICATION_STATE_FILE")"
+    [[ "$last_notified" =~ ^[0-9]+$ ]] || last_notified=0
+    [[ -n "$previous_signature" ]] && previous_active=1
+
+    if [[ -n "$signature" ]]; then
+        if [[ "$signature" != "$previous_signature" ||
+              "$RUN_HIGHEST_SEVERITY" != "$previous_severity" ]] ||
+           (( now - last_notified >= NOTIFICATION_REMINDER_DAYS * 86400 )) ||
+           (( RUN_HAS_REPAIR == 1 )); then
+            should_notify=1
+        fi
+        if (( should_notify == 1 )); then
+            case "$RUN_HIGHEST_SEVERITY" in
+                alert) description="Database maintenance requires action" ;;
+                *) description="Database maintenance completed with a warning" ;;
+            esac
+            body="$(build_summary_text true)"
+            notify_unraid "$RUN_HIGHEST_SEVERITY" "$description" "$body" || true
+            if ! save_attention_state "$signature" "$RUN_HIGHEST_SEVERITY" "$now"; then
+                error "DBRepair notification state could not be saved"
+                NOTIFICATION_FAILED=1
+            fi
+        else
+            log INFO "Unchanged DBRepair warning notification suppressed until reminder interval"
+            if ! save_attention_state "$signature" "$RUN_HIGHEST_SEVERITY" "$last_notified"; then
+                error "DBRepair notification state could not be saved"
+                NOTIFICATION_FAILED=1
+            fi
+        fi
+        return 0
+    fi
+
+    if (( RUN_HAS_REPAIR == 1 )); then
+        body="$(build_summary_text true)"
+        notify_unraid normal "Database repair completed successfully" "$body" || true
+    elif (( previous_active == 1 )); then
+        body="All previously reported Plex DBRepair issues are resolved."$'\n\n'"$(build_summary_text true)"
+        notify_unraid normal "Database maintenance healthy" "$body" || true
+    else
+        log INFO "All Plex databases were healthy; routine notification suppressed"
+    fi
+    if ! clear_attention_state; then
+        error "DBRepair notification state could not be cleared"
+        NOTIFICATION_FAILED=1
+    fi
+}
 
 ###############################################################################
 # MAIN
 ###############################################################################
 
 main() {
-  umask 022
+    local container final_status="OK" final_summary
+    umask 022
+    trap cleanup EXIT
 
+    if ! mkdir -p -- "$LOG_DIR"; then
+        printf '%s [ERROR] [DBREPAIR] Unable to create log directory: %s\n' \
+            "$(timestamp)" "$LOG_DIR" >&2
+        return 1
+    fi
+    rotate_log
+    touch "$LOG_FILE" || return 1
 
-  # -------------------------------------------------------------------------
-  # Prepare logging
-  # -------------------------------------------------------------------------
+    if ! require_commands; then
+        notify_unraid alert "DBRepair wrapper cannot start" \
+            "One or more required Unraid commands are unavailable. Log: $LOG_FILE" || true
+        write_status_receipt FAILED "Required command validation failed"
+        return 1
+    fi
+    if ! validate_configuration; then
+        notify_unraid alert "DBRepair wrapper cannot start" \
+            "Configuration validation or the Unraid Docker service failed. Log: $LOG_FILE" || true
+        write_status_receipt FAILED "Configuration or Docker validation failed"
+        return 1
+    fi
+    acquire_lock || return 0
 
-  if ! mkdir -p "$LOG_DIR" 2>/dev/null; then
+    RUNTIME_DIR="$(mktemp -d /tmp/plex_dbrepair.XXXXXX)" || return 1
+    cleanup_legacy_logs
+    prune_reports || warn "Old DBRepair reports could not be pruned"
+    initialize_notification_state || {
+        error "Notification state could not be initialized"
+        notify_unraid alert "DBRepair wrapper cannot start" \
+            "Notification state could not be initialized. Log: $LOG_FILE" || true
+        return 1
+    }
 
-    printf '%s [ERROR] [DBREPAIR] Unable to create log directory: %s\n' \
-      "$(timestamp)" \
-      "$LOG_DIR" \
-      >&2
+    log INFO "===== Plex DBRepair Scheduler START v${VERSION} ====="
+    log INFO "Configured containers: ${CONTAINERS[*]}"
+    prepare_latest_release || release_fallback "Unexpected release preparation failure"
 
-    return 1
-  fi
+    for container in "${CONTAINERS[@]}"; do
+        process_container "$container" || true
+    done
 
+    if ! write_run_report; then
+        error "Structured DBRepair run report could not be written"
+        RUN_REPORT_FILE=""
+        RUN_HAS_ISSUE=1
+        GLOBAL_ISSUE_KEY+="report-write-failed;"
+        raise_severity alert
+    fi
+    update_notifications || true
 
-  # -------------------------------------------------------------------------
-  # Prevent overlapping scheduled runs
-  # -------------------------------------------------------------------------
-
-  acquire_lock
-
-
-  # -------------------------------------------------------------------------
-  # Log maintenance
-  #
-  # Run before writing this execution's normal log entries.
-  # -------------------------------------------------------------------------
-
-  rotate_log
-
-  cleanup_legacy_logs
-
-
-  # -------------------------------------------------------------------------
-  # Start
-  # -------------------------------------------------------------------------
-
-  log "INFO" \
-    "===== Plex DBRepair Scheduler START ====="
-
-
-  log "INFO" \
-    "Version: v${VERSION}"
-
-
-  log "INFO" \
-    "Configured containers: ${CONTAINERS[*]}"
-
-
-  if (( LEGACY_LOGS_REMOVED > 0 )); then
-
-    log "INFO" \
-      "Removed ${LEGACY_LOGS_REMOVED} legacy timestamp log file(s)."
-
-  fi
-
-
-  # -------------------------------------------------------------------------
-  # Validation
-  # -------------------------------------------------------------------------
-
-  require_commands
-
-  validate_environment
-
-
-  # -------------------------------------------------------------------------
-  # Obtain latest DBRepair
-  # -------------------------------------------------------------------------
-
-  download_latest_dbrepair
-
-
-  # -------------------------------------------------------------------------
-  # Process Plex containers
-  # -------------------------------------------------------------------------
-
-  local container
-
-  for container in "${CONTAINERS[@]}"; do
-
-    process_container "$container" || true
-
-  done
-
-
-  # -------------------------------------------------------------------------
-  # Summary
-  # -------------------------------------------------------------------------
-
-  local download_state="fallback-existing"
-
-
-  if (( DOWNLOAD_READY == 1 )); then
-
-    download_state="validated-latest"
-
-  fi
-
-
-  log "INFO" \
-    "Run summary: configured=${#CONTAINERS[@]} processed=${CONTAINERS_PROCESSED} successful=${CONTAINERS_SUCCESSFUL} failed=${CONTAINERS_FAILED} skipped=${CONTAINERS_SKIPPED} temporarily_started=${CONTAINERS_TEMP_STARTED} updated=${CONTAINERS_UPDATED} download=${download_state} warnings=${WARNING_COUNT} errors=${ERROR_COUNT}"
-
-
-  # -------------------------------------------------------------------------
-  # Final result
-  # -------------------------------------------------------------------------
-
-  if (( CONTAINERS_FAILED > 0 || ERROR_COUNT > 0 )); then
-
-    log "ERROR" \
-      "===== Plex DBRepair Scheduler COMPLETE WITH ERRORS ====="
-
-    return 1
-  fi
-
-
-  if (( WARNING_COUNT > 0 )); then
-
-    log "WARN" \
-      "===== Plex DBRepair Scheduler COMPLETE WITH WARNINGS ====="
-
-    return 0
-  fi
-
-
-  log "INFO" \
-    "===== Plex DBRepair Scheduler COMPLETE ====="
-
-
-  return 0
+    final_summary="processed=${CONTAINERS_PROCESSED} successful=${CONTAINERS_SUCCESSFUL} failed=${CONTAINERS_FAILED} repaired=${CONTAINERS_REPAIRED} healthy=${CONTAINERS_HEALTHY} updated=${CONTAINERS_UPDATED} temporarily_started=${CONTAINERS_TEMP_STARTED} recovered=${CONTAINERS_RECOVERED} warnings=${WARNING_COUNT} errors=${ERROR_COUNT}"
+    if (( CONTAINERS_FAILED > 0 || ERROR_COUNT > 0 || NOTIFICATION_FAILED > 0 )); then
+        final_status="FAILED"
+        log ERROR "Run summary: $final_summary"
+        log ERROR "===== Plex DBRepair Scheduler COMPLETE WITH ERRORS ====="
+        write_status_receipt "$final_status" "$final_summary"
+        return 1
+    fi
+    if (( RUN_HAS_ISSUE > 0 || WARNING_COUNT > 0 )); then
+        final_status="WARNING"
+        log WARN "Run summary: $final_summary"
+        log WARN "===== Plex DBRepair Scheduler COMPLETE WITH WARNINGS ====="
+    else
+        log INFO "Run summary: $final_summary"
+        log INFO "===== Plex DBRepair Scheduler COMPLETE ====="
+    fi
+    write_status_receipt "$final_status" "$final_summary"
 }
 
-
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
