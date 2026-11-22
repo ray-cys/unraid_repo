@@ -80,7 +80,7 @@ PROBE_ADDRESS_OVERRIDES=(
 # Optional per-container files: NAME.headers (curl header-file syntax) and
 # NAME.cookies (Netscape cookie jar). Credentials are never printed or placed
 # on curl's command line. Supply qBittorrent auth for its protected API.
-PROBE_AUTH_DIR="/mnt/vault/cloud/logs/docker_service_watchdog/probe-auth"
+PROBE_AUTH_DIR="/mnt/vault/cloud/logs/script/docker_service_watchdog/probe-auth"
 PROBE_MAX_BYTES=65536
 PROBE_UI_MAX_BYTES=1048576 # Bounded web UI recognition needs more than API JSON.
 PROBE_MAX_REDIRECTS=3     # Same-origin redirects for UI recognition only.
@@ -94,7 +94,7 @@ UPTIME_FILE="/proc/uptime"
 VAULT_MOUNT="/mnt/vault"
 STATE_DIR="/mnt/vault/cloud/logs/docker_service_watchdog"
 STATE_FILE="$STATE_DIR/state.json"
-STATUS_DIR="/mnt/vault/cloud/logs/user_scripts_status"
+STATUS_DIR="/mnt/vault/cloud/logs/script/user_scripts_status"
 LOG_FILE="$STATE_DIR/docker-service-watchdog.log"
 LOG_MAX_BYTES=$((1024 * 1024))
 LOCK_FILE="/run/docker_service_watchdog.lock"
