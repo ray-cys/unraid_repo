@@ -77,7 +77,8 @@ jq -e '(.outbox|length)==1' "$OPS_NOTIFICATION_STATE" >/dev/null
 ops_notify alert 'Fixture failure' 'Preserved download' 'Import proof failed; payload untouched.'
 jq 'del(.lastSentAt)' "$OPS_NOTIFICATION_STATE" >"$TMP_DIR/notify-reset.json"; command mv "$TMP_DIR/notify-reset.json" "$OPS_NOTIFICATION_STATE"
 ops_flush_notifications
-tail -n 4 "$fixture/notifications.txt" | grep -q 'Import proof failed' || fail 'urgent report was not prioritized'
+grep -q 'Import proof failed' "$fixture/notifications.txt" || fail 'urgent report was omitted'
+jq -e '(.outbox|length)==0' "$OPS_NOTIFICATION_STATE" >/dev/null || fail 'short reports were not packed together'
 )
 (
 source "$repo/user_script/arr_delete_sync_tag.sh"

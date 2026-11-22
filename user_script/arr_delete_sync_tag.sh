@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Sonarr + Radarr - Plex Delete Sync and Tagger v2.2.0
+# Sonarr + Radarr - Plex Delete Sync and Tagger v2.3.0
 #
 # Once-daily, persistent-state deletion confirmation for Sonarr and Radarr.
 # Sonarr unmonitors confirmed deleted episodes/seasons and can retire a fully
@@ -15,7 +15,7 @@ umask 077
 # Release version for logs, notifications, and the HTTP User-Agent. State-file
 # version fields below are independent schema versions and must not be changed
 # merely when this release version changes.
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.3.0"
 
 ###############################################################################
 # CONFIGURATION
@@ -198,6 +198,9 @@ LOG_RUNAWAY_MULTIPLIER=4           # Discard an inherited active log above 4x th
 HTTP_CONNECT_TIMEOUT=10
 HTTP_MAX_TIME=90
 HTTP_RETRIES=2
+# Retry read-back only; a failed or delayed mutation is never blindly replayed.
+API_VERIFY_ATTEMPTS=3
+API_VERIFY_DELAY_SECONDS=1
 USER_AGENT="Arr-Delete-Sync-Tag/$SCRIPT_VERSION"
 
 ###############################################################################
@@ -217,6 +220,7 @@ ARR_URL=""
 ARR_API_KEY=""
 ARR_TEMP_PREFIX=""
 ARR_USER_AGENT=""
+VERIFY_RUNTIME_DIR=""
 QUARANTINE_RUN_ID=""
 NOTIFICATION_BATCH=""
 LOG_READY=false
@@ -321,34 +325,31 @@ strip_notification_emoji() {
 
 initialize_grouped_notifications() {
     local next invalid_backup
-
-    [[ -s "$PENDING_ACTIONS_FILE" ]] || printf '%s\n' '{"version":1,"actions":{}}' >"$PENDING_ACTIONS_FILE"
-    jq -e '.version==1 and (.actions|type)=="object"' "$PENDING_ACTIONS_FILE" >/dev/null || return 1
-    [[ "$SEND_GROUPED_NOTIFICATIONS" == true ]] || return 0
-
-    if [[ -f "$NOTIFICATION_STATE_FILE" ]] &&
-       ! jq -e 'type == "object" and ((.attention // {}) | type == "object")' \
-            "$NOTIFICATION_STATE_FILE" >/dev/null 2>&1; then
-        invalid_backup="${NOTIFICATION_STATE_FILE}.invalid.$(date '+%Y%m%d_%H%M%S')"
-        cp -f -- "$NOTIFICATION_STATE_FILE" "$invalid_backup" 2>/dev/null || true
-        log WARNING "Invalid grouped-notification state was archived and will be rebuilt: $invalid_backup"
-        rm -f -- "$NOTIFICATION_STATE_FILE"
+    INITIALIZATION_FAILURE_REASON=""
+    if [[ "$SEND_GROUPED_NOTIFICATIONS" == true ]]; then
+        if [[ -f "$NOTIFICATION_STATE_FILE" ]] && ! jq -e 'type=="object" and ((.attention // {})|type)=="object"' "$NOTIFICATION_STATE_FILE" >/dev/null 2>&1; then
+            invalid_backup="${NOTIFICATION_STATE_FILE}.invalid.$(date '+%Y%m%d_%H%M%S')"
+            cp -f -- "$NOTIFICATION_STATE_FILE" "$invalid_backup" || return 1
+            log WARNING "Invalid notification suppression state preserved at $invalid_backup; durable pending events retained."
+            rm -f -- "$NOTIFICATION_STATE_FILE" || return 1
+        fi
+        if [[ ! -e "$NOTIFICATION_STATE_FILE" ]]; then
+            next=$(mktemp "$RUNTIME_DIR/.notification-state.XXXXXX") || return 1
+            printf '%s\n' '{"version":1,"attention":{},"lastSentAt":null}' >"$next" && mv -f -- "$next" "$NOTIFICATION_STATE_FILE" || return 1
+        fi
+        NOTIFICATION_BATCH="$PENDING_NOTIFICATIONS_FILE"
+        : >>"$NOTIFICATION_BATCH" || return 1
     fi
-
-    if [[ ! -f "$NOTIFICATION_STATE_FILE" ]]; then
-        next="$(mktemp "$RUNTIME_DIR/.notification-state.XXXXXX")" || return 1
-        printf '%s\n' '{"version":1,"attention":{},"lastSentAt":null}' > "$next" || {
-            rm -f -- "$next"
-            return 1
-        }
-        mv -f -- "$next" "$NOTIFICATION_STATE_FILE" || return 1
+    # Existing empty/corrupt action journals are never interpreted as no work.
+    # Initialize the outbox first so a journal failure can still be reported.
+    if [[ ! -e "$PENDING_ACTIONS_FILE" ]]; then
+        next=$(mktemp "$RUNTIME_DIR/.pending-actions.XXXXXX") || return 1
+        printf '%s\n' '{"version":1,"actions":{}}' >"$next" && ops_publish_checkpoint "$next" "$PENDING_ACTIONS_FILE" || return 1
     fi
-
-    # A durable outbox survives crashes and carries items omitted by the email cap.
-    NOTIFICATION_BATCH="$PENDING_NOTIFICATIONS_FILE"
-    : >> "$NOTIFICATION_BATCH"
-    [[ -s "$PENDING_ACTIONS_FILE" ]] || printf '%s\n' '{"version":1,"actions":{}}' >"$PENDING_ACTIONS_FILE"
-    jq -e '.version==1 and (.actions|type)=="object"' "$PENDING_ACTIONS_FILE" >/dev/null || return 1
+    if ! jq -e '.version==1 and (.actions|type)=="object"' "$PENDING_ACTIONS_FILE" >/dev/null; then
+        INITIALIZATION_FAILURE_REASON="Action journal is invalid: $PENDING_ACTIONS_FILE. Existing records were preserved; no Arr or sidecar mutations were attempted."
+        return 1
+    fi
     if [[ -s "$ACTION_RECEIPTS_FILE" ]]; then
         local receipts_tmp="$RUNTIME_DIR/.action-receipts.$$"
         jq -c --argjson cutoff "$(( $(date +%s)-ACTION_RECEIPT_RETENTION_DAYS*86400 ))" \
@@ -379,7 +380,7 @@ append_notification_record() {
         --arg run "$RUN_ID" --arg queuedAt "$(date -Iseconds)" \
         --argjson chunk "$NOTIFICATION_ITEM_MAX_CHARS" \
         'range(0;([$detail|length,1]|max);$chunk) as $offset | {
-            runId:$run,queuedAt:$queuedAt,
+            runId:$run,queuedAt:$queuedAt,chunkOffset:$offset,
             event: $event,
             severity: $severity,
             app: $app,
@@ -437,6 +438,13 @@ notification_reminder_due() {
     (( now_epoch - last_epoch >= reminder_days * 86400 ))
 }
 
+remove_queued_stateful_notifications() {
+    local key="$1" tmp
+    [[ -s "$NOTIFICATION_BATCH" ]] || return 0
+    tmp=$(mktemp "$RUNTIME_DIR/.notification-current.XXXXXX") || return 1
+    jq -c --arg key "$key" 'select(.key!=$key or .event=="action")' "$NOTIFICATION_BATCH" >"$tmp" && mv -f -- "$tmp" "$NOTIFICATION_BATCH"
+}
+
 queue_stateful_attention_notification() {
     local severity="$1"
     local app_name="$2"
@@ -449,6 +457,12 @@ queue_stateful_attention_notification() {
 
     [[ "$SEND_GROUPED_NOTIFICATIONS" == true ]] || return 0
     [[ -n "$NOTIFICATION_BATCH" && -f "$NOTIFICATION_BATCH" ]] || return 0
+
+    if jq -e --arg key "$key" --arg signature "$signature" \
+        'select(.key==$key and (.event=="resolved" or (.event=="attention" and .signature!=$signature)))' \
+        "$NOTIFICATION_BATCH" >/dev/null 2>&1; then
+        remove_queued_stateful_notifications "$key" || return 1
+    fi
 
     previous="$(jq -r --arg key "$key" '.attention[$key].signature // ""' \
         "$NOTIFICATION_STATE_FILE" 2>/dev/null || true)"
@@ -475,8 +489,9 @@ queue_stateful_resolution_notification() {
     local detail="$4"
 
     [[ "$SEND_GROUPED_NOTIFICATIONS" == true ]] || return 0
-    jq -e --arg key "$key" '.attention[$key] != null' "$NOTIFICATION_STATE_FILE" \
-        >/dev/null 2>&1 || return 0
+    if ! jq -e --arg key "$key" '.attention[$key] != null' "$NOTIFICATION_STATE_FILE" >/dev/null 2>&1 &&
+       ! jq -e --arg key "$key" 'select(.key==$key and .event!="action")' "$NOTIFICATION_BATCH" >/dev/null 2>&1; then return 0; fi
+    remove_queued_stateful_notifications "$key" || return 1
     append_notification_record resolved INFO "$app_name" "$key" "" "$title" "$detail"
 }
 
@@ -517,11 +532,8 @@ queue_folder_resolution_notification() {
     [[ -n "$NOTIFICATION_BATCH" && -f "$NOTIFICATION_BATCH" ]] || return 0
 
     key="folder:${app_name,,}:${item_id}"
-    jq -e --arg key "$key" '.attention[$key] != null' "$NOTIFICATION_STATE_FILE" \
-        >/dev/null 2>&1 || return 0
+    queue_stateful_resolution_notification "$app_name" "$key" "$title" "Pending directory cleanup completed: $media_path"
 
-    append_notification_record resolved INFO "$app_name" "$key" "" \
-        "$title" "Pending directory cleanup completed: $media_path"
 }
 
 queue_cleanup_action_notification() {
@@ -574,6 +586,7 @@ mark_notification_batch_delivered() {
 }
 
 send_grouped_notification() {
+    local LC_ALL=C
     local total actions attention resolved errors
     local importance description mode body="" record entry shown=0 omitted
     local sorted delivered
@@ -618,7 +631,8 @@ send_grouped_notification() {
             else 3
             end,
             .app,
-            .title
+            (.title | sub(" \\(detail part [0-9]+\\)$"; "")),
+            (.chunkOffset // 0)
         ) | .[]
         ' "$NOTIFICATION_BATCH" > "$sorted" || {
         rm -f -- "$sorted" "$delivered"
@@ -636,12 +650,14 @@ send_grouped_notification() {
               + if .detail == "" then "" else "\n  " + (.detail | gsub("[\\r\\n]+"; "\n  ")) end) as $text
             | $text
             ' <<< "$record")"
+        if (( ${#body}+${#entry}+2>22000 )); then continue; fi
         body+="$entry"$'\n\n'
         printf '%s\n' "$record" >> "$delivered"
         ((shown += 1))
     done < "$sorted"
     rm -f -- "$sorted"
 
+    if ((shown==0)); then rm -f -- "$delivered"; log ERROR "No queued section fits the daily notification byte budget; all events preserved."; return 1; fi
     omitted=$((total - shown))
     if (( omitted > 0 )); then
         body+="${omitted} additional item(s) remain in the durable notification queue and will be included in a later daily notification."$'\n'
@@ -714,6 +730,7 @@ cleanup_main() {
         rm -f -- "$LOCK_DIR/pid"
         rmdir -- "$LOCK_DIR" 2>/dev/null || true
     fi
+    if [[ "$VERIFY_RUNTIME_DIR" == /tmp/arr-delete-verify.* ]]; then rm -rf -- "$VERIFY_RUNTIME_DIR"; fi
     trap - EXIT
     exit "$status"
 }
@@ -1676,7 +1693,9 @@ quarantine_recorded_sidecars() {
                 log ERROR "Sidecar was quarantined but its ownership or permissions could not be normalized: $destination"
                 return 1
             }
-            journal_finish "$move_id" "Sidecar quarantined; ownership normalized" || return 1
+            ops_flush_file "$destination" || return 1
+            sync -- "$(dirname -- "$source")" "$(dirname -- "$destination")" || return 1
+            journal_finish "$move_id" "Sidecar quarantined; ownership normalized; file/directory changes flushed" || return 1
             CLEANUP_OPERATION_DETAILS+="Quarantined $relative: $source -> $destination"$'\n'
             log INFO "Quarantined $app_name Kodi sidecar: $source -> $destination"
             [[ -n "$CLEANUP_QUARANTINE_RUN_ID" ]] || \
@@ -1722,6 +1741,22 @@ quarantine_recorded_sidecars() {
 # API: one response body on stdout; useful diagnostics on errors
 ###############################################################################
 
+# Flush only destructive-operation checkpoints and their receipts, never every
+# log line. Flush the containing directory after atomic replacement too.
+ops_flush_file() {
+    sync -- "$1"
+}
+
+ops_publish_checkpoint() {
+    local temporary="$1" destination="$2"
+    ops_flush_file "$temporary" || return 1
+    mv -f -- "$temporary" "$destination" || return 1
+    ops_flush_file "$destination" || return 1
+    # Some FUSE versions reject directory fsync; syncfs is a checked fallback.
+    sync -- "$(dirname -- "$destination")" 2>/dev/null || sync -f "$destination"
+}
+
+
 journal_intent() {
     local kind="$1" key="$2" source="$3" destination="$4" verification="$5" id tmp
     id=$(printf '%s' "$APP_CONTEXT|$kind|$key" | sha256sum | cut -d ' ' -f1)
@@ -1735,7 +1770,7 @@ journal_intent() {
     jq --arg id "$id" --arg app "$APP_CONTEXT" --arg kind "$kind" --arg source "$source" \
       --rawfile destination "$destination_file" --arg verification "$verification" --argjson now "$(date +%s)" \
       '.actions[$id]={app:$app,kind:$kind,source:$source,destination:$destination,verification:$verification,startedAt:$now}' \
-      "$PENDING_ACTIONS_FILE" >"$tmp" && mv -f -- "$tmp" "$PENDING_ACTIONS_FILE" || return 1
+      "$PENDING_ACTIONS_FILE" >"$tmp" && ops_publish_checkpoint "$tmp" "$PENDING_ACTIONS_FILE" || return 1
     rm -f -- "$destination_file"
     printf '%s' "$id"
 }
@@ -1744,8 +1779,9 @@ journal_finish() {
     local id="$1" result="$2" tmp
     jq -c --arg id "$id" --arg result "$result" --argjson now "$(date +%s)" \
       '.actions[$id] + {id:$id,result:$result,finishedAt:$now}' "$PENDING_ACTIONS_FILE" >>"$ACTION_RECEIPTS_FILE" || return 1
+    ops_flush_file "$ACTION_RECEIPTS_FILE" || return 1
     tmp=$(mktemp "$RUNTIME_DIR/.pending-actions.XXXXXX") || return 1
-    jq --arg id "$id" 'del(.actions[$id])' "$PENDING_ACTIONS_FILE" >"$tmp" && mv -f -- "$tmp" "$PENDING_ACTIONS_FILE"
+    jq --arg id "$id" 'del(.actions[$id])' "$PENDING_ACTIONS_FILE" >"$tmp" && ops_publish_checkpoint "$tmp" "$PENDING_ACTIONS_FILE"
 }
 
 recover_pending_actions() {
@@ -1782,69 +1818,173 @@ recover_pending_actions() {
                 failed=$((failed+1))
             fi
         elif [[ "$kind" == api ]]; then
-            if [[ "$verification" == PUT && ( "$source" == /api/v3/episode/monitor || "$source" == /api/v3/movie/editor ) ]]; then
-                local ids id_file object_id object_endpoint object_body expected_file desired=0 checked=0 read_failed=false
-                expected_file=$(mktemp "$RUNTIME_DIR/.recovery-payload.XXXXXX") || return 1
-                printf '%s' "$destination" >"$expected_file"
-                ids=$(jq -r '(.episodeIds // .movieIds // [])[]' "$expected_file") || return 1
-                [[ -n "$ids" ]] || read_failed=true
-                while IFS= read -r object_id; do
-                    [[ "$object_id" =~ ^[1-9][0-9]*$ ]] || { read_failed=true; continue; }
-                    if [[ "$source" == /api/v3/episode/monitor ]]; then object_endpoint="/api/v3/episode/$object_id"; else object_endpoint="/api/v3/movie/$object_id"; fi
-                    if ! object_body=$(api_get_json "$object_endpoint") || ! jq -e --argjson id "$object_id" '.id==$id' <<<"$object_body" >/dev/null; then read_failed=true; continue; fi
-                    checked=$((checked+1))
-                    if jq -e --slurpfile expected "$expected_file" '
-                        $expected[0] as $e |
-                        (if ($e|has("monitored")) then .monitored==$e.monitored else true end)
-                        and (if ($e|has("tags")) then (.tags // []) as $actual | all($e.tags[]; . as $tag | ($actual|index($tag))!=null) else true end)
-                      ' <<<"$object_body" >/dev/null; then desired=$((desired+1)); fi
-                done <<<"$ids"
-                rm -f -- "$expected_file"
-                if [[ "$read_failed" == true ]]; then
-                    queue_attention_notification ERROR "$APP_CONTEXT" "Bulk action recovery incomplete" "$source remains pending: one or more exact object IDs could not be read. No bulk PUT was replayed. Action: $id."
-                    failed=$((failed+1))
-                else
-                    journal_finish "$id" "Bulk PUT read-back: $desired/$checked targets currently match requested monitoring/tags; fresh snapshots will reevaluate remaining actions" || return 1
-                    queue_action_notification "$APP_CONTEXT" "Reconciled interrupted bulk update" "$source: $desired of $checked exact objects currently have the requested monitoring/tags. Remaining targets will be reevaluated from fresh Arr state; the old PUT body was not blindly replayed."
-                fi
-                continue
-            fi
-            body=$(mktemp "$RUNTIME_DIR/.recovery-api.XXXXXX") || return 1
-            http=$(curl --silent --show-error --connect-timeout "$HTTP_CONNECT_TIMEOUT" --max-time "$HTTP_MAX_TIME" \
-              --header "X-Api-Key: $ARR_API_KEY" --output "$body" --write-out '%{http_code}' "$ARR_URL$source") || http=000
-            if [[ "$verification" == PUT && "$http" == 200 ]] && jq -e 'type=="object" and (.id|type)=="number" and .id>0' "$body" >/dev/null; then
-                # No blind replay of an old PUT body: fresh snapshots rebuild tags
-                # and monitoring decisions and preserve intervening user changes.
-                journal_finish "$id" "Interrupted PUT reconciled by fresh API read; current object will be reevaluated" || return 1
-                queue_action_notification "$APP_CONTEXT" "Reconciled interrupted API update" "GET $source succeeded. The old request was not replayed; fresh monitoring/tag decisions will use the current Arr record."
-            elif [[ "$verification" == DELETE && "$http" == 404 ]]; then
-                journal_finish "$id" "Interrupted DELETE: API confirms object absent" || return 1
-                queue_action_notification "$APP_CONTEXT" "Confirmed interrupted Arr removal" "$source no longer exists in Arr. No file deletion or duplicate DELETE was performed; review Arr import exclusions if required."
-            elif [[ "$verification" == DELETE && "$http" == 200 ]]; then
-                journal_finish "$id" "Interrupted DELETE did not remove the object; fresh retirement safeguards will reevaluate it" || return 1
-            elif [[ "$verification" == POST && "$http" == 200 ]]; then
-                local label match
-                label=$(jq -r 'if type=="object" then .label // "" else "" end' <<<"$destination" 2>/dev/null) || label=""
-                if [[ "$source" == /api/v3/tag && -n "$label" ]] && jq -e 'type=="array"' "$body" >/dev/null; then
-                    match=$(jq -r --arg label "$label" '[.[]|select(.label==$label and (.id // 0)>0)]|length' "$body")
-                    journal_finish "$id" "Tag POST reconciled from authoritative tag catalog; matches=$match" || return 1
-                    queue_action_notification "$APP_CONTEXT" "Reconciled interrupted tag creation" "Tag '$label': $match exact catalog match(es). The POST was not blindly retried; the current catalog will drive any remaining tag action."
-                else
-                    # A missing command in a bounded command history cannot
-                    # establish that the non-idempotent POST never ran.
-                    queue_attention_notification ERROR "$APP_CONTEXT" "Unverified command submission preserved" "POST $source was interrupted. No automatic POST retry was sent; verify whether Arr accepted it, then use --resolve-pending with the action ID and verified outcome. Action: $id."
-                    failed=$((failed+1))
-                fi
+            if verify_arr_checkpoint_with_grace "$id"; then
+                journal_finish "$id" "Recovered interrupted API mutation: $ARR_VERIFY_REASON" || return 1
+                queue_stateful_resolution_notification "$APP_CONTEXT" "api-action:$id" "Arr mutation verified" "$verification $source: $ARR_VERIFY_REASON"
+                queue_action_notification "$APP_CONTEXT" "Verified interrupted Arr action" "$verification $source: $ARR_VERIFY_REASON. No mutation was replayed."
+            elif [[ "$ARR_VERIFY_DIFFERENT" == true && "$verification" != POST ]]; then
+                journal_finish "$id" "Requested state not present: $ARR_VERIFY_REASON; fresh snapshots will reevaluate remaining actions" || return 1
+                queue_stateful_resolution_notification "$APP_CONTEXT" "api-action:$id" "Arr request outcome reconciled" "$verification $source: requested state is not present. The old request was not replayed; fresh state will determine any new action."
+                queue_action_notification "$APP_CONTEXT" "Reconciled unapplied or changed Arr action" "$verification $source: $ARR_VERIFY_REASON. The old request was not replayed; current records will drive fresh monitoring/retirement decisions."
+            elif [[ "$ARR_VERIFY_DIFFERENT" == true && "$source" == /api/v3/tag ]]; then
+                journal_finish "$id" "Tag creation not present in current catalog; fresh catalog will drive any new creation" || return 1
+                queue_stateful_resolution_notification "$APP_CONTEXT" "api-action:$id" "Tag creation outcome reconciled" "The tag is absent from the authoritative catalog; fresh catalog checks precede any new creation."
+                queue_action_notification "$APP_CONTEXT" "Reconciled absent tag creation" "$source: $ARR_VERIFY_REASON. Fresh catalog checks will precede any new POST."
             else
-                queue_attention_notification ERROR "$APP_CONTEXT" "API action recovery unavailable" "$verification $source remains pending; read-back returned HTTP $http. No mutation was replayed."
+                queue_stateful_attention_notification ERROR "$APP_CONTEXT" "api-action:$id" "$ARR_VERIFY_REASON" "Arr mutation remains unverified" "$verification $source: $ARR_VERIFY_REASON. Checkpoint $id retained; no mutation replayed and no fully successful outcome claimed." 14
                 failed=$((failed+1))
             fi
-            rm -f -- "$body"
         else failed=$((failed+1)); fi
         resolved=$((resolved+1))
     done <"$records"
     rm -f -- "$records"
     (( failed==0 ))
+}
+
+arr_verification_get() {
+    local endpoint="$1" output="$2" http
+    ARR_VERIFY_HTTP=""
+    http=$(curl --silent --show-error --connect-timeout "$HTTP_CONNECT_TIMEOUT" --max-time "$HTTP_MAX_TIME" \
+      --request GET --header "X-Api-Key: $ARR_API_KEY" --header 'Accept: application/json' \
+      --output "$output" --write-out '%{http_code}' "$ARR_URL$endpoint") || { ARR_VERIFY_HTTP="${http:-000}"; return 1; }
+    ARR_VERIFY_HTTP="$http"
+    [[ "$http" == 200 || "$http" == 404 ]]
+}
+
+arr_expected_fields_match() {
+    local expected="$1" actual="$2" id="$3" tags_mode="${4:-replace}"
+    jq -e --slurpfile expected "$expected" --argjson id "$id" --arg tagsMode "$tags_mode" '
+      $expected[0] as $e
+      | type=="object" and .id==$id
+      and (if ($e|has("monitored")) then .monitored==$e.monitored else true end)
+      and (if ($e|has("tags")) then
+          (.tags // []) as $actual
+          | if $tagsMode=="add" then all($e.tags[]; . as $tag | ($actual|index($tag))!=null)
+            elif $tagsMode=="remove" then all($e.tags[]; . as $tag | ($actual|index($tag))==null)
+            else ($actual|sort)==($e.tags|sort) end
+        else true end)
+      and (if ($e|has("seasons")) then
+          (.seasons // []) as $actual
+          | all($e.seasons[]; . as $season | any($actual[]; .seasonNumber==$season.seasonNumber and .monitored==$season.monitored))
+        else true end)
+    ' "$actual" >/dev/null
+}
+
+journal_expected_resource() {
+    local id="$1" resource="$2" tmp
+    tmp=$(mktemp "$RUNTIME_DIR/.expected-resource.XXXXXX") || return 1
+    jq --arg id "$id" --slurpfile resource "$resource" '.actions[$id].expectedResource=$resource[0]' \
+      "$PENDING_ACTIONS_FILE" >"$tmp" && ops_publish_checkpoint "$tmp" "$PENDING_ACTIONS_FILE"
+}
+
+arr_prepare_delete_expectation() {
+    local endpoint="${1%%\?*}" output="$2" resource catalog field exclusion expected_id
+    resource=$(mktemp "${VERIFY_RUNTIME_DIR:-$RUNTIME_DIR}/.delete-before.XXXXXX") || return 1
+    catalog=$(mktemp "${VERIFY_RUNTIME_DIR:-$RUNTIME_DIR}/.delete-catalog.XXXXXX") || return 1
+    case "$endpoint" in
+      /api/v3/series/[0-9]*) field=tvdbId; exclusion=/api/v3/importlistexclusion;;
+      /api/v3/movie/[0-9]*) field=tmdbId; exclusion=/api/v3/exclusions;;
+      *) log ERROR "Unsupported removal endpoint; mutation refused: $endpoint"; return 1;;
+    esac
+    expected_id=${endpoint##*/}
+    [[ "$expected_id" =~ ^[1-9][0-9]*$ ]] || return 1
+    if ! arr_verification_get "$endpoint" "$resource" || [[ "$ARR_VERIFY_HTTP" != 200 ]] ||
+       ! jq -e --argjson id "$expected_id" --arg field "$field" '.id==$id and (.[$field]|type)=="number" and .[$field]>0' "$resource" >/dev/null; then
+        log ERROR "Exact removal identity could not be read; DELETE was not sent: $endpoint"; return 1
+    fi
+    # Check read-back capability before removing a title. Official v3 endpoints
+    # expose TVDB IDs for Sonarr and TMDB IDs for Radarr, never title matching.
+    if ! arr_verification_get "$exclusion" "$catalog" || [[ "$ARR_VERIFY_HTTP" != 200 ]] || ! jq -e 'type=="array"' "$catalog" >/dev/null; then
+        log ERROR "Import exclusion catalog unavailable; DELETE was not sent: $exclusion"; return 1
+    fi
+    jq --arg field "$field" --arg endpoint "$exclusion" \
+      '{id,externalId:.[$field],externalField:$field,exclusionEndpoint:$endpoint,title:(.title // "")}' "$resource" >"$output" || return 1
+    rm -f -- "$resource" "$catalog"
+}
+
+verify_arr_checkpoint() {
+    local id="$1" checkpoint expected actual endpoint method payload ids object_id object_endpoint mode matches=0 total=0 body response_id external_id field exclusions
+    ARR_VERIFY_REASON=""; ARR_VERIFY_DIFFERENT=false
+    checkpoint=$(mktemp "${VERIFY_RUNTIME_DIR:-$RUNTIME_DIR}/.verify-checkpoint.XXXXXX") || return 1
+    expected=$(mktemp "${VERIFY_RUNTIME_DIR:-$RUNTIME_DIR}/.verify-expected.XXXXXX") || return 1
+    actual=$(mktemp "${VERIFY_RUNTIME_DIR:-$RUNTIME_DIR}/.verify-actual.XXXXXX") || return 1
+    jq --arg id "$id" '.actions[$id]' "$PENDING_ACTIONS_FILE" >"$checkpoint" || return 1
+    endpoint=$(jq -r '.source' "$checkpoint"); method=$(jq -r '.verification' "$checkpoint")
+    jq -r '.destination // ""' "$checkpoint" >"$expected"
+    if [[ "$method" == DELETE ]]; then
+        external_id=$(jq -r '.expectedResource.externalId // 0' "$checkpoint")
+        field=$(jq -r '.expectedResource.externalField // ""' "$checkpoint")
+        exclusions=$(jq -r '.expectedResource.exclusionEndpoint // ""' "$checkpoint")
+        if ! [[ "$external_id" =~ ^[1-9][0-9]*$ ]] || [[ -z "$field" || -z "$exclusions" ]]; then ARR_VERIFY_REASON="Removal identity/exclusion context is missing; no exclusion can be inferred from a title"; return 1; fi
+        arr_verification_get "${endpoint%%\?*}" "$actual" || { ARR_VERIFY_REASON="Removal read-back API unavailable"; return 1; }
+        if [[ "$ARR_VERIFY_HTTP" == 200 ]]; then
+            object_id=$(jq -r '.expectedResource.id' "$checkpoint")
+            if jq -e --argjson id "$object_id" --arg field "$field" --argjson external "$external_id" '.id==$id and .[$field]==$external' "$actual" >/dev/null; then
+                ARR_VERIFY_DIFFERENT=true; ARR_VERIFY_REASON="Exact Arr object still exists; removal is not confirmed"
+            else ARR_VERIFY_REASON="Removal read-back returned a different/invalid identity; checkpoint preserved"; fi
+            return 1
+        fi
+        [[ "$ARR_VERIFY_HTTP" == 404 ]] || return 1
+        arr_verification_get "$exclusions" "$actual" || { ARR_VERIFY_REASON="Object is absent, but exclusion API unavailable"; return 1; }
+        if [[ "$ARR_VERIFY_HTTP" == 200 ]] && jq -e --arg field "$field" --argjson external "$external_id" \
+          'type=="array" and any(.[];.[$field]==$external)' "$actual" >/dev/null; then
+            ARR_VERIFY_REASON="Removal verified: exact object absent and $field=$external_id present in import exclusions"; return 0
+        fi
+        ARR_VERIFY_REASON="Object is absent, but $field=$external_id exclusion is not verified. Checkpoint retained; removal is not reported as fully successful"; return 1
+    elif [[ "$method" == PUT ]]; then
+        if [[ "$endpoint" == /api/v3/episode/monitor || "$endpoint" == /api/v3/movie/editor ]]; then
+            ids=$(jq -r '(.episodeIds // .movieIds // [])[]' "$expected") || return 1
+            mode=$(jq -r '.applyTags // "replace"' "$expected")
+            [[ -n "$ids" ]] || { ARR_VERIFY_REASON="Bulk request contained no exact target IDs"; return 1; }
+            while IFS= read -r object_id; do
+                [[ "$object_id" =~ ^[1-9][0-9]*$ ]] || return 1
+                if [[ "$endpoint" == /api/v3/episode/monitor ]]; then object_endpoint="/api/v3/episode/$object_id"; else object_endpoint="/api/v3/movie/$object_id"; fi
+                arr_verification_get "$object_endpoint" "$actual" || { ARR_VERIFY_REASON="Exact bulk target $object_id could not be read"; return 1; }
+                [[ "$ARR_VERIFY_HTTP" == 200 ]] && jq -e --argjson id "$object_id" '.id==$id' "$actual" >/dev/null || { ARR_VERIFY_REASON="Bulk target ID $object_id missing or mismatched"; return 1; }
+                total=$((total+1))
+                if arr_expected_fields_match "$expected" "$actual" "$object_id" "$mode"; then matches=$((matches+1)); fi
+            done <<<"$ids"
+            ARR_VERIFY_REASON="Read-back: $matches/$total exact targets have the requested monitoring/tags"
+            if ((matches==total)); then return 0; fi
+            ARR_VERIFY_DIFFERENT=true; return 1
+        fi
+        object_id=${endpoint##*/}; [[ "$object_id" =~ ^[1-9][0-9]*$ ]] || return 1
+        arr_verification_get "$endpoint" "$actual" || { ARR_VERIFY_REASON="Arr object read-back unavailable"; return 1; }
+        if [[ "$ARR_VERIFY_HTTP" != 200 ]] || ! jq -e --argjson id "$object_id" '.id==$id' "$actual" >/dev/null; then ARR_VERIFY_REASON="Arr object identity missing or mismatched"; return 1; fi
+        if arr_expected_fields_match "$expected" "$actual" "$object_id"; then ARR_VERIFY_REASON="Monitoring, seasons and tags verified against exact object ID $object_id"; return 0; fi
+        ARR_VERIFY_REASON="Exact object $object_id does not currently match requested monitoring/seasons/tags"; ARR_VERIFY_DIFFERENT=true; return 1
+    elif [[ "$method" == POST && "$endpoint" == /api/v3/tag ]]; then
+        local label
+        label=$(jq -r '.label // ""' "$expected") || return 1
+        arr_verification_get /api/v3/tag "$actual" || { ARR_VERIFY_REASON="Tag catalog read-back unavailable"; return 1; }
+        [[ "$ARR_VERIFY_HTTP" == 200 ]] && jq -e 'type=="array"' "$actual" >/dev/null || return 1
+        matches=$(jq --arg label "$label" '[.[]|select(.label==$label and (.id // 0)>0)]|length' "$actual")
+        ARR_VERIFY_REASON="Tag '$label' exact catalog matches=$matches"
+        ((matches==1)) && return 0
+        [[ "$matches" != 0 ]] || ARR_VERIFY_DIFFERENT=true
+        return 1
+    elif [[ "$method" == POST && "$endpoint" == /api/v3/command ]]; then
+        response_id=$(jq -r '.responseId // 0' "$checkpoint")
+        [[ "$response_id" =~ ^[1-9][0-9]*$ ]] || { ARR_VERIFY_REASON="Command response ID unavailable; POST will not be replayed"; return 1; }
+        arr_verification_get "/api/v3/command/$response_id" "$actual" || { ARR_VERIFY_REASON="Command read-back API unavailable"; return 1; }
+        if [[ "$ARR_VERIFY_HTTP" == 200 ]] && jq -e --argjson id "$response_id" --slurpfile expected "$expected" '
+          $expected[0] as $e | . as $command | (.body // .) as $body
+          | .id==$id and ((.name // .body.name // "" | ascii_downcase)==($e.name|ascii_downcase))
+          and ((.status // "" | ascii_downcase) as $s | ["queued","pending","started","completed"] | index($s)!=null)
+          and all($e|to_entries[]|select(.key!="name"); . as $entry | $body[$entry.key]==$entry.value)
+        ' "$actual" >/dev/null; then ARR_VERIFY_REASON="Command $response_id identity and accepted execution status verified; completion is checked separately"; return 0; fi
+        ARR_VERIFY_REASON="Command $response_id status/body not verified; no duplicate POST submitted"; return 1
+    fi
+    ARR_VERIFY_REASON="Unsupported mutation verification; checkpoint retained"; return 1
+}
+
+verify_arr_checkpoint_with_grace() {
+    local id="$1" attempt
+    for ((attempt=1;attempt<=API_VERIFY_ATTEMPTS;attempt++)); do
+        if verify_arr_checkpoint "$id"; then return 0; fi
+        ((attempt>=API_VERIFY_ATTEMPTS)) || sleep "$API_VERIFY_DELAY_SECONDS"
+    done
+    return 1
 }
 
 api_request() {
@@ -1853,13 +1993,18 @@ api_request() {
     local payload="$3"
     local body err http_status curl_status message
 
-    local journal_id="" payload_file=""
+    local journal_id="" payload_file="" delete_expectation=""
+    if [[ "$method" == DELETE ]]; then
+        delete_expectation=$(mktemp "${VERIFY_RUNTIME_DIR:-$RUNTIME_DIR}/.delete-expectation.XXXXXX") || return 1
+        arr_prepare_delete_expectation "$endpoint" "$delete_expectation" || return 1
+    fi
     if [[ -n "$payload" ]]; then
         payload_file=$(mktemp "$RUNTIME_DIR/.api-payload.XXXXXX") || return 1
         printf '%s' "$payload" >"$payload_file" || return 1
     fi
     if [[ "$method" != GET ]]; then
         journal_id=$(journal_intent api "$method $endpoint" "$endpoint" "$payload" "$method") || return 1
+        if [[ -n "$delete_expectation" ]]; then journal_expected_resource "$journal_id" "$delete_expectation" || return 1; rm -f -- "$delete_expectation"; fi
     fi
     body="$(mktemp "$RUNTIME_DIR/.${ARR_TEMP_PREFIX}-body.XXXXXX")" || return 1
     err="$(mktemp "$RUNTIME_DIR/.${ARR_TEMP_PREFIX}-error.XXXXXX")" || {
@@ -1920,7 +2065,25 @@ api_request() {
         return 1
     fi
 
-    if [[ -n "$journal_id" ]]; then journal_finish "$journal_id" "HTTP $http_status accepted by $ARR_NAME" || { rm -f -- "$body" "$err"; return 1; }; fi
+    if [[ -n "$journal_id" ]]; then
+        if [[ "$method" == POST && "$endpoint" == /api/v3/command ]]; then
+            local response_id response_tmp
+            response_id=$(jq -r '.id // 0' "$body" 2>/dev/null) || response_id=0
+            if [[ "$response_id" =~ ^[1-9][0-9]*$ ]]; then
+                response_tmp=$(mktemp "$RUNTIME_DIR/.command-response.XXXXXX") || return 1
+                jq --arg id "$journal_id" --argjson response "$response_id" '.actions[$id].responseId=$response' "$PENDING_ACTIONS_FILE" >"$response_tmp" &&
+                  ops_publish_checkpoint "$response_tmp" "$PENDING_ACTIONS_FILE" || return 1
+            fi
+        fi
+        if ! verify_arr_checkpoint_with_grace "$journal_id"; then
+            log ERROR "$ARR_NAME accepted $method $endpoint (HTTP $http_status), but read-back is unverified: $ARR_VERIFY_REASON"
+            queue_stateful_attention_notification ERROR "$APP_CONTEXT" "api-action:$journal_id" "$ARR_VERIFY_REASON" "Arr change accepted but not verified" "$method $endpoint: $ARR_VERIFY_REASON. Recovery checkpoint retained; no automatic mutation retry was sent." 14
+            rm -f -- "$body" "$err" "${payload_file:-$RUNTIME_DIR/.unused-payload}"
+            return 1
+        fi
+        journal_finish "$journal_id" "Verified after HTTP $http_status: $ARR_VERIFY_REASON" || { rm -f -- "$body" "$err"; return 1; }
+        queue_stateful_resolution_notification "$APP_CONTEXT" "api-action:$journal_id" "Arr mutation verified" "$method $endpoint: $ARR_VERIFY_REASON"
+    fi
     cat "$body"
     rm -f -- "$body" "$err" "${payload_file:-$RUNTIME_DIR/.unused-payload}"
 }
@@ -3457,7 +3620,7 @@ validate_common_configuration() {
         return 1
     }
     for command in curl jq mktemp stat sort cut tr cp mv find grep pgrep chown chmod wc \
-        realpath sha256sum dirname rmdir flock; do
+        realpath sha256sum dirname rmdir flock sync; do
         command -v "$command" >/dev/null 2>&1 || {
             printf 'Required command not found: %s\n' "$command" >&2
             return 1
@@ -3662,8 +3825,9 @@ main() {
 
     exec 8>"$QUARANTINE_COORDINATION_LOCK"
     flock -n 8 || { log WARNING "Metadata quarantine is in use; scheduled run deferred without changes."; return 0; }
+    VERIFY_RUNTIME_DIR=$(mktemp -d /tmp/arr-delete-verify.XXXXXX) || return 1
     remove_stale_temp_files
-    initialize_grouped_notifications || die "Could not initialize grouped notification state."
+    initialize_grouped_notifications || die "${INITIALIZATION_FAILURE_REASON:-Could not initialize the action journal or grouped notification state; existing records were preserved.}"
     if [[ "$mode" == --list-pending ]]; then
         NOTIFICATION_FINALIZED=true
         jq '.actions|to_entries|map({id:.key}+.value)' "$PENDING_ACTIONS_FILE"

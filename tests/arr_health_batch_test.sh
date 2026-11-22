@@ -23,6 +23,9 @@ jq -n '{history:{noofslots:1005,slots:([range(0;1000)|{nzo_id:("old-"+tostring),
 collect_sab_download_ledger
 jq -se 'length==4 and any(.[];.id=="active-id" and .kind=="sabQueue") and any(.[];.id=="old-enrolled") and any(.[];.id=="new-import" and .app=="Radarr")' "$DOWNLOAD_LEDGER_OBSERVATIONS_FILE" >/dev/null
 process_sab_activity_audit
+FLOW_CUTOFF_EPOCH=190000
+calculate_flow_sab_activity
+[[ "$FLOW_SAB_TV_COMPLETED" == 0 && "$FLOW_SAB_MOVIE_COMPLETED" == 1 ]]
 [[ "$SAB_AUDIT_OK" == true && "$SAB_AUDIT_MOVIE_COMPLETED" == 1 && "$SAB_AUDIT_TV_FAILED" == 1 && "$SAB_AUDIT_TV_COMPLETED" == 0 && "$SAB_AUDIT_F1_IGNORED" == 1 ]]
 jq --arg signature "$SAB_LEDGER_NEW_SIGNATURE" --argjson now "$START_TIME" '.monitor={sabLedgerCacheSignature:$signature,sabLedgerLastReplayAt:$now,sabFilesystemLastSuccessfulAt:$now}' "$STATE_FILE" >"$root/changed.json"; mv "$root/changed.json" "$STATE_FILE"
 : >"$DOWNLOAD_LEDGER_OBSERVATIONS_FILE"

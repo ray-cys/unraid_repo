@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# SABnzbd Cleanup v2.2.0
+# SABnzbd Cleanup v2.3.0
 #
 # PURPOSE
 # -------
@@ -65,7 +65,7 @@ set -uo pipefail
 # CONFIGURATION
 ###############################################################################
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 
 # ---------------------------------------------------------------------------
 # Execution behavior
@@ -289,7 +289,7 @@ is_false() {
 }
 
 OPS_SCRIPT_NAME="arr_sabnzbd_cleanup"
-OPS_SCRIPT_VERSION="2.2.0"
+OPS_SCRIPT_VERSION="2.3.0"
 OPS_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
 OPS_ATTENTION_DETAILS=""
 OPS_ATTENTION_FILE=""
@@ -299,6 +299,7 @@ OPS_LOG_BYTES=""
 # INFO records actions, warnings and one completion summary. DEBUG adds routine
 # progress. Numbered backups expire by size, count and age; receipts are separate.
 ops_initialize_log() {
+    find "$LOG_DIR" -maxdepth 1 -type f \( -name '.notify-*' -o -name '.operation-*' \) -mtime +1 -delete || return 1
     local file suffix bytes now cutoff
     [[ ! -L "$LOG_FILE" ]] || return 1
     now=$(date +%s); cutoff=$((now-LOG_RETENTION_DAYS*86400))
@@ -350,31 +351,92 @@ ops_log() {
 }
 
 # Durable daily outbox. Unsent chunks survive failures, daily limits and caps.
+# Flush only destructive-operation checkpoints and their receipts, never every
+# log line. Flush the containing directory after atomic replacement too.
+ops_flush_file() {
+    sync -- "$1"
+}
+
+ops_publish_checkpoint() {
+    local temporary="$1" destination="$2"
+    ops_flush_file "$temporary" || return 1
+    mv -f -- "$temporary" "$destination" || return 1
+    ops_flush_file "$destination" || return 1
+    # Some FUSE versions reject directory fsync; syncfs is a checked fallback.
+    sync -- "$(dirname -- "$destination")" 2>/dev/null || sync -f "$destination"
+}
+
+ops_flush_directory() {
+    sync -- "$1" 2>/dev/null || sync -f "$1"
+}
+
+ops_flush_move() {
+    local source="$1" destination="$2"
+    if [[ -f "$destination" ]]; then ops_flush_file "$destination" || return 1
+    elif [[ -d "$destination" ]]; then sync -f "$destination" || return 1
+    else return 1; fi
+    ops_flush_directory "$(dirname -- "$source")" || return 1
+    ops_flush_directory "$(dirname -- "$destination")"
+}
+
+ops_set_topic() {
+    local topic="$1" status="$2" summary="$3" tmp
+    ops_notification_state || return 1
+    tmp=$(mktemp "${LOG_DIR}/.notify-topic.XXXXXX") || return 1
+    jq --arg topic "$topic" --arg status "$status" --arg summary "$summary" --arg at "$(date -Iseconds)" '
+      .topics[$topic]={status:$status,summary:$summary,updatedAt:$at}
+      | .outbox |= map(
+          if .topic==$topic and .kind=="attention" and $status=="healthy" then
+            .description as $previousDescription | .message as $previousMessage
+            | .kind="resolved" | .importance="normal"
+            | .id += ":resolved" | .description="Queued condition resolved before delivery"
+            | .message=("Earlier queued condition: "+$previousDescription+"\nEarlier detail: "+$previousMessage[0:600]+"\nCurrent result: "+$summary+"\nThe earlier warning is no longer reported as active.")
+          else . end)
+    ' "$OPS_NOTIFICATION_STATE" >"$tmp" && mv -f -- "$tmp" "$OPS_NOTIFICATION_STATE"
+}
+
 ops_notification_state() {
     local tmp
     [[ ! -L "$OPS_NOTIFICATION_STATE" ]] || return 1
     if [[ ! -e "$OPS_NOTIFICATION_STATE" ]]; then
         tmp=$(mktemp "${LOG_DIR}/.notify-state.XXXXXX") || return 1
-        printf '%s\n' '{"version":1,"outbox":[],"attention":{}}' >"$tmp" && mv -f -- "$tmp" "$OPS_NOTIFICATION_STATE" || return 1
+        printf '%s\n' '{"version":1,"outbox":[],"attention":{},"topics":{}}' >"$tmp" && mv -f -- "$tmp" "$OPS_NOTIFICATION_STATE" || return 1
     fi
-    jq -e 'type=="object" and ((.outbox // [])|type)=="array"' "$OPS_NOTIFICATION_STATE" >/dev/null
+    jq -e 'type=="object" and ((.outbox // [])|type)=="array" and ((.topics // {})|type)=="object"' "$OPS_NOTIFICATION_STATE" >/dev/null || return 1
+    if jq -e '.outbox==null or .topics==null or any(.outbox[]?; .topic==null or .kind==null or ((.message // "")|utf8bytelength)>8000)' "$OPS_NOTIFICATION_STATE" >/dev/null; then
+        local topic=sab-cleanup
+        [[ "$OPS_SCRIPT_NAME" != quarantine_lifecycle ]] || topic=lifecycle
+        tmp=$(mktemp "$LOG_DIR/.notify-migration.XXXXXX") || return 1
+        jq --arg topic "$topic" '
+          .outbox //= [] | .topics //= {}
+          | .outbox |= [ .[] | .topic //= $topic
+            | .kind //= (if .description=="Quarantine review required" then "attention" else "action" end)
+            | if (.message|utf8bytelength)>8000 then
+                . as $event | range(0;(.message|length);2000) as $offset
+                | $event + {id:($event.id+":part"+($offset|tostring)),offset:(($event.offset // 0)+$offset),message:$event.message[$offset:$offset+2000]}
+              else . end ]
+        ' "$OPS_NOTIFICATION_STATE" >"$tmp" && mv -f -- "$tmp" "$OPS_NOTIFICATION_STATE" || return 1
+    fi
 }
 
 ops_notify() {
-    local importance="$1" subject="$2" description="$3" message="$4" tmp message_file id
+    local importance="$1" subject="$2" description="$3" message="$4" topic="${5:-}" kind="${6:-action}" tmp message_file id
     OPS_NOTIFICATION_DELIVERED=false
     ops_notification_state || return 1
     message_file=$(mktemp "${LOG_DIR}/.notify-message.XXXXXX") || return 1
     printf '%s' "$message" >"$message_file" || return 1
-    id=$( { printf '%s\n' "$subject" "$description"; cat "$message_file"; } | sha256sum | cut -d ' ' -f1)
+    id=$( { printf '%s\n' "$subject" "$description" "$topic" "$kind"; cat "$message_file"; } | sha256sum | cut -d ' ' -f1)
     tmp=$(mktemp "${LOG_DIR}/.notify-outbox.XXXXXX") || return 1
     jq --arg id "$id" --arg importance "$importance" --arg subject "$subject" --arg description "$description" \
-      --rawfile message "$message_file" --arg at "$(date -Iseconds)" '
+      --arg topic "$topic" --arg kind "$kind" --rawfile message "$message_file" --arg at "$(date -Iseconds)" '
       .outbox //= []
       | if any(.outbox[]; .eventId==$id) then . else
-          .outbox += [range(0;([$message|length,1]|max);8000) as $offset |
+          if $topic!="" and ($kind=="attention" or $kind=="resolved") then
+            .outbox |= map(select(.topic!=$topic or (.kind!="attention" and .kind!="resolved")))
+          else . end
+          | .outbox += [range(0;([$message|length,1]|max);2000) as $offset |
             {eventId:$id,id:($id+":"+($offset|tostring)),importance:$importance,subject:$subject,description:$description,
-             message:$message[$offset:$offset+8000],offset:$offset,queuedAt:$at}]
+             message:$message[$offset:$offset+2000],offset:$offset,queuedAt:$at,topic:$topic,kind:$kind}]
         end
     ' "$OPS_NOTIFICATION_STATE" >"$tmp" && mv -f -- "$tmp" "$OPS_NOTIFICATION_STATE" || { rm -f -- "$tmp" "$message_file"; return 1; }
     rm -f -- "$message_file"
@@ -383,29 +445,189 @@ ops_notify() {
 }
 
 ops_flush_notifications() {
-    local tmp selected body importance subject count today="$(date +%F)" notify_bin="${NOTIFY_BIN:-${NOTIFY:-}}"
+    local tmp selected body importance subject count sent today="$(date +%F)" notify_bin="${NOTIFY_BIN:-${NOTIFY:-}}"
     ops_notification_state || return 1
     jq -e '(.outbox // []|length)>0' "$OPS_NOTIFICATION_STATE" >/dev/null || return 0
     [[ "$(jq -r '.lastSentAt // ""' "$OPS_NOTIFICATION_STATE")" != "$today"* ]] || return 0
     selected=$(mktemp "${LOG_DIR}/.notify-selected.XXXXXX") || return 1
-    jq '[.outbox | sort_by((if .importance=="alert" then 0 elif .importance=="warning" then 1 else 2 end),.queuedAt,.eventId,(.offset // 0)) | .[0]]' "$OPS_NOTIFICATION_STATE" >"$selected" || return 1
-    # Each complete chunk stays below the platform argv limit, including UTF-8.
-    body=$(jq -r '.[0] | "Queued: "+.queuedAt+"\n"+.description+"\n\n"+.message' "$selected")
-    importance=$(jq -r '.[0].importance' "$selected"); subject=$(jq -r '.[0].subject' "$selected")
+    # Include as many complete sections as fit a 22 KB payload budget. Reserve
+    # 2 KB for the summary/footer; count UTF-8 bytes, not display characters.
+    jq '
+      .topics as $topics
+      | [.outbox[] | . as $event
+         | ($topics[.topic // ""] // {}) as $topic
+         | .effectiveImportance=(if $topic.status=="healthy" and (.kind // "")!="attention" then "normal" else .importance end)
+         | .render=("Queued: "+.queuedAt+"\n"+.description+"\n"
+           + (if ($topic.summary // "")!="" then "Current status: "+$topic.summary+"\nAction details below were recorded at the queued time.\n" else "" end)
+           + "\n"+.message)]
+      | sort_by((if .effectiveImportance=="alert" then 0 elif .effectiveImportance=="warning" then 1 else 2 end),.queuedAt,.eventId,(.offset // 0))
+      | reduce .[] as $event ({bytes:0,selected:[]};
+          (($event.render|utf8bytelength)+10) as $bytes
+          | if .bytes+$bytes<=22000 then .bytes+=$bytes | .selected+=[$event] else . end)
+      | .selected
+    ' "$OPS_NOTIFICATION_STATE" >"$selected" || return 1
+    sent=$(jq 'length' "$selected")
+    if ((sent==0)); then
+        rm -f -- "$selected"; ops_log ERROR "Queued legacy report exceeds the notification byte budget; report preserved for review."; return 1
+    fi
+    body=$(jq -r 'map(.render)|join("\n\n----------\n\n")' "$selected")
+    importance=$(jq -r 'if any(.[];.effectiveImportance=="alert") then "alert" elif any(.[];.effectiveImportance=="warning") then "warning" else "normal" end' "$selected")
+    subject=$(jq -r '.[0].subject' "$selected")
     body=$(printf '%s' "$body" | jq -Rsr 'explode | map(select(.!=8205 and .!=8419 and .!=65039 and (. < 9728 or . > 10175) and (. < 126976 or . > 129791))) | implode')
     count=$(jq '.outbox|length' "$OPS_NOTIFICATION_STATE")
-    if (( count>1 )); then body+=$'\n\n'"$((count-1)) further report chunk(s) remain queued for a later daily notification."; fi
+    body+=$'\n\n'"Included $sent report section(s); $((count-sent)) additional section(s) remain queued. Completed-action records are retained separately."
     if [[ ! -x "$notify_bin" ]] || ! "$notify_bin" -i "$importance" -s "$subject" -d "Operational actions and exceptions" -m "$body" >/dev/null 2>&1; then
-        rm -f -- "$selected"
-        ops_log ERROR "Notification delivery failed; detailed report retained in the daily outbox."
-        return 1
+        rm -f -- "$selected"; ops_log ERROR "Notification delivery failed; detailed reports retained in the daily outbox."; return 1
     fi
     tmp=$(mktemp "${LOG_DIR}/.notify-sent.XXXXXX") || return 1
     jq --slurpfile selected "$selected" --arg now "$(date -Iseconds)" \
       '.outbox |= map(. as $event | select(any($selected[0][]; .id==$event.id)|not)) | .lastSentAt=$now' \
       "$OPS_NOTIFICATION_STATE" >"$tmp" && mv -f -- "$tmp" "$OPS_NOTIFICATION_STATE" || return 1
     rm -f -- "$selected"
-    ops_log INFO "Delivered one detailed daily notification; remaining report chunks=$((count-1))."
+    ops_log INFO "Delivered one daily email containing $sent report sections; queued sections=$((count-sent))."
+}
+
+# Unfinished purge/restore operations outlive processes and daily log rotation.
+ops_list_pending_operations() {
+    local state="${OPS_PENDING_OPERATIONS_FILE:-$LOG_DIR/pending-operations.json}"
+    [[ -d "$LOG_DIR" ]] || { printf 'Operation state directory is unavailable: %s\n' "$LOG_DIR" >&2; return 1; }
+    if [[ -f "$state" ]]; then jq -e '.version==1 and (.operations|type)=="object"' "$state" >/dev/null && jq '.operations' "$state"
+    else printf '{}\n'; fi
+}
+
+ops_operation_state() {
+    OPS_PENDING_OPERATIONS_FILE="${OPS_PENDING_OPERATIONS_FILE:-$LOG_DIR/pending-operations.json}"
+    OPS_OPERATION_AUDIT_FILE="${OPS_OPERATION_AUDIT_FILE:-$LOG_DIR/operation-recovery.jsonl}"
+    [[ ! -L "$OPS_PENDING_OPERATIONS_FILE" && ! -L "$OPS_OPERATION_AUDIT_FILE" ]] || return 1
+    local tmp
+    if [[ ! -e "$OPS_PENDING_OPERATIONS_FILE" ]]; then
+        tmp=$(mktemp "$LOG_DIR/.operation-state.XXXXXX") || return 1
+        printf '%s\n' '{"version":1,"operations":{}}' >"$tmp"
+        ops_publish_checkpoint "$tmp" "$OPS_PENDING_OPERATIONS_FILE" || return 1
+    fi
+    jq -e '.version==1 and (.operations|type)=="object"' "$OPS_PENDING_OPERATIONS_FILE" >/dev/null
+}
+
+ops_operation_paths_valid() {
+    local source="$1" destination="$2" source_real root_real destination_real allowed=false root
+    [[ -d "$OPS_QUARANTINE_ROOT" && ! -L "$OPS_QUARANTINE_ROOT" ]] || return 1
+    source_real=$(realpath -m -- "$source") || return 1
+    root_real=$(realpath -m -- "$OPS_QUARANTINE_ROOT") || return 1
+    [[ "$source_real" == "$root_real"/* ]] || return 1
+    if [[ -n "$destination" ]]; then
+        destination_real=$(realpath -m -- "$destination") || return 1
+        for root in "${OPS_RESTORE_ROOTS[@]}"; do
+            root_real=$(realpath -m -- "$root") || return 1
+            [[ "$destination_real" != "$root_real"/* ]] || allowed=true
+        done
+        [[ "$allowed" == true ]] || return 1
+    fi
+}
+
+ops_operation_begin() {
+    local kind="$1" source="$2" destination="$3" proof="$4" identity="" id tmp
+    ops_operation_state || return 1
+    ops_operation_paths_valid "$source" "$destination" || { ops_log ERROR "Unsafe operation paths; checkpoint and mutation refused: $source -> $destination"; return 1; }
+    id=$(printf '%s' "$kind|$source|$destination" | sha256sum | cut -d ' ' -f1)
+    if jq -e --arg id "$id" '.operations[$id]!=null' "$OPS_PENDING_OPERATIONS_FILE" >/dev/null; then
+        # A partial purge resumes only after the caller's normal retention,
+        # inventory, Mover and byte-limit checks. Its original evidence stays.
+        [[ "$kind" == purge ]] || { ops_log ERROR "Restore already pending; reconciliation required ($id)."; return 1; }
+        printf '%s' "$id"; return 0
+    fi
+    [[ -f "$proof" ]] || return 1
+    ops_flush_file "$proof" || return 1
+    ops_flush_directory "$(dirname -- "$proof")" || return 1
+    if [[ "$kind" == restore ]]; then identity=$(stat -c '%d:%i:%F:%s' -- "$source") || return 1; fi
+    tmp=$(mktemp "$LOG_DIR/.operation-intent.XXXXXX") || return 1
+    jq --arg id "$id" --arg kind "$kind" --arg source "$source" --arg destination "$destination" \
+      --arg proof "$proof" --arg identity "$identity" --argjson now "$(date +%s)" \
+      '.operations[$id]={kind:$kind,source:$source,destination:$destination,proof:$proof,identity:$identity,startedAt:$now}' \
+      "$OPS_PENDING_OPERATIONS_FILE" >"$tmp" && ops_publish_checkpoint "$tmp" "$OPS_PENDING_OPERATIONS_FILE" || return 1
+    printf '%s' "$id"
+}
+
+ops_operation_finish() {
+    ops_operation_state || return 1
+    local id="$1" result="$2" tmp
+    jq -c --arg id "$id" --arg result "$result" --argjson now "$(date +%s)" \
+      '.operations[$id]+{id:$id,result:$result,at:$now}' "$OPS_PENDING_OPERATIONS_FILE" >>"$OPS_OPERATION_AUDIT_FILE" || return 1
+    ops_flush_file "$OPS_OPERATION_AUDIT_FILE" || return 1
+    tmp=$(mktemp "$LOG_DIR/.operation-finished.XXXXXX") || return 1
+    jq --arg id "$id" 'del(.operations[$id])' "$OPS_PENDING_OPERATIONS_FILE" >"$tmp" && ops_publish_checkpoint "$tmp" "$OPS_PENDING_OPERATIONS_FILE"
+}
+
+ops_receipt_in_use() {
+    local state="${OPS_PENDING_OPERATIONS_FILE:-$LOG_DIR/pending-operations.json}"
+    [[ -f "$state" ]] || return 1
+    if ! jq -e '.version==1 and (.operations|type)=="object"' "$state" >/dev/null 2>&1; then
+        ops_log ERROR "Invalid operation state; all aged receipts preserved until checkpoints can be reviewed: $state"
+        return 0
+    fi
+    jq -e --arg file "$1" 'any(.operations[]?;.proof==$file)' "$state" >/dev/null
+}
+
+ops_recover_operations() {
+    local list entry id kind source destination identity actual failed=0
+    OPS_RECOVERY_DETAILS=""; OPS_RECOVERED_COUNT=0
+    ops_operation_state || return 1
+    list=$(mktemp "$LOG_DIR/.operation-recovery.XXXXXX") || return 1
+    jq -c '.operations|to_entries[]' "$OPS_PENDING_OPERATIONS_FILE" >"$list" || return 1
+    while IFS= read -r entry; do
+        id=$(jq -r '.key' <<<"$entry"); kind=$(jq -r '.value.kind' <<<"$entry")
+        source=$(jq -r '.value.source' <<<"$entry"); destination=$(jq -r '.value.destination' <<<"$entry")
+        ops_operation_paths_valid "$source" "$destination" || { ops_log ERROR "Unsafe pending operation preserved: $id"; failed=$((failed+1)); continue; }
+        if [[ "$kind" == purge && -z "$destination" ]]; then
+            if [[ ! -e "$source" && ! -L "$source" ]]; then
+                ops_operation_finish "$id" "Reconciled interrupted purge: directory absence confirmed; no new deletion performed" || return 1
+                OPS_RECOVERY_DETAILS+="- Reconciled interrupted purge: $source is absent. No new deletion was needed. Operation $id."$'\n'
+                OPS_RECOVERED_COUNT=$((OPS_RECOVERED_COUNT+1))
+            elif [[ -d "$source" && ! -L "$source" ]]; then
+                ops_log WARNING "Incomplete purge preserved: $source; remaining files will be retried only after normal retention, idle, Mover and execution-limit checks. Operation $id."
+            else
+                ops_log ERROR "Interrupted purge source changed type; preserved for review: $source (operation $id)"; failed=$((failed+1))
+            fi
+        elif [[ "$kind" == restore && -n "$destination" ]]; then
+            if [[ ! -e "$source" && ! -L "$source" && -e "$destination" && ! -L "$destination" ]]; then
+                identity=$(jq -r '.value.identity' <<<"$entry")
+                actual=$(stat -c '%d:%i:%F:%s' -- "$destination") || actual=""
+                if [[ -n "$identity" && "$actual" == "$identity" ]]; then
+                    ops_operation_finish "$id" "Reconciled interrupted restore: original object identity verified at destination" || return 1
+                    OPS_RECOVERY_DETAILS+="- Recovered interrupted restore: $source -> $destination. Original object identity matched; no overwrite or repeat move performed."$'\n'
+                    OPS_RECOVERED_COUNT=$((OPS_RECOVERED_COUNT+1))
+                else
+                    ops_log ERROR "Restore destination exists but identity cannot be proven (possible cross-filesystem copy); destination preserved: $destination. Review operation $id with --pending-operations; use --resolve-operation only after verification."
+                    failed=$((failed+1))
+                fi
+            elif [[ -e "$source" && ! -e "$destination" && ! -L "$destination" ]]; then
+                ops_operation_finish "$id" "Interrupted restore was not applied; original source preserved for explicit retry" || return 1
+                OPS_RECOVERY_DETAILS+="- Restore did not occur: $source remains quarantined; $destination was not created. An explicit restore may be retried."$'\n'
+                OPS_RECOVERED_COUNT=$((OPS_RECOVERED_COUNT+1))
+            else
+                ops_log ERROR "Ambiguous interrupted restore: source=$source; destination=$destination. Both locations preserved; operation=$id."
+                failed=$((failed+1))
+            fi
+        else ops_log ERROR "Unknown checkpoint type preserved for review: $id"; failed=$((failed+1)); fi
+    done <"$list"
+    rm -f -- "$list"
+    # Keep the small recovery audit for one year, independently of main logs.
+    if [[ -s "$OPS_OPERATION_AUDIT_FILE" ]]; then
+        local retained
+        retained=$(mktemp "$LOG_DIR/.operation-audit.XXXXXX") || return 1
+        jq -c --argjson cutoff "$(( $(date +%s)-365*86400 ))" 'select(.at >= $cutoff)' "$OPS_OPERATION_AUDIT_FILE" >"$retained" &&
+          ops_publish_checkpoint "$retained" "$OPS_OPERATION_AUDIT_FILE" || return 1
+    fi
+    ((failed==0))
+}
+
+ops_resolve_operation() {
+    local id="$1" note="$2"
+    [[ "$id" =~ ^[a-f0-9]{64}$ && -n "$note" ]] || return 2
+    ops_operation_state || return 1
+    jq -e --arg id "$id" '.operations[$id]!=null' "$OPS_PENDING_OPERATIONS_FILE" >/dev/null || return 2
+    ops_operation_finish "$id" "Operator verified: $note" || return 1
+    OPS_RECOVERY_DETAILS="- Operator resolved operation $id: $note. No payload mutation was performed by this command."
+    OPS_RECOVERED_COUNT=1
 }
 
 log() {
@@ -495,6 +717,8 @@ Options:
   --no-purge    Disable delayed quarantine purge.
   --inspect     List quarantine payloads, original paths, state and retention age; change nothing.
   --restore WRAPPER Restore one manifest-backed payload to its original path; never overwrite.
+  --pending-operations List unfinished purge/restore checkpoints.
+  --resolve-operation ID "verified outcome" Record an operator resolution; change no payload.
   --version     Print release version.
   --help        Show this help.
 
@@ -513,6 +737,8 @@ parse_args() {
       --execute) DRY_RUN=false ;;
       --purge) PURGE_QUARANTINE=true ;;
       --no-purge) PURGE_QUARANTINE=false ;;
+      --pending-operations) CLI_OPERATION=pending ;;
+      --resolve-operation) [[ $# -ge 3 ]] || { usage >&2; exit 2; }; CLI_OPERATION=resolve; CLI_OPERATION_ID="$2"; CLI_OPERATION_NOTE="$3"; shift 2 ;;
       --inspect) CLI_OPERATION=inspect ;;
       --restore) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; CLI_OPERATION=restore; CLI_WRAPPER="$2"; shift ;;
       --version) printf 'sabnzbd_cleanup.sh %s\n' "$VERSION"; exit 0 ;;
@@ -542,7 +768,7 @@ require_commands() {
   local command_name
   local missing=0
 
-  for command_name in awk basename cat chown chmod curl cut date dirname find flock jq mkdir mktemp mv realpath rm rmdir sed sort stat sha256sum tee tr wc; do
+  for command_name in awk basename cat chown chmod curl cut date dirname find flock jq mkdir mktemp mv realpath rm rmdir sed sort stat sha256sum tee tr wc sync; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       log "ERROR" "Required command not found: $command_name"
       missing=1
@@ -1872,15 +2098,16 @@ quarantine_payload() {
     '{scriptVersion:$version,runId:$runId,state:"prepared",preparedEpoch:$now,quarantinedAt:$quarantinedAt,
       owner:$owner,category:$category,downloadId:$downloadId,jobName:$jobName,originalPath:$originalPath,
       payloadName:$payloadName,completedEpoch:$completedEpoch,bytes:$bytes,importProof:$proof[0]}' >"$prepared" ||
-     ! mv -f -- "$prepared" "$manifest"; then
+     ! ops_publish_checkpoint "$prepared" "$manifest"; then
       log ERROR "Cannot commit quarantine intent; source was preserved: $source_path"; return 1
   fi
   if ! mv -- "$source_path" "$wrapper/payload"; then
     log ERROR "Quarantine move was unsuccessful; recovery manifest retained: $manifest"; return 1
   fi
   normalize_quarantine_permissions "$wrapper" || return 1
+  ops_flush_move "$source_path" "$wrapper/payload" || return 1
   jq --argjson now "$(date +%s)" '.state="committed" | .quarantinedEpoch=$now' "$manifest" >"$committed" &&
-    mv -f -- "$committed" "$manifest" || return 1
+    ops_publish_checkpoint "$committed" "$manifest" || return 1
   normalize_quarantine_permissions "$manifest" || return 1
 
   return 0
@@ -1919,6 +2146,9 @@ inspect_quarantines() {
 }
 
 restore_quarantine_payload() {
+  OPS_QUARANTINE_ROOT="$QUARANTINE_DIR_REAL"
+  OPS_RESTORE_ROOTS=("$SAB_MOVIE_DIR_REAL" "$SAB_TV_DIR_REAL")
+  local operation_id
   local wrapper="$1" manifest="$1/.sabnzbd-cleanup-manifest.json" destination resolved
   check_mover_guard "before manual quarantine restore" || return $?
   validate_quarantine_manifest "$wrapper" || { log ERROR "Invalid restore manifest or unsafe wrapper: $wrapper"; return 1; }
@@ -1929,9 +2159,15 @@ restore_quarantine_payload() {
   if is_true "$DRY_RUN"; then log INFO "[DRY RUN] Would restore $wrapper/payload -> $destination"; return 0; fi
   mkdir -p -- "$PURGE_RECEIPT_DIR" "$(dirname -- "$destination")" || return 1
   jq -c --argjson at "$(date +%s)" '. + {auditEvent:"restore_intent",at:$at}' "$manifest" >>"$PURGE_RECEIPT_DIR/$RUN_ID.jsonl" || return 1
+  operation_id=$(ops_operation_begin restore "$wrapper/payload" "$destination" "$PURGE_RECEIPT_DIR/$RUN_ID.jsonl") || { log ERROR "Cannot flush restore checkpoint; payload preserved."; return 1; }
   check_mover_guard "immediately before manual restore" || return $?
-  mv -- "$wrapper/payload" "$destination" || return 1
+  ops_operation_paths_valid "$wrapper/payload" "$destination" || return 1
+  mv -T -n -- "$wrapper/payload" "$destination" || return 1
+  [[ ! -e "$wrapper/payload" && ! -L "$wrapper/payload" && -e "$destination" ]] || { log ERROR "Restore was not completed; existing paths and checkpoint preserved."; return 1; }
   jq -c --argjson at "$(date +%s)" '. + {auditEvent:"restore_verified",at:$at}' "$manifest" >>"$PURGE_RECEIPT_DIR/$RUN_ID.jsonl" || return 1
+  ops_flush_move "$wrapper/payload" "$destination" || return 1
+  ops_flush_file "$PURGE_RECEIPT_DIR/$RUN_ID.jsonl" || return 1
+  ops_operation_finish "$operation_id" "Restore verified by successful move, source absence and destination presence" || return 1
   rm -f -- "$manifest"; rmdir -- "$wrapper" 2>/dev/null || true
   RECOVERY_DETAILS+=("Restored $destination from $wrapper/payload; existing destinations were not overwritten. Permissions outside quarantine were not changed.")
   ((RECOVERED++)) || true
@@ -1979,13 +2215,24 @@ recover_quarantine_preparations() {
 }
 
 purge_quarantine() {
+  OPS_QUARANTINE_ROOT="$QUARANTINE_DIR_REAL"
+  OPS_RESTORE_ROOTS=("$SAB_MOVIE_DIR_REAL" "$SAB_TV_DIR_REAL")
+  local operation_id expired_receipts
   is_true "$PURGE_QUARANTINE" || return 0
   [[ -d "$QUARANTINE_DIR_REAL/items" ]] || return 0
   local wrappers="$TMP_DIR/purge-wrappers.list" candidates="$TMP_DIR/purge-candidates.tsv" wrapper manifest epoch at now size inventory receipt tmp count
   : >"$candidates"
   now=$(date +%s)
   mkdir -p -- "$PURGE_RECEIPT_DIR" || return 1
-  find "$PURGE_RECEIPT_DIR" -maxdepth 1 -type f -name '*.jsonl' -mtime "+$PURGE_RECEIPT_RETENTION_DAYS" -delete || return 1
+  if ! is_true "$DRY_RUN"; then
+    expired_receipts="$TMP_DIR/old-receipts.list"
+    find "$PURGE_RECEIPT_DIR" -maxdepth 1 -type f -name '*.jsonl' -mtime "+$PURGE_RECEIPT_RETENTION_DAYS" -print0 >"$expired_receipts" || return 1
+    local old_receipt
+    while IFS= read -r -d '' old_receipt; do
+      ops_receipt_in_use "$old_receipt" && continue
+      rm -f -- "$old_receipt" || return 1
+    done <"$expired_receipts"
+  fi
   find "$QUARANTINE_DIR_REAL/items" -mindepth 2 -maxdepth 2 -type d -print0 >"$wrappers" || return 1
   while IFS= read -r -d '' wrapper; do
     manifest="$wrapper/.sabnzbd-cleanup-manifest.json"
@@ -2028,9 +2275,13 @@ purge_quarantine() {
     fi
     jq -nc --slurpfile manifest "$manifest" --slurpfile files "$tmp" --arg wrapper "$wrapper" --argjson now "$now" \
       '{event:"purge_intent",at:$now,wrapper:$wrapper,manifest:$manifest[0],files:$files[0]}' >>"$receipt" || return 1
+    operation_id=$(ops_operation_begin purge "$wrapper" "" "$receipt") || { log ERROR "Cannot flush purge checkpoint; payload preserved: $wrapper"; return 1; }
     check_mover_guard "immediately before quarantine deletion" || return $?
     if rm -rf --one-file-system -- "$wrapper" && [[ ! -e "$wrapper" && ! -L "$wrapper" ]]; then
       jq -nc --arg wrapper "$wrapper" --argjson now "$(date +%s)" '{event:"purge_verified",at:$now,wrapper:$wrapper}' >>"$receipt" || return 1
+      ops_flush_directory "$(dirname -- "$wrapper")" || return 1
+      ops_flush_file "$receipt" || return 1
+      ops_operation_finish "$operation_id" "Purge verified: wrapper absent; files=$count bytes=$size" || return 1
       PURGE_DETAILS+=("Purged $wrapper: $count files, $(bytes_human "$size"); quarantine age=$(((now-epoch)/86400)) days; deletion verified.")
       ((PURGED++)) || true; ((BYTES_PURGED+=size)) || true
       log INFO "Purged quarantine: $wrapper; files=$count; bytes=$size; absence verified."
@@ -2254,7 +2505,12 @@ notify_summary() {
   if [[ -s "${OPS_ATTENTION_FILE:-}" ]]; then warnings=$(cat "$OPS_ATTENTION_FILE"); fi
   signature=$(printf '%s' "$BACKUP_CLEANUP_STATUS|$STRANDED_CLEANUP_STATUS|$QUARANTINE_PURGE_STATUS|$warnings" | sha256sum | cut -d ' ' -f1)
   previous=$(jq -r '.lastAttentionSignature // ""' "$OPS_NOTIFICATION_STATE" 2>/dev/null || true)
-  if (( changed==0 && ERRORS==0 )) && [[ -z "$warnings" && -z "$previous" ]]; then return 0; fi
+  local kind=action topic_status=healthy queued_attention=false
+  jq -e 'any(.outbox[]?;.topic=="sab-cleanup" and (.kind=="attention" or .kind=="resolved"))' "$OPS_NOTIFICATION_STATE" >/dev/null && queued_attention=true
+  if [[ -n "$warnings" || "$ERRORS" != 0 ]]; then topic_status=attention; fi
+  ops_set_topic sab-cleanup "$topic_status" "status=$topic_status; backup=$BACKUP_CLEANUP_STATUS; downloads=$STRANDED_CLEANUP_STATUS; purge=$QUARANTINE_PURGE_STATUS; errors=$ERRORS" || return 1
+  if (( changed==0 && ERRORS==0 )) && [[ -z "$warnings" && -z "$previous" && "$queued_attention" != true ]]; then return 0; fi
+  if ((changed==0)); then if [[ "$topic_status" == attention ]]; then kind=attention; else kind=resolved; fi; fi
   if (( changed==0 )) && [[ -n "$warnings" && "$signature" == "$previous" ]]; then return 0; fi
   is_true "$DRY_RUN" && mode="DRY RUN"
   (( ERRORS==0 )) || importance=alert
@@ -2269,7 +2525,7 @@ notify_summary() {
   done
   if [[ -n "$warnings" ]]; then message+=$'\n\n'"Exceptions and preserved items:"$'\n'"$warnings"; fi
   if [[ -n "$previous" && -z "$warnings" && "$ERRORS" == 0 ]]; then message+=$'\n'"Recovery: previously reported cleanup exceptions are no longer present; configured checks completed."; fi
-  ops_notify "$importance" "SABnzbd Cleanup" "Actions, recovery and protected downloads" "$message" || return 1
+  ops_notify "$importance" "SABnzbd Cleanup" "Actions, recovery and protected downloads" "$message" sab-cleanup "$kind" || return 1
   if [[ "$OPS_NOTIFICATION_DELIVERED" == true ]]; then
     local tmp="$TMP_DIR/notification-state.json" new_signature=""
     [[ -z "$warnings" && "$ERRORS" == 0 ]] || new_signature="$signature"
@@ -2308,10 +2564,16 @@ main() {
   local operation_status
   local quarantine_ready=false
 
-  CLI_OPERATION=""; CLI_WRAPPER=""
+  CLI_OPERATION=""; CLI_WRAPPER=""; CLI_OPERATION_ID=""; CLI_OPERATION_NOTE=""
   parse_args "$@"
   if [[ "$CLI_OPERATION" == inspect ]]; then inspect_quarantines; return $?; fi
+  if [[ "$CLI_OPERATION" == pending ]]; then ops_list_pending_operations; return $?; fi
   initialize || return 1
+  if [[ "$CLI_OPERATION" == resolve ]]; then
+    ops_resolve_operation "$CLI_OPERATION_ID" "$CLI_OPERATION_NOTE" || return $?
+    RECOVERED=1; RECOVERY_DETAILS+=("$OPS_RECOVERY_DETAILS")
+    notify_summary; return $?
+  fi
   if [[ -n "$CLI_OPERATION" ]]; then
     STRANDED_CLEANUP_STATUS="MANUAL_${CLI_OPERATION^^}"
     validate_stranded_environment || return 1
@@ -2365,6 +2627,15 @@ main() {
       quarantine_ready=true
       if [[ -z "$SAB_MOVIE_DIR_REAL" && -d "$SAB_MOVIE_DIR" ]]; then SAB_MOVIE_DIR_REAL=$(realpath -- "$SAB_MOVIE_DIR"); fi
       if [[ -z "$SAB_TV_DIR_REAL" && -d "$SAB_TV_DIR" ]]; then SAB_TV_DIR_REAL=$(realpath -- "$SAB_TV_DIR"); fi
+      OPS_QUARANTINE_ROOT="$QUARANTINE_DIR_REAL"
+      OPS_RESTORE_ROOTS=("$SAB_MOVIE_DIR_REAL" "$SAB_TV_DIR_REAL")
+      if ! is_true "$DRY_RUN"; then
+        local recovery_status=0
+        ops_recover_operations || recovery_status=$?
+        RECOVERED=$((RECOVERED+OPS_RECOVERED_COUNT))
+        [[ -z "$OPS_RECOVERY_DETAILS" ]] || RECOVERY_DETAILS+=("$OPS_RECOVERY_DETAILS")
+        if ((recovery_status!=0)); then ((ERRORS++)) || true; log ERROR "Pending purge/restore operations require review; further payload mutations stopped."; return 1; fi
+      fi
       if ! is_true "$DRY_RUN"; then recover_quarantine_preparations || { ((ERRORS++)) || true; log ERROR "Interrupted quarantine recovery incomplete; preserved affected payloads."; }; fi
     else
       is_true "$CLEAN_STRANDED_DOWNLOADS" && STRANDED_CLEANUP_STATUS="SKIPPED_CONFIGURATION"

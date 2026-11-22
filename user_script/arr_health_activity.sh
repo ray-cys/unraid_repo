@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.10.0
+# ARR Health / Download / Import Monitor v3.11.0
 #
 # PURPOSE
 # -------
@@ -670,6 +670,7 @@ HEALTH_HEARTBEAT_HOURS=6
 
 # Rotate after approximately 5 MiB.
 LOG_MAX_SIZE_MB=5
+LOG_LINE_MAX_BYTES=4096
 
 # Keep:
 #   arr_health_activity.log
@@ -1133,26 +1134,22 @@ debug_log() {
 ###############################################################################
 
 persistent_log() {
-
-    local level="$1"
+    local level="$1" message line size max_bytes
+    local LC_ALL=C
     shift
-
-    if [ "$level" = "DEBUG" ] && ! log_level_enabled DEBUG; then
-        return
+    [[ "$level" != DEBUG ]] || log_level_enabled DEBUG || return 0
+    [[ -n "$LOG_FILE" ]] || return 0
+    message="$*"; message=${message//$'\n'/ | }; message=${message//$'\r'/}
+    printf -v line '%s | %s | %s' "$(date '+%Y/%m/%d %T')" "$level" "$message"
+    if (( ${#line}>LOG_LINE_MAX_BYTES )); then line="${line:0:LOG_LINE_MAX_BYTES-24} ... [line truncated]"; fi
+    size=$(stat -c '%s' "$LOG_FILE" 2>/dev/null || printf 0)
+    [[ "$size" =~ ^[0-9]+$ ]] || size=0
+    max_bytes=$((LOG_MAX_SIZE_MB*1024*1024))
+    if (( size>0 && size+${#line}+1>max_bytes )); then
+        rotate_persistent_log true || { log "ERROR: Persistent log rotation failed; append refused"; return 1; }
     fi
-
-    if [ -z "$LOG_FILE" ]; then
-        return
-    fi
-
-    if ! printf '%s | %s | %s\n' \
-        "$(date '+%Y/%m/%d %T')" \
-        "$level" \
-        "$*" \
-        >>"$LOG_FILE" 2>/dev/null
-    then
-
-        log "WARNING: Unable to write persistent log: $LOG_FILE"
+    if ! printf '%s\n' "$line" >>"$LOG_FILE"; then
+        log "WARNING: Unable to write persistent log: $LOG_FILE"; return 1
     fi
 }
 
@@ -1162,18 +1159,17 @@ prune_persistent_logs_by_age() {
 
     [ -d "$STATE_DIR" ] || return 0
     [[ "$LOG_RETENTION_DAYS" =~ ^[0-9]+$ ]] || return 0
-    (( LOG_RETENTION_DAYS > 0 )) || return 0
-
     # find rounds file ages down to complete 24-hour periods. Subtract one so
     # a setting of 30 removes backups once they have reached 30 days old.
     find_mtime=$((LOG_RETENTION_DAYS - 1))
 
-    find "$STATE_DIR" \
-        -maxdepth 1 \
-        -type f \
-        -name 'arr_health_activity.log.*' \
-        -mtime "+${find_mtime}" \
-        -delete 2>/dev/null || true
+    local backup suffix bytes
+    for backup in "$LOG_FILE".[0-9]*; do
+        [[ -f "$backup" ]] || continue
+        suffix=${backup##*.}; [[ "$suffix" =~ ^[0-9]+$ ]] || continue
+        bytes=$(stat -c '%s' "$backup") || continue
+        if ((suffix>LOG_BACKUPS || bytes>LOG_MAX_SIZE_MB*1024*1024 || (LOG_RETENTION_DAYS>0 && $(date +%s)-$(stat -c '%Y' "$backup")>=LOG_RETENTION_DAYS*86400))); then rm -f -- "$backup" || return 1; fi
+    done
 }
 
 ###############################################################################
@@ -1181,54 +1177,25 @@ prune_persistent_logs_by_age() {
 ###############################################################################
 
 rotate_persistent_log() {
-
-    [ -f "$LOG_FILE" ] || return 0
-
-    local size
-    local max_bytes
-    local i
-
-    size=$(stat -c '%s' "$LOG_FILE" 2>/dev/null || echo 0)
-
-    [[ "$size" =~ ^[0-9]+$ ]] || size=0
-
-    max_bytes=$(( LOG_MAX_SIZE_MB * 1024 * 1024 ))
-
-    if (( size < max_bytes )); then
+    [[ -f "$LOG_FILE" && ! -L "$LOG_FILE" ]] || return 0
+    local force="${1:-false}" size max_bytes i
+    size=$(stat -c '%s' "$LOG_FILE") || return 1
+    max_bytes=$((LOG_MAX_SIZE_MB*1024*1024))
+    [[ "$force" == true ]] || ((size>=max_bytes)) || return 0
+    # Legacy oversized generations cannot be retained beyond the new cap.
+    if ((size>max_bytes)); then
+        : >"$LOG_FILE" || return 1
+        debug_log "Discarded inherited oversized active log ($size bytes)"
         return 0
     fi
-
-    log "Rotating persistent ARR monitor log"
-
-    ###########################################################################
-    # REMOVE OLDEST
-    ###########################################################################
-
-    if (( LOG_BACKUPS > 0 )); then
-
-        rm -f -- "${LOG_FILE}.${LOG_BACKUPS}" 2>/dev/null || true
-
-        #######################################################################
-        # SHIFT EXISTING BACKUPS
-        #######################################################################
-
-        for (( i=LOG_BACKUPS-1; i>=1; i-- )); do
-
-            if [ -f "${LOG_FILE}.${i}" ]; then
-
-                mv -f \
-                    "${LOG_FILE}.${i}" \
-                    "${LOG_FILE}.$((i + 1))"
-            fi
-
+    if ((LOG_BACKUPS>0)); then
+        rm -f -- "$LOG_FILE.$LOG_BACKUPS" || return 1
+        for ((i=LOG_BACKUPS-1;i>=1;i--)); do
+            [[ ! -f "$LOG_FILE.$i" ]] || mv -f -- "$LOG_FILE.$i" "$LOG_FILE.$((i+1))" || return 1
         done
-
-        mv -f "$LOG_FILE" "${LOG_FILE}.1"
-
-    else
-
-        : >"$LOG_FILE"
+        mv -f -- "$LOG_FILE" "$LOG_FILE.1" || return 1
     fi
+    : >"$LOG_FILE"
 }
 
 runtime() {
@@ -6563,7 +6530,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.10.0 lifecycle commands' \
+        'ARR Health Monitor v3.11.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -14199,78 +14166,18 @@ count_arr_imports_since() {
 ###############################################################################
 
 calculate_flow_sab_activity() {
-
     FLOW_SAB_TV_COMPLETED=0
     FLOW_SAB_MOVIE_COMPLETED=0
-
-    [ -f "$SAB_HISTORY" ] || return 1
-
-    local item
-    local status
-    local category
-    local event_epoch
-
-    while IFS= read -r item; do
-
-        [ -n "$item" ] || continue
-
-        status=$(
-            echo "$item" |
-                jq -r '.status // ""'
-        )
-
-        #######################################################################
-        # ONLY SUCCESSFULLY COMPLETED SAB JOBS ARE RELEVANT HERE
-        #######################################################################
-
-        [ "${status,,}" = "completed" ] || continue
-
-        category=$(
-            echo "$item" |
-                jq -r '.category // .cat // ""'
-        )
-
-        #######################################################################
-        # F1 REMAINS COMPLETELY OUTSIDE THIS WORKFLOW
-        #######################################################################
-
-        if [ "${category,,}" = "${SAB_IGNORED_CATEGORY,,}" ]; then
-            continue
-        fi
-
-        event_epoch=$(sab_history_event_epoch "$item")
-
-        (( event_epoch > 0 )) || continue
-
-        if (( event_epoch < FLOW_CUTOFF_EPOCH )); then
-            continue
-        fi
-
-        #######################################################################
-        # TV
-        #######################################################################
-
-        if [ "${category,,}" = "${SAB_TV_CATEGORY,,}" ]; then
-
-            ((FLOW_SAB_TV_COMPLETED++)) || true
-
-            continue
-        fi
-
-        #######################################################################
-        # MOVIES
-        #######################################################################
-
-        if [ "${category,,}" = "${SAB_MOVIE_CATEGORY,,}" ]; then
-
-            ((FLOW_SAB_MOVIE_COMPLETED++)) || true
-        fi
-
-    done < <(
-        jq -c '.history.slots[]?' "$SAB_HISTORY"
-    )
-
-    return 0
+    [[ -f "$SAB_HISTORY" ]] || return 1
+    prepare_sab_history_index || return 1
+    local counts
+    counts=$(jq -r --arg tv "${SAB_TV_CATEGORY,,}" --arg movie "${SAB_MOVIE_CATEGORY,,}" \
+      --arg ignored "${SAB_IGNORED_CATEGORY,,}" --argjson cutoff "$FLOW_CUTOFF_EPOCH" '
+        [.[] | select((.status // "" | ascii_downcase)=="completed" and .auditEpoch>0 and .auditEpoch >= $cutoff)
+         | (.category // .cat // "" | ascii_downcase) | select(.!=$ignored)] as $categories
+        | [([$categories[]|select(.==$tv)]|length),([$categories[]|select(.==$movie)]|length)] | @tsv
+      ' "${TMP_DIR}/sab-normalized-history.json") || return 1
+    IFS=$'\t' read -r FLOW_SAB_TV_COMPLETED FLOW_SAB_MOVIE_COMPLETED <<<"$counts"
 }
 
 ###############################################################################
@@ -15112,7 +15019,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.10.0"
+    "START | ARR Health Monitor v3.11.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -15125,7 +15032,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.10.0"
+debug_log "Starting ARR Health Monitor v3.11.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -15625,19 +15532,25 @@ else
     SAB_FILESYSTEM_SCAN_REASON="Scheduled hourly filesystem audit not due; prior issues preserved"
 fi
 
+start_monitor_phase "state-maintenance"
 carry_deferred_filesystem_issue_counts || log "WARNING: Could not summarize preserved filesystem issues"
 prune_sab_progress_state
+end_monitor_phase "state-maintenance"
 
 ###############################################################################
 # ACTIVITY FLOW ANOMALY - v2.6
 ###############################################################################
 
+start_monitor_phase "activity-flow"
 assess_activity_flow
+end_monitor_phase "activity-flow"
 
+start_monitor_phase "monitor-self-health"
 # Core service endpoint failures are already represented by the per-service
 # API lifecycle issues. This adds repeated incomplete-run, secondary history,
 # and internal flow-analysis failures without duplicating those API alerts.
 record_monitor_scan_issue
+end_monitor_phase "monitor-self-health"
 
 ###############################################################################
 # RESOLUTION CHECK
@@ -15659,7 +15572,9 @@ NOTIFICATION_LAST_ERROR=""
 # Persist the complete observation/lifecycle transaction before sending. If a
 # notification command blocks or the process is interrupted, the underlying
 # issue state remains durable and no unavailable collector can resolve issues.
+start_monitor_phase "pre-notification-checkpoint"
 commit_state_transaction "pre-notification" || exit 3
+end_monitor_phase "pre-notification-checkpoint"
 
 start_monitor_phase "notifications"
 
@@ -15680,7 +15595,9 @@ if [ "$NOTIFICATION_ATTEMPTED" = true ]; then
 fi
 
 end_monitor_phase "notifications"
+start_monitor_phase "post-notification-checkpoint"
 commit_state_transaction "post-notification" || exit 3
+end_monitor_phase "post-notification-checkpoint"
 
 start_monitor_phase "finalization"
 
@@ -15712,7 +15629,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.10.0 completed"
+log "ARR Health Monitor v3.11.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""
