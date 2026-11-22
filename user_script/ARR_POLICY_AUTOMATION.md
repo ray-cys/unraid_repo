@@ -1,6 +1,9 @@
 # Guarded Arr policy automation
 
-`arr_health_activity.sh` 3.12.0 monitors Sonarr, Radarr and SABnzbd and can
+See [ARR_AUTOMATION.md](ARR_AUTOMATION.md) for the shared action windows,
+combined budgets, profile-change holds and the four-script integration.
+
+`arr_health_activity.sh` 3.13.0 monitors Sonarr, Radarr and SABnzbd and can
 resolve narrowly proven import-policy rejections. No additional schedule is
 needed: keep its five-minute schedule and the existing four-hour import batches.
 The monitor makes no direct library filesystem checks for these decisions.
@@ -78,7 +81,7 @@ blocklist and command first. A damaged journal fails closed and is preserved.
 
 ## Quarantine and notifications
 
-`sabnzbd_cleanup.sh` 2.4.0 (installed as `arr_sabnzbd_cleanup`) accepts a separate
+`sabnzbd_cleanup.sh` 2.5.0 (installed as `arr_sabnzbd_cleanup`) accepts a separate
 verified **policy disposition**, without pretending the rejected job imported.
 It checks exact unchanged SAB identity, current media IDs/monitoring, no active
 queue use, stable source path and at most one remaining video. For redundant

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# SABnzbd Cleanup v2.4.0
+# SABnzbd Cleanup v2.5.0
 #
 # PURPOSE
 # -------
@@ -65,7 +65,7 @@ set -uo pipefail
 # CONFIGURATION
 ###############################################################################
 
-VERSION="2.4.0"
+VERSION="2.5.0"
 
 # ---------------------------------------------------------------------------
 # Execution behavior
@@ -153,6 +153,8 @@ SAB_API_KEY="${SAB_API_KEY:-PUT_YOUR_SABNZBD_API_KEY_HERE}"
 # Host-visible completed download layout. These defaults match the repository's
 # arr_health_activity.sh configuration.
 # Only the monitor-generated verified dispositions can authorize rejected-payload quarantine.
+# Exact native import receipts survive history pruning and destination renames.
+IMPORT_RECEIPT_FILE="${IMPORT_RECEIPT_FILE:-/mnt/vault/cloud/logs/script/arr_health_activity/import-receipts.json}"
 POLICY_DISPOSITION_FILE="${POLICY_DISPOSITION_FILE:-/mnt/vault/cloud/logs/script/arr_health_activity/policy-actions.json}"
 
 SAB_COMPLETE_ROOT="${SAB_COMPLETE_ROOT:-/mnt/user/media/net/complete}"
@@ -292,7 +294,7 @@ is_false() {
 }
 
 OPS_SCRIPT_NAME="arr_sabnzbd_cleanup"
-OPS_SCRIPT_VERSION="2.4.0"
+OPS_SCRIPT_VERSION="2.5.0"
 OPS_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
 OPS_ATTENTION_DETAILS=""
 OPS_ATTENTION_FILE=""
@@ -1889,7 +1891,13 @@ source_media_count() {
   local path="$1"
   local count=0
   local file
-  local base
+  local base inventory
+  inventory=$(mktemp "$TMP_DIR/source-media.XXXXXX") || return 1
+  if [[ -f "$path" && ! -L "$path" ]]; then
+    printf '%s\0' "$path" >"$inventory" || return 1
+  elif [[ -d "$path" && ! -L "$path" ]]; then
+    find "$path" -xdev -type f -print0 >"$inventory" || { rm -f -- "$inventory"; return 1; }
+  else rm -f -- "$inventory"; return 1; fi
 
   while IFS= read -r -d '' file; do
     base="${file##*/}"
@@ -1903,13 +1911,8 @@ source_media_count() {
         ((count++)) || true
         ;;
     esac
-  done < <(
-    if [[ -f "$path" ]]; then
-      printf '%s\0' "$path"
-    else
-      find "$path" -type f -print0 2>/dev/null
-    fi
-  )
+  done <"$inventory"
+  rm -f -- "$inventory" || return 1
 
   printf '%s' "$count"
 }
@@ -1921,6 +1924,63 @@ source_media_count() {
 # A policy disposition is NOT an import. Accept only this monitor's durable,
 # verified exact-ID receipt, with unchanged SAB identity and fresh Arr checks.
 # It authorizes reversible quarantine only, never removal from the library.
+# Durable receipts supplement native history; they never substitute a title
+# match or a different current file. A rename is accepted only for the SAME ID.
+verify_durable_import_receipt() {
+  local owner="$1" download_id="${2,,}" source_path="$3" proof_file="$4" item="$5"
+  local input="$TMP_DIR/import-receipt-job.json" receipt="$TMP_DIR/import-receipt.json" targets="$TMP_DIR/import-receipt-targets.jsonl"
+  local root key target target_id parent_id file_id kind object="$TMP_DIR/receipt-object.json" media="$TMP_DIR/receipt-media.json"
+  local paths="$TMP_DIR/receipt-paths.jsonl" resolved source_count count
+  [[ -f "$IMPORT_RECEIPT_FILE" && ! -L "$IMPORT_RECEIPT_FILE" ]] || return 11
+  printf '%s' "$item" >"$input" || return 11
+  jq -e --arg app "$owner" --arg id "$download_id" --slurpfile job "$input" '
+    select(.version==1) | .receipts[$app+":"+$id] | select(.app==$app and .downloadId==$id and .conflict!=true and
+      .sab==($job[0]|{nzo_id,name,storage,completed,category}) and (.targets|type)=="object" and (.targets|length)>0)' "$IMPORT_RECEIPT_FILE" >"$receipt" || return 11
+  case "$owner" in
+    Sonarr) root="${SONARR_URL%/}/api/v3"; key="$SONARR_API_KEY"; kind=episode ;;
+    Radarr) root="${RADARR_URL%/}/api/v3"; key="$RADARR_API_KEY"; kind=movie ;;
+    *) return 11 ;;
+  esac
+  jq -c '.targets[]' "$receipt" >"$targets" || return 11
+  : >"$paths"
+  while IFS= read -r target; do
+    target_id=$(jq -r '.targetId' <<<"$target"); parent_id=$(jq -r '.parentId' <<<"$target"); file_id=$(jq -r '.fileId' <<<"$target")
+    [[ "$target_id" =~ ^[1-9][0-9]*$ && "$parent_id" =~ ^[1-9][0-9]*$ && "$file_id" =~ ^[1-9][0-9]*$ ]] || return 12
+    jq -e --arg kind "$kind" '.kind==$kind' <<<"$target" >/dev/null || return 12
+    arr_get "$root/$kind/$target_id" "$key" "$object" && arr_get "$root/${kind}file/$file_id" "$key" "$media" || return 10
+    local target_input="$TMP_DIR/receipt-target.json"; printf '%s' "$target" >"$target_input"
+    jq -e --slurpfile expected "$target_input" --arg kind "$kind" '
+      $expected[0] as $e | .id==$e.targetId and .hasFile==true and
+      (if $kind=="episode" then .episodeFileId==$e.fileId and .seriesId==$e.parentId and
+        ($e.seasonNumber==null or .seasonNumber==$e.seasonNumber) and ($e.episodeNumber==null or .episodeNumber==$e.episodeNumber)
+       else .movieFileId==$e.fileId end)' "$object" >/dev/null || return 12
+    jq -e --argjson id "$file_id" --argjson parent "$parent_id" --arg kind "$kind" '.id==$id and .size>0 and
+      (if $kind=="episode" then .seriesId==$parent else .movieId==$parent end) and (.path|type)=="string"' "$media" >/dev/null || return 12
+    local external parent_object="$TMP_DIR/receipt-parent.json" parent_kind=movie
+    external=$(jq -r '.parentExternalId // 0' <<<"$target")
+    if [[ "$external" =~ ^[1-9][0-9]*$ ]]; then
+      [[ "$kind" != episode ]] || parent_kind=series
+      arr_get "$root/$parent_kind/$parent_id" "$key" "$parent_object" || return 10
+      jq -e --argjson id "$parent_id" --argjson external "$external" --arg kind "$kind" '.id==$id and
+        (if $kind=="episode" then .tvdbId==$external else .tmdbId==$external end)' "$parent_object" >/dev/null || return 12
+    else
+      # Older receipts without TVDB/TMDB identity can prove the original exact
+      # path, but may not authorize a rename after database IDs were reused.
+      jq -e --slurpfile expected "$target_input" '.path==$expected[0].pathAtImport' "$media" >/dev/null || return 12
+    fi
+    resolved=$(resolve_imported_path "$owner" "$(jq -r '.path' "$media")") || return 12
+    jq -nc --arg path "$resolved" '$path' >>"$paths" || return 12
+  done <"$targets"
+  source_count=$(source_media_count "$source_path") || return 13
+  count=$(jq -s 'unique|length' "$paths") || return 12
+  [[ "$source_count" =~ ^[0-9]+$ ]] && ((count>0 && count>=source_count)) || return 13
+  jq -n --arg owner "$owner" --arg id "$download_id" --argjson count "$count" --argjson source "$source_count" \
+    --slurpfile receipt "$receipt" --slurpfile paths "$paths" \
+    '{proofKind:"durable-import-receipt",owner:$owner,downloadId:$id,importReceipt:$receipt[0],
+      latestGrabEpoch:0,importEvents:($receipt[0].targets|length),verifiedImportedPaths:$count,
+      remainingSourceMediaFiles:$source,importedPaths:($paths|unique)}' >"$proof_file"
+}
+
 verify_policy_disposition() {
   local owner="$1" download_id="${2,,}" source_path="$3" proof_file="$4" item="$5"
   local receipt="$TMP_DIR/policy-receipt.json" target="$TMP_DIR/policy-current-target.json" parent="$TMP_DIR/policy-current-parent.json"
@@ -2441,6 +2501,13 @@ process_completed_jobs() {
     proof_file="$TMP_DIR/proof_${SCANNED}.json"
     verify_arr_import "$owner" "$download_id" "$source_path" "$proof_file"
     proof_status=$?
+    if ((proof_status!=0)); then
+      # Fresh exact-ID APIs and physical destination checks remain mandatory.
+      # An unavailable/pruned history endpoint alone no longer discards proof.
+      if verify_durable_import_receipt "$owner" "$download_id" "$source_path" "$proof_file" "$item"; then
+        proof_status=0
+      fi
+    fi
     if [[ "$proof_status" == 11 ]]; then
       verify_policy_disposition "$owner" "$download_id" "$source_path" "$proof_file" "$item"
       proof_status=$?
@@ -2535,7 +2602,7 @@ process_completed_jobs() {
     if (( quarantine_status == 0 )); then
       ((QUARANTINED++)) || true
       ((BYTES_QUARANTINED += size)) || true
-      QUARANTINE_DETAILS+=("Quarantined [$owner] $job_name: $source_path -> $LAST_QUARANTINE_DESTINATION ($(bytes_human "$size")); $(jq -r 'if .proofKind=="policy-disposition" then "verified policy disposition (not an import)" else "exact import proof" end' "$proof_file") and fresh queue protections passed.")
+      QUARANTINE_DETAILS+=("Quarantined [$owner] $job_name: $source_path -> $LAST_QUARANTINE_DESTINATION ($(bytes_human "$size")); $(jq -r 'if .proofKind=="policy-disposition" then "verified policy disposition (not an import)" elif .proofKind=="durable-import-receipt" then "durable exact-file import proof (current paths revalidated)" else "exact import proof" end' "$proof_file") and fresh queue protections passed.")
 
       if is_true "$DRY_RUN"; then
         log "INFO" "Action: dry-run candidate only"

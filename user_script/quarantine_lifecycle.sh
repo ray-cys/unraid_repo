@@ -15,7 +15,7 @@
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_VERSION="1.5.0"
 readonly REQUIRED_PURGE_CONFIRMATION="DELETE_EXPIRED_QUARANTINE"
 
 ###############################################################################
@@ -41,6 +41,9 @@ PURGE_CONFIRMATION="DELETE_EXPIRED_QUARANTINE"
 # Bound each scheduled deletion pass. Oldest runs are processed first and any
 # remainder is retried by the next scheduled run.
 MAX_PURGE_RUNS_PER_EXECUTION=25
+# Oversized runs are drained by regular-file entries within the same byte cap.
+# Per-file intents/receipts make interrupted partial runs resumable.
+MAX_PURGE_FILES_PER_EXECUTION=250
 MAX_PURGE_BYTES_PER_EXECUTION=$((10 * 1024 * 1024 * 1024))
 
 # Purging through /mnt/user is safe during parity checks, but defer while Mover
@@ -96,6 +99,7 @@ PURGED_FILES=0
 UNMANAGED_ENTRIES=0
 SCAN_ERRORS=0
 PURGE_LIMIT_REACHED=0
+PARTIALLY_PURGED_RUNS=0
 PURGE_DEFERRED_REASON=""
 REMAINING_EXPIRED_RUNS=0
 PURGE_RECEIPT_FILE=""
@@ -117,7 +121,7 @@ SERIES_REAL=""
 ###############################################################################
 
 OPS_SCRIPT_NAME="quarantine_lifecycle"
-OPS_SCRIPT_VERSION="1.4.0"
+OPS_SCRIPT_VERSION="1.5.0"
 OPS_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
 OPS_ATTENTION_DETAILS=""
 OPS_ATTENTION_FILE=""
@@ -360,13 +364,14 @@ ops_operation_begin() {
     if jq -e --arg id "$id" '.operations[$id]!=null' "$OPS_PENDING_OPERATIONS_FILE" >/dev/null; then
         # A partial purge resumes only after the caller's normal retention,
         # inventory, Mover and byte-limit checks. Its original evidence stays.
-        [[ "$kind" == purge ]] || { ops_log ERROR "Restore already pending; reconciliation required ($id)."; return 1; }
+        [[ "$kind" == purge || "$kind" == purge-file ]] || { ops_log ERROR "Restore already pending; reconciliation required ($id)."; return 1; }
         printf '%s' "$id"; return 0
     fi
     [[ -f "$proof" ]] || return 1
     ops_flush_file "$proof" || return 1
     ops_flush_directory "$(dirname -- "$proof")" || return 1
     if [[ "$kind" == restore ]]; then identity=$(stat -c '%d:%i:%F:%s' -- "$source") || return 1; fi
+    if [[ "$kind" == purge-file ]]; then identity=$(stat -c '%d:%i:%f:%s:%Y:%Z' -- "$source") || return 1; fi
     tmp=$(mktemp "$LOG_DIR/.operation-intent.XXXXXX") || return 1
     jq --arg id "$id" --arg kind "$kind" --arg source "$source" --arg destination "$destination" \
       --arg proof "$proof" --arg identity "$identity" --argjson now "$(date +%s)" \
@@ -405,7 +410,17 @@ ops_recover_operations() {
         id=$(jq -r '.key' <<<"$entry"); kind=$(jq -r '.value.kind' <<<"$entry")
         source=$(jq -r '.value.source' <<<"$entry"); destination=$(jq -r '.value.destination' <<<"$entry")
         ops_operation_paths_valid "$source" "$destination" || { ops_log ERROR "Unsafe pending operation preserved: $id"; failed=$((failed+1)); continue; }
-        if [[ "$kind" == purge && -z "$destination" ]]; then
+        if [[ "$kind" == purge-file && -z "$destination" ]]; then
+            if [[ ! -e "$source" && ! -L "$source" ]]; then
+                ops_operation_finish "$id" 'Recovered incremental purge: file absence confirmed; no repeated deletion' || return 1
+                OPS_RECOVERY_DETAILS+="- Reconciled an interrupted incremental purge: $source is absent; no new unlink was needed."$'\n'
+                OPS_RECOVERED_COUNT=$((OPS_RECOVERED_COUNT+1))
+            elif [[ -f "$source" && ! -L "$source" && "$(stat -c '%d:%i:%f:%s:%Y:%Z' -- "$source")" == "$(jq -r '.value.identity' <<<"$entry")" ]]; then
+                ops_log WARNING "Interrupted file purge retained for normal retention/idle/Mover/limit reevaluation: $source"
+            else
+                ops_log ERROR "Interrupted file purge identity changed; preserved: $source"; failed=$((failed+1))
+            fi
+        elif [[ "$kind" == purge && -z "$destination" ]]; then
             if [[ ! -e "$source" && ! -L "$source" ]]; then
                 ops_operation_finish "$id" "Reconciled interrupted purge: directory absence confirmed; no new deletion performed" || return 1
                 OPS_RECOVERY_DETAILS+="- Reconciled interrupted purge: $source is absent. No new deletion was needed. Operation $id."$'\n'
@@ -1110,6 +1125,83 @@ restore_item() {
 # PURGE
 ###############################################################################
 
+# Oversized runs drain by verified regular-file entries. Every unlink has a
+# durable intent. No recursive delete is used for a partial run; special files,
+# changed objects and single files above the budget remain protected.
+purge_run_incrementally() {
+    local run="$1" run_id="$2" age_days="$3" list="$RUNTIME_DIR/chunk-files.list"
+    local selected="$RUNTIME_DIR/chunk-selected.list" manifest="$RUNTIME_DIR/chunk-receipt.tsv"
+    local relative source canonical identity dev inode mode bytes mtime ctime current op_id
+    local chosen_files=0 chosen_bytes=0 completed_files=0 completed_bytes=0 before_files="$PURGED_FILES" entry
+    local file_budget=$((MAX_PURGE_FILES_PER_EXECUTION-PURGED_FILES))
+    (( file_budget>0 )) || { PURGE_LIMIT_REACHED=1; return 0; }
+    find "$run" -xdev -type f -printf '%P\0' >"$list" || return 1
+    sort -z "$list" -o "$list" || return 1
+    : >"$selected"; : >"$manifest"
+    while IFS= read -r -d '' relative; do
+        valid_relative_path "$relative" || return 1
+        case "$relative" in movies/*|series/*) ;; *) return 1;; esac
+        source="$run/$relative"
+        canonical=$(realpath -e -- "$source") || return 1
+        [[ "$canonical" == "$source" && -f "$source" && ! -L "$source" ]] || return 1
+        identity=$(stat -c '%d:%i:%f:%s:%Y:%Z' -- "$source") || return 1
+        IFS=: read -r dev inode mode bytes mtime ctime <<<"$identity"
+        [[ "$bytes" =~ ^[0-9]+$ ]] || return 1
+        if (( PURGED_BYTES+chosen_bytes+bytes>MAX_PURGE_BYTES_PER_EXECUTION )); then
+            PURGE_LIMIT_REACHED=1
+            continue
+        fi
+        (( chosen_files<file_budget )) || { PURGE_LIMIT_REACHED=1; break; }
+        printf '%s\0%s\0' "$relative" "$identity" >>"$selected" || return 1
+        printf 'FILE_INTENT\t%s\t%s\t%s\t%s\t%s\tf\t%s\trecorded_before_delete\tidentity=%s\n' \
+          "$(date -Iseconds)" "$run_id" "$age_days" "${relative%%/*}" "$(escape_tsv_field "${relative#*/}")" "$bytes" "$identity" >>"$manifest" || return 1
+        chosen_files=$((chosen_files+1)); chosen_bytes=$((chosen_bytes+bytes))
+    done <"$list"
+    if ((chosen_files==0)); then
+        AUDIT_ATTENTION_DETAILS+="Run $run_id remains: no regular file fits the remaining byte/file budget, or only special entries remain."$'\n'
+        return 0
+    fi
+    initialize_purge_receipt && append_purge_receipt_block "$manifest" || return 1
+    while IFS= read -r -d '' relative && IFS= read -r -d '' identity; do
+        if [[ "$DEFER_PURGE_WHILE_MOVER" == true ]] && unraid_mover_running; then
+            PURGE_DEFERRED_REASON="Unraid Mover became active during incremental purge"; break
+        fi
+        validate_managed_run_path "$run" "$run_id" || return 1
+        source="$run/$relative"; current=$(stat -c '%d:%i:%f:%s:%Y:%Z' -- "$source") || return 1
+        [[ "$current" == "$identity" && -f "$source" && ! -L "$source" ]] || { log ERROR "Incremental purge object changed; preserved: $source"; return 1; }
+        [[ "$(realpath -e -- "$source")" == "$source" ]] || return 1
+        # A pre-existing interrupted intent must describe this same object.
+        op_id=$(ops_operation_begin purge-file "$source" '' "$PURGE_RECEIPT_FILE") || return 1
+        entry=$(jq -r --arg id "$op_id" '.operations[$id].identity // ""' "$OPS_PENDING_OPERATIONS_FILE")
+        [[ "$entry" == "$identity" ]] || { log ERROR "Pending file identity changed; unlink refused: $source"; return 1; }
+        [[ "$(stat -c '%d:%i:%f:%s:%Y:%Z' -- "$source")" == "$identity" ]] || return 1
+        IFS=: read -r dev inode mode bytes mtime ctime <<<"$identity"
+        rm -f -- "$source" || return 1
+        [[ ! -e "$source" && ! -L "$source" ]] || return 1
+        ops_flush_directory "$(dirname -- "$source")" || return 1
+        PURGED_FILES=$((PURGED_FILES+1)); PURGED_BYTES=$((PURGED_BYTES+bytes))
+        completed_files=$((completed_files+1)); completed_bytes=$((completed_bytes+bytes))
+        ops_operation_finish "$op_id" "Incremental purge verified; file absent; bytes=$bytes; run=$run_id" || return 1
+        printf '%s\t%s\t%s\n' "$bytes" "$run_id" "$(escape_tsv_field "$relative")" >>"$PURGE_FILE_CANDIDATES" || return 1
+        printf 'FILE_RESULT\t%s\t%s\t%s\t%s\t%s\tf\t%s\tpurged_and_absence_verified\t-\n' \
+          "$(date -Iseconds)" "$run_id" "$age_days" "${relative%%/*}" "$(escape_tsv_field "${relative#*/}")" "$bytes" >"$manifest" || return 1
+        append_purge_receipt_block "$manifest" || return 1
+    done <"$selected"
+    # Removing empty directories does not discard unlisted content. Defer
+    # even rmdir when Mover starts after the last unlink.
+    if [[ "$DEFER_PURGE_WHILE_MOVER" != true ]] || ! unraid_mover_running; then
+        find "$run" -xdev -depth -type d -print0 >"$list" || return 1
+        while IFS= read -r -d '' source; do rmdir -- "$source" 2>/dev/null || true; done <"$list"
+    else PURGE_DEFERRED_REASON="Unraid Mover became active before empty-directory cleanup"; fi
+    if [[ ! -e "$run" ]]; then
+        PURGED_RUNS=$((PURGED_RUNS+1))
+        ops_flush_directory "$QUARANTINE_REAL" || return 1
+    elif (( PURGED_FILES>before_files )); then
+        PARTIALLY_PURGED_RUNS=$((PARTIALLY_PURGED_RUNS+1)); PURGE_LIMIT_REACHED=1
+    fi
+    PURGE_RUN_DETAILS+="- $run_id (${age_days} days): incremental purge removed $completed_files file(s), $(human_bytes "$completed_bytes"); remaining entries are retained for a later eligible run."$'\n'
+}
+
 purge_expired() {
     local run run_id created age_days files bytes operation_id
     OPS_QUARANTINE_ROOT="$QUARANTINE_REAL"
@@ -1154,17 +1246,8 @@ purge_expired() {
         IFS=$'\t' read -r files bytes < <(awk -F '\t' -v id="$run_id" '$1==id {print $4 "\t" $5}' "$INDEX_FILE")
         [[ "$files" =~ ^[0-9]+$ && "$bytes" =~ ^[0-9]+$ ]] || { log ERROR "Invalid audited inventory for $run_id"; return 1; }
 
-        if ((bytes>MAX_PURGE_BYTES_PER_EXECUTION)); then
-            PURGE_LIMIT_REACHED=1
-            log WARN "Oversized run preserved: $run_id; bytes=$bytes exceeds MAX_PURGE_BYTES_PER_EXECUTION=$MAX_PURGE_BYTES_PER_EXECUTION. Smaller expired runs will still be evaluated."
-            AUDIT_ATTENTION_DETAILS+="Oversized run preserved: $run_id ($(human_bytes "$bytes")); configured purge byte limit=$(human_bytes "$MAX_PURGE_BYTES_PER_EXECUTION")."$'\n'
-            continue
-        fi
-        if ((PURGED_RUNS>=MAX_PURGE_RUNS_PER_EXECUTION)); then
-            PURGE_LIMIT_REACHED=1; log WARN "Run count limit reached; remaining expired runs retained."; break
-        fi
-        if ((PURGED_BYTES+bytes>MAX_PURGE_BYTES_PER_EXECUTION)); then
-            PURGE_LIMIT_REACHED=1; log WARN "Run $run_id exceeds the remaining byte budget; preserved while smaller runs are evaluated."; continue
+        if ((PURGED_RUNS+PARTIALLY_PURGED_RUNS>=MAX_PURGE_RUNS_PER_EXECUTION || PURGED_FILES>=MAX_PURGE_FILES_PER_EXECUTION)); then
+            PURGE_LIMIT_REACHED=1; break
         fi
 
         if (( MIN_RUN_IDLE_HOURS>0 )); then
@@ -1174,6 +1257,10 @@ purge_expired() {
                 log WARN "Recently changed run $run_id was preserved; retention alone does not authorize purge."
                 continue
             fi
+        fi
+        if ((PURGED_BYTES+bytes>MAX_PURGE_BYTES_PER_EXECUTION || PURGED_FILES+files>MAX_PURGE_FILES_PER_EXECUTION)); then
+            purge_run_incrementally "$run" "$run_id" "$age_days" || return 1
+            continue
         fi
         if ! persist_run_inventory_before_delete \
             "$run" "$run_id" "$age_days" "$files" "$bytes"; then
@@ -1221,7 +1308,7 @@ purge_expired() {
         PURGE_RUN_DETAILS+="- ${run_id} (${age_days} days): ${files} file(s), $(human_bytes "$bytes"); movies=${INVENTORY_MOVIE_FILES}, series=${INVENTORY_SERIES_FILES}"$'\n'
     done < <(awk -F '\t' 'NR>1 && $6=="true" {printf "%s%c", $1, 0}' "$INDEX_FILE" | sort -z | while IFS= read -r -d '' id; do printf '%s\0' "$QUARANTINE_REAL/$id"; done)
 
-    if (( PURGED_RUNS > 0 )); then
+    if (( PURGED_FILES > 0 || PURGED_RUNS > 0 )); then
         log DEBUG "Refreshing quarantine index after purge"
         audit_quarantine || {
             log ERROR "Purge completed, but the remaining quarantine index could not be refreshed"
@@ -1232,10 +1319,10 @@ purge_expired() {
     fi
     if (( PURGE_LIMIT_REACHED == 1 || REMAINING_EXPIRED_RUNS > 0 || UNMANAGED_ENTRIES > 0 || SCAN_ERRORS > 0 )); then
         RESULT_STATUS="WARNING"
-        RESULT_SUMMARY="Purged $PURGED_RUNS run(s), $PURGED_FILES file(s), and $(human_bytes "$PURGED_BYTES"); retained expired=$REMAINING_EXPIRED_RUNS, unmanaged=$UNMANAGED_ENTRIES, scan errors=$SCAN_ERRORS. Safety deferrals and limits are included in this report."
+        RESULT_SUMMARY="Purged $PURGED_RUNS complete run(s), partially drained $PARTIALLY_PURGED_RUNS run(s), $PURGED_FILES file(s), and $(human_bytes "$PURGED_BYTES"); retained expired=$REMAINING_EXPIRED_RUNS, unmanaged=$UNMANAGED_ENTRIES, scan errors=$SCAN_ERRORS. Safety deferrals and limits are included in this report."
     else
         RESULT_STATUS="OK"
-        RESULT_SUMMARY="Purged $PURGED_RUNS run(s), $PURGED_FILES file(s), and $(human_bytes "$PURGED_BYTES")"
+        RESULT_SUMMARY="Purged $PURGED_RUNS complete run(s), partially drained $PARTIALLY_PURGED_RUNS run(s), $PURGED_FILES file(s), and $(human_bytes "$PURGED_BYTES")"
     fi
     log INFO "$RESULT_SUMMARY"
 }
@@ -1280,11 +1367,11 @@ update_lifecycle_notifications() {
     [[ -z "$signature" ]] || current_topic=attention
     ops_set_topic lifecycle "$current_topic" "status=$current_topic; purged=$PURGED_RUNS runs/$PURGED_FILES files; expired retained=$REMAINING_EXPIRED_RUNS; unmanaged=$UNMANAGED_ENTRIES; scan errors=$SCAN_ERRORS" || return 1
 
-    if (( PURGED_RUNS > 0 || ${OPS_RECOVERED_COUNT:-0}>0 )); then
-        if ((PURGED_RUNS>0)); then detail="$(build_purge_detail)"$'\n\n'"$detail"; fi
+    if (( PURGED_FILES > 0 || PURGED_RUNS > 0 || ${OPS_RECOVERED_COUNT:-0}>0 )); then
+        if ((PURGED_FILES>0 || PURGED_RUNS>0)); then detail="$(build_purge_detail)"$'\n\n'"$detail"; fi
         [[ -z "$signature" ]] && importance="normal"
         local action_description="Quarantine recovery completed"
-        ((PURGED_RUNS==0)) || action_description="Quarantine purge completed"
+        ((PURGED_FILES==0 && PURGED_RUNS==0)) || action_description="Quarantine purge completed"
         notify_unraid "$importance" "$action_description" \
             "$RESULT_SUMMARY"$'\n'"$detail" || return 1
         [[ "$OPS_NOTIFICATION_DELIVERED" == true ]] || return 0
@@ -1330,6 +1417,7 @@ main() {
     rotate_log || return 1
     touch "$LOG_FILE" || return 1
     validate_configuration || return 1
+    [[ "$MAX_PURGE_FILES_PER_EXECUTION" =~ ^[1-9][0-9]*$ ]] || { log ERROR 'Invalid per-execution purge file limit'; return 1; }
     [[ "$MIN_RUN_IDLE_HOURS" =~ ^[0-9]+$ ]] || { log ERROR "MIN_RUN_IDLE_HOURS must be nonnegative"; return 1; }
     prune_purge_receipts || {
         log ERROR "Unable to apply purge receipt retention"
@@ -1377,7 +1465,7 @@ main() {
                 RESULT_STATUS="FAILED"
                 RESULT_SUMMARY="Quarantine purge stopped after a safety or deletion failure"
                 failure_detail="$RESULT_SUMMARY"
-                if (( PURGED_RUNS > 0 )); then
+                if (( PURGED_FILES > 0 || PURGED_RUNS > 0 )); then
                     failure_detail+=$'\n'"Completed before failure: $PURGED_RUNS run(s), $PURGED_FILES file(s), $(human_bytes "$PURGED_BYTES")"
                 fi
                 if [[ -n "$PURGE_RECEIPT_FILE" ]]; then

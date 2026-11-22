@@ -186,7 +186,7 @@ assert_contains "$PURGE_RECEIPT_FILE" "purged_and_absence_verified"
 
 update_lifecycle_notifications || fail "purge notification failed"
 assert_contains "$MOCK_NOTIFY_LOG" "Quarantine purge completed"
-assert_contains "$MOCK_NOTIFY_LOG" "Purged 1 run(s), 3 file(s)"
+assert_contains "$MOCK_NOTIFY_LOG" "Purged 1 complete run(s), partially drained 0 run(s), 3 file(s)"
 assert_contains "$MOCK_NOTIFY_LOG" "Largest purged files:"
 assert_contains "$MOCK_NOTIFY_LOG" "series/Example Show/Season 01/episode-thumb.jpg"
 assert_contains "$MOCK_NOTIFY_LOG" "...and 1 more file(s)"

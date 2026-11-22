@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.12.0
+# ARR Health / Download / Import Monitor v3.13.0
 #
 # PURPOSE
 # -------
@@ -295,15 +295,17 @@
 #
 # SAFETY
 # ------
-# READ ONLY.
+# Monitoring is read-only except for the explicitly bounded native Arr command
+# and policy-rejection workflows configured below. All payload disposal remains
+# delegated to guarded quarantine scripts.
 #
 # This script NEVER:
 #
 #   - Deletes downloads
 #   - Removes SAB history
-#   - Removes Sonarr/Radarr queue entries
+#   - Removes non-allowlisted queue items or deletes download data
 #   - Forces imports
-#   - Marks downloads failed
+#   - Marks non-allowlisted downloads failed
 #   - Changes monitoring
 #   - Changes quality profiles
 #   - Changes Custom Formats
@@ -653,6 +655,25 @@ POLICY_BURST_LIMIT=5
 # Alert if preserved rejected payloads still await cleanup after its normal
 # 336-hour eligibility window plus 48 hours; adjust if that threshold changes.
 POLICY_CLEANUP_EXPECTED_HOURS=384
+
+# Native import events are preserved before Arr history ages out. The cleanup
+# script resolves these exact file IDs to current paths, including renames.
+IMPORT_RECEIPTS_ENABLED=true
+IMPORT_RECEIPT_RETENTION_DAYS=365
+
+# New Arr actions run only within these Singapore-time four-hour windows.
+# 0 means 00:00/04:00/08:00/12:00/16:00/20:00; each window lasts ten minutes.
+ARR_AUTOMATION_ENABLED=true
+AUTOMATION_TIMEZONE="Asia/Singapore"
+AUTOMATION_BATCH_HOUR_OFFSET=0
+AUTOMATION_BATCH_WINDOW_MINUTES=10
+AUTOMATION_MISSING_SURVEY_HOURS=168
+AUTOMATION_MISSING_CANDIDATES_PER_APP=4
+AUTOMATION_MISSING_MAX_RECORDS=5000
+AUTOMATION_IMPORT_RETRY_MAX_ATTEMPTS=3
+AUTOMATION_SONARR_COMPLETE_ROOT="/data/net/complete/series"
+AUTOMATION_RADARR_COMPLETE_ROOT="/data/net/complete/movies"
+AUTOMATION_PROFILE_POLL_MINUTES=60
 
 STATE_FILE="${STATE_DIR}/state.json"
 STATE_BACKUP="${STATE_DIR}/state.json.bak"
@@ -5503,6 +5524,8 @@ mark_notified() {
                 )
             else .
             end
+        elif ($key|startswith("AUTO:EVENT:")) then
+            .monitor.automationNotifications[($key|ltrimstr("AUTO:EVENT:"))]=$signature
         elif ($key|startswith("POLICY:ACTION:")) then
             .monitor.policyNotifications[($key|ltrimstr("POLICY:ACTION:"))]=$signature
         elif .issues[$key] then
@@ -6560,7 +6583,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.12.0 lifecycle commands' \
+        'ARR Health Monitor v3.13.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -6570,6 +6593,7 @@ print_lifecycle_command_help() {
         '  /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script COMMAND' \
         '' \
         'Inspect and manage one issue:' \
+        '  --automation-status  Show action/hold/baseline summaries; no changes.' \
         '  --policy-actions  List guarded policy actions/checkpoints; no changes.' \
         '  --list-active' \
         '      List active issues and their 12-character ACK IDs.' \
@@ -14934,6 +14958,648 @@ prune_state() {
 # prohibited here. The separate cleanup script consumes verified dispositions.
 ###############################################################################
 
+###############################################################################
+# AUTOMATION DOCUMENTS AND DURABLE IMPORT PROOF
+# No media filesystem reads are performed by receipt capture/profile polling.
+###############################################################################
+
+automation_document_valid() {
+    local file="$1" kind="$2"
+    case "$kind" in
+        actions)
+            jq -e '.version==1 and (.actions|type)=="object" and (.observations|type)=="object" and (.profiles|type)=="object" and (.events|type)=="object" and (.missing|type)=="object" and
+              all(.actions[]; (.app=="Sonarr" or .app=="Radarr") and (.kind=="missing-search" or .kind=="import-retry") and
+                (.status=="intent" or .status=="accepted" or .status=="completed" or .status=="failed") and
+                (.startedAt|type)=="number" and .startedAt>0 and (.targetId|type)=="number" and .targetId>0 and .parentId>0 and
+                (if .kind=="missing-search" then
+                  .command==(if .app=="Sonarr" then {name:"EpisodeSearch",episodeIds:[.targetId]} else {name:"MoviesSearch",movieIds:[.targetId]} end)
+                 else .command.name==(if .app=="Sonarr" then "DownloadedEpisodesScan" else "DownloadedMoviesScan" end) and
+                   .command.importMode=="Auto" and .command.downloadClientId==.downloadId and (.command.path|startswith("/")) end))' "$file" >/dev/null ;;
+        receipts)
+            jq -e '.version==1 and (.receipts|type)=="object" and all(.receipts|to_entries[];
+              .key as $key | .value | (.app=="Sonarr" or .app=="Radarr") and .downloadId!="" and $key==(.app+":"+.downloadId) and
+              (.targets|type)=="object" and (.targets|length)>0 and
+              all(.targets[]; .fileId>0 and .targetId>0 and .parentId>0 and (.pathAtImport|type)=="string" and (.pathAtImport|length)>0))' "$file" >/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+
+automation_publish_document() {
+    local candidate="$1" target="$2" kind="$3"
+    automation_document_valid "$candidate" "$kind" || return 1
+    if [ -f "$target" ] && cmp -s -- "$candidate" "$target"; then rm -f -- "$candidate"; return 0; fi
+    sync -- "$candidate" || return 1
+    if [ -f "$target" ] && automation_document_valid "$target" "$kind"; then
+        cp -- "$target" "${target}.bak.tmp.$$" && sync -- "${target}.bak.tmp.$$" &&
+          mv -f -- "${target}.bak.tmp.$$" "${target}.bak" || return 1
+    fi
+    mv -f -- "$candidate" "$target" && sync -- "$target" && sync -- "$(dirname -- "$target")"
+}
+
+append_native_import_receipt_events() {
+    jq -c --arg app "$1" '
+          (if type=="array" then . else .records end)[] | select(.eventType=="downloadFolderImported" and ((.data.downloadClient // ""|ascii_downcase)=="sabnzbd")) |
+          (.downloadId // ""|ascii_downcase) as $download | (.data.fileId|tonumber? // 0) as $file |
+          (if $app=="Sonarr" then .episodeId else .movieId end) as $target |
+          (if $app=="Sonarr" then .seriesId else .movieId end) as $parent |
+          select($download!="" and $file>0 and $target>0 and $parent>0 and (.data.importedPath // "")!="") |
+          (try (.date|sub("\\.[0-9]+Z$";"Z")|fromdateiso8601) catch 0) as $epoch | select($epoch>0) |
+          {app:$app,downloadId:$download,historyId:.id,importedAt:$epoch,release:.sourceTitle,
+            target:{kind:(if $app=="Sonarr" then "episode" else "movie" end),targetId:$target,parentId:$parent,fileId:$file,
+              parentExternalId:(if $app=="Sonarr" then (.series.tvdbId // 0) else (.movie.tmdbId // 0) end),
+              seasonNumber:(.episode.seasonNumber // null),episodeNumber:(.episode.episodeNumber // null),
+              pathAtImport:.data.importedPath,droppedPath:(.data.droppedPath // ""),importedAt:$epoch,historyId:.id}}' "$2" >>"$3" || return 1
+}
+
+capture_durable_import_receipts() {
+    [ "$IMPORT_RECEIPTS_ENABLED" = true ] || return 0
+    local file="$STATE_DIR/import-receipts.json" tmp="$TMP_DIR/import-receipts-working.json" events="$TMP_DIR/import-proof-events.jsonl"
+    local app history
+    if [ -e "$file" ]; then
+        if ! automation_document_valid "$file" receipts; then
+            record_normalized_issue Monitor:import-receipts Monitor 'Import receipt store invalid' IMPORT_RECEIPT_STATE ERROR invalid \
+              'Receipt store preserved; automatic proof capture stopped' 0 'Restore or inspect import-receipts.json; cleanup will not use invalid receipt data.'
+            return 1
+        fi
+        cp -- "$file" "$tmp" || return 1
+    else printf '{"version":1,"receipts":{}}\n' >"$tmp" || return 1; fi
+    : >"$events"
+    for app in Sonarr Radarr; do
+        case "$app" in
+            Sonarr) [ "$SONARR_AUDIT_OK" = true ] || continue; history="$SONARR_AUDIT_HISTORY" ;;
+            Radarr) [ "$RADARR_AUDIT_OK" = true ] || continue; history="$RADARR_AUDIT_HISTORY" ;;
+        esac
+        [ -f "$history" ] || continue
+        append_native_import_receipt_events "$app" "$history" "$events" || return 1
+    done
+    if [ "$SAB_HISTORY_OK" = true ] && [ -f "$SAB_HISTORY" ]; then
+        local jobs="$TMP_DIR/import-receipt-backfill.jsonl" job id page="$TMP_DIR/import-receipt-backfill-history.json" checked="$TMP_DIR/import-receipt-backfill-checks.jsonl"
+        : >"$checked"
+        jq -c --slurpfile existing "$tmp" --slurpfile state "$STATE_FILE" --arg tv "${SAB_TV_CATEGORY,,}" --arg movie "${SAB_MOVIE_CATEGORY,,}" --argjson now "$START_TIME" '
+          [.history.slots[] | select(.status=="Completed") |
+            (.category // .cat // ""|ascii_downcase) as $cat | select($cat==$tv or $cat==$movie) |
+            (if $cat==$tv then "Sonarr" else "Radarr" end) as $app | (.nzo_id|ascii_downcase) as $id |
+            select($existing[0].receipts[$app+":"+$id]==null and $now-($state[0].monitor.importReceiptBackfill[$app+":"+$id] // 0)>=86400) |
+            {app:$app,id:$id}] | .[:2][]' "$SAB_HISTORY" >"$jobs" || return 1
+        while IFS= read -r job; do
+            runtime_budget_allows_optional_phase import-receipt-backfill || break
+            app=$(jq -r '.app' <<<"$job"); id=$(jq -r '.id' <<<"$job")
+            if ! fetch_arr_history_by_download_id "$app" "$id" "$page"; then continue; fi
+            if jq -e '.totalRecords==(.records|length)' "$page" >/dev/null; then
+                append_native_import_receipt_events "$app" "$page" "$events" || return 1
+            fi
+            jq -nc --arg key "$app:$id" --argjson at "$START_TIME" '{key:$key,at:$at}' >>"$checked" || return 1
+        done <"$jobs"
+        if [ -s "$checked" ]; then
+            local state_tmp="$TMP_DIR/state.receipt-backfill.json"
+            jq --slurpfile checked "$checked" --argjson cutoff "$((START_TIME-365*86400))" '
+              reduce $checked[] as $c (.; .monitor.importReceiptBackfill[$c.key]=$c.at) |
+              .monitor.importReceiptBackfill |= with_entries(select(.value>=$cutoff))' "$STATE_FILE" >"$state_tmp" && save_state "$state_tmp" || return 1
+        fi
+    fi
+    [ -s "$events" ] || return 0
+    # SAB UUID + immutable job identity bind imported evidence to the payload.
+    [ "$SAB_HISTORY_OK" = true ] && [ -f "$SAB_HISTORY" ] || return 0
+    local merged="$TMP_DIR/import-receipts.merged.json"
+    jq --slurpfile events "$events" --slurpfile sab "$SAB_HISTORY" --argjson cutoff "$((START_TIME-IMPORT_RECEIPT_RETENTION_DAYS*86400))" '
+      ($sab[0].history.slots | map({key:(.nzo_id|ascii_downcase),value:({nzo_id,name,storage,completed,category})}) | from_entries) as $jobs |
+      reduce $events[] as $e (.; ($e.app+":"+$e.downloadId) as $key |
+        .receipts[$key] as $old |
+        if $jobs[$e.downloadId]==null then . else
+          .receipts[$key] = (($old // {app:$e.app,downloadId:$e.downloadId,release:$e.release,firstImportAt:$e.importedAt,targets:{}}) |
+            .conflict=((.conflict // false) or (.sab!=null and .sab!=$jobs[$e.downloadId])) |
+            .sab=(.sab // $jobs[$e.downloadId]) |
+            .firstImportAt=([(.firstImportAt // $e.importedAt),$e.importedAt]|min) |
+            .lastImportAt=([(.lastImportAt // 0),$e.importedAt]|max) |
+            .targets[($e.target.kind+":"+($e.target.targetId|tostring)+":"+($e.target.fileId|tostring))]=$e.target)
+        end) |
+      .receipts |= with_entries(select(.value.conflict==true or .value.lastImportAt>=$cutoff))' "$tmp" >"$merged" || return 1
+    automation_publish_document "$merged" "$file" receipts || return 1
+    debug_log 'Captured exact download/file-ID import receipts; unchanged evidence requires no storage rewrite'
+}
+
+automation_target_history() {
+    local kind="$1" target="$2" root="$3" key="$4" output="$5" query
+    if [ "$kind" = episode ]; then query="episodeId=$target"; else query="movieIds=$target"; fi
+    api_get "$root/history?page=1&pageSize=1000&sortKey=date&sortDirection=descending&$query" "$key" "$output" || return 1
+    jq -e --argjson target "$target" --arg kind "$kind" '(.records|type)=="array" and
+      .totalRecords==(.records|length) and all(.records[]; (if $kind=="episode" then .episodeId else .movieId end)==$target)' "$output" >/dev/null
+}
+
+automation_last_moment_guard() {
+    local candidate="$1" root="$2" key="$3" app kind target parent parent_kind object="$TMP_DIR/automation-final-object.json" owner="$TMP_DIR/automation-final-parent.json"
+    app=$(jq -r '.app' "$candidate"); kind=$(jq -r '.mediaKind' "$candidate"); target=$(jq -r '.targetId' "$candidate"); parent=$(jq -r '.parentId' "$candidate")
+    [[ "$target" =~ ^[1-9][0-9]*$ && "$parent" =~ ^[1-9][0-9]*$ ]] || return 1
+    parent_kind=movie; [ "$kind" != episode ] || parent_kind=series
+    api_get "$root/$kind/$target" "$key" "$object" && api_get "$root/$parent_kind/$parent" "$key" "$owner" || return 1
+    jq -e --slurpfile c "$candidate" '.id==$c[0].targetId and .monitored==true and
+      (if $c[0].mediaKind=="episode" then .seriesId==$c[0].parentId else true end) and
+      (if $c[0].kind=="missing-search" then .hasFile==false and (.episodeFileId // .movieFileId // 0)==0 else true end)' "$object" >/dev/null || return 1
+    jq -e --slurpfile c "$candidate" --slurpfile target "$object" '.id==$c[0].parentId and .monitored==true and (.tags|length)==0 and
+      (if $c[0].mediaKind=="episode" then any(.seasons[]?; .seasonNumber==$target[0].seasonNumber and .monitored==true) else true end)' "$owner" >/dev/null || return 1
+    fetch_arr_queue "$app" "$root" "$key" "$TMP_DIR/automation-final-queue.json" || return 1
+    local history="$TMP_DIR/automation-final-history.json" id
+    automation_target_history "$kind" "$target" "$root" "$key" "$history" || return 1
+    # No deletion at any retained time: explicit native searches/scans must not
+    # undo Plex deletion intent while unmonitoring is still catching up.
+    jq -e 'all(.records[]; .eventType!="episodeFileDeleted" and .eventType!="movieFileDeleted")' "$history" >/dev/null || return 1
+    if [ "$(jq -r '.kind' "$candidate")" = missing-search ]; then
+        jq -e --slurpfile c "$candidate" 'all(.records[]; (if $c[0].mediaKind=="episode" then .seriesId else .movieId end)!=$c[0].parentId)' "$TMP_DIR/automation-final-queue.json" >/dev/null || return 1
+    else
+        id=$(jq -r '.downloadId' "$candidate")
+        jq -e --arg id "$id" --slurpfile c "$candidate" '[.records[]|select((.downloadId // ""|ascii_downcase)==$id)] as $r |
+          ($r|length)==1 and ($r[0]|{id,downloadId,outputPath,status,trackedDownloadState,statusMessages,episodeId,movieId,seriesId})==$c[0].queueProof' "$TMP_DIR/automation-final-queue.json" >/dev/null || return 1
+    fi
+    # A manual SAB job not yet represented by Arr is ambiguous: it may already
+    # contain the missing media. Never launch a speculative duplicate search.
+    fetch_sab_queue "$TMP_DIR/automation-final-sab.json" || return 1
+    if [ "$(jq -r '.kind' "$candidate")" = import-retry ]; then
+        jq -e --arg id "$id" 'all(.queue.slots[]?; (.nzo_id // ""|ascii_downcase)!=$id)' "$TMP_DIR/automation-final-sab.json" >/dev/null || return 1
+    else
+        local category="$SAB_MOVIE_CATEGORY"; [ "$app" != Sonarr ] || category="$SAB_TV_CATEGORY"
+        jq -e --arg category "${category,,}" --slurpfile q "$TMP_DIR/automation-final-queue.json" '
+          [$q[0].records[].downloadId|ascii_downcase] as $known |
+          all(.queue.slots[]? | select((.cat // .category // ""|ascii_downcase)==$category); (.nzo_id|ascii_downcase) as $id | ($known|index($id))!=null)' "$TMP_DIR/automation-final-sab.json" >/dev/null || return 1
+    fi
+}
+
+automation_followup_imports() {
+    local record action="$TMP_DIR/automation-followup-action.json" id app root key kind target parent current="$TMP_DIR/automation-followup-object.json"
+    local file_id media="$TMP_DIR/automation-followup-file.json" owner="$TMP_DIR/automation-followup-parent.json" profile="$TMP_DIR/automation-followup-profile.json"
+    local file_epoch proof="$TMP_DIR/automation-followup-proof.json" fingerprint runs parent_kind external profile_id
+    while IFS= read -r record; do
+        runtime_budget_allows_optional_phase automation-import-followup || return 0
+        id=$(jq -r '.key' <<<"$record"); printf '%s' "$record" | jq '.value' >"$action"
+        app=$(jq -r '.app' "$action"); kind=$(jq -r '.mediaKind' "$action"); target=$(jq -r '.targetId' "$action"); parent=$(jq -r '.parentId' "$action")
+        automation_state_update '.actions[$id].followupAt=$now' --arg id "$id" --argjson now "$START_TIME" || return 1
+        IFS=$'\t' read -r root key < <(arr_reconciliation_connection "$app")
+        api_get "$root/$kind/$target" "$key" "$current" || continue
+        jq -e --slurpfile a "$action" '.id==$a[0].targetId and
+          (if $a[0].mediaKind=="episode" then .seriesId==$a[0].parentId and
+            ($a[0].identity.seasonNumber==null or .seasonNumber==$a[0].identity.seasonNumber) and
+            ($a[0].identity.episodeNumber==null or .episodeNumber==$a[0].identity.episodeNumber) else true end)' "$current" >/dev/null || continue
+        if ! jq -e '.hasFile==true and (.episodeFileId // .movieFileId // 0)>0' "$current" >/dev/null; then
+            automation_state_update '.actions[$id].proofRuns=0 | .actions[$id].proofFingerprint=""' --arg id "$id" || return 1
+            continue
+        fi
+        file_id=$(jq -r '.episodeFileId // .movieFileId // 0' "$current")
+        [[ "$file_id" =~ ^[1-9][0-9]*$ ]] || continue
+        api_get "$root/${kind}file/$file_id" "$key" "$media" || continue
+        jq -e --slurpfile a "$action" --argjson id "$file_id" '.id==$id and .size>0 and (.path|length)>0 and
+          (if $a[0].mediaKind=="episode" then .seriesId==$a[0].parentId else .movieId==$a[0].parentId end)' "$media" >/dev/null || continue
+        file_epoch=$(date_to_epoch "$(jq -r '.dateAdded // ""' "$media")")
+        ((file_epoch>=$(jq -r '.startedAt' "$action"))) || continue
+        if [ "$(jq -r '.kind' "$action")" = import-retry ]; then
+            [ -f "$STATE_DIR/import-receipts.json" ] && automation_document_valid "$STATE_DIR/import-receipts.json" receipts || continue
+            jq -e --slurpfile a "$action" --argjson file "$file_id" '.receipts[$a[0].app+":"+$a[0].downloadId] |
+              select(.conflict!=true) | any(.targets[]; .targetId==$a[0].targetId and .parentId==$a[0].parentId and .fileId==$file and .importedAt>=$a[0].startedAt)' \
+              "$STATE_DIR/import-receipts.json" >/dev/null || continue
+        fi
+        parent_kind=movie; [ "$kind" != episode ] || parent_kind=series
+        api_get "$root/$parent_kind/$parent" "$key" "$owner" || continue
+        external=$(jq -r '.parentExternalId // (if .mediaKind=="episode" then .owner.tvdbId else .owner.tmdbId end) // 0' "$action")
+        if [[ "$external" =~ ^[1-9][0-9]*$ ]]; then
+            jq -e --argjson external "$external" --arg kind "$kind" '(if $kind=="episode" then .tvdbId else .tmdbId end)==$external' "$owner" >/dev/null || continue
+        fi
+        profile_id=$(jq -r '.qualityProfileId // 0' "$owner")
+        [[ "$profile_id" =~ ^[1-9][0-9]*$ ]] || continue
+        api_get "$root/qualityprofile/$profile_id" "$key" "$profile" || continue
+        jq -e --slurpfile p "$profile" '(.customFormatScore|type)=="number" and .customFormatScore >= $p[0].minFormatScore and
+          (.quality.quality.id as $quality | [$p[0].items[] | select(.allowed==true) | .quality.id, .items[]?.quality.id] | index($quality)!=null)' "$media" >/dev/null || continue
+        fingerprint=$(printf '%s' "$kind:$target:$parent:$file_id:$file_epoch" | sha256sum | awk '{print $1}')
+        automation_state_update '.actions[$id].proofRuns=(if .actions[$id].proofFingerprint==$fp then ((.actions[$id].proofRuns // 0)+1) else 1 end) | .actions[$id].proofFingerprint=$fp' \
+          --arg id "$id" --arg fp "$fingerprint" || return 1
+        runs=$(jq -r --arg id "$id" '.actions[$id].proofRuns' "$AUTOMATION_STATE_FILE")
+        if ((runs>=2)); then
+            automation_state_update '.actions[$id] += {outcome:"import_verified",status:"completed",verifiedFileId:$file,verifiedAt:$now}' \
+              --arg id "$id" --argjson file "$file_id" --argjson now "$START_TIME" || return 1
+        fi
+    done < <(jq -c --argjson now "$START_TIME" '[.actions|to_entries[]|select(.value.outcome!="import_verified" and
+      $now-(.value.followupAt // 0)>=(if (.value.proofRuns // 0)>0 then 240 else 3600 end) and $now-.value.startedAt<30*86400)]|
+      sort_by(.value.followupAt // 0)|.[:4][]' "$AUTOMATION_STATE_FILE")
+}
+
+
+automation_state_update() {
+    local filter="$1"; shift
+    local candidate="$TMP_DIR/automation-updated.json"
+    jq "$@" "$filter" "$AUTOMATION_STATE_FILE" >"$candidate" &&
+      automation_publish_document "$candidate" "$AUTOMATION_STATE_FILE" actions
+}
+
+automation_event() {
+    local id="$1" app="$2" title="$3" detail="$4"
+    local signature; signature=$(printf '%s' "$detail" | sha256sum | awk '{print $1}')
+    automation_state_update '.events[$id]={app:$app,title:$title,detail:$detail,signature:$signature,at:$now}' \
+      --arg signature "$signature" --arg id "$id" --arg app "$app" --arg title "$title" --arg detail "$detail" --argjson now "$START_TIME"
+}
+
+automation_window_open() {
+    local hour minute
+    hour=$(TZ="$AUTOMATION_TIMEZONE" date -d "@$START_TIME" +%H)
+    minute=$(TZ="$AUTOMATION_TIMEZONE" date -d "@$START_TIME" +%M)
+    (( (10#$hour-AUTOMATION_BATCH_HOUR_OFFSET+24)%4==0 && 10#$minute<AUTOMATION_BATCH_WINDOW_MINUTES ))
+}
+
+automation_api_ready() {
+    [ "$SONARR_API_OK" = true ] && [ "$RADARR_API_OK" = true ] &&
+      [ "$SONARR_QUEUE_OK" = true ] && [ "$RADARR_QUEUE_OK" = true ] &&
+      [ "$SAB_API_OK" = true ] && [ "$SAB_HISTORY_OK" = true ] && [ "$SAB_QUEUE_OK" = true ] || return 1
+    jq -es 'all(.[][]; (.type // ""|ascii_downcase)!="error" and (.type // ""|ascii_downcase)!="warning")' \
+      "$SONARR_HEALTH" "$RADARR_HEALTH" >/dev/null
+}
+
+automation_profile_audit() {
+    local app="$1" root key previous checked profiles="$TMP_DIR/automation-profiles.json" formats="$TMP_DIR/automation-formats.json"
+    local summary="$TMP_DIR/automation-profile-summary.json" signature old_signature old_count issues hold=0
+    IFS=$'\t' read -r root key < <(arr_reconciliation_connection "$app")
+    checked=$(jq -r --arg app "$app" '.profiles[$app].checkedAt // 0' "$AUTOMATION_STATE_FILE")
+    if ((START_TIME-checked<AUTOMATION_PROFILE_POLL_MINUTES*60)) && ! automation_window_open; then return 0; fi
+    api_get "$root/qualityprofile" "$key" "$profiles" && api_get "$root/customformat" "$key" "$formats" || return 1
+    jq -e 'type=="array" and length>0 and all(.[]; .id>0 and (.items|type)=="array" and (.formatItems|type)=="array")' "$profiles" >/dev/null || return 1
+    jq -e 'type=="array"' "$formats" >/dev/null || return 1
+    jq -n --slurpfile profiles "$profiles" --slurpfile formats "$formats" '
+      {profiles:($profiles[0]|sort_by(.id)),formats:($formats[0]|sort_by(.id)),issues:[
+        $profiles[0][] as $p |
+        ([$p.items[] | select(.allowed==true) | .quality.id, .id, .items[]?.quality.id, .items[]?.id] | map(select(.!=null))) as $allowed |
+        ([$p.formatItems[] | .score | select(.>0)] | add // 0) as $ceiling |
+        ([$formats[0][].id]) as $formats |
+        (if ($allowed|length)==0 then {id:(($p.id|tostring)+":qualities"),title:$p.name,reason:"Quality profile has no allowed quality"} else empty end),
+        (if ($allowed|index($p.cutoff))==null then {id:(($p.id|tostring)+":cutoff"),title:$p.name,reason:"Quality cutoff is not an allowed quality/group"} else empty end),
+        (if $p.minFormatScore>$ceiling then {id:(($p.id|tostring)+":minimum"),title:$p.name,reason:("Minimum format score "+($p.minFormatScore|tostring)+" exceeds the sum of all positive scores "+($ceiling|tostring))} else empty end),
+        (if any($p.formatItems[]; .format as $id | ($formats|index($id))==null) then {id:(($p.id|tostring)+":format"),title:$p.name,reason:"Profile references a custom-format ID absent from the catalog"} else empty end)
+      ]}' >"$summary" || return 1
+    signature=$(jq -Sc '{profiles:[.profiles[]|{id,cutoff,upgradeAllowed,minFormatScore,cutoffFormatScore,minUpgradeFormatScore,items,formatItems}],formats:[.formats[]|{id,specifications,includeCustomFormatWhenRenaming}]}' "$summary" | sha256sum | awk '{print $1}')
+    old_signature=$(jq -r --arg app "$app" '.profiles[$app].signature // ""' "$AUTOMATION_STATE_FILE")
+    hold=$(jq -r --arg app "$app" '.profiles[$app].holdUntil // 0' "$AUTOMATION_STATE_FILE")
+    if [ -n "$old_signature" ] && [ "$old_signature" != "$signature" ]; then
+        hold=$((START_TIME+4*3600))
+        automation_event "profiles:$app:$START_TIME" "$app" 'Quality/custom-format configuration changed' \
+          'Detected native profile/custom-format changes, including changes produced by Recyclarr. New automated rejection, retry and search actions are held for four hours. Profiles and scores were not modified.' || return 1
+    fi
+    automation_state_update '.profiles[$app]={signature:$signature,checkedAt:$now,holdUntil:$hold,issues:$summary[0].issues,profileCount:($summary[0].profiles|length)}' \
+      --arg app "$app" --arg signature "$signature" --argjson now "$START_TIME" --argjson hold "$hold" --slurpfile summary "$summary"
+}
+
+automation_prepare() {
+    AUTOMATION_STATE_FILE="$STATE_DIR/automation-actions.json"
+    AUTOMATION_CONTROLS_OK=false
+    if [ ! -e "$AUTOMATION_STATE_FILE" ]; then
+        printf '{"version":1,"actions":{},"observations":{},"profiles":{},"events":{},"missing":{}}\n' >"$TMP_DIR/automation-initial.json"
+        automation_publish_document "$TMP_DIR/automation-initial.json" "$AUTOMATION_STATE_FILE" actions || return 1
+    fi
+    if ! automation_document_valid "$AUTOMATION_STATE_FILE" actions; then
+        record_normalized_issue Monitor:automation-state Monitor 'Automation journal invalid' ARR_AUTOMATION_STATE ERROR invalid \
+          'New automated actions stopped; journal preserved' 0 'Restore or inspect automation-actions.json before allowing new actions; monitoring continues.'
+        return 1
+    fi
+    automation_state_update '.observations |= with_entries(select(.value.lastAt>=$cutoff)) |
+      .events |= with_entries(select(.value.at>=$retention)) |
+      .actions |= with_entries(select(.value.status=="intent" or .value.status=="failed" or .value.startedAt>=$retention))' \
+      --argjson cutoff "$((START_TIME-86400))" --argjson retention "$((START_TIME-365*86400))" || return 1
+    automation_api_ready || return 0
+    local app
+    for app in Sonarr Radarr; do
+        if ! automation_profile_audit "$app"; then
+            # A failed forced window audit must not be treated as restored on
+            # the next cached off-window scan; require a successful re-poll.
+            automation_state_update '.profiles[$app].checkedAt=0' --arg app "$app" || return 1
+            record_normalized_issue "Monitor:profile-audit:$app" Monitor "$app profile audit unavailable" ARR_PROFILE_AUDIT WARNING unavailable \
+              'Current profile/custom-format catalog could not be validated' 0 'No new automated actions are allowed until the read-only profile audit succeeds.'
+            return 0
+        fi
+    done
+    if jq -e --argjson now "$START_TIME" 'all(.profiles[]; .holdUntil<=$now and (.issues|length)==0)' "$AUTOMATION_STATE_FILE" >/dev/null &&
+       ! jq -e 'any(.actions[]; .status=="intent")' "$AUTOMATION_STATE_FILE" >/dev/null; then
+        AUTOMATION_CONTROLS_OK=true
+    fi
+}
+
+automation_observe_candidate() {
+    local id="$1" fingerprint="$2" min_seconds="${3:-240}"
+    automation_state_update '
+      .observations[$id] as $old |
+      .observations[$id]={fingerprint:$fp,
+        firstAt:(if $old.fingerprint==$fp and $now-$old.lastAt<=1800 then $old.firstAt else $now end),
+        lastAt:$now,runs:(if $old.fingerprint==$fp and $now-$old.lastAt<=1800 then ($old.runs+1) else 1 end)}' \
+      --arg id "$id" --arg fp "$fingerprint" --argjson now "$START_TIME" || return 1
+    jq -e --arg id "$id" --argjson now "$START_TIME" --argjson minimum "$min_seconds" \
+      '.observations[$id].runs>=2 and $now-.observations[$id].firstAt>=$minimum' "$AUTOMATION_STATE_FILE" >/dev/null
+}
+
+automation_action_budget() {
+    local policy="$STATE_DIR/policy-actions.json" counter="$TMP_DIR/automation-budget.jsonl" today run
+    jq -e 'all(.actions[]; .status!="intent")' "$AUTOMATION_STATE_FILE" >/dev/null || return 1
+    jq -c '.actions[]|{startedAt}' "$AUTOMATION_STATE_FILE" >"$counter" || return 1
+    if [ -f "$policy" ]; then
+        policy_validate_journal "$policy" || return 1
+        jq -c '.actions[]|{startedAt}' "$policy" >>"$counter" || return 1
+        # Do not race any unresolved policy mutation or replacement request.
+        jq -e 'all(.actions[]; .status=="done")' "$policy" >/dev/null || return 1
+    fi
+    IFS=$'\t' read -r today run < <(jq -sr --argjson now "$START_TIME" '[([.[]|select(.startedAt>=$now-86400)]|length),([.[]|select(.startedAt==$now)]|length)]|@tsv' "$counter")
+    (( today<POLICY_MAX_ACTIONS_PER_DAY && run<POLICY_MAX_ACTIONS_PER_RUN ))
+}
+
+automation_no_active_command() {
+    local root="$1" key="$2" commands="$TMP_DIR/automation-active-commands.json"
+    api_get "$root/command" "$key" "$commands" || return 1
+    jq -e 'type=="array" and all(.[]; ((.status=="queued" or .status=="started") and (.name|test("Search$|^Downloaded.*Scan$")))|not)' "$commands" >/dev/null
+}
+
+automation_command_readback() {
+    local action_file="$1" root="$2" key="$3" command_id="$4" response="$TMP_DIR/automation-command.json"
+    [[ "$command_id" =~ ^[1-9][0-9]*$ ]] || return 1
+    api_get "$root/command/$command_id" "$key" "$response" || return 1
+    jq -e --slurpfile action "$action_file" --argjson id "$command_id" '
+      . as $response | $action[0].command as $request | .id==$id and .name==$request.name and (.body|type)=="object" and
+      (.status=="queued" or .status=="started" or .status=="completed" or .status=="failed") and
+      all($request|to_entries[]; . as $field |
+        if $field.key=="importMode" then ($response.body[$field.key]|ascii_downcase)==($field.value|ascii_downcase)
+        else $response.body[$field.key]==$field.value end)' "$response" >/dev/null
+}
+
+automation_submit_command() {
+    local candidate="$1" root="$2" key="$3" action_id body command_id status
+    automation_window_open && automation_action_budget && automation_no_active_command "$root" "$key" &&
+      automation_last_moment_guard "$candidate" "$root" "$key" || return 1
+    action_id=$(jq -r '.key' "$candidate"); action_id="$action_id:$START_TIME"
+    automation_state_update '.actions[$id]=$candidate[0]+{status:"intent",startedAt:$now,outcome:"pending"}' \
+      --arg id "$action_id" --argjson now "$START_TIME" --slurpfile candidate "$candidate" || return 1
+    body=$(jq -c '.command' "$candidate")
+    rm -f -- "$TMP_DIR/automation-submit-response.json" || return 1
+    policy_mutate POST "$root/command" "$key" "$body" "$TMP_DIR/automation-submit-response.json" || true
+    command_id=$(jq -r '.id // 0' "$TMP_DIR/automation-submit-response.json" 2>/dev/null) || command_id=0
+    [[ "$command_id" =~ ^[1-9][0-9]*$ ]] || return 1
+    automation_state_update '.actions[$id].commandId=$command' --arg id "$action_id" --argjson command "$command_id" || return 1
+    if automation_command_readback "$candidate" "$root" "$key" "$command_id"; then
+        status=$(jq -r '.status' "$TMP_DIR/automation-command.json")
+        case "$status" in failed|completed) ;; *) status=accepted;; esac
+        local native_message
+        native_message=$(jq -r '(.exception.message // .message // "")|tostring|.[0:2000]' "$TMP_DIR/automation-command.json")
+        automation_state_update '.actions[$id].status=$status | .actions[$id].nativeMessage=$message' --arg message "$native_message" --arg id "$action_id" --arg status "$status"
+    else return 1; fi
+}
+
+automation_build_missing_candidate() {
+    local app="$1" target="$2" parent="$3" kind="$4" root="$5" key="$6" output="$7"
+    local object="$TMP_DIR/automation-target.json" owner="$TMP_DIR/automation-parent.json" history="$TMP_DIR/automation-target-history.json"
+    local queue parent_kind=movie id_filter history_filter="$TMP_DIR/automation-protected.json"
+    [[ "$target" =~ ^[1-9][0-9]*$ && "$parent" =~ ^[1-9][0-9]*$ ]] || return 1
+    if [ "$kind" = episode ]; then queue="$SONARR_QUEUE"; parent_kind=series; id_filter="episodeId=$target"
+    else queue="$RADARR_QUEUE"; id_filter="movieIds=$target"; fi
+    # Protect entire parent while any pack/episode/movie queue item is active.
+    jq -e --arg kind "$kind" --argjson parent "$parent" 'all(.records[]; (if $kind=="episode" then .seriesId else .movieId end)!=$parent)' "$queue" >/dev/null || return 1
+    api_get "$root/$kind/$target" "$key" "$object" && api_get "$root/$parent_kind/$parent" "$key" "$owner" || return 1
+    jq -e --argjson id "$target" --argjson parent "$parent" --arg kind "$kind" '.id==$id and .monitored==true and .hasFile==false and
+      (if $kind=="episode" then .seriesId==$parent and .episodeFileId==0 and (.seasonNumber|type)=="number" and .seasonNumber>=0 and .episodeNumber>0 else .movieFileId==0 and .isAvailable==true end)' "$object" >/dev/null || return 1
+    jq -e --argjson id "$parent" --slurpfile target "$object" --arg kind "$kind" '.id==$id and .monitored==true and (.tags|length)==0 and
+      (if $kind=="episode" then any(.seasons[]?; .seasonNumber==$target[0].seasonNumber and .monitored==true) else true end)' "$owner" >/dev/null || return 1
+    local available
+    if [ "$kind" = episode ]; then available=$(date_to_epoch "$(jq -r '.airDateUtc // ""' "$object")")
+    else available=$(date_to_epoch "$(jq -r '.added // ""' "$object")"); fi
+    ((available>0 && START_TIME-available>=86400)) || return 1
+    api_get "$root/history?page=1&pageSize=1000&sortKey=date&sortDirection=descending&$id_filter" "$key" "$history" || return 1
+    jq -e --argjson id "$target" --arg kind "$kind" '.records|type=="array"' "$history" >/dev/null || return 1
+    jq -e --argjson id "$target" --arg kind "$kind" --argjson cutoff "$((START_TIME-7*86400))" '
+      .totalRecords==(.records|length) and all(.records[]; (if $kind=="episode" then .episodeId else .movieId end)==$id) and
+      all(.records[]; .eventType!="episodeFileDeleted" and .eventType!="movieFileDeleted" and .eventType!="downloadFolderImported" and
+        (.eventType!="grabbed" or ((try (.date|sub("\\.[0-9]+Z$";"Z")|fromdateiso8601) catch 0)<$cutoff)))' "$history" >/dev/null || return 1
+    # Durable import evidence remains a deletion-intent veto after native history
+    # has expired. Never search missing media that the script knows once existed.
+    if [ -f "$STATE_DIR/import-receipts.json" ]; then
+        automation_document_valid "$STATE_DIR/import-receipts.json" receipts || return 1
+        jq -e --arg app "$app" --argjson id "$target" 'all(.receipts[] | select(.app==$app); all(.targets[]; .targetId!=$id))' "$STATE_DIR/import-receipts.json" >/dev/null || return 1
+    fi
+    jq -e --arg app "$app" --argjson id "$target" 'all(.downloadLedger[]? | select(.app==$app) | select((.arrImportedAt // 0)>0 or (.arrIgnoredAt // 0)>0 or (.manuallyDismissedAt // 0)>0 or ((.arrFailedAt // 0)==0 and (.sabFailedAt // 0)==0)); all(.targets[]?; (.episodeId // .movieId // 0)!=$id))' "$STATE_FILE" >/dev/null || return 1
+    jq -n --arg app "$app" --arg kind "$kind" --argjson target "$target" --argjson parent "$parent" \
+      --slurpfile object "$object" --slurpfile owner "$owner" \
+      '{key:($app+":missing:"+($target|tostring)),app:$app,kind:"missing-search",mediaKind:$kind,targetId:$target,parentId:$parent,
+        title:($owner[0].title+" / "+($object[0].title // "missing media")),
+        identity:($object[0]|{id,seriesId,seasonNumber,episodeNumber,airDateUtc,hasFile,episodeFileId,movieFileId,monitored}),
+        owner:($owner[0]|{id,tvdbId,tmdbId,qualityProfileId,monitored,tags,seasons:[.seasons[]?|{seasonNumber,monitored}]}),
+        command:(if $kind=="episode" then {name:"EpisodeSearch",episodeIds:[$target]} else {name:"MoviesSearch",movieIds:[$target]} end)}' >"$output"
+}
+
+automation_fetch_missing() {
+    local app="$1" root="$2" key="$3" output="$4" page=1 loaded=0 total=0 records="$TMP_DIR/automation-missing-pages.jsonl" count
+    : >"$records"
+    while ((loaded<AUTOMATION_MISSING_MAX_RECORDS)); do
+        api_get "$root/wanted/missing?page=$page&pageSize=500&monitored=true" "$key" "$output" || return 1
+        jq -e '(.records|type)=="array" and (.totalRecords|type)=="number"' "$output" >/dev/null || return 1
+        total=$(jq '.totalRecords' "$output"); count=$(jq '.records|length' "$output")
+        ((total<=AUTOMATION_MISSING_MAX_RECORDS)) || return 1
+        jq -c '.records[]' "$output" >>"$records" || return 1
+        loaded=$((loaded+count)); ((loaded>=total)) && break
+        ((count>0)) || return 1; page=$((page+1))
+    done
+    jq -s --argjson total "$total" 'unique_by(.id) | select(length==$total) | {records:.,totalRecords:$total}' "$records" >"$output" || return 1
+    jq -e '.records|type=="array"' "$output" >/dev/null
+}
+
+automation_missing_searches() {
+    automation_window_open || return 0
+    local app root key wanted="$TMP_DIR/automation-wanted.json" baseline window surveyed cursor count selected="$TMP_DIR/automation-selected.json"
+    local item target parent kind candidate="$TMP_DIR/automation-missing-candidate.json" hash previous survey_error
+    window=$(TZ="$AUTOMATION_TIMEZONE" date -d "@$START_TIME" +%Y%m%d%H)
+    for app in Sonarr Radarr; do
+        surveyed=$(jq -r --arg app "$app" '.missing[$app].surveyedAt // 0' "$AUTOMATION_STATE_FILE")
+        previous=$(jq -r --arg app "$app" '.missing[$app].window // ""' "$AUTOMATION_STATE_FILE")
+        survey_error=$(jq -r --arg app "$app" '.missing[$app].surveyError // ""' "$AUTOMATION_STATE_FILE")
+        if ((START_TIME-surveyed<AUTOMATION_MISSING_SURVEY_HOURS*3600)) && [ "$previous" != "$window" ] && [ -z "$survey_error" ]; then continue; fi
+        IFS=$'\t' read -r root key < <(arr_reconciliation_connection "$app")
+        if ! automation_fetch_missing "$app" "$root" "$key" "$wanted"; then
+            automation_state_update '.missing[$app].surveyError=$error' --arg app "$app" \
+              --arg error "Native wanted/missing survey was unavailable or incomplete (maximum $AUTOMATION_MISSING_MAX_RECORDS records). No speculative searches were submitted; retry waits for the next approved window." || return 1
+            continue
+        fi
+        automation_state_update '.missing[$app].surveyError=""' --arg app "$app" || return 1
+        baseline=$(jq -r --arg app "$app" '.missing[$app].baselineAt // 0' "$AUTOMATION_STATE_FILE")
+        if ((baseline==0)); then
+            # Existing missing backlogs have unknown deletion history at deploy.
+            # Preserve them rather than redownloading something deleted in Plex.
+            automation_state_update '.missing[$app]={baselineAt:$now,baselineIds:[$wanted[0].records[].id],surveyedAt:$now,window:$window,cursor:0,selected:[]}' \
+              --arg app "$app" --argjson now "$START_TIME" --arg window "$window" --slurpfile wanted "$wanted" || return 1
+            count=$(jq '.records|length' "$wanted")
+            automation_event "missing-baseline:$app" "$app" 'Missing-media search baseline recorded' \
+              "Preserved $count pre-existing missing monitored item(s), whose prior Plex deletion intent cannot be proven. Weekly bounded searches apply to newly missing, never-imported media; existing files, deletion history, holds, queues and tags remain protected." || return 1
+            continue
+        fi
+        if [ "$previous" != "$window" ]; then
+            jq --arg app "$app" --argjson limit "$AUTOMATION_MISSING_CANDIDATES_PER_APP" --slurpfile wanted "$wanted" '
+              .missing[$app] as $m | [$wanted[0].records[] | . as $e | select(($m.baselineIds|index($e.id))==null)] as $new |
+              (if ($new|length)==0 then [] else ($m.cursor % ($new|length)) as $start | ($new[$start:]+$new[:$start])[:$limit] end)' "$AUTOMATION_STATE_FILE" >"$selected" || return 1
+            automation_state_update '.missing[$app].selected=$selected[0] | .missing[$app].window=$window | .missing[$app].surveyedAt=$now | .missing[$app].cursor=((.missing[$app].cursor // 0)+$limit)' \
+              --arg app "$app" --arg window "$window" --argjson now "$START_TIME" --argjson limit "$AUTOMATION_MISSING_CANDIDATES_PER_APP" --slurpfile selected "$selected" || return 1
+        fi
+        while IFS= read -r item; do
+            runtime_budget_allows_optional_phase automation-missing-search || return 0
+            automation_action_budget || return 0
+            target=$(jq -r '.id' <<<"$item")
+            if [ "$app" = Sonarr ]; then parent=$(jq -r '.seriesId' <<<"$item"); kind=episode; else parent="$target"; kind=movie; fi
+            jq -e --arg app "$app" --argjson target "$target" --argjson cutoff "$((START_TIME-7*86400))" 'all(.actions[]; .app!=$app or .kind!="missing-search" or .targetId!=$target or .startedAt<$cutoff)' "$AUTOMATION_STATE_FILE" >/dev/null || continue
+            automation_build_missing_candidate "$app" "$target" "$parent" "$kind" "$root" "$key" "$candidate" || continue
+            hash=$(jq -Sc 'del(.identity.lastSearchTime,.owner.statistics,.owner.nextAiring,.owner.previousAiring)' "$candidate" | sha256sum | awk '{print $1}')
+            automation_observe_candidate "$app:missing:$target" "$hash" || continue
+            # Repeat the exact current monitoring, history, queue and native-file
+            # checks immediately before the one bounded search submission.
+            fetch_arr_queue "$app" "$root" "$key" "$TMP_DIR/automation-current-queue.json" || continue
+            if [ "$app" = Sonarr ]; then cp "$TMP_DIR/automation-current-queue.json" "$SONARR_QUEUE"; else cp "$TMP_DIR/automation-current-queue.json" "$RADARR_QUEUE"; fi
+            automation_build_missing_candidate "$app" "$target" "$parent" "$kind" "$root" "$key" "$candidate" || continue
+            if ! automation_submit_command "$candidate" "$root" "$key"; then
+                if jq -e 'any(.actions[]; .status=="intent")' "$AUTOMATION_STATE_FILE" >/dev/null; then return 0; fi
+            fi
+        done < <(jq -c --arg app "$app" '.missing[$app].selected[]?' "$AUTOMATION_STATE_FILE")
+    done
+}
+
+automation_import_retries() {
+    automation_window_open || return 0
+    local app queue item id root key reasons candidate="$TMP_DIR/automation-retry-candidate.json" sab="$TMP_DIR/automation-retry-sab.json"
+    local added completed count last hash path target parent kind command allowed_root
+    for app in Sonarr Radarr; do
+        case "$app" in Sonarr) queue="$SONARR_QUEUE";kind=episode;command=DownloadedEpisodesScan;; Radarr) queue="$RADARR_QUEUE";kind=movie;command=DownloadedMoviesScan;; esac
+        while IFS= read -r item; do
+            automation_action_budget || return 0
+            id=$(jq -r '.downloadId // ""|ascii_downcase' <<<"$item")
+            [[ "$id" =~ ^[a-z0-9-]+$ ]] || continue
+            # Only explicit transient locks/busy conditions qualify. Mixed
+            # policy, permission, disk-space, identity and unknown reasons hold.
+            jq -e '(.protocol|ascii_downcase)=="usenet" and .status=="completed" and (.trackedDownloadState=="importPending" or .trackedDownloadState=="importBlocked") and
+              ([.statusMessages[]?.messages[]?] as $m | ($m|length)>0 and all($m[]; test("being used by another process|sharing violation|resource (temporarily unavailable|busy)|temporarily locked";"i")) and
+                all($m[]; (test("custom format|not an upgrade|permission|denied|disk|space|unmatched|unknown";"i")|not)))' <<<"$item" >/dev/null || continue
+            count=$(jq --arg id "$id" '[.actions[]|select(.kind=="import-retry" and .downloadId==$id)]|length' "$AUTOMATION_STATE_FILE")
+            ((count<AUTOMATION_IMPORT_RETRY_MAX_ATTEMPTS)) || continue
+            last=$(jq --arg id "$id" '[.actions[]|select(.kind=="import-retry" and .downloadId==$id)|.startedAt]|max // 0' "$AUTOMATION_STATE_FILE")
+            jq -e --arg id "$id" 'all(.queue.slots[]?; (.nzo_id|ascii_downcase)!=$id)' "$SAB_QUEUE" >/dev/null || continue
+            jq --arg id "$id" '[.history.slots[]?|select((.nzo_id|ascii_downcase)==$id and .status=="Completed")]|select(length==1)|.[0]' "$SAB_HISTORY" >"$sab" || continue
+            completed=$(jq -r '.completed|tonumber? // 0' "$sab"); added=$(date_to_epoch "$(jq -r '.added // ""' <<<"$item")")
+            ((completed>0 && added>0 && START_TIME-completed>=6*3600 && START_TIME-added>=6*3600)) || continue
+            path=$(jq -r '.outputPath // ""' <<<"$item")
+            allowed_root="$AUTOMATION_RADARR_COMPLETE_ROOT"; [ "$app" != Sonarr ] || allowed_root="$AUTOMATION_SONARR_COMPLETE_ROOT"
+            [[ "$path" == "${allowed_root%/}/"* && "$path" != *'/../'* && "$path" != */.. && "$path" != *$'\n'* ]] || continue
+            # Exact download-target history is required; no title-only retry.
+            IFS=$'\t' read -r root key < <(arr_reconciliation_connection "$app")
+            fetch_arr_history_by_download_id "$app" "$id" "$TMP_DIR/automation-retry-history.json" || continue
+            target=$(jq -r '(.episodeId // .movieId // 0)' <<<"$item"); parent=$(jq -r '(.seriesId // .movieId // 0)' <<<"$item")
+            [[ "$target" =~ ^[1-9][0-9]*$ && "$parent" =~ ^[1-9][0-9]*$ ]] || continue
+            jq -e --arg id "$id" --arg kind "$kind" --argjson target "$target" --argjson parent "$parent" '
+              .totalRecords==(.records|length) and any(.records[]; .eventType=="grabbed" and (.downloadId|ascii_downcase)==$id and
+                (if $kind=="episode" then .episodeId==$target and .seriesId==$parent else .movieId==$target end)) and
+              all(.records[]; .eventType!="downloadFolderImported" and .eventType!="downloadFailed" and .eventType!="downloadIgnored")' "$TMP_DIR/automation-retry-history.json" >/dev/null || continue
+            local object="$TMP_DIR/automation-retry-object.json" owner="$TMP_DIR/automation-retry-owner.json" owner_kind=movie
+            [ "$kind" != episode ] || owner_kind=series
+            api_get "$root/$kind/$target" "$key" "$object" && api_get "$root/$owner_kind/$parent" "$key" "$owner" || continue
+            jq -e --argjson id "$target" --argjson parent "$parent" --arg kind "$kind" '.id==$id and .monitored==true and
+              (if $kind=="episode" then .seriesId==$parent else true end)' "$object" >/dev/null || continue
+            jq -e --argjson id "$parent" --arg kind "$kind" --slurpfile object "$object" '.id==$id and .monitored==true and (.tags|length)==0 and
+              (if $kind=="episode" then any(.seasons[]?; .seasonNumber==$object[0].seasonNumber and .monitored==true) else true end)' "$owner" >/dev/null || continue
+            printf '%s' "$item" >"$TMP_DIR/automation-retry-item.json"
+            jq -n --arg app "$app" --arg id "$id" --arg path "$path" --arg command "$command" --arg kind "$kind" \
+              --argjson target "$target" --argjson parent "$parent" --slurpfile object "$object" --slurpfile owner "$owner" --slurpfile queue "$TMP_DIR/automation-retry-item.json" \
+              '{key:($app+":retry:"+$id),app:$app,kind:"import-retry",downloadId:$id,mediaKind:$kind,targetId:$target,parentId:$parent,
+                title:$queue[0].title,reason:[$queue[0].statusMessages[]?.messages[]?],
+                identity:($object[0]|{id,seriesId,seasonNumber,episodeNumber,hasFile,episodeFileId,movieFileId,monitored}),
+                parentExternalId:(if $kind=="episode" then ($owner[0].tvdbId // 0) else ($owner[0].tmdbId // 0) end),
+                queueProof:($queue[0]|{id,downloadId,outputPath,status,trackedDownloadState,statusMessages,episodeId,movieId,seriesId}),
+                command:{name:$command,path:$path,downloadClientId:$id,importMode:"Auto"}}' >"$candidate" || return 1
+            hash=$(jq -Sc . "$candidate" | sha256sum | awk '{print $1}')
+            automation_observe_candidate "$app:retry:$id" "$hash" || continue
+            ((START_TIME-last>=4*3600)) || continue
+            # Native Auto import still evaluates every file under Arr's own
+            # policy; it never means forced/manual import or policy override.
+            if ! automation_submit_command "$candidate" "$root" "$key"; then
+                if jq -e 'any(.actions[]; .status=="intent")' "$AUTOMATION_STATE_FILE" >/dev/null; then return 0; fi
+            fi
+        done < <(jq -c '.records[]?|select(any(.statusMessages[]?.messages[]?;test("another process|sharing violation|resource|temporarily locked";"i")))' "$queue")
+    done
+}
+
+automation_reconcile_commands() {
+    local action id app root key command status file="$TMP_DIR/automation-recover-action.json"
+    while IFS= read -r action; do
+        runtime_budget_allows_optional_phase automation-command-readback || return 0
+        id=$(jq -r '.key' <<<"$action"); printf '%s' "$action" | jq '.value' >"$file"
+        automation_state_update '.actions[$id].commandCheckedAt=$now' --arg id "$id" --argjson now "$START_TIME" || return 1
+        app=$(jq -r '.app' "$file"); command=$(jq -r '.commandId // 0' "$file")
+        IFS=$'\t' read -r root key < <(arr_reconciliation_connection "$app")
+        if automation_command_readback "$file" "$root" "$key" "$command"; then
+            status=$(jq -r '.status' "$TMP_DIR/automation-command.json")
+            case "$status" in failed|completed) ;; *) status=accepted;; esac
+            local native_message
+            native_message=$(jq -r '(.exception.message // .message // "")|tostring|.[0:2000]' "$TMP_DIR/automation-command.json")
+            automation_state_update '.actions[$id].status=$status | .actions[$id].nativeMessage=$message | .actions[$id].lastVerifiedStatus=$status' --arg message "$native_message" --arg id "$id" --arg status "$status" || return 1
+        else
+            automation_state_update '.actions[$id].lastVerifiedStatus=(.actions[$id].lastVerifiedStatus // .actions[$id].status) | .actions[$id].status="intent"' --arg id "$id" || return 1
+        fi
+    done < <(jq -c '[.actions|to_entries[]|select((.value.status=="intent" or .value.status=="accepted") and .value.outcome!="import_verified")]|sort_by(.value.commandCheckedAt // 0)|.[:4][]' "$AUTOMATION_STATE_FILE")
+}
+
+automation_report() {
+    local issue action id app title detail status signature sent record file
+    while IFS= read -r issue; do
+        app=$(jq -r '.app' <<<"$issue"); detail=$(jq -r '.error' <<<"$issue")
+        record_normalized_issue "Monitor:missing-survey:$app" Monitor "$app missing-media survey unavailable" ARR_AUTOMATION_SURVEY WARNING unavailable \
+          'Complete native missing-media survey could not be obtained' 0 "$detail"
+    done < <(jq -c '.missing|to_entries[]|select((.value.surveyError // "")!="")|{app:.key,error:.value.surveyError}' "$AUTOMATION_STATE_FILE")
+    while IFS= read -r issue; do
+        app=$(jq -r '.app' <<<"$issue"); id=$(jq -r '.id' <<<"$issue"); title=$(jq -r '.title' <<<"$issue"); detail=$(jq -r '.reason' <<<"$issue")
+        record_normalized_issue "PROFILE:$app:$id" "$app" "$title" ARR_PROFILE_CONFIGURATION WARNING invalid "$detail" 0 \
+          "$detail. Automated actions are held; no profile, score, monitoring or download data was changed. Correct the source Recyclarr configuration or native profile."
+    done < <(jq -c '.profiles|to_entries[]|.key as $app|.value.issues[]?|.+{app:$app}' "$AUTOMATION_STATE_FILE")
+    while IFS= read -r record; do
+        id=$(jq -r '.key' <<<"$record"); app=$(jq -r '.value.app' <<<"$record"); title=$(jq -r '.value.title' <<<"$record"); detail=$(jq -r '.value.detail' <<<"$record")
+        signature=$(printf '%s' "$detail" | sha256sum | awk '{print $1}')
+        sent=$(jq -r --arg id "$id" '.monitor.automationNotifications[$id] // ""' "$STATE_FILE")
+        [ "$sent" = "$signature" ] || queue_group_notification "AUTO:EVENT:$id" "$signature" "$app" "$title" ARR_AUTOMATION INFO 0 "$detail" reconciled
+    done < <(jq -c --slurpfile state "$STATE_FILE" '.events|to_entries[]|select(($state[0].monitor.automationNotifications[.key] // "")!=.value.signature)' "$AUTOMATION_STATE_FILE")
+    while IFS= read -r action; do
+        id=$(jq -r '.key' <<<"$action"); printf '%s' "$action" | jq '.value' >"$TMP_DIR/automation-report-action.json"
+        file="$TMP_DIR/automation-report-action.json"
+        app=$(jq -r '.app' "$file"); title=$(jq -r '.title' "$file"); status=$(jq -r '.status' "$file")
+        detail="Action: $(jq -r '.kind' "$file"); exact $app target $(jq -r '.targetId' "$file")."$'\n'
+        detail+="Checkpoint: $status; native command ID: $(jq -r '.commandId // "unverified"' "$file")."$'\n'
+        if [ "$(jq -r '.kind' "$file")" = import-retry ]; then
+            detail+="Download ID: $(jq -r '.downloadId' "$file"); path: $(jq -r '.command.path' "$file")."$'\n'
+            detail+="Original warning: $(jq -r '.reason|join("; ")' "$file")."$'\n'
+        else
+            detail+="Monitored missing target passed queue/history/deletion/hold checks. Pre-existing missing backlog entries were preserved."$'\n'
+        fi
+        if [ -n "$(jq -r '.nativeMessage // ""' "$file")" ]; then
+            detail+="Arr result: $(jq -r '.nativeMessage' "$file")."$'\n'
+        fi
+        detail+="Native request: $(jq -r '.command.name' "$file"), under the existing profile/monitoring policy. Payloads and library files were not deleted; no profile was lowered and no forced import was requested."$'\n'
+        detail+="A completed search/scan command does not prove an import; the normal exact-download reconciliation continues independently."
+        if [ "$(jq -r '.outcome' "$file")" = import_verified ]; then
+            detail+=$'\n'"Eventual exact-target import verified on two scans; Arr file ID $(jq -r '.verifiedFileId' "$file"). No command was replayed to infer this result."
+        fi
+        if [ "$status" = failed ]; then
+            record_normalized_issue "AUTO:ACTION:$id" "$app" "$title" ARR_AUTOMATION_COMMAND_FAILED WARNING failed \
+              'Arr reported that the bounded command failed' 0 "$detail No immediate retry was submitted; original queue warnings and attempt limits remain in force."
+        elif [ "$status" = intent ]; then
+            record_normalized_issue "AUTO:ACTION:$id" "$app" "$title" ARR_AUTOMATION_UNCERTAIN WARNING intent \
+              'Command outcome is unverified; no automatic replay allowed' 0 "$detail Request may have succeeded before a timeout; new automated mutations are held pending verification."
+        else
+            signature="action:submitted:$(jq -r '.outcome // "pending"' "$file")"
+            sent=$(jq -r --arg id "$id" '.monitor.automationNotifications[$id] // ""' "$STATE_FILE")
+            [ "$sent" = "$signature" ] || queue_group_notification "AUTO:EVENT:$id" "$signature" "$app" "$title" ARR_AUTOMATION INFO 0 "$detail" reconciled
+        fi
+    done < <(jq -c --slurpfile state "$STATE_FILE" '.actions|to_entries[]|select(.value.status=="intent" or .value.status=="failed" or ($state[0].monitor.automationNotifications[.key] // "")!=("action:submitted:"+(.value.outcome // "pending")))' "$AUTOMATION_STATE_FILE")
+}
+
+process_arr_automation() {
+    [ -f "${AUTOMATION_STATE_FILE:-}" ] && automation_document_valid "$AUTOMATION_STATE_FILE" actions || return 0
+    if automation_api_ready; then
+        automation_reconcile_commands || return 1
+        automation_followup_imports || return 1
+    fi
+    if [ "$ARR_AUTOMATION_ENABLED" = true ] && [ "$AUTOMATION_CONTROLS_OK" = true ] && automation_window_open; then
+        automation_import_retries || true
+        automation_missing_searches || true
+    fi
+    automation_report
+}
+
 policy_disposition_matches() {
     local app="$1" id="${2,,}" item="$3" file="${POLICY_STATE_FILE:-$STATE_DIR/policy-actions.json}"
     [ -r "$file" ] || return 1
@@ -15140,6 +15806,9 @@ policy_finish_tracking() {
         status=queue_verified
     fi
     if [ "$status" = queue_verified ] && [ "$mode" = replace ]; then
+        if [ -f "${AUTOMATION_STATE_FILE:-}" ]; then
+            [ "${ARR_AUTOMATION_ENABLED:-true}" = true ] && [ "${AUTOMATION_CONTROLS_OK:-false}" = true ] && automation_window_open || return 1
+        fi
         # Re-read monitoring/identity immediately before search: a user may have
         # deleted or unmonitored the target between rejection and this step.
         target_id=$(jq -r '.targetId' <<<"$action"); kind=$(jq -r '.kind' <<<"$action")
@@ -15282,10 +15951,18 @@ process_policy_remediation() {
     while IFS= read -r action; do
         policy_finish_tracking "$action" || log 'WARNING: Policy checkpoint remains pending; payload protected'
     done < <(jq -c '.actions[] | select(.status!="done")' "$POLICY_STATE_FILE")
+    while IFS= read -r action; do
+        runtime_budget_allows_optional_phase policy-replacement-followup || break
+        policy_check_replacement "$action" || log 'WARNING: Replacement follow-up unavailable; import not inferred'
+    done < <(jq -c --argjson now "$START_TIME" '[.actions[] | select(.status=="done" and .mode=="replace" and
+      (.replacementState // "")!="import_verified" and $now >= (.replacementCheckedAt // 0)+3600)] |
+      sort_by(.replacementCheckedAt // 0) | .[:4][]' "$POLICY_STATE_FILE")
     # Any ambiguous previous mutation blocks NEW actions globally.
     if jq -e 'any(.actions[]; .status!="done")' "$POLICY_STATE_FILE" >/dev/null; then
         policy_report_actions; return 0
     fi
+    if [ "${ARR_AUTOMATION_ENABLED:-true}" != true ] || [ "${AUTOMATION_CONTROLS_OK:-true}" != true ]; then policy_report_actions; return 0; fi
+    if [ -f "${AUTOMATION_STATE_FILE:-}" ] && ! automation_window_open; then policy_report_actions; return 0; fi
     total=$(jq -s '[.[].records[]? | select(any(.statusMessages[]?.messages[]?; test("custom format|not an upgrade|not a quality revision";"i")))]|length' "$SONARR_QUEUE" "$RADARR_QUEUE")
     if (( total>POLICY_BURST_LIMIT )); then
         record_normalized_issue POLICY:burst Monitor 'Policy automation held' ARR_POLICY_AUTOMATION WARNING burst \
@@ -15305,6 +15982,7 @@ process_policy_remediation() {
             mode=$(jq -r '.mode' "$TMP_DIR/policy-candidate.json")
             fingerprint=$(jq -Sc 'del(.parent.statistics,.parent.nextAiring,.parent.previousAiring,.target.statistics,.queue.estimatedCompletionTime,.queue.timeleft)' "$TMP_DIR/policy-candidate.json" | sha256sum | awk '{print $1}')
             policy_observe "$id" "$fingerprint" || continue
+            if [ -f "${AUTOMATION_STATE_FILE:-}" ]; then automation_action_budget || break; fi
             (( count<POLICY_MAX_ACTIONS_PER_RUN )) || break
             daily=$(jq --argjson since "$((START_TIME-86400))" '[.actions[]|select(.startedAt>=$since)]|length' "$POLICY_STATE_FILE")
             (( daily<POLICY_MAX_ACTIONS_PER_DAY )) || break
@@ -15337,14 +16015,17 @@ process_policy_remediation() {
     for queue in "$SONARR_QUEUE" "$RADARR_QUEUE"; do
         jq --slurpfile p "$POLICY_STATE_FILE" '.records |= map(select($p[0].actions[((.downloadId // "")|ascii_downcase)].status!="done")) | .totalRecords=(.records|length)' "$queue" >"$qtmp" && mv "$qtmp" "$queue" || return 1
     done
-    while IFS= read -r action; do
-        runtime_budget_allows_optional_phase policy-replacement-followup || break
-        policy_check_replacement "$action" || log 'WARNING: Replacement follow-up unavailable; import not inferred'
-    done < <(jq -c --argjson now "$START_TIME" '[.actions[] | select(.status=="done" and .mode=="replace" and
-      (.replacementState // "")!="import_verified" and $now >= (.replacementCheckedAt // 0)+3600)] |
-      sort_by(.replacementCheckedAt // 0) | .[:4][]' "$POLICY_STATE_FILE")
     policy_report_actions
 }
+
+# /bin/bash SCRIPT --automation-status: read-only action/hold/search baseline summary.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --automation-status ]]; then
+    if [ -f "$STATE_DIR/automation-actions.json" ]; then
+        jq '{profiles,missing:(.missing|with_entries(.value |= {baselineAt,baselineCount:(.baselineIds|length),surveyedAt,window,cursor,selectedIds:[.selected[]?.id]})),
+          actionCount:(.actions|length),recentActions:([.actions[]|{app,kind,targetId,downloadId,status,outcome,commandId,startedAt}]|sort_by(.startedAt)|reverse|.[:50])}' "$STATE_DIR/automation-actions.json"
+    else printf 'No automation state recorded.\n'; fi
+    exit $?
+fi
 
 # Policy action inventory:
 # /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script --policy-actions
@@ -15514,7 +16195,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.12.0"
+    "START | ARR Health Monitor v3.13.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -15527,7 +16208,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.12.0"
+debug_log "Starting ARR Health Monitor v3.13.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -15855,10 +16536,20 @@ end_monitor_phase "service-collection"
 # UNIFIED HEALTH / QUEUE PROCESSING
 ###############################################################################
 
+start_monitor_phase "automation-controls"
+automation_prepare || log 'WARNING: Automation controls unavailable; new actions held'
+end_monitor_phase "automation-controls"
+
 if runtime_budget_allows_optional_phase "policy-remediation"; then
     start_monitor_phase "policy-remediation"
     process_policy_remediation || log "WARNING: Policy automation stopped; review grouped report and journal"
     end_monitor_phase "policy-remediation"
+fi
+
+if runtime_budget_allows_optional_phase "arr-automation"; then
+    start_monitor_phase "arr-automation"
+    process_arr_automation || log 'WARNING: Arr automation deferred or awaits verification'
+    end_monitor_phase "arr-automation"
 fi
 
 start_monitor_phase "issue-evaluation"
@@ -15999,6 +16690,12 @@ then
     end_monitor_phase "activity-audit"
 fi
 
+if runtime_budget_allows_optional_phase "import-receipts"; then
+    start_monitor_phase "import-receipts"
+    capture_durable_import_receipts || log 'WARNING: Durable import receipt capture stopped; prior proof preserved'
+    end_monitor_phase "import-receipts"
+fi
+
 if runtime_budget_allows_optional_phase "download-ledger-reconciliation"; then
     start_monitor_phase "download-ledger-reconciliation"
     process_exact_download_ledger || true
@@ -16130,7 +16827,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.12.0 completed"
+log "ARR Health Monitor v3.13.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""

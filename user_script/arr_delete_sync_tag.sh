@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Sonarr + Radarr - Plex Delete Sync and Tagger v2.3.0
+# Sonarr + Radarr - Plex Delete Sync and Tagger v2.4.0
 #
 # Once-daily, persistent-state deletion confirmation for Sonarr and Radarr.
 # Sonarr unmonitors confirmed deleted episodes/seasons and can retire a fully
@@ -15,7 +15,7 @@ umask 077
 # Release version for logs, notifications, and the HTTP User-Agent. State-file
 # version fields below are independent schema versions and must not be changed
 # merely when this release version changes.
-readonly SCRIPT_VERSION="2.3.0"
+readonly SCRIPT_VERSION="2.4.0"
 
 ###############################################################################
 # CONFIGURATION
@@ -155,6 +155,10 @@ MAX_SIDECAR_SIZE_MB=100
 # Files outside the built-in and configured sets are never moved; they become
 # classified folder blockers. Keep this comma-separated and extension-only.
 EXTRA_SIDECAR_EXTENSIONS="xml,json,txt,sfv,md5,sha1,sha256,url,webp"
+# Exact named Kodi actor/extra-artwork and OS-cache files may be captured only
+# after content signature checks. Newly recognized files still need two stable
+# path/size/hash observations; unknown files and remaining videos stay blocked.
+AUTO_RECOGNIZE_KNOWN_AUXILIARY=true
 
 # An unchanged blocker is notified once, when its contents change, when it is
 # resolved, and at this low-frequency reminder interval.
@@ -911,6 +915,34 @@ is_video_extension() {
     return 1
 }
 
+# Recognize only named Kodi artwork directories and named OS cache files.
+# A matching suffix alone is insufficient: check the binary/content signature.
+is_known_auxiliary_sidecar() {
+    local relative="${2,,}" file="$3" header name="${2##*/}" directory="${2%/*}"
+    [[ "$AUTO_RECOGNIZE_KNOWN_AUXILIARY" == true && -f "$file" && ! -L "$file" ]] || return 1
+    name="${relative##*/}"; directory="${relative%/*}"
+    header=$(od -An -tx1 -N12 -- "$file" | tr -d ' \n') || return 1
+    case "$relative" in
+        .ds_store) [[ "$header" == 0000000142756431* ]] ;;
+        thumbs.db) [[ "$header" == d0cf11e0a1b11ae1* ]] ;;
+        desktop.ini)
+            [[ $(file_size_bytes "$file") -le 16384 ]] &&
+              LC_ALL=C grep -Eq '^\[\.ShellClassInfo\][[:space:]]*$' "$file"
+            ;;
+        .actors/*|actors/*|extrafanart/*|extrathumbs/*)
+            # No recursive directory rule: arbitrary nested content stays blocked.
+            [[ "${directory,,}" == .actors || "${directory,,}" == actors || "${directory,,}" == extrafanart || "${directory,,}" == extrathumbs ]] || return 1
+            case "${name##*.}" in
+                jpg|jpeg|tbn) [[ "$header" == ffd8ff* ]] ;;
+                png) [[ "$header" == 89504e470d0a1a0a* ]] ;;
+                webp) [[ "$header" == 52494646????????57454250 ]] ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 classify_cleanup_entry() {
     local app_name="$1"
     local relative="$2"
@@ -951,6 +983,10 @@ classify_cleanup_entry() {
        [[ "$app_name" == sonarr &&
           "$name" =~ ^season([0-9]{2,}|-all|-specials)-(poster|banner|fanart|landscape|thumb)\.(jpg|jpeg|png|webp)$ ]]; then
         printf 'recognized-artwork'
+        return
+    fi
+    if is_known_auxiliary_sidecar "$app_name" "$relative" "$entry"; then
+        printf 'known-auxiliary-awaiting-confirmation'
         return
     fi
     printf 'unknown-file'
@@ -1044,7 +1080,7 @@ capture_kodi_sidecars() {
     local media_root="$3"
     local media_relative_paths="$4"
     local media_real relative lower name rel_dir file_name stem candidate
-    local file size size_after hash eligible capture_failed=0
+    local file size size_after hash eligible capture_failed=0 allow_auxiliary="${5:-false}"
     local files='[]'
     local type extension
     local -A exact_paths=()
@@ -1128,6 +1164,9 @@ capture_kodi_sidecars() {
                 eligible=true
             fi
         fi
+        if [[ "$eligible" == false && "$allow_auxiliary" == true ]] && is_known_auxiliary_sidecar "$app_name" "$relative" "$file"; then
+            eligible=true
+        fi
         [[ "$eligible" == true ]] || continue
 
         size="$(file_size_bytes "$file")" || {
@@ -1184,7 +1223,7 @@ build_sidecar_cleanup_plan() {
     fi
 
     current_file="$(mktemp "$RUNTIME_DIR/.sidecars.late-current.XXXXXX")" || return 1
-    if ! capture_kodi_sidecars "$app_name" "$media_path" "$media_root" '[]' \
+    if ! capture_kodi_sidecars "$app_name" "$media_path" "$media_root" '[]' true \
         > "$current_file"; then
         rm -f -- "$current_file"
         return 1
@@ -3619,7 +3658,7 @@ validate_common_configuration() {
         printf 'Unsafe RUNTIME_DIR: %s\n' "$RUNTIME_DIR" >&2
         return 1
     }
-    for command in curl jq mktemp stat sort cut tr cp mv find grep pgrep chown chmod wc \
+    for command in od curl jq mktemp stat sort cut tr cp mv find grep pgrep chown chmod wc \
         realpath sha256sum dirname rmdir flock sync; do
         command -v "$command" >/dev/null 2>&1 || {
             printf 'Required command not found: %s\n' "$command" >&2
