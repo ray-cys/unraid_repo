@@ -177,6 +177,12 @@ else
     # for the production /mnt/user prefix.
     eval "$(declare -f validate_configuration | sed "s#/mnt/user/#$TEST_ROOT/#g")"
     mountpoint() { return 0; }
+    saved_jobs=("${BACKUP_JOBS[@]}")
+    for reserved_label in manifests completed.txt .owner; do
+        BACKUP_JOBS=("$reserved_label|$src")
+        if validate_configuration >/dev/null 2>&1; then fail 'reserved metadata label accepted'; fi
+    done
+    BACKUP_JOBS=("${saved_jobs[@]}")
     SHUTDOWN_REMOTE_ON_SUCCESS=false
     LOCK_FILE="$TEST_ROOT/vault.local.lock"
     STATUS_DIR="$TEST_ROOT/vault-main-status"

@@ -426,7 +426,7 @@ validate_configuration() {
 
     for job in "${BACKUP_JOBS[@]}"; do
         IFS='|' read -r label source <<<"$job"
-        [[ "$label" != . && "$label" != .. && -z "${seen_labels[$label]:-}" && "$label" =~ ^[A-Za-z0-9._-]+$ ]] || {
+        [[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$label" != manifests && "$label" != completed.txt && -z "${seen_labels[$label]:-}" ]] || {
             log ERROR "Unsafe backup label: $label"
             return 1
         }
