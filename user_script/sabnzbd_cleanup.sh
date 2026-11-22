@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# SABnzbd Cleanup v2.3.0
+# SABnzbd Cleanup v2.4.0
 #
 # PURPOSE
 # -------
@@ -65,7 +65,7 @@ set -uo pipefail
 # CONFIGURATION
 ###############################################################################
 
-VERSION="2.3.0"
+VERSION="2.4.0"
 
 # ---------------------------------------------------------------------------
 # Execution behavior
@@ -152,6 +152,9 @@ SAB_API_KEY="${SAB_API_KEY:-PUT_YOUR_SABNZBD_API_KEY_HERE}"
 
 # Host-visible completed download layout. These defaults match the repository's
 # arr_health_activity.sh configuration.
+# Only the monitor-generated verified dispositions can authorize rejected-payload quarantine.
+POLICY_DISPOSITION_FILE="${POLICY_DISPOSITION_FILE:-/mnt/vault/cloud/logs/script/arr_health_activity/policy-actions.json}"
+
 SAB_COMPLETE_ROOT="${SAB_COMPLETE_ROOT:-/mnt/user/media/net/complete}"
 
 SAB_MOVIE_CATEGORY="${SAB_MOVIE_CATEGORY:-movie}"
@@ -289,7 +292,7 @@ is_false() {
 }
 
 OPS_SCRIPT_NAME="arr_sabnzbd_cleanup"
-OPS_SCRIPT_VERSION="2.3.0"
+OPS_SCRIPT_VERSION="2.4.0"
 OPS_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
 OPS_ATTENTION_DETAILS=""
 OPS_ATTENTION_FILE=""
@@ -1915,6 +1918,53 @@ source_media_count() {
 # ARR IMPORT PROOF
 ###############################################################################
 
+# A policy disposition is NOT an import. Accept only this monitor's durable,
+# verified exact-ID receipt, with unchanged SAB identity and fresh Arr checks.
+# It authorizes reversible quarantine only, never removal from the library.
+verify_policy_disposition() {
+  local owner="$1" download_id="${2,,}" source_path="$3" proof_file="$4" item="$5"
+  local receipt="$TMP_DIR/policy-receipt.json" target="$TMP_DIR/policy-current-target.json" parent="$TMP_DIR/policy-current-parent.json"
+  local root key kind target_id parent_id mode file_id file endpoint resolved source_count
+  [[ -r "$POLICY_DISPOSITION_FILE" ]] || return 11
+  local item_file="$TMP_DIR/policy-sab-item.json"
+  printf '%s' "$item" >"$item_file" || return 11
+  jq -e --arg id "$download_id" --arg app "$owner" --slurpfile sab_item "$item_file" '$sab_item[0] as $item |
+    .actions[$id] | select(.downloadId==$id and .app==$app and .status=="done" and .queueVerified==true and
+      (.mode=="redundant" or .mode=="replace") and
+      .sab==($item|{nzo_id,name,storage,completed,category}))' "$POLICY_DISPOSITION_FILE" >"$receipt" || return 11
+  kind=$(jq -r '.kind' "$receipt"); target_id=$(jq -r '.targetId' "$receipt"); parent_id=$(jq -r '.parentId' "$receipt"); mode=$(jq -r '.mode' "$receipt")
+  [[ "$target_id" =~ ^[1-9][0-9]*$ && "$parent_id" =~ ^[1-9][0-9]*$ ]] || return 11
+  case "$owner:$kind" in
+    Sonarr:episode) root="${SONARR_URL%/}/api/v3"; key="$SONARR_API_KEY"; endpoint=series ;;
+    Radarr:movie) root="${RADARR_URL%/}/api/v3"; key="$RADARR_API_KEY"; endpoint=movie ;;
+    *) return 11 ;;
+  esac
+  source_count=$(source_media_count "$source_path") || return 13
+  # A second video could be a partial pack/extra required episode: preserve.
+  [[ "$source_count" =~ ^[01]$ ]] || return 13
+  arr_get "$root/$kind/$target_id" "$key" "$target" && arr_get "$root/$endpoint/$parent_id" "$key" "$parent" || return 10
+  jq -e --argjson id "$target_id" --argjson parent "$parent_id" --arg kind "$kind" --slurpfile receipt "$receipt" '.id==$id and .monitored==true and
+    (if $kind=="episode" then .seriesId==$parent and .seasonNumber==$receipt[0].target.seasonNumber and .episodeNumber==$receipt[0].target.episodeNumber else true end)' "$target" >/dev/null || return 12
+  jq -e --argjson id "$parent_id" '.id==$id and .monitored==true and (.tags|length)==0' "$parent" >/dev/null || return 12
+  local imported='[]'
+  if [[ "$mode" == redundant ]]; then
+    file_id=$(jq -r '.fileId' "$receipt"); [[ "$file_id" =~ ^[1-9][0-9]*$ ]] || return 12
+    jq -e --argjson file "$file_id" '(.episodeFileId // .movieFileId)==$file and .hasFile==true' "$target" >/dev/null || return 12
+    file="$TMP_DIR/policy-existing-file.json"
+    arr_get "$root/${kind}file/$file_id" "$key" "$file" || return 10
+    jq -e --argjson id "$file_id" --argjson parent "$parent_id" --arg kind "$kind" --slurpfile receipt "$receipt" '.id==$id and .path==$receipt[0].filePath and
+      (if $kind=="episode" then .seriesId==$parent else .movieId==$parent end)' "$file" >/dev/null || return 12
+    resolved=$(resolve_imported_path "$owner" "$(jq -r '.path' "$file")") || return 12
+    imported=$(jq -nc --arg path "$resolved" '[$path]') || return 12
+  else
+    # Rejection must still be followed by an explicitly accepted targeted search.
+    jq -e '.commandId>0' "$receipt" >/dev/null || return 11
+  fi
+  jq -n --arg owner "$owner" --arg id "$download_id" --argjson paths "$imported" --argjson count "$source_count" --slurpfile receipt "$receipt" \
+    '{proofKind:"policy-disposition",owner:$owner,downloadId:$id,policyReceipt:$receipt[0],importEvents:0,
+      latestGrabEpoch:0,verifiedImportedPaths:($paths|length),remainingSourceMediaFiles:$count,importedPaths:$paths}' >"$proof_file"
+}
+
 verify_arr_import() {
   local owner="$1"
   local download_id="$2"
@@ -2026,6 +2076,11 @@ proof_paths_still_valid() {
     (( size > 0 )) || return 1
   done < <(jq -r '.importedPaths[]?' "$proof_file")
 
+  if jq -e '.proofKind=="policy-disposition" and .policyReceipt.mode=="replace"' "$proof_file" >/dev/null; then
+    # Missing-media rejection has no imported destination. It remains protected
+    # by the exact receipt, single-video inventory, path-idle and fresh queues.
+    return 0
+  fi
   jq -e '.importedPaths | length > 0' "$proof_file" >/dev/null 2>&1
 }
 
@@ -2386,6 +2441,10 @@ process_completed_jobs() {
     proof_file="$TMP_DIR/proof_${SCANNED}.json"
     verify_arr_import "$owner" "$download_id" "$source_path" "$proof_file"
     proof_status=$?
+    if [[ "$proof_status" == 11 ]]; then
+      verify_policy_disposition "$owner" "$download_id" "$source_path" "$proof_file" "$item"
+      proof_status=$?
+    fi
 
     case "$proof_status" in
       0) ;;
@@ -2476,7 +2535,7 @@ process_completed_jobs() {
     if (( quarantine_status == 0 )); then
       ((QUARANTINED++)) || true
       ((BYTES_QUARANTINED += size)) || true
-      QUARANTINE_DETAILS+=("Quarantined [$owner] $job_name: $source_path -> $LAST_QUARANTINE_DESTINATION ($(bytes_human "$size")); exact import proof and queue protections passed.")
+      QUARANTINE_DETAILS+=("Quarantined [$owner] $job_name: $source_path -> $LAST_QUARANTINE_DESTINATION ($(bytes_human "$size")); $(jq -r 'if .proofKind=="policy-disposition" then "verified policy disposition (not an import)" else "exact import proof" end' "$proof_file") and fresh queue protections passed.")
 
       if is_true "$DRY_RUN"; then
         log "INFO" "Action: dry-run candidate only"

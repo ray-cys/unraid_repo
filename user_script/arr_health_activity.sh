@@ -1,11 +1,11 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.11.0
+# ARR Health / Download / Import Monitor v3.12.0
 #
 # PURPOSE
 # -------
-# Read-only monitoring of Sonarr, Radarr, and the Usenet -> Arr workflow:
+# Monitoring and guarded policy remediation for Sonarr, Radarr, and Usenet:
 #
 #   SABnzbd
 #      |
@@ -143,6 +143,7 @@
 #
 # ARR-SIDE DETECTION
 # ------------------
+#   CF_REJECT_MINIMUM
 #   CF_REJECT_LOWER_SCORE
 #   CF_REJECT_EQUAL_SCORE
 #   CF_REJECT
@@ -636,6 +637,22 @@ SAB_REQUIRED_MOUNT="/mnt/user"
 SAB_FILESYSTEM_GUARD_ENABLED=true
 MOVER_GUARD_ENABLED=true
 MOVER_PROCESS_PATTERN='(^|/)(mover|mover\.old)( |$)|mover\.php'
+
+# Automated policy handling: no forced imports, profile changes, payload deletion,
+# series searches, or pack handling. Disable to retain monitoring-only behavior.
+# Six hours includes the four-hour import batch plus a two-hour grace period.
+# Two stable observations at least four minutes apart are mandatory.
+# Any tag on the movie/series protects it from automation (deletion/hold intent).
+# Limits apply across both apps; replacement is at most once/target/7 days,
+# three times/30 days. A burst or uncertain mutation stops new actions.
+POLICY_AUTOMATION_ENABLED=true
+POLICY_GRACE_HOURS=6
+POLICY_MAX_ACTIONS_PER_RUN=2
+POLICY_MAX_ACTIONS_PER_DAY=4
+POLICY_BURST_LIMIT=5
+# Alert if preserved rejected payloads still await cleanup after its normal
+# 336-hour eligibility window plus 48 hours; adjust if that threshold changes.
+POLICY_CLEANUP_EXPECTED_HOURS=384
 
 STATE_FILE="${STATE_DIR}/state.json"
 STATE_BACKUP="${STATE_DIR}/state.json.bak"
@@ -2985,6 +3002,10 @@ classify_issue() {
        'custom format|customformat|custom-format|format score'
     then
 
+        if [[ "$combined" =~ below.*profile.minimum ]]; then
+            echo "CF_REJECT_MINIMUM"
+            return
+        fi
         new_score=$(extract_cf_new_score "$message")
         existing_score=$(extract_cf_existing_score "$message")
 
@@ -3216,6 +3237,7 @@ is_policy_rejection() {
         CF_REJECT_LOWER_SCORE|\
         CF_REJECT_EQUAL_SCORE|\
         CF_REJECT|\
+        CF_REJECT_MINIMUM|\
         UPGRADE_REJECT)
 
             return 0
@@ -3294,6 +3316,7 @@ classification_min_age() {
         CF_REJECT_LOWER_SCORE|\
         CF_REJECT_EQUAL_SCORE|\
         CF_REJECT|\
+        CF_REJECT_MINIMUM|\
         UPGRADE_REJECT|\
         TBA_METADATA|\
         WARNING|\
@@ -3356,6 +3379,10 @@ classification_reason() {
 
         CF_REJECT_EQUAL_SCORE)
             echo "Downloaded release has the same Custom Format score and is not considered an upgrade.${escalation}"
+            ;;
+
+        CF_REJECT_MINIMUM)
+            echo "Release custom-format score is below the quality profile minimum"
             ;;
 
         CF_REJECT)
@@ -5242,6 +5269,7 @@ reminder_policy_for_classification() {
         # remain visible in state/logs after the reminder budget is exhausted.
         ACTIVITY_FLOW_ANOMALY|\
         CF_REJECT|\
+        CF_REJECT_MINIMUM|\
         CF_REJECT_*|\
         UPGRADE_REJECT|\
         TBA_METADATA|\
@@ -5475,6 +5503,8 @@ mark_notified() {
                 )
             else .
             end
+        elif ($key|startswith("POLICY:ACTION:")) then
+            .monitor.policyNotifications[($key|ltrimstr("POLICY:ACTION:"))]=$signature
         elif .issues[$key] then
             .issues[$key].notifiedSignature = $signature
             |
@@ -6530,7 +6560,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.11.0 lifecycle commands' \
+        'ARR Health Monitor v3.12.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -6540,6 +6570,7 @@ print_lifecycle_command_help() {
         '  /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script COMMAND' \
         '' \
         'Inspect and manage one issue:' \
+        '  --policy-actions  List guarded policy actions/checkpoints; no changes.' \
         '  --list-active' \
         '      List active issues and their 12-character ACK IDs.' \
         '' \
@@ -10526,6 +10557,21 @@ process_sab_orphans() {
             continue
         fi
 
+        # A proven rejection is intentionally awaiting scheduled quarantine,
+        # not a missing import. Keep exact SAB identity binding; warn if the
+        # cleanup deadline passes instead of suppressing a stuck cleanup forever.
+        if policy_disposition_matches "$owner" "$nzo_id" "$item"; then
+            if (( age >= POLICY_CLEANUP_EXPECTED_HOURS )); then
+                record_normalized_issue "SABnzbd:policy-cleanup:${nzo_id,,}" SABnzbd "$name" \
+                  SAB_STRANDED_POLICY_CLEANUP WARNING waiting \
+                  'Verified rejected payload still awaits quarantine beyond expected cleanup window' "$age" \
+                  "Download ID: $nzo_id. Arr policy disposition verified; no import is expected for this rejected release. Payload remains at $completed_path after ${age}h. Check arr_sabnzbd_cleanup for queue/path/Mover/receipt blockers. No repeated download rejection or search was submitted."
+            else
+                debug_log "Verified policy rejection awaiting guarded scheduled quarantine: $nzo_id"
+            fi
+            continue
+        fi
+
         #######################################################################
         # ANALYZE REMAINING CONTENT
         #######################################################################
@@ -13481,7 +13527,21 @@ download_ledger_needs_review() {
     ' <<<"$record" >/dev/null
 }
 
+apply_policy_ledger_dispositions() {
+    if [ -r "${POLICY_STATE_FILE:-$STATE_DIR/policy-actions.json}" ] && policy_validate_journal "${POLICY_STATE_FILE:-$STATE_DIR/policy-actions.json}"; then
+        local policy_tmp="$TMP_DIR/state.policy-ledger.json"
+        jq --slurpfile p "${POLICY_STATE_FILE:-$STATE_DIR/policy-actions.json}" '
+          reduce ($p[0].actions[]? | select(.status=="done" and .queueVerified==true)) as $a (.;
+            if .downloadLedger[$a.downloadId] then
+              .downloadLedger[$a.downloadId].arrIgnoredAt=$a.startedAt |
+              .downloadLedger[$a.downloadId].policyDisposition=$a.mode
+            else . end)' "$STATE_FILE" >"$policy_tmp" && save_state "$policy_tmp" || return 1
+    fi
+
+}
+
 process_download_ledger_issues() {
+
 
     local now
     local records_file="${TMP_DIR}/download-ledger-records.jsonl"
@@ -13704,6 +13764,7 @@ process_exact_download_ledger() {
           "$STATE_FILE" >"$cursor_tmp" && save_state "$cursor_tmp" || return 1
     fi
 
+    apply_policy_ledger_dispositions || return 1
     if ! perform_download_ledger_reconciliation; then
         log "ERROR: Unable to complete automatic download reconciliation"
         return 1
@@ -14868,6 +14929,440 @@ prune_state() {
 }
 
 ###############################################################################
+# GUARDED POLICY REMEDIATION
+# Queue mutations are never retried. Payload deletion and forced import are
+# prohibited here. The separate cleanup script consumes verified dispositions.
+###############################################################################
+
+policy_disposition_matches() {
+    local app="$1" id="${2,,}" item="$3" file="${POLICY_STATE_FILE:-$STATE_DIR/policy-actions.json}"
+    [ -r "$file" ] || return 1
+    if [ "${POLICY_JOURNAL_TRUSTED:-false}" != true ]; then
+        policy_validate_journal "$file" || return 1
+        POLICY_JOURNAL_TRUSTED=true
+    fi
+    local input="$TMP_DIR/policy-leftover-item.json"
+    printf '%s' "$item" >"$input" || return 1
+    jq -e --arg app "$app" --arg id "$id" --slurpfile item "$input" '
+      .actions[$id] | .status=="done" and .queueVerified==true and .app==$app and
+      .sab==($item[0]|{nzo_id,name,storage,completed,category})' "$file" >/dev/null
+}
+
+policy_validate_journal() {
+    jq -e '
+      type=="object" and .version==1 and (.actions|type)=="object" and (.observations|type)=="object" and
+      all(.actions|to_entries[];
+        .key as $id | .value |
+        .downloadId==$id and ($id|test("^[a-z0-9-]+$")) and
+        ((.sab.nzo_id // ""|ascii_downcase)==$id) and ((.queue.downloadId // ""|ascii_downcase)==$id) and .queue.id==.queueId and
+        ((.app=="Sonarr" and .kind=="episode") or (.app=="Radarr" and .kind=="movie")) and
+        (.mode=="redundant" or .mode=="replace") and
+        (.status=="intent" or .status=="queue_verified" or .status=="search_uncertain" or .status=="done") and
+        ([.targetId,.parentId,.queueId,.startedAt] | all(.[]; type=="number" and .>0 and .==floor)) and
+        (.command == (if .kind=="episode" then {name:"EpisodeSearch",episodeIds:[.targetId]} else {name:"MoviesSearch",movieIds:[.targetId]} end)) and
+        (.profile|type)=="object" and (.target|type)=="object" and (.parent|type)=="object" and (.sab|type)=="object" and (.queue|type)=="object")
+    ' "$1" >/dev/null
+}
+
+policy_publish() {
+    local candidate="$1" target="$2"
+    policy_validate_journal "$candidate" || return 1
+    if [ -f "$target" ] && cmp -s -- "$candidate" "$target"; then
+        rm -f -- "$candidate"
+        return 0
+    fi
+    sync -- "$candidate" || return 1
+    if [ -f "$target" ] && policy_validate_journal "$target"; then
+        cp -- "$target" "${target}.bak.tmp.$$" && sync -- "${target}.bak.tmp.$$" && mv -- "${target}.bak.tmp.$$" "${target}.bak" || return 1
+    fi
+    mv -f -- "$candidate" "$target" && sync -- "$target" && sync -- "$(dirname -- "$target")"
+}
+
+policy_update_action() {
+    local id="$1" patch="$2" tmp="${POLICY_STATE_FILE}.tmp.$$"
+    jq --arg id "$id" --argjson patch "$patch" '.actions[$id] += $patch' "$POLICY_STATE_FILE" >"$tmp" && policy_publish "$tmp" "$POLICY_STATE_FILE"
+}
+
+policy_mutate() {
+    local method="$1" url="$2" key="$3" body="$4" output="$5"
+    # NO --retry: a timeout may follow a successfully applied mutation.
+    local code
+    code=$(curl --silent --show-error --connect-timeout "$HTTP_CONNECT_TIMEOUT_SECONDS" \
+      --max-time "$HTTP_REQUEST_TIMEOUT_SECONDS" --max-filesize 1048576 \
+      -X "$method" -H "X-Api-Key: $key" -H 'Content-Type: application/json' \
+      --data-binary "$body" -o "$output" -w '%{http_code}' "$url") || return 1
+    [[ "$code" =~ ^2[0-9][0-9]$ ]]
+}
+
+policy_queue_reason() {
+    # Require every native import rejection to belong to the SAME allowlisted
+    # policy decision. Mixed filesystem/identity/permission warnings are held.
+    jq -r '
+      [.statusMessages[]?.messages[]?] as $reasons
+      | if ($reasons|length)==0 then "hold"
+        elif all($reasons[]; test("^Not (a |an )?(Custom Format|quality revision|upgrade for existing)";"i"))
+             and all($reasons[]; (test("AfterRename|BeforeRename";"i")|not)) then "redundant"
+        elif all($reasons[]; test("^Custom Formats? .*(have score|score of|score) -?[0-9]+ .*below .*profile minimum -?[0-9]+$";"i")) then "replace"
+        else "hold" end' <<<"$1"
+}
+
+policy_build_candidate() {
+    local app="$1" item="$2" output="$3" id queue_id root key history target parent profile file_id file
+    local item_file="$TMP_DIR/policy-queue-item.json"
+    printf '%s' "$item" >"$item_file" || return 1
+    id=$(jq -r '.downloadId | ascii_downcase' <<<"$item")
+    [[ "$id" =~ ^[a-z0-9-]+$ ]] || return 1
+    queue_id=$(jq -r '.id' <<<"$item")
+    [[ "$queue_id" =~ ^[1-9][0-9]*$ ]] || return 1
+    local mode; mode=$(policy_queue_reason "$item")
+    [[ "$mode" != hold ]] || return 1
+    # Completed Usenet only; multi-file and multi-episode releases fail closed.
+    jq -e '(.protocol|ascii_downcase)=="usenet" and (.status|ascii_downcase)=="completed" and
+      .trackedDownloadState=="importPending" and (.trackedDownloadStatus=="warning" or .trackedDownloadStatus=="error")' <<<"$item" >/dev/null || return 1
+    local sab="$TMP_DIR/policy-sab.json"
+    jq --arg id "$id" '[.history.slots[]? | select((.nzo_id|ascii_downcase)==$id)] | select(length==1) | .[0] | select(.status=="Completed")' "$SAB_HISTORY" >"$sab" || return 1
+    jq -e 'type=="object"' "$sab" >/dev/null || return 1
+    local completed added; completed=$(jq -r '.completed // 0 | tonumber? // 0 | floor' "$sab")
+    added=$(date_to_epoch "$(jq -r '.added // ""' <<<"$item")")
+    (( completed>0 && added>0 && START_TIME-completed>=POLICY_GRACE_HOURS*3600 && START_TIME-added>=POLICY_GRACE_HOURS*3600 )) || return 1
+    # SAB must have no active entry for this ID (including paused/post-processing).
+    jq -e --arg id "$id" 'all(.queue.slots[]?; (.nzo_id|ascii_downcase)!=$id)' "$SAB_QUEUE" >/dev/null || return 1
+    IFS=$'\t' read -r root key < <(arr_reconciliation_connection "$app")
+    history="$TMP_DIR/policy-history.json"
+    fetch_arr_history_by_download_id "$app" "$id" "$history" || return 1
+    jq -e --arg id "$id" '(.records|type)=="array" and (.totalRecords==(.records|length)) and all(.records[]; ((.downloadId // "")|ascii_downcase)==$id) and
+      any(.records[]; .eventType=="grabbed") and all(.records[]; .eventType!="downloadFolderImported" and .eventType!="downloadFailed" and .eventType!="downloadIgnored")' "$history" >/dev/null || return 1
+    target="$TMP_DIR/policy-target.json"; parent="$TMP_DIR/policy-parent.json"; profile="$TMP_DIR/policy-profile.json"; file="$TMP_DIR/policy-file.json"
+    local target_id parent_id endpoint kind command ids_field
+    if [ "$app" = Sonarr ]; then
+        target_id=$(jq -r '.episodeId // 0' <<<"$item"); parent_id=$(jq -r '.seriesId // 0' <<<"$item")
+        [[ "$target_id" =~ ^[1-9][0-9]*$ && "$parent_id" =~ ^[1-9][0-9]*$ ]] || return 1
+        # Exact one grabbed episode, exact series/season/episode. Title parsing
+        # only acts as an additional PACK VETO, never identity proof.
+        jq -e --argjson id "$target_id" --argjson parent "$parent_id" '[.records[] | select(.eventType=="grabbed")] as $g |
+          ($g|length)==1 and $g[0].episodeId==$id and $g[0].seriesId==$parent' "$history" >/dev/null || return 1
+        jq -e '.title | test("[Ss][0-9]{1,3}[Ee][0-9]{1,3}([^0-9Ee-]|$)") and (test("[Ss][0-9]{1,3}[Ee][0-9]{1,3}([Ee-][0-9]|.*[Ss][0-9]{1,3}[Ee][0-9])|complete|season[ ._-]*[0-9]";"i")|not)' <<<"$item" >/dev/null || return 1
+        api_get "$root/episode/$target_id" "$key" "$target" && api_get "$root/series/$parent_id" "$key" "$parent" || return 1
+        jq -e --argjson id "$target_id" --argjson parent "$parent_id" --slurpfile queue_item "$item_file" '$queue_item[0] as $item | .id==$id and .seriesId==$parent and .seasonNumber==$item.seasonNumber and .episodeNumber>0 and .monitored==true' "$target" >/dev/null || return 1
+        local season; season=$(jq '.seasonNumber' "$target")
+        jq -e --argjson id "$parent_id" --argjson season "$season" '.id==$id and .monitored==true and any(.seasons[]?; .seasonNumber==$season and .monitored==true) and (.tags|length)==0' "$parent" >/dev/null || return 1
+        file_id=$(jq -r '.episodeFileId // 0' "$target"); endpoint=episodefile; kind=episode; command=EpisodeSearch; ids_field=episodeIds
+    else
+        target_id=$(jq -r '.movieId // 0' <<<"$item"); parent_id="$target_id"
+        [[ "$target_id" =~ ^[1-9][0-9]*$ ]] || return 1
+        jq -e --argjson id "$target_id" '[.records[] | select(.eventType=="grabbed")] as $g | ($g|length)==1 and $g[0].movieId==$id' "$history" >/dev/null || return 1
+        api_get "$root/movie/$target_id" "$key" "$target" || return 1
+        cp "$target" "$parent" || return 1
+        jq -e --argjson id "$target_id" '.id==$id and .monitored==true and (.tags|length)==0' "$target" >/dev/null || return 1
+        file_id=$(jq -r '.movieFileId // 0' "$target"); endpoint=moviefile; kind=movie; command=MoviesSearch; ids_field=movieIds
+    fi
+    local profile_id; profile_id=$(jq -r '.qualityProfileId // 0' "$parent")
+    [[ "$profile_id" =~ ^[1-9][0-9]*$ ]] || return 1
+    api_get "$root/qualityprofile/$profile_id" "$key" "$profile" || return 1
+    jq -e --argjson id "$profile_id" '.id==$id and (.minFormatScore|type)=="number"' "$profile" >/dev/null || return 1
+    printf '{}\n' >"$file"
+    jq -e --slurpfile p "$profile" '
+      .quality.quality.id as $quality |
+      [$p[0].items[] | select(.allowed==true) | .quality.id, .items[]?.quality.id] | index($quality)!=null' <<<"$item" >/dev/null || return 1
+    if [ "$mode" = redundant ]; then
+        [[ "$file_id" =~ ^[1-9][0-9]*$ ]] || return 1
+        api_get "$root/$endpoint/$file_id" "$key" "$file" || return 1
+        jq -e --argjson id "$file_id" --argjson parent "$parent_id" --arg kind "$kind" --slurpfile profile "$profile" '
+          .id==$id and (if $kind=="episode" then .seriesId==$parent else .movieId==$parent end) and
+          (.path|type)=="string" and (.path|length)>0 and .size>0 and
+          (.customFormatScore|type)=="number" and .customFormatScore >= $profile[0].minFormatScore and
+          (.quality.quality.id as $quality | [$profile[0].items[] | select(.allowed==true) | .quality.id, .items[]?.quality.id] | index($quality)!=null)' "$file" >/dev/null || return 1
+    else
+        # Replacement applies only to genuinely missing monitored media. An
+        # existing copy, conflicting hasFile, any tag, or profile mismatch vetoes.
+        [[ "$file_id" = 0 ]] || return 1
+        jq -e '.hasFile==false' "$target" >/dev/null || return 1
+        jq -e --slurpfile p "$profile" '
+          . as $q | (.customFormatScore|type)=="number" and .customFormatScore < $p[0].minFormatScore and
+          all(.statusMessages[]?.messages[]?;
+            capture("score (?<score>-?[0-9]+) .*profile minimum (?<minimum>-?[0-9]+)$";"i") |
+            (.score|tonumber)==$q.customFormatScore and (.minimum|tonumber)==$p[0].minFormatScore)' <<<"$item" >/dev/null || return 1
+    fi
+    jq -n --arg app "$app" --arg id "$id" --arg mode "$mode" --arg kind "$kind" --arg command "$command" --arg field "$ids_field" \
+      --argjson targetId "$target_id" --argjson parentId "$parent_id" --argjson queueId "$queue_id" --slurpfile queue_item "$item_file" \
+      --slurpfile target "$target" --slurpfile parent "$parent" --slurpfile profile "$profile" --slurpfile file "$file" --slurpfile sab "$sab" \
+      '$queue_item[0] as $item | {app:$app,downloadId:$id,mode:$mode,kind:$kind,targetId:$targetId,parentId:$parentId,queueId:$queueId,
+        title:$item.title,warning:[$item.statusMessages[]?.messages[]?],command:{name:$command,($field):[$targetId]},
+        fileId:($file[0].id // 0),filePath:($file[0].path // ""),profile:$profile[0],target:$target[0],parent:$parent[0],
+        sab:($sab[0]|{nzo_id,name,storage,completed,category}),queue:$item}' >"$output"
+}
+
+policy_observe() {
+    local id="$1" fingerprint="$2" tmp="${POLICY_STATE_FILE}.tmp.$$"
+    jq --arg id "$id" --arg fingerprint "$fingerprint" --argjson now "$START_TIME" '
+      .observations[$id] as $old | .observations[$id]={fingerprint:$fingerprint,at:$now,
+        runs:(if $old.fingerprint==$fingerprint and ($now-$old.at)<=1200 then
+          (if ($now-$old.at)>=240 then ($old.runs+1) else $old.runs end) else 1 end),
+        at:(if $old.fingerprint==$fingerprint and ($now-$old.at)<240 then $old.at else $now end)}' \
+      "$POLICY_STATE_FILE" >"$tmp" && policy_publish "$tmp" "$POLICY_STATE_FILE" || return 1
+    jq -e --arg id "$id" '.observations[$id].runs>=2' "$POLICY_STATE_FILE" >/dev/null
+}
+
+policy_verify_removed() {
+    local app="$1" id="$2" root="$3" key="$4" mode="$5" q="$TMP_DIR/policy-verify-queue.json"
+    fetch_arr_queue "$app" "$root" "$key" "$q" || return 1
+    jq -e --arg id "$id" 'all(.records[]; ((.downloadId // "")|ascii_downcase)!=$id)' "$q" >/dev/null || return 1
+    local history="$TMP_DIR/policy-verify-history.json"
+    fetch_arr_history_by_download_id "$app" "$id" "$history" || return 1
+    jq -e --arg id "$id" --arg mode "$mode" '.records|any(.[]; ((.downloadId // "")|ascii_downcase)==$id and
+      .eventType==(if $mode=="replace" then "downloadFailed" else "downloadIgnored" end))' "$history" >/dev/null || return 1
+    if [ "$mode" = replace ]; then
+        # Failed history alone does not establish blocklist insertion.
+        local b="$TMP_DIR/policy-blocklist.json"
+        api_get "$root/blocklist?page=1&pageSize=100&sortKey=date&sortDirection=descending" "$key" "$b" || return 1
+        # Arr blocklist resources do not expose downloadId. Correlate the
+        # exact original download through its history, then exact native media
+        # IDs, release title, quality, and insertion time in the blocklist.
+        jq -e --arg id "$id" --slurpfile journal "$POLICY_STATE_FILE" '
+          $journal[0].actions[$id] as $a | any(.records[]?;
+            .sourceTitle==$a.title and .quality==$a.queue.quality and
+            (if $a.kind=="episode" then .seriesId==$a.parentId and (.episodeIds|sort)==[$a.targetId] else .movieId==$a.targetId end) and
+            ((try (.date|sub("\\.[0-9]+Z$";"Z")|fromdateiso8601) catch 0) >= $a.startedAt-5))' "$b" >/dev/null || return 1
+    fi
+}
+
+policy_finish_tracking() {
+    local action="$1" id app mode root key tmp status body target_id kind current
+    local action_file="$TMP_DIR/policy-active-action.json"
+    printf '%s' "$action" >"$action_file" || return 1
+    id=$(jq -r '.downloadId' <<<"$action"); app=$(jq -r '.app' <<<"$action"); mode=$(jq -r '.mode' <<<"$action")
+    status=$(jq -r '.status' <<<"$action")
+    IFS=$'\t' read -r root key < <(arr_reconciliation_connection "$app")
+    if [ "$status" = intent ]; then
+        # Recovery only verifies the original DELETE; it NEVER submits it again.
+        policy_verify_removed "$app" "$id" "$root" "$key" "$mode" || return 1
+        policy_update_action "$id" '{"status":"queue_verified","queueVerified":true}' || return 1
+        status=queue_verified
+    fi
+    if [ "$status" = queue_verified ] && [ "$mode" = replace ]; then
+        # Re-read monitoring/identity immediately before search: a user may have
+        # deleted or unmonitored the target between rejection and this step.
+        target_id=$(jq -r '.targetId' <<<"$action"); kind=$(jq -r '.kind' <<<"$action")
+        current="$TMP_DIR/policy-presearch.json"
+        api_get "$root/$kind/$target_id" "$key" "$current" || return 1
+        jq -e --argjson id "$target_id" '.id==$id and .monitored==true and .hasFile==false' "$current" >/dev/null || return 1
+        local parent="$TMP_DIR/policy-presearch-parent.json" parent_kind=movie parent_id
+        parent_id=$(jq -r '.parentId' <<<"$action"); [ "$app" != Sonarr ] || parent_kind=series
+        api_get "$root/$parent_kind/$parent_id" "$key" "$parent" || return 1
+        jq -e --argjson id "$parent_id" --slurpfile action_record "$action_file" '$action_record[0] as $action | .id==$id and .monitored==true and (.tags|length)==0 and .qualityProfileId==$action.parent.qualityProfileId and
+          (if $action.kind=="episode" then any(.seasons[]?; .seasonNumber==$action.target.seasonNumber and .monitored==true) else true end)' "$parent" >/dev/null || return 1
+        local profile="$TMP_DIR/policy-presearch-profile.json" profile_id
+        profile_id=$(jq -r '.qualityProfileId' "$parent")
+        api_get "$root/qualityprofile/$profile_id" "$key" "$profile" || return 1
+        jq -e --slurpfile action_record "$action_file" '$action_record[0] as $action | .==$action.profile' "$profile" >/dev/null || return 1
+        # Persist before POST. A timeout or interruption leaves an uncertain
+        # search, which is not automatically repeated.
+        policy_update_action "$id" '{"status":"search_uncertain"}' || return 1
+        body=$(jq -c '.command' <<<"$action")
+        policy_mutate POST "$root/command" "$key" "$body" "$TMP_DIR/policy-search-response.json" || return 1
+        local command_id; command_id=$(jq -r '.id // 0' "$TMP_DIR/policy-search-response.json")
+        [[ "$command_id" =~ ^[1-9][0-9]*$ ]] || return 1
+        policy_update_action "$id" "{\"commandId\":$command_id}" || return 1
+        status=search_uncertain
+    fi
+    if [ "$status" = search_uncertain ]; then
+        local command_id; command_id=$(jq -r --arg id "$id" '.actions[$id].commandId // 0' "$POLICY_STATE_FILE")
+        [[ "$command_id" =~ ^[1-9][0-9]*$ ]] || return 1
+        api_get "$root/command/$command_id" "$key" "$TMP_DIR/policy-command-verify.json" || return 1
+        jq -e --argjson id "$command_id" --slurpfile action_record "$action_file" '$action_record[0] as $action | .id==$id and .name==$action.command.name and
+          (.status=="queued" or .status=="started" or .status=="completed") and
+          (if $action.kind=="movie" then .body.movieIds==$action.command.movieIds else .body.episodeIds==$action.command.episodeIds end)' "$TMP_DIR/policy-command-verify.json" >/dev/null || return 1
+    fi
+    policy_update_action "$id" '{"status":"done","queueVerified":true}' || return 1
+}
+
+policy_check_replacement() {
+    local action="$1" id root key target_id parent_id kind target file file_id epoch
+    local action_file="$TMP_DIR/policy-active-action.json"
+    printf '%s' "$action" >"$action_file" || return 1
+    id=$(jq -r '.downloadId' <<<"$action")
+    (( START_TIME >= $(jq -r '.replacementCheckedAt // 0' <<<"$action")+3600 )) || return 0
+    IFS=$'\t' read -r root key < <(arr_reconciliation_connection "$(jq -r '.app' <<<"$action")")
+    target_id=$(jq -r '.targetId' <<<"$action"); parent_id=$(jq -r '.parentId' <<<"$action"); kind=$(jq -r '.kind' <<<"$action")
+    target="$TMP_DIR/policy-replacement-target.json"; file="$TMP_DIR/policy-replacement-file.json"
+    policy_update_action "$id" "{\"replacementCheckedAt\":$START_TIME}" || return 1
+    api_get "$root/$kind/$target_id" "$key" "$target" || return 1
+    jq -e --argjson id "$target_id" --argjson parent "$parent_id" --slurpfile action_record "$action_file" '$action_record[0] as $action | .id==$id and
+      (if $action.kind=="episode" then .seriesId==$parent and .seasonNumber==$action.target.seasonNumber and .episodeNumber==$action.target.episodeNumber else true end)' "$target" >/dev/null || return 1
+    file_id=$(jq -r '.episodeFileId // .movieFileId // 0' "$target")
+    [[ "$file_id" =~ ^[1-9][0-9]*$ ]] || return 0
+    api_get "$root/${kind}file/$file_id" "$key" "$file" || return 1
+    jq -e --argjson id "$file_id" --argjson parent "$parent_id" --arg kind "$kind" '.id==$id and .size>0 and (.path|length)>0 and
+      (if $kind=="episode" then .seriesId==$parent else .movieId==$parent end)' "$file" >/dev/null || return 1
+    epoch=$(date_to_epoch "$(jq -r '.dateAdded // ""' "$file")")
+    (( epoch >= $(jq -r '.startedAt' <<<"$action") )) || return 0
+    local parent="$TMP_DIR/policy-replacement-parent.json" profile="$TMP_DIR/policy-replacement-profile.json" parent_kind=movie profile_id
+    [ "$kind" != episode ] || parent_kind=series
+    api_get "$root/$parent_kind/$parent_id" "$key" "$parent" || return 1
+    profile_id=$(jq -r '.qualityProfileId // 0' "$parent")
+    [[ "$profile_id" =~ ^[1-9][0-9]*$ ]] || return 1
+    api_get "$root/qualityprofile/$profile_id" "$key" "$profile" || return 1
+    jq -e --slurpfile p "$profile" '(.customFormatScore|type)=="number" and .customFormatScore >= $p[0].minFormatScore and
+      (.quality.quality.id as $quality | [$p[0].items[] | select(.allowed==true) | .quality.id, .items[]?.quality.id] | index($quality)!=null)' "$file" >/dev/null || return 0
+    # This verifies the database import; do not touch physical media paths.
+    policy_update_action "$id" "{\"replacementState\":\"import_verified\",\"replacementFileId\":$file_id,\"replacementImportedAt\":$epoch}"
+}
+
+policy_report_actions() {
+    local action id status severity detail app title
+    while IFS= read -r action; do
+        id=$(jq -r '.downloadId' <<<"$action"); status=$(jq -r '.status' <<<"$action"); app=$(jq -r '.app' <<<"$action"); title=$(jq -r '.title' <<<"$action")
+        severity=WARNING; [ "$status" != done ] || severity=INFO
+        detail="Download ID: $id"$'\n'"Original warning: $(jq -r '.warning|join("; ")' <<<"$action")"$'\n'
+        if [ "$status" = done ]; then
+            detail+="Queue removal and native disposition verified. Payload preserved for guarded quarantine by arr_sabnzbd_cleanup; library unchanged."$'\n'
+            if [ "$(jq -r '.mode' <<<"$action")" = replace ]; then
+                if [ "$(jq -r '.replacementState // "waiting"' <<<"$action")" = import_verified ]; then
+                    detail+="Exact release blocklisted; targeted replacement search accepted. A subsequent exact-target Arr file import was verified (file ID $(jq -r '.replacementFileId' <<<"$action"))."
+                else
+                    detail+="Exact release blocklisted; one targeted replacement search accepted (command $(jq -r '.commandId' <<<"$action")). Compliant import still pending; no success inferred."
+                fi
+            else
+                detail+="Redundant release ignored without blocklisting or replacement search; existing file ID $(jq -r '.fileId' <<<"$action") retained."
+            fi
+            if [ "$(jq -r '.mode' <<<"$action")" = replace ] &&
+               [ "$(jq -r '.replacementState // "waiting"' <<<"$action")" != import_verified ] &&
+               (( START_TIME-$(jq -r '.startedAt' <<<"$action")>=7*86400 )); then
+                record_normalized_issue "POLICY:WAITING:$id" "$app" "$title" ARR_POLICY_REPLACEMENT_PENDING WARNING waiting \
+                  'No policy-compliant replacement imported within seven days' 168 \
+                  "$detail No repeated search was sent. Review release availability or the quality profile if this remains required."
+            fi
+        else
+            detail+="Checkpoint: $status. Request outcome or next action is not fully verified; automatic mutation replay prohibited. Payload preserved."
+        fi
+        local signature
+        signature=$(jq -r '"policy:"+.status+":"+(.replacementState // "waiting")+":"+((.replacementFileId // 0)|tostring)' <<<"$action")
+        if [ "$status" = done ]; then
+            local sent; sent=$(jq -r --arg id "$id" '.monitor.policyNotifications[$id] // ""' "$STATE_FILE")
+            if [ "$sent" != "$signature" ]; then
+                queue_group_notification "POLICY:ACTION:$id" "$signature" "$app" "$title" ARR_POLICY_AUTOMATION INFO 0 "$detail" reconciled
+            fi
+        else
+            record_normalized_issue "POLICY:$id" "$app" "$title" ARR_POLICY_AUTOMATION "$severity" "$status" \
+              "Policy action: $status" 0 "$detail" 1 0 0
+        fi
+    done < <(jq -c --slurpfile monitor "$STATE_FILE" --argjson now "$START_TIME" '
+      .actions[] | ("policy:"+.status+":"+(.replacementState // "waiting")+":"+((.replacementFileId // 0)|tostring)) as $signature |
+      select(.status!="done" or ($monitor[0].monitor.policyNotifications[.downloadId] // "")!=$signature or
+        (.mode=="replace" and (.replacementState // "")!="import_verified" and $now-.startedAt>=7*86400))' "$POLICY_STATE_FILE")
+}
+
+process_policy_remediation() {
+    POLICY_STATE_FILE="$STATE_DIR/policy-actions.json"
+    if [ "$POLICY_AUTOMATION_ENABLED" != true ]; then
+        if [ -f "$POLICY_STATE_FILE" ] && policy_validate_journal "$POLICY_STATE_FILE"; then
+            policy_report_actions
+        fi
+        return 0
+    fi
+    if [ ! -e "$POLICY_STATE_FILE" ]; then
+        printf '{"version":1,"actions":{},"observations":{}}\n' >"${POLICY_STATE_FILE}.tmp.$$" && policy_publish "${POLICY_STATE_FILE}.tmp.$$" "$POLICY_STATE_FILE" || return 1
+    fi
+    if ! policy_validate_journal "$POLICY_STATE_FILE"; then
+        record_normalized_issue POLICY:state Monitor 'Policy automation stopped' ARR_POLICY_AUTOMATION ERROR invalid-state \
+          'Policy journal invalid; no actions permitted' 0 'Existing journal preserved. Restore its backup or review the damaged file before enabling actions.'
+        return 1
+    fi
+    # Both queues and SAB must be complete and healthy for ANY remediation.
+    if [ "$SONARR_QUEUE_OK" != true ] || [ "$RADARR_QUEUE_OK" != true ] || [ "$SAB_HISTORY_OK" != true ] || [ "$SAB_QUEUE_OK" != true ]; then
+        policy_report_actions
+        return 0
+    fi
+    local maintenance="${POLICY_STATE_FILE}.tmp.$$"
+    jq --argjson now "$START_TIME" '.observations |= with_entries(select(.value.at>=$now-86400)) |
+      .actions |= with_entries(select(.value.status!="done" or .value.startedAt>=$now-365*86400))' "$POLICY_STATE_FILE" >"$maintenance" &&
+      policy_publish "$maintenance" "$POLICY_STATE_FILE" || return 1
+    local action id app queue root key item mode fingerprint count=0 daily target_count window_count existing total
+    # Pending mutation recovery does not replay DELETE/POST.
+    while IFS= read -r action; do
+        policy_finish_tracking "$action" || log 'WARNING: Policy checkpoint remains pending; payload protected'
+    done < <(jq -c '.actions[] | select(.status!="done")' "$POLICY_STATE_FILE")
+    # Any ambiguous previous mutation blocks NEW actions globally.
+    if jq -e 'any(.actions[]; .status!="done")' "$POLICY_STATE_FILE" >/dev/null; then
+        policy_report_actions; return 0
+    fi
+    total=$(jq -s '[.[].records[]? | select(any(.statusMessages[]?.messages[]?; test("custom format|not an upgrade|not a quality revision";"i")))]|length' "$SONARR_QUEUE" "$RADARR_QUEUE")
+    if (( total>POLICY_BURST_LIMIT )); then
+        record_normalized_issue POLICY:burst Monitor 'Policy automation held' ARR_POLICY_AUTOMATION WARNING burst \
+          'Too many simultaneous policy failures; possible profile change' 0 "$total candidates exceed limit $POLICY_BURST_LIMIT. All downloads preserved; inspect Recyclarr/profile changes."
+        policy_report_actions; return 0
+    fi
+    for app in Sonarr Radarr; do
+        case "$app" in Sonarr) queue="$SONARR_QUEUE";; Radarr) queue="$RADARR_QUEUE";; esac
+        while IFS= read -r item; do
+            runtime_budget_allows_optional_phase policy-remediation || break
+            id=$(jq -r '.downloadId // "" | ascii_downcase' <<<"$item"); [ -n "$id" ] || continue
+            jq -e --arg id "$id" '.actions[$id]!=null' "$POLICY_STATE_FILE" >/dev/null && continue
+            # One exact queue row per download across BOTH apps; packs vetoed.
+            existing=$(jq -s --arg id "$id" '[.[].records[]? | select((.downloadId // ""|ascii_downcase)==$id)] | length' "$SONARR_QUEUE" "$RADARR_QUEUE")
+            [ "$existing" = 1 ] || continue
+            policy_build_candidate "$app" "$item" "$TMP_DIR/policy-candidate.json" || continue
+            mode=$(jq -r '.mode' "$TMP_DIR/policy-candidate.json")
+            fingerprint=$(jq -Sc 'del(.parent.statistics,.parent.nextAiring,.parent.previousAiring,.target.statistics,.queue.estimatedCompletionTime,.queue.timeleft)' "$TMP_DIR/policy-candidate.json" | sha256sum | awk '{print $1}')
+            policy_observe "$id" "$fingerprint" || continue
+            (( count<POLICY_MAX_ACTIONS_PER_RUN )) || break
+            daily=$(jq --argjson since "$((START_TIME-86400))" '[.actions[]|select(.startedAt>=$since)]|length' "$POLICY_STATE_FILE")
+            (( daily<POLICY_MAX_ACTIONS_PER_DAY )) || break
+            if [ "$mode" = replace ]; then
+                target_count=$(jq --slurpfile c "$TMP_DIR/policy-candidate.json" --argjson since "$((START_TIME-7*86400))" '[.actions[]|select(.app==$c[0].app and .targetId==$c[0].targetId and .mode=="replace" and .startedAt>=$since)]|length' "$POLICY_STATE_FILE")
+                window_count=$(jq --slurpfile c "$TMP_DIR/policy-candidate.json" --argjson since "$((START_TIME-30*86400))" '[.actions[]|select(.app==$c[0].app and .targetId==$c[0].targetId and .mode=="replace" and .startedAt>=$since)]|length' "$POLICY_STATE_FILE")
+                (( target_count==0 && window_count<3 )) || continue
+            fi
+            # Re-fetch complete queue and all identity/profile/file/history
+            # evidence immediately before recording intent and removing tracking.
+            IFS=$'\t' read -r root key < <(arr_reconciliation_connection "$app")
+            fetch_arr_queue "$app" "$root" "$key" "$TMP_DIR/policy-fresh-queue.json" || continue
+            item=$(jq -c --arg id "$id" '[.records[] | select(((.downloadId // "")|ascii_downcase)==$id)] | select(length==1) | .[0]' "$TMP_DIR/policy-fresh-queue.json")
+            [ -n "$item" ] || continue
+            policy_build_candidate "$app" "$item" "$TMP_DIR/policy-fresh-candidate.json" || continue
+            [ "$fingerprint" = "$(jq -Sc 'del(.parent.statistics,.parent.nextAiring,.parent.previousAiring,.target.statistics,.queue.estimatedCompletionTime,.queue.timeleft)' "$TMP_DIR/policy-fresh-candidate.json" | sha256sum | awk '{print $1}')" ] || continue
+            local tmp="${POLICY_STATE_FILE}.tmp.$$" queue_id blocklist=false
+            jq --slurpfile c "$TMP_DIR/policy-candidate.json" --arg id "$id" --argjson now "$START_TIME" '.actions[$id]=$c[0]+{status:"intent",startedAt:$now}' "$POLICY_STATE_FILE" >"$tmp" && policy_publish "$tmp" "$POLICY_STATE_FILE" || return 1
+            queue_id=$(jq -r '.queueId' "$TMP_DIR/policy-candidate.json")
+            [ "$mode" != replace ] || blocklist=true
+            ((count++)) || true
+            # removeFromClient=false preserves SAB data. skipRedownload=true
+            # prevents native redownload competing with our single command.
+            policy_mutate DELETE "$root/queue/$queue_id?removeFromClient=false&blocklist=$blocklist&skipRedownload=true&changeCategory=false" "$key" '' "$TMP_DIR/policy-delete-response" || true
+            action=$(jq -c --arg id "$id" '.actions[$id]' "$POLICY_STATE_FILE")
+            policy_finish_tracking "$action" || { policy_report_actions; return 0; }
+        done < <(jq -c '.records[]? | select(any(.statusMessages[]?.messages[]?; test("custom format|not an upgrade|not a quality revision";"i")))' "$queue")
+    done
+    local qtmp="$TMP_DIR/policy-filtered-queue.json"
+    for queue in "$SONARR_QUEUE" "$RADARR_QUEUE"; do
+        jq --slurpfile p "$POLICY_STATE_FILE" '.records |= map(select($p[0].actions[((.downloadId // "")|ascii_downcase)].status!="done")) | .totalRecords=(.records|length)' "$queue" >"$qtmp" && mv "$qtmp" "$queue" || return 1
+    done
+    while IFS= read -r action; do
+        runtime_budget_allows_optional_phase policy-replacement-followup || break
+        policy_check_replacement "$action" || log 'WARNING: Replacement follow-up unavailable; import not inferred'
+    done < <(jq -c --argjson now "$START_TIME" '[.actions[] | select(.status=="done" and .mode=="replace" and
+      (.replacementState // "")!="import_verified" and $now >= (.replacementCheckedAt // 0)+3600)] |
+      sort_by(.replacementCheckedAt // 0) | .[:4][]' "$POLICY_STATE_FILE")
+    policy_report_actions
+}
+
+# Policy action inventory:
+# /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script --policy-actions
+# Columns: app, download ID, action, checkpoint, target ID, replacement state.
+# "intent" or "search_uncertain" means a request may have succeeded before a
+# timeout; do not delete the journal or retry it manually without reviewing Arr.
+# Scheduled scans re-read native outcomes and resume verified next steps only.
+# POLICY_AUTOMATION_ENABLED=false pauses new actions and keeps monitoring.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --policy-actions ]]; then
+    if [ -f "$STATE_DIR/policy-actions.json" ]; then
+        jq -r '.actions[] | [.app,.downloadId,.mode,.status,.targetId,(.replacementState // "not verified")] | @tsv' "$STATE_DIR/policy-actions.json"
+    else
+        printf 'No policy actions recorded.\n'
+    fi
+    exit $?
+fi
+
+###############################################################################
 # LOCK
 ###############################################################################
 
@@ -15019,7 +15514,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.11.0"
+    "START | ARR Health Monitor v3.12.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -15032,7 +15527,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.11.0"
+debug_log "Starting ARR Health Monitor v3.12.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -15360,6 +15855,12 @@ end_monitor_phase "service-collection"
 # UNIFIED HEALTH / QUEUE PROCESSING
 ###############################################################################
 
+if runtime_budget_allows_optional_phase "policy-remediation"; then
+    start_monitor_phase "policy-remediation"
+    process_policy_remediation || log "WARNING: Policy automation stopped; review grouped report and journal"
+    end_monitor_phase "policy-remediation"
+fi
+
 start_monitor_phase "issue-evaluation"
 
 if [ "$SAB_ENABLED" = true ]; then
@@ -15629,7 +16130,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.11.0 completed"
+log "ARR Health Monitor v3.12.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""
