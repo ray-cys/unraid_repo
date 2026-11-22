@@ -3,15 +3,26 @@
 ###############################################################################
 # Backup Restore Drill
 #
-# Proves that the newest Hubble appdata and boot-device backups can be read and
+# Checks that selected Hubble appdata and boot-device backups can be read and
 # restored into an isolated staging directory. It never writes to live appdata
-# or the boot device.
+# or the boot device. This is a bounded extraction/database drill, not proof
+# of application startup or boot-device recovery.
+#
+# CLI: bash script [--generation-root /mnt/user/backup/vault_versions/hubble-STAMP]
+# With no arguments use the newest local backups. --generation-root uses the
+# completed ISS generation itself (appdata/ and flash/); it is run ON ISS.
+# Optional environment: VAULT_MOUNT, DRILL_ROOT, LOG_DIR, STATUS_DIR,
+# MAX_APPDATA_ARCHIVES (0=all), MAX_EXTRACT_BYTES, EXTRA_FREE_MARGIN_BYTES.
+# Default: rotate two archives weekly; release restored payload after checking
+# each archive and retain compact evidence only. Larger archives exceeding the
+# space budget are reported as untested, never silently counted as verified.
+# An OK result covers the named selection, not every application or a full restore.
 ###############################################################################
 
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.1"
+readonly SCRIPT_VERSION="1.2"
 
 ###############################################################################
 # CONFIGURATION
@@ -26,7 +37,8 @@ DRILL_ROOT="${DRILL_ROOT:-/mnt/vault/restore_drill}"
 # Otherwise use archive base names without .tar.gz.
 APPDATA_ARCHIVE_ALLOWLIST=()
 
-MAX_APPDATA_ARCHIVES="${MAX_APPDATA_ARCHIVES:-0}"
+MAX_APPDATA_ARCHIVES="${MAX_APPDATA_ARCHIVES:-2}"
+MAX_EXTRACT_BYTES="${MAX_EXTRACT_BYTES:-$((64 * 1024 * 1024 * 1024))}"
 CHECK_SQLITE_DATABASES="${CHECK_SQLITE_DATABASES:-true}"
 SQLITE_MAX_FILES="${SQLITE_MAX_FILES:-200}"
 
@@ -40,9 +52,9 @@ EXTRA_FREE_MARGIN_BYTES="${EXTRA_FREE_MARGIN_BYTES:-$((5 * 1024 * 1024 * 1024))}
 MAX_SUCCESSFUL_DRILLS="${MAX_SUCCESSFUL_DRILLS:-2}"
 KEEP_FAILED_DRILL="${KEEP_FAILED_DRILL:-false}"
 
-LOG_DIR="${LOG_DIR:-/mnt/vault/cloud/logs/backup_restore_drill}"
+LOG_DIR="${LOG_DIR:-/mnt/vault/cloud/logs/script/backup_restore_drill}"
 MAX_LOGS="${MAX_LOGS:-5}"
-STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/user_scripts_status}"
+STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 NOTIFY_BIN="${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}"
 LOCK_FILE="${LOCK_FILE:-/run/backup_restore_drill.lock}"
 
@@ -69,6 +81,17 @@ ARCHIVES_CHECKED=0
 ARCHIVES_EXTRACTED=0
 DATABASES_CHECKED=0
 DATABASES_FAILED=0
+DRILL_WARNINGS=0
+ARCHIVES_SKIPPED=0
+GENERATION_ROOT=""
+EXTRACT_PID=""
+SELECTED_NAMES=()
+SELECTED_BYTES=()
+SELECTED_HASHES=()
+SELECTED_RAW=()
+EXTRACTED_BASE=""
+CHECKED_NAMES=()
+SKIPPED_NAMES=()
 
 ###############################################################################
 # HELPERS
@@ -124,6 +147,14 @@ write_receipt() {
 
 cleanup() {
     local rc=$?
+    if [[ -n "$EXTRACT_PID" ]]; then
+        kill -TERM -- "-$EXTRACT_PID" 2>/dev/null || true
+        wait "$EXTRACT_PID" 2>/dev/null || true
+    fi
+    if (( rc != 0 )); then
+        RESULT_SUMMARY="Restore drill failed: ${RESULT_SUMMARY}; archives restored=$ARCHIVES_EXTRACTED, database failures=$DATABASES_FAILED. Production data was not modified."
+        notify_unraid alert "Restore drill failed" "$RESULT_SUMMARY"$'\n'"Source: $APPDATA_BACKUP"$'\n'"Log: $LOG_FILE"
+    fi
     if (( WORK_PROMOTED == 0 )) && [[ -d "$WORK_DIR" ]]; then
         if [[ "$KEEP_FAILED_DRILL" == true ]]; then
             mv -- "$WORK_DIR" "${WORK_DIR%.partial}.failed" 2>/dev/null || true
@@ -231,7 +262,7 @@ prune_drills() {
 
 validate_environment() {
     local command numeric
-    for command in find sort gzip tar unzip sha256sum flock awk stat grep; do
+    for command in find sort tar unzip sha256sum flock awk stat grep jq realpath setsid timeout; do
         command -v "$command" >/dev/null 2>&1 || {
             log ERROR "Required command not found: $command"
             return 1
@@ -255,6 +286,7 @@ validate_environment() {
     }
 
     for numeric in \
+        "$MAX_EXTRACT_BYTES" \
         "$MAX_APPDATA_ARCHIVES" \
         "$SQLITE_MAX_FILES" \
         "$EXTRA_FREE_MARGIN_BYTES" \
@@ -276,6 +308,10 @@ validate_environment() {
         return 1
     fi
 
+    if [[ -n "$GENERATION_ROOT" ]]; then
+        APPDATA_BACKUP_ROOT="$GENERATION_ROOT/appdata"
+        FLASH_BACKUP_ROOT="$GENERATION_ROOT/flash"
+    fi
     [[ -d "$APPDATA_BACKUP_ROOT" ]] || {
         log ERROR "Appdata backup root unavailable: $APPDATA_BACKUP_ROOT"
         return 1
@@ -284,13 +320,25 @@ validate_environment() {
         log ERROR "Flash backup root unavailable: $FLASH_BACKUP_ROOT"
         return 1
     }
+    mountpoint -q "$VAULT_MOUNT" || return 1
+    [[ ! -L "$DRILL_ROOT" && $(realpath -m -- "$DRILL_ROOT") == "$DRILL_ROOT" ]] || return 1
     [[ "$DRILL_ROOT" == "$VAULT_MOUNT"/* &&
        "$DRILL_ROOT" != "$VAULT_MOUNT/" ]] || {
         log ERROR "Unsafe DRILL_ROOT: $DRILL_ROOT"
         return 1
     }
 
-    APPDATA_BACKUP="$(latest_entry "$APPDATA_BACKUP_ROOT" d 'backup_[0-9]*_[0-9]*')"
+    if [[ -n "$GENERATION_ROOT" ]]; then
+        [[ "$GENERATION_ROOT" =~ ^/mnt/user/backup/vault_versions/hubble-[0-9]{8}_[0-9]{6}$ &&
+           -f "$GENERATION_ROOT/completed.txt" && ! -L "$GENERATION_ROOT" &&
+           $(realpath -e "$GENERATION_ROOT") == "$GENERATION_ROOT" ]] || {
+            log ERROR "Expected a completed canonical ISS generation"; return 1;
+        }
+        APPDATA_BACKUP="$GENERATION_ROOT/appdata"
+        FLASH_BACKUP_ROOT="$GENERATION_ROOT/flash"
+    else
+        APPDATA_BACKUP="$(latest_entry "$APPDATA_BACKUP_ROOT" d 'backup_[0-9]*_[0-9]*')"
+    fi
     FLASH_BACKUP="$(latest_flash_backup)"
     [[ -n "$APPDATA_BACKUP" ]] || {
         log ERROR "No successful appdata backup generation found"
@@ -302,87 +350,134 @@ validate_environment() {
     }
 }
 
-check_free_space() {
-    local appdata_bytes flash_bytes compressed required available
-    appdata_bytes="$(tree_bytes "$APPDATA_BACKUP")"
-    flash_bytes="$(file_bytes "$FLASH_BACKUP")"
-    compressed=$((appdata_bytes + flash_bytes))
-    required="$(awk -v b="$compressed" -v m="$EXTRACT_SPACE_MULTIPLIER" \
-        -v e="$EXTRA_FREE_MARGIN_BYTES" 'BEGIN {printf "%.0f", b*m+e}')"
-    available="$(df -B1 --output=avail "$DRILL_ROOT" 2>/dev/null |
-        awk 'NR==2 {print $1}')"
-    [[ "$available" =~ ^[0-9]+$ ]] || return 1
+# A selected archive is checked against the original producer manifest. Hashes
+# are not re-created as a new baseline. Manifest checksum must name only itself.
+select_appdata_archives() {
+    local raw bytes hash name count expected i start j
+    local -a names=() sizes=() hashes=() raws=()
+    [[ -f "$APPDATA_BACKUP/backup_manifest.tsv" && ! -L "$APPDATA_BACKUP/backup_manifest.tsv" &&
+       -f "$APPDATA_BACKUP/backup_manifest.tsv.sha256" ]] || return 1
+    [[ $(wc -l <"$APPDATA_BACKUP/backup_manifest.tsv.sha256") == 1 ]] || return 1
+    hash=$(awk '{print $1}' "$APPDATA_BACKUP/backup_manifest.tsv.sha256")
+    [[ "$hash" =~ ^[a-f0-9]{64}$ &&
+       $(sha256sum "$APPDATA_BACKUP/backup_manifest.tsv" | awk '{print $1}') == "$hash" ]] || return 1
+    expected=$(sed -n 's/^# archive_count=//p' "$APPDATA_BACKUP/backup_manifest.tsv")
+    [[ "$expected" =~ ^[1-9][0-9]*$ ]] || return 1
+    while IFS=$'\t' read -r raw bytes hash name; do
+        [[ "$raw" == \#* ]] && continue
+        [[ "$raw" =~ ^[0-9]+$ && "$bytes" =~ ^[0-9]+$ && "$hash" =~ ^[a-f0-9]{64}$ &&
+           "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ &&
+           -f "$APPDATA_BACKUP/$name.tar.gz" && ! -L "$APPDATA_BACKUP/$name.tar.gz" ]] || return 1
+        # Reject duplicates, which could hide a missing archive behind the count.
+        for i in "${names[@]}"; do [[ "$i" != "$name" ]] || return 1; done
+        names+=("$name"); sizes+=("$bytes"); hashes+=("$hash"); raws+=("$raw")
+    done <"$APPDATA_BACKUP/backup_manifest.tsv"
+    count=${#names[@]}
+    (( count == expected )) || return 1
+    start=$(( ($(date +%s) / 604800 * 2) % count ))
+    for ((j=0; j<count; j++)); do
+        i=$(( (start+j) % count ))
+        selected_archive "${names[$i]}" || continue
+        if (( ${raws[$i]} > MAX_EXTRACT_BYTES )); then
+            ARCHIVES_SKIPPED=$((ARCHIVES_SKIPPED+1))
+            SKIPPED_NAMES+=("${names[$i]} (estimated expanded size exceeds budget)")
+            log INFO "Outside bounded drill scope: ${names[$i]}; recorded raw size exceeds $(human_bytes "$MAX_EXTRACT_BYTES") budget"
+            continue
+        fi
+        if (( MAX_APPDATA_ARCHIVES > 0 && ${#SELECTED_NAMES[@]} >= MAX_APPDATA_ARCHIVES )); then continue; fi
+        SELECTED_NAMES+=("${names[$i]}"); SELECTED_BYTES+=("${sizes[$i]}")
+        SELECTED_HASHES+=("${hashes[$i]}"); SELECTED_RAW+=("${raws[$i]}")
+    done
+    (( ${#SELECTED_NAMES[@]} > 0 ))
+}
 
-    log INFO "Space preflight: available=$(human_bytes "$available"), required=$(human_bytes "$required")"
-    if (( available < required )); then
-        log ERROR "Insufficient free space for isolated extraction"
-        return 1
+check_free_space() {
+    local available required=0 raw
+    for raw in "${SELECTED_RAW[@]}"; do (( raw <= required )) || required=$raw; done
+    # One appdata archive is extracted at a time. The larger compressed-size
+    # estimate is a fallback; recorded raw sizes can be stale, so runtime checks
+    # remain mandatory during extraction.
+    local compressed
+    for compressed in "${SELECTED_BYTES[@]}"; do
+        raw=$(awk -v b="$compressed" -v m="$EXTRACT_SPACE_MULTIPLIER" 'BEGIN {printf "%.0f",b*m}')
+        (( raw <= required )) || required=$raw
+    done
+    (( required <= MAX_EXTRACT_BYTES )) || required=$MAX_EXTRACT_BYTES
+    required=$((required + EXTRA_FREE_MARGIN_BYTES + $(file_bytes "$FLASH_BACKUP")))
+    available=$(df -B1 --output=avail "$DRILL_ROOT" | awk 'NR==2 {print $1}')
+    [[ "$available" =~ ^[0-9]+$ ]] || return 1
+    log INFO "Selected ${#SELECTED_NAMES[@]} appdata archives; available=$(human_bytes "$available"), required=$(human_bytes "$required")"
+    (( available >= required ))
+}
+
+bounded_extract() {
+    local archive="$1" destination="$2" available used rc=0
+    mkdir -p -- "$destination" || return 1
+    # GNU tar rejects traversal and extraction through symlink parents. Keep-old
+    # also refuses duplicate/overlapping entries. Each archive gets a fresh root.
+    local -a extract_command
+    if [[ "$archive" == *.zip ]]; then
+        extract_command=(unzip -q "$archive" -d "$destination")
+    else
+        extract_command=(tar -xzf "$archive" -C "$destination" --no-same-owner
+            --no-same-permissions --keep-old-files --delay-directory-restore)
     fi
+    setsid timeout --signal=TERM --kill-after=10 3600 "${extract_command[@]}" \
+        >"$WORK_DIR/extraction.stdout" 2>"$WORK_DIR/extraction.stderr" &
+    EXTRACT_PID=$!
+    while kill -0 "$EXTRACT_PID" 2>/dev/null; do
+        available=$(df -B1 --output=avail "$DRILL_ROOT" | awk 'NR==2 {print $1}')
+        used=$(du -sb "$destination" | awk '{print $1}')
+        if ! [[ "$available" =~ ^[0-9]+$ && "$used" =~ ^[0-9]+$ ]] ||
+           (( available < EXTRA_FREE_MARGIN_BYTES || used > MAX_EXTRACT_BYTES )); then
+            log ERROR "Extraction stopped: free-space reserve or expanded-size budget exceeded"
+            kill -TERM -- "-$EXTRACT_PID" 2>/dev/null || true
+            wait "$EXTRACT_PID" 2>/dev/null || true
+            EXTRACT_PID=""; return 1
+        fi
+        sleep 1
+    done
+    wait "$EXTRACT_PID" || rc=$?
+    EXTRACT_PID=""
+    if (( rc != 0 )); then tail -n 12 "$WORK_DIR/extraction.stderr"; return "$rc"; fi
+    used=$(du -sb "$destination" | awk '{print $1}')
+    available=$(df -B1 --output=avail "$DRILL_ROOT" | awk 'NR==2 {print $1}')
+    (( used <= MAX_EXTRACT_BYTES && available >= EXTRA_FREE_MARGIN_BYTES ))
 }
 
 drill_appdata() {
-    local archive base extracted=0
-    local -a archives=()
-
-    mapfile -t archives < <(
-        find "$APPDATA_BACKUP" -maxdepth 1 -type f -name '*.tar.gz' \
-            -printf '%f\n' 2>/dev/null | sort
-    )
-    (( ${#archives[@]} > 0 )) || {
-        log ERROR "No appdata archives found in $APPDATA_BACKUP"
-        return 1
-    }
-
+    local i name archive hash
     mkdir -p -- "$WORK_DIR/appdata" || return 1
-
-    for base in "${archives[@]}"; do
-        archive="${APPDATA_BACKUP}/${base}"
-        base="${base%.tar.gz}"
-        selected_archive "$base" || continue
-        if (( MAX_APPDATA_ARCHIVES > 0 && extracted >= MAX_APPDATA_ARCHIVES )); then
-            break
-        fi
-
-        log INFO "Testing appdata archive: $archive"
-        gzip -t "$archive" || {
-            log ERROR "Gzip integrity failed: $archive"
-            return 1
-        }
-        tar -tzf "$archive" >/dev/null || {
-            log ERROR "Tar listing failed: $archive"
-            return 1
-        }
-        validate_archive_paths "$archive" || {
-            log ERROR "Unsafe path found in archive: $archive"
-            return 1
-        }
-
-        sha256sum "$archive" >>"$WORK_DIR/archive-sha256.txt" || return 1
-        tar -xzf "$archive" -C "$WORK_DIR/appdata" \
-            --no-same-owner --no-same-permissions || {
-            log ERROR "Extraction failed: $archive"
-            return 1
-        }
-        ARCHIVES_CHECKED=$((ARCHIVES_CHECKED + 1))
-        ARCHIVES_EXTRACTED=$((ARCHIVES_EXTRACTED + 1))
-        extracted=$((extracted + 1))
+    for ((i=0; i<${#SELECTED_NAMES[@]}; i++)); do
+        name="${SELECTED_NAMES[$i]}"; archive="$APPDATA_BACKUP/$name.tar.gz"
+        RESULT_SUMMARY="Checking appdata archive $name"
+        [[ $(file_bytes "$archive") == "${SELECTED_BYTES[$i]}" ]] || return 1
+        hash=$(sha256sum "$archive" | awk '{print $1}') || return 1
+        [[ "$hash" == "${SELECTED_HASHES[$i]}" ]] || { log ERROR "Producer checksum mismatch: $name"; return 1; }
+        validate_archive_paths "$archive" || { log ERROR "Unsafe/unreadable tar: $name"; return 1; }
+        bounded_extract "$archive" "$WORK_DIR/appdata/$name" || return 1
+        ARCHIVES_CHECKED=$((ARCHIVES_CHECKED+1)); ARCHIVES_EXTRACTED=$((ARCHIVES_EXTRACTED+1))
+        EXTRACTED_BASE="$WORK_DIR/appdata/$name"
+        check_sqlite_databases || return 1
+        CHECKED_NAMES+=("$name")
+        printf '%s  %s.tar.gz\n' "$hash" "$name" >>"$WORK_DIR/archive-sha256.txt"
+        rm -rf -- "$WORK_DIR/appdata/$name" || return 1
+        log INFO "Restored and checked $name; temporary payload removed"
     done
-
-    (( ARCHIVES_EXTRACTED > 0 )) || {
-        log ERROR "Archive selection extracted nothing"
-        return 1
-    }
 }
 
 drill_flash() {
-    local required found checksum_file checksum_dir checksum_name list_file
+    local required found checksum_file checksum_name expected_hash actual_hash list_file
     log INFO "Testing boot-device backup: $FLASH_BACKUP"
 
     checksum_file="${FLASH_BACKUP}.sha256"
     if [[ -f "$checksum_file" ]]; then
-        checksum_dir="$(dirname "$checksum_file")"
-        checksum_name="$(basename "$checksum_file")"
-        if ! (cd "$checksum_dir" && sha256sum -c --status "$checksum_name"); then
+        expected_hash=$(awk 'NR==1 {print $1}' "$checksum_file")
+        checksum_name=$(sed -n '1s/^[^ ]*  //p' "$checksum_file")
+        actual_hash=$(sha256sum "$FLASH_BACKUP" | awk '{print $1}') || return 1
+        if [[ $(wc -l <"$checksum_file") != 1 ||
+              "$checksum_name" != "${FLASH_BACKUP##*/}" ||
+              ! "$expected_hash" =~ ^[a-f0-9]{64}$ || "$actual_hash" != "$expected_hash" ]]; then
             FLASH_CHECKSUM_STATUS="FAILED"
             log ERROR "Boot-device SHA-256 verification failed: $checksum_file"
             return 1
@@ -397,11 +492,6 @@ drill_flash() {
         FLASH_CHECKSUM_STATUS="MISSING_ALLOWED"
         log WARN "Boot-device checksum sidecar is missing; continuing by configuration"
     fi
-
-    unzip -tq "$FLASH_BACKUP" >/dev/null || {
-        log ERROR "Boot-device ZIP integrity failed"
-        return 1
-    }
 
     mkdir -p -- "$WORK_DIR/flash" || return 1
 
@@ -425,49 +515,56 @@ drill_flash() {
         return 1
     fi
 
-    unzip -q "$FLASH_BACKUP" -d "$WORK_DIR/flash" || return 1
-    sha256sum "$FLASH_BACKUP" >>"$WORK_DIR/archive-sha256.txt" || return 1
+    bounded_extract "$FLASH_BACKUP" "$WORK_DIR/flash" || return 1
+    # Extraction validated ZIP CRC; the sidecar was already hashed above.
+    printf '%s\n' "$FLASH_CHECKSUM_STATUS $FLASH_BACKUP" >>"$WORK_DIR/archive-sha256.txt" || return 1
 
+    found=$(find "$WORK_DIR/flash" -type d -name config -print -quit)
+    [[ -n "$found" ]] || { log ERROR "Boot backup has no config directory"; return 1; }
     for required in super.dat ident.cfg; do
         found="$(
             find "$WORK_DIR/flash" -type f -path "*/config/$required" \
                 -print -quit 2>/dev/null
         )"
         [[ -n "$found" ]] || {
-            log ERROR "Boot backup is missing required path: $required"
-            return 1
+            log WARN "Boot backup lacks recommended legacy path: $required; review this OS/storage layout"
+            DRILL_WARNINGS=$((DRILL_WARNINGS+1))
         }
     done
 
     log INFO "Boot-device restore verified $FLASH_ARCHIVE_FILES files"
+    rm -rf -- "$WORK_DIR/flash" || return 1
 }
 
 check_sqlite_databases() {
     local database result checked=0
     [[ "$CHECK_SQLITE_DATABASES" == true ]] || return 0
     if ! command -v sqlite3 >/dev/null 2>&1; then
-        log WARN "sqlite3 is unavailable; database quick checks were skipped"
-        return 0
+        log WARN "sqlite3 is unavailable; database checks NOT verified"
+        DRILL_WARNINGS=$((DRILL_WARNINGS+1)); return 0
     fi
 
     while IFS= read -r -d '' database; do
         if (( checked >= SQLITE_MAX_FILES )); then
-            log WARN "SQLite check limit reached: $SQLITE_MAX_FILES"
-            break
+            log WARN "SQLite check limit reached: $SQLITE_MAX_FILES; remaining databases NOT verified"
+            DRILL_WARNINGS=$((DRILL_WARNINGS+1)); break
         fi
         dd if="$database" bs=15 count=1 status=none 2>/dev/null |
             grep -q '^SQLite format 3' || continue
         checked=$((checked + 1))
         DATABASES_CHECKED=$((DATABASES_CHECKED + 1))
-        result="$(sqlite3 -readonly "$database" 'PRAGMA quick_check;' 2>&1)" || true
-        if [[ "$result" != "ok" ]]; then
+        result="$(timeout --signal=TERM --kill-after=5 120 sqlite3 -readonly "$database" 'PRAGMA quick_check;' 2>&1)" || true
+        if [[ "$result" == *"no such collation"* || "$result" == *"no such function"* ]]; then
+            DRILL_WARNINGS=$((DRILL_WARNINGS+1))
+            log WARN "Database check unverified: $database; SQLite build lacks required application extension: $result"
+        elif [[ "$result" != "ok" ]]; then
             DATABASES_FAILED=$((DATABASES_FAILED + 1))
             log ERROR "SQLite quick_check failed: $database: $result"
         else
             log INFO "SQLite quick_check passed: $database"
         fi
     done < <(
-        find "$WORK_DIR/appdata" -type f \
+        find "${EXTRACTED_BASE:-$WORK_DIR/appdata}" -type f \
             \( -iname '*.db' -o -iname '*.sqlite' -o -iname '*.sqlite3' \) \
             -print0 2>/dev/null
     )
@@ -485,6 +582,9 @@ promote_drill() {
         printf 'flash_archive_files=%s\n' "$FLASH_ARCHIVE_FILES"
         printf 'archives_extracted=%s\n' "$ARCHIVES_EXTRACTED"
         printf 'databases_checked=%s\n' "$DATABASES_CHECKED"
+        printf 'scope=rotating bounded selection; no service startup or boot test\n'
+        printf 'checked_archive=%s\n' "${CHECKED_NAMES[@]}"
+        printf 'not_extracted=%s\n' "${SKIPPED_NAMES[@]}"
     } >"$WORK_DIR/result.txt" || return 1
 
     mv -- "$WORK_DIR" "$FINAL_DIR" || return 1
@@ -496,12 +596,24 @@ promote_drill() {
 ###############################################################################
 
 main() {
+    case "${1:-}" in
+        --help) printf 'Usage: bash script [--generation-root /mnt/user/backup/vault_versions/hubble-STAMP]\nRun on the host holding the backup. Default rotates two archives; MAX_APPDATA_ARCHIVES=0 selects all within MAX_EXTRACT_BYTES. Restored payload is removed; only evidence retained.\n'; return 0;;
+        --generation-root) [[ $# == 2 ]] || return 2; GENERATION_ROOT="$2";;
+        "") ;;
+        *) return 2;;
+    esac
     trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     if ! mountpoint -q "$VAULT_MOUNT"; then
         printf 'Vault pool is not mounted: %s\n' "$VAULT_MOUNT" >&2
         return 1
     fi
+    [[ "$DRILL_ROOT" == "$VAULT_MOUNT"/* && "$DRILL_ROOT" != "$VAULT_MOUNT/" &&
+       ! -L "$DRILL_ROOT" && $(realpath -m -- "$DRILL_ROOT") == "$DRILL_ROOT" ]] || {
+        printf 'Unsafe drill workspace: %s\n' "$DRILL_ROOT" >&2; return 1;
+    }
     mkdir -p -- "$LOG_DIR" "$DRILL_ROOT" || return 1
     : >"$LOG_FILE" || return 1
     prune_logs
@@ -514,7 +626,15 @@ main() {
     fi
 
     log INFO "Starting isolated backup restore drill"
+    # Shared locks match producers; select only while retention is excluded.
+    exec {APPDATA_LOCK_FD}>"${APPDATA_LOCK_FILE:-/tmp/appdata_backup.lock}" || return 1
+    flock -s -n "$APPDATA_LOCK_FD" || { RESULT_SUMMARY="Appdata producer active; retry the drill later"; return 1; }
+    exec {FLASH_LOCK_FD}>"${FLASH_LOCK_FILE:-/tmp/flash_backup.lock}" || return 1
+    flock -s -n "$FLASH_LOCK_FD" || { RESULT_SUMMARY="Flash producer active; retry the drill later"; return 1; }
     validate_environment || return 1
+    RESULT_SUMMARY="Producer manifest missing or invalid"
+    select_appdata_archives || return 1
+    RESULT_SUMMARY="Insufficient extraction space"
     check_free_space || return 1
     [[ ! -e "$WORK_DIR" && ! -e "$FINAL_DIR" ]] || {
         log ERROR "Drill destination already exists"
@@ -523,8 +643,8 @@ main() {
     mkdir -p -- "$WORK_DIR" || return 1
 
     drill_appdata || return 1
+    RESULT_SUMMARY="Boot-device archive validation failed"
     drill_flash || return 1
-    check_sqlite_databases || return 1
     promote_drill || return 1
     prune_drills || {
         RESULT_STATUS="WARNING"
@@ -535,10 +655,14 @@ main() {
     }
 
     RESULT_STATUS="OK"
-    RESULT_SUMMARY="${ARCHIVES_EXTRACTED} appdata archives restored; ${DATABASES_CHECKED} SQLite databases checked; boot ZIP restored with ${FLASH_ARCHIVE_FILES} files and checksum ${FLASH_CHECKSUM_STATUS}"
+    local importance=normal
+    if (( DRILL_WARNINGS > 0 )); then RESULT_STATUS="WARNING"; importance=warning; fi
+    RESULT_SUMMARY="Restored and removed temporary payload: ${CHECKED_NAMES[*]}. SQLite databases checked: ${DATABASES_CHECKED}. Boot ZIP restored: ${FLASH_ARCHIVE_FILES} files; checksum ${FLASH_CHECKSUM_STATUS}. Scope: rotating selection, not a full application/boot recovery test."
+    if (( ARCHIVES_SKIPPED > 0 )); then RESULT_SUMMARY+=" Outside extraction budget: ${SKIPPED_NAMES[*]}."; fi
+    if (( DRILL_WARNINGS > 0 )); then RESULT_SUMMARY+=" Warnings/unverified checks: $DRILL_WARNINGS; review drill log for affected checks."; fi
     log INFO "$RESULT_SUMMARY"
     write_receipt "$RESULT_STATUS" "$RESULT_SUMMARY"
-    notify_unraid normal "Restore drill passed" \
+    notify_unraid "$importance" "Restore drill $RESULT_STATUS" \
         "$RESULT_SUMMARY"$'\n'"Staging result: $FINAL_DIR"
 }
 

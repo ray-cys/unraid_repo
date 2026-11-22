@@ -142,3 +142,101 @@ defaults until the entire network/storage path is measured.
 References: [rsync options](https://download.samba.org/pub/rsync/rsync.1),
 [OpenSSH transport settings](https://man.openbsd.org/ssh_config),
 [Unraid array behavior](https://docs.unraid.net/unraid-os/using-unraid-to/manage-storage/array/overview/).
+
+## Completion-driven vault copies (appdata v3.7 / vault v1.6)
+
+On Hubble, keep the appdata schedule and replace the weekly
+`vault_remote_backup` schedule with `10 * * * *`. The hourly job checks local
+metadata first; without a new request it exits without WOL, SSH, rsync, a new
+backup log, or notification. `remote_backup` keeps its existing Sunday mirror
+schedule and shared ISS lease.
+
+A fully successful appdata run (including staged-generation recovery and
+container restarts) atomically publishes
+`/mnt/vault/cloud/logs/script/user_scripts_status/iss-backup-request.json`.
+The vault consumer checks the request age (maximum 72 hours), source identity
+and manifest digest, and acquires producer locks **before** waking ISS. This
+queues work rather than starting a child that inherits the producer's lock.
+Failed transfers leave the request pending for the next hourly attempt.
+New requests supersede older requests with the latest successful generation.
+
+The copied appdata archives are verified against the original producer hashes
+on ISS using the normal transfer manifest. No fresh hash of corrupted source
+bytes can replace that baseline. Only after remote verification and promotion
+is `iss-backup-delivered.json` atomically saved with the source identity and
+remote generation path. Dry runs never acknowledge requests. A completed
+request is not copied again. `bash script --force` explicitly repeats the
+current request; freshness and safety checks still apply. To retain manual,
+schedule-independent operation, set `COMPLETION_DRIVEN=false` in the vault
+configuration. Repository `DRY_RUN=true` remains intentional; live Hubble uses
+`false`.
+
+Deploy the standalone `backup_restore_drill.sh` as a User Scripts entry named
+`backup_restore_drill`. It does not need an independent cron schedule. After a
+successful live vault copy, vault v1.6 uploads/checksums this reviewed script
+and runs a bounded drill **on ISS**, at most once per seven days. ISS must
+provide GNU tar/coreutils, setsid, timeout, unzip, flock, jq and preferably
+sqlite3. It uses the completed generation itself, while the existing ISS lease
+protects it from competing retention/shutdown. Restored files never replace
+production appdata or `/boot`.
+
+The drill rotates two appdata archives weekly, checks original producer hashes,
+extracts each to a separate directory, checks SQLite databases where supported,
+and deletes the temporary payload before the next archive. It also verifies and
+extracts the flash ZIP. It retains two small result directories and five logs
+under `/mnt/user/backup/vault_versions/restore_drill` on ISS. Default extraction
+budget is 64 GiB per archive with a 5 GiB free-space reserve; live space and size
+checks stop extraction if the budget is exceeded. Oversize applications are
+explicitly outside this bounded selection, not certified as restored. Missing
+SQLite support, application-specific SQL extensions, scan limits, and absent
+recommended legacy flash files produce a warning rather than a false claim of
+full verification. Extraction/database failures retain the verified remote
+backup and are included in the vault notification. The delivery acknowledgement
+is preserved, so a drill failure does not trigger repeated full generation
+copies. A failed drill is attempted again after the next successful new copy.
+A successful bounded drill is not proof of application startup or USB boot.
+
+Manual local drill:
+
+```bash
+/bin/bash /boot/config/plugins/user.scripts/scripts/backup_restore_drill/script
+```
+
+Manual ISS drill (run **on ISS**, with a real completed generation name):
+
+```bash
+VAULT_MOUNT=/mnt/user \
+DRILL_ROOT=/mnt/user/backup/vault_versions/restore_drill \
+LOG_DIR=/mnt/user/backup/vault_versions/restore_drill/logs \
+STATUS_DIR=/mnt/user/backup/vault_versions/restore_drill/status \
+/bin/bash /mnt/user/backup/vault_versions/.hubble-restore-drill.sh \
+  --generation-root /mnt/user/backup/vault_versions/hubble-YYYYMMDD_HHMMSS
+```
+
+For a deliberate wider drill, `MAX_APPDATA_ARCHIVES=0` selects all archives that
+fit `MAX_EXTRACT_BYTES`. Adjust the budget only after checking the actual target
+filesystem. Producer locks protect source selection and local retention. GNU tar
+path checks, fresh per-archive roots and refusal to overwrite entries prevent
+archive traversal/link collisions; this is not an execution sandbox for arbitrary
+untrusted backups.
+
+## Arr monitoring during appdata maintenance
+
+`arr_health_activity.sh` v3.13.2 and appdata v3.7 coordinate through
+`/run/arr-appdata-coordination.lock`. A normal Arr scan holds it shared through
+its observation, automation and notification phases. Appdata waits up to fifteen
+minutes for an existing scan before it can stop containers, then holds it
+exclusively until restart attempts finish. New scans defer while backup owns it,
+and for a bounded two-minute startup grace after release. No API polling,
+automation, reminders or issue resolution occurs during a deferred invocation;
+existing issue state is preserved. CLI state administration remains available.
+
+Deferred invocations write a small `/run` timestamp. The next normal scan uses
+recent proof that the scheduler continued running to avoid a false missed-run
+alert; an unrelated old gap or previous failed scan is not erased. After startup
+grace, containers/APIs still unavailable are real failures and alert normally.
+The existing Docker watchdog per-container maintenance leases remain in use.
+Deploy **both** scripts to close the mid-scan stop race. This intentionally
+pauses the whole Arr/SAB scan during appdata maintenance instead of declaring
+unobserved applications healthy. It does not erase existing alerts from before
+the upgrade.

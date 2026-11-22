@@ -124,6 +124,9 @@ run_backup() {
         RETRIES=3 \
         RETRY_DELAY=0 \
         MAX_LOGS=20 \
+        ARR_BACKUP_GATE="$root/arr-gate.lock" \
+        ARR_BACKUP_GRACE="$root/arr-grace" \
+        ISS_REQUEST_FILE="$root/iss-request.json" \
         LOCK_FILE="$root/appdata.lock" \
         NOTIFY_BIN="$root/bin/notify" \
         MOCK_NOTIFY_LOG="$root/notify.log" \

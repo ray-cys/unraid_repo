@@ -14,7 +14,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.5"
+readonly SCRIPT_VERSION="1.6"
 
 ###############################################################################
 # CONFIGURATION
@@ -56,6 +56,21 @@ DEFER_REMOTE_SHUTDOWN_DURING_CRITICAL_ARRAY_OPERATION=true
 
 # Keep true for the first manually reviewed run.
 DRY_RUN=true
+# Schedule hourly. No request/new generation means no network traffic or WOL.
+# --force bypasses deduplication only; producer/freshness/integrity checks remain.
+COMPLETION_DRIVEN=true
+ISS_REQUEST_FILE="${ISS_REQUEST_FILE:-/mnt/vault/cloud/logs/script/user_scripts_status/iss-backup-request.json}"
+ISS_DELIVERED_FILE="${ISS_DELIVERED_FILE:-/mnt/vault/cloud/logs/script/user_scripts_status/iss-backup-delivered.json}"
+MAX_PRODUCER_AGE_SECONDS=$((72 * 3600))
+ISS_REQUEST_ID=""
+ISS_REQUEST_GENERATION=""
+# Run a bounded drill on ISS itself once weekly, while it is already awake.
+# The local User Scripts entry supplies the reviewed standalone drill script.
+RUN_REMOTE_RESTORE_DRILL=true
+RESTORE_DRILL_SCRIPT="${RESTORE_DRILL_SCRIPT:-/boot/config/plugins/user.scripts/scripts/backup_restore_drill/script}"
+RESTORE_DRILL_INTERVAL_SECONDS=604800
+RESTORE_DRILL_RESULT="not_due"
+RESTORE_DRILL_SUMMARY=""
 
 USE_LOW_PRIORITY_IO=true
 IONICE_CLASS=2
@@ -250,6 +265,7 @@ backup_finish() {
     [[ "$BACKUP_RESULT" != OK || "$status" != FAILED ]] || status=WARNING
     [[ "${DRY_RUN:-false}" != true || "$status" != OK ]] || status=WARNING
     [[ "$RETENTION_RESULT" != FAILED || "$status" != OK ]] || status=WARNING
+    case "$RESTORE_DRILL_RESULT" in FAILED|WARNING) [[ "$status" != OK ]] || status=WARNING;; esac
     [[ "$SHUTDOWN_RESULT" == deferred || ( -z "${REMOTE_SHUTDOWN_SKIPPED_REASON:-}" && "${REMOTE_SHUTDOWN_FAILED:-0}" == 0 ) ]] || { [[ "$status" != OK ]] || status=WARNING; }
     [[ "$SHUTDOWN_RESULT" == deferred || -z "${REMOTE_SHUTDOWN_SKIPPED_REASON:-}" ]] || SHUTDOWN_RESULT=skipped
     if (( rc == 0 )); then BACKUP_PHASE=completed; fi
@@ -262,8 +278,8 @@ Log: $LOG_FILE" >/dev/null 2>&1; then NOTIFICATION_RESULT=sent; else NOTIFICATIO
     if mountpoint -q /mnt/vault && command -v jq >/dev/null; then
         mkdir -p -- "$STATUS_DIR"
         temp=$(mktemp "$STATUS_DIR/.${SCRIPT_ID}.XXXXXX") &&
-            jq -n --arg name "$SCRIPT_ID" --arg status "$status" --arg summary "$summary" --arg phase "$BACKUP_PHASE" --arg copy "$BACKUP_RESULT" --arg verification "$VERIFICATION_RESULT" --arg retention "$RETENTION_RESULT" --arg notification "$NOTIFICATION_RESULT" --arg shutdown "$SHUTDOWN_RESULT" --arg shutdown_reason "${REMOTE_SHUTDOWN_SKIPPED_REASON:-}" --arg version "$SCRIPT_VERSION" --arg log "$LOG_FILE" --argjson duration "$(( $(date +%s)-BACKUP_STARTED ))" --argjson epoch "$(date +%s)" \
-            '{name:$name,status:$status,summary:$summary,phase:$phase,copy:$copy,verification:$verification,retention:$retention,notification:$notification,shutdown:$shutdown,shutdown_reason:$shutdown_reason,scriptVersion:$version,duration_seconds:$duration,log:$log,epoch:$epoch}' >"$temp" && mv -f -- "$temp" "$STATUS_DIR/$SCRIPT_ID.json"
+            jq -n --arg drill "$RESTORE_DRILL_RESULT" --arg drillSummary "$RESTORE_DRILL_SUMMARY" --arg name "$SCRIPT_ID" --arg status "$status" --arg summary "$summary" --arg phase "$BACKUP_PHASE" --arg copy "$BACKUP_RESULT" --arg verification "$VERIFICATION_RESULT" --arg retention "$RETENTION_RESULT" --arg notification "$NOTIFICATION_RESULT" --arg shutdown "$SHUTDOWN_RESULT" --arg shutdown_reason "${REMOTE_SHUTDOWN_SKIPPED_REASON:-}" --arg version "$SCRIPT_VERSION" --arg log "$LOG_FILE" --argjson duration "$(( $(date +%s)-BACKUP_STARTED ))" --argjson epoch "$(date +%s)" \
+            '{restoreDrill:$drill,restoreDrillSummary:$drillSummary,name:$name,status:$status,summary:$summary,phase:$phase,copy:$copy,verification:$verification,retention:$retention,notification:$notification,shutdown:$shutdown,shutdown_reason:$shutdown_reason,scriptVersion:$version,duration_seconds:$duration,log:$log,epoch:$epoch}' >"$temp" && mv -f -- "$temp" "$STATUS_DIR/$SCRIPT_ID.json"
     fi
     [[ -z "$LEASE_INPUT" ]] || exec {LEASE_INPUT}>&-
     [[ -z "$LEASE_PID" ]] || { kill "$LEASE_PID" 2>/dev/null || true; wait "$LEASE_PID" 2>/dev/null || true; }
@@ -545,6 +561,101 @@ vault_select_sources() {
     done
     BACKUP_JOBS=("${selected[@]}")
 }
+# Return 10 for a harmless no-op. Malformed/stale requests fail visibly.
+vault_pending_request() {
+    local digest completed now delivered="" root="" job label source
+    [[ -f "$ISS_REQUEST_FILE" ]] || return 10
+    jq -e '.schema==1 and (.generation|type=="string") and
+      (.manifestSha256|test("^[a-f0-9]{64}$")) and
+      (.completedAt|type=="number" and .==floor and .>0)' "$ISS_REQUEST_FILE" >/dev/null || return 1
+    ISS_REQUEST_GENERATION=$(jq -r .generation "$ISS_REQUEST_FILE") || return 1
+    digest=$(jq -r .manifestSha256 "$ISS_REQUEST_FILE") || return 1
+    completed=$(jq -r .completedAt "$ISS_REQUEST_FILE") || return 1
+    now=$(date +%s)
+    for job in "${BACKUP_JOBS[@]}"; do
+        IFS='|' read -r label source <<<"$job"
+        [[ "$label" != appdata ]] || root="$source"
+    done
+    [[ -n "$root" && "$ISS_REQUEST_GENERATION" == "$root"/backup_* &&
+       "${ISS_REQUEST_GENERATION##*/}" =~ ^backup_[0-9]{8}_[0-9]{6}$ &&
+       -d "$ISS_REQUEST_GENERATION" && ! -L "$ISS_REQUEST_GENERATION" &&
+       $(realpath -e -- "$ISS_REQUEST_GENERATION") == "$ISS_REQUEST_GENERATION" ]] || return 1
+    ISS_REQUEST_ID="${ISS_REQUEST_GENERATION##*/}:$digest"
+    if [[ -f "$ISS_DELIVERED_FILE" ]]; then delivered=$(jq -r '.requestId // ""' "$ISS_DELIVERED_FILE") || return 1; fi
+    [[ "$ISS_REQUEST_ID" != "$delivered" || "${1:-}" == --force ]] || return 10
+    (( completed <= now && now-completed <= MAX_PRODUCER_AGE_SECONDS )) || {
+        printf 'Pending ISS request is stale/future-dated; source backup must succeed again\n' >&2; return 1;
+    }
+    [[ $(sha256sum "$ISS_REQUEST_GENERATION/backup_manifest.tsv" | awk '{print $1}') == "$digest" ]] || return 1
+}
+vault_acknowledge_request() {
+    [[ -n "$ISS_REQUEST_ID" ]] || return 0
+    local tmp
+    mkdir -p -- "${ISS_DELIVERED_FILE%/*}" || return 1
+    tmp=$(mktemp "${ISS_DELIVERED_FILE}.XXXXXX") || return 1
+    if jq -n --arg requestId "$ISS_REQUEST_ID" --arg source "$ISS_REQUEST_GENERATION" \
+      --arg remote "$REMOTE_FINAL" --argjson verifiedAt "$(date +%s)" \
+      '{schema:1,requestId:$requestId,source:$source,remote:$remote,verifiedAt:$verifiedAt,verification:"sha256"}' >"$tmp" &&
+      mv -f -- "$tmp" "$ISS_DELIVERED_FILE"; then return 0; fi
+    rm -f -- "$tmp"; return 1
+}
+# Reuse the producer's expected archive digests in the transfer manifest. The
+# existing remote SHA pass then proves the original backup, with no second full
+# read of every local archive or repeated remote payload checksum pass.
+vault_appdata_manifest() {
+    local source="$1" manifest="$2" raw bytes hash name path rows=0 expected
+    local -A hashes=()
+    expected=$(sed -n 's/^# archive_count=//p' "$source/backup_manifest.tsv")
+    [[ "$expected" =~ ^[1-9][0-9]*$ ]] || return 1
+    while IFS=$'\t' read -r raw bytes hash name; do
+        [[ "$raw" == \#* ]] && continue
+        [[ "$raw" =~ ^[0-9]+$ && "$bytes" =~ ^[0-9]+$ && "$hash" =~ ^[a-f0-9]{64}$ &&
+           "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && -z "${hashes[$name]+present}" ]] || return 1
+        hashes[$name]="$hash"; rows=$((rows+1))
+        [[ -f "$source/$name.tar.gz" && ! -L "$source/$name.tar.gz" &&
+           $(stat -c %s "$source/$name.tar.gz") == "$bytes" ]] || return 1
+    done <"$source/backup_manifest.tsv"
+    (( rows == expected )) || return 1
+    : >"$manifest"
+    while IFS= read -r -d '' path; do
+        if [[ "$path" == ./*.tar.gz && "${path#./}" != */* ]]; then
+            name="${path#./}"; name="${name%.tar.gz}"
+            [[ -n "${hashes[$name]:-}" ]] || return 1
+            printf '%s  %s\n' "${hashes[$name]}" "$path" >>"$manifest"
+        else
+            (cd "$source" && sha256sum -- "$path") >>"$manifest" || return 1
+        fi
+    done <"$manifest.files"
+}
+
+vault_remote_restore_drill() {
+    [[ "$RUN_REMOTE_RESTORE_DRILL" == true ]] || { RESTORE_DRILL_RESULT=disabled; return 0; }
+    local root="$REMOTE_VERSION_ROOT/restore_drill" last digest remote_script output rc=0
+    [[ -f "$RESTORE_DRILL_SCRIPT" && ! -L "$RESTORE_DRILL_SCRIPT" ]] || {
+        RESTORE_DRILL_SUMMARY="Restore drill script is missing on Hubble; no drill performed"; return 1;
+    }
+    last=$(ssh_exec "if test -f $(shell_quote "$root/status/backup_restore_drill.json"); then jq -r 'if .status==\"OK\" or .status==\"WARNING\" then .epoch else 0 end' $(shell_quote "$root/status/backup_restore_drill.json"); else printf 0; fi") || return 1
+    [[ "$last" =~ ^[0-9]+$ ]] || return 1
+    if (( last <= $(date +%s) && $(date +%s)-last < RESTORE_DRILL_INTERVAL_SECONDS )); then
+        RESTORE_DRILL_SUMMARY="Weekly ISS restore drill not due; last completed epoch=$last"; return 0
+    fi
+    backup_phase restore-drill
+    remote_script="$REMOTE_VERSION_ROOT/.hubble-restore-drill.sh"
+    digest=$(sha256sum "$RESTORE_DRILL_SCRIPT" | awk '{print $1}') || return 1
+    rsync -a --protect-args "$RESTORE_DRILL_SCRIPT" "$REMOTE:$remote_script" || return 1
+    output="$TMP_DIR/remote-drill.log"
+    # No second email from ISS: its detailed receipt joins the vault notification.
+    # A timeout is a drill failure, not permission to invalidate/delete a backup.
+    ssh_exec "test \"\$(sha256sum $(shell_quote "$remote_script") | awk '{print \$1}')\" = '$digest' && VAULT_MOUNT=/mnt/user DRILL_ROOT=$(shell_quote "$root") LOG_DIR=$(shell_quote "$root/logs") STATUS_DIR=$(shell_quote "$root/status") NOTIFY_BIN=/nonexistent timeout --signal=TERM --kill-after=15 7200 bash $(shell_quote "$remote_script") --generation-root $(shell_quote "$REMOTE_FINAL")" >"$output" 2>&1 || rc=$?
+    tail -n 20 "$output" >>"$LOG_FILE"
+    if (( rc != 0 )); then
+        RESTORE_DRILL_SUMMARY="ISS extraction/database drill failed (exit=$rc); verified backup retained. Evidence: $root/logs"; return 1
+    fi
+    RESTORE_DRILL_SUMMARY=$(ssh_exec "jq -r '.summary' $(shell_quote "$root/status/backup_restore_drill.json")") || return 1
+    RESTORE_DRILL_RESULT=$(ssh_exec "jq -r '.status' $(shell_quote "$root/status/backup_restore_drill.json")") || return 1
+    [[ "$RESTORE_DRILL_RESULT" == OK || "$RESTORE_DRILL_RESULT" == WARNING ]]
+}
+
 vault_inventory() {
     (cd "$1" && find . \( -name '*.partial' -o -name .rsync-partial -o -name '*.tmp' -o -name '*.sock' \) -prune -o -printf '%y:%s:%T@:%l:%p\0' | sort -z | sha256sum)
 }
@@ -579,7 +690,11 @@ build_manifest() {
         printf '%s\0' "$path" >>"$manifest.files"
     done <"$manifest.inventory"
     (( files > 0 )) || { log ERROR "Refusing an empty source for $label"; return 1; }
-    (cd "$source" && sort -z "$manifest.files" | xargs -0 -r sha256sum) >"$manifest" || return 1
+    if [[ "$label" == appdata ]]; then
+        vault_appdata_manifest "$source" "$manifest" || return 1
+    else
+        (cd "$source" && sort -z "$manifest.files" | xargs -0 -r sha256sum) >"$manifest" || return 1
+    fi
     after=$(vault_inventory "$source") || return 1
     [[ "$before" == "$after" ]] || { log WARN "Source changed while hashing $label; run will be retried"; return 1; }
     MANIFEST_FILES[$label]=$files; MANIFEST_BYTES[$label]=$bytes; SOURCE_FINGERPRINT[$label]=$after
@@ -820,6 +935,16 @@ main() {
     local job label source manifest notification_message
     exec 9>"$LOCK_FILE" || return 1
     flock -n 9 || { printf 'Another vault backup is active\n' >&2; return 1; }
+    local pending_rc=0
+    case "${1:-}" in ""|--force) ;; *) printf 'Usage: bash script [--force]\nHourly default consumes successful appdata requests; --force repeats a pending/delivered generation.\n'; return 2;; esac
+    if [[ "$COMPLETION_DRIVEN" == true ]]; then
+        vault_pending_request "${1:-}" || pending_rc=$?
+        if (( pending_rc == 10 )); then printf 'No new completed appdata generation; ISS remains undisturbed\n'; return 0; fi
+        if (( pending_rc != 0 )); then
+            notify_unraid warning "ISS handoff unavailable" "Pending appdata request is malformed, stale, or its source changed. No ISS wake or transfer was attempted. A fresh successful appdata backup is required."
+            return 1
+        fi
+    fi
     trap backup_finish EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -839,15 +964,21 @@ main() {
     validate_configuration || return 1
     build_priority_prefix
     TMP_DIR="$(mktemp -d /tmp/vault-to-iss.XXXXXX)" || return 1
+    vault_producer_locks || return 1
+    vault_select_sources || return 1
+    if [[ -n "$ISS_REQUEST_ID" ]]; then
+        local matched=false
+        for job in "${BACKUP_JOBS[@]}"; do
+            [[ "$job" != "appdata|$ISS_REQUEST_GENERATION" ]] || matched=true
+        done
+        [[ "$matched" == true ]] || { log ERROR "Producer advanced; pending request will be retried on the next check"; return 1; }
+    fi
     wait_for_remote || return 1
     backup_phase capabilities
     backup_capabilities || return 1
     backup_acquire_lease || { log ERROR "ISS is already in use by another backup, or lease acquisition failed"; return 1; }
     [[ "$PRESERVE_HARD_LINKS" != true ]] || RSYNC_ARGS+=(-H)
     RSYNC_ARGS+=("--timeout=$RSYNC_IO_TIMEOUT")
-    vault_producer_locks || return 1
-    vault_select_sources || return 1
-
     RSYNC_ARGS+=("--rsync-path=LC_ALL=C rsync")
     backup_phase prepare
     if [[ "$DRY_RUN" != true ]]; then
@@ -885,6 +1016,7 @@ main() {
     }
 
     BACKUP_RESULT=OK; VERIFICATION_RESULT=sha256_verified
+    vault_acknowledge_request || { log ERROR "Remote generation verified but local handoff acknowledgement failed; retry remains pending"; return 1; }
     if ! prune_remote_generations; then
         RETENTION_RESULT=FAILED
 
@@ -896,6 +1028,10 @@ main() {
     fi
 
     RETENTION_RESULT=OK
+    if ! vault_remote_restore_drill; then
+        RESTORE_DRILL_RESULT=FAILED
+        [[ -n "$RESTORE_DRILL_SUMMARY" ]] || RESTORE_DRILL_SUMMARY="ISS restore drill unavailable; verified backup retained. Review remote drill prerequisites/logs."
+    fi
 
     RESULT_SUMMARY="Verified ${GENERATION_NAME}: ${FILES_VERIFIED} files, $(human_bytes "$BYTES_TRANSFERRED")"
     log INFO "$RESULT_SUMMARY"
@@ -907,7 +1043,9 @@ main() {
     elif (( REMOTE_SHUTDOWN_FAILED == 1 )); then
         notification_message+=$'\n'"Remote shutdown: request failed"
     fi
+    notification_message+=$'\n'"Restore drill: $RESTORE_DRILL_RESULT. $RESTORE_DRILL_SUMMARY"
     local importance=normal
+    case "$RESTORE_DRILL_RESULT" in FAILED|WARNING) importance=warning;; esac
     if [[ -n "$REMOTE_SHUTDOWN_SKIPPED_REASON" && "$SHUTDOWN_RESULT" != deferred ]] || (( REMOTE_SHUTDOWN_FAILED != 0 )); then importance=warning; fi
     notify_unraid "$importance" "Backup completed" "$notification_message"
 

@@ -185,6 +185,7 @@ else
     BACKUP_JOBS=("${saved_jobs[@]}")
     SHUTDOWN_REMOTE_ON_SUCCESS=false
     LOCK_FILE="$TEST_ROOT/vault.local.lock"
+    COMPLETION_DRIVEN=false; RUN_REMOTE_RESTORE_DRILL=false
     STATUS_DIR="$TEST_ROOT/vault-main-status"
     NOTIFY_BIN="$TEST_ROOT/main-notify"; printf '#!/bin/sh\nexit 0\n' >"$NOTIFY_BIN"; chmod 755 "$NOTIFY_BIN"
     GENERATION_NAME=hubble-20261122_235959

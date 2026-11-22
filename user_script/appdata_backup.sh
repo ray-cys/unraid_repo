@@ -59,7 +59,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="3.6"
+readonly SCRIPT_VERSION="3.7"
 
 
 ###############################################################################
@@ -407,6 +407,11 @@ NOTIFY_SUBJECT="${NOTIFY_SUBJECT:-Scheduled Backup}"
 LOCK_FILE="${LOCK_FILE:-/tmp/appdata_backup.lock}"
 # Shared expiring leases prevent watchdog alerts/recovery during owned downtime.
 DOCKER_MAINTENANCE_DIR="${DOCKER_MAINTENANCE_DIR:-/run/docker-service-maintenance}"
+# Arr scans hold this shared; backup takes it exclusively before any Docker stop.
+ARR_BACKUP_GATE="${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}"
+ARR_BACKUP_GRACE="${ARR_BACKUP_GRACE:-/run/arr-appdata-recovery-until}"
+ISS_REQUEST_FILE="${ISS_REQUEST_FILE:-/mnt/vault/cloud/logs/script/user_scripts_status/iss-backup-request.json}"
+ISS_HANDOFF_RESULT="not_requested"
 
 
 ###############################################################################
@@ -1942,6 +1947,36 @@ discover_target_containers() {
 }
 
 
+# Publish only completed vault generations after successful container restart.
+# The ISS consumer acknowledges the manifest identity only after remote SHA proof.
+publish_iss_request() {
+    local generation="${APPDATA_BACKUP_PATH:-}" digest tmp
+    [[ "$generation" == "$DEST_DIR"/backup_* && -d "$generation" ]] || return 1
+    manifest_checksum_valid "$generation" || return 1
+    command -v jq >/dev/null || return 1
+    digest=$(sha256sum "$generation/backup_manifest.tsv" | awk '{print $1}') || return 1
+    mkdir -p -- "${ISS_REQUEST_FILE%/*}" || return 1
+    tmp=$(mktemp "${ISS_REQUEST_FILE}.XXXXXX") || return 1
+    if jq -n --arg generation "$generation" --arg manifestSha256 "$digest" \
+       --argjson completedAt "$(date +%s)" \
+       '{schema:1,generation:$generation,manifestSha256:$manifestSha256,completedAt:$completedAt}' >"$tmp" &&
+       mv -f -- "$tmp" "$ISS_REQUEST_FILE"; then
+        ISS_HANDOFF_RESULT="queued"
+        log "ISS" "INFO" "Queued verified generation for completion-driven ISS backup: $generation"
+    else
+        rm -f -- "$tmp"; return 1
+    fi
+}
+
+release_arr_backup_gate() {
+    [[ "${ARR_BACKUP_GATE_HELD:-false}" == true ]] || return 0
+    # Bounded startup grace; /run is cleared on boot. Failed restarts remain real
+    # faults once this expires, rather than receiving indefinite suppression.
+    printf '%s\n' "$(( $(date +%s) + 120 ))" >"$ARR_BACKUP_GRACE"
+    exec {ARR_BACKUP_GATE_FD}>&-
+    ARR_BACKUP_GATE_HELD=false
+}
+
 backup_maintenance_begin() {
     local name="$1" fd tmp boot process_start
     [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 1
@@ -2155,6 +2190,7 @@ handle_exit() {
 
         emergency_restart_containers
     fi
+    release_arr_backup_gate
 
     if [ "$exit_code" -ne 0 ] &&
        [ "$KEEP_PARTIAL" != "true" ] &&
@@ -3370,6 +3406,9 @@ send_final_notification() {
         overall_status="FAILED"
     fi
 
+    if [ "$ISS_HANDOFF_RESULT" = "failed" ] && [ "$overall_status" = "OK" ]; then
+        overall_status="WARNING"
+    fi
     if [ "$overall_status" = "FAILED" ]; then
         importance="alert"
     elif [ "$overall_status" = "WARNING" ]; then
@@ -3414,6 +3453,11 @@ send_final_notification() {
 
     body+=$'\n'
     body+="Container restart: ${restart_status}"$'\n'
+    case "$ISS_HANDOFF_RESULT" in
+        queued) body+="ISS backup: verified generation queued; next hourly check will transfer it and acknowledge remote verification."$'\n';;
+        failed) body+="ISS backup: local generation completed, but its request could not be saved; no remote freshness is established. Check status-directory write access and retry the handoff."$'\n';;
+        *) body+="ISS backup: no completion request published for this run."$'\n';;
+    esac
 
     if [ "$RESTART_FAILED" -gt 0 ]; then
         body+="  Failed: ${RESTART_FAILED}"$'\n'
@@ -3568,11 +3612,16 @@ ${LOG_FILE}"
         recovery_status=$?
 
         if [ "$recovery_status" -eq 0 ]; then
+            if ! publish_iss_request; then
+                notify_unraid warning "ISS handoff failed" "Local staged recovery succeeded, but its ISS request could not be saved. Generation: $APPDATA_BACKUP_PATH"
+                return 1
+            fi
             notify_unraid \
                 "normal" \
                 "Backup staging recovery complete" \
                 "A previously verified appdata generation was copied to the vault and verified again.
-Path: ${APPDATA_BACKUP_PATH}"
+Path: ${APPDATA_BACKUP_PATH}
+ISS: verified generation queued for the next hourly check."
             prune_logs
             return 0
         fi
@@ -3648,6 +3697,15 @@ ${WORK_DIR}"
     # Map running containers to their owned appdata directories
     # -----------------------------------------------------------------------
 
+    # Wait for an in-flight monitor; never stop its APIs midway through a scan.
+    exec {ARR_BACKUP_GATE_FD}>"$ARR_BACKUP_GATE" || return 1
+    if ! flock -x -w 900 "$ARR_BACKUP_GATE_FD"; then
+        log "DOCKER" "ERROR" "Arr scan coordination timed out; no containers stopped"
+        notify_unraid alert "Backup deferred - Arr scan active" "Appdata backup could not obtain the Arr maintenance gate within 15 minutes. No containers were stopped."
+        return 1
+    fi
+    ARR_BACKUP_GATE_HELD=true
+
     if ! discover_target_containers; then
         log "DOCKER" "ERROR" \
             "One or more running containers could not be inspected safely"
@@ -3689,6 +3747,8 @@ ${LOG_FILE}"
     # Optional share backup
     # -----------------------------------------------------------------------
 
+    release_arr_backup_gate
+
     if ! run_shares_backup; then
         final_exit=1
     fi
@@ -3713,6 +3773,11 @@ ${LOG_FILE}"
         final_exit=1
     fi
 
+    if (( final_exit == 0 )) && ! publish_iss_request; then
+        final_exit=1
+        log "ISS" "ERROR" "Local backup succeeded, but completion request could not be published"
+        ISS_HANDOFF_RESULT="failed"
+    fi
     send_final_notification "$runtime_human"
 
 

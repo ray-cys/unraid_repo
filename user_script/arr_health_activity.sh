@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.13.1
+# ARR Health / Download / Import Monitor v3.13.2
 #
 # PURPOSE
 # -------
@@ -6701,7 +6701,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.13.1 lifecycle commands' \
+        'ARR Health Monitor v3.13.2 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -7784,6 +7784,15 @@ record_monitor_schedule_issue() {
 
     allowed_gap=$(( MONITOR_EXPECTED_INTERVAL_MINUTES + MONITOR_MISSED_RUN_GRACE_MINUTES ))
 
+    local maintenance_seen
+    maintenance_seen=$(cat "${ARR_BACKUP_DEFERRED_AT:-/run/arr-appdata-monitor-deferred-at}" 2>/dev/null || true)
+    if [[ "$maintenance_seen" =~ ^[0-9]+$ ]] &&
+       (( maintenance_seen > PREVIOUS_RUN_STARTED_AT && maintenance_seen <= START_TIME &&
+          START_TIME - maintenance_seen <= allowed_gap * 60 )); then
+        log "MAINTENANCE: Previous monitoring interval includes scheduled backup deferrals; schedule-gap alert suppressed"
+        rm -f -- "$ARR_BACKUP_DEFERRED_AT"
+        return 0
+    fi
     (( PREVIOUS_RUN_STARTED_AT > 0 )) || return
     (( PREVIOUS_RUN_GAP_MINUTES > allowed_gap )) || return
 
@@ -16250,6 +16259,33 @@ require_command mountpoint
 require_command pgrep
 
 ###############################################################################
+# APPDATA BACKUP COORDINATION
+# Normal scans hold a shared gate through notification/automation. Backup waits
+# before stopping containers. Deferred scans preserve issue state and do not
+# resolve issues, send reminders, poll APIs, or submit recovery commands.
+# CLI state administration remains available during a backup.
+###############################################################################
+ARR_BACKUP_GATE="${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}"
+ARR_BACKUP_GRACE="${ARR_BACKUP_GRACE:-/run/arr-appdata-recovery-until}"
+ARR_BACKUP_DEFERRED_AT="${ARR_BACKUP_DEFERRED_AT:-/run/arr-appdata-monitor-deferred-at}"
+if [[ $# == 0 ]]; then
+    exec {ARR_BACKUP_GATE_FD}>"$ARR_BACKUP_GATE" || exit 3
+    arr_backup_deferred=false
+    flock -s -n "$ARR_BACKUP_GATE_FD" || arr_backup_deferred=true
+    arr_grace_until=$(cat "$ARR_BACKUP_GRACE" 2>/dev/null || true)
+    arr_gate_now=$(date +%s)
+    if [[ "$arr_grace_until" =~ ^[0-9]+$ ]] &&
+       (( arr_grace_until > arr_gate_now && arr_grace_until <= arr_gate_now + 120 )); then
+        arr_backup_deferred=true
+    fi
+    if [[ "$arr_backup_deferred" == true ]]; then
+        printf '%s\n' "$START_TIME" >"$ARR_BACKUP_DEFERRED_AT"
+        log "MAINTENANCE: Arr scan deferred for appdata backup/startup grace; existing issues preserved; no API calls or recovery actions"
+        exit 0
+    fi
+fi
+
+###############################################################################
 # TEMP DIRECTORY
 ###############################################################################
 
@@ -16366,7 +16402,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.13.1"
+    "START | ARR Health Monitor v3.13.2"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -16379,7 +16415,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.13.1"
+debug_log "Starting ARR Health Monitor v3.13.2"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -16998,7 +17034,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.13.1 completed"
+log "ARR Health Monitor v3.13.2 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""

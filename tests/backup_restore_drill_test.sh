@@ -25,6 +25,8 @@ done
 # Sourcing is supported specifically so archive-validation fixtures can call
 # the drill phases without mounting or modifying any production path.
 source "$repo_root/user_script/backup_restore_drill.sh"
+EXTRA_FREE_MARGIN_BYTES=0
+DRILL_ROOT="$test_root"
 
 LOG_DIR="$test_root/logs"
 mkdir -p -- "$LOG_DIR"
@@ -78,8 +80,7 @@ FLASH_ARCHIVE_FILES=0
 drill_flash
 [[ "$FLASH_CHECKSUM_STATUS" == VERIFIED ]]
 (( FLASH_ARCHIVE_FILES >= 12 ))
-[[ -f "$WORK_DIR/flash/config/super.dat" ]]
-[[ -f "$WORK_DIR/flash/config/ident.cfg" ]]
+[[ ! -e "$WORK_DIR/flash" ]] # Restored payload is removed after validation.
 
 ###############################################################################
 # Checksum mismatch
