@@ -13818,10 +13818,10 @@ process_sab_activity_audit() {
       . as $all | map(select(.auditEpoch >= $cutoff)) as $recent
       | [($all|length), ([$all[].auditEpoch|select(.>0)]|min // 0),
           ([$recent[]|select((.category // .cat // "" | ascii_downcase)==$ignored)]|length),
-          ([$recent[]|select((.category // .cat // "" | ascii_downcase)==$movie and (.status|ascii_downcase)=="completed")]|length),
-          ([$recent[]|select((.category // .cat // "" | ascii_downcase)==$movie and (.status|ascii_downcase)=="failed")]|length),
-          ([$recent[]|select((.category // .cat // "" | ascii_downcase)==$tv and (.status|ascii_downcase)=="completed")]|length),
-          ([$recent[]|select((.category // .cat // "" | ascii_downcase)==$tv and (.status|ascii_downcase)=="failed")]|length)] | @tsv
+          ([$recent[]|select((.category // .cat // "" | ascii_downcase)==$movie and (.status // "" | ascii_downcase)=="completed")]|length),
+          ([$recent[]|select((.category // .cat // "" | ascii_downcase)==$movie and (.status // "" | ascii_downcase)=="failed")]|length),
+          ([$recent[]|select((.category // .cat // "" | ascii_downcase)==$tv and (.status // "" | ascii_downcase)=="completed")]|length),
+          ([$recent[]|select((.category // .cat // "" | ascii_downcase)==$tv and (.status // "" | ascii_downcase)=="failed")]|length)] | @tsv
     ' "${TMP_DIR}/sab-normalized-history.json") || return 1
     IFS=$'\t' read -r loaded oldest SAB_AUDIT_F1_IGNORED SAB_AUDIT_MOVIE_COMPLETED SAB_AUDIT_MOVIE_FAILED SAB_AUDIT_TV_COMPLETED SAB_AUDIT_TV_FAILED <<<"$counts"
     total=$(jq '.history.noofslots // (.history.slots|length)' "$SAB_HISTORY")

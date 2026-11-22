@@ -104,6 +104,11 @@ recover_pending_actions
 jq -e '(.actions|length)==0' "$PENDING_ACTIONS_FILE" >/dev/null
 grep -q 'Recovered interrupted sidecar move' "$ACTION_RECEIPTS_FILE"
 grep -q 'Recovered interrupted sidecar quarantine' "$PENDING_NOTIFICATIONS_FILE"
+# Sidecar action reports include exact paths rather than only counters/log hints.
+CLEANUP_QUARANTINED=1 CLEANUP_FOLDERS_REMOVED=1
+CLEANUP_OPERATION_DETAILS="Quarantined poster.jpg: /media/Example/poster.jpg -> /bin/run/Example/poster.jpg; removed /media/Example with rmdir."
+queue_cleanup_action_notification Sonarr 'Example Show' /media/Example
+grep -q 'Quarantined poster.jpg' "$PENDING_NOTIFICATIONS_FILE"
 # Notification failure and display caps preserve the outbox, including omitted actions.
 NOTIFY_BIN="$fixture/arr-notify"; printf '#!/bin/sh\nexit 1\n' >"$NOTIFY_BIN"; chmod +x "$NOTIFY_BIN"
 queue_action_notification Sonarr 'Removed empty series folder' 'Example Show: quarantined 3 artwork files, then removed Season 01 and series directory with rmdir.'

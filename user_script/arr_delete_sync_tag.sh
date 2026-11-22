@@ -236,6 +236,8 @@ FOLDER_CLEANUP_PENDING=0
 MOVER_DEFERRALS=0
 MOVER_GUARD_NOTICE_LOGGED=false
 
+CLEANUP_OPERATION_DETAILS=""
+CLEANUP_EXCEPTION_DETAILS=""
 CLEANUP_COMPLETE=false
 CLEANUP_FOLDER_PENDING=false
 CLEANUP_QUARANTINED=0
@@ -273,6 +275,9 @@ log() {
     shift
 
     message="$*"
+    if [[ "$level" == ERROR || "$level" == WARNING ]] && [[ " ${FUNCNAME[*]} " == *" quarantine_recorded_sidecars "* ]]; then
+        CLEANUP_EXCEPTION_DETAILS+="$message"$'\n'
+    fi
     [[ "$level" != DEBUG || "${LOG_LEVEL^^}" == DEBUG ]] || return 0
     if [[ "$LOG_LINE_MAX_BYTES" =~ ^[0-9]+$ ]] &&
        (( LOG_LINE_MAX_BYTES > 0 )) &&
@@ -495,6 +500,7 @@ queue_folder_blocker_notification() {
         detail+=$'\n'"Recognized late sidecars awaiting next-run confirmation: ${CLEANUP_LATE_CANDIDATE_COUNT}"
     fi
     [[ -n "$CLEANUP_BLOCKER_DETAILS" ]] && detail+=$'\n'"${CLEANUP_BLOCKER_DETAILS}"
+    [[ -n "$CLEANUP_EXCEPTION_DETAILS" ]] && detail+=$'\n'"Preserved entries and reasons:"$'\n'"${CLEANUP_EXCEPTION_DETAILS}"
     signature="${CLEANUP_BLOCKER_SIGNATURE:-$(notification_hash "$media_path|$CLEANUP_BLOCKER_COUNT|$CLEANUP_LATE_CANDIDATE_COUNT|$CLEANUP_BLOCKER_DETAILS")}"
     queue_stateful_attention_notification WARNING "$app_name" "$key" \
         "$signature" "$title" "$detail" "$FOLDER_BLOCKER_REMINDER_DAYS"
@@ -531,6 +537,7 @@ queue_cleanup_action_notification() {
         detail+=$'\n'"Late sidecars confirmed unchanged and quarantined: ${CLEANUP_LATE_CONFIRMED_COUNT}."
     fi
     detail+=$'\n'"Media path: ${media_path}"
+    detail+=$'\n'"${CLEANUP_OPERATION_DETAILS}"
     queue_action_notification "$app_name" "$title cleanup" "$detail"
 }
 
@@ -1229,6 +1236,7 @@ remove_empty_media_dirs() {
         [[ ! -L "$directory" ]] || continue
         if rmdir -- "$directory" 2>/dev/null; then
             ((removed += 1))
+            CLEANUP_OPERATION_DETAILS+="Removed empty directory with rmdir: $directory"$'\n'
             log INFO "Removed empty media directory: $directory"
         fi
     done < <(find "$media_path" -depth -type d -empty -print0 2>/dev/null)
@@ -1472,6 +1480,8 @@ quarantine_recorded_sidecars() {
     local cleanup_plan
     local late_candidate
 
+    CLEANUP_OPERATION_DETAILS=""
+    CLEANUP_EXCEPTION_DETAILS=""
     CLEANUP_COMPLETE=false
     CLEANUP_FOLDER_PENDING=false
     CLEANUP_QUARANTINED=0
@@ -1667,6 +1677,7 @@ quarantine_recorded_sidecars() {
                 return 1
             }
             journal_finish "$move_id" "Sidecar quarantined; ownership normalized" || return 1
+            CLEANUP_OPERATION_DETAILS+="Quarantined $relative: $source -> $destination"$'\n'
             log INFO "Quarantined $app_name Kodi sidecar: $source -> $destination"
             [[ -n "$CLEANUP_QUARANTINE_RUN_ID" ]] || \
                 CLEANUP_QUARANTINE_RUN_ID="$QUARANTINE_RUN_ID"
@@ -3216,7 +3227,7 @@ while IFS= read -r SERIES_ID; do
                 elif (( CLEANUP_CHANGED > 0 )); then
                     queue_attention_notification WARNING Sonarr \
                         "$SERIES_TITLE sidecar cleanup deferred" \
-                        "$CLEANUP_CHANGED recorded sidecar file(s) changed or became unsafe. See $LOG_FILE."
+                        "Preserved $CLEANUP_CHANGED changed/unsafe recorded sidecar(s). Completed: quarantined=$CLEANUP_QUARANTINED; folders removed=$CLEANUP_FOLDERS_REMOVED."$'\n'"$CLEANUP_EXCEPTION_DETAILS"
                 fi
             else
                 CLEANUP_RC=$?
@@ -3228,7 +3239,7 @@ while IFS= read -r SERIES_ID; do
                         log ERROR "Kodi sidecar quarantine failed for $SERIES_TITLE; its manifest was retained."
                         queue_attention_notification ERROR Sonarr \
                             "$SERIES_TITLE sidecar quarantine failed" \
-                            "The manifest was retained and the next daily run will retry. See $LOG_FILE."
+                            "Cleanup failed after quarantining $CLEANUP_QUARANTINED sidecar(s) and removing $CLEANUP_FOLDERS_REMOVED empty folder(s). Recovery intent and the manifest were retained; the next run will verify outcomes before retrying."$'\n'"$CLEANUP_OPERATION_DETAILS"$'\n'"$CLEANUP_EXCEPTION_DETAILS"
                         ;;
                 esac
             fi
@@ -4709,7 +4720,7 @@ if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( MOVIES_CONFIRMED > 0 )); then
             elif (( CLEANUP_CHANGED > 0 )); then
                 queue_attention_notification WARNING Radarr \
                     "$MOVIE_LABEL sidecar cleanup deferred" \
-                    "$CLEANUP_CHANGED recorded sidecar file(s) changed or became unsafe. See $LOG_FILE."
+                    "Preserved $CLEANUP_CHANGED changed/unsafe recorded sidecar(s). Completed: quarantined=$CLEANUP_QUARANTINED; folders removed=$CLEANUP_FOLDERS_REMOVED."$'\n'"$CLEANUP_EXCEPTION_DETAILS"
             fi
         else
             CLEANUP_RC=$?
@@ -4721,7 +4732,7 @@ if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( MOVIES_CONFIRMED > 0 )); then
                     log ERROR "Kodi sidecar quarantine failed for $MOVIE_LABEL; its manifest was retained."
                     queue_attention_notification ERROR Radarr \
                         "$MOVIE_LABEL sidecar quarantine failed" \
-                        "The manifest was retained and the next daily run will retry. See $LOG_FILE."
+                        "Cleanup failed after quarantining $CLEANUP_QUARANTINED sidecar(s) and removing $CLEANUP_FOLDERS_REMOVED empty folder(s). Recovery intent and the manifest were retained; the next run will verify outcomes before retrying."$'\n'"$CLEANUP_OPERATION_DETAILS"$'\n'"$CLEANUP_EXCEPTION_DETAILS"
                     ;;
             esac
         fi
