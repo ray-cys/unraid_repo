@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.9.1
+# ARR Health / Download / Import Monitor v3.9.2
 #
 # PURPOSE
 # -------
@@ -747,6 +747,10 @@ FLOW_ANOMALY_ESCALATE_HOURS=24
 DOWNLOAD_LEDGER_ENABLED=true
 DOWNLOAD_LEDGER_GRAB_TO_SAB_WARN_MINUTES=60
 DOWNLOAD_LEDGER_SAB_VANISHED_WARN_MINUTES=60
+# After 12 hours, vanished/never-arrived attempts with successful API checks
+# become WARNING review items. This does not assert cancellation or import,
+# dismiss the record, or downgrade a completed download awaiting import.
+DOWNLOAD_LEDGER_HISTORICAL_REVIEW_MINUTES=720
 DOWNLOAD_LEDGER_IMPORT_WARN_MINUTES=300
 DOWNLOAD_LEDGER_ESCALATE_MINUTES=720
 DOWNLOAD_LEDGER_DISCOVERY_HOURS=24
@@ -5245,6 +5249,7 @@ reminder_policy_for_classification() {
         SAB_ERROR|\
         SAB_WARNING|\
         MONITOR_SCHEDULE_MISSED|\
+        DOWNLOAD_FLOW_REVIEW_REQUIRED|\
         DOWNLOAD_FLOW_RECONCILED_*)
             mode="once"
             interval_hours=0
@@ -5755,7 +5760,7 @@ dismiss_download_flow_issue() {
     case "$classification" in
         DOWNLOAD_FLOW_NOT_REACHED_SAB|\
         DOWNLOAD_FLOW_SAB_VANISHED|\
-        DOWNLOAD_FLOW_IMPORT_MISSING)
+        DOWNLOAD_FLOW_IMPORT_MISSING|DOWNLOAD_FLOW_REVIEW_REQUIRED)
             ;;
 
         *)
@@ -6062,7 +6067,7 @@ batch_dismiss_downloads() {
     esac
 
     case "$classification" in
-        ""|DOWNLOAD_FLOW_NOT_REACHED_SAB|DOWNLOAD_FLOW_SAB_VANISHED|DOWNLOAD_FLOW_IMPORT_MISSING)
+        ""|DOWNLOAD_FLOW_NOT_REACHED_SAB|DOWNLOAD_FLOW_SAB_VANISHED|DOWNLOAD_FLOW_IMPORT_MISSING|DOWNLOAD_FLOW_REVIEW_REQUIRED)
             ;;
         *)
             log "ERROR: Unsupported batch-dismiss classification: $classification"
@@ -6160,6 +6165,7 @@ batch_dismiss_downloads() {
             (.value.classification // "") == "DOWNLOAD_FLOW_NOT_REACHED_SAB"
             or (.value.classification // "") == "DOWNLOAD_FLOW_SAB_VANISHED"
             or (.value.classification // "") == "DOWNLOAD_FLOW_IMPORT_MISSING"
+            or (.value.classification // "") == "DOWNLOAD_FLOW_REVIEW_REQUIRED"
           )
         | select($source == "" or (.value.app // "") == $source)
         | select(
@@ -6553,7 +6559,11 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.9.1 lifecycle commands' \
+        'ARR Health Monitor v3.9.2 lifecycle commands' \
+        'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
+        'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
+        'Review warnings notify once per unchanged issue and remain in --list-active.' \
+        'Notification details include the last reconciliation decision and evidence.' \
         '' \
         'Always invoke the Unraid User Scripts copy through /bin/bash:' \
         '  /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script COMMAND' \
@@ -12612,9 +12622,7 @@ record_arr_database_file_reconciliation() {
                 episode_number=$(jq -r '.episodeNumber // -1' <<<"$target")
 
                 if ! [[ "$target_id" =~ ^[0-9]+$ ]] || (( target_id <= 0 )) ||
-                   ! [[ "$parent_id" =~ ^[0-9]+$ ]] || (( parent_id <= 0 )) ||
-                   ! [[ "$season_number" =~ ^-?[0-9]+$ ]] || (( season_number < 0 )) ||
-                   ! [[ "$episode_number" =~ ^-?[0-9]+$ ]] || (( episode_number < 0 ))
+                   ! [[ "$parent_id" =~ ^[0-9]+$ ]] || (( parent_id <= 0 ))
                 then
                     write_download_reconciliation_result \
                         "$download_id" "$app" true false \
@@ -12665,7 +12673,16 @@ record_arr_database_file_reconciliation() {
                 has_file=$(jq -r '(.hasFile // false) | tostring' "$object_file")
                 file_id=$(jq -r '.episodeFileId // 0' "$object_file")
 
-                if [[ "$target_id" =~ ^[0-9]+$ ]] && (( target_id > 0 )) &&
+                # History may contain exact episode/series IDs without expanded
+                # numbering. Enrich missing numbers only from that exact episode;
+                # supplied numbers must still match. Never infer identity by title.
+                [[ "$season_number" =~ ^[0-9]+$ ]] || season_number="$current_season_number"
+                [[ "$episode_number" =~ ^[0-9]+$ ]] || episode_number="$current_episode_number"
+
+                if [[ "$current_season_number" =~ ^[0-9]+$ ]] &&
+                   [[ "$current_episode_number" =~ ^[0-9]+$ ]] &&
+                   [ "$(jq -r '.id // 0' "$object_file")" = "$target_id" ] &&
+                   [[ "$target_id" =~ ^[0-9]+$ ]] && (( target_id > 0 )) &&
                    [[ "$parent_id" =~ ^[0-9]+$ ]] && (( parent_id > 0 )) &&
                    [[ "$file_id" =~ ^[0-9]+$ ]] && (( file_id > 0 )) &&
                    [ "$has_file" = true ] &&
@@ -12779,7 +12796,8 @@ record_arr_database_file_reconciliation() {
 
                 if [[ "$target_id" =~ ^[0-9]+$ ]] && (( target_id > 0 )) &&
                    [[ "$file_id" =~ ^[0-9]+$ ]] && (( file_id > 0 )) &&
-                   [ "$has_file" = true ]
+                   [ "$has_file" = true ] &&
+                   [ "$(jq -r '.id // 0' "$object_file")" = "$target_id" ]
                 then
                     identity_valid=true
                 fi
@@ -12846,7 +12864,8 @@ record_arr_database_file_reconciliation() {
         file_date_epoch=$(date_to_epoch "$file_date")
         file_path=$(jq -r '.path // ""' "$media_file")
 
-        if [ "$file_parent_id" != "$parent_id" ] ||
+        if [ "$(jq -r '.id // 0' "$media_file")" != "$file_id" ] ||
+           [ "$file_parent_id" != "$parent_id" ] ||
            [ -z "$file_path" ] ||
            { [ "$target_type" = episode ] &&
              [ "$current_season_number" != "$season_number" ]; }
@@ -12927,81 +12946,89 @@ update_download_reconciliation_state() {
             |
             if ($id == "") or (.downloadLedger[$id] == null)
             then .
-            elif ($result.scanOk // false) != true
-            then .
             else
-                .downloadLedger[$id].reconciliationLastCheckedAt = $now
+                .downloadLedger[$id].reconciliationLastAttemptAt = $now
+                | .downloadLedger[$id].reconciliationLastScanOk = $result.scanOk
+                | .downloadLedger[$id].reconciliationLastReason = ($result.evidence // "API evidence unavailable")
+                | .downloadLedger[$id].reconciliationLastDetail = ($result.detail // "")
                 |
-                if ($result.evidenceFound // false) != true
-                then
-                    .downloadLedger[$id].reconciliationCandidateFingerprint = ""
-                    |
-                    .downloadLedger[$id].reconciliationCandidateRuns = 0
-                    |
-                    .downloadLedger[$id].reconciliationCandidateFirstSeenAt = 0
-                    |
-                    .downloadLedger[$id].reconciliationCandidateLastSeenAt = 0
+                # API failures preserve candidates and never become proof of
+                # recovery or a historical-only outcome.
+                if ($result.scanOk // false) != true then .
                 else
-                    (
-                        if
-                            (.downloadLedger[$id].reconciliationCandidateFingerprint // "")
-                            == ($result.fingerprint // "")
-                            and
-                            (.downloadLedger[$id].reconciliationCandidateRuns // 0) > 0
-                        then
-                            (.downloadLedger[$id].reconciliationCandidateRuns // 0) + 1
-                        else 1
-                        end
-                    ) as $candidateRuns
+                    .downloadLedger[$id].reconciliationLastCheckedAt = $now
                     |
-                    .downloadLedger[$id].reconciliationCandidateFingerprint = (
-                        $result.fingerprint // ""
-                    )
-                    |
-                    .downloadLedger[$id].reconciliationCandidateRuns = $candidateRuns
-                    |
-                    .downloadLedger[$id].reconciliationCandidateFirstSeenAt = (
-                        if $candidateRuns == 1
-                        then $now
-                        else (
-                            .downloadLedger[$id].reconciliationCandidateFirstSeenAt
-                            // $now
-                        )
-                        end
-                    )
-                    |
-                    .downloadLedger[$id].reconciliationCandidateLastSeenAt = $now
-                    |
-                    if $candidateRuns >= $confirmRuns
+                    if ($result.evidenceFound // false) != true
                     then
-                        .downloadLedger[$id].arrReconciledAt = $now
+                        .downloadLedger[$id].reconciliationCandidateFingerprint = ""
                         |
-                        .downloadLedger[$id].reconciliationKind = (
-                            $result.kind // ""
-                        )
+                        .downloadLedger[$id].reconciliationCandidateRuns = 0
                         |
-                        .downloadLedger[$id].reconciliationClassification = (
-                            $result.classification // "DOWNLOAD_FLOW_RECONCILED"
-                        )
+                        .downloadLedger[$id].reconciliationCandidateFirstSeenAt = 0
                         |
-                        .downloadLedger[$id].reconciliationSeverity = (
-                            $result.severity // "INFO"
-                        )
+                        .downloadLedger[$id].reconciliationCandidateLastSeenAt = 0
+                    else
+                        (
+                            if
+                                (.downloadLedger[$id].reconciliationCandidateFingerprint // "")
+                                == ($result.fingerprint // "")
+                                and
+                                (.downloadLedger[$id].reconciliationCandidateRuns // 0) > 0
+                            then
+                                (.downloadLedger[$id].reconciliationCandidateRuns // 0) + 1
+                            else 1
+                            end
+                        ) as $candidateRuns
                         |
-                        .downloadLedger[$id].reconciliationDetail = (
-                            $result.detail // ""
-                        )
-                        |
-                        .downloadLedger[$id].reconciliationEvidence = (
-                            $result.evidence // ""
-                        )
-                        |
-                        .downloadLedger[$id].reconciliationFingerprint = (
+                        .downloadLedger[$id].reconciliationCandidateFingerprint = (
                             $result.fingerprint // ""
                         )
                         |
-                        .downloadLedger[$id].lastSeen = $now
-                    else .
+                        .downloadLedger[$id].reconciliationCandidateRuns = $candidateRuns
+                        |
+                        .downloadLedger[$id].reconciliationCandidateFirstSeenAt = (
+                            if $candidateRuns == 1
+                            then $now
+                            else (
+                                .downloadLedger[$id].reconciliationCandidateFirstSeenAt
+                                // $now
+                            )
+                            end
+                        )
+                        |
+                        .downloadLedger[$id].reconciliationCandidateLastSeenAt = $now
+                        |
+                        if $candidateRuns >= $confirmRuns
+                        then
+                            .downloadLedger[$id].arrReconciledAt = $now
+                            |
+                            .downloadLedger[$id].reconciliationKind = (
+                                $result.kind // ""
+                            )
+                            |
+                            .downloadLedger[$id].reconciliationClassification = (
+                                $result.classification // "DOWNLOAD_FLOW_RECONCILED"
+                            )
+                            |
+                            .downloadLedger[$id].reconciliationSeverity = (
+                                $result.severity // "INFO"
+                            )
+                            |
+                            .downloadLedger[$id].reconciliationDetail = (
+                                $result.detail // ""
+                            )
+                            |
+                            .downloadLedger[$id].reconciliationEvidence = (
+                                $result.evidence // ""
+                            )
+                            |
+                            .downloadLedger[$id].reconciliationFingerprint = (
+                                $result.fingerprint // ""
+                            )
+                            |
+                            .downloadLedger[$id].lastSeen = $now
+                        else .
+                        end
                     end
                 end
             end
@@ -13319,6 +13346,8 @@ perform_download_ledger_reconciliation() {
             | select((.value.manuallyDismissedAt // 0) <= 0)
             | select(
                 (.value.reconciliationCandidateRuns // 0) > 0
+                or (.value.reconciliationLastAttemptAt // 0) <= 0
+                or .value.reconciliationLastScanOk == false
                 or (.value.reconciliationLastCheckedAt // 0) <= 0
                 or (($now - (.value.reconciliationLastCheckedAt // 0)) / 60) >= $retryMinutes
               )
@@ -13445,6 +13474,37 @@ perform_download_ledger_reconciliation() {
     queue_download_reconciliation_notifications || return 1
 }
 
+download_ledger_arr_queue_contains() {
+    local app="$1" download_id="$2" queue_file=""
+    case "$app" in
+        Sonarr) queue_file="$SONARR_QUEUE" ;;
+        Radarr) queue_file="$RADARR_QUEUE" ;;
+    esac
+    [ -s "$queue_file" ] || return 1
+    jq -e --arg id "${download_id,,}" '
+        (if type == "array" then . else .records end)[]?
+        | select((.downloadId // "" | ascii_downcase) == $id)
+    ' "$queue_file" >/dev/null
+}
+
+# Historical ambiguity remains visible, but is distinct from a live failure.
+# Successful Arr/SAB audits and complete queues are mandatory at the caller.
+download_ledger_needs_review() {
+    local record="$1" classification="$2" age_minutes="$3"
+    case "$classification" in
+        DOWNLOAD_FLOW_SAB_VANISHED|DOWNLOAD_FLOW_NOT_REACHED_SAB) ;;
+        *) return 1 ;;
+    esac
+    (( age_minutes >= DOWNLOAD_LEDGER_HISTORICAL_REVIEW_MINUTES )) || return 1
+    jq -e --argjson now "$START_TIME" \
+        --argjson retry "$DOWNLOAD_LEDGER_RECONCILE_RETRY_MINUTES" '
+        .reconciliationLastScanOk == true
+        and (.reconciliationLastCheckedAt // 0) > 0
+        and ($now - .reconciliationLastCheckedAt) <= (($retry + 10) * 60)
+        and (.reconciliationCandidateRuns // 0) == 0
+    ' <<<"$record" >/dev/null
+}
+
 process_download_ledger_issues() {
 
     local now
@@ -13519,7 +13579,9 @@ process_download_ledger_issues() {
             current_arr_issue=true
         fi
 
-        if [ "$current_arr_issue" = true ] || sab_primary_download_exists "$download_id"; then
+        if [ "$current_arr_issue" = true ] ||
+           download_ledger_arr_queue_contains "$app" "$download_id" ||
+           sab_primary_download_exists "$download_id"; then
             continue
         fi
 
@@ -13577,11 +13639,21 @@ process_download_ledger_issues() {
             stage="escalated"
         fi
 
+        if download_ledger_needs_review "$record" "$classification" "$age_minutes"; then
+            classification="DOWNLOAD_FLOW_REVIEW_REQUIRED"
+            severity="WARNING"
+            stage="review"
+            message="Historical download outcome is unverified; absent from current Arr/SAB queues and available SAB history. Import or cancellation is not confirmed"
+        fi
+
         detail="Download ID: ${download_id}"$'\n'
         detail+="Release: ${release}"$'\n'
         detail+="Exact flow age: ${age_minutes} minute(s)"$'\n'
         detail+="Last Arr queue status: $(jq -r '.arrQueueStatus // "not observed"' <<<"$record")"$'\n'
         detail+="Last SAB status: $(jq -r '.sabStatus // "not observed"' <<<"$record")"
+
+        detail+=$'\n'"Reconciliation: $(jq -r '.reconciliationLastReason // "Not yet checked"' <<<"$record")"
+        detail+=$'\n'"Evidence: $(jq -r '.reconciliationLastDetail // ""' <<<"$record")"
 
         record_normalized_issue \
             "FLOW:DOWNLOAD:${download_id}" \
@@ -15106,7 +15178,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.9.1"
+    "START | ARR Health Monitor v3.9.2"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -15119,7 +15191,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.9.1"
+debug_log "Starting ARR Health Monitor v3.9.2"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -15693,7 +15765,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.9.1 completed"
+log "ARR Health Monitor v3.9.2 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""
