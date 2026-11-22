@@ -20,6 +20,15 @@ check_mover_guard() { return 0; }
 normalize_quarantine_permissions() { [[ "${break_commit:-false}" != true ]]; }
 proof="$fixture/proof.json"; printf '{"verified":true}\n' >"$proof"
 source_path="$SAB_MOVIE_DIR_REAL/Example Movie"; mkdir -p "$source_path"; printf 'fixture media\n' >"$source_path/movie.mkv"
+# A missing share must fail before any persistent log directory is created.
+(
+  LOG_DIR=/mnt/user/never-create-cleanup-fixture
+  SEND_NOTIFICATIONS=false
+  mountpoint() { return 1; }
+  mkdir() { printf 'unexpected write' >"$fixture/initialization-write"; return 1; }
+  if initialize; then fail 'missing log share was accepted'; fi
+  [[ ! -e "$fixture/initialization-write" ]] || fail 'log directory created below a missing share'
+)
 # The intent must exist before the payload move begins.
 mv() {
   if [[ "${2:-}" == "$source_path" ]]; then

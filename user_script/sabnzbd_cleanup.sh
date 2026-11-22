@@ -941,6 +941,18 @@ validate_stranded_environment() {
 }
 
 initialize() {
+  # Never create a shadow log/outbox tree on Unraid's root filesystem if the
+  # share/pool disappeared. A RAM marker bounds the exceptional direct alert.
+  local required_log_mount="" storage_marker="/tmp/arr-sab-cleanup-storage-$(date +%F).notified" storage_reason
+  case "$LOG_DIR" in /mnt/user/*) required_log_mount=/mnt/user;; /mnt/vault/*) required_log_mount=/mnt/vault;; esac
+  if [[ -n "$required_log_mount" ]] && ! mountpoint -q "$required_log_mount"; then
+    storage_reason="Required log storage $required_log_mount is unavailable. No backup deletions, quarantine moves, purges or restores were attempted."
+    printf '%s\n' "$storage_reason" >&2
+    if [[ ! -e "$storage_marker" && -x "$NOTIFY" ]] && is_true "$SEND_NOTIFICATIONS"; then
+      if "$NOTIFY" -i alert -s "SABnzbd Cleanup" -d "Storage preflight failed" -m "$storage_reason" >/dev/null 2>&1; then : >"$storage_marker"; fi
+    fi
+    return 1
+  fi
   mkdir -p -- "$LOG_DIR" || {
     printf 'Unable to create log directory: %s\n' "$LOG_DIR" >&2
     exit 1
@@ -2299,7 +2311,7 @@ main() {
   CLI_OPERATION=""; CLI_WRAPPER=""
   parse_args "$@"
   if [[ "$CLI_OPERATION" == inspect ]]; then inspect_quarantines; return $?; fi
-  initialize
+  initialize || return 1
   if [[ -n "$CLI_OPERATION" ]]; then
     STRANDED_CLEANUP_STATUS="MANUAL_${CLI_OPERATION^^}"
     validate_stranded_environment || return 1
