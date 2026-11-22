@@ -690,7 +690,7 @@ cleanup_app() {
     exit "$status"
 }
 
-cleanup_notify_preflight_failure() {
+notify_preflight_failure() {
     local reason="$1" marker="/tmp/arr-delete-preflight-$(date +%F).notified"
     printf '%s\n' "$reason" >&2
     [[ ! -e "$marker" && -x "$NOTIFY_BIN" ]] || return 0
@@ -698,7 +698,7 @@ cleanup_notify_preflight_failure() {
       -m "$reason"$'\n'"No Arr API changes, sidecar moves, folder removals or retirements were attempted. Existing state and media were preserved." >/dev/null 2>&1; then : >"$marker"; fi
 }
 
-main() {
+cleanup_main() {
     local status=$?
     if [[ "$NOTIFICATION_FINALIZED" != true && -n "$NOTIFICATION_BATCH" && -s "$NOTIFICATION_BATCH" ]]; then
         send_grouped_notification || true
