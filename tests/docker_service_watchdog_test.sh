@@ -66,8 +66,10 @@ docker_cmd() {
 endpoint_healthy() { PROBE_RESULT=ready; [[ "$MOCK_ENDPOINT" == true ]]; }
 
 fresh; make_info exited
+startup_job_rules=("${JOB_RULES[@]}"); JOB_RULES=()
 scan 'kometa||on-demand|0'
 [[ "$(jq '.observations | length' "$STATE_WORK")" == 0 ]] || fail 'intentional on-demand stop alerted'
+JOB_RULES=("${startup_job_rules[@]}")
 scan 'service||always|0'
 active service:availability && fail 'single scan activated failure'
 scan 'service||always|0'
@@ -308,6 +310,8 @@ active metafusion:job-failed && fail 'verified successful job did not clear prio
 
 # A whole-run log banner counts completion but must not invent success.
 fresh; NOW="$(date +%s)"
+saved_job_rules=("${JOB_RULES[@]}")
+JOB_RULES=("kometa|6|24|dockerlogs")
 MOCK_LOGS="$(date -u '+%Y-%m-%dT%H:%M:%SZ') | Finished 04:00 Run |"
 # Simulate a shell tail override that misinterprets a separated byte count.
 # Production byte/line calls must bypass it and attach counts to options.
@@ -319,6 +323,7 @@ jq -e '.jobs.kometa.finished > 0 and .jobs.kometa.success == 0' "$STATE_WORK" >/
 MOCK_LOGS=""
 check_job kometa "$MOCK_INFO" || fail 'cached log evidence failed'
 [[ "$(jq -r .jobs.kometa.result "$STATE_WORK")" == completed-unverified ]] || fail 'unverified state silently cleared'
+JOB_RULES=("${saved_job_rules[@]}")
 
 # Recyclarr frequency accepts a producer receipt, counts distinct completions,
 # and permits a full initial window before flagging fewer than two runs.
@@ -393,6 +398,6 @@ STATUS_DIR="$TEST_ROOT/status"; UPTIME_FILE="$TEST_ROOT/uptime"
 printf '99999.00 0.00\n' >"$UPTIME_FILE"
 docker() { return 0; }
 (main) >"$TEST_ROOT/main.log" 2>&1 || { cat "$TEST_ROOT/main.log" >&2; fail 'main orchestration failed'; }
-jq -e '.status == "OK" and .scriptVersion == "3.3"' "$STATUS_DIR/docker_service_watchdog.json" >/dev/null || fail 'main receipt incorrect'
+jq -e '.status == "OK" and .scriptVersion == "3.4"' "$STATUS_DIR/docker_service_watchdog.json" >/dev/null || fail 'main receipt incorrect'
 jq -e '.phase == "completed" and .executionComplete == true and .failures == 0' "$HEARTBEAT_FILE" >/dev/null || fail 'main heartbeat not finalized'
 printf 'docker_service_watchdog fixture tests passed\n'

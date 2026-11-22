@@ -4,7 +4,7 @@ These scripts are independent Unraid User Scripts. Keeping them in GitHub does
 not install, enable, or schedule them. Review container names, URLs, paths, and
 expected service states before deployment. Run scripts through `/bin/bash`.
 
-## Docker service watchdog v3.3
+## Docker service watchdog v3.4
 
 Optional schedule: `*/5 * * * *`. Each rule is
 `container|optional HTTP endpoint|always or on-demand|restart permission`.
@@ -39,6 +39,16 @@ persisted before execution, consumes a budget even on failure/timeout, and is
 limited to two attempts per 24 hours with a six-hour cooldown. Docker health and
 the configured HTTP endpoint are verified after restart. Application-specific
 functionality is outside these basic availability probes.
+
+When an application has neither a Docker healthcheck nor an HTTP readiness
+probe, recovery can confirm Docker `running` only; its recovery notification
+explicitly says application readiness is unverified. This permits recovery of
+a stopped resident scheduler without claiming that its next job succeeded.
+To permit automatic recovery of stopped `always` containers, also set
+`RESTART_STOPPED_CONTAINERS=true`. A processing failure alone never queues a
+restart. Log-reader errors cannot inhibit recovery of a separately confirmed
+Docker state/health failure. Maintenance, shared-outage and flapping guards,
+permissions, cooldowns, budgets and confirmation scans remain in effect.
 
 Unraid boot grace defaults to five minutes, and container startup grace to two
 minutes. Docker/curl operations have timeouts. Invalid state disables recovery
@@ -153,14 +163,62 @@ Change the source if `STATUS_FILE` is customized. It distinguishes last run
 failure, last success, completion and active processing. Invalid evidence freezes
 existing job findings; it cannot falsely clear an earlier failed run.
 
-Kometa and Imagemaid use bounded, timestamped Docker log tails by default. Only
-whole-run completion banners count; collection, playlist and test-run banners
-are excluded. The monitor caches evidence between scans. A completion banner
-does **not** prove success: with `REQUIRE_VERIFIED_JOB_SUCCESS=true`, the result
-is a stable `job-unverified` warning until authoritative evidence is provided.
-No repeated email is sent merely because another identical banner appears.
-If an image does not send these records to Docker logs, configure another source.
-Plain container log-file tails need a parseable timestamp on the marker line.
+Kometa (`kometateam/kometa:nightly`) and ImageMaid
+(`kometateam/imagemaid:develop`) now read **complete native run logs** through
+their existing container Python 3 runtime:
+
+| Profile | Container log | Hubble host mount |
+| --- | --- | --- |
+| Kometa | `/config/logs/meta.log` | `/mnt/vault/cloud/logs/docker/kometa` |
+| ImageMaid | `/config/logs/imagemaid.log` | `/mnt/ramlogs/imagemaid` |
+
+`runlog:/container/path` in `JOB_RULES` selects this reader. It reads log files
+only; it does not change schedules, Plex files, application configuration or
+permissions. There is no extra service, helper file, or host Python dependency.
+Its cursor and bounded redacted findings stay in the watchdog's existing
+`state.json`, under `.jobs[PROFILE].runLog`.
+
+The first scan reads the previous rotated log plus the current log. Subsequent
+scans seek to saved offsets; unchanged logs require only small identity/anchor
+checks. Rotation drains the previously observed file before newer files, looking
+through up to nine numbered rotations. Truncation/replacement invalidates the
+cursor. Each app has a 128 MiB / ten-second scan budget; a backlog checkpoints
+and resumes next scan without clearing existing findings. No 70 MB log copies
+are written to watchdog storage. Missed-completion/runtime deadlines continue
+while evidence is unavailable or catching up. Log reads may access the pool
+holding the configured application log; no media-library paths are inspected.
+
+Kometa requires a normal whole-run start, finish banner and timing footer;
+collection, library-only, test and validation run banners do not establish a
+normal scheduled completion. ImageMaid uses its `Validating Options` header
+because `Script Started` is not written to the native file in this version.
+Its finish banner **and** `Total Runtime` footer are required. Caught exceptions
+remain failures even when ImageMaid subsequently prints its normal summary.
+Native timestamps use the container's local timezone, matching its logger.
+
+| Observed outcome | Watchdog result |
+| --- | --- |
+| Complete normal run with no reported errors/warnings | INFO, clean completion |
+| Completed with WARNING records | `job-warnings`, WARNING |
+| Completed with ERROR records | `job-errors`, WARNING, partial processing failure |
+| CRITICAL/FATAL records | `job-failed`, CRITICAL; active fatal errors also alert |
+| Missing boundaries, unsupported format or unreadable log | Evidence warning; prior incidents remain |
+
+Severity comes from structured log levels, not a search for the word "error" in
+arbitrary titles or summary tables. Duplicate reasons and ImageMaid's repeated
+error report are not counted twice. At most 32 distinct reason fingerprints and
+three redacted examples per severity are retained per run. A newer clean run
+automatically clears earlier job incidents after two confirming scans. New runs
+retain the last completed result while still active; old failures cannot be
+cleared by an incomplete tail. An error appended just after a completion footer
+can revise that same run instead of retaining a false clean result.
+
+These results describe what the application logged, not independent verification
+of every Plex change. Future image logging changes can require parser updates;
+unsupported formats must not be interpreted as clean runs. The optional legacy
+`dockerlogs`/`log:` sources still report a banner as completed-unverified when
+`REQUIRE_VERIFIED_JOB_SUCCESS=true`. A maintained producer receipt still takes
+precedence over native logs. Unchanged issue sets do not generate reminders.
 
 Recyclarr now reads its resident cron scheduler's Docker logs automatically.
 The default command `/cron.sh` and job position `0` match this installation's
@@ -198,8 +256,9 @@ lost. These host receipts override the default native/log source. Jobs are never
 automatically restarted simply because processing failed, ran late or overran.
 
 Reference implementations: [Metafusion runtime status](https://github.com/ray-cys/metafusion/blob/main/helper/runtime.py),
-[Kometa run completion](https://github.com/Kometa-Team/Kometa/blob/master/kometa.py),
-[ImageMaid run summary](https://github.com/Kometa-Team/ImageMaid/blob/master/imagemaid.py),
+[Kometa nightly run completion](https://github.com/Kometa-Team/Kometa/blob/nightly/kometa.py),
+[ImageMaid develop run summary](https://github.com/Kometa-Team/ImageMaid/blob/develop/imagemaid.py),
+[ImageMaid logger](https://github.com/Kometa-Team/Kometa-Utils/blob/master/kometautils/logging.py),
 [Plex API](https://developer.plex.tv/pms/),
 [qBittorrent WebAPI](https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-%28qBittorrent-5.0%29).
 

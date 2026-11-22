@@ -1,10 +1,10 @@
 #!/bin/bash
-# Docker Service Watchdog v3.3 -- Unraid service availability and bounded recovery.
+# Docker Service Watchdog v3.4 -- Unraid service availability and bounded recovery.
 # Optional schedule: every five minutes. Pi-hole and application-specific health
 # remain owned by the DNS and Arr monitors. All recovery is disabled by default.
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.3"
+readonly SCRIPT_VERSION="3.4"
 
 ###############################################################################
 # CONFIGURATION
@@ -38,16 +38,20 @@ DISCOVER_UNCLASSIFIED=true
 # profile|max completion age hours|max runtime hours|evidence source
 # User schedule + grace: weekly Imagemaid -> 192h; 4-hour jobs -> 6h.
 # Recyclarr: Wed/Sun 06:00; longest gap 96h + 24h grace, two successes per 8 days.
-# Sources: native:/container/path (Metafusion); log:/container/path; a host JSON
+# Sources: runlog:/container/path (Kometa/ImageMaid full native run logs);
+# native:/container/path (Metafusion); log:/container/path; a host JSON
 # receipt; or docker (one-shot containers only). Change log paths to your mounts.
 JOB_RULES=(
-    "imagemaid|192|24|dockerlogs"
-    "kometa|6|24|dockerlogs"
+    "imagemaid|192|24|runlog:/config/logs/imagemaid.log"
+    "kometa|6|24|runlog:/config/logs/meta.log"
     "metafusion|6|24|native:/tmp/metafusion-status.json"
     "recyclarr|120|24|dockerlogs"
 )
 JOB_FREQUENCY_RULES=("recyclarr|2|192") # profile|min successful runs|rolling hours
 JOB_READ_MAX_BYTES=262144
+# Stream new native-log bytes only; allow a 70 MB Kometa run plus rotation
+# catch-up without copying the log to vault or RAM. Backlogs resume next scan.
+JOB_LOG_SCAN_MAX_BYTES=$((128 * 1024 * 1024))
 REQUIRE_VERIFIED_JOB_SUCCESS=true
 RECYCLARR_JOB_COMMAND="/cron.sh"
 RECYCLARR_JOB_POSITION=0
@@ -226,7 +230,7 @@ state_valid() {
                 (.containerId | type == "string") and (.start | type == "number" and . >= 0 and . == floor) and
                 (.iteration | type == "string" and test("^[0-9]*$")) and
                 (.failed | type == "boolean") and (.seen | type == "boolean") and (.open | type == "boolean")
-                else . == {} end)))) and
+                else . == {} end)) and ((.runLog // {}) | type == "object"))) and
         ((.flapping // {}) | type == "object" and all(.[];
             (.down | type == "boolean") and (.unstable | type == "boolean") and
             (.last | type == "number" and . >= 0 and . == floor) and
@@ -438,9 +442,238 @@ parse_recyclarr_log() {
         '{containerId:$id,iteration:$iteration,start:$start,failed:$failed,seen:$seen,open:$open}')"
 }
 
+# The two Python applications already provide Python 3 in their images. Run
+# this read-only streaming reader there: no host Python dependency/helper file,
+# no whole-log copy, no application/configuration/receipt writes. Its compact
+# cursor and redacted findings live only in the existing watchdog state.
+read_native_run_log() {
+    local name="$1" profile="$2" path="$3" info="$4" old="$5" program context id
+    context="$(jq -c '.runLog // {}' <<<"$old")" || return 1
+    id="$(jq -r '.[0].Id' <<<"$info")" || return 1
+    program="$(cat <<'PY'
+import copy
+import datetime
+import functools
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+import time
+
+profile, source, limit, now, container = sys.argv[1:]
+limit, now = int(limit), int(now)
+if profile not in ("kometa", "imagemaid") or not os.path.isabs(source):
+    raise ValueError("Unsupported native run-log profile/path")
+if not 1024 <= limit <= 512 * 1024 * 1024:
+    raise ValueError("Invalid native log scan limit")
+saved = json.load(sys.stdin)
+state = saved if isinstance(saved, dict) and saved.get("version") == 1 and saved.get("source") == source else {}
+if state.get("containerId") != container:
+    state.pop("cursor", None)
+    state.pop("active", None)
+state.update(version=1, source=source, containerId=container)
+state.setdefault("completed", {})
+state.setdefault("successfulAt", 0)
+state.setdefault("gap", False)
+budget, deadline = limit, time.monotonic() + 10
+record = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(?:[,.]\d+)?\]\s+\S+\s+(TRACE|DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL)\s+(.*)$")
+ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+def redact(message):
+    message = re.sub(r"(?i)authorization[=: ]+(?:bearer\s+|basic\s+)?[^\s,;|]+", "authorization=[REDACTED]", message)
+    message = re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1[REDACTED]@", message)
+    message = re.sub(r"(?i)(api[_-]?key|token|password|secret)[=: ]+[^\s,;|]+", r"\1=[REDACTED]", message)
+    # Arbitrary URL query strings can also contain credentials or signed URLs.
+    message = re.sub(r"(https?://[^\s?#|]+)[?#][^\s|]*", r"\1?[REDACTED]", message)
+    return message[:240]
+
+def new_run(epoch=0, full=False, mode="normal", prelude=None):
+    return {"startedAt": epoch, "full": full, "mode": mode, "terminal": False,
+            "closed": False, "summary": False, "previousSuccess": state["successfulAt"],
+            "findings": copy.deepcopy(prelude or {})}
+
+@functools.lru_cache(maxsize=512)
+def timestamp(stamp):
+    return int(datetime.datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S").timestamp())
+
+def finding(run, level, message):
+    if not message.strip(" |-=*\t"):
+        return
+    group = "fatal" if level in ("CRITICAL", "FATAL") else "errors" if level == "ERROR" else "warnings"
+    bucket = run["findings"].setdefault(group, {"keys": [], "examples": []})
+    key = hashlib.sha256(message.encode()).hexdigest()[:24]
+    if key not in bucket["keys"] and len(bucket["keys"]) < 32:
+        bucket["keys"].append(key)
+        if len(bucket["examples"]) < 3:
+            bucket["examples"].append(redact(message))
+
+def outcome(run):
+    flags = run["findings"]
+    if flags.get("fatal", {}).get("keys"):
+        return "failed"
+    if flags.get("errors", {}).get("keys"):
+        return "completed-errors"
+    if not run["full"] or run["mode"] != "normal":
+        return "completed-unverified"
+    return "completed-warnings" if flags.get("warnings", {}).get("keys") else "success"
+
+def finish(run, epoch):
+    if run["mode"] != "normal":
+        return
+    result = outcome(run)
+    state["completed"] = {"startedAt": run["startedAt"], "finishedAt": epoch,
+                          "result": result, "findings": copy.deepcopy(run["findings"])}
+    if result == "success":
+        state["successfulAt"] = epoch
+    elif state["successfulAt"] == epoch:
+        state["successfulAt"] = run["previousSuccess"]
+    if run["full"]:
+        state["gap"] = False
+    run["closed"] = True
+
+def consume(raw):
+    text = ansi.sub("", raw.decode("utf-8", errors="replace")).rstrip("\r\n")
+    match = record.match(text)
+    if not match:
+        if re.match(r"^\[\d{4}-\d\d-\d\d ", text):
+            state["gap"] = True
+            if state.get("active"):
+                state["active"]["full"] = False
+        return
+    stamp, level, message = match.groups()
+    epoch = timestamp(stamp)
+    if not 0 < epoch <= now + 300:
+        state["gap"] = True
+        state.setdefault("active", new_run())["full"] = False
+        return
+    message = message.strip().strip("|").strip()
+    banner = message.strip(" =-*\t")
+    run = state.get("active")
+    if run is None:
+        state["active"] = run = new_run()
+    if profile == "kometa" and re.fullmatch(r"Starting (?:\d{1,2}:\d{2} )?Run", banner):
+        prelude = run["findings"] if not run["startedAt"] else None
+        state["active"] = run = new_run(epoch, True, prelude=prelude)
+    elif profile == "kometa" and re.fullmatch(r"Starting .+ Run", banner):
+        state["active"] = run = new_run(epoch, False, "excluded")
+    elif profile == "imagemaid" and banner == "Validating Options":
+        state["active"] = run = new_run(epoch, True, prelude=run["findings"] if not run["startedAt"] else None)
+    elif profile == "imagemaid" and banner == "Script Started" and not run["startedAt"]:
+        run.update(startedAt=epoch, full=True)
+    if profile == "imagemaid" and banner in ("Error Report", "Critical Report", "Warning Report"):
+        run["summary"] = True
+    elif profile == "imagemaid" and banner == "ImageMaid Summary":
+        run["summary"] = False
+    if level in ("WARNING", "WARN", "ERROR", "CRITICAL", "FATAL") and not run["summary"]:
+        finding(run, level, message)
+        if run["closed"]:
+            finish(run, state["completed"].get("finishedAt", epoch))
+    terminal = (profile == "kometa" and re.fullmatch(r"Finished (?:\d{1,2}:\d{2} )?Run", banner)) or (profile == "imagemaid" and banner == "ImageMaid Finished")
+    if terminal:
+        run["terminal"] = True
+    footer = (profile == "kometa" and banner.startswith("Start Time:") and "Finished:" in banner and "Run Time:" in banner) or (profile == "imagemaid" and re.match(r"Total Runtime\s*\|", banner))
+    if footer and run["terminal"] and not run["closed"]:
+        finish(run, epoch)
+
+def identity(path):
+    value = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(value.st_mode):
+        raise ValueError("Native log must be a regular file")
+    return f"{value.st_dev}:{value.st_ino}", value.st_size
+
+def anchors(handle, offset):
+    handle.seek(0)
+    head = handle.read(min(offset, 128))
+    handle.seek(max(0, offset - 256))
+    tail = handle.read(min(offset, 256))
+    return hashlib.sha256(head).hexdigest(), hashlib.sha256(tail).hexdigest()
+
+stem, extension = os.path.splitext(source)
+paths = [f"{stem}-{number}{extension}" for number in range(9, 0, -1)] + [source]
+files = [(path, *identity(path)) for path in paths if os.path.lexists(path)]
+if not files or files[-1][0] != source:
+    raise ValueError("Current native log is unavailable")
+cursor = state.get("cursor", {})
+index = next((i for i, item in enumerate(files) if item[1] == cursor.get("identity")), None)
+if index is None:
+    if cursor:
+        state["gap"] = True
+    # Bootstrap the previous run as well, so a currently running job does not
+    # hide the most recent completed result. Never scan all nine old runs.
+    files = files[-2:]
+    state.pop("active", None)
+    cursor = {}
+else:
+    files = files[index:]
+
+backlog = False
+for path, expected, snapshot_size in files:
+    if budget <= 0 or time.monotonic() >= deadline:
+        backlog = True
+        break
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as handle:
+        current = os.fstat(handle.fileno())
+        if f"{current.st_dev}:{current.st_ino}" != expected:
+            raise ValueError("Native log rotated during discovery; retry")
+        offset = int(cursor.get("offset", 0)) if cursor.get("identity") == expected else 0
+        if offset and (offset > snapshot_size or anchors(handle, offset) != (cursor.get("head"), cursor.get("tail"))):
+            offset = 0
+            state["gap"] = True
+            state.pop("active", None)
+        if not offset:
+            state.pop("active", None)
+        handle.seek(offset)
+        while offset < snapshot_size and budget > 0 and time.monotonic() < deadline:
+            raw = handle.readline(min(65537, budget + 1, snapshot_size - offset))
+            if not raw or not raw.endswith(b"\n"):
+                # Do not consume a partially written line or a split chunk.
+                if len(raw) > 65536:
+                    raise ValueError("Native log line exceeds safe parse limit")
+                break
+            consume(raw)
+            offset += len(raw)
+            budget -= len(raw)
+        head, tail = anchors(handle, offset)
+        cursor = {"identity": expected, "offset": offset, "head": head, "tail": tail}
+        state["cursor"] = cursor
+        if offset < snapshot_size:
+            backlog = True
+            break
+    # A later rotated/current file is a distinct run; its prelude must not
+    # inherit warnings/errors from this file.
+    if path != source:
+        state.pop("active", None)
+state["backlog"] = backlog
+completed = state["completed"]
+active = state.get("active", {})
+started = active.get("startedAt", 0) if active.get("mode") == "normal" else 0
+print(json.dumps({"reader": state, "started": max(started, completed.get("startedAt", 0)),
+                  "finished": completed.get("finishedAt", 0), "success": state["successfulAt"],
+                  "result": completed.get("result", "unknown"), "backlog": backlog,
+                  "incomplete": state["gap"] or not (started or completed),
+                  "findings": completed.get("findings", {}),
+                  "activeFatal": active.get("findings", {}).get("fatal", {}) if not active.get("closed") and active.get("mode") == "normal" else {}}))
+PY
+)" || return 1
+    printf '%s' "$context" | docker_cmd exec -i "$name" python3 -c "$program" "$profile" "$path" "$JOB_LOG_SCAN_MAX_BYTES" "$NOW" "$id"
+}
+
+job_deadlines() {
+    local name="$1" first="$2" started="$3" finished="$4" max_age="$5" runtime="$6" stamp="$4"
+    if (( started > finished && runtime > 0 && NOW - started > runtime * 3600 )); then
+        observe "$name:job-overrun" CRITICAL "Scheduled job exceeded configured ${runtime}h runtime limit" || return 1
+    fi
+    (( stamp > 0 )) || stamp="$first"
+    if (( max_age > 0 && NOW - stamp > max_age * 3600 )); then
+        observe "$name:job-overdue" CRITICAL "No completed scheduled run within ${max_age}h (schedule plus grace); last known completion/start used even when new log evidence is incomplete" || return 1
+    fi
+}
+
 check_job() {
     local name="$1" info="$2" profile rule max_age runtime source file started=0 finished=0 success=0 result=unknown
-    local old first old_finished old_success scan since line stamp read_error=false rc key frequency min_runs hours count receipt_history='[]' log_state='{}'
+    local old first old_finished old_success scan since line stamp read_error=false rc key frequency min_runs hours count receipt_history='[]' log_state='{}' run_log='{}' findings='{}' detail="" retract_success=false replace_unverified=false
     profile="${PROFILE_BY_NAME[$name]:-$name}"
     rule=""
     for line in "${JOB_RULES[@]}"; do [[ "${line%%|*}" != "$profile" ]] || rule="$line"; done
@@ -455,6 +688,34 @@ check_job() {
     # An explicit producer receipt takes precedence over inference from logs.
     if [[ -f "$STATE_DIR/jobs/$profile.json" ]]; then source="$STATE_DIR/jobs/$profile.json"; fi
     case "$source" in
+        runlog:*)
+            if read_native_run_log "$name" "$profile" "${source#runlog:}" "$info" "$old" >"$file" 2>/dev/null &&
+                jq -e 'type == "object" and (.reader | type == "object" and .version == 1) and
+                    (.started | type == "number" and . >= 0 and . == floor) and
+                    (.finished | type == "number" and . >= 0 and . == floor) and
+                    (.success | type == "number" and . >= 0 and . == floor) and
+                    (.backlog | type == "boolean") and (.incomplete | type == "boolean") and
+                    (.findings | type == "object") and (.activeFatal | type == "object") and
+                    (.result | IN("unknown", "success", "failed", "completed-errors", "completed-warnings", "completed-unverified"))' "$file" >/dev/null; then
+                run_log="$(jq -c .reader "$file")"
+                mutate --arg name "$name" --argjson reader "$run_log" --argjson now "$NOW" \
+                    '.jobs //= {} | .jobs[$name] = ((.jobs[$name] // {firstSeen:$now,started:0,finished:0,success:0,result:"unknown",scanned:$now,logState:{},history:[]}) | .runLog=$reader)' || return 1
+                if [[ "$(jq -r .backlog "$file")" == true ]]; then
+                    log INFO "$name: native-log scan in progress; saved cursor, retaining previous job findings" || return 1
+                    job_deadlines "$name" "$first" "$(jq -r '.started // 0' <<<"$old")" "$old_finished" "$max_age" "$runtime" || return 1
+                    while IFS= read -r key; do FROZEN_KEYS["$key"]=1; done < <(jq -r --arg prefix "$name:job-" '.observations | keys[] | select(startswith($prefix))' "$STATE_WORK")
+                    return 0
+                fi
+                started="$(jq -r .started "$file")"; finished="$(jq -r .finished "$file")"
+                success="$(jq -r .success "$file")"; result="$(jq -r .result "$file")"
+                findings="$(jq -c .findings "$file")"
+                detail="$(jq -r '"Distinct recorded reasons (capped at 32 per severity): fatal=\((.fatal.keys // []) | length), errors=\((.errors.keys // []) | length), warnings=\((.warnings.keys // []) | length). " +
+                    ([.fatal.examples[]?, .errors.examples[]?, .warnings.examples[]?] | .[0:5] | join("; "))' <<<"$findings")"
+                if [[ "$(jq -r '(.activeFatal.keys // []) | length > 0' "$file")" == true ]]; then
+                    observe "$name:job-fatal" CRITICAL "Active native run logged a fatal failure: $(jq -r '.activeFatal.examples | join("; ")' "$file"); processing failure does not trigger a container restart" || return 1
+                fi
+                [[ "$(jq -r .incomplete "$file")" != true ]] || read_error=true
+            else read_error=true; fi ;;
         receipt)
             observe "$name:job-evidence" WARNING "Internal scheduler needs producer receipts: --record-job $profile EXIT_CODE START_EPOCH; no completion/success is inferred from container uptime" || return 1
             return 0 ;;
@@ -522,26 +783,48 @@ check_job() {
     esac
     if [[ "$result" == success ]] && (( finished <= 0 || success != finished )); then read_error=true; fi
     if [[ "$read_error" == true ]] || (( started > NOW + 300 || finished > NOW + 300 || success > NOW + 300 || started < 0 || finished < 0 || success < 0 || success > finished )); then
-        observe "$name:job-evidence" WARNING "Job completion evidence unavailable/invalid; configured source requires review" || return 1
+        observe "$name:job-evidence" WARNING "Job completion evidence unavailable/invalid; source=$source requires review" || return 1
+        if [[ "$source" == runlog:* ]]; then
+            job_deadlines "$name" "$first" "$(jq -r '.started // 0' <<<"$old")" "$old_finished" "$max_age" "$runtime" || return 1
+        fi
         # Keep the last valid evidence; never clear a failure from a bad read.
         while IFS= read -r key; do FROZEN_KEYS["$key"]=1; done < <(jq -r --arg prefix "$name:job-" '.observations | keys[] | select(startswith($prefix))' "$STATE_WORK")
-        RECOVERY_BLOCKED["$name"]=1
+        # Missing run logs cannot mask a Docker availability/health failure.
+        # Job evidence never authorizes restarts; Docker recovery has its own
+        # permissions, thresholds, maintenance leases and post-restart checks.
+        [[ "$source" == runlog:* ]] || RECOVERY_BLOCKED["$name"]=1
         return 0
     fi
-    if [[ "$result" == unknown ]] || (( finished > 0 && finished < old_finished )); then
+    # Docker's receive timestamp can be a few seconds after the native footer.
+    # Permit the first complete native result to replace a nearby legacy banner
+    # result, including errors; never apply this exception to a prior failure.
+    if [[ "$source" == runlog:* && "$result" != unknown && "$result" != completed-unverified &&
+        "$(jq -r '.result // "unknown"' <<<"$old")" == completed-unverified &&
+        "$(jq -c '.runLog // {}' <<<"$old")" == '{}' ]] &&
+        (( finished > 0 && old_finished >= finished && old_finished - finished <= 300 )); then
+        replace_unverified=true
+    fi
+    if [[ "$result" == unknown ]] || { [[ "$replace_unverified" == false ]] && (( finished > 0 && finished < old_finished )); }; then
         result="$(jq -r '.result // "unknown"' <<<"$old")"
     fi
     if [[ "$(jq -r '.result // "unknown"' <<<"$old")" == failed ]] && (( finished <= old_finished )); then
         result=failed
     fi
     (( started > 0 )) || started="$(jq -r '.started // 0' <<<"$old")"
-    (( finished >= old_finished )) || finished="$old_finished"
-    (( success >= old_success )) || success="$old_success"
+    [[ "$replace_unverified" == true ]] || { (( finished >= old_finished )) || finished="$old_finished"; }
+    if [[ "$source" == runlog:* && "$result" != success ]] && (( finished > 0 && finished == old_success && success < old_success )); then
+        # A notification/report error appended after the footer can revise the
+        # same run. Do not keep its earlier clean timestamp as verified success.
+        retract_success=true
+    else
+        (( success >= old_success )) || success="$old_success"
+    fi
     mutate --arg name "$name" --arg result "$result" --argjson first "$first" --argjson started "$started" \
         --argjson finished "$finished" --argjson success "$success" --argjson scanned "$NOW" --argjson receipt_history "$receipt_history" --argjson log_state "$log_state" \
+        --argjson run_log "$run_log" --argjson retract "$retract_success" \
         '.jobs //= {} | (.jobs[$name].history // []) as $history |
-            .jobs[$name]={firstSeen:$first,started:$started,finished:$finished,success:$success,result:$result,scanned:$scanned,logState:$log_state,
-                history:(($history + $receipt_history + (if $result == "success" and $success > 0 then [$success] else [] end)) | unique | map(select(. >= ($scanned - 28*86400))))}' || return 1
+            .jobs[$name]={firstSeen:$first,started:$started,finished:$finished,success:$success,result:$result,scanned:$scanned,logState:$log_state,runLog:$run_log,
+                history:(($history + $receipt_history + (if $result == "success" and $success > 0 then [$success] else [] end)) | unique | map(select(. >= ($scanned - 28*86400) and (($retract | not) or . != $finished))))}' || return 1
     if [[ "$result" == failed ]]; then
         local error_detail=""
         if [[ "$source" == native:* ]]; then
@@ -550,22 +833,24 @@ check_job() {
                 gsub("(?i)https?://[^/@[:space:]]+@"; "[URL-CREDENTIALS-REDACTED]@") |
                 gsub("(?i)(api[_-]?key|token|password|authorization)[=: ]+[^ ,;\\n]+"; "[REDACTED]") |
                 gsub("[\\r\\n]"; " ") | .[0:500]' "$file")"
+        elif [[ "$source" == runlog:* ]]; then
+            error_detail="Native run logged a fatal failure. $detail; log=${source#runlog:}"
         fi
         observe "$name:job-failed" CRITICAL "Most recent scheduled job failed; finished_epoch=$finished; last_success_epoch=$success. ${error_detail:-Review the scheduled job log or completion record.} Container availability is checked separately" || return 1
+    fi
+    if [[ "$source" == runlog:* ]]; then
+        if [[ "$result" == completed-errors ]]; then
+            observe "$name:job-errors" WARNING "Run completed with processing errors; finished_epoch=$finished. $detail; log=${source#runlog:}. Docker availability is checked separately" || return 1
+        elif [[ "$result" == completed-warnings ]]; then
+            observe "$name:job-warnings" WARNING "Run completed with warnings; finished_epoch=$finished. $detail; log=${source#runlog:}" || return 1
+        elif [[ "$result" == success ]]; then
+            log INFO "$name: native run completed without reported errors or warnings; finished_epoch=$finished; log=${source#runlog:}" || return 1
+        fi
     fi
     if [[ "$result" == completed-unverified && "$REQUIRE_VERIFIED_JOB_SUCCESS" == true ]]; then
         observe "$name:job-unverified" WARNING "Whole-run completion banner observed; success not established. Configure a producer receipt to verify outcome" || return 1
     fi
-    if (( started > finished )); then
-        if (( runtime > 0 && NOW - started > runtime * 3600 )); then
-            observe "$name:job-overrun" CRITICAL "Scheduled job exceeded configured ${runtime}h runtime limit" || return 1
-        fi
-    elif (( max_age > 0 )); then
-        stamp="$finished"; (( stamp > 0 )) || stamp="$first"
-        if (( NOW - stamp > max_age * 3600 )); then
-            observe "$name:job-overdue" CRITICAL "No completed scheduled run within ${max_age}h (schedule plus grace); container running is not completion evidence" || return 1
-        fi
-    fi
+    job_deadlines "$name" "$first" "$started" "$finished" "$max_age" "$runtime" || return 1
     for frequency in "${JOB_FREQUENCY_RULES[@]}"; do
         IFS='|' read -r key min_runs hours <<<"$frequency"
         [[ "$key" == "$profile" ]] || continue
@@ -813,11 +1098,18 @@ inspect_valid() {
 }
 
 verify_service() {
-    local info
+    local info health
+    VERIFY_MESSAGE=""
     info="$(docker_cmd inspect "$1" 2>/dev/null)" && inspect_valid "$info" || return 1
     jq -e '.[0].State | .Status == "running" and ((.Health.Status // "none") == "none" or .Health.Status == "healthy")' <<<"$info" >/dev/null || return 1
     endpoint_healthy "$2" "$1" || return 1
-    [[ "$PROBE_RESULT" == ready ]] || { [[ "$PROBE_RESULT" == reachable || "$PROBE_RESULT" == unconfigured ]] && jq -e '.[0].State.Health.Status == "healthy"' <<<"$info" >/dev/null; }
+    health="$(jq -r '.[0].State.Health.Status // "none"' <<<"$info")"
+    if [[ "$PROBE_RESULT" == ready ]]; then VERIFY_MESSAGE='Docker running and application readiness validated'
+    elif [[ ( "$PROBE_RESULT" == reachable || "$PROBE_RESULT" == unconfigured ) && "$health" == healthy ]]; then
+        VERIFY_MESSAGE='Docker running and Docker health=healthy'
+    elif [[ "$PROBE_RESULT" == unconfigured && "$health" == none && -z "$2" && -z "$(probe_rule "$1" || true)" ]]; then
+        VERIFY_MESSAGE='Docker running; no Docker healthcheck or application readiness probe is configured; scheduled-job outcome remains independently monitored'
+    else return 1; fi
 }
 
 attempt_recovery() {
@@ -862,7 +1154,7 @@ attempt_recovery() {
     if docker_cmd restart "$name" >/dev/null 2>&1; then
         while (( elapsed <= RECOVERY_TIMEOUT_SECONDS )); do
             if verify_service "$name" "$url"; then
-                observe "$name:recovery-action" WARNING "Container restarted; Docker health and configured endpoint verified; awaiting stable recovery scans" 1
+                observe "$name:recovery-action" WARNING "Container restarted; $VERIFY_MESSAGE; awaiting stable recovery scans" 1
                 exec {fd}>&-
                 return 0
             fi
@@ -1059,9 +1351,10 @@ main() {
     for number in "$COMMAND_TIMEOUT_SECONDS" "$HTTP_CONNECT_TIMEOUT" "$HTTP_MAX_TIME" "$FAILURE_CONFIRM_SCANS" "$RECOVERY_CONFIRM_SCANS" \
         "$CONSECUTIVE_FAILURES_BEFORE_RESTART" "$RESTART_COOLDOWN_SECONDS" "$RESTART_BUDGET_WINDOW_SECONDS" "$MAX_RESTART_ATTEMPTS" \
         "$RECOVERY_TIMEOUT_SECONDS" "$RECOVERY_POLL_SECONDS" "$MAX_MAINTENANCE_SECONDS" "$LOG_MAX_BYTES" "$PROBE_MAX_BYTES" "$JOB_READ_MAX_BYTES" \
-        "$SHARED_FAILURE_THRESHOLD" "$FLAP_WINDOW_SECONDS" "$FLAP_TRANSITION_THRESHOLD" "$FLAP_STABLE_SECONDS" "$PROBE_UI_MAX_BYTES" "$PROBE_MAX_ROUTES"; do
+        "$SHARED_FAILURE_THRESHOLD" "$FLAP_WINDOW_SECONDS" "$FLAP_TRANSITION_THRESHOLD" "$FLAP_STABLE_SECONDS" "$PROBE_UI_MAX_BYTES" "$PROBE_MAX_ROUTES" "$JOB_LOG_SCAN_MAX_BYTES"; do
         [[ "$number" =~ ^[1-9][0-9]*$ ]] || return 2
     done
+    (( JOB_LOG_SCAN_MAX_BYTES >= 1024 && JOB_LOG_SCAN_MAX_BYTES <= 512 * 1024 * 1024 )) || return 2
     for number in "$BOOT_GRACE_SECONDS" "$CONTAINER_GRACE_SECONDS" "$LOG_SIZE_WARNING_BYTES" "$PROBE_MAX_REDIRECTS"; do [[ "$number" =~ ^[0-9]+$ ]] || return 2; done
     for flag in "$AUTO_RESTART" "$RESTART_STOPPED_CONTAINERS" "$CHECK_LOG_SIZE" "$DISCOVER_UNCLASSIFIED" "$REQUIRE_VERIFIED_JOB_SUCCESS"; do [[ "$flag" == true || "$flag" == false ]] || return 2; done
     local profile max_age runtime source
