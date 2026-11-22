@@ -1,10 +1,10 @@
 #!/bin/bash
-# Docker Service Watchdog v3.0 -- Unraid service availability and bounded recovery.
+# Docker Service Watchdog v3.1 -- Unraid service availability and bounded recovery.
 # Optional schedule: every five minutes. Pi-hole and application-specific health
 # remain owned by the DNS and Arr monitors. All recovery is disabled by default.
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.0"
+readonly SCRIPT_VERSION="3.1"
 
 ###############################################################################
 # CONFIGURATION
@@ -27,6 +27,7 @@ SERVICE_SPECS=(
     "seerr||always|0"
     "prowlarr||always|0"
     "photoprism||always|0"
+    "lumunarr||always|0"
 )
 # Exact names win; aliases are used only if the primary is absent. If both
 # exist the additional container is reported as unclassified, never ignored.
@@ -71,6 +72,8 @@ DOCKER_HOST_IP="192.168.50.4"
 # on curl's command line. Supply qBittorrent auth for its protected API.
 PROBE_AUTH_DIR="/mnt/vault/cloud/logs/docker_service_watchdog/probe-auth"
 PROBE_MAX_BYTES=65536
+PROBE_UI_MAX_BYTES=1048576 # Bounded web UI recognition needs more than API JSON.
+PROBE_MAX_REDIRECTS=3     # Same-origin redirects for UI recognition only.
 SHARED_FAILURE_THRESHOLD=3
 FLAP_WINDOW_SECONDS=3600
 FLAP_TRANSITION_THRESHOLD=4
@@ -180,7 +183,7 @@ bound_existing_logs() {
         size="$(stat -c %s "$file")" || return 1
         if (( size > LOG_MAX_BYTES )); then
             tmp="$(mktemp "$STATE_DIR/.log-tail.XXXXXX")" || return 1
-            tail -c "$LOG_MAX_BYTES" -- "$file" >"$tmp" && mv -f -- "$tmp" "$file" || { rm -f -- "$tmp"; return 1; }
+            command tail "-c$LOG_MAX_BYTES" -- "$file" >"$tmp" && mv -f -- "$tmp" "$file" || { rm -f -- "$tmp"; return 1; }
         fi
     done
 }
@@ -398,9 +401,9 @@ check_job() {
         dockerlogs|log:*)
             since=$((scan > 0 ? scan - 300 : NOW - (max_age > 0 ? max_age * 3600 : 86400)))
             if [[ "$source" == dockerlogs ]]; then
-                docker_cmd logs --timestamps --since "$since" --tail 2000 "$name" 2>&1 | tail -c "$JOB_READ_MAX_BYTES" >"$file"; rc=$?
+                docker_cmd logs --timestamps --since "$since" --tail 2000 "$name" 2>&1 | command tail "-c$JOB_READ_MAX_BYTES" >"$file"; rc=$?
             else
-                docker_cmd exec "$name" tail -c "$JOB_READ_MAX_BYTES" -- "${source#log:}" >"$file" 2>/dev/null; rc=$?
+                docker_cmd exec "$name" tail "-c$JOB_READ_MAX_BYTES" -- "${source#log:}" >"$file" 2>/dev/null; rc=$?
             fi
             if (( rc != 0 )); then read_error=true
             else
@@ -408,14 +411,14 @@ check_job() {
                 # Only a whole-run banner counts. Collection/playlist/test-run
                 # banners do not. A banner proves completion, not success.
                 if [[ "$profile" == kometa ]]; then
-                    stamp="$(grep -E 'Starting ([0-9]{1,2}:[0-9]{2} )?Run[[:space:]|=]*$' "$file" | tail -n 1 || true)"
+                    stamp="$(grep -E 'Starting ([0-9]{1,2}:[0-9]{2} )?Run[[:space:]|=]*$' "$file" | command tail -n1 || true)"
                     stamp="${stamp%% *}"
                     [[ ! "$stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T ]] || started="$(epoch_value "$stamp")"
-                    line="$(grep -E 'Finished ([0-9]{1,2}:[0-9]{2} )?Run[[:space:]|=]*$' "$file" | tail -n 1 || true)"
+                    line="$(grep -E 'Finished ([0-9]{1,2}:[0-9]{2} )?Run[[:space:]|=]*$' "$file" | command tail -n1 || true)"
                 elif [[ "$profile" == imagemaid ]]; then
-                    stamp="$(grep -E 'Script Started' "$file" | tail -n 1 || true)"; stamp="${stamp%% *}"
+                    stamp="$(grep -E 'Script Started' "$file" | command tail -n1 || true)"; stamp="${stamp%% *}"
                     [[ ! "$stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T ]] || started="$(epoch_value "$stamp")"
-                    line="$(grep -E 'ImageMaid Finished' "$file" | tail -n 1 || true)"
+                    line="$(grep -E 'ImageMaid Finished' "$file" | command tail -n1 || true)"
                 else line=""; fi
                 stamp="${line%% *}"
                 if [[ "$stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T ]]; then finished="$(epoch_value "$stamp")"; fi
@@ -458,7 +461,17 @@ check_job() {
         '.jobs //= {} | (.jobs[$name].history // []) as $history |
             .jobs[$name]={firstSeen:$first,started:$started,finished:$finished,success:$success,result:$result,scanned:$scanned,
                 history:(($history + $receipt_history + (if $result == "success" and $success > 0 then [$success] else [] end)) | unique | map(select(. >= ($scanned - 28*86400))))}' || return 1
-    if [[ "$result" == failed ]]; then observe "$name:job-failed" CRITICAL "Most recent scheduled job failed; container remains independently monitored" || return 1; fi
+    if [[ "$result" == failed ]]; then
+        local error_detail=""
+        if [[ "$source" == native:* ]]; then
+            error_detail="$(jq -r '(.last_error // "No failure detail recorded") | tostring |
+                gsub("(?i)authorization[=: ]+(bearer[ ]+|basic[ ]+)?[^ ,;\\r\\n]+"; "authorization=[REDACTED]") |
+                gsub("(?i)https?://[^/@[:space:]]+@"; "[URL-CREDENTIALS-REDACTED]@") |
+                gsub("(?i)(api[_-]?key|token|password|authorization)[=: ]+[^ ,;\\n]+"; "[REDACTED]") |
+                gsub("[\\r\\n]"; " ") | .[0:500]' "$file")"
+        fi
+        observe "$name:job-failed" CRITICAL "Most recent scheduled job failed; finished_epoch=$finished; last_success_epoch=$success. ${error_detail:-Review the producer completion record.} Container availability is checked separately" || return 1
+    fi
     if [[ "$result" == completed-unverified && "$REQUIRE_VERIFIED_JOB_SUCCESS" == true ]]; then
         observe "$name:job-unverified" WARNING "Whole-run completion banner observed; success not established. Configure a producer receipt to verify outcome" || return 1
     fi
@@ -525,7 +538,22 @@ probe_rule() {
 }
 
 probe_url() {
-    local name="$1" info="$2" port="$3" path="$4" host mapped mode
+    local name="$1" info="$2" port="$3" path="$4" host mapped mode profile env_port peer
+    profile="${PROFILE_BY_NAME[$name]:-$name}"
+    # qBittorrent images commonly change the internal port via WEBUI_PORT.
+    # A VPN companion may own the actual published mapping/network namespace.
+    if [[ "$profile" == qbittorrent ]]; then
+        env_port="$(jq -r '[.[0].Config.Env[]? | select(startswith("WEBUI_PORT=")) | split("=")[1]] | last // ""' <<<"$info")"
+        if [[ -n "$env_port" ]]; then
+            [[ "$env_port" =~ ^[1-9][0-9]{0,4}$ ]] && (( env_port <= 65535 )) || return 1
+            port="$env_port"
+        fi
+    fi
+    mode="$(jq -r '.[0].HostConfig.NetworkMode // ""' <<<"$info")"
+    if [[ "$mode" == container:* ]]; then
+        peer="${mode#container:}"
+        info="$(docker_cmd inspect "$peer" 2>/dev/null)" && inspect_valid "$info" || return 1
+    fi
     mapped="$(jq -r --arg port "$port/tcp" '. [0].NetworkSettings.Ports[$port][0] // {} | [(.HostIp // ""),(.HostPort // "")] | join("|")' <<<"$info")" || return 1
     host="${mapped%%|*}"; mapped="${mapped#*|}"
     if [[ -n "$mapped" ]]; then
@@ -543,8 +571,12 @@ probe_url() {
     printf 'http://%s:%s%s\n' "$host" "$port" "$path"
 }
 
+safe_probe_target() {
+    printf '%s\n' "$1" | sed -E 's#(https?://)[^/@]*@#\1[REDACTED]@#; s/[?#].*$//'
+}
+
 readiness_probe() {
-    local name="$1" url="$2" rule profile port path kind pattern info body code rc
+    local name="$1" url="$2" rule profile port path kind pattern info body code rc response redirect origin target_origin redirects=0 limit target
     local -a args=()
     PROBE_RESULT=unconfigured; PROBE_MESSAGE='No readiness probe configured'
     rule="$(probe_rule "$name")" || rule=""
@@ -556,12 +588,32 @@ readiness_probe() {
         url="$(probe_url "$name" "$info" "$port" "$path")" || { PROBE_MESSAGE='Unable to resolve published/custom-IP endpoint; configure an explicit URL'; return 0; }
     fi
     body="$TMP_DIR/$name.probe"
+    limit="$PROBE_MAX_BYTES"
+    [[ "$kind" != recognize ]] || limit="$PROBE_UI_MAX_BYTES"
     [[ ! -f "$PROBE_AUTH_DIR/$name.headers" ]] || args+=(--header "@$PROBE_AUTH_DIR/$name.headers")
     [[ ! -f "$PROBE_AUTH_DIR/$name.cookies" ]] || args+=(--cookie "$PROBE_AUTH_DIR/$name.cookies")
-    code="$(curl --silent --output "$body" --connect-timeout "$HTTP_CONNECT_TIMEOUT" --max-time "$HTTP_MAX_TIME" \
-        --max-filesize "$PROBE_MAX_BYTES" --write-out '%{http_code}' "${args[@]}" "$url")"; rc=$?
-    if (( rc == 3 || rc == 60 || rc == 63 || rc == 77 )); then PROBE_RESULT=unconfigured; PROBE_MESSAGE="Probe URL/TLS/response-size configuration requires review (curl=$rc)"; return 0; fi
-    if (( rc != 0 )); then PROBE_RESULT=transport; PROBE_MESSAGE="HTTP transport failed (curl=$rc)"; return 1; fi
+    [[ "$url" =~ ^(https?://[^/?#]+) ]] || { PROBE_MESSAGE='Probe URL has no supported origin'; return 0; }
+    origin="${BASH_REMATCH[1]}"
+    while :; do
+        target="$(safe_probe_target "$url")"
+        response="$(curl --silent --noproxy '*' --proto '=http,https' --output "$body" \
+            --connect-timeout "$HTTP_CONNECT_TIMEOUT" --max-time "$HTTP_MAX_TIME" \
+            --max-filesize "$limit" --write-out '%{http_code}\n%{redirect_url}' "${args[@]}" "$url")"; rc=$?
+        code="${response%%$'\n'*}"; redirect=""
+        [[ "$response" != *$'\n'* ]] || redirect="${response#*$'\n'}"
+        if (( rc == 3 || rc == 60 || rc == 63 || rc == 77 )); then PROBE_RESULT=unconfigured; PROBE_MESSAGE="Probe URL/TLS/response-size configuration requires review (curl=$rc; limit=${limit}B; target=$target)"; return 0; fi
+        if (( rc != 0 )); then PROBE_RESULT=transport; PROBE_MESSAGE="HTTP transport failed (curl=$rc; target=$target)"; return 1; fi
+        if [[ "$code" =~ ^3[0-9][0-9]$ && "$kind" == recognize && -n "$redirect" ]]; then
+            [[ "$redirect" =~ ^(https?://[^/?#]+) ]] || { PROBE_RESULT=unconfigured; PROBE_MESSAGE='Redirect target invalid'; return 0; }
+            target_origin="${BASH_REMATCH[1]}"
+            if [[ "$target_origin" != "$origin" ]] || (( redirects >= PROBE_MAX_REDIRECTS )); then
+                PROBE_RESULT=unconfigured; PROBE_MESSAGE='Cross-origin redirect or redirect limit reached; configure the final application URL'; return 0
+            fi
+            redirects=$((redirects + 1)); url="$redirect"
+            continue
+        fi
+        break
+    done
     if [[ "$code" == 401 || "$code" == 403 ]]; then PROBE_RESULT=authentication; PROBE_MESSAGE='Endpoint reachable; authentication required/rejected; readiness unverified'; return 0; fi
     if [[ "$code" =~ ^3[0-9][0-9]$ ]]; then PROBE_RESULT=authentication; PROBE_MESSAGE='HTTP redirect; readiness unverified (check login or base URL)'; return 0; fi
     if [[ "$code" == 400 || "$code" == 404 || "$code" == 429 ]]; then PROBE_RESULT=unconfigured; PROBE_MESSAGE="Probe endpoint/parameters/rate limit requires review (HTTP $code)"; return 0; fi
@@ -575,7 +627,7 @@ readiness_probe() {
         version-json) jq -e '.version | type == "string" and length > 0' "$body" >/dev/null 2>&1 || return 1 ;;
         recognize)
             grep -Eq -- "$pattern" "$body" || return 1
-            PROBE_RESULT=reachable; PROBE_MESSAGE='Application UI recognized; backend readiness requires Docker health or a stronger configured probe'; return 0 ;;
+            PROBE_RESULT=reachable; PROBE_MESSAGE="Application UI recognized (${redirects} same-origin redirects); backend readiness requires Docker health or a stronger configured probe"; return 0 ;;
         reachable) PROBE_RESULT=reachable; PROBE_MESSAGE='HTTP reachable; application readiness not verified'; return 0 ;;
         *) PROBE_RESULT=unconfigured; PROBE_MESSAGE='Unknown probe validation mode'; return 0 ;;
     esac
@@ -584,6 +636,24 @@ readiness_probe() {
 
 endpoint_healthy() {
     readiness_probe "${2:-service}" "$1"
+}
+
+diagnose_service() {
+    local name="$1" url="${2:-}" info rule profile port path kind pattern resolved
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 2
+    TMP_DIR="$(mktemp -d /tmp/docker-watchdog-diagnose.XXXXXX)" || return 1
+    trap cleanup EXIT
+    info="$(docker_cmd inspect "$name" 2>/dev/null)" && inspect_valid "$info" || { printf 'Inspection failed: %s\n' "$name" >&2; return 1; }
+    printf 'Watchdog: %s\nContainer: %s\n' "$SCRIPT_VERSION" "$name"
+    jq -r '.[0] | "State: \(.State.Status); health: \(.State.Health.Status // "none")\nNetwork mode: \(.HostConfig.NetworkMode // "unknown")\nPublished ports: \(.NetworkSettings.Ports // {})"' <<<"$info"
+    rule="$(probe_rule "$name" || true)"
+    IFS='|' read -r profile port path kind pattern <<<"$rule"
+    resolved="$url"
+    if [[ -z "$resolved" && -n "$rule" ]]; then resolved="$(probe_url "$name" "$info" "$port" "$path" || true)"; fi
+    printf 'Resolved probe: %s\n' "$(safe_probe_target "${resolved:-not configured}")"
+    readiness_probe "$name" "$url" || true
+    printf 'Probe classification: %s\nEvidence: %s\n' "$PROBE_RESULT" "$PROBE_MESSAGE"
+    printf 'No monitoring state, notifications, or container actions were performed.\n'
 }
 
 inspect_valid() {
@@ -814,7 +884,7 @@ write_receipt() {
 main() {
     local spec name url expected allowed uptime status=OK failed=false command
     case "${1:-}" in
-        --help|-h) printf '%s\n' 'Usage: bash docker_service_watchdog.sh [--version|--maintenance CONTAINER MINUTES REASON|--record-job PROFILE EXIT_CODE [START_EPOCH]]'
+        --help|-h) printf '%s\n' 'Usage: bash docker_service_watchdog.sh [--version|--diagnose CONTAINER [URL]|--maintenance CONTAINER MINUTES REASON|--record-job PROFILE EXIT_CODE [START_EPOCH]]'
             printf '%s\n' 'Schedule every five minutes. Recovery requires global AND per-service permission.' \
                 'Maintenance suppresses availability checks/restarts, freezes active findings, and expires within 24h.' \
                 'Remove /run/docker-service-maintenance/CONTAINER.manual.json to end a manual lease early.' \
@@ -822,6 +892,7 @@ main() {
                 'Internal schedulers need native status, timestamped whole-run evidence, or producer receipts.' \
                 'Run docker_watchdog_liveness.sh independently every five minutes to monitor this script.'; return 0 ;;
         --version) printf 'docker_service_watchdog.sh %s\n' "$SCRIPT_VERSION"; return 0 ;;
+        --diagnose) [[ $# == 2 || $# == 3 ]] || return 2; diagnose_service "$2" "${3:-}"; return $? ;;
         --maintenance) [[ $# == 4 ]] || return 2; set_manual_maintenance "$2" "$3" "$4"; return $? ;;
         --record-job) [[ $# == 3 || $# == 4 ]] || return 2; record_job "$2" "$3" "${4:-0}"; return $? ;;
         '') ;;
@@ -840,10 +911,10 @@ main() {
     for number in "$COMMAND_TIMEOUT_SECONDS" "$HTTP_CONNECT_TIMEOUT" "$HTTP_MAX_TIME" "$FAILURE_CONFIRM_SCANS" "$RECOVERY_CONFIRM_SCANS" \
         "$CONSECUTIVE_FAILURES_BEFORE_RESTART" "$RESTART_COOLDOWN_SECONDS" "$RESTART_BUDGET_WINDOW_SECONDS" "$MAX_RESTART_ATTEMPTS" \
         "$RECOVERY_TIMEOUT_SECONDS" "$RECOVERY_POLL_SECONDS" "$MAX_MAINTENANCE_SECONDS" "$LOG_MAX_BYTES" "$PROBE_MAX_BYTES" "$JOB_READ_MAX_BYTES" \
-        "$SHARED_FAILURE_THRESHOLD" "$FLAP_WINDOW_SECONDS" "$FLAP_TRANSITION_THRESHOLD" "$FLAP_STABLE_SECONDS"; do
+        "$SHARED_FAILURE_THRESHOLD" "$FLAP_WINDOW_SECONDS" "$FLAP_TRANSITION_THRESHOLD" "$FLAP_STABLE_SECONDS" "$PROBE_UI_MAX_BYTES"; do
         [[ "$number" =~ ^[1-9][0-9]*$ ]] || return 2
     done
-    for number in "$BOOT_GRACE_SECONDS" "$CONTAINER_GRACE_SECONDS" "$LOG_SIZE_WARNING_BYTES"; do [[ "$number" =~ ^[0-9]+$ ]] || return 2; done
+    for number in "$BOOT_GRACE_SECONDS" "$CONTAINER_GRACE_SECONDS" "$LOG_SIZE_WARNING_BYTES" "$PROBE_MAX_REDIRECTS"; do [[ "$number" =~ ^[0-9]+$ ]] || return 2; done
     for flag in "$AUTO_RESTART" "$RESTART_STOPPED_CONTAINERS" "$CHECK_LOG_SIZE" "$DISCOVER_UNCLASSIFIED" "$REQUIRE_VERIFIED_JOB_SUCCESS"; do [[ "$flag" == true || "$flag" == false ]] || return 2; done
     local profile max_age runtime source
     for spec in "${JOB_RULES[@]}"; do

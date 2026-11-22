@@ -7,6 +7,7 @@ trap 'rm -rf -- "${TEST_ROOT:?}"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 # shellcheck disable=SC1091
 source "$ROOT/user_script/docker_service_watchdog.sh"
+[[ "${SERVICE_SPECS[*]}" == *'lumunarr||always|0'* ]] || fail 'Lumunarr policy missing'
 STATE_DIR="$TEST_ROOT/state"; mkdir -p "$STATE_DIR"
 HEARTBEAT_FILE="$TEST_ROOT/heartbeat/heartbeat.json"
 STATE_FILE="$STATE_DIR/state.json"; STATE_WORK="$TEST_ROOT/work.json"
@@ -44,9 +45,12 @@ make_info() {
 }
 MOCK_INSPECT_FAIL=false; MOCK_RESTART_FAIL=false; MOCK_ENDPOINT=true; MOCK_LOGS=""; MOCK_NATIVE='{}'
 MOCK_INVENTORY=service
+MOCK_PEER_INFO=""
 docker_cmd() {
     case "$1" in
-        inspect) [[ "$MOCK_INSPECT_FAIL" != true ]] || return 124; printf '%s\n' "$MOCK_INFO" ;;
+        inspect)
+            [[ "$MOCK_INSPECT_FAIL" != true ]] || return 124
+            if [[ "$2" == vpn && -n "$MOCK_PEER_INFO" ]]; then printf '%s\n' "$MOCK_PEER_INFO"; else printf '%s\n' "$MOCK_INFO"; fi ;;
         container) printf '%s\n' "$MOCK_INVENTORY" ;;
         logs) printf '%s\n' "$MOCK_LOGS" ;;
         exec) printf '%s\n' "$MOCK_NATIVE" ;;
@@ -144,9 +148,20 @@ resolve_inventory || fail 'inventory resolution failed'
 
 # Readiness interprets body and authentication separately from transport.
 MOCK_HTTP_CODE=200; MOCK_HTTP_BODY='<MediaContainer machineIdentifier="fixture"/>'; MOCK_CURL_RC=0
+MOCK_REDIRECT_FIRST=""; MOCK_REDIRECT_TO=""
 curl() {
-    local output="" argument previous=""
-    for argument in "$@"; do [[ "$previous" != --output ]] || output="$argument"; previous="$argument"; done
+    local output="" argument previous="" limit=65536 url="${*: -1}"
+    for argument in "$@"; do
+        [[ "$previous" != --output ]] || output="$argument"
+        [[ "$previous" != --max-filesize ]] || limit="$argument"
+        previous="$argument"
+    done
+    printf '%s\n' "$url" >>"$TEST_ROOT/requests"
+    printf '%s\n' "$limit" >"$TEST_ROOT/probe-limit"
+    if [[ -n "$MOCK_REDIRECT_FIRST" && "$url" == "$MOCK_REDIRECT_FIRST" ]]; then
+        : >"$output"; printf '302\n%s' "$MOCK_REDIRECT_TO"; return 0
+    fi
+    if (( ${#MOCK_HTTP_BODY} > limit )); then : >"$output"; printf '%s' "$MOCK_HTTP_CODE"; return 63; fi
     printf '%s' "$MOCK_HTTP_BODY" >"$output"
     printf '%s' "$MOCK_HTTP_CODE"
     return "$MOCK_CURL_RC"
@@ -165,6 +180,32 @@ MOCK_CURL_RC=63
 readiness_probe plex-media-server http://fixture/identity || fail 'oversize probe treated as service failure'
 [[ "$PROBE_RESULT" == unconfigured ]] || fail 'oversize response could trigger restart'
 MOCK_CURL_RC=0
+
+# Web UI bodies may exceed the API cap. Normal local login/base-path redirects
+# are followed only for UI recognition and only within the original origin.
+printf -v large_ui '%*s' 100000 ''
+MOCK_HTTP_BODY="SABnzbd$large_ui"
+readiness_probe sabnzbd http://fixture/ || fail 'large SAB UI rejected'
+[[ "$PROBE_RESULT" == reachable && "$(cat "$TEST_ROOT/probe-limit")" == "$PROBE_UI_MAX_BYTES" ]] || fail 'UI cap not used'
+MOCK_HTTP_BODY='Tautulli login'; MOCK_REDIRECT_FIRST=http://fixture/; MOCK_REDIRECT_TO=http://fixture/auth/login
+: >"$TEST_ROOT/requests"
+readiness_probe tautulli http://fixture/ || fail 'same-origin UI redirect rejected'
+[[ "$PROBE_RESULT" == reachable && "$(wc -l <"$TEST_ROOT/requests")" -eq 2 ]] || fail 'normal redirect not recognized'
+MOCK_REDIRECT_TO=http://other-host/login; : >"$TEST_ROOT/requests"
+readiness_probe tautulli http://fixture/ || fail 'cross-origin handling failed'
+[[ "$PROBE_RESULT" == unconfigured && "$(wc -l <"$TEST_ROOT/requests")" -eq 1 ]] || fail 'cross-origin redirect followed'
+MOCK_REDIRECT_TO=http://fixture/; : >"$TEST_ROOT/requests"
+readiness_probe photoprism http://fixture/ || fail 'redirect-loop handling failed'
+[[ "$PROBE_RESULT" == unconfigured && "$(wc -l <"$TEST_ROOT/requests")" -eq $((PROBE_MAX_REDIRECTS + 1)) ]] || fail 'redirect loop not bounded'
+MOCK_REDIRECT_FIRST=""; MOCK_REDIRECT_TO=""
+
+# Resolve qBittorrent's configured internal port through a VPN peer's mapping.
+MOCK_PEER_INFO="$(jq '.[0].HostConfig={NetworkMode:"bridge"} | .[0].NetworkSettings={Ports:{"8090/tcp":[{HostIp:"0.0.0.0",HostPort:"18090"}]}}' <<<"$MOCK_INFO")"
+qbit_info="$(jq '.[0].Config.Env=["WEBUI_PORT=8090"] | .[0].HostConfig={NetworkMode:"container:vpn"}' <<<"$MOCK_INFO")"
+resolved="$(probe_url qbittorrent "$qbit_info" 8080 /api/v2/app/version)" || fail 'VPN peer route resolution failed'
+[[ "$resolved" == "http://$DOCKER_HOST_IP:18090/api/v2/app/version" ]] || fail 'qBittorrent port/VPN mapping ignored'
+safe="$(safe_probe_target 'http://user:password@fixture/path?apikey=secret')"
+[[ "$safe" != *password* && "$safe" != *secret* ]] || fail 'probe diagnostics expose credentials'
 
 # Shared transport failures inhibit ALL candidate restarts before actions run.
 fresh; PROBE_FAILURES=([one]=1 [two]=1 [three]=1)
@@ -185,17 +226,29 @@ check_job metafusion "$MOCK_INFO" || fail 'native job status rejected'
 jq -e --argjson now "$NOW" '.jobs.metafusion.success == $now' "$STATE_WORK" >/dev/null || fail 'native success missing'
 NOW=$((NOW + 7*3600)); check_job metafusion "$MOCK_INFO" || fail 'native stale check failed'
 [[ -n "${SEEN[metafusion:job-overdue]:-}" ]] || fail 'missed internal run not detected'
-MOCK_NATIVE="$(jq -nc --argjson now "$NOW" '{state:"idle",heartbeat_at:"2026-11-21T00:00:00Z",pid:1,last_run_started:($now-60),last_run_finished:$now,last_run_status:"failed"}')"
+MOCK_NATIVE="$(jq -nc --argjson now "$NOW" '{state:"idle",heartbeat_at:"2026-11-21T00:00:00Z",pid:1,last_run_started:($now-60),last_run_finished:$now,last_run_status:"failed",last_error:"Provider request failed token=supersecret Authorization: Bearer hiddensecret https://user:secretpw@fixture/problem"}')"
 check_job metafusion "$MOCK_INFO"; check_job metafusion "$MOCK_INFO"
 active metafusion:job-failed || fail 'native failed job not classified'
+detail="$(jq -r '.observations["metafusion:job-failed"].message' "$STATE_WORK")"
+[[ "$detail" == *'Provider request failed'* && "$detail" != *supersecret* && "$detail" != *hiddensecret* && "$detail" != *secretpw* ]] || fail 'native failure detail missing or credentials exposed'
 MOCK_NATIVE='{}'; SEEN=(); FROZEN_KEYS=()
 check_job metafusion "$MOCK_INFO"; finish_observations
 active metafusion:job-failed || fail 'invalid evidence falsely cleared failure'
+MOCK_NATIVE="$(jq -nc --argjson now "$NOW" '{state:"idle",heartbeat_at:"2026-11-21T00:00:00Z",pid:1,last_run_started:($now-30),last_run_finished:$now,last_success:$now,last_run_status:"success"}')"
+for recovery_scan in 1 2; do
+    SEEN=(); FROZEN_KEYS=()
+    check_job metafusion "$MOCK_INFO"; finish_observations
+done
+active metafusion:job-failed && fail 'verified successful job did not clear prior failure'
 
 # A whole-run log banner counts completion but must not invent success.
 fresh; NOW="$(date +%s)"
 MOCK_LOGS="$(date -u '+%Y-%m-%dT%H:%M:%SZ') | Finished 04:00 Run |"
+# Simulate a shell tail override that misinterprets a separated byte count.
+# Production byte/line calls must bypass it and attach counts to options.
+tail() { printf "tail: cannot open '262144' for reading\n" >&2; return 1; }
 check_job kometa "$MOCK_INFO" || fail 'Kometa log completion check failed'
+unset -f tail
 [[ -n "${SEEN[kometa:job-unverified]:-}" ]] || fail 'completion banner reported verified success'
 jq -e '.jobs.kometa.finished > 0 and .jobs.kometa.success == 0' "$STATE_WORK" >/dev/null || fail 'completion evidence incorrect'
 MOCK_LOGS=""
@@ -244,6 +297,6 @@ STATUS_DIR="$TEST_ROOT/status"; UPTIME_FILE="$TEST_ROOT/uptime"
 printf '99999.00 0.00\n' >"$UPTIME_FILE"
 docker() { return 0; }
 (main) >"$TEST_ROOT/main.log" 2>&1 || { cat "$TEST_ROOT/main.log" >&2; fail 'main orchestration failed'; }
-jq -e '.status == "OK" and .scriptVersion == "3.0"' "$STATUS_DIR/docker_service_watchdog.json" >/dev/null || fail 'main receipt incorrect'
+jq -e '.status == "OK" and .scriptVersion == "3.1"' "$STATUS_DIR/docker_service_watchdog.json" >/dev/null || fail 'main receipt incorrect'
 jq -e '.phase == "completed" and .executionComplete == true and .failures == 0' "$HEARTBEAT_FILE" >/dev/null || fail 'main heartbeat not finalized'
 printf 'docker_service_watchdog fixture tests passed\n'

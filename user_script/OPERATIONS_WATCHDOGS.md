@@ -4,14 +4,14 @@ These scripts are independent Unraid User Scripts. Keeping them in GitHub does
 not install, enable, or schedule them. Review container names, URLs, paths, and
 expected service states before deployment. Run scripts through `/bin/bash`.
 
-## Docker service watchdog v3.0
+## Docker service watchdog v3.1
 
 Optional schedule: `*/5 * * * *`. Each rule is
 `container|optional HTTP endpoint|always or on-demand|restart permission`.
 All listed applications now default to continuously running, including the
 internally scheduled Imagemaid, Kometa, Metafusion, and Recyclarr containers.
 The list includes both Plex instances, Sonarr, Radarr, SABnzbd, qBittorrent,
-Bazarr, Tautulli, Seerr, Prowlarr and PhotoPrism. Pi-hole is monitored by
+Bazarr, Tautulli, Seerr, Prowlarr, PhotoPrism and Lumunarr. Pi-hole is monitored by
 `dns_redundancy_watchdog.sh` instead. Adjust exact names to the deployed stack.
 `lometa` and `tautilli` are supported aliases if the primary name is absent.
 Use on-demand only for a container intended to exit; nonzero exits still alert.
@@ -27,7 +27,7 @@ it. A changed issue set/severity produces one grouped notification; unchanged
 conditions have no reminders. Notification delivery failures retain pending
 transitions for retry. OOM and Docker restart-count changes are events, not
 permanent availability failures. Readiness validates application responses;
-401/403 and redirects are authentication/configuration warnings, never proof of
+401/403 and API redirects are authentication/configuration warnings, never proof of
 readiness or permission to restart. HTTP 400/404/429, TLS configuration errors,
 and oversized responses inhibit recovery rather than trigger it.
 
@@ -51,8 +51,9 @@ v1 notification fingerprints are not imported.
 `PROBE_RULES` defines the expected container port, read-only path and response
 validator. Explicit URLs in `SERVICE_SPECS` take precedence. Otherwise endpoints
 come from published ports, host networking, or an unambiguous custom-network IP.
-VPN/shared-container networking, custom base paths and ambiguous mappings need
-explicit URLs; these conditions warn and block recovery rather than guessing.
+qBittorrent's `WEBUI_PORT` and a single shared/VPN companion's port mappings are
+supported. Unresolved/ambiguous mappings and custom base paths need explicit
+URLs; these conditions warn and block recovery rather than guessing.
 
 Plex validates `/identity`, the Arr ping probes validate JSON status, qBittorrent
 validates its application-version response, and Seerr validates its status version.
@@ -60,6 +61,27 @@ The SABnzbd, Bazarr, Tautulli and PhotoPrism defaults recognize their web UI onl
 that proves identity/reachability, not backend operation. Native Docker health
 can provide additional evidence. Configure a stronger supported API probe where
 desired. No probe requests library listings or touches physical media paths.
+
+Web UI recognition has a separate 1 MiB response cap (API responses remain capped
+at 64 KiB). UI probes follow up to three same-origin redirects, allowing normal
+login/base-path redirects without claiming backend readiness. Cross-origin
+redirects are rejected before sending another request, protecting configured
+headers/cookies. API redirects remain unverified. LAN probes bypass HTTP proxy
+environment variables. Lumunarr initially uses container/Docker health only.
+
+To diagnose an unresolved endpoint without notifications, state changes, or
+container actions:
+
+```bash
+/bin/bash /boot/config/plugins/user.scripts/scripts/docker_service_watchdog/script --diagnose qbittorrent
+# Optionally test the exact working Web UI/API URL:
+/bin/bash /path/to/docker_service_watchdog.sh --diagnose qbittorrent http://HOST:PORT/api/v2/app/version
+```
+
+Output includes network mode, published ports, resolved probe target, and the
+probe classification. Credentials and query parameters are omitted from target
+diagnostics. A timeout can still be a genuine firewall/network/service issue;
+route discovery does not change Docker networking or VPN configuration.
 
 Optional files under `PROBE_AUTH_DIR`: `CONTAINER.headers` contains HTTP headers;
 `CONTAINER.cookies` is a Netscape cookie jar. Protect credentials with owner-only
@@ -94,6 +116,13 @@ completion evidence. Runtime limits default to 24 hours and require a reliable
 job-start timestamp; it never treats container start time as an internally
 scheduled job start. Initial missing-completion checks allow a complete initial
 window instead of accusing jobs of missing historical runs it never observed.
+
+Host log-tail calls bypass shell overrides and use attached byte/line count
+options. This avoids a separated numeric byte limit being interpreted as a
+filename. Metafusion failures now include bounded, credential-redacted error
+detail and completion/success timestamps. Actual job failures and missing
+producer integration are not suppressed. They resolve after authoritative
+successful processing and the configured recovery confirmation scans.
 
 Metafusion uses its native `/tmp/metafusion-status.json` via bounded Docker exec.
 Change the source if `STATUS_FILE` is customized. It distinguishes last run
