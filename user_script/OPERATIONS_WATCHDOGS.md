@@ -4,7 +4,7 @@ These scripts are independent Unraid User Scripts. Keeping them in GitHub does
 not install, enable, or schedule them. Review container names, URLs, paths, and
 expected service states before deployment. Run scripts through `/bin/bash`.
 
-## Docker service watchdog v3.1
+## Docker service watchdog v3.2
 
 Optional schedule: `*/5 * * * *`. Each rule is
 `container|optional HTTP endpoint|always or on-demand|restart permission`.
@@ -83,6 +83,14 @@ probe classification. Credentials and query parameters are omitted from target
 diagnostics. A timeout can still be a genuine firewall/network/service issue;
 route discovery does not change Docker networking or VPN configuration.
 
+For auto-discovered qBittorrent endpoints only, transport failure can try up to
+three routes: the published host address, loopback when Docker published on a
+wildcard address, and the inspected container/network-namespace IPv4 address.
+Every route is derived from that container's Docker metadata; no ports are
+scanned. An explicit URL disables fallback. HTTP/authentication errors do not
+trigger route switching. A successful fallback must still validate the expected
+qBittorrent version response; its target is included in the probe evidence.
+
 Optional files under `PROBE_AUTH_DIR`: `CONTAINER.headers` contains HTTP headers;
 `CONTAINER.cookies` is a Netscape cookie jar. Protect credentials with owner-only
 permissions. qBittorrent API authentication is required unless your current
@@ -109,7 +117,7 @@ Container uptime is independent of successful scheduled processing. Defaults:
 | Imagemaid | Weekly | Completion within 192 hours (weekly plus 24-hour grace) |
 | Kometa | Every four hours | Completion within six hours |
 | Metafusion | Every four hours before Kometa | Completion within six hours |
-| Recyclarr | Twice weekly | Two successful runs in a rolling 192-hour window |
+| Recyclarr | Wednesday/Sunday 06:00 Singapore time | Completion within 120 hours; two successes per rolling 192 hours |
 
 The watchdog does not enforce job ordering or trigger jobs. It monitors
 completion evidence. Runtime limits default to 24 hours and require a reliable
@@ -138,12 +146,20 @@ No repeated email is sent merely because another identical banner appears.
 If an image does not send these records to Docker logs, configure another source.
 Plain container log-file tails need a parseable timestamp on the marker line.
 
-Recyclarr requires a producer receipt because an internal scheduler's work cannot
-be verified from its container state. The absence of that integration is a
-`job-evidence` warning, not a fabricated successful run. The same receipt mechanism
-can provide definitive Kometa/Imagemaid outcomes. From a real host-side post-run
-hook, invoke the script with the canonical job profile, actual exit code, and
-optional Unix start timestamp:
+Recyclarr now reads its resident cron scheduler's Docker logs automatically.
+The default command `/cron.sh` and job position `0` match this installation's
+scheduler output. It matches whole-job start/terminal records by command,
+position and iteration, carries start/error context between polls, and counts
+`job succeeded` as success only with a known run start and no observed ERR/FTL
+or error/fatal records in that run. A scheduler failure or an error inside a
+zero-exit wrapper still fails the job check. Per-library `Completed at` lines
+never establish whole-job success. A terminal record without its start/error
+context is completed-unverified until a complete run is observed. Unsupported
+logging formats can still use an explicit producer receipt.
+
+Producer receipts remain available for Recyclarr or definitive Kometa/Imagemaid
+outcomes. From a real host-side post-run hook, invoke the script with the
+canonical job profile, actual exit code, and optional Unix start timestamp:
 
 ```bash
 /bin/bash /path/to/docker_service_watchdog.sh --record-job recyclarr 0 1795270000

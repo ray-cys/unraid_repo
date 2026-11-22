@@ -149,6 +149,7 @@ resolve_inventory || fail 'inventory resolution failed'
 # Readiness interprets body and authentication separately from transport.
 MOCK_HTTP_CODE=200; MOCK_HTTP_BODY='<MediaContainer machineIdentifier="fixture"/>'; MOCK_CURL_RC=0
 MOCK_REDIRECT_FIRST=""; MOCK_REDIRECT_TO=""
+MOCK_TRANSPORT_URL=""
 curl() {
     local output="" argument previous="" limit=65536 url="${*: -1}"
     for argument in "$@"; do
@@ -157,6 +158,7 @@ curl() {
         previous="$argument"
     done
     printf '%s\n' "$url" >>"$TEST_ROOT/requests"
+    if [[ -n "$MOCK_TRANSPORT_URL" && "$url" == "$MOCK_TRANSPORT_URL" ]]; then : >"$output"; printf '000'; return 28; fi
     printf '%s\n' "$limit" >"$TEST_ROOT/probe-limit"
     if [[ -n "$MOCK_REDIRECT_FIRST" && "$url" == "$MOCK_REDIRECT_FIRST" ]]; then
         : >"$output"; printf '302\n%s' "$MOCK_REDIRECT_TO"; return 0
@@ -204,6 +206,21 @@ MOCK_PEER_INFO="$(jq '.[0].HostConfig={NetworkMode:"bridge"} | .[0].NetworkSetti
 qbit_info="$(jq '.[0].Config.Env=["WEBUI_PORT=8090"] | .[0].HostConfig={NetworkMode:"container:vpn"}' <<<"$MOCK_INFO")"
 resolved="$(probe_url qbittorrent "$qbit_info" 8080 /api/v2/app/version)" || fail 'VPN peer route resolution failed'
 [[ "$resolved" == "http://$DOCKER_HOST_IP:18090/api/v2/app/version" ]] || fail 'qBittorrent port/VPN mapping ignored'
+
+# Reproduce Hubble's published-port timeout, followed by a validated loopback
+# response. Explicit URLs must never be silently replaced by fallback routes.
+MOCK_INFO="$(jq '.[0].HostConfig={NetworkMode:"bridge"} | .[0].Config.Env=[] |
+    .[0].NetworkSettings={Ports:{"8080/tcp":[{HostIp:"0.0.0.0",HostPort:"8686"}]},Networks:{bridge:{IPAddress:"172.17.0.10"}}}' <<<"$MOCK_INFO")"
+MOCK_HTTP_BODY=v5.1.0; MOCK_HTTP_CODE=200
+MOCK_TRANSPORT_URL="http://$DOCKER_HOST_IP:8686/api/v2/app/version"
+: >"$TEST_ROOT/requests"
+readiness_probe qbittorrent '' || fail 'metadata fallback did not recover readiness'
+[[ "$PROBE_RESULT" == ready && "$PROBE_MESSAGE" == *127.0.0.1:8686* ]] || fail 'fallback lacked qBittorrent validation'
+[[ "$(wc -l <"$TEST_ROOT/requests")" -eq 2 ]] || fail 'unexpected fallback request count'
+: >"$TEST_ROOT/requests"
+if readiness_probe qbittorrent "$MOCK_TRANSPORT_URL"; then fail 'explicit failing URL replaced silently'; fi
+[[ "$(wc -l <"$TEST_ROOT/requests")" -eq 1 ]] || fail 'explicit URL used extra routes'
+MOCK_TRANSPORT_URL=""
 safe="$(safe_probe_target 'http://user:password@fixture/path?apikey=secret')"
 [[ "$safe" != *password* && "$safe" != *secret* ]] || fail 'probe diagnostics expose credentials'
 
@@ -234,6 +251,7 @@ detail="$(jq -r '.observations["metafusion:job-failed"].message' "$STATE_WORK")"
 MOCK_NATIVE='{}'; SEEN=(); FROZEN_KEYS=()
 check_job metafusion "$MOCK_INFO"; finish_observations
 active metafusion:job-failed || fail 'invalid evidence falsely cleared failure'
+NOW=$((NOW + 60))
 MOCK_NATIVE="$(jq -nc --argjson now "$NOW" '{state:"idle",heartbeat_at:"2026-11-21T00:00:00Z",pid:1,last_run_started:($now-30),last_run_finished:$now,last_success:$now,last_run_status:"success"}')"
 for recovery_scan in 1 2; do
     SEEN=(); FROZEN_KEYS=()
@@ -268,6 +286,37 @@ NOW=$((NOW + 192*3600 + 1)); SEEN=()
 check_job recyclarr "$MOCK_INFO" || fail 'frequency audit failed'
 [[ -n "${SEEN[recyclarr:job-frequency]:-}" ]] || fail 'twice-weekly completion frequency not checked'
 
+# Recyclarr's actual resident cron output is sufficient without a receipt.
+# Per-library completion alone is not. Preserve error/start context between scans.
+fresh; NOW="$(date +%s)"; rm "$STATE_DIR/jobs/recyclarr.json"
+start_stamp="$(date -u -d "@$((NOW-10))" '+%Y-%m-%dT%H:%M:%SZ')"
+end_stamp="$(date -u -d "@$((NOW-1))" '+%Y-%m-%dT%H:%M:%SZ')"
+MOCK_LOGS="$start_stamp level=info msg=starting iteration=0 job.command=/cron.sh job.position=0 job.schedule=\"0 6 * * 3,7\"
+$end_stamp [INF] radarr: Completed at 11/22/2026 06:00:03
+$end_stamp [INF] sonarr: Completed at 11/22/2026 06:00:03
+$end_stamp level=info msg=\"job succeeded\" iteration=0 job.command=/cron.sh job.position=0 job.schedule=\"0 6 * * 3,7\""
+check_job recyclarr "$MOCK_INFO" || fail 'native cron success parse failed'
+jq -e '.jobs.recyclarr.result == "success" and .jobs.recyclarr.success > 0 and (.jobs.recyclarr.history | length) == 1' "$STATE_WORK" >/dev/null || fail 'native cron success not recorded'
+[[ -z "${SEEN[recyclarr:job-evidence]:-}" && -z "${SEEN[recyclarr:job-unverified]:-}" ]] || fail 'valid scheduler result still requires receipt'
+
+fresh
+MOCK_LOGS="$start_stamp level=info msg=starting iteration=1 job.command=/cron.sh job.position=0
+$end_stamp [ERR] Failed to synchronize Sonarr"
+check_job recyclarr "$MOCK_INFO" || fail 'open cron context failed'
+MOCK_LOGS="$end_stamp level=info msg=\"job succeeded\" iteration=1 job.command=/cron.sh job.position=0"
+check_job recyclarr "$MOCK_INFO" || fail 'terminal cron context failed'
+[[ "$(jq -r '.jobs.recyclarr.result' "$STATE_WORK")" == failed ]] || fail 'scheduler zero exit hid application error'
+
+fresh; MOCK_LOGS="$end_stamp [INF] radarr: Completed at 11/22/2026 06:00:03"
+check_job recyclarr "$MOCK_INFO" || fail 'library-only parse failed'
+jq -e '.jobs.recyclarr.success == 0 and .jobs.recyclarr.finished == 0' "$STATE_WORK" >/dev/null || fail 'per-library line invented whole-job success'
+MOCK_LOGS=""; check_job recyclarr "$MOCK_INFO" || fail 'empty cached context broke next scan'
+
+fresh
+MOCK_LOGS="$end_stamp level=info msg=\"job succeeded\" iteration=5 job.command=/cron.sh job.position=0"
+check_job recyclarr "$MOCK_INFO" || fail 'truncated cron window failed'
+[[ "$(jq -r '.jobs.recyclarr.result' "$STATE_WORK")" == completed-unverified ]] || fail 'missing start/error scope invented success'
+
 # Flapping collapses oscillations into a stable incident and blocks recovery.
 fresh; EFFECTIVE_SPECS=('service||always|0'); NOW="$(date +%s)"
 for state in false true false true false true; do
@@ -297,6 +346,6 @@ STATUS_DIR="$TEST_ROOT/status"; UPTIME_FILE="$TEST_ROOT/uptime"
 printf '99999.00 0.00\n' >"$UPTIME_FILE"
 docker() { return 0; }
 (main) >"$TEST_ROOT/main.log" 2>&1 || { cat "$TEST_ROOT/main.log" >&2; fail 'main orchestration failed'; }
-jq -e '.status == "OK" and .scriptVersion == "3.1"' "$STATUS_DIR/docker_service_watchdog.json" >/dev/null || fail 'main receipt incorrect'
+jq -e '.status == "OK" and .scriptVersion == "3.2"' "$STATUS_DIR/docker_service_watchdog.json" >/dev/null || fail 'main receipt incorrect'
 jq -e '.phase == "completed" and .executionComplete == true and .failures == 0' "$HEARTBEAT_FILE" >/dev/null || fail 'main heartbeat not finalized'
 printf 'docker_service_watchdog fixture tests passed\n'

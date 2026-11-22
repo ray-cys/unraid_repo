@@ -1,10 +1,10 @@
 #!/bin/bash
-# Docker Service Watchdog v3.1 -- Unraid service availability and bounded recovery.
+# Docker Service Watchdog v3.2 -- Unraid service availability and bounded recovery.
 # Optional schedule: every five minutes. Pi-hole and application-specific health
 # remain owned by the DNS and Arr monitors. All recovery is disabled by default.
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.1"
+readonly SCRIPT_VERSION="3.2"
 
 ###############################################################################
 # CONFIGURATION
@@ -37,18 +37,20 @@ DISABLED_SERVICES=()       # Explicitly ignored, intentionally disabled services
 DISCOVER_UNCLASSIFIED=true
 # profile|max completion age hours|max runtime hours|evidence source
 # User schedule + grace: weekly Imagemaid -> 192h; 4-hour jobs -> 6h.
-# Recyclarr: two weekly runs, checked over 8 days without assuming spaced days.
+# Recyclarr: Wed/Sun 06:00; longest gap 96h + 24h grace, two successes per 8 days.
 # Sources: native:/container/path (Metafusion); log:/container/path; a host JSON
 # receipt; or docker (one-shot containers only). Change log paths to your mounts.
 JOB_RULES=(
     "imagemaid|192|24|dockerlogs"
     "kometa|6|24|dockerlogs"
     "metafusion|6|24|native:/tmp/metafusion-status.json"
-    "recyclarr|192|24|receipt"
+    "recyclarr|120|24|dockerlogs"
 )
 JOB_FREQUENCY_RULES=("recyclarr|2|192") # profile|min successful runs|rolling hours
 JOB_READ_MAX_BYTES=262144
 REQUIRE_VERIFIED_JOB_SUCCESS=true
+RECYCLARR_JOB_COMMAND="/cron.sh"
+RECYCLARR_JOB_POSITION=0
 # profile|container TCP port|readiness path|validation type|expected body
 # Override an explicit URL in SERVICE_SPECS for custom paths/ports. Otherwise
 # published-port mappings or a custom Docker IP are inspected, not guessed.
@@ -74,6 +76,7 @@ PROBE_AUTH_DIR="/mnt/vault/cloud/logs/docker_service_watchdog/probe-auth"
 PROBE_MAX_BYTES=65536
 PROBE_UI_MAX_BYTES=1048576 # Bounded web UI recognition needs more than API JSON.
 PROBE_MAX_REDIRECTS=3     # Same-origin redirects for UI recognition only.
+PROBE_MAX_ROUTES=3        # qBittorrent only: metadata-proven host/loopback/IP.
 SHARED_FAILURE_THRESHOLD=3
 FLAP_WINDOW_SECONDS=3600
 FLAP_TRANSITION_THRESHOLD=4
@@ -209,7 +212,13 @@ state_valid() {
             (.started | type == "number" and . >= 0 and . == floor) and
             (.finished | type == "number" and . >= 0 and . == floor) and
             (.success | type == "number" and . >= 0 and . == floor) and
-            (.scanned | type == "number" and . >= 0 and . == floor) and (.result | type == "string"))) and
+            (.scanned | type == "number" and . >= 0 and . == floor) and (.result | type == "string") and
+            ((.history // []) | type == "array" and all(.[]; type == "number" and . >= 0 and . == floor)) and
+            ((.logState // {}) | type == "object" and (if has("containerId") then
+                (.containerId | type == "string") and (.start | type == "number" and . >= 0 and . == floor) and
+                (.iteration | type == "string" and test("^[0-9]*$")) and
+                (.failed | type == "boolean") and (.seen | type == "boolean") and (.open | type == "boolean")
+                else . == {} end)))) and
         ((.flapping // {}) | type == "object" and all(.[];
             (.down | type == "boolean") and (.unstable | type == "boolean") and
             (.last | type == "number" and . >= 0 and . == floor) and
@@ -368,9 +377,62 @@ record_job() {
     return "$rc"
 }
 
+# Recyclarr's resident scheduler emits authoritative cron-process outcomes.
+# Match the configured command/position/iteration, never a per-library
+# "Completed at" line. Keep open-run/error context across polling windows.
+parse_recyclarr_log() {
+    local file="$1" info="$2" old="$3" id context iteration="" start=0 failed=false seen=false open=false
+    local line stamp epoch event_iteration command_match=false position_match=false
+    id="$(jq -r '.[0].Id' <<<"$info")"
+    context="$(jq -c --arg id "$id" '.logState // {} | select(.containerId == $id and (.start | type == "number") and
+        (.iteration | type == "string" and test("^[0-9]+$")) and (.failed | type == "boolean") and (.seen | type == "boolean") and (.open | type == "boolean"))' <<<"$old")"
+    if [[ -n "$context" ]]; then
+        IFS=$'\t' read -r iteration start failed seen open < <(jq -r '[.iteration,.start,.failed,.seen,.open] | @tsv' <<<"$context")
+    fi
+    JOB_LOG_STARTED=0; JOB_LOG_FINISHED=0; JOB_LOG_SUCCESS=0; JOB_LOG_RESULT=unknown; JOB_LOG_HISTORY='[]'
+    while IFS= read -r line; do
+        stamp="${line%% *}"
+        [[ "$stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T ]] || continue
+        epoch="$(epoch_value "$stamp")"
+        (( epoch > 0 && epoch <= NOW + 300 )) || continue
+        command_match=false; position_match=false
+        [[ " $line " != *" job.command=$RECYCLARR_JOB_COMMAND "* && " $line " != *" job.command=\"$RECYCLARR_JOB_COMMAND\" "* ]] || command_match=true
+        [[ " $line " != *" job.position=$RECYCLARR_JOB_POSITION "* ]] || position_match=true
+        if [[ "$command_match" == true && "$position_match" == true && "$line" =~ iteration=([0-9]+) ]]; then
+            event_iteration="${BASH_REMATCH[1]}"
+            if [[ "$line" =~ msg=(\"starting\"|starting)[[:space:]] ]]; then
+                if (( epoch > start )) || { (( epoch == start )) && [[ "$iteration" != "$event_iteration" ]]; }; then
+                    start="$epoch"; iteration="$event_iteration"; failed=false; seen=true; open=true
+                fi
+                JOB_LOG_STARTED="$start"
+            elif [[ "$line" == *'msg="job succeeded"'* || "$line" == *'msg="job failed"'* ]]; then
+                (( epoch >= start )) || continue
+                (( epoch >= JOB_LOG_FINISHED )) || continue
+                JOB_LOG_FINISHED="$epoch"
+                if [[ "$line" == *'msg="job failed"'* ]]; then
+                    JOB_LOG_RESULT=failed
+                elif [[ "$seen" == true && "$event_iteration" == "$iteration" ]] && (( epoch >= start )); then
+                    if [[ "$failed" == true ]]; then JOB_LOG_RESULT=failed
+                    else
+                        JOB_LOG_RESULT=success; JOB_LOG_SUCCESS="$epoch"
+                        JOB_LOG_HISTORY="$(jq -c --argjson epoch "$epoch" '. + [$epoch] | unique' <<<"$JOB_LOG_HISTORY")"
+                    fi
+                else JOB_LOG_RESULT=completed-unverified; fi
+                open=false
+            fi
+        elif [[ "$open" == true ]] && (( epoch >= start )) && [[ "$line" =~ \[(ERR|FTL)\]|level=(error|fatal) ]]; then
+            failed=true
+        fi
+    done <"$file"
+    if [[ "$open" == true ]]; then JOB_LOG_STARTED="$start"; fi
+    JOB_LOG_STATE="$(jq -nc --arg id "$id" --arg iteration "$iteration" --argjson start "$start" \
+        --argjson failed "$failed" --argjson seen "$seen" --argjson open "$open" \
+        '{containerId:$id,iteration:$iteration,start:$start,failed:$failed,seen:$seen,open:$open}')"
+}
+
 check_job() {
     local name="$1" info="$2" profile rule max_age runtime source file started=0 finished=0 success=0 result=unknown
-    local old first old_finished old_success scan since line stamp read_error=false rc key frequency min_runs hours count receipt_history='[]'
+    local old first old_finished old_success scan since line stamp read_error=false rc key frequency min_runs hours count receipt_history='[]' log_state='{}'
     profile="${PROFILE_BY_NAME[$name]:-$name}"
     rule=""
     for line in "${JOB_RULES[@]}"; do [[ "${line%%|*}" != "$profile" ]] || rule="$line"; done
@@ -408,6 +470,11 @@ check_job() {
             if (( rc != 0 )); then read_error=true
             else
                 sed -E $'s/\033\\[[0-9;]*[[:alpha:]]//g' "$file" >"$file.clean" && mv -f -- "$file.clean" "$file" || return 1
+                if [[ "$profile" == recyclarr ]]; then
+                    parse_recyclarr_log "$file" "$info" "$old" || return 1
+                    started="$JOB_LOG_STARTED"; finished="$JOB_LOG_FINISHED"; success="$JOB_LOG_SUCCESS"; result="$JOB_LOG_RESULT"
+                    receipt_history="$JOB_LOG_HISTORY"; log_state="$JOB_LOG_STATE"
+                else
                 # Only a whole-run banner counts. Collection/playlist/test-run
                 # banners do not. A banner proves completion, not success.
                 if [[ "$profile" == kometa ]]; then
@@ -423,6 +490,7 @@ check_job() {
                 stamp="${line%% *}"
                 if [[ "$stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T ]]; then finished="$(epoch_value "$stamp")"; fi
                 if (( finished > 0 )); then result=completed-unverified; fi
+                fi
             fi ;;
         docker)
             started="$(epoch_value "$(jq -r '.[0].State.StartedAt // ""' <<<"$info")")"
@@ -452,14 +520,19 @@ check_job() {
         RECOVERY_BLOCKED["$name"]=1
         return 0
     fi
-    if [[ "$result" == unknown ]]; then result="$(jq -r '.result // "unknown"' <<<"$old")"; fi
+    if [[ "$result" == unknown ]] || (( finished > 0 && finished < old_finished )); then
+        result="$(jq -r '.result // "unknown"' <<<"$old")"
+    fi
+    if [[ "$(jq -r '.result // "unknown"' <<<"$old")" == failed ]] && (( finished <= old_finished )); then
+        result=failed
+    fi
     (( started > 0 )) || started="$(jq -r '.started // 0' <<<"$old")"
     (( finished >= old_finished )) || finished="$old_finished"
     (( success >= old_success )) || success="$old_success"
     mutate --arg name "$name" --arg result "$result" --argjson first "$first" --argjson started "$started" \
-        --argjson finished "$finished" --argjson success "$success" --argjson scanned "$NOW" --argjson receipt_history "$receipt_history" \
+        --argjson finished "$finished" --argjson success "$success" --argjson scanned "$NOW" --argjson receipt_history "$receipt_history" --argjson log_state "$log_state" \
         '.jobs //= {} | (.jobs[$name].history // []) as $history |
-            .jobs[$name]={firstSeen:$first,started:$started,finished:$finished,success:$success,result:$result,scanned:$scanned,
+            .jobs[$name]={firstSeen:$first,started:$started,finished:$finished,success:$success,result:$result,scanned:$scanned,logState:$log_state,
                 history:(($history + $receipt_history + (if $result == "success" and $success > 0 then [$success] else [] end)) | unique | map(select(. >= ($scanned - 28*86400))))}' || return 1
     if [[ "$result" == failed ]]; then
         local error_detail=""
@@ -470,7 +543,7 @@ check_job() {
                 gsub("(?i)(api[_-]?key|token|password|authorization)[=: ]+[^ ,;\\n]+"; "[REDACTED]") |
                 gsub("[\\r\\n]"; " ") | .[0:500]' "$file")"
         fi
-        observe "$name:job-failed" CRITICAL "Most recent scheduled job failed; finished_epoch=$finished; last_success_epoch=$success. ${error_detail:-Review the producer completion record.} Container availability is checked separately" || return 1
+        observe "$name:job-failed" CRITICAL "Most recent scheduled job failed; finished_epoch=$finished; last_success_epoch=$success. ${error_detail:-Review the scheduled job log or completion record.} Container availability is checked separately" || return 1
     fi
     if [[ "$result" == completed-unverified && "$REQUIRE_VERIFIED_JOB_SUCCESS" == true ]]; then
         observe "$name:job-unverified" WARNING "Whole-run completion banner observed; success not established. Configure a producer receipt to verify outcome" || return 1
@@ -537,8 +610,8 @@ probe_rule() {
     return 1
 }
 
-probe_url() {
-    local name="$1" info="$2" port="$3" path="$4" host mapped mode profile env_port peer
+probe_routes() {
+    local name="$1" info="$2" port="$3" path="$4" host mapped mode profile env_port peer bound_host ip
     profile="${PROFILE_BY_NAME[$name]:-$name}"
     # qBittorrent images commonly change the internal port via WEBUI_PORT.
     # A VPN companion may own the actual published mapping/network namespace.
@@ -557,9 +630,20 @@ probe_url() {
     mapped="$(jq -r --arg port "$port/tcp" '. [0].NetworkSettings.Ports[$port][0] // {} | [(.HostIp // ""),(.HostPort // "")] | join("|")' <<<"$info")" || return 1
     host="${mapped%%|*}"; mapped="${mapped#*|}"
     if [[ -n "$mapped" ]]; then
+        bound_host="$host"
         [[ "$host" != 0.0.0.0 && "$host" != :: && -n "$host" ]] || host="$DOCKER_HOST_IP"
         [[ "$host" != *:* ]] || host="[$host]"
         printf 'http://%s:%s%s\n' "$host" "$mapped" "$path"
+        if [[ "$profile" == qbittorrent ]]; then
+            # Alternate routes are derived from this container/namespace only.
+            # No port scan, Docker restart, firewall edit or VPN reconfiguration.
+            if [[ "$bound_host" == 0.0.0.0 ]]; then printf 'http://127.0.0.1:%s%s\n' "$mapped" "$path"
+            elif [[ "$bound_host" == :: ]]; then printf 'http://[::1]:%s%s\n' "$mapped" "$path"; fi
+            while IFS= read -r ip; do
+                [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+                printf 'http://%s:%s%s\n' "$ip" "$port" "$path"
+            done < <(jq -r '[.[0].NetworkSettings.Networks[]?.IPAddress | select(length > 0)] | unique[]' <<<"$info")
+        fi
         return 0
     fi
     mode="$(jq -r '.[0].HostConfig.NetworkMode // ""' <<<"$info")"
@@ -571,13 +655,17 @@ probe_url() {
     printf 'http://%s:%s%s\n' "$host" "$port" "$path"
 }
 
+probe_url() {
+    probe_routes "$@" | sed -n '1p'
+}
+
 safe_probe_target() {
     printf '%s\n' "$1" | sed -E 's#(https?://)[^/@]*@#\1[REDACTED]@#; s/[?#].*$//'
 }
 
 readiness_probe() {
-    local name="$1" url="$2" rule profile port path kind pattern info body code rc response redirect origin target_origin redirects=0 limit target
-    local -a args=()
+    local name="$1" url="$2" rule profile port path kind pattern info body code rc response redirect origin target_origin redirects=0 limit target route_index=0
+    local -a args=() routes=()
     PROBE_RESULT=unconfigured; PROBE_MESSAGE='No readiness probe configured'
     rule="$(probe_rule "$name")" || rule=""
     if [[ -z "$rule" && -z "$url" ]]; then return 0; fi
@@ -585,7 +673,11 @@ readiness_probe() {
     kind="${kind:-reachable}"
     if [[ -z "$url" ]]; then
         info="$(docker_cmd inspect "$name" 2>/dev/null)" && inspect_valid "$info" || { PROBE_RESULT=inspection; PROBE_MESSAGE='Probe inspection failed'; return 1; }
-        url="$(probe_url "$name" "$info" "$port" "$path")" || { PROBE_MESSAGE='Unable to resolve published/custom-IP endpoint; configure an explicit URL'; return 0; }
+        mapfile -t routes < <(probe_routes "$name" "$info" "$port" "$path")
+        (( ${#routes[@]} > 0 )) || { PROBE_MESSAGE='Unable to resolve published/custom-IP endpoint; configure an explicit URL'; return 0; }
+        url="${routes[0]}"
+    else
+        routes=("$url")
     fi
     body="$TMP_DIR/$name.probe"
     limit="$PROBE_MAX_BYTES"
@@ -602,7 +694,15 @@ readiness_probe() {
         code="${response%%$'\n'*}"; redirect=""
         [[ "$response" != *$'\n'* ]] || redirect="${response#*$'\n'}"
         if (( rc == 3 || rc == 60 || rc == 63 || rc == 77 )); then PROBE_RESULT=unconfigured; PROBE_MESSAGE="Probe URL/TLS/response-size configuration requires review (curl=$rc; limit=${limit}B; target=$target)"; return 0; fi
-        if (( rc != 0 )); then PROBE_RESULT=transport; PROBE_MESSAGE="HTTP transport failed (curl=$rc; target=$target)"; return 1; fi
+        if (( rc != 0 )); then
+            if (( (rc == 7 || rc == 28 || rc == 52 || rc == 56) && route_index + 1 < ${#routes[@]} && route_index + 1 < PROBE_MAX_ROUTES )); then
+                route_index=$((route_index + 1)); url="${routes[$route_index]}"
+                [[ "$url" =~ ^(https?://[^/?#]+) ]] || return 1
+                origin="${BASH_REMATCH[1]}"; redirects=0
+                continue
+            fi
+            PROBE_RESULT=transport; PROBE_MESSAGE="HTTP transport failed (curl=$rc; last target=$target; attempted routes=$((route_index + 1)))"; return 1
+        fi
         if [[ "$code" =~ ^3[0-9][0-9]$ && "$kind" == recognize && -n "$redirect" ]]; then
             [[ "$redirect" =~ ^(https?://[^/?#]+) ]] || { PROBE_RESULT=unconfigured; PROBE_MESSAGE='Redirect target invalid'; return 0; }
             target_origin="${BASH_REMATCH[1]}"
@@ -631,7 +731,7 @@ readiness_probe() {
         reachable) PROBE_RESULT=reachable; PROBE_MESSAGE='HTTP reachable; application readiness not verified'; return 0 ;;
         *) PROBE_RESULT=unconfigured; PROBE_MESSAGE='Unknown probe validation mode'; return 0 ;;
     esac
-    PROBE_RESULT=ready; PROBE_MESSAGE='Application readiness response validated'
+    PROBE_RESULT=ready; PROBE_MESSAGE="Application readiness response validated (target=$target; route=$((route_index + 1)))"
 }
 
 endpoint_healthy() {
@@ -911,7 +1011,7 @@ main() {
     for number in "$COMMAND_TIMEOUT_SECONDS" "$HTTP_CONNECT_TIMEOUT" "$HTTP_MAX_TIME" "$FAILURE_CONFIRM_SCANS" "$RECOVERY_CONFIRM_SCANS" \
         "$CONSECUTIVE_FAILURES_BEFORE_RESTART" "$RESTART_COOLDOWN_SECONDS" "$RESTART_BUDGET_WINDOW_SECONDS" "$MAX_RESTART_ATTEMPTS" \
         "$RECOVERY_TIMEOUT_SECONDS" "$RECOVERY_POLL_SECONDS" "$MAX_MAINTENANCE_SECONDS" "$LOG_MAX_BYTES" "$PROBE_MAX_BYTES" "$JOB_READ_MAX_BYTES" \
-        "$SHARED_FAILURE_THRESHOLD" "$FLAP_WINDOW_SECONDS" "$FLAP_TRANSITION_THRESHOLD" "$FLAP_STABLE_SECONDS" "$PROBE_UI_MAX_BYTES"; do
+        "$SHARED_FAILURE_THRESHOLD" "$FLAP_WINDOW_SECONDS" "$FLAP_TRANSITION_THRESHOLD" "$FLAP_STABLE_SECONDS" "$PROBE_UI_MAX_BYTES" "$PROBE_MAX_ROUTES"; do
         [[ "$number" =~ ^[1-9][0-9]*$ ]] || return 2
     done
     for number in "$BOOT_GRACE_SECONDS" "$CONTAINER_GRACE_SECONDS" "$LOG_SIZE_WARNING_BYTES" "$PROBE_MAX_REDIRECTS"; do [[ "$number" =~ ^[0-9]+$ ]] || return 2; done
