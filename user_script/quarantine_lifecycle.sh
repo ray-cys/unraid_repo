@@ -1,15 +1,96 @@
 #!/bin/bash
 
 ###############################################################################
-# Metadata Quarantine Lifecycle Manager
+# Metadata Quarantine Lifecycle Manager v1.5.0
 #
-# Audits, restores, and optionally expires run directories created by
-# metadata_cleanup.sh and arr_delete_sync_tag.sh under /mnt/user/media/bin.
+# PURPOSE / PERSONAL USE CASE
+# ---------------------------
+# Keep the metadata recovery bin bounded while retaining time to restore orphaned
+# artwork, NFO files and subtitles quarantined by arr_delete_sync_tag.sh or the
+# compatible metadata_cleanup.sh. Reports explain what was removed and retained.
 #
-# Usage:
-#   quarantine_lifecycle.sh audit
-#   quarantine_lifecycle.sh purge
-#   quarantine_lifecycle.sh restore RUN_ID movies|series RELATIVE_PATH
+# ROLE AND OWNED PATHS
+# -------------------
+# This script manages timestamped RUN_ID/movies/... and RUN_ID/series/... trees
+# under QUARANTINE_ROOT, default /mnt/user/media/bin. It does NOT purge the full
+# SAB payload quarantine at /mnt/user/media/net/quarantine; sabnzbd_cleanup.sh owns
+# that separate 14-day lifecycle. Movies/series restore roots are explicit config.
+#
+# PROCESS: NORMAL SCHEDULED PURGE
+# ------------------------------
+# 1. Acquire the lifecycle and producer-coordination locks; verify mounts/roots,
+#    initialize logging/outbox, and reconcile unfinished purge/restore intents.
+# 2. Audit managed runs into quarantine-index.tsv, recording run age, file count,
+#    byte size and eligibility. Preserve unmanaged, unsafe or incomplete scans.
+# 3. Select oldest eligible runs: default retention is 45 days and the run must
+#    also have been idle for 24 hours. Both purge gates must be enabled/match.
+# 4. Commit inventory evidence before deletion and recheck Mover/path stability.
+#    Small runs use the verified whole-run purge path. Oversized runs drain through
+#    individually checked regular-file entries rather than waiting forever.
+# 5. For each incremental unlink, record durable intent; verify canonical path,
+#    device/inode, mode, size and timestamps; then confirm absence and flush the
+#    parent. Remove newly empty directories with rmdir. Never truncate a large
+#    file merely to make it fit the byte budget.
+# 6. Refresh the remaining index and report complete vs partial runs, actual file
+#    counts/bytes, named purged files and why remaining entries were preserved.
+# 7. Retain resumable work for the next scheduled pass. A partial pass changes
+#    timestamps, so the normal idle requirement can delay its next eligible pass.
+#
+# BOUNDS / SAFETY / AUTOMATIC RECOVERY
+# ----------------------------------
+# Defaults: at most 25 touched/completed runs, 250 regular files and 10 GiB per
+# execution. Smaller fitting entries/runs may progress when a larger one cannot.
+# A single oversized file, special entry or changed object is preserved/reported.
+# Mover, missing mounts, active producer locks and insufficient evidence defer or
+# stop mutations. Normal retention/idle/limits are rechecked before resuming work.
+# After interruption, confirmed absence can close a purge intent without repeating
+# its deletion. A restored object must retain the expected identity at destination;
+# both copies, mismatched identity or other ambiguity require review. Referenced
+# receipts stay pinned instead of aging out while an operation is unfinished.
+# These checks do not make purged content recoverable: final purge is permanent.
+#
+# AUDIT / RESTORE MODES
+# --------------------
+# The configured DEFAULT_MODE is purge. A no-argument invocation can delete expired
+# quarantine: use the explicit audit mode to preview the inventory/eligibility.
+# Audit does not change quarantine payloads; it can update logs, indexes and reports.
+# Restore selects an actual run, movies|series bucket and a relative item path.
+# It moves that item to its configured library root, refusing root escapes and
+# existing destinations. Restoring files does not re-add an Arr title or update
+# Plex automatically; application refresh/monitoring remains a separate decision.
+#
+# SCHEDULE
+# --------
+# Run once daily, normally after metadata producers. Automatic retries/partial
+# purges use later scheduled runs; no extra continuation job is created. Unraid
+# User Scripts owns cron configuration. This script does not install schedules.
+#
+# NOTIFICATIONS / LOGGING / STATE
+# ------------------------------
+# A durable once-daily grouped outbox reports actual purges/restores/recovery,
+# protected entries and failures. Unchanged attention is suppressed; failed
+# notification delivery leaves the report queued. Bounded email details include
+# representative filenames/sizes; the full receipt retains the individual paths.
+# LOG_DIR defaults to /mnt/vault/cloud/logs/script/quarantine_lifecycle.
+# It stores the current index, daily notification state, pending-operations.json,
+# operation recovery audit, and purge-receipts/. The active log is capped at 1 MiB
+# with two backups and 30-day backup retention; receipts normally retain 365 days.
+# STATUS_DIR separately stores the small latest-run status for optional reporting.
+# Keep pending journals/receipts: deleting them is not a safe way to clear a hold.
+#
+# CLI / OPERATOR EXAMPLES
+# -----------------------
+#   lifecycle_script="/boot/config/plugins/user.scripts/scripts/quarantine_lifecycle/script"
+#   /bin/bash "$lifecycle_script" --help
+#   /bin/bash "$lifecycle_script" audit
+#   /bin/bash "$lifecycle_script" purge
+#   /bin/bash "$lifecycle_script" restore RUN_ID movies "Movie (2026)/poster.jpg"
+#   /bin/bash "$lifecycle_script" --pending-operations
+#   /bin/bash "$lifecycle_script" --resolve-operation OPERATION_ID "verified outcome"
+# Use actual RUN_ID/path values from the index and operation IDs from the pending
+# list. --resolve-operation records an already verified operator decision without
+# moving/deleting payloads; it is not an instruction to force an unsafe retry.
+# Use /bin/bash because direct execution from Unraid flash can be disallowed.
 ###############################################################################
 
 set -uo pipefail

@@ -1,12 +1,112 @@
 #!/usr/bin/env bash
-#
+
+###############################################################################
 # Sonarr + Radarr - Plex Delete Sync and Tagger v2.4.0
 #
-# Once-daily, persistent-state deletion confirmation for Sonarr and Radarr.
-# Sonarr unmonitors confirmed deleted episodes/seasons and can retire a fully
-# deleted series. Radarr adds an audit tag, watches for monitored/fileless
-# movies, and can retire a confirmed deleted movie. Requirements: bash 4+,
-# curl, jq.
+# PURPOSE / PERSONAL USE CASE
+# ---------------------------
+# Keep Sonarr and Radarr consistent with media removed by Plex or another tool,
+# without accidentally downloading it again or discarding surviving library media.
+# Also quarantine eligible orphaned Kodi artwork/NFO/subtitle files and retire
+# fully deleted titles after a configurable hold. Plex itself is not queried:
+# missing-file observations and optional native Arr history provide the evidence.
+#
+# ROLE IN THE FOUR-SCRIPT WORKFLOW
+# -------------------------------
+#   arr_health_activity.sh  -> monitors the download/import pipeline and recovery
+#   THIS SCRIPT            -> confirms library deletions and quarantines sidecars
+#   quarantine_lifecycle.sh -> expires metadata runs under /mnt/user/media/bin
+#   sabnzbd_cleanup.sh     -> separately manages full SAB payloads and backups
+#
+# The two quarantine roots have different owners and retention workflows. This
+# script's metadata bin is NOT the SAB completed-download quarantine.
+#
+# PROCESS: NORMAL SCHEDULED RUN
+# -----------------------------
+# 1. Validate configuration/storage, acquire the script and metadata locks, rotate
+#    logs, and reconcile unfinished actions using read-back evidence.
+# 2. Collect current Arr resources and compare exact IDs/file presence with saved
+#    snapshots. A first missing observation does not authorize deletion handling;
+#    CONFIRMATION_RUNS defaults to two successful observations.
+# 3. Sonarr: unmonitor confirmed missing episodes and, when appropriate, emptied
+#    seasons; apply the configured audit tags. Partial season deletion does not
+#    unmonitor the whole series through the ordinary default-off series switch.
+# 4. Radarr: confirm missing movies and apply the audit tag after Radarr's native
+#    Unmonitor Deleted Movies setting has unmonitored them. A still-monitored,
+#    fileless movie is reported; optional targeted rescan is separately configured.
+# 5. Once a whole media folder is proven fileless, compare sidecars against the
+#    recorded path/size/hash manifest. Move eligible unchanged files into a new
+#    metadata quarantine run, then remove only empty directories using rmdir.
+# 6. Retain unknown/changed entries as named blockers and retry on later runs.
+#    Newly discovered recognized sidecars require two stable cleanup observations.
+#    Named Kodi auxiliary artwork/OS caches also require content signatures.
+# 7. Separately evaluate full-title retirement. Previously downloaded, fully
+#    deleted titles may enter the 90-day hold after all eligibility checks pass.
+#    Revalidate monitoring, queues, holds and cleanup before removal from Arr;
+#    remove the record without deleting media and verify the native list exclusion.
+# 8. Prune eligible stale absent state, publish checkpoints, and send the normal
+#    grouped daily action/attention report. Unfinished work remains recorded.
+#
+# RETIREMENT AND RE-DOWNLOAD POLICY
+# -------------------------------
+# ARR_RETIREMENT_DAYS defaults to 90. keep-in-arr exempts a title. Continuing
+# Sonarr series follow SONARR_RETIRE_CONTINUING_SERIES / retire-series opt-in;
+# installed personal overrides can differ from repository defaults. This full-
+# series retirement path is separate from SONARR_UNMONITOR_SERIES=false.
+# Native import-list exclusions prevent supported lists from re-adding a removed
+# title. Manual requests or external applications can require their own policy;
+# an Arr exclusion is not a universal block across every requester in the stack.
+#
+# SCHEDULE / EXECUTION MODE
+# ------------------------
+# Run once daily, allowing Arr to refresh deletion state first. Run the metadata
+# lifecycle afterward if coordinating their schedules. Scheduling is managed in
+# Unraid User Scripts; this script never creates or edits cron entries.
+# DRY_RUN=false is the repository default. --dry-run previews application/file
+# mutations but still updates observation state and logs; it is not state-free.
+# All-library rescans are optional and disabled by default.
+#
+# SAFETY, I/O AND REVIEW BOUNDARIES
+# -------------------------------
+# No surviving library video is deleted by this script. Nonempty folders are
+# never recursively removed. Missing history is not proof of a Plex deletion;
+# REQUIRE_DELETE_HISTORY_EVENT controls whether native history is mandatory.
+# Path roots, symlinks, hashes, queues, retention holds and API read-back constrain
+# mutations. Mover defers sidecar moves/folder cleanup without losing manifests.
+# An uncertain API request is not blindly replayed. Unknown files, changed proof,
+# mount/API failures and conflicting outcomes stay protected for review/retry.
+# Filesystem inventory/hashing and optional rescans can wake media disks. Owner
+# nobody, directory 0755 and file 0644 normalization applies only to the configured
+# metadata quarantine tree; other paths keep their ownership and permissions.
+#
+# NOTIFICATIONS / LOGGING / STATE
+# ------------------------------
+# Normal reports are grouped at most once per day, with named actions, source and
+# destination paths, removed folders, retirement results and preserved blockers.
+# Unchanged blockers are suppressed until change/resolution or the configured
+# 14-day reminder. Undelivered/overflow details remain queued; preflight failures
+# can produce a separate bounded alert. No notification requires emoji.
+# RUNTIME_DIR defaults to /mnt/user/cloud/logs/script/arr_delete_sync_tag.
+# It contains separate Sonarr/Radarr snapshots, notification state/outbox, pending
+# actions and audit receipts. Separate schemas still live in this one directory.
+# The active log is capped at 1 MiB with two backups; backups age out after 30
+# days. Audit receipts have their own 365-day retention. Do not delete state or
+# journals to force another action: they prevent duplicates and preserve proof.
+#
+# CLI / OPERATOR EXAMPLES
+# -----------------------
+# Always use /bin/bash on Unraid; the flash filesystem may not allow direct exec.
+#   sync_script="/boot/config/plugins/user.scripts/scripts/arr_delete_sync_tag/script"
+#   /bin/bash "$sync_script" --help
+#   /bin/bash "$sync_script" all --dry-run
+#   /bin/bash "$sync_script" sonarr --execute
+#   /bin/bash "$sync_script" radarr --execute
+#   /bin/bash "$sync_script" --list-pending
+#   /bin/bash "$sync_script" --resolve-pending ACTION_ID "verified outcome"
+# The last command records an operator decision only after actual Arr/filesystem
+# verification; it does not replay, undo, or itself perform the pending mutation.
+# Use the action ID printed by --list-pending. --version displays this release.
+###############################################################################
 
 set -uo pipefail
 IFS=$'\n\t'

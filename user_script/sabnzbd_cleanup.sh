@@ -3,60 +3,112 @@
 ###############################################################################
 # SABnzbd Cleanup v2.5.0
 #
-# PURPOSE
-# -------
-# Apply all local SABnzbd retention in one place:
+# PURPOSE / PERSONAL USE CASE
+# ---------------------------
+# Reclaim SABnzbd backup and completed-download storage in one scheduled script,
+# while protecting required media and leaving the native SAB/Arr history intact.
+# The GitHub filename is sabnzbd_cleanup.sh; the personal Unraid User Scripts
+# entry is arr_sabnzbd_cleanup. Both names refer to this same implementation.
 #
-#   1. Delete expired NZB backup files.
-#   2. Delete expired SABnzbd application backup ZIP files.
-#   3. Safely reclaim completed download folders after Sonarr or Radarr has
-#      already imported the payload, while leaving SABnzbd history untouched.
+# ROLE IN THE FOUR-SCRIPT WORKFLOW
+# -------------------------------
+# arr_health_activity.sh captures durable exact-ID import receipts and verified
+# policy dispositions. This script may consume that proof alongside native history
+# before moving leftover SAB payloads. It also owns their final quarantine purge.
+# It does NOT expire metadata under /mnt/user/media/bin: quarantine_lifecycle.sh
+# handles that separate bin, produced by arr_delete_sync_tag.sh.
 #
-# This is designed for the Unraid User Scripts plugin. A nightly schedule is
-# recommended after the configuration and dry-run output have been reviewed.
+# PROCESS: NORMAL SCHEDULED RUN
+# -----------------------------
+# 1. Validate configured mounts, execution mode, roots and locks; initialize the
+#    bounded logs/daily outbox and reconcile unfinished move/purge/restore work.
+# 2. Apply backup retention independently: default NZB backups retain 60 days;
+#    top-level SAB application backup ZIPs retain seven days. Matches are limited
+#    to the supported backup extensions/locations, not arbitrary archive trees.
+# 3. Obtain complete SAB history/queue and enabled Arr queues. Map categories
+#    explicitly to Sonarr/Radarr; preserve active or ambiguously owned jobs.
+# 4. Consider Completed jobs only after MIN_COMPLETED_AGE_HOURS (336 hours / 14
+#    days) and MIN_PATH_STABLE_HOURS (24 hours unchanged). Resolve source paths
+#    through configured roots/mappings and reject unsafe/unstable paths.
+# 5. Establish one supported proof route:
+#    a. Native history: exact grab/download ID and subsequent import events, with
+#       current nonempty imported library files accounting for remaining videos.
+#    b. Durable import receipt: unchanged SAB identity and exact native target/
+#       file IDs resolved to current physical library files. TVDB/TMDB identity
+#       permits verified renames; older receipts without it require the old path.
+#    c. Verified policy disposition: an explicitly handled redundant/rejected job
+#       recorded by the monitor, not a fabricated import. Fresh monitoring/file
+#       checks and the narrow single-video protection still apply.
+# 6. Recheck current queues, proof and Mover immediately before a move. Commit a
+#    prepared manifest, move the payload into its owned quarantine wrapper, then
+#    verify/commit the completed move. Nothing is moved into the live library.
+# 7. Purge only this script's valid, committed quarantine wrappers after their own
+#    14-day retention, subject to limits, Mover checks and durable purge receipts.
+# 8. Report the real actions, named source/destination paths, retained items and
+#    errors. Failed/ambiguous work stays protected and can be revisited later.
 #
-# A completed path is eligible only when all of the following are true:
+# QUARANTINE / RETENTION / LIMITS
+# ------------------------------
+# Default root: /mnt/user/media/net/quarantine/items/Sonarr|Radarr/WRAPPER/payload.
+# Each wrapper has .sabnzbd-cleanup-manifest.json with original path, job identity,
+# proof and move/retention state. Purge age uses the recorded quarantine time,
+# not a directory mtime that permissions or file activity might change.
+# Defaults: ten quarantine moves, 25 purges and 100 GiB purge bytes per run.
+# The initial completed-age gate and the later quarantine retention are separate:
+# a job usually waits at least 14 days before quarantine, then another 14 days
+# before final purge. Quarantine can be restored before final purge; deleted
+# backup files and already purged payloads are not recoverable through this CLI.
 #
-#   - SABnzbd reports the job as Completed.
-#   - The SAB category maps explicitly to Sonarr or Radarr.
-#   - The job is older than MIN_COMPLETED_AGE_HOURS.
-#   - The path has not changed for MIN_PATH_STABLE_HOURS.
-#   - The download ID is absent from both Arr Activity queues.
-#   - The owning Arr has a matching grabbed history event.
-#   - The owning Arr has a later downloadFolderImported history event.
-#   - Every distinct importedPath still exists as a non-empty library file.
-#   - The number of verified imported paths accounts for all remaining source
-#     media files. Ambiguous season packs are skipped, not guessed.
-#   - Every resolved source/destination path remains below an explicit root.
-#   - Unraid Mover is not running at startup or immediately before any backup
-#     deletion, quarantine move, or quarantine purge.
+# SAFETY, I/O AND REVIEW BOUNDARIES
+# -------------------------------
+# Incomplete APIs/pagination, missing destinations, wrong IDs, conflicting receipts,
+# partial/unaccounted packs and recently changed paths do not authorize a move.
+# Source traversal must succeed; an unreadable subtree cannot count as zero media.
+# Moves require the supported same-filesystem path/device checks. Owner nobody,
+# 0755 directories and 0644 files apply only to this quarantine tree; other source,
+# backup, library and log paths keep their permissions/ownership.
+# Mover is rechecked before destructive backup cleanup, quarantine/purge and restore.
+# An uncertain operation is not blindly repeated. Restore never overwrites an
+# existing path or returns an actively queued job. The script does not change SAB
+# history, Arr queue/history records, monitoring or live library files. Proof and
+# inventory checks do read real source/library storage and may wake array disks.
 #
-# SAFETY MODEL
-# ------------
-#   - DRY_RUN defaults to true.
-#   - Backup cleanup matches only .nzb, .nzb.gz, and top-level .zip files.
-#   - Eligible payloads are moved into a manifest-backed quarantine first.
-#   - Quarantine is purged only after QUARANTINE_RETENTION_DAYS.
-#   - MAX_QUARANTINES_PER_RUN limits the impact of any one run.
-#   - Any API, pagination, path, history, or filesystem ambiguity is a skip.
-#   - An active Unraid Mover stops the run successfully before further writes.
-#   - SAB history is never deleted, archived, or modified.
-#   - The script never removes Arr queue/history records or library files.
+# SCHEDULE / EXECUTION MODE
+# ------------------------
+# Run once daily during a quiet period after your normal import batches. The
+# four-hour action windows in the health monitor do not shorten these cleanup
+# retention gates. Cron is configured in Unraid User Scripts, not by this script.
+# GitHub defaults DRY_RUN=true; the installed personal copy can retain execute mode.
+# Inspect the local configuration before running. --dry-run previews payload/
+# backup deletions, moves and purges, while logs/observations can still be updated.
+# CLEAN_BACKUPS, CLEAN_STRANDED_DOWNLOADS and PURGE_QUARANTINE are independent
+# module switches. --no-purge permits quarantine without final payload purging.
 #
-# USAGE
-# -----
-#   1. Fill in all API keys and confirm every path/path mapping below.
-#   2. Run with DRY_RUN=true until every candidate is expected.
-#   3. Set DRY_RUN=false to enable backup deletion and quarantine operations.
-#   4. Keep PURGE_QUARANTINE=false initially if you want manual review.
-#   5. When satisfied, set PURGE_QUARANTINE=true for delayed space recovery.
+# NOTIFICATIONS / LOGGING / STATE
+# ------------------------------
+# A durable outbox sends at most one normal grouped report per day. It identifies
+# actual backup deletions, quarantine/purge/restore paths and bytes, proof route,
+# protected jobs and failures; overflow/failed reports remain queued. Unchanged
+# attention is suppressed rather than producing one email per job every run.
+# LOG_DIR defaults to /mnt/user/cloud/logs/script/arr_sabnzbd_cleanup. It contains
+# notification state/outbox, pending operations and independent recovery/purge
+# receipts. Runtime scratch is separate temporary storage. The active log is capped
+# at 1 MiB with two backups and 30-day backup retention; audit retention is normally
+# 365 days, with referenced receipts pinned while operations remain unfinished.
 #
-# Optional command-line overrides:
-#
-#   sabnzbd_cleanup.sh --dry-run
-#   sabnzbd_cleanup.sh --execute
-#   sabnzbd_cleanup.sh --execute --no-purge
-#
+# CLI / OPERATOR EXAMPLES
+# -----------------------
+#   cleanup_script="/boot/config/plugins/user.scripts/scripts/arr_sabnzbd_cleanup/script"
+#   /bin/bash "$cleanup_script" --help
+#   /bin/bash "$cleanup_script" --dry-run --no-purge
+#   /bin/bash "$cleanup_script" --execute --no-purge
+#   /bin/bash "$cleanup_script" --inspect
+#   /bin/bash "$cleanup_script" --restore /mnt/user/media/net/quarantine/items/Sonarr/WRAPPER
+#   /bin/bash "$cleanup_script" --pending-operations
+#   /bin/bash "$cleanup_script" --resolve-operation OPERATION_ID "verified outcome"
+# Replace WRAPPER/OPERATION_ID with values from inspection/pending output. Operator
+# resolution records a verified decision; it does not move/delete payloads or
+# force a retry. Use /bin/bash because direct flash execution can be disallowed.
 ###############################################################################
 
 set -uo pipefail

@@ -18,6 +18,92 @@
 # become stranded outside the normal Arr workflow.
 #
 #
+# USE CASES / ROLE IN THE FOUR-SCRIPT WORKFLOW
+# -------------------------------------------
+# Use this script to distinguish real Arr/SAB service failures, blocked imports,
+# expected four-hour batching, old abandoned download attempts, and cleanup residue.
+# It combines native health, queues/history and exact download/file identities so
+# one pipeline problem can produce a grouped explanation rather than an email
+# from every affected application. It is a monitor with bounded recovery, not a
+# replacement for every native notification or an unconditional repair tool.
+#
+#   SABnzbd -> Sonarr/Radarr -> verified library import
+#                |                      |
+#                +---- THIS SCRIPT -----+ -> issues, receipts, bounded recovery
+#
+#   arr_delete_sync_tag.sh  -> library deletion/unmonitor/tag/sidecar handling
+#   quarantine_lifecycle.sh -> metadata bin retention (/mnt/user/media/bin)
+#   sabnzbd_cleanup.sh      -> SAB backup/full-payload retention (net/quarantine)
+#
+# THIS SCRIPT neither purges those bins nor performs their filesystem moves.
+#
+# PROCESS: NORMAL SCHEDULED RUN
+# -----------------------------
+# 1. Acquire the run lock, validate state and open a working transaction. Detect
+#    earlier incomplete runs/schedule gaps and prepare the bounded log lifecycle.
+# 2. Discover/poll enabled native APIs: Arr queue/health/status and SAB queue,
+#    history/warnings/status/provider evidence. Incomplete collectors preserve
+#    existing dependent issues instead of falsely declaring them resolved.
+# 3. Audit quality/custom-format configuration and recover recorded request
+#    outcomes. Evaluate eligible automation only under its timing/safety gates.
+# 4. Classify every queue reason, group related symptoms by their primary cause,
+#    and retain all reasons with the highest applicable severity. Recognize
+#    intentional batch waits instead of treating every queued job as stalled.
+# 5. Review recent native activity and capture durable import/file-ID receipts.
+#    Bounded backfill/enrichment handles older jobs or omitted embedded metadata;
+#    unverifiable evidence remains protected rather than invented.
+# 6. Reconcile exact download flows through native terminal history or fresh exact
+#    file records with stable two-scan evidence. Actual source/library filesystem
+#    residue is a separate hourly audit, guarded by mounts, Mover and time budget.
+# 7. Update issue lifecycles only where current evidence is complete, persist
+#    state before notification, deliver grouped changes, and retain failed delivery
+#    state. Prune eligible old resolved records and emit a compact health summary.
+#
+# CONTROLLED AUTOMATION / ACTION WINDOWS
+# -------------------------------------
+# The monitor runs every five minutes; NEW rejection/retry/search actions use the
+# first ten minutes at 00:00/04:00/08:00/12:00/16:00/20:00 Asia/Singapore by default.
+# Read-only monitoring/recovery continues outside those windows. Actual schedules
+# are configured in User Scripts; the script's window is an additional action gate.
+# All action types share two actions/run and four actions/rolling 24 hours.
+#
+# - Proven redundant release: ignore exact queue tracking only after verifying a
+#   suitable existing file. Do not blocklist it or request another download.
+# - Explicit below-minimum rejection with genuinely missing monitored media:
+#   blocklist the exact release, preserve its payload, and submit one targeted
+#   replacement search. Keep the original quality policy unchanged.
+# - Explicit transient busy/locked import: after six hours and stable scans,
+#   request a native Auto scan of the exact download/path. At most three attempts
+#   per download, separated by at least four hours; never force a manual import.
+# - Weekly missing-media survey: inspect a bounded rotating set of newly missing
+#   eligible targets and use exact EpisodeSearch/MoviesSearch commands. The first
+#   survey protects the existing missing backlog because prior Plex deletion
+#   intent may no longer be provable from retained history.
+# - Native profile/custom-format changes, including Recyclarr changes, produce a
+#   four-hour hold. Invalid/inconsistent settings hold actions until corrected;
+#   the script never lowers scores or rewrites profiles to make an import succeed.
+#
+# Exact IDs, current monitoring, queues, tags/holds, prior import/deletion evidence,
+# stable observations and current profiles protect required media. Packs, mixed
+# warnings and unsupported policy cases remain protected. A submitted/completed
+# command is NOT proof of an import: report pending until exact fresh import/file
+# proof is verified. Unknown request outcomes are not blindly replayed.
+# ARR_AUTOMATION_ENABLED pauses new actions; POLICY_AUTOMATION_ENABLED separately
+# controls rejection handling. Acknowledging an alert is notification management,
+# not a replacement for configuring these automation controls.
+#
+# I/O / LIMITATIONS / WHEN REVIEW IS STILL NEEDED
+# ----------------------------------------------
+# Native health and database-file reconciliation do not directly stat media paths.
+# The separate filesystem audit and actual native import scans can wake disks.
+# Old ambiguous download attempts can remain REVIEW_REQUIRED; a stale warning is
+# not proof of import/cancellation. Unknown blockers, conflicting proof and
+# unverifiable mutations require review. New future native health sources are
+# reported dynamically, but unknown import reasons are not automatically repaired.
+# A permanently stopped script/host cannot send its own missed-schedule alert;
+# the gap is detected only when the script executes again.
+#
+#
 # RECOMMENDED SCHEDULE
 # --------------------
 # Run this script EVERY FIVE MINUTES using Unraid User Scripts.
@@ -85,7 +171,8 @@
 #   2 Radarr issues
 #   1 SAB issue
 #
-# the script sends ONE grouped Unraid notification rather than six.
+# the script creates one grouped batch rather than one email per issue. Large
+# batches may be split into bounded pages by the notification size limits.
 #
 # Already-notified unchanged issues are suppressed individually.
 #
@@ -139,6 +226,37 @@
 # Temporarily set LOG_LEVEL=DEBUG to restore per-phase, per-item, retry, cache,
 # threshold, and suppression detail while troubleshooting. Persistent logs are
 # bounded by both size/generation rotation and a numbered-backup age limit.
+# Defaults: 5 MiB per active/rotated log, two backups, 30-day rotated-log
+# retention and a 4 KiB line limit. Audit/intent files have separate retention.
+#
+#
+# STATE / RECEIPTS / OPERATOR USE
+# --------------------------------
+# STATE_DIR defaults to /mnt/vault/cloud/logs/script/arr_health_activity.
+# state.json/backups hold issue lifecycles, collector cursors and exact-flow state.
+# policy-actions.json and automation-actions.json hold request intent/outcomes;
+# import-receipts.json preserves exact native import/file IDs and stable external
+# identity for later cleanup, including verified renames. Each receipt/journal
+# has its own retention/recovery rules; unresolved proof is not disposable clutter.
+# Batch dismissal previews/manifests live in batch-dismissals/. A preview writes
+# both a readable TSV and an ACK-ID selection file. Batch execution requires the
+# reviewed exact count, narrowing filters and an operator reason; it does not
+# change Arr/SAB queues or media files. --ack only suppresses the current unchanged
+# signature; it neither resolves the issue nor makes pipeline health healthy.
+#
+# Use /bin/bash for the User Scripts copy because Unraid flash may reject direct
+# execution. Read-only inventory and notification-management examples:
+#   monitor_script="/boot/config/plugins/user.scripts/scripts/arr_health_activity/script"
+#   /bin/bash "$monitor_script" --help
+#   /bin/bash "$monitor_script" --automation-status
+#   /bin/bash "$monitor_script" --policy-actions
+#   /bin/bash "$monitor_script" --list-active
+#   /bin/bash "$monitor_script" --ack ACK_ID "reviewed; waiting for upstream fix"
+#   /bin/bash "$monitor_script" --unack ACK_ID
+#   /bin/bash "$monitor_script" --dismiss-download ACK_ID "intentional removal"
+# Only dismiss a flow after verifying its intended disposition. Do not erase state
+# or intent journals to silence an alert or repeat an unverified request. Full
+# batch-preview/execute examples and safeguards are printed by --help.
 #
 #
 # ARR-SIDE DETECTION
