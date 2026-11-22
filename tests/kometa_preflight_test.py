@@ -13,8 +13,9 @@ import yaml
 
 with tempfile.TemporaryDirectory(prefix='kometa-preflight-fixture-') as folder:
     root=Path(folder)
-    for name in ['logs','metadata','overlays']: (root/name).mkdir()
-    (root/'config.yml').write_text(yaml.safe_dump({'plex':{'url':'fixture','token':'fixture'},'libraries':{'Movies':{},'TV Shows':{}}}))
+    for name in ['logs','metadata','overlays','collections']: (root/name).mkdir()
+    (root/'config.yml').write_text(yaml.safe_dump({'settings':{'default_collection_order':'release'},'plex':{'url':'fixture','token':'fixture'},'libraries':{'Movies':{},'TV Shows':{}}}))
+    (root/'collections/movie_collection.yml').write_text(yaml.safe_dump({'dynamic_collections':{'TMDb':{'type':'tmdb_collection','sync':True,'exclude':[123]},'Custom':{'type':'tmdb_collection','template':'my_custom'}}}))
     (root/'logs/meta.log').write_text('[INFO] | Starting 20:00 Run |\n[INFO] | Finished 20:00 Run |\n')
     present={'match':{'mapping_id':1},'title':'Present'}
     absent={'match':{'mapping_id':999},'title':'Absent'}
@@ -50,6 +51,11 @@ with tempfile.TemporaryDirectory(prefix='kometa-preflight-fixture-') as folder:
     assert overlay['templates']['resolution_info']['filters']=='<<resolution_filters>>'
     rules=overlay['templates']['resolution_info']['conditionals']['resolution_filters']['conditions']
     assert len(rules)==12 and rules[0]['value']['episodes']['count']==1
+    collections=yaml.safe_load((root/'collections/movie_collection.yml').read_text())
+    assert collections['templates']['preflight_tmdb_collection_order']=={'tmdb_collection_details':'<<value>>','minimum_items':2,'collection_order':'release'}
+    assert collections['dynamic_collections']['TMDb']['exclude']==[123]
+    assert collections['dynamic_collections']['TMDb']['sync'] is True
+    assert collections['dynamic_collections']['Custom']['template']=='my_custom'
     result=run();assert result['changed'] is False,result
     movie_ids.append('tmdb://999')
     result=run();assert result['status']=='OK',result

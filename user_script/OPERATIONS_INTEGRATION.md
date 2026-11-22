@@ -110,6 +110,27 @@ the old search semantics instead of changing to the default 50% filter threshold
 No overlays are disabled and general validation is not switched off. Existing
 warnings remain until the next normal application run proves a clean result.
 
+Preflight v1.1 also gives the native TMDb dynamic-collection template an explicit
+copy of the effective `default_collection_order`. This avoids a warning for each
+generated collection while preserving its inherited order, native two-item
+minimum, membership, exclusions and sync policy. Existing custom templates are
+left alone; an edited managed template stops reconciliation for review.
+
+Application warnings need their underlying evidence checked before remediation:
+
+* Empty overlay results can be normal: no current media matches that codec,
+  edition or rating. They do not establish a container or download failure.
+* A runtime overlay needs a parsed Plex duration. If targeted Plex analysis
+  reports an invalid media header, the media needs recovery/replacement; neither
+  changing overlay text nor restarting Docker repairs its contents.
+* Kometa's metadata-backup language table may not represent a valid Plex language
+  preference (for example, `zh`). Preserve the preference and report the backup
+  limitation rather than changing playback behavior or excluding the field just
+  to hide an error.
+* Oversized artwork can be replaced by a smaller JPEG with the same dimensions
+  and an updated exact `file_background` reference. Retain the original artwork
+  and configuration backup; this is separate from media-file repair.
+
 ## Compatibility scope and intentional exclusions
 
 The hourly backup health audit checks commands/GNU interfaces, rsync capability,

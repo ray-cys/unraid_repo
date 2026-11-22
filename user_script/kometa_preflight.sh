@@ -1,13 +1,13 @@
 #!/bin/bash
 # shellcheck disable=SC2034
 arrayStarted=true
-# Kometa configuration reconciliation v1.0. Schedule 55 3,7,11,15,19,23 * * *.
+# Kometa configuration reconciliation v1.1. Schedule 55 3,7,11,15,19,23 * * *.
 # Run after MetaFusion and before the four-hour Kometa boundaries. Never changes
 # Plex/Arr media, identity, monitoring or download policy. Missing exact-ID
 # metadata is retained in a deferred catalogue and restored when Plex has it.
 # Incomplete Plex identity inventories/active producers prohibit edits.
 set -uo pipefail
-readonly SCRIPT_VERSION="1.0"
+readonly SCRIPT_VERSION="1.1"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/kometa_preflight}"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 NOTIFY_BIN="${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}"
@@ -135,6 +135,28 @@ try:
     elif not (template.get('plex_all') is True and template.get('filters')=='<<resolution_filters>>' and
               'resolution_filters' in (template.get('conditionals') or {})):
         raise SafetyError('Unknown resolution template; no automatic rewrite')
+    # Native dynamic TMDb defaults inherit collection_order with a warning for
+    # every collection. Make the identical effective order explicit, without
+    # changing membership, sync/exclusions or an existing custom template.
+    collection=root/'collections/movie_collection.yml'
+    if collection.exists():
+        original=collection.read_bytes(); definitions=yaml.safe_load(original) or {}
+        inherited=(cfg['libraries']['Movies'].get('settings') or {}).get('default_collection_order',
+                    (cfg.get('settings') or {}).get('default_collection_order'))
+        altered=False; template_name='preflight_tmdb_collection_order'
+        templates=definitions.get('templates') or {}
+        expected={'tmdb_collection_details':'<<value>>','minimum_items':2,'collection_order':inherited}
+        for definition in (definitions.get('dynamic_collections') or {}).values():
+            if not isinstance(definition,dict) or definition.get('type')!='tmdb_collection':continue
+            if not inherited or definition.get('template') not in (None,template_name):continue
+            if template_name in templates and templates[template_name]!=expected:
+                raise SafetyError('Managed collection template differs; custom settings preserved')
+            if definition.get('template') is None:
+                definition['template']=template_name;templates[template_name]=expected;altered=True
+        if altered:
+            definitions['templates']=templates
+            staged.append((collection,original,yaml.safe_dump(definitions,sort_keys=False,allow_unicode=True).encode()))
+            changes.append('Made inherited TMDb collection order explicit: '+str(inherited)+'; membership/sync/exclusions preserved')
     # Prepare every file before any replacement; original bytes are retained.
     stamp=time.strftime('%Y%m%d_%H%M%S')+'_'+str(time.time_ns()); backup=state/'backups'/stamp
     for path,old,new in staged:
