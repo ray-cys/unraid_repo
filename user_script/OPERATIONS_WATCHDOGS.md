@@ -165,6 +165,16 @@ live in `/run/docker-watchdog-liveness` and reset at reboot. If the User Scripts
 scheduler itself stops executing both scripts, an external monitor is still
 needed; no local script can detect its own permanent non-execution.
 
+Liveness v1.1 uses one bounded heartbeat snapshot per scan, validates numeric
+configuration and notification-state schema, and identifies missing dependencies
+in its execution output. Notifications include condition-specific evidence,
+measured age/runtime or failure count, thresholds, and an operational action.
+Temporary files are tracked and cleaned on normal/signal exit; delivery and
+checkpoint failures leave transitions retryable. Corrupt state is retained as
+`state.json.invalid` (bounded to the configured read limit) before the checker
+rebuilds its checkpoint after successful delivery. State format remains v1, so
+existing valid notification checkpoints are retained without a reset.
+
 ### Maintenance
 
 Deploy the accompanying appdata backup v3.6 and Plex DBRepair v3.3 scripts to get
