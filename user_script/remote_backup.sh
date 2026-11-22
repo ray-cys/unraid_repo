@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Remote NAS Backup v2.2
+# Remote NAS Backup v2.3
 #
 # PURPOSE
 # -------
@@ -42,6 +42,7 @@
 ###############################################################################
 
 set -uo pipefail
+export LC_ALL=C
 
 
 ###############################################################################
@@ -127,7 +128,7 @@ BACKUP_JOBS=(
 #   ownership/group preservation
 #
 RSYNC_BASE_ARGS=(
-    "-aH"
+    "-a"
     "--delete-delay"
     "--partial"
     "--partial-dir=.rsync-partial"
@@ -138,13 +139,14 @@ RSYNC_BASE_ARGS=(
 # Default exclusions applied to every backup job.
 #
 DEFAULT_EXCLUDES=(
+    "--exclude=/.hubble-backup-identity"
     "--exclude=*.sock"
     "--exclude=*/.cache/*"
 )
 
 # Include rsync itemized file changes in the run log.
 #
-LOG_ITEMIZED_CHANGES=true
+LOG_ITEMIZED_CHANGES=false
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +300,228 @@ NOTIFY_EXCERPT_LINES=8
 LOCK_FILE="/tmp/remote_backup.lock"
 
 
+readonly SCRIPT_ID="remote_backup"
+readonly SCRIPT_VERSION="2.3"
+
+###############################################################################
+# SHARED ISS COORDINATION AND TRANSPORT (embedded; standalone User Script)
+###############################################################################
+# Both scripts must use the same remote lock. It is held by a live SSH process,
+# not a stale PID file. Only the owner may request ISS shutdown.
+REMOTE_BACKUP_LOCK="/run/hubble-iss-backup.lock"
+REMOTE_LEASE_WAIT_SECONDS=1800
+RSYNC_IO_TIMEOUT=300
+MAX_MAIN_LOG_BYTES=$((1024 * 1024))
+MAX_RAW_LOG_BYTES=$((2 * 1024 * 1024))
+PRESERVE_HARD_LINKS=true
+STATUS_DIR="/mnt/vault/cloud/logs/script/user_scripts_status"
+BACKUP_RESULT=not_started
+RETENTION_RESULT=not_started
+VERIFICATION_RESULT=not_started
+BACKUP_PHASE=startup
+BACKUP_NOTIFIED=false
+NOTIFICATION_RESULT=not_attempted
+SHUTDOWN_RESULT=not_requested
+BACKUP_STARTED=$(date +%s)
+BACKUP_TMP=""
+LEASE_PID=""
+LEASE_INPUT=""
+LEASE_TOKEN=""
+TRANSPORT_OPTIONS=()
+
+backup_transport_init() {
+    local value flag
+    [[ "$SSH_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( SSH_PORT <= 65535 )) || return 1
+    [[ "$REMOTE_LEASE_WAIT_SECONDS" =~ ^(0|[1-9][0-9]*)$ ]] && (( REMOTE_LEASE_WAIT_SECONDS <= 86400 )) || return 1
+    for value in "$RSYNC_IO_TIMEOUT" "$MAX_MAIN_LOG_BYTES" "$MAX_RAW_LOG_BYTES"; do [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1; done
+    for flag in "$PRESERVE_HARD_LINKS" "$DRY_RUN" "$ENABLE_WOL" "$USE_LOW_PRIORITY_IO"; do [[ "$flag" == true || "$flag" == false ]] || return 1; done
+    BACKUP_TMP=$(mktemp -d /tmp/iss-backup.XXXXXX) || return 1
+    chmod 700 "$BACKUP_TMP" || return 1
+    TRANSPORT_OPTIONS=(-p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout="${SSH_CONNECT_TIMEOUT:-8}"
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o Compression=no
+        -o ControlMaster=auto -o ControlPersist=60 -o "ControlPath=$BACKUP_TMP/ssh")
+    printf -v RSYNC_RSH '%q ' ssh "${TRANSPORT_OPTIONS[@]}"
+    export RSYNC_RSH
+}
+backup_ssh() {
+    local command
+    if (( $# == 1 )); then command="$1"; else printf -v command '%q ' "$@"; fi
+    if (( ${BACKUP_SSH_COMMAND_TIMEOUT:-0} > 0 )); then
+        timeout --signal=TERM --kill-after=5 "$BACKUP_SSH_COMMAND_TIMEOUT" ssh "${TRANSPORT_OPTIONS[@]}" "$REMOTE" "export LC_ALL=C; $command"
+    else
+        ssh "${TRANSPORT_OPTIONS[@]}" "$REMOTE" "export LC_ALL=C; $command"
+    fi
+}
+backup_source_ready() {
+    local source="$1" mount canonical
+    [[ "$source" == /* && "$source" != / && "$source" != *$'\n'* && "$source" != *$'\t'* && -d "$source" && ! -L "$source" ]] || return 1
+    case "$source" in /mnt/user/*) mount=/mnt/user;; /mnt/vault/*) mount=/mnt/vault;; /boot/*) mount=/boot;; *) return 1;; esac
+    mountpoint -q "$mount" || return 1
+    canonical=$(realpath -e -- "$source") || return 1
+    [[ "$canonical" == "$source" ]] || return 1
+    [[ -n "$(find "$source" -mindepth 1 -maxdepth 1 -print -quit)" ]] || return 1
+}
+backup_capabilities() {
+    local cmd value
+    for value in "$RSYNC_IO_TIMEOUT" "$MAX_MAIN_LOG_BYTES" "$MAX_RAW_LOG_BYTES"; do [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1; done
+    [[ "$PRESERVE_HARD_LINKS" == true || "$PRESERVE_HARD_LINKS" == false ]] || return 1
+    [[ "$SSH_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( SSH_PORT <= 65535 )) || return 1
+    for cmd in ssh rsync jq timeout flock realpath sha256sum stat find sort awk tail head tee date mktemp xargs grep cat du mountpoint; do command -v "$cmd" >/dev/null || return 1; done
+    # The options used here are supported by rsync >= 3.1, on BOTH ends.
+    printf 'Local: %s\n' "$(rsync --version | head -n 1)" >>"$LOG_FILE"
+    rsync --version | awk 'NR==1 {split($3,v,"."); exit !(v[1]>3 || (v[1]==3 && v[2]>=1))}' || return 1
+    local remote_boot
+    remote_boot=$(BACKUP_SSH_COMMAND_TIMEOUT=30 backup_ssh 'cat /proc/sys/kernel/random/boot_id') || return 1
+    [[ -n "$remote_boot" && "$remote_boot" != "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]] || return 1
+    BACKUP_SSH_COMMAND_TIMEOUT=30 backup_ssh bash -s <<'CAPABILITIES'
+set -euo pipefail
+export LC_ALL=C
+for cmd in bash rsync flock realpath sha256sum stat find sort awk df mktemp du mv cat; do command -v "$cmd" >/dev/null; done
+rsync --version | awk 'NR==1 {split($3,v,"."); exit !(v[1]>3 || (v[1]==3 && v[2]>=1))}'
+rsync --version | head -n 1
+CAPABILITIES
+}
+backup_acquire_lease() {
+    local ready output_fd remote_script original_input original_output
+    [[ "$REMOTE_BACKUP_LOCK" =~ ^/run/[A-Za-z0-9_.-]+$ && "$REMOTE_LEASE_WAIT_SECONDS" =~ ^[0-9]+$ ]] || return 1
+    remote_script=$(cat <<'LEASE'
+set -euo pipefail
+exec 9>"$1"
+printf '%s\n' "$BASHPID" >"$1.waiter.$3"
+trap 'rm -f -- "$1.waiter.$3"' EXIT
+flock -w "$2" 9 || exit 75
+rm -f -- "$1.waiter.$3"
+printf '%s\n' "$3" >"$1.owner"
+trap 'rm -f -- "$1.owner"' EXIT
+# A recently accepted shutdown must finish before another job starts. /run is
+# cleared on reboot; failed shutdown reservations expire after fifteen minutes.
+if [[ -f /run/hubble-iss-shutdown.pending ]]; then
+    read -r stamp </run/hubble-iss-shutdown.pending
+    [[ "$stamp" =~ ^[0-9]+$ ]] || exit 75
+    (( $(date +%s) - stamp > 900 )) || exit 75
+    rm -f /run/hubble-iss-shutdown.pending
+fi
+printf 'ISS_BACKUP_READY\n'
+while IFS= read -r line; do :; done
+LEASE
+) || return 1
+    LEASE_TOKEN="$SCRIPT_ID-$$-$RANDOM-$RANDOM"
+    coproc ISS_LEASE { backup_ssh bash -c "$remote_script" -- "$REMOTE_BACKUP_LOCK" "$REMOTE_LEASE_WAIT_SECONDS" "$LEASE_TOKEN"; }
+    LEASE_PID=${ISS_LEASE_PID:-}
+    original_input=${ISS_LEASE[1]:-}; original_output=${ISS_LEASE[0]:-}
+    [[ -n "$LEASE_PID" && -n "$original_input" && -n "$original_output" ]] || return 1
+    exec {LEASE_INPUT}>&"$original_input"
+    exec {output_fd}<&"$original_output"
+    exec {original_input}>&-
+    exec {original_output}<&-
+    if ! IFS= read -r -t "$((REMOTE_LEASE_WAIT_SECONDS+15))" ready <&"$output_fd" || [[ "$ready" != ISS_BACKUP_READY ]]; then
+        exec {output_fd}<&-
+        return 1
+    fi
+    exec {output_fd}<&-
+}
+backup_lease_alive() {
+    [[ -n "$LEASE_PID" && -n "$LEASE_INPUT" ]] && kill -0 "$LEASE_PID" 2>/dev/null &&
+        (trap - PIPE; printf 'active\n' >&"$LEASE_INPUT") &&
+        BACKUP_SSH_COMMAND_TIMEOUT=15 backup_ssh "test -f $REMOTE_BACKUP_LOCK.owner && test \"\$(cat $REMOTE_BACKUP_LOCK.owner)\" = '$LEASE_TOKEN'"
+}
+backup_shutdown_handoff() {
+    local waiters
+    if ! waiters=$(BACKUP_SSH_COMMAND_TIMEOUT=30 backup_ssh bash -s -- "$REMOTE_BACKUP_LOCK" "$REMOTE_LEASE_WAIT_SECONDS" <<'WAITERS'
+set -euo pipefail
+for file in "$1".waiter.*; do
+    [[ -f "$file" ]] || continue
+    read -r pid <"$file"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || exit 3
+    age=$(( $(date +%s)-$(stat -c %Y -- "$file") ))
+    (( age >= 0 )) || exit 3
+    # Dead/reused PIDs cannot leave a permanent shutdown blocker behind.
+    if (( age <= $2+60 )) && kill -0 "$pid" 2>/dev/null; then printf 'waiting\n'; else rm -f -- "$file"; fi
+done
+WAITERS
+); then
+        REMOTE_SHUTDOWN_SKIPPED_REASON="Queued backup status could not be verified"
+        return 1
+    fi
+    if [[ -n "$waiters" ]]; then
+        SHUTDOWN_RESULT=deferred
+        REMOTE_SHUTDOWN_SKIPPED_REASON="Another backup is waiting for ISS; leaving it running for handoff"
+        return 1
+    fi
+}
+backup_request_shutdown() {
+    backup_lease_alive || return 1
+    BACKUP_SSH_COMMAND_TIMEOUT=30 backup_ssh bash -s <<'SHUTDOWN'
+set -euo pipefail
+if [[ -x /usr/local/sbin/powerdown ]]; then command=/usr/local/sbin/powerdown
+elif command -v powerdown >/dev/null; then command=$(command -v powerdown)
+elif command -v poweroff >/dev/null; then command=$(command -v poweroff)
+else exit 3; fi
+date +%s >/run/hubble-iss-shutdown.pending
+nohup "$command" >/run/hubble-iss-shutdown.log 2>&1 </dev/null &
+printf 'Clean shutdown queued; pid=%s\n' "$!"
+SHUTDOWN
+}
+backup_bound_log() {
+    local file="$1" limit="$2" temp
+    [[ -f "$file" ]] || return 0
+    (( $(stat -c %s "$file") > limit )) || return 0
+    temp=$(mktemp "${file}.bounded.XXXXXX") || return 1
+    tail -c "$limit" -- "$file" >"$temp" && mv -f -- "$temp" "$file" || { rm -f -- "$temp"; return 1; }
+}
+backup_phase() {
+    local now
+    now=$(date +%s)
+    printf '%s [PHASE] %s: %ss elapsed\n' "$(date '+%F %T')" "$BACKUP_PHASE" "$((now-BACKUP_PHASE_STARTED))" >>"$LOG_FILE"
+    BACKUP_PHASE="$1"; BACKUP_PHASE_STARTED="$now"
+}
+BACKUP_PHASE_STARTED=$BACKUP_STARTED
+backup_finish() {
+    local rc=$? status=OK temp summary
+    trap - EXIT INT TERM PIPE
+    (( rc == 0 )) || status=FAILED
+    [[ "$BACKUP_RESULT" != OK || "$status" != FAILED ]] || status=WARNING
+    [[ "${DRY_RUN:-false}" != true || "$status" != OK ]] || status=WARNING
+    [[ "$RETENTION_RESULT" != FAILED || "$status" != OK ]] || status=WARNING
+    [[ "$SHUTDOWN_RESULT" == deferred || ( -z "${REMOTE_SHUTDOWN_SKIPPED_REASON:-}" && "${REMOTE_SHUTDOWN_FAILED:-0}" == 0 ) ]] || { [[ "$status" != OK ]] || status=WARNING; }
+    [[ "$SHUTDOWN_RESULT" == deferred || -z "${REMOTE_SHUTDOWN_SKIPPED_REASON:-}" ]] || SHUTDOWN_RESULT=skipped
+    if (( rc == 0 )); then BACKUP_PHASE=completed; fi
+    summary="${SCRIPT_ID} v${SCRIPT_VERSION}; copy=$BACKUP_RESULT; verify=$VERIFICATION_RESULT; retention=$RETENTION_RESULT; phase=$BACKUP_PHASE; duration=$(( $(date +%s)-BACKUP_STARTED ))s; shutdown=$SHUTDOWN_RESULT ${REMOTE_SHUTDOWN_SKIPPED_REASON:-}"
+    if (( rc != 0 )) && [[ "$BACKUP_NOTIFIED" != true && -x "${NOTIFY_BIN:-}" ]]; then
+        if timeout 30 "$NOTIFY_BIN" -i alert -s "${SCRIPT_ID}" -d 'Backup failed' -m "$summary
+Log: $LOG_FILE" >/dev/null 2>&1; then NOTIFICATION_RESULT=sent; else NOTIFICATION_RESULT=failed; fi
+    fi
+    [[ "$NOTIFICATION_RESULT" != failed && "$NOTIFICATION_RESULT" != unavailable || "$status" != OK ]] || status=WARNING
+    if mountpoint -q /mnt/vault && command -v jq >/dev/null; then
+        mkdir -p -- "$STATUS_DIR"
+        temp=$(mktemp "$STATUS_DIR/.${SCRIPT_ID}.XXXXXX") &&
+            jq -n --arg name "$SCRIPT_ID" --arg status "$status" --arg summary "$summary" --arg phase "$BACKUP_PHASE" --arg copy "$BACKUP_RESULT" --arg verification "$VERIFICATION_RESULT" --arg retention "$RETENTION_RESULT" --arg notification "$NOTIFICATION_RESULT" --arg shutdown "$SHUTDOWN_RESULT" --arg shutdown_reason "${REMOTE_SHUTDOWN_SKIPPED_REASON:-}" --arg version "$SCRIPT_VERSION" --arg log "$LOG_FILE" --argjson duration "$(( $(date +%s)-BACKUP_STARTED ))" --argjson epoch "$(date +%s)" \
+            '{name:$name,status:$status,summary:$summary,phase:$phase,copy:$copy,verification:$verification,retention:$retention,notification:$notification,shutdown:$shutdown,shutdown_reason:$shutdown_reason,scriptVersion:$version,duration_seconds:$duration,log:$log,epoch:$epoch}' >"$temp" && mv -f -- "$temp" "$STATUS_DIR/$SCRIPT_ID.json"
+    fi
+    [[ -z "$LEASE_INPUT" ]] || exec {LEASE_INPUT}>&-
+    [[ -z "$LEASE_PID" ]] || { kill "$LEASE_PID" 2>/dev/null || true; wait "$LEASE_PID" 2>/dev/null || true; }
+    [[ ${#TRANSPORT_OPTIONS[@]} == 0 ]] || ssh "${TRANSPORT_OPTIONS[@]}" -O exit "$REMOTE" >/dev/null 2>&1 || true
+    [[ -z "$BACKUP_TMP" ]] || rm -rf -- "$BACKUP_TMP"
+    [[ -z "${TMP_DIR:-}" ]] || rm -rf -- "$TMP_DIR"
+    [[ ! -f "${LOG_FILE:-}" ]] || backup_bound_log "$LOG_FILE" "$MAX_MAIN_LOG_BYTES" || true
+    exit "$rc"
+}
+
+# A deletion ceiling is deliberately not a transaction: hitting it fails the
+# run, and some deletions may already have occurred. Review before raising it.
+MAX_DELETIONS=10000
+backup_destination() {
+    local label="$1" source="$2" destination="$3" identity expected actual dest_q
+    [[ "$destination" == /mnt/user/* && "$destination" != *'/../'* && "$destination" != *$'\n'* ]] || return 1
+    dest_q=$(printf '%q' "$destination")
+    actual=$(backup_ssh "test -d $dest_q && test ! -L $dest_q && realpath -e -- $dest_q") || return 1
+    [[ "$actual" == "$destination" ]] || return 1
+    identity=$(printf '%s\n' "$SCRIPT_ID" "$REMOTE" "$label" "$source" "$destination" | sha256sum); identity=${identity%% *}
+    expected=$(backup_ssh "if test -f $dest_q/.hubble-backup-identity; then cat $dest_q/.hubble-backup-identity; fi") || return 1
+    [[ -z "$expected" || "$expected" == "$identity" ]] || return 1
+    [[ "$DRY_RUN" == true || -n "$expected" ]] || backup_ssh "printf '%s\\n' '$identity' > $dest_q/.hubble-backup-identity"
+}
+
 ###############################################################################
 # RUNTIME STATE
 #
@@ -341,15 +565,6 @@ declare -A DEST_FREE_BYTES=()
 # LOCKING
 ###############################################################################
 
-exec 9>"$LOCK_FILE"
-
-if ! flock -n 9; then
-    printf '%s %s\n' \
-        "$(date '+%Y-%m-%d %H:%M:%S')" \
-        "Another remote_backup.sh run is active, exiting (lock: $LOCK_FILE)"
-
-    exit 1
-fi
 
 
 ###############################################################################
@@ -373,6 +588,7 @@ log() {
     shift 2
 
     local message="$*"
+    backup_bound_log "$LOG_FILE" "$MAX_MAIN_LOG_BYTES" || return 1
 
     printf '%s [%s][%s] %s\n' \
         "$(date '+%Y-%m-%d %H:%M:%S')" \
@@ -384,24 +600,28 @@ log() {
 
 
 notify_unraid() {
+    BACKUP_NOTIFIED=true
     local importance="$1"
     local description="$2"
     local message="$3"
 
     if [ ! -x "$NOTIFY_BIN" ]; then
+        NOTIFICATION_RESULT=unavailable
         log "NOTIFY" "WARN" \
             "Unraid notification helper unavailable: $NOTIFY_BIN"
 
         return 0
     fi
 
-    if ! "$NOTIFY_BIN" \
+    NOTIFICATION_RESULT=sent
+    if ! timeout 30 "$NOTIFY_BIN" \
         -i "$importance" \
         -b \
         -s "$NOTIFY_SUBJECT" \
         -d "$description" \
         -m "$message"
     then
+        NOTIFICATION_RESULT=failed
         log "NOTIFY" "WARN" \
             "Failed to send Unraid notification"
     fi
@@ -542,6 +762,8 @@ validate_configuration() {
             ;;
     esac
 
+    [[ "$MAX_DELETIONS" =~ ^[0-9]+$ ]] || return 1
+
     if ! [[ "$MAX_RETRIES" =~ ^[0-9]+$ ]] ||
        [ "$MAX_RETRIES" -lt 1 ]
     then
@@ -619,7 +841,7 @@ validate_configuration() {
 
         seen_labels["$label"]=1
 
-        if [ ! -d "$src" ]; then
+        if ! backup_source_ready "$src"; then
             log "PREFLIGHT" "ERROR" \
                 "Local source does not exist for ${label}: $src"
             return 1
@@ -666,30 +888,8 @@ build_priority_prefix() {
 # SSH HELPERS
 ###############################################################################
 
-ssh_run() {
-    local command_string=""
-
-    printf -v command_string '%q ' "$@"
-
-    ssh \
-        -o BatchMode=yes \
-        -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" \
-        -p "$SSH_PORT" \
-        "$REMOTE" \
-        "$command_string"
-}
-
-
-ssh_raw() {
-    local command_string="$1"
-
-    ssh \
-        -o BatchMode=yes \
-        -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" \
-        -p "$SSH_PORT" \
-        "$REMOTE" \
-        "$command_string"
-}
+ssh_run() { local command_string; printf -v command_string '%q ' "$@"; BACKUP_SSH_COMMAND_TIMEOUT=30 backup_ssh "$command_string"; }
+ssh_raw() { BACKUP_SSH_COMMAND_TIMEOUT=30 backup_ssh "$1"; }
 
 
 classify_ssh_error() {
@@ -907,7 +1107,7 @@ validate_remote_destinations() {
             bwlimit \
             <<<"$descriptor"
 
-        if ! ssh_run test -d "$dest" >/dev/null 2>&1; then
+        if ! backup_destination "$label" "$src" "$dest"; then
             REMOTE_VALIDATION_ERROR="Remote destination missing for ${label}: ${dest}"
 
             log "REMOTE" "ERROR" \
@@ -939,13 +1139,19 @@ build_rsync_args() {
     local pattern=""
     local -a extra_array=()
 
-    local rsync_ssh_command="ssh -p ${SSH_PORT} -o BatchMode=yes -o ConnectTimeout=${SSH_CONNECT_TIMEOUT}"
+    local rsync_ssh_command="$RSYNC_RSH"
 
     output=(
         "${RSYNC_BASE_ARGS[@]}"
+        "--timeout=$RSYNC_IO_TIMEOUT"
+        "--max-delete=$MAX_DELETIONS"
+        "--filter=P /.hubble-backup-identity"
+        "--rsync-path=LC_ALL=C rsync"
         "${DEFAULT_EXCLUDES[@]}"
         -e "$rsync_ssh_command"
     )
+
+    [[ "$PRESERVE_HARD_LINKS" != true ]] || output+=(-H)
 
     if [ -n "$extra_excludes" ]; then
         IFS=',' read -r -a extra_array <<<"$extra_excludes"
@@ -1271,9 +1477,7 @@ preflight_space() {
 
         DEST_FREE_BYTES["$dest"]="$available"
 
-        required_by_device["$device"]=$(
-            (${required_by_device["$device"]:-0} + estimated)
-        )
+        required_by_device["$device"]=$(( ${required_by_device["$device"]:-0} + estimated ))
 
         available_by_device["$device"]="$available"
         mount_by_device["$device"]="$mountpoint"
@@ -1284,10 +1488,7 @@ preflight_space() {
         available="${available_by_device[$device]:-0}"
         mountpoint="${mount_by_device[$device]:-unknown}"
 
-        percentage_buffer=$(
-            # shellcheck disable=SC2035
-            (needed * PREFLIGHT_BUFFER_PERCENT / 100)
-        )
+        percentage_buffer=$(( needed * PREFLIGHT_BUFFER_PERCENT / 100 ))
 
         if [ "$percentage_buffer" -lt "$PREFLIGHT_MIN_BUFFER_BYTES" ]; then
             safety_buffer="$PREFLIGHT_MIN_BUFFER_BYTES"
@@ -1497,20 +1698,23 @@ rsync_label() {
         log "RSYNC" "INFO" \
             "[${label}] running: ${command_string}"
 
-        "${command[@]}" 2>&1 |
-            tee "$tmp_log" |
-            while IFS= read -r line; do
-                [ -n "$line" ] || continue
-
-                log "RSYNC" "INFO" \
-                    "[${label}] $line"
-            done
-
+        if ! backup_source_ready "$src" || ! backup_lease_alive; then
+            RESULT_REASON[$label]="Source mount/identity changed or ISS lease lost"
+            FAILED_LABELS+=("$label")
+            return 1
+        fi
+        local job_started job_elapsed
+        job_started=$(date +%s)
+        "${command[@]}" 2>&1 | tail -c "$MAX_RAW_LOG_BYTES" >"$tmp_log"
         status="${PIPESTATUS[0]}"
+        job_elapsed=$(( $(date +%s)-job_started ))
+        tail -n 35 -- "$tmp_log" >>"$LOG_FILE"
+        log RSYNC INFO "[$label] attempt duration=${job_elapsed}s"
 
         parse_rsync_stats \
             "$tmp_log" \
             "$label"
+        log RSYNC INFO "[$label] measured network average=$(bytes_to_human "$(( ${BYTES_SENT[$label]:-0} / (job_elapsed > 0 ? job_elapsed : 1) ))")/s"
 
         saved_log="$(
             preserve_raw_log \
@@ -1681,11 +1885,7 @@ refresh_remote_space_for_report() {
 ###############################################################################
 
 remote_shutdown_blockers() {
-    ssh \
-        -o BatchMode=yes \
-        -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" \
-        -p "$SSH_PORT" \
-        "$REMOTE" \
+    BACKUP_SSH_COMMAND_TIMEOUT=30 backup_ssh \
         bash -s -- \
         "$DEFER_REMOTE_SHUTDOWN_WHILE_MOVER" \
         "$DEFER_REMOTE_SHUTDOWN_DURING_PARITY_CHECK" \
@@ -1763,6 +1963,7 @@ shutdown_remote() {
     local blockers=""
     local blocker_status=0
 
+    backup_lease_alive || { REMOTE_SHUTDOWN_SKIPPED_REASON="Shared ISS lease is not held"; return 0; }
     if [ "$REMOTE_READY" -ne 1 ]; then
         return 0
     fi
@@ -1795,6 +1996,7 @@ shutdown_remote() {
         return 0
     fi
 
+    if ! backup_shutdown_handoff; then log REMOTE INFO "$REMOTE_SHUTDOWN_SKIPPED_REASON"; return 0; fi
     blockers="$(remote_shutdown_blockers 2>/dev/null)"
     blocker_status=$?
 
@@ -1817,13 +2019,15 @@ shutdown_remote() {
     log "REMOTE" "INFO" \
         "Requesting shutdown of ${DEST_NAS}"
 
-    if ssh_raw \
-        'nohup powerdown >/dev/null 2>&1 </dev/null &'
+    backup_phase shutdown
+    if backup_request_shutdown
     then
+        SHUTDOWN_RESULT=requested
         log "REMOTE" "INFO" \
             "Shutdown request sent successfully"
     else
         REMOTE_SHUTDOWN_FAILED=1
+        SHUTDOWN_RESULT=failed_or_unconfirmed
 
         log "REMOTE" "ERROR" \
             "Failed to send shutdown command to ${DEST_NAS}"
@@ -1921,8 +2125,11 @@ prune_raw_logs() {
 
 
 prune_old_artifacts() {
-    prune_main_logs
-    prune_raw_logs
+    local file
+    prune_main_logs && prune_raw_logs || { RETENTION_RESULT=FAILED; return 1; }
+    while IFS= read -r -d '' file; do backup_bound_log "$file" "$MAX_MAIN_LOG_BYTES" || return 1; done < <(find "$LOG_DIR" -maxdepth 1 -type f -name 'remote_backup_*.log' -print0)
+    while IFS= read -r -d '' file; do backup_bound_log "$file" "$MAX_RAW_LOG_BYTES" || return 1; done < <(find "$RAW_LOG_DIR" -maxdepth 1 -type f -name 'rsync_*.log' -print0)
+    RETENTION_RESULT=OK
 }
 
 
@@ -1962,9 +2169,9 @@ send_final_notification() {
         level="alert"
         overall_status="FAILED"
 
-    elif [ "$REMOTE_SHUTDOWN_FAILED" -ne 0 ]; then
+    elif [ "$REMOTE_SHUTDOWN_FAILED" -ne 0 ] || { [ -n "$REMOTE_SHUTDOWN_SKIPPED_REASON" ] && [ "$SHUTDOWN_RESULT" != deferred ]; } || [ "$RETENTION_RESULT" = FAILED ]; then
         level="warning"
-        overall_status="OK - shutdown failed"
+        overall_status="OK - shutdown or retention requires review"
     fi
 
     body+="Mode: "
@@ -1976,6 +2183,7 @@ send_final_notification() {
     fi
 
     body+=$'\n'
+    body+="Version: ${SCRIPT_VERSION}; retention: ${RETENTION_RESULT}"$'\n'
     body+="Runtime: ${runtime_human}"$'\n'
     body+="Route: ${SRC_NAS} -> ${DEST_NAS}"$'\n'
     body+=$'\n'
@@ -2089,6 +2297,21 @@ Log: ${LOG_FILE}"
 ###############################################################################
 
 main() {
+    exec 9>"$LOCK_FILE"
+
+    if ! flock -n 9; then
+        printf '%s %s\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" \
+            "Another remote_backup.sh run is active, exiting (lock: $LOCK_FILE)"
+
+        exit 1
+    fi
+
+    trap backup_finish EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 141' PIPE
+    backup_transport_init || return 1
     local backup_failed=0
 
     local runtime_seconds=0
@@ -2098,6 +2321,7 @@ main() {
     # Logging initialization
     # -----------------------------------------------------------------------
 
+    mountpoint -q /mnt/user || { printf 'Local /mnt/user is not mounted\n' >&2; return 1; }
     if ! ensure_dir "$LOG_DIR"; then
         printf '%s ERROR: Unable to create log directory: %s\n' \
             "$(date '+%Y-%m-%d %H:%M:%S')" \
@@ -2182,6 +2406,10 @@ Reason: ${REMOTE_WAIT_ERROR}"
     fi
 
 
+    backup_phase capabilities
+    backup_capabilities || return 1
+    backup_acquire_lease || { log REMOTE ERROR "ISS is already in use by another backup, or lease acquisition failed"; return 1; }
+
     # -----------------------------------------------------------------------
     # Validate configured remote destinations
     # -----------------------------------------------------------------------
@@ -2205,6 +2433,7 @@ No rsync was started."
     # Aggregate space preflight
     # -----------------------------------------------------------------------
 
+    backup_phase preflight
     if ! preflight_space; then
         shutdown_remote 1 || true
 
@@ -2224,8 +2453,13 @@ No live rsync was started."
     # Rsync backup jobs
     # -----------------------------------------------------------------------
 
+    backup_phase transfer
     if ! run_all_backups; then
         backup_failed=1
+        BACKUP_RESULT=FAILED; VERIFICATION_RESULT=FAILED
+    else
+        if [[ "$DRY_RUN" == true ]]; then BACKUP_RESULT=DRY_RUN; VERIFICATION_RESULT=not_performed
+        else BACKUP_RESULT=OK; VERIFICATION_RESULT=rsync_transfer_verified; fi
     fi
 
 
@@ -2258,6 +2492,8 @@ No live rsync was started."
             "Remote backup completed with failures in ${runtime_human}"
     fi
 
+    prune_old_artifacts || RETENTION_RESULT=FAILED
+    backup_phase notification
     send_final_notification \
         "$backup_failed" \
         "$runtime_human"
@@ -2267,7 +2503,6 @@ No live rsync was started."
     # Retention
     # -----------------------------------------------------------------------
 
-    prune_old_artifacts
 
 
     # -----------------------------------------------------------------------
@@ -2288,4 +2523,4 @@ No live rsync was started."
 # ENTRY POINT
 ###############################################################################
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
