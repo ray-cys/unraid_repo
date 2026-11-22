@@ -983,9 +983,9 @@ purge_expired() {
     else
         REMAINING_EXPIRED_RUNS="$EXPIRED_RUNS"
     fi
-    if (( PURGE_LIMIT_REACHED == 1 )); then
+    if (( PURGE_LIMIT_REACHED == 1 || REMAINING_EXPIRED_RUNS > 0 || UNMANAGED_ENTRIES > 0 || SCAN_ERRORS > 0 )); then
         RESULT_STATUS="WARNING"
-        RESULT_SUMMARY="Purged $PURGED_RUNS run(s), $PURGED_FILES file(s), and $(human_bytes "$PURGED_BYTES"); $REMAINING_EXPIRED_RUNS expired run(s) remain after reaching the execution limit"
+        RESULT_SUMMARY="Purged $PURGED_RUNS run(s), $PURGED_FILES file(s), and $(human_bytes "$PURGED_BYTES"); retained expired=$REMAINING_EXPIRED_RUNS, unmanaged=$UNMANAGED_ENTRIES, scan errors=$SCAN_ERRORS. Safety deferrals and limits are included in this report."
     else
         RESULT_STATUS="OK"
         RESULT_SUMMARY="Purged $PURGED_RUNS run(s), $PURGED_FILES file(s), and $(human_bytes "$PURGED_BYTES")"

@@ -160,6 +160,10 @@ audit_quarantine || fail "initial quarantine audit failed"
 [[ "$EXPIRED_RUNS" -eq 1 ]] || fail "fixture run was not classified as expired"
 assert_contains "$INDEX_FILE" "$RUN_ID"
 
+MIN_RUN_IDLE_HOURS=24
+purge_expired || fail "recent-run guard failed"
+[[ -d "$RUN_DIR" && "$RESULT_STATUS" == WARNING ]] || fail "recently changed expired run was not preserved and reported as warning"
+MIN_RUN_IDLE_HOURS=0
 purge_expired || fail "receipt-backed purge failed"
 [[ ! -e "$RUN_DIR" ]] || fail "expired run was not removed"
 [[ "$PURGED_RUNS" -eq 1 ]] || fail "purged run total is incorrect"
