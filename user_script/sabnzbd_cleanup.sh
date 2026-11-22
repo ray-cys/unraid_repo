@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# SABnzbd Cleanup v2.0
+# SABnzbd Cleanup v2.2.0
 #
 # PURPOSE
 # -------
@@ -65,7 +65,7 @@ set -uo pipefail
 # CONFIGURATION
 ###############################################################################
 
-VERSION="2.1"
+VERSION="2.2.0"
 
 # ---------------------------------------------------------------------------
 # Execution behavior
@@ -101,6 +101,10 @@ QUARANTINE_RETENTION_DAYS="${QUARANTINE_RETENTION_DAYS:-14}"
 
 # Limit real quarantine moves per run. Zero means unlimited.
 MAX_QUARANTINES_PER_RUN="${MAX_QUARANTINES_PER_RUN:-10}"
+MAX_PURGES_PER_RUN="${MAX_PURGES_PER_RUN:-25}"
+MAX_PURGE_BYTES_PER_RUN="${MAX_PURGE_BYTES_PER_RUN:-107374182400}"
+PURGE_RECEIPT_RETENTION_DAYS=365
+PURGE_RECEIPT_DIR="${LOG_DIR:-/mnt/user/cloud/logs/script/arr_sabnzbd_cleanup}/purge-receipts"
 
 # Refuse to overlap Unraid Mover. The process pattern matches current and
 # legacy Unraid mover entry points and is shared with mover_audit.sh.
@@ -177,10 +181,17 @@ QUARANTINE_FILE_MODE="${QUARANTINE_FILE_MODE:-0644}"
 
 LOG_DIR="${LOG_DIR:-/mnt/user/cloud/logs/script/arr_sabnzbd_cleanup}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/arr_sabnzbd_cleanup.log}"
-LOG_MAX_BYTES="${LOG_MAX_BYTES:-2097152}"
+# Compact operational logs; full inventories remain in deletion receipts.
+LOG_LEVEL="${LOG_LEVEL:-INFO}"
+LOG_BACKUP_FILES=2
+LOG_RETENTION_DAYS=30
+LOG_LINE_MAX_BYTES=4096
+
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-1048576}"
 LOG_KEEP="${LOG_KEEP:-2}"
 
 SEND_NOTIFICATIONS="${SEND_NOTIFICATIONS:-true}"
+OPS_NOTIFICATION_STATE="${LOG_DIR}/notification-state.json"
 NOTIFY_DRY_RUN="${NOTIFY_DRY_RUN:-false}"
 NOTIFY="${NOTIFY:-/usr/local/emhttp/webGui/scripts/notify}"
 
@@ -244,9 +255,14 @@ BYTES_ELIGIBLE=0
 BYTES_QUARANTINED=0
 BYTES_PURGED=0
 
+BACKUP_DETAILS=()
 QUARANTINE_DETAILS=()
 PURGE_DETAILS=()
 
+RECOVERED=0
+NOTIFICATION_FINALIZED=false
+RUN_INITIALIZED=false
+RECOVERY_DETAILS=()
 MOVER_GUARD_TRIGGERED=false
 MOVER_GUARD_CONTEXT=""
 
@@ -272,18 +288,128 @@ is_false() {
   esac
 }
 
+OPS_SCRIPT_NAME="arr_sabnzbd_cleanup"
+OPS_SCRIPT_VERSION="2.2.0"
+OPS_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
+OPS_ATTENTION_DETAILS=""
+OPS_ATTENTION_FILE=""
+OPS_LOG_BYTES=""
+
+# Shared operational logging convention, embedded to keep User Scripts standalone.
+# INFO records actions, warnings and one completion summary. DEBUG adds routine
+# progress. Numbered backups expire by size, count and age; receipts are separate.
+ops_initialize_log() {
+    local file suffix bytes now cutoff
+    [[ ! -L "$LOG_FILE" ]] || return 1
+    now=$(date +%s); cutoff=$((now-LOG_RETENTION_DAYS*86400))
+    for file in "$LOG_FILE".[0-9]*; do
+        [[ -f "$file" ]] || continue
+        suffix=${file##*.}; [[ "$suffix" =~ ^[0-9]+$ ]] || continue
+        bytes=$(stat -c '%s' "$file") || return 1
+        if (( suffix>LOG_BACKUP_FILES || bytes>LOG_MAX_BYTES || (LOG_RETENTION_DAYS>0 && $(stat -c '%Y' "$file")<=cutoff) )); then
+            rm -f -- "$file" || return 1
+        fi
+    done
+    : >>"$LOG_FILE" || return 1
+    OPS_LOG_BYTES=$(stat -c '%s' "$LOG_FILE") || return 1
+    if (( OPS_LOG_BYTES>LOG_MAX_BYTES*4 )); then : >"$LOG_FILE"; OPS_LOG_BYTES=0; fi
+    if (( OPS_LOG_BYTES>=LOG_MAX_BYTES )); then ops_rotate_log || return 1; fi
+}
+
+ops_rotate_log() {
+    local i
+    rm -f -- "$LOG_FILE.$LOG_BACKUP_FILES" || return 1
+    for ((i=LOG_BACKUP_FILES-1;i>=1;i--)); do
+        [[ ! -f "$LOG_FILE.$i" ]] || mv -f -- "$LOG_FILE.$i" "$LOG_FILE.$((i+1))" || return 1
+    done
+    [[ ! -f "$LOG_FILE" ]] || mv -f -- "$LOG_FILE" "$LOG_FILE.1" || return 1
+    : >"$LOG_FILE" || return 1
+    OPS_LOG_BYTES=0
+}
+
+ops_log() {
+    local level="$1" message line size
+    local LC_ALL=C
+    shift; message="$*"
+    [[ "$level" != DEBUG || "${LOG_LEVEL^^}" == DEBUG ]] || return 0
+    case "$level" in
+        WARN|WARNING|ERROR|CRITICAL)
+            OPS_ATTENTION_DETAILS+="- [$level] $message"$'\n'
+            if [[ -n "${OPS_ATTENTION_FILE:-}" ]]; then printf '%s\n' "- [$level] $message" >>"$OPS_ATTENTION_FILE"; fi
+            ;;
+    esac
+    if (( ${#message}>LOG_LINE_MAX_BYTES )); then message="${message:0:LOG_LINE_MAX_BYTES} ... [line truncated]"; fi
+    printf -v line '%s | %s | %s v%s | run=%s | %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$OPS_SCRIPT_NAME" "$OPS_SCRIPT_VERSION" "$OPS_RUN_ID" "$message"
+    printf '%s\n' "$line" >&2
+    [[ -d "${LOG_FILE%/*}" ]] || return 0
+    [[ -n "${OPS_LOG_BYTES:-}" ]] || ops_initialize_log || return 1
+    size=$(( ${#line}+1 ))
+    if (( OPS_LOG_BYTES+size>LOG_MAX_BYTES )); then ops_rotate_log || return 1; fi
+    printf '%s\n' "$line" >>"$LOG_FILE" || return 1
+    OPS_LOG_BYTES=$(( OPS_LOG_BYTES+size ))
+}
+
+# Durable daily outbox. Unsent chunks survive failures, daily limits and caps.
+ops_notification_state() {
+    local tmp
+    [[ ! -L "$OPS_NOTIFICATION_STATE" ]] || return 1
+    if [[ ! -e "$OPS_NOTIFICATION_STATE" ]]; then
+        tmp=$(mktemp "${LOG_DIR}/.notify-state.XXXXXX") || return 1
+        printf '%s\n' '{"version":1,"outbox":[],"attention":{}}' >"$tmp" && mv -f -- "$tmp" "$OPS_NOTIFICATION_STATE" || return 1
+    fi
+    jq -e 'type=="object" and ((.outbox // [])|type)=="array"' "$OPS_NOTIFICATION_STATE" >/dev/null
+}
+
+ops_notify() {
+    local importance="$1" subject="$2" description="$3" message="$4" tmp message_file id
+    OPS_NOTIFICATION_DELIVERED=false
+    ops_notification_state || return 1
+    message_file=$(mktemp "${LOG_DIR}/.notify-message.XXXXXX") || return 1
+    printf '%s' "$message" >"$message_file" || return 1
+    id=$( { printf '%s\n' "$subject" "$description"; cat "$message_file"; } | sha256sum | cut -d ' ' -f1)
+    tmp=$(mktemp "${LOG_DIR}/.notify-outbox.XXXXXX") || return 1
+    jq --arg id "$id" --arg importance "$importance" --arg subject "$subject" --arg description "$description" \
+      --rawfile message "$message_file" --arg at "$(date -Iseconds)" '
+      .outbox //= []
+      | if any(.outbox[]; .eventId==$id) then . else
+          .outbox += [range(0;([$message|length,1]|max);8000) as $offset |
+            {eventId:$id,id:($id+":"+($offset|tostring)),importance:$importance,subject:$subject,description:$description,
+             message:$message[$offset:$offset+8000],offset:$offset,queuedAt:$at}]
+        end
+    ' "$OPS_NOTIFICATION_STATE" >"$tmp" && mv -f -- "$tmp" "$OPS_NOTIFICATION_STATE" || { rm -f -- "$tmp" "$message_file"; return 1; }
+    rm -f -- "$message_file"
+    ops_flush_notifications || return 1
+    if ! jq -e --arg id "$id" 'any(.outbox[]?;.eventId==$id)' "$OPS_NOTIFICATION_STATE" >/dev/null; then OPS_NOTIFICATION_DELIVERED=true; fi
+}
+
+ops_flush_notifications() {
+    local tmp selected body importance subject count today="$(date +%F)" notify_bin="${NOTIFY_BIN:-${NOTIFY:-}}"
+    ops_notification_state || return 1
+    jq -e '(.outbox // []|length)>0' "$OPS_NOTIFICATION_STATE" >/dev/null || return 0
+    [[ "$(jq -r '.lastSentAt // ""' "$OPS_NOTIFICATION_STATE")" != "$today"* ]] || return 0
+    selected=$(mktemp "${LOG_DIR}/.notify-selected.XXXXXX") || return 1
+    jq '[.outbox | sort_by((if .importance=="alert" then 0 elif .importance=="warning" then 1 else 2 end),.queuedAt,.eventId,(.offset // 0)) | .[0]]' "$OPS_NOTIFICATION_STATE" >"$selected" || return 1
+    # Each complete chunk stays below the platform argv limit, including UTF-8.
+    body=$(jq -r '.[0] | "Queued: "+.queuedAt+"\n"+.description+"\n\n"+.message' "$selected")
+    importance=$(jq -r '.[0].importance' "$selected"); subject=$(jq -r '.[0].subject' "$selected")
+    body=$(printf '%s' "$body" | jq -Rsr 'explode | map(select(.!=8205 and .!=8419 and .!=65039 and (. < 9728 or . > 10175) and (. < 126976 or . > 129791))) | implode')
+    count=$(jq '.outbox|length' "$OPS_NOTIFICATION_STATE")
+    if (( count>1 )); then body+=$'\n\n'"$((count-1)) further report chunk(s) remain queued for a later daily notification."; fi
+    if [[ ! -x "$notify_bin" ]] || ! "$notify_bin" -i "$importance" -s "$subject" -d "Operational actions and exceptions" -m "$body" >/dev/null 2>&1; then
+        rm -f -- "$selected"
+        ops_log ERROR "Notification delivery failed; detailed report retained in the daily outbox."
+        return 1
+    fi
+    tmp=$(mktemp "${LOG_DIR}/.notify-sent.XXXXXX") || return 1
+    jq --slurpfile selected "$selected" --arg now "$(date -Iseconds)" \
+      '.outbox |= map(. as $event | select(any($selected[0][]; .id==$event.id)|not)) | .lastSentAt=$now' \
+      "$OPS_NOTIFICATION_STATE" >"$tmp" && mv -f -- "$tmp" "$OPS_NOTIFICATION_STATE" || return 1
+    rm -f -- "$selected"
+    ops_log INFO "Delivered one detailed daily notification; remaining report chunks=$((count-1))."
+}
+
 log() {
-  local level="$1"
-  shift
-
-  local line
-  line="$(timestamp) [$level] $*"
-
-  if [[ -n "$LOG_FILE" && -d "${LOG_FILE%/*}" ]]; then
-    printf '%s\n' "$line" | tee -a "$LOG_FILE"
-  else
-    printf '%s\n' "$line"
-  fi
+    ops_log "$@"
 }
 
 die() {
@@ -341,8 +467,14 @@ cleanup_tmp() {
 
 on_exit() {
   local exit_code=$?
+  if [[ "$RUN_INITIALIZED" == true && "$NOTIFICATION_FINALIZED" != true ]]; then
+    if (( exit_code!=0 )); then ((ERRORS++)) || true; fi
+    notify_summary || exit_code=1
+  fi
+  if [[ "$RUN_INITIALIZED" == true ]] && is_true "$SEND_NOTIFICATIONS"; then ops_flush_notifications || exit_code=1; fi
   cleanup_tmp
-  return "$exit_code"
+  trap - EXIT
+  exit "$exit_code"
 }
 
 trap on_exit EXIT
@@ -361,7 +493,16 @@ Options:
   --execute     Enable backup deletion and quarantine operations.
   --purge       Enable delayed quarantine purge.
   --no-purge    Disable delayed quarantine purge.
+  --inspect     List quarantine payloads, original paths, state and retention age; change nothing.
+  --restore WRAPPER Restore one manifest-backed payload to its original path; never overwrite.
+  --version     Print release version.
   --help        Show this help.
+
+Normal scheduled invocation uses configuration above. Notifications include actions,
+protected items and failures, grouped through a durable once-daily outbox.
+Examples: /bin/bash SCRIPT --dry-run --no-purge
+          /bin/bash SCRIPT --inspect
+          /bin/bash SCRIPT --restore /mnt/user/media/net/quarantine/items/Sonarr/WRAPPER
 EOF
 }
 
@@ -372,6 +513,9 @@ parse_args() {
       --execute) DRY_RUN=false ;;
       --purge) PURGE_QUARANTINE=true ;;
       --no-purge) PURGE_QUARANTINE=false ;;
+      --inspect) CLI_OPERATION=inspect ;;
+      --restore) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; CLI_OPERATION=restore; CLI_WRAPPER="$2"; shift ;;
+      --version) printf 'sabnzbd_cleanup.sh %s\n' "$VERSION"; exit 0 ;;
       --help|-h)
         usage
         exit 0
@@ -391,35 +535,14 @@ parse_args() {
 ###############################################################################
 
 rotate_logs() {
-  [[ -f "$LOG_FILE" ]] || return 0
-
-  local size
-  size="$(stat_size "$LOG_FILE")"
-  [[ "$size" =~ ^[0-9]+$ ]] || size=0
-  (( size >= LOG_MAX_BYTES )) || return 0
-
-  if (( LOG_KEEP <= 0 )); then
-    : > "$LOG_FILE"
-    return 0
-  fi
-
-  rm -f -- "${LOG_FILE}.${LOG_KEEP}" 2>/dev/null || true
-
-  local i
-  for ((i=LOG_KEEP-1; i>=1; i--)); do
-    if [[ -f "${LOG_FILE}.${i}" ]]; then
-      mv -f -- "${LOG_FILE}.${i}" "${LOG_FILE}.$((i + 1))"
-    fi
-  done
-
-  mv -f -- "$LOG_FILE" "${LOG_FILE}.1"
+    ops_initialize_log
 }
 
 require_commands() {
   local command_name
   local missing=0
 
-  for command_name in awk basename cat chown chmod curl cut date dirname find flock jq mkdir mktemp mv realpath rm rmdir sed sort stat tee tr wc; do
+  for command_name in awk basename cat chown chmod curl cut date dirname find flock jq mkdir mktemp mv realpath rm rmdir sed sort stat sha256sum tee tr wc; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       log "ERROR" "Required command not found: $command_name"
       missing=1
@@ -560,7 +683,7 @@ normalize_quarantine_permissions() {
 
   # find does not follow symlinks by default. chown -h changes a symlink's own
   # owner, while chmod is limited to real directories and regular files.
-  if ! find "$target_real" -xdev -exec chown -h -- "$QUARANTINE_OWNER" {} +; then
+  if ! find "$target_real" -xdev ! -user "$QUARANTINE_OWNER" -exec chown -h -- "$QUARANTINE_OWNER" {} +; then
     log "ERROR" "Unable to set quarantine owner '$QUARANTINE_OWNER': $target_real"
     failed=true
   fi
@@ -599,6 +722,8 @@ validate_common_environment() {
   validate_boolean "TLS_VERIFY" "$TLS_VERIFY" || valid=false
   validate_integer "LOG_MAX_BYTES" "$LOG_MAX_BYTES" || valid=false
   validate_integer "LOG_KEEP" "$LOG_KEEP" || valid=false
+  validate_integer "MAX_PURGES_PER_RUN" "$MAX_PURGES_PER_RUN" || valid=false
+  validate_integer "MAX_PURGE_BYTES_PER_RUN" "$MAX_PURGE_BYTES_PER_RUN" || valid=false
   validate_integer "CURL_CONNECT_TIMEOUT" "$CURL_CONNECT_TIMEOUT" || valid=false
   validate_integer "CURL_MAX_TIME" "$CURL_MAX_TIME" || valid=false
 
@@ -821,7 +946,6 @@ initialize() {
     exit 1
   }
 
-  rotate_logs
   require_commands
 
   exec 9>"$LOCK_FILE"
@@ -830,9 +954,14 @@ initialize() {
     exit 0
   fi
 
+  RUN_INITIALIZED=true
+  rotate_logs || die "Persistent logging initialization failed."
+  ops_notification_state || die "Invalid notification state; existing outbox was preserved."
   TMP_DIR="$(mktemp -d '/tmp/sabnzbd_cleanup.XXXXXX')" || \
     die "Unable to create temporary directory."
 
+  OPS_ATTENTION_FILE="$TMP_DIR/attention-details.txt"
+  : >"$OPS_ATTENTION_FILE"
   SAB_HISTORY_FILE="$TMP_DIR/sab_history.json"
   SAB_QUEUE_FILE="$TMP_DIR/sab_queue.json"
   SONARR_QUEUE_FILE="$TMP_DIR/sonarr_queue.json"
@@ -853,18 +982,9 @@ mover_is_running() {
 }
 
 notify_mover_skip() {
-  local context="$1"
-
-  is_true "$SEND_NOTIFICATIONS" || return 0
-  is_true "$NOTIFY_MOVER_SKIP" || return 0
-  [[ -x "$NOTIFY" ]] || return 0
-
-  "$NOTIFY" \
-    -i normal \
-    -s "SABnzbd Cleanup" \
-    -d "Cleanup skipped while Unraid Mover is active" \
-    -m "Guard point: ${context}. No further cleanup writes were attempted; the next scheduled run will retry." \
-    >/dev/null 2>&1 || true
+  # The finalizer includes the guard context and completed actions in the same
+  # durable daily report; never send a second standalone Mover email.
+  return 0
 }
 
 check_mover_guard() {
@@ -973,6 +1093,7 @@ process_backup_candidate() {
   (( guard_status == 0 )) || return "$guard_status"
 
   if rm -f -- "$file"; then
+    BACKUP_DETAILS+=("Removed $backup_kind backup: $file ($(bytes_human "$size")); retention policy satisfied.")
     log "INFO" "Deleted ${label}: $file"
     case "$backup_kind" in
       nzb) ((NZB_BACKUPS_REMOVED++)) || true ;;
@@ -992,6 +1113,11 @@ cleanup_backup_class() {
   local candidate_status
   local class_failed=false
 
+  local candidate_list="$TMP_DIR/backup-$backup_kind.list"
+  if ! find_backup_candidates "$backup_kind" >"$candidate_list"; then
+    log ERROR "Incomplete $backup_kind backup inventory; this backup class was preserved."
+    return 1
+  fi
   while IFS= read -r -d '' file; do
     process_backup_candidate "$backup_kind" "$file"
     candidate_status=$?
@@ -1001,7 +1127,7 @@ cleanup_backup_class() {
     elif (( candidate_status != 0 )); then
       class_failed=true
     fi
-  done < <(find_backup_candidates "$backup_kind")
+  done <"$candidate_list"
 
   ! is_true "$class_failed"
 }
@@ -1028,9 +1154,9 @@ cleanup_backups() {
   local operation_status
   local cleanup_failed=false
 
-  log "INFO" "Cleaning SABnzbd backups."
-  log "INFO" "NZB retention: ${NZB_RETENTION_DAYS}d"
-  log "INFO" "Application backup retention: ${APP_BACKUP_RETENTION_DAYS}d"
+  log "DEBUG" "Cleaning SABnzbd backups."
+  log "DEBUG" "NZB retention: ${NZB_RETENTION_DAYS}d"
+  log "DEBUG" "Application backup retention: ${APP_BACKUP_RETENTION_DAYS}d"
 
   if [[ -n "$NZB_BACKUP_DIR_REAL" ]]; then
     cleanup_backup_class nzb
@@ -1161,7 +1287,11 @@ fetch_sab_history() {
 }
 
 fetch_sab_queue() {
-  sab_get queue "$SAB_QUEUE_FILE" "start=0" "limit=0"
+  sab_get queue "$SAB_QUEUE_FILE" "start=0" "limit=0" || return 1
+  jq -e '.queue|type=="object" and (.slots|type)=="array" and ((.noofslots|tonumber) <= (.slots|length))' "$SAB_QUEUE_FILE" >/dev/null || {
+    log ERROR "SAB queue is incomplete or invalid; stranded download cleanup is prohibited."
+    return 1
+  }
 }
 
 fetch_arr_queue() {
@@ -1493,18 +1623,7 @@ resolve_imported_path() {
 }
 
 newest_path_mtime() {
-  local path="$1"
-  local newest=0
-  local item
-  local mtime
-
-  while IFS= read -r -d '' item; do
-    mtime="$(stat_mtime "$item")"
-    [[ "$mtime" =~ ^[0-9]+$ ]] || continue
-    (( mtime > newest )) && newest="$mtime"
-  done < <(find "$path" -print0 2>/dev/null)
-
-  printf '%s' "$newest"
+  find "$1" -xdev -printf '%T@\n' | awk 'BEGIN{max=0} $1>max {max=$1} END{printf "%.0f",max}'
 }
 
 path_is_stable() {
@@ -1521,23 +1640,8 @@ path_is_stable() {
 }
 
 path_size() {
-  local path="$1"
-  local total=0
-  local item
-  local size
-
-  if [[ -f "$path" ]]; then
-    stat_size "$path"
-    return
-  fi
-
-  while IFS= read -r -d '' item; do
-    size="$(stat_size "$item")"
-    [[ "$size" =~ ^[0-9]+$ ]] || size=0
-    ((total += size)) || true
-  done < <(find "$path" -type f -print0 2>/dev/null)
-
-  printf '%s' "$total"
+  if [[ -f "$1" ]]; then stat_size "$1"; return; fi
+  find "$1" -xdev -type f -printf '%s\n' | awk '{n+=$1} END{printf "%.0f",n+0}'
 }
 
 source_media_count() {
@@ -1717,6 +1821,7 @@ quarantine_payload() {
     wrapper="${wrapper}__${RUN_ID}"
   fi
 
+  LAST_QUARANTINE_DESTINATION="$wrapper/payload"
   payload_name="$(basename -- "$source_path")"
   manifest="${wrapper}/.sabnzbd-cleanup-manifest.json"
 
@@ -1747,129 +1852,178 @@ quarantine_payload() {
     return 1
   fi
 
+  local prepared="$wrapper/.manifest-prepared.$$" committed="$wrapper/.manifest-committed.$$"
+  if ! jq -n --arg version "$VERSION" --arg runId "$RUN_ID" --arg quarantinedAt "$(timestamp)" \
+    --arg owner "$owner" --arg category "$category" --arg downloadId "$download_id" --arg jobName "$job_name" \
+    --arg originalPath "$source_path" --arg payloadName "$payload_name" --argjson completedEpoch "$completed_epoch" \
+    --argjson bytes "$size" --argjson now "$(date +%s)" --slurpfile proof "$proof_file" \
+    '{scriptVersion:$version,runId:$runId,state:"prepared",preparedEpoch:$now,quarantinedAt:$quarantinedAt,
+      owner:$owner,category:$category,downloadId:$downloadId,jobName:$jobName,originalPath:$originalPath,
+      payloadName:$payloadName,completedEpoch:$completedEpoch,bytes:$bytes,importProof:$proof[0]}' >"$prepared" ||
+     ! mv -f -- "$prepared" "$manifest"; then
+      log ERROR "Cannot commit quarantine intent; source was preserved: $source_path"; return 1
+  fi
   if ! mv -- "$source_path" "$wrapper/payload"; then
-    rmdir -- "$wrapper" 2>/dev/null || true
-    return 1
+    log ERROR "Quarantine move was unsuccessful; recovery manifest retained: $manifest"; return 1
   fi
-
-  if ! normalize_quarantine_permissions "$wrapper"; then
-    ((ERRORS++)) || true
-    log "ERROR" "Payload was quarantined but its ownership or permissions could not be normalized: $wrapper"
-    return 1
-  fi
-
-  local proof_json
-  proof_json="$(cat "$proof_file")"
-
-  if ! jq -n \
-    --arg version "$VERSION" \
-    --arg runId "$RUN_ID" \
-    --arg quarantinedAt "$(timestamp)" \
-    --arg owner "$owner" \
-    --arg category "$category" \
-    --arg downloadId "$download_id" \
-    --arg jobName "$job_name" \
-    --arg originalPath "$source_path" \
-    --arg payloadName "$payload_name" \
-    --argjson completedEpoch "$completed_epoch" \
-    --argjson bytes "$size" \
-    --argjson proof "$proof_json" \
-    '{
-      scriptVersion: $version,
-      runId: $runId,
-      quarantinedAt: $quarantinedAt,
-      owner: $owner,
-      category: $category,
-      downloadId: $downloadId,
-      jobName: $jobName,
-      originalPath: $originalPath,
-      payloadName: $payloadName,
-      completedEpoch: $completedEpoch,
-      bytes: $bytes,
-      importProof: $proof
-    }' > "$manifest"
-  then
-    log "ERROR" "Payload moved but manifest creation failed: $wrapper"
-    return 1
-  fi
-
-  if ! normalize_quarantine_permissions "$manifest"; then
-    ((ERRORS++)) || true
-    log "ERROR" "Quarantine manifest was written but its ownership or permissions could not be normalized: $manifest"
-    return 1
-  fi
+  normalize_quarantine_permissions "$wrapper" || return 1
+  jq --argjson now "$(date +%s)" '.state="committed" | .quarantinedEpoch=$now' "$manifest" >"$committed" &&
+    mv -f -- "$committed" "$manifest" || return 1
+  normalize_quarantine_permissions "$manifest" || return 1
 
   return 0
 }
 
-purge_quarantine() {
-  is_true "$PURGE_QUARANTINE" || {
-    log "INFO" "Quarantine purge is disabled."
-    return 0
-  }
+validate_quarantine_manifest() {
+  local wrapper="$1" manifest="$1/.sabnzbd-cleanup-manifest.json" real owner
+  [[ -d "$wrapper" && ! -L "$wrapper" && -f "$manifest" && ! -L "$manifest" ]] || return 1
+  real=$(realpath -- "$wrapper") || return 1
+  owner=$(basename -- "$(dirname -- "$real")")
+  [[ "$owner" == Sonarr || "$owner" == Radarr ]] || return 1
+  path_is_below "$real" "$QUARANTINE_DIR_REAL/items/$owner" || return 1
+  jq -e --arg owner "$owner" --arg movie "$SAB_MOVIE_DIR_REAL" --arg tv "$SAB_TV_DIR_REAL" '
+    type=="object" and .owner==$owner
+    and (.downloadId|type)=="string" and (.downloadId|length)>0
+    and (.originalPath|type)=="string" and
+      ((.originalPath|startswith($movie+"/")) or (.originalPath|startswith($tv+"/")))
+    and (.bytes|type)=="number" and .bytes>=0
+    and ((.state // "committed")=="committed" or .state=="prepared")
+  ' "$manifest" >/dev/null
+}
 
+inspect_quarantines() {
+  local root list manifest epoch age
+  [[ -d "$QUARANTINE_DIR/items" && ! -L "$QUARANTINE_DIR" ]] || { printf 'No quarantine payloads found.\n'; return 0; }
+  root=$(realpath -- "$QUARANTINE_DIR") || return 1
+  exec 9>"$LOCK_FILE"; flock -n 9 || { printf 'Cleanup is active; inspection deferred.\n' >&2; return 1; }
+  TMP_DIR=$(mktemp -d /tmp/sabnzbd_cleanup.XXXXXX) || return 1
+  list="$TMP_DIR/inspect.list"
+  find "$root/items" -mindepth 3 -maxdepth 3 -name '.sabnzbd-cleanup-manifest.json' -type f -print0 >"$list" || return 1
+  while IFS= read -r -d '' manifest; do
+    jq -c --arg wrapper "${manifest%/*}" --argjson now "$(date +%s)" \
+      '{wrapper:$wrapper,job:.jobName,originalPath,state:(.state // "committed"),quarantinedAt,quarantinedEpoch,bytes,
+        ageDays:(if (.quarantinedEpoch // 0)>0 then (($now-.quarantinedEpoch)/86400|floor) else null end)}' "$manifest" || return 1
+  done <"$list"
+}
+
+restore_quarantine_payload() {
+  local wrapper="$1" manifest="$1/.sabnzbd-cleanup-manifest.json" destination resolved
+  check_mover_guard "before manual quarantine restore" || return $?
+  validate_quarantine_manifest "$wrapper" || { log ERROR "Invalid restore manifest or unsafe wrapper: $wrapper"; return 1; }
+  destination=$(jq -r '.originalPath' "$manifest")
+  resolved=$(realpath -m -- "$destination") || return 1
+  if ! { path_is_below "$resolved" "$SAB_MOVIE_DIR_REAL" || path_is_below "$resolved" "$SAB_TV_DIR_REAL"; }; then log ERROR "Restore path escapes completed-download roots: $destination"; return 1; fi
+  [[ -e "$wrapper/payload" && ! -L "$wrapper/payload" && ! -e "$destination" && ! -L "$destination" ]] || { log ERROR "Restore refused: source missing/unsafe or destination already exists: $destination"; return 1; }
+  if is_true "$DRY_RUN"; then log INFO "[DRY RUN] Would restore $wrapper/payload -> $destination"; return 0; fi
+  mkdir -p -- "$PURGE_RECEIPT_DIR" "$(dirname -- "$destination")" || return 1
+  jq -c --argjson at "$(date +%s)" '. + {auditEvent:"restore_intent",at:$at}' "$manifest" >>"$PURGE_RECEIPT_DIR/$RUN_ID.jsonl" || return 1
+  check_mover_guard "immediately before manual restore" || return $?
+  mv -- "$wrapper/payload" "$destination" || return 1
+  jq -c --argjson at "$(date +%s)" '. + {auditEvent:"restore_verified",at:$at}' "$manifest" >>"$PURGE_RECEIPT_DIR/$RUN_ID.jsonl" || return 1
+  rm -f -- "$manifest"; rmdir -- "$wrapper" 2>/dev/null || true
+  RECOVERY_DETAILS+=("Restored $destination from $wrapper/payload; existing destinations were not overwritten. Permissions outside quarantine were not changed.")
+  ((RECOVERED++)) || true
+  log INFO "Restored quarantined download: $destination"
+}
+
+recover_quarantine_preparations() {
+  local manifests="$TMP_DIR/prepared-manifests.list" manifest wrapper source tmp payload_exists=false source_exists=false
   [[ -d "$QUARANTINE_DIR_REAL/items" ]] || return 0
+  find "$QUARANTINE_DIR_REAL/items" -mindepth 3 -maxdepth 3 -name '.sabnzbd-cleanup-manifest.json' -type f -print0 >"$manifests" || return 1
+  while IFS= read -r -d '' manifest; do
+    jq -e '.state=="prepared"' "$manifest" >/dev/null || continue
+    wrapper=${manifest%/*}
+    validate_quarantine_manifest "$wrapper" || { log ERROR "Invalid interrupted quarantine was preserved: $wrapper"; ((ERRORS++)) || true; continue; }
+    source=$(jq -r '.originalPath' "$manifest")
+    if [[ -e "$wrapper/payload" && ! -e "$source" && ! -L "$source" ]]; then
+      local recorded_size actual_size
+      recorded_size=$(jq -r '.bytes' "$manifest"); actual_size=$(path_size "$wrapper/payload") || return 1
+      if [[ "$recorded_size" != "$actual_size" ]]; then
+        log ERROR "Interrupted payload size differs from its intent: $wrapper/payload; recorded=$recorded_size actual=$actual_size. Payload preserved for review."
+        ((ERRORS++)) || true; continue
+      fi
+      check_mover_guard "before recovering quarantine intent" || return $?
+      normalize_quarantine_permissions "$wrapper" || return 1
+      tmp="$wrapper/.manifest-recovered.$$"
+      jq --argjson now "$(date +%s)" '.state="committed" | .quarantinedEpoch=$now | .recovered=true' "$manifest" >"$tmp" && mv -f -- "$tmp" "$manifest" || return 1
+      normalize_quarantine_permissions "$manifest" || return 1
+      ((RECOVERED++)) || true
+      RECOVERY_DETAILS+=("Recovered interrupted move: $source -> $wrapper/payload; manifest committed; retention restarted conservatively.")
+    elif [[ -e "$source" && ! -e "$wrapper/payload" && ! -L "$wrapper/payload" ]]; then
+      local extras="$TMP_DIR/prepared-extra.list"
+      find "$wrapper" -mindepth 1 -maxdepth 1 ! -name '.sabnzbd-cleanup-manifest.json' -print -quit >"$extras" || return 1
+      if [[ ! -s "$extras" ]]; then
+        mkdir -p -- "$PURGE_RECEIPT_DIR" || return 1
+        jq -c --argjson now "$(date +%s)" '. + {auditEvent:"interrupted_move_not_applied",auditedAt:$now}' "$manifest" >>"$PURGE_RECEIPT_DIR/$RUN_ID.jsonl" || return 1
+        rm -f -- "$manifest" && rmdir -- "$wrapper" || return 1
+        RECOVERY_DETAILS+=("Interrupted move did not occur: source preserved at $source; empty prepared wrapper removed; import proof will be reevaluated.")
+        ((RECOVERED++)) || true
+      else log ERROR "Interrupted quarantine contains unexpected entries; source and wrapper preserved: $wrapper"; ((ERRORS++)) || true; fi
+    else
+      log ERROR "Ambiguous interrupted move preserved: source=$source; quarantine=$wrapper/payload. Neither copy was overwritten or deleted."
+      ((ERRORS++)) || true
+    fi
+  done <"$manifests"
+}
 
-  check_mover_guard "before quarantine purge" || return $?
-
-  local cutoff_minutes=$((QUARANTINE_RETENTION_DAYS * 1440))
-  local wrapper
-  local wrapper_real
-  local manifest
-  local size
-  local owner
-
-  log "INFO" "Checking quarantine entries older than ${QUARANTINE_RETENTION_DAYS} days."
-
+purge_quarantine() {
+  is_true "$PURGE_QUARANTINE" || return 0
+  [[ -d "$QUARANTINE_DIR_REAL/items" ]] || return 0
+  local wrappers="$TMP_DIR/purge-wrappers.list" candidates="$TMP_DIR/purge-candidates.tsv" wrapper manifest epoch at now size inventory receipt tmp count
+  : >"$candidates"
+  now=$(date +%s)
+  mkdir -p -- "$PURGE_RECEIPT_DIR" || return 1
+  find "$PURGE_RECEIPT_DIR" -maxdepth 1 -type f -name '*.jsonl' -mtime "+$PURGE_RECEIPT_RETENTION_DAYS" -delete || return 1
+  find "$QUARANTINE_DIR_REAL/items" -mindepth 2 -maxdepth 2 -type d -print0 >"$wrappers" || return 1
   while IFS= read -r -d '' wrapper; do
     manifest="$wrapper/.sabnzbd-cleanup-manifest.json"
-    [[ -f "$manifest" ]] || {
-      log "WARNING" "Skipping unmarked quarantine directory: $wrapper"
+    if ! validate_quarantine_manifest "$wrapper"; then
+      log WARNING "Quarantine preserved: missing/invalid manifest or unsafe path: $wrapper"; continue
+    fi
+    jq -e '(.state // "committed")=="committed"' "$manifest" >/dev/null || continue
+    epoch=$(jq -r '.quarantinedEpoch // 0' "$manifest")
+    if [[ ! "$epoch" =~ ^[0-9]+$ ]] || ((epoch<=0)); then
+      at=$(jq -r '.quarantinedAt // ""' "$manifest"); epoch=$(date_to_epoch "$at")
+    fi
+    if [[ ! "$epoch" =~ ^[0-9]+$ ]] || ((epoch<=0 || epoch>now)); then
+      log WARNING "Quarantine preserved: trustworthy quarantine timestamp unavailable: $wrapper"; continue
+    fi
+    (( now-epoch>=QUARANTINE_RETENTION_DAYS*86400 )) || continue
+    printf '%s\t%s\n' "$epoch" "$wrapper" >>"$candidates"
+  done <"$wrappers"
+  sort -n "$candidates" -o "$candidates" || return 1
+  receipt="$PURGE_RECEIPT_DIR/$RUN_ID.jsonl"
+  while IFS=$'\t' read -r epoch wrapper; do
+    [[ -n "$wrapper" ]] || continue
+    check_mover_guard "before quarantine purge" || return $?
+    validate_quarantine_manifest "$wrapper" || return 1
+    inventory="$TMP_DIR/purge-inventory.raw"
+    find "$wrapper" -xdev -type f -printf '%P\t%s\0' >"$inventory" || { log ERROR "Incomplete purge inventory; wrapper preserved: $wrapper"; return 1; }
+    tmp="$TMP_DIR/purge-inventory.json"
+    jq -Rs '[split("\u0000")[]|select(length>0)|capture("^(?<path>.*)\t(?<bytes>[0-9]+)$";"s")|.bytes|=tonumber]' "$inventory" >"$tmp" || return 1
+    size=$(jq '[.[].bytes]|add // 0' "$tmp"); count=$(jq 'length' "$tmp")
+    if ((size>MAX_PURGE_BYTES_PER_RUN)); then
+      log WARNING "Oversized expired payload preserved: $wrapper; size=$(bytes_human "$size") exceeds MAX_PURGE_BYTES_PER_RUN=$(bytes_human "$MAX_PURGE_BYTES_PER_RUN"). Other eligible payloads will still be evaluated."
       continue
-    }
-
-    jq empty "$manifest" >/dev/null 2>&1 || {
-      log "WARNING" "Skipping quarantine directory with invalid manifest: $wrapper"
-      continue
-    }
-
-    wrapper_real="$(realpath -- "$wrapper")" || continue
-    owner="$(basename -- "$(dirname -- "$wrapper_real")")"
-    [[ "$owner" == "Sonarr" || "$owner" == "Radarr" ]] || continue
-    path_is_below "$wrapper_real" "${QUARANTINE_DIR_REAL}/items/${owner}" || continue
-
-    size="$(jq -r '.bytes // 0' "$manifest")"
-    [[ "$size" =~ ^[0-9]+$ ]] || size=0
-
+    fi
+    if ((PURGED>=MAX_PURGES_PER_RUN || BYTES_PURGED+size>MAX_PURGE_BYTES_PER_RUN)); then
+      log WARNING "Purge limit reached; retained additional expired payloads for the next run (count limit=$MAX_PURGES_PER_RUN, byte limit=$MAX_PURGE_BYTES_PER_RUN)."; break
+    fi
+    manifest="$wrapper/.sabnzbd-cleanup-manifest.json"
     if is_true "$DRY_RUN"; then
-      log "INFO" "[DRY RUN] Would purge quarantine: $wrapper"
-      ((PURGED++)) || true
-      ((BYTES_PURGED += size)) || true
-      PURGE_DETAILS+=("$wrapper")
-      continue
+      PURGE_DETAILS+=("[DRY RUN] Would purge $(jq -r '.jobName // .downloadId' "$manifest"): $wrapper ($count files, $(bytes_human "$size")); manifest retention satisfied.")
+      ((PURGED++)) || true; ((BYTES_PURGED+=size)) || true; continue
     fi
-
-    # Recheck for every destructive purge so a Mover that starts during a
-    # longer cleanup stops all remaining writes immediately.
-    check_mover_guard "before purging ${wrapper}" || return $?
-
-    if rm -rf -- "$wrapper"; then
-      log "INFO" "Purged quarantine: $wrapper"
-      ((PURGED++)) || true
-      ((BYTES_PURGED += size)) || true
-      PURGE_DETAILS+=("$wrapper")
-    else
-      ((ERRORS++)) || true
-      log "ERROR" "Failed to purge quarantine: $wrapper"
-    fi
-  done < <(
-    find "$QUARANTINE_DIR_REAL/items" \
-      -mindepth 2 \
-      -maxdepth 2 \
-      -type d \
-      -mmin "+${cutoff_minutes}" \
-      -print0 2>/dev/null
-  )
+    jq -nc --slurpfile manifest "$manifest" --slurpfile files "$tmp" --arg wrapper "$wrapper" --argjson now "$now" \
+      '{event:"purge_intent",at:$now,wrapper:$wrapper,manifest:$manifest[0],files:$files[0]}' >>"$receipt" || return 1
+    check_mover_guard "immediately before quarantine deletion" || return $?
+    if rm -rf --one-file-system -- "$wrapper" && [[ ! -e "$wrapper" && ! -L "$wrapper" ]]; then
+      jq -nc --arg wrapper "$wrapper" --argjson now "$(date +%s)" '{event:"purge_verified",at:$now,wrapper:$wrapper}' >>"$receipt" || return 1
+      PURGE_DETAILS+=("Purged $wrapper: $count files, $(bytes_human "$size"); quarantine age=$(((now-epoch)/86400)) days; deletion verified.")
+      ((PURGED++)) || true; ((BYTES_PURGED+=size)) || true
+      log INFO "Purged quarantine: $wrapper; files=$count; bytes=$size; absence verified."
+    else ((ERRORS++)) || true; log ERROR "Quarantine deletion incomplete; remaining entries preserved: $wrapper"; return 1; fi
+  done <"$candidates"
 }
 
 ###############################################################################
@@ -2028,17 +2182,17 @@ process_completed_jobs() {
     ((ELIGIBLE++)) || true
     ((BYTES_ELIGIBLE += size)) || true
 
-    log "INFO" "------------------------------------------------------------"
-    log "INFO" "Verified stranded completed download"
-    log "INFO" "Owner: $owner"
-    log "INFO" "Category: $category"
-    log "INFO" "Release: $job_name"
-    log "INFO" "Download ID: $download_id"
-    log "INFO" "Completed age: ${age_hours}h"
-    log "INFO" "Source path: $source_path"
-    log "INFO" "Source size: $(bytes_human "$size")"
-    log "INFO" "Verified imported paths: $verified_paths"
-    log "INFO" "Remaining source media files: $source_media"
+    log "DEBUG" "------------------------------------------------------------"
+    log "DEBUG" "Verified stranded completed download"
+    log "DEBUG" "Owner: $owner"
+    log "DEBUG" "Category: $category"
+    log "DEBUG" "Release: $job_name"
+    log "DEBUG" "Download ID: $download_id"
+    log "DEBUG" "Completed age: ${age_hours}h"
+    log "DEBUG" "Source path: $source_path"
+    log "DEBUG" "Source size: $(bytes_human "$size")"
+    log "DEBUG" "Verified imported paths: $verified_paths"
+    log "DEBUG" "Remaining source media files: $source_media"
 
     if (( MAX_QUARANTINES_PER_RUN > 0 && QUARANTINED >= MAX_QUARANTINES_PER_RUN )) && ! is_true "$DRY_RUN"; then
       log "WARNING" "Per-run quarantine limit reached; preserving remaining candidates."
@@ -2059,7 +2213,7 @@ process_completed_jobs() {
     if (( quarantine_status == 0 )); then
       ((QUARANTINED++)) || true
       ((BYTES_QUARANTINED += size)) || true
-      QUARANTINE_DETAILS+=("$owner | $job_name | $(bytes_human "$size")")
+      QUARANTINE_DETAILS+=("Quarantined [$owner] $job_name: $source_path -> $LAST_QUARANTINE_DESTINATION ($(bytes_human "$size")); exact import proof and queue protections passed.")
 
       if is_true "$DRY_RUN"; then
         log "INFO" "Action: dry-run candidate only"
@@ -2080,33 +2234,35 @@ process_completed_jobs() {
 ###############################################################################
 
 notify_summary() {
+  NOTIFICATION_FINALIZED=true
   is_true "$SEND_NOTIFICATIONS" || return 0
-  [[ -x "$NOTIFY" ]] || return 0
-
-  if is_true "$DRY_RUN" && ! is_true "$NOTIFY_DRY_RUN"; then
-    return 0
-  fi
-
-  (( NZB_BACKUPS_ELIGIBLE > 0 ||
-     APP_BACKUPS_ELIGIBLE > 0 ||
-     QUARANTINED > 0 ||
-     PURGED > 0 ||
-     ERRORS > 0 )) || return 0
-
-  local importance="normal"
-  (( ERRORS > 0 )) && importance="warning"
-
-  local mode="EXECUTE"
+  if is_true "$DRY_RUN" && ! is_true "$NOTIFY_DRY_RUN"; then return 0; fi
+  local changed=$((NZB_BACKUPS_REMOVED+APP_BACKUPS_REMOVED+QUARANTINED+PURGED+RECOVERED))
+  local warnings="$OPS_ATTENTION_DETAILS" signature previous="" mode="EXECUTE" importance=normal message detail shown=0
+  if [[ -s "${OPS_ATTENTION_FILE:-}" ]]; then warnings=$(cat "$OPS_ATTENTION_FILE"); fi
+  signature=$(printf '%s' "$BACKUP_CLEANUP_STATUS|$STRANDED_CLEANUP_STATUS|$QUARANTINE_PURGE_STATUS|$warnings" | sha256sum | cut -d ' ' -f1)
+  previous=$(jq -r '.lastAttentionSignature // ""' "$OPS_NOTIFICATION_STATE" 2>/dev/null || true)
+  if (( changed==0 && ERRORS==0 )) && [[ -z "$warnings" && -z "$previous" ]]; then return 0; fi
+  if (( changed==0 )) && [[ -n "$warnings" && "$signature" == "$previous" ]]; then return 0; fi
   is_true "$DRY_RUN" && mode="DRY RUN"
-
-  local message
-  message="Mode=${mode}; backup_status=${BACKUP_CLEANUP_STATUS}; backup_files=$((NZB_BACKUPS_ELIGIBLE + APP_BACKUPS_ELIGIBLE)) ($(bytes_human "$((NZB_BACKUP_BYTES + APP_BACKUP_BYTES))")); stranded_status=${STRANDED_CLEANUP_STATUS}; quarantined=${QUARANTINED} ($(bytes_human "$BYTES_QUARANTINED")); purge_status=${QUARANTINE_PURGE_STATUS}; purged=${PURGED} ($(bytes_human "$BYTES_PURGED")); errors=${ERRORS}"
-
-  "$NOTIFY" \
-    -i "$importance" \
-    -s "SABnzbd Cleanup" \
-    -d "Backup and completed-download cleanup summary" \
-    -m "$message" >/dev/null 2>&1 || true
+  (( ERRORS==0 )) || importance=alert
+  [[ -z "$warnings" || "$importance" == alert ]] || importance=warning
+  message="SABnzbd Cleanup v$VERSION | Mode: $mode"$'\n'
+  message+="Backup cleanup: $BACKUP_CLEANUP_STATUS; removed $NZB_BACKUPS_REMOVED NZB backup(s), $APP_BACKUPS_REMOVED application backup(s), $(bytes_human "$((NZB_BACKUP_BYTES+APP_BACKUP_BYTES))") eligible."$'\n'
+  message+="Completed downloads: $STRANDED_CLEANUP_STATUS; quarantined $QUARANTINED payload(s), $(bytes_human "$BYTES_QUARANTINED")."$'\n'
+  message+="Quarantine purge: $QUARANTINE_PURGE_STATUS; purged $PURGED payload(s), $(bytes_human "$BYTES_PURGED"). Recovered interrupted actions: $RECOVERED."$'\n'
+  message+="Protected/skipped: active queue=$QUEUE_PROTECTED; recently changed=$PATH_UNSTABLE; import history unproven=$HISTORY_UNPROVEN; destination unverified=$DESTINATION_UNVERIFIED; source media unaccounted=$SOURCE_UNACCOUNTED; Mover stops=$MOVER_PROTECTED. Errors: $ERRORS."$'\n'
+  for detail in "${RECOVERY_DETAILS[@]}" "${QUARANTINE_DETAILS[@]}" "${PURGE_DETAILS[@]}" "${BACKUP_DETAILS[@]}"; do
+    message+=$'\n'"- $detail"; shown=$((shown+1))
+  done
+  if [[ -n "$warnings" ]]; then message+=$'\n\n'"Exceptions and preserved items:"$'\n'"$warnings"; fi
+  if [[ -n "$previous" && -z "$warnings" && "$ERRORS" == 0 ]]; then message+=$'\n'"Recovery: previously reported cleanup exceptions are no longer present; configured checks completed."; fi
+  ops_notify "$importance" "SABnzbd Cleanup" "Actions, recovery and protected downloads" "$message" || return 1
+  if [[ "$OPS_NOTIFICATION_DELIVERED" == true ]]; then
+    local tmp="$TMP_DIR/notification-state.json" new_signature=""
+    [[ -z "$warnings" && "$ERRORS" == 0 ]] || new_signature="$signature"
+    jq --arg signature "$new_signature" '.lastAttentionSignature=$signature' "$OPS_NOTIFICATION_STATE" >"$tmp" && mv -f -- "$tmp" "$OPS_NOTIFICATION_STATE" || return 1
+  fi
 }
 
 log_detail_list() {
@@ -2124,38 +2280,12 @@ log_detail_list() {
 }
 
 print_summary() {
-  log "INFO" "============================================================"
-  log "INFO" "SABnzbd cleanup v${VERSION} summary"
-  log "INFO" "Mode: $(is_true "$DRY_RUN" && printf 'DRY RUN' || printf 'EXECUTE')"
-  log "INFO" "Runtime: $(runtime)"
-  log "INFO" "Backup cleanup status: $BACKUP_CLEANUP_STATUS"
-  log "INFO" "NZB backups eligible: $NZB_BACKUPS_ELIGIBLE ($(bytes_human "$NZB_BACKUP_BYTES"))"
-  log "INFO" "NZB backups removed: $NZB_BACKUPS_REMOVED"
-  log "INFO" "Application backups eligible: $APP_BACKUPS_ELIGIBLE ($(bytes_human "$APP_BACKUP_BYTES"))"
-  log "INFO" "Application backups removed: $APP_BACKUPS_REMOVED"
-  log "INFO" "Stranded cleanup status: $STRANDED_CLEANUP_STATUS"
-  log "INFO" "SAB records scanned: $SCANNED"
-  log "INFO" "Completed records scanned: $COMPLETED_SCANNED"
-  log "INFO" "Too young: $TOO_YOUNG"
-  log "INFO" "Queue protected: $QUEUE_PROTECTED"
-  log "INFO" "Completed path already absent: $PATH_MISSING"
-  log "INFO" "Recently changed path protected: $PATH_UNSTABLE"
-  log "INFO" "Import history unproven: $HISTORY_UNPROVEN"
-  log "INFO" "Imported destination unverified: $DESTINATION_UNVERIFIED"
-  log "INFO" "Source media unaccounted: $SOURCE_UNACCOUNTED"
-  log "INFO" "Other safety skips: $SAFETY_SKIPPED"
-  log "INFO" "Mover guard stops: $MOVER_PROTECTED"
-  if is_true "$MOVER_GUARD_TRIGGERED"; then
-    log "INFO" "Mover guard context: $MOVER_GUARD_CONTEXT"
+  log INFO "SUMMARY | backups=$BACKUP_CLEANUP_STATUS removed=$((NZB_BACKUPS_REMOVED+APP_BACKUPS_REMOVED)) | stranded=$STRANDED_CLEANUP_STATUS quarantined=$QUARANTINED bytes=$BYTES_QUARANTINED | purge=$QUARANTINE_PURGE_STATUS purged=$PURGED bytes=$BYTES_PURGED | recovered=$RECOVERED errors=$ERRORS runtime=$(runtime)"
+  if [[ "${LOG_LEVEL^^}" == DEBUG ]]; then
+    log_detail_list "Quarantine details:" "${QUARANTINE_DETAILS[@]}"
+    log_detail_list "Purge details:" "${PURGE_DETAILS[@]}"
+    log_detail_list "Recovery details:" "${RECOVERY_DETAILS[@]}"
   fi
-  log "INFO" "Eligible: $ELIGIBLE ($(bytes_human "$BYTES_ELIGIBLE"))"
-  log "INFO" "Quarantined/planned: $QUARANTINED ($(bytes_human "$BYTES_QUARANTINED"))"
-  log "INFO" "Quarantine purge status: $QUARANTINE_PURGE_STATUS"
-  log "INFO" "Purged/planned: $PURGED ($(bytes_human "$BYTES_PURGED"))"
-  log "INFO" "Errors: $ERRORS"
-
-  log_detail_list "Quarantine details:" "${QUARANTINE_DETAILS[@]}"
-  log_detail_list "Purge details:" "${PURGE_DETAILS[@]}"
 }
 
 ###############################################################################
@@ -2166,12 +2296,25 @@ main() {
   local operation_status
   local quarantine_ready=false
 
+  CLI_OPERATION=""; CLI_WRAPPER=""
   parse_args "$@"
+  if [[ "$CLI_OPERATION" == inspect ]]; then inspect_quarantines; return $?; fi
   initialize
+  if [[ -n "$CLI_OPERATION" ]]; then
+    STRANDED_CLEANUP_STATUS="MANUAL_${CLI_OPERATION^^}"
+    validate_stranded_environment || return 1
+    prepare_quarantine_environment || return 1
+    fetch_required_state || { log ERROR "Cannot validate active queues for restore; payload preserved."; return 1; }
+    local restore_id
+    restore_id=$(jq -r '.downloadId' "$CLI_WRAPPER/.sabnzbd-cleanup-manifest.json") || return 1
+    if download_is_active_anywhere "$restore_id"; then log ERROR "Restore refused: exact download is active in an Arr/SAB queue ($restore_id)."; return 1; fi
+    restore_quarantine_payload "$CLI_WRAPPER"
+    return $?
+  fi
 
-  log "INFO" "Starting SABnzbd cleanup v${VERSION}."
-  log "INFO" "DRY_RUN=$DRY_RUN | CLEAN_BACKUPS=$CLEAN_BACKUPS | CLEAN_STRANDED_DOWNLOADS=$CLEAN_STRANDED_DOWNLOADS | PURGE_QUARANTINE=$PURGE_QUARANTINE"
-  log "INFO" "Mover guard enabled: $MOVER_GUARD_ENABLED"
+  log "DEBUG" "Starting SABnzbd cleanup v${VERSION}."
+  log "DEBUG" "DRY_RUN=$DRY_RUN | CLEAN_BACKUPS=$CLEAN_BACKUPS | CLEAN_STRANDED_DOWNLOADS=$CLEAN_STRANDED_DOWNLOADS | PURGE_QUARANTINE=$PURGE_QUARANTINE"
+  log "DEBUG" "Mover guard enabled: $MOVER_GUARD_ENABLED"
 
   check_mover_guard "startup"
   operation_status=$?
@@ -2208,6 +2351,9 @@ main() {
   if is_true "$CLEAN_STRANDED_DOWNLOADS" || is_true "$PURGE_QUARANTINE"; then
     if prepare_quarantine_environment; then
       quarantine_ready=true
+      if [[ -z "$SAB_MOVIE_DIR_REAL" && -d "$SAB_MOVIE_DIR" ]]; then SAB_MOVIE_DIR_REAL=$(realpath -- "$SAB_MOVIE_DIR"); fi
+      if [[ -z "$SAB_TV_DIR_REAL" && -d "$SAB_TV_DIR" ]]; then SAB_TV_DIR_REAL=$(realpath -- "$SAB_TV_DIR"); fi
+      if ! is_true "$DRY_RUN"; then recover_quarantine_preparations || { ((ERRORS++)) || true; log ERROR "Interrupted quarantine recovery incomplete; preserved affected payloads."; }; fi
     else
       is_true "$CLEAN_STRANDED_DOWNLOADS" && STRANDED_CLEANUP_STATUS="SKIPPED_CONFIGURATION"
       is_true "$PURGE_QUARANTINE" && QUARANTINE_PURGE_STATUS="SKIPPED_CONFIGURATION"
@@ -2215,13 +2361,15 @@ main() {
   fi
 
   if is_true "$CLEAN_STRANDED_DOWNLOADS" && is_true "$quarantine_ready"; then
-    log "INFO" "Minimum completed age: ${MIN_COMPLETED_AGE_HOURS}h"
-    log "INFO" "Minimum path stability: ${MIN_PATH_STABLE_HOURS}h"
+    log "DEBUG" "Minimum completed age: ${MIN_COMPLETED_AGE_HOURS}h"
+    log "DEBUG" "Minimum path stability: ${MIN_PATH_STABLE_HOURS}h"
 
     if ! validate_stranded_environment; then
       STRANDED_CLEANUP_STATUS="SKIPPED_CONFIGURATION"
     elif ! fetch_required_state; then
       STRANDED_CLEANUP_STATUS="SKIPPED_API_FAILURE"
+      ((ERRORS++)) || true
+      log ERROR "Sonarr/Radarr/SAB API collection failed; completed-download payloads were preserved."
     else
       STRANDED_CLEANUP_STATUS="RUNNING"
       process_completed_jobs
@@ -2243,7 +2391,7 @@ main() {
   fi
 
   if is_true "$PURGE_QUARANTINE" && is_true "$quarantine_ready"; then
-    log "INFO" "Quarantine retention: ${QUARANTINE_RETENTION_DAYS}d"
+    log "DEBUG" "Quarantine retention: ${QUARANTINE_RETENTION_DAYS}d"
     QUARANTINE_PURGE_STATUS="RUNNING"
     purge_quarantine
     operation_status=$?
@@ -2267,4 +2415,4 @@ main() {
   (( ERRORS == 0 ))
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

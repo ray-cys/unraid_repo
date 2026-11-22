@@ -32,7 +32,7 @@ assert_absent() {
 # shellcheck disable=SC1090
 source "$SCRIPT"
 
-[[ "$SCRIPT_VERSION" == "2.1.0" ]] || fail "unexpected script version"
+[[ "$SCRIPT_VERSION" == "2.2.0" ]] || fail "unexpected script version"
 [[ "$USER_AGENT" == "Arr-Delete-Sync-Tag/$SCRIPT_VERSION" ]] ||
     fail "HTTP User-Agent does not contain the release version"
 

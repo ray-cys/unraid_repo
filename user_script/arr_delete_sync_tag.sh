@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Sonarr + Radarr - Plex Delete Sync and Tagger v2.1.0
+# Sonarr + Radarr - Plex Delete Sync and Tagger v2.2.0
 #
 # Once-daily, persistent-state deletion confirmation for Sonarr and Radarr.
 # Sonarr unmonitors confirmed deleted episodes/seasons and can retire a fully
@@ -15,7 +15,7 @@ umask 077
 # Release version for logs, notifications, and the HTTP User-Agent. State-file
 # version fields below are independent schema versions and must not be changed
 # merely when this release version changes.
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
 
 ###############################################################################
 # CONFIGURATION
@@ -31,6 +31,9 @@ SONARR_STATE_BACKUP="$RUNTIME_DIR/sonarr-state.json.bak"
 RADARR_STATE_FILE="$RUNTIME_DIR/radarr-state.json"
 RADARR_STATE_BACKUP="$RUNTIME_DIR/radarr-state.json.bak"
 NOTIFICATION_STATE_FILE="$RUNTIME_DIR/notification-state.json"
+PENDING_ACTIONS_FILE="$RUNTIME_DIR/pending-actions.json"
+ACTION_RECEIPTS_FILE="$RUNTIME_DIR/action-receipts.jsonl"
+PENDING_NOTIFICATIONS_FILE="$RUNTIME_DIR/pending-notifications.jsonl"
 
 # No trailing slash. Each application keeps its own API key.
 SONARR_URL="http://192.168.50.4:8989"
@@ -38,10 +41,10 @@ SONARR_API_KEY="PUT_YOUR_SONARR_API_KEY_HERE"
 RADARR_URL="http://192.168.50.4:7878"
 RADARR_API_KEY="PUT_YOUR_RADARR_API_KEY_HERE"
 
-# Keep true for at least two scheduled runs before changing it to false.
+# Execution is enabled for this personal installation; set true for a preview.
 # Dry-run still creates state and confirms candidates, but never changes either
 # application. One switch keeps both workflows in the same operating mode.
-DRY_RUN=true
+DRY_RUN=false
 CONFIRMATION_RUNS=2
 
 # A single optional freshness policy applies to both applications. Enabling it
@@ -169,6 +172,9 @@ NOTIFICATION_ITEM_MAX_CHARS=600
 # A progress line is written for the first series and then every N series, so
 # a long library inspection is visibly active without filling the log.
 PROGRESS_LOG_EVERY=25
+LOG_LEVEL="INFO"
+QUARANTINE_COORDINATION_LOCK="/tmp/arr_metadata_quarantine.lock"
+ACTION_RECEIPT_RETENTION_DAYS=365
 
 # ---------------------------------------------------------------------------
 # Persistent logging
@@ -199,6 +205,8 @@ USER_AGENT="Arr-Delete-Sync-Tag/$SCRIPT_VERSION"
 ###############################################################################
 
 APP_CONTEXT="MAIN"
+RUN_ID="$(date +%Y%m%d_%H%M%S)_$$"
+NOTIFICATION_FINALIZED=false
 LOCK_HELD=false
 WORK_STATE=""
 CURRENT_SNAPSHOT_FILE=""
@@ -265,6 +273,7 @@ log() {
     shift
 
     message="$*"
+    [[ "$level" != DEBUG || "${LOG_LEVEL^^}" == DEBUG ]] || return 0
     if [[ "$LOG_LINE_MAX_BYTES" =~ ^[0-9]+$ ]] &&
        (( LOG_LINE_MAX_BYTES > 0 )) &&
        (( ${#message} > LOG_LINE_MAX_BYTES ));
@@ -272,7 +281,7 @@ log() {
         message="${message:0:LOG_LINE_MAX_BYTES} ... [line truncated]"
     fi
 
-    line="[$(date '+%Y-%m-%d %H:%M:%S')] [$APP_CONTEXT] [$level] $message"
+    line="$(date '+%Y-%m-%d %H:%M:%S') | $level | arr_delete_sync_tag v$SCRIPT_VERSION | run=$RUN_ID | $APP_CONTEXT | $message"
     printf '%s\n' "$line" >&2
 
     if [[ "$LOG_READY" == true ]] && ! append_persistent_log "$line"; then
@@ -308,6 +317,8 @@ strip_notification_emoji() {
 initialize_grouped_notifications() {
     local next invalid_backup
 
+    [[ -s "$PENDING_ACTIONS_FILE" ]] || printf '%s\n' '{"version":1,"actions":{}}' >"$PENDING_ACTIONS_FILE"
+    jq -e '.version==1 and (.actions|type)=="object"' "$PENDING_ACTIONS_FILE" >/dev/null || return 1
     [[ "$SEND_GROUPED_NOTIFICATIONS" == true ]] || return 0
 
     if [[ -f "$NOTIFICATION_STATE_FILE" ]] &&
@@ -328,8 +339,16 @@ initialize_grouped_notifications() {
         mv -f -- "$next" "$NOTIFICATION_STATE_FILE" || return 1
     fi
 
-    NOTIFICATION_BATCH="$(mktemp "$RUNTIME_DIR/.notification-batch.XXXXXX")" || return 1
-    : > "$NOTIFICATION_BATCH"
+    # A durable outbox survives crashes and carries items omitted by the email cap.
+    NOTIFICATION_BATCH="$PENDING_NOTIFICATIONS_FILE"
+    : >> "$NOTIFICATION_BATCH"
+    [[ -s "$PENDING_ACTIONS_FILE" ]] || printf '%s\n' '{"version":1,"actions":{}}' >"$PENDING_ACTIONS_FILE"
+    jq -e '.version==1 and (.actions|type)=="object"' "$PENDING_ACTIONS_FILE" >/dev/null || return 1
+    if [[ -s "$ACTION_RECEIPTS_FILE" ]]; then
+        local receipts_tmp="$RUNTIME_DIR/.action-receipts.$$"
+        jq -c --argjson cutoff "$(( $(date +%s)-ACTION_RECEIPT_RETENTION_DAYS*86400 ))" \
+          'select(.finishedAt >= $cutoff)' "$ACTION_RECEIPTS_FILE" >"$receipts_tmp" && mv -f -- "$receipts_tmp" "$ACTION_RECEIPTS_FILE" || return 1
+    fi
 }
 
 append_notification_record() {
@@ -352,14 +371,17 @@ append_notification_record() {
         --arg signature "$signature" \
         --arg title "$title" \
         --arg detail "$detail" \
-        '{
+        --arg run "$RUN_ID" --arg queuedAt "$(date -Iseconds)" \
+        --argjson chunk "$NOTIFICATION_ITEM_MAX_CHARS" \
+        'range(0;([$detail|length,1]|max);$chunk) as $offset | {
+            runId:$run,queuedAt:$queuedAt,
             event: $event,
             severity: $severity,
             app: $app,
             key: $key,
             signature: $signature,
-            title: $title,
-            detail: $detail
+            title: ($title + if ($detail|length)>$chunk then " (detail part " + (($offset/$chunk+1)|tostring) + ")" else "" end),
+            detail: $detail[$offset:$offset+$chunk]
         }' >> "$NOTIFICATION_BATCH"
 }
 
@@ -549,8 +571,15 @@ send_grouped_notification() {
     local importance description mode body="" record entry shown=0 omitted
     local sorted delivered
 
+    NOTIFICATION_FINALIZED=true
     [[ "$SEND_GROUPED_NOTIFICATIONS" == true ]] || return 0
     [[ -n "$NOTIFICATION_BATCH" && -s "$NOTIFICATION_BATCH" ]] || return 0
+    if [[ "$(jq -r '.lastSentAt // ""' "$NOTIFICATION_STATE_FILE")" == "$(date +%Y-%m-%d)"* ]]; then
+        log INFO "Daily grouped notification already sent; pending events retained for the next day."
+        return 0
+    fi
+    local deduplicated="$RUNTIME_DIR/.outbox-deduplicated.$$"
+    jq -sc 'unique_by([.event,.app,.key,.signature,.title,.detail,(if .event=="action" then .runId else "" end)]) | .[]' "$NOTIFICATION_BATCH" >"$deduplicated" && mv -f -- "$deduplicated" "$NOTIFICATION_BATCH" || return 1
 
     total="$(wc -l < "$NOTIFICATION_BATCH" | tr -d ' ')"
     actions="$(jq -s '[.[] | select(.event == "action")] | length' "$NOTIFICATION_BATCH")"
@@ -564,7 +593,8 @@ send_grouped_notification() {
     mode=EXECUTE
     [[ "$DRY_RUN" == true ]] && mode="DRY RUN"
     description="Daily grouped summary: actions=${actions}, attention=${attention}, resolved=${resolved}"
-    body="Mode: ${mode}"$'\n'
+    body="Arr Delete Sync v${SCRIPT_VERSION} | Run ${RUN_ID}"$'\n'
+    body+="Mode: ${mode}; events may include retained earlier-run actions."$'\n'
     body+="Actions: ${actions} | Attention: ${attention} | Resolved: ${resolved}"$'\n\n'
 
     sorted="$(mktemp "$RUNTIME_DIR/.notification-render.XXXXXX")" || return 1
@@ -595,12 +625,9 @@ send_grouped_notification() {
             (if .event == "attention" then "ATTENTION"
              elif .event == "resolved" then "RESOLVED"
              else "ACTION" end) as $label
-            | ("- [" + .app + "] " + .title + " [" + $label + "]"
+            | ("- [" + .app + "] " + .title + " [" + $label + "]" + " (" + (.queuedAt // "earlier run") + ")"
               + if .detail == "" then "" else "\n  " + (.detail | gsub("[\\r\\n]+"; "\n  ")) end) as $text
-            | if ($text | length) > $maximum
-              then $text[0:$maximum] + "\n  Detail shortened; see the persistent log."
-              else $text
-              end
+            | $text
             ' <<< "$record")"
         body+="$entry"$'\n\n'
         printf '%s\n' "$record" >> "$delivered"
@@ -610,7 +637,7 @@ send_grouped_notification() {
 
     omitted=$((total - shown))
     if (( omitted > 0 )); then
-        body+="${omitted} additional item(s) omitted; see ${LOG_FILE}."$'\n'
+        body+="${omitted} additional item(s) remain in the durable notification queue and will be included in a later daily notification."$'\n'
     fi
 
     if [[ ! -x "$NOTIFY_BIN" ]]; then
@@ -637,6 +664,9 @@ send_grouped_notification() {
         log ERROR "Notification was sent, but its suppression state could not be updated."
         return 1
     }
+    local remaining="$RUNTIME_DIR/.notification-remaining.$$"
+    jq -c --slurpfile delivered "$delivered" '. as $event | select(($delivered | index($event)) == null)' \
+        "$NOTIFICATION_BATCH" >"$remaining" && mv -f -- "$remaining" "$NOTIFICATION_BATCH" || return 1
     rm -f -- "$delivered"
     log INFO "Sent one grouped notification with $shown of $total queued item(s)."
 }
@@ -660,10 +690,19 @@ cleanup_app() {
     exit "$status"
 }
 
-cleanup_main() {
+cleanup_notify_preflight_failure() {
+    local reason="$1" marker="/tmp/arr-delete-preflight-$(date +%F).notified"
+    printf '%s\n' "$reason" >&2
+    [[ ! -e "$marker" && -x "$NOTIFY_BIN" ]] || return 0
+    if "$NOTIFY_BIN" -i alert -s "Arr Delete Sync" -d "Preflight failed; cleanup preserved" \
+      -m "$reason"$'\n'"No Arr API changes, sidecar moves, folder removals or retirements were attempted. Existing state and media were preserved." >/dev/null 2>&1; then : >"$marker"; fi
+}
+
+main() {
     local status=$?
-    [[ -n "$NOTIFICATION_BATCH" && -f "$NOTIFICATION_BATCH" ]] &&
-        rm -f -- "$NOTIFICATION_BATCH"
+    if [[ "$NOTIFICATION_FINALIZED" != true && -n "$NOTIFICATION_BATCH" && -s "$NOTIFICATION_BATCH" ]]; then
+        send_grouped_notification || true
+    fi
     if [[ "$LOCK_HELD" == true ]]; then
         rm -f -- "$LOCK_DIR/pid"
         rmdir -- "$LOCK_DIR" 2>/dev/null || true
@@ -913,16 +952,16 @@ normalize_quarantine_permissions() {
 
     # find does not follow symlinks by default. chown -h changes a symlink's
     # own owner; chmod is limited to real directories and regular files.
-    if ! find "$target_real" -xdev -exec chown -h -- "$QUARANTINE_OWNER" {} +; then
+    if ! find "$target_real" -xdev ! -user "$QUARANTINE_OWNER" -exec chown -h -- "$QUARANTINE_OWNER" {} +; then
         log ERROR "Unable to set quarantine owner '$QUARANTINE_OWNER': $target_real"
         failed=true
     fi
-    if ! find "$target_real" -xdev -type d \
+    if ! find "$target_real" -xdev -type d ! -perm "$QUARANTINE_DIRECTORY_MODE" \
         -exec chmod -- "$QUARANTINE_DIRECTORY_MODE" {} +; then
         log ERROR "Unable to set quarantine directory mode $QUARANTINE_DIRECTORY_MODE: $target_real"
         failed=true
     fi
-    if ! find "$target_real" -xdev -type f \
+    if ! find "$target_real" -xdev -type f ! -perm "$QUARANTINE_FILE_MODE" \
         -exec chmod -- "$QUARANTINE_FILE_MODE" {} +; then
         log ERROR "Unable to set quarantine file mode $QUARANTINE_FILE_MODE: $target_real"
         failed=true
@@ -1619,11 +1658,15 @@ quarantine_recorded_sidecars() {
             log ERROR "Quarantine destination already exists; refusing to overwrite it: $destination"
             return 1
         }
+        if [[ "$DEFER_SIDECAR_CLEANUP_WHILE_MOVER" == true ]] && unraid_mover_running; then return 4; fi
+        local move_id
+        move_id=$(journal_intent sidecar "$source" "$source" "$destination" "$expected_hash") || return 1
         if mv -- "$source" "$destination"; then
             normalize_quarantine_permissions "$destination" || {
                 log ERROR "Sidecar was quarantined but its ownership or permissions could not be normalized: $destination"
                 return 1
             }
+            journal_finish "$move_id" "Sidecar quarantined; ownership normalized" || return 1
             log INFO "Quarantined $app_name Kodi sidecar: $source -> $destination"
             [[ -n "$CLEANUP_QUARANTINE_RUN_ID" ]] || \
                 CLEANUP_QUARANTINE_RUN_ID="$QUARANTINE_RUN_ID"
@@ -1653,6 +1696,7 @@ quarantine_recorded_sidecars() {
     fi
 
     if [[ "$REMOVE_EMPTY_MEDIA_FOLDERS" == true ]]; then
+        if [[ "$DEFER_SIDECAR_CLEANUP_WHILE_MOVER" == true ]] && unraid_mover_running; then return 4; fi
         remove_empty_media_dirs "$media_real"
         if [[ -e "$media_real" || -L "$media_real" ]]; then
             CLEANUP_FOLDER_PENDING=true
@@ -1667,12 +1711,145 @@ quarantine_recorded_sidecars() {
 # API: one response body on stdout; useful diagnostics on errors
 ###############################################################################
 
+journal_intent() {
+    local kind="$1" key="$2" source="$3" destination="$4" verification="$5" id tmp
+    id=$(printf '%s' "$APP_CONTEXT|$kind|$key" | sha256sum | cut -d ' ' -f1)
+    if jq -e --arg id "$id" '.actions[$id]!=null' "$PENDING_ACTIONS_FILE" >/dev/null; then
+        log ERROR "Unfinished action $id must be reconciled before another mutation of the same target."; return 1
+    fi
+    local destination_file
+    destination_file=$(mktemp "$RUNTIME_DIR/.intent-payload.XXXXXX") || return 1
+    printf '%s' "$destination" >"$destination_file" || return 1
+    tmp=$(mktemp "$RUNTIME_DIR/.pending-actions.XXXXXX") || return 1
+    jq --arg id "$id" --arg app "$APP_CONTEXT" --arg kind "$kind" --arg source "$source" \
+      --rawfile destination "$destination_file" --arg verification "$verification" --argjson now "$(date +%s)" \
+      '.actions[$id]={app:$app,kind:$kind,source:$source,destination:$destination,verification:$verification,startedAt:$now}' \
+      "$PENDING_ACTIONS_FILE" >"$tmp" && mv -f -- "$tmp" "$PENDING_ACTIONS_FILE" || return 1
+    rm -f -- "$destination_file"
+    printf '%s' "$id"
+}
+
+journal_finish() {
+    local id="$1" result="$2" tmp
+    jq -c --arg id "$id" --arg result "$result" --argjson now "$(date +%s)" \
+      '.actions[$id] + {id:$id,result:$result,finishedAt:$now}' "$PENDING_ACTIONS_FILE" >>"$ACTION_RECEIPTS_FILE" || return 1
+    tmp=$(mktemp "$RUNTIME_DIR/.pending-actions.XXXXXX") || return 1
+    jq --arg id "$id" 'del(.actions[$id])' "$PENDING_ACTIONS_FILE" >"$tmp" && mv -f -- "$tmp" "$PENDING_ACTIONS_FILE"
+}
+
+recover_pending_actions() {
+    if [[ "$DRY_RUN" == true ]]; then
+        log DEBUG "Dry run: pending action recovery is report-only; no journal or filesystem mutation was performed."
+        return 0
+    fi
+    local records="$RUNTIME_DIR/.recovery-records.$$" entry id kind source destination verification body http resolved=0 failed=0
+    jq -c --arg app "$APP_CONTEXT" '.actions|to_entries[]|select(.value.app==$app)' "$PENDING_ACTIONS_FILE" >"$records" || return 1
+    while IFS= read -r entry; do
+        IFS=$'\t' read -r id kind < <(jq -r '[.key,.value.kind]|@tsv' <<<"$entry")
+        source=$(jq -r '.value.source' <<<"$entry"); destination=$(jq -r '.value.destination' <<<"$entry"); verification=$(jq -r '.value.verification' <<<"$entry")
+        if [[ "$kind" == sidecar ]]; then
+            # Revalidate recorded paths; a journal is never authority to escape roots.
+            local source_real destination_real quarantine_real movies_real series_real
+            source_real=$(realpath -m -- "$source") || return 1
+            destination_real=$(realpath -m -- "$destination") || return 1
+            quarantine_real=$(realpath -m -- "$QUARANTINE_ROOT") || return 1
+            movies_real=$(realpath -m -- "$MOVIES_ROOT") || return 1
+            series_real=$(realpath -m -- "$SERIES_ROOT") || return 1
+            if [[ "$destination_real" != "$quarantine_real"/* || ( "$source_real" != "$movies_real"/* && "$source_real" != "$series_real"/* ) ]]; then
+                queue_attention_notification ERROR "$APP_CONTEXT" "Unsafe interrupted sidecar path preserved" "Action $id resolves outside configured media/quarantine roots. No filesystem change was made."
+                failed=$((failed+1)); continue
+            fi
+            if [[ ! -e "$source" && ! -L "$source" && -f "$destination" && ! -L "$destination" ]] &&
+               [[ "$(sha256sum -- "$destination" | cut -d ' ' -f1)" == "$verification" ]]; then
+                normalize_quarantine_permissions "$destination" || return 1
+                journal_finish "$id" "Recovered interrupted sidecar move; destination hash verified" || return 1
+                queue_action_notification "$APP_CONTEXT" "Recovered interrupted sidecar quarantine" "$source -> $destination; SHA-256 matched. Folder cleanup will be reevaluated."
+            elif [[ -f "$source" && ! -e "$destination" && ! -L "$destination" ]]; then
+                journal_finish "$id" "Move did not occur; fresh manifest checks will reevaluate the source" || return 1
+            else
+                queue_attention_notification ERROR "$APP_CONTEXT" "Interrupted sidecar action is ambiguous" "Source: $source; destination: $destination. Both copies were preserved; automatic overwriting is prohibited."
+                failed=$((failed+1))
+            fi
+        elif [[ "$kind" == api ]]; then
+            if [[ "$verification" == PUT && ( "$source" == /api/v3/episode/monitor || "$source" == /api/v3/movie/editor ) ]]; then
+                local ids id_file object_id object_endpoint object_body expected_file desired=0 checked=0 read_failed=false
+                expected_file=$(mktemp "$RUNTIME_DIR/.recovery-payload.XXXXXX") || return 1
+                printf '%s' "$destination" >"$expected_file"
+                ids=$(jq -r '(.episodeIds // .movieIds // [])[]' "$expected_file") || return 1
+                [[ -n "$ids" ]] || read_failed=true
+                while IFS= read -r object_id; do
+                    [[ "$object_id" =~ ^[1-9][0-9]*$ ]] || { read_failed=true; continue; }
+                    if [[ "$source" == /api/v3/episode/monitor ]]; then object_endpoint="/api/v3/episode/$object_id"; else object_endpoint="/api/v3/movie/$object_id"; fi
+                    if ! object_body=$(api_get_json "$object_endpoint") || ! jq -e --argjson id "$object_id" '.id==$id' <<<"$object_body" >/dev/null; then read_failed=true; continue; fi
+                    checked=$((checked+1))
+                    if jq -e --slurpfile expected "$expected_file" '
+                        $expected[0] as $e |
+                        (if ($e|has("monitored")) then .monitored==$e.monitored else true end)
+                        and (if ($e|has("tags")) then (.tags // []) as $actual | all($e.tags[]; . as $tag | ($actual|index($tag))!=null) else true end)
+                      ' <<<"$object_body" >/dev/null; then desired=$((desired+1)); fi
+                done <<<"$ids"
+                rm -f -- "$expected_file"
+                if [[ "$read_failed" == true ]]; then
+                    queue_attention_notification ERROR "$APP_CONTEXT" "Bulk action recovery incomplete" "$source remains pending: one or more exact object IDs could not be read. No bulk PUT was replayed. Action: $id."
+                    failed=$((failed+1))
+                else
+                    journal_finish "$id" "Bulk PUT read-back: $desired/$checked targets currently match requested monitoring/tags; fresh snapshots will reevaluate remaining actions" || return 1
+                    queue_action_notification "$APP_CONTEXT" "Reconciled interrupted bulk update" "$source: $desired of $checked exact objects currently have the requested monitoring/tags. Remaining targets will be reevaluated from fresh Arr state; the old PUT body was not blindly replayed."
+                fi
+                continue
+            fi
+            body=$(mktemp "$RUNTIME_DIR/.recovery-api.XXXXXX") || return 1
+            http=$(curl --silent --show-error --connect-timeout "$HTTP_CONNECT_TIMEOUT" --max-time "$HTTP_MAX_TIME" \
+              --header "X-Api-Key: $ARR_API_KEY" --output "$body" --write-out '%{http_code}' "$ARR_URL$source") || http=000
+            if [[ "$verification" == PUT && "$http" == 200 ]] && jq -e 'type=="object" and (.id|type)=="number" and .id>0' "$body" >/dev/null; then
+                # No blind replay of an old PUT body: fresh snapshots rebuild tags
+                # and monitoring decisions and preserve intervening user changes.
+                journal_finish "$id" "Interrupted PUT reconciled by fresh API read; current object will be reevaluated" || return 1
+                queue_action_notification "$APP_CONTEXT" "Reconciled interrupted API update" "GET $source succeeded. The old request was not replayed; fresh monitoring/tag decisions will use the current Arr record."
+            elif [[ "$verification" == DELETE && "$http" == 404 ]]; then
+                journal_finish "$id" "Interrupted DELETE: API confirms object absent" || return 1
+                queue_action_notification "$APP_CONTEXT" "Confirmed interrupted Arr removal" "$source no longer exists in Arr. No file deletion or duplicate DELETE was performed; review Arr import exclusions if required."
+            elif [[ "$verification" == DELETE && "$http" == 200 ]]; then
+                journal_finish "$id" "Interrupted DELETE did not remove the object; fresh retirement safeguards will reevaluate it" || return 1
+            elif [[ "$verification" == POST && "$http" == 200 ]]; then
+                local label match
+                label=$(jq -r 'if type=="object" then .label // "" else "" end' <<<"$destination" 2>/dev/null) || label=""
+                if [[ "$source" == /api/v3/tag && -n "$label" ]] && jq -e 'type=="array"' "$body" >/dev/null; then
+                    match=$(jq -r --arg label "$label" '[.[]|select(.label==$label and (.id // 0)>0)]|length' "$body")
+                    journal_finish "$id" "Tag POST reconciled from authoritative tag catalog; matches=$match" || return 1
+                    queue_action_notification "$APP_CONTEXT" "Reconciled interrupted tag creation" "Tag '$label': $match exact catalog match(es). The POST was not blindly retried; the current catalog will drive any remaining tag action."
+                else
+                    # A missing command in a bounded command history cannot
+                    # establish that the non-idempotent POST never ran.
+                    queue_attention_notification ERROR "$APP_CONTEXT" "Unverified command submission preserved" "POST $source was interrupted. No automatic POST retry was sent; verify whether Arr accepted it, then use --resolve-pending with the action ID and verified outcome. Action: $id."
+                    failed=$((failed+1))
+                fi
+            else
+                queue_attention_notification ERROR "$APP_CONTEXT" "API action recovery unavailable" "$verification $source remains pending; read-back returned HTTP $http. No mutation was replayed."
+                failed=$((failed+1))
+            fi
+            rm -f -- "$body"
+        else failed=$((failed+1)); fi
+        resolved=$((resolved+1))
+    done <"$records"
+    rm -f -- "$records"
+    (( failed==0 ))
+}
+
 api_request() {
     local method="$1"
     local endpoint="$2"
     local payload="$3"
     local body err http_status curl_status message
 
+    local journal_id="" payload_file=""
+    if [[ -n "$payload" ]]; then
+        payload_file=$(mktemp "$RUNTIME_DIR/.api-payload.XXXXXX") || return 1
+        printf '%s' "$payload" >"$payload_file" || return 1
+    fi
+    if [[ "$method" != GET ]]; then
+        journal_id=$(journal_intent api "$method $endpoint" "$endpoint" "$payload" "$method") || return 1
+    fi
     body="$(mktemp "$RUNTIME_DIR/.${ARR_TEMP_PREFIX}-body.XXXXXX")" || return 1
     err="$(mktemp "$RUNTIME_DIR/.${ARR_TEMP_PREFIX}-error.XXXXXX")" || {
         rm -f -- "$body"
@@ -1697,13 +1874,13 @@ api_request() {
             curl --silent --show-error \
                 --connect-timeout "$HTTP_CONNECT_TIMEOUT" \
                 --max-time "$HTTP_MAX_TIME" \
-                --retry "$HTTP_RETRIES" --retry-all-errors \
+                --retry 0 \
                 --request "$method" \
                 --header "X-Api-Key: $ARR_API_KEY" \
                 --header 'Accept: application/json' \
                 --header 'Content-Type: application/json' \
                 --header "User-Agent: $ARR_USER_AGENT" \
-                --data-binary "$payload" \
+                --data-binary "@$payload_file" \
                 --output "$body" --write-out '%{http_code}' \
                 "$ARR_URL$endpoint" 2>"$err"
         )"
@@ -1712,7 +1889,7 @@ api_request() {
             curl --silent --show-error \
                 --connect-timeout "$HTTP_CONNECT_TIMEOUT" \
                 --max-time "$HTTP_MAX_TIME" \
-                --retry "$HTTP_RETRIES" --retry-all-errors \
+                --retry 0 \
                 --request "$method" \
                 --header "X-Api-Key: $ARR_API_KEY" \
                 --header 'Accept: application/json' \
@@ -1728,12 +1905,13 @@ api_request() {
         [[ -n "$http_status" ]] || http_status=none
         [[ -n "$message" ]] || message="no response body"
         log ERROR "$ARR_NAME $method $endpoint failed (curl=$curl_status HTTP=$http_status): $message"
-        rm -f -- "$body" "$err"
+        rm -f -- "$body" "$err" "${payload_file:-$RUNTIME_DIR/.unused-payload}"
         return 1
     fi
 
+    if [[ -n "$journal_id" ]]; then journal_finish "$journal_id" "HTTP $http_status accepted by $ARR_NAME" || { rm -f -- "$body" "$err"; return 1; }; fi
     cat "$body"
-    rm -f -- "$body" "$err"
+    rm -f -- "$body" "$err" "${payload_file:-$RUNTIME_DIR/.unused-payload}"
 }
 
 api_get_json() {
@@ -1778,29 +1956,31 @@ age_at_least_days() {
 }
 
 load_arr_queue() {
-    local kind="$1"
-    local queue
-    local endpoint
-
-    if [[ "$kind" == sonarr ]]; then
-        endpoint='/api/v3/queue?page=1&pageSize=10000&includeUnknownSeriesItems=true&includeSeries=true&includeEpisode=true'
-    else
-        endpoint='/api/v3/queue?page=1&pageSize=10000&includeUnknownMovieItems=true&includeMovie=true'
-    fi
-    queue="$(api_get_json "$endpoint")" || return 1
-    jq -e 'type == "object" and (.records | type == "array")' \
-        >/dev/null 2>&1 <<< "$queue" || {
-        log ERROR "$ARR_NAME queue response did not contain a records array."
-        return 1
-    }
-
-    if [[ "$kind" == sonarr ]]; then
-        SONARR_QUEUE_JSON="$queue"
-        SONARR_QUEUE_AVAILABLE=true
-    else
-        RADARR_QUEUE_JSON="$queue"
-        RADARR_QUEUE_AVAILABLE=true
-    fi
+    local kind="$1" page=1 loaded=0 total=0 count queue endpoint merged
+    if [[ "$kind" == sonarr ]]; then SONARR_QUEUE_AVAILABLE=false; else RADARR_QUEUE_AVAILABLE=false; fi
+    local pages_file="$RUNTIME_DIR/.${ARR_TEMP_PREFIX}-queue-pages.$$"
+    : >"$pages_file" || return 1
+    while :; do
+        if [[ "$kind" == sonarr ]]; then
+            endpoint="/api/v3/queue?page=$page&pageSize=500&includeUnknownSeriesItems=true&includeSeries=true&includeEpisode=true"
+        else
+            endpoint="/api/v3/queue?page=$page&pageSize=500&includeUnknownMovieItems=true&includeMovie=true"
+        fi
+        queue="$(api_get_json "$endpoint")" || { rm -f -- "$pages_file"; return 1; }
+        if ! jq -e 'type=="object" and (.records|type)=="array" and (.totalRecords|type)=="number"' <<<"$queue" >/dev/null; then
+            rm -f -- "$pages_file"; log ERROR "Incomplete or invalid $ARR_NAME queue response; destructive actions are prohibited."; return 1
+        fi
+        count=$(jq '.records|length' <<<"$queue"); total=$(jq '.totalRecords' <<<"$queue")
+        printf '%s\n' "$queue" >>"$pages_file" || return 1
+        loaded=$((loaded+count))
+        (( loaded>=total )) && break
+        if (( count==0 || page>=1000 )); then rm -f -- "$pages_file"; log ERROR "Truncated $ARR_NAME queue: $loaded/$total"; return 1; fi
+        page=$((page+1))
+    done
+    merged=$(jq -sc '.[0] as $first | . as $pages | $first | .records=[$pages[].records[]]' "$pages_file") || return 1
+    rm -f -- "$pages_file"
+    if [[ "$kind" == sonarr ]]; then SONARR_QUEUE_JSON="$merged"; SONARR_QUEUE_AVAILABLE=true
+    else RADARR_QUEUE_JSON="$merged"; RADARR_QUEUE_AVAILABLE=true; fi
 }
 
 sonarr_queue_has_series() {
@@ -2783,11 +2963,11 @@ cp -- "$STATE_FILE" "$WORK_STATE" || die "Cannot copy state to working file."
 # RUN
 ###############################################################################
 
-log INFO "Starting delete sync (dry-run=$DRY_RUN, confirmations=$CONFIRMATION_RUNS)."
+log DEBUG "Starting delete sync (dry-run=$DRY_RUN, confirmations=$CONFIRMATION_RUNS)."
 if [[ "$TRIGGER_LIBRARY_RESCAN" == true ]]; then
     log INFO "API-only mode: requesting one Sonarr all-library rescan before checking episodes."
 else
-    log INFO "Using Sonarr's current database state; no rescan will be requested."
+    log DEBUG "Using Sonarr's current database state; no rescan will be requested."
 fi
 
 SYSTEM="$(api_get_json "/api/v3/system/status")" || {
@@ -2797,7 +2977,7 @@ SYSTEM="$(api_get_json "/api/v3/system/status")" || {
 if ! jq -e '.appName == "Sonarr"' >/dev/null 2>&1 <<< "$SYSTEM"; then
     die "Configured SONARR_URL did not identify itself as Sonarr."
 fi
-log INFO "Connected to Sonarr $(jq -r '.version // "unknown"' <<< "$SYSTEM")."
+log DEBUG "Connected to Sonarr $(jq -r '.version // "unknown"' <<< "$SYSTEM")."
 
 load_tag_catalog || {
     ((API_FAILURES += 1))
@@ -2816,6 +2996,7 @@ if [[ "$TRIGGER_LIBRARY_RESCAN" == true ]]; then
     }
 fi
 
+recover_pending_actions || die "Unresolved prior actions require review; no further $ARR_NAME mutations were attempted."
 SERIES="$(api_get_json "/api/v3/series")" || {
     ((API_FAILURES += 1))
     die "Could not retrieve series; state was not changed."
@@ -2947,7 +3128,7 @@ while IFS= read -r SERIES_ID; do
                 if [[ "$REQUIRE_DELETE_HISTORY_EVENT" == true ]]; then
                     ACTION_IDS="$IDS_WITH_HISTORY"
                 fi
-                log INFO "History audit: $IDS_WITH_HISTORY_COUNT of $ID_COUNT confirmed episode(s) in $SERIES_TITLE have episodeFileDeleted evidence."
+                log DEBUG "History audit: $IDS_WITH_HISTORY_COUNT of $ID_COUNT confirmed episode(s) in $SERIES_TITLE have episodeFileDeleted evidence."
                 if [[ "$REQUIRE_DELETE_HISTORY_EVENT" == true ]] &&
                    (( IDS_WITH_HISTORY_COUNT < ID_COUNT )); then
                     queue_attention_notification WARNING Sonarr \
@@ -3245,11 +3426,11 @@ if (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )); then
     (( API_FAILURES > 0 || SIDECAR_FAILURES > 0 )) && FAILURE_SEVERITY=ERROR
     queue_attention_notification "$FAILURE_SEVERITY" Sonarr \
         "Daily Sonarr delete-sync completed with failures" \
-        "API failures: $API_FAILURES; History failures: $HISTORY_FAILURES; sidecar failures: $SIDECAR_FAILURES. See $LOG_FILE."
+        "API failures: $API_FAILURES; history failures: $HISTORY_FAILURES; sidecar failures: $SIDECAR_FAILURES. Completed: unmonitored episodes=$EPISODE_ACTIONS, seasons=$SEASON_ACTIONS, series=$SERIES_ACTIONS; sidecars quarantined=$SIDECARS_QUARANTINED, empty folders removed=$FOLDERS_REMOVED, Arr removals=$ARR_REMOVALS. Pending actions were preserved for fresh verification."
     log WARNING "Completed with API, History, or sidecar failures; safe state was saved and unfinished actions will be retried."
     exit 2
 fi
-log INFO "Completed successfully."
+log DEBUG "Completed successfully."
 )
 
 ###############################################################################
@@ -3265,7 +3446,7 @@ validate_common_configuration() {
         return 1
     }
     for command in curl jq mktemp stat sort cut tr cp mv find grep pgrep chown chmod wc \
-        realpath sha256sum dirname rmdir; do
+        realpath sha256sum dirname rmdir flock; do
         command -v "$command" >/dev/null 2>&1 || {
             printf 'Required command not found: %s\n' "$command" >&2
             return 1
@@ -3417,7 +3598,10 @@ main() {
     local sonarr_rc=0 radarr_rc=0 lock_rc=0 notification_rc=0
 
     case "$mode" in
-        all|sonarr|radarr) ;;
+        --help|-h)
+            printf '%s\n' 'Usage: /bin/bash SCRIPT [all|sonarr|radarr] [--dry-run|--execute]' '       /bin/bash SCRIPT --list-pending' '       /bin/bash SCRIPT --resolve-pending ACTION_ID "verified outcome and reason"' 'Execution is enabled by configuration. Preview still updates observation state.' 'Uncertain mutations are not blindly retried; read current Arr state and inspect pending actions.' 'Resolution records an operator decision in the action audit; it does not replay or reverse an action.' 'Notifications contain named actions, paths, preserved blockers and recovery results; unsent events carry forward.'
+            return 0 ;;
+        all|sonarr|radarr|--list-pending|--resolve-pending) ;;
         --version|-V)
             printf 'arr_delete_sync_tag.sh %s\n' "$SCRIPT_VERSION"
             return 0
@@ -3428,15 +3612,18 @@ main() {
             ;;
     esac
 
+    if [[ "$mode" == all || "$mode" == sonarr || "$mode" == radarr ]]; then
+        case "${2:-}" in --dry-run) DRY_RUN=true;; --execute) DRY_RUN=false;; "") ;; *) printf 'Unknown override: %s\n' "$2" >&2; return 2;; esac
+    fi
     command -v mountpoint >/dev/null 2>&1 || {
         printf 'Required command not found: mountpoint\n' >&2
         return 1
     }
     mountpoint -q /mnt/user || {
-        printf '/mnt/user is not mounted; refusing to create runtime state.\n' >&2
+        notify_preflight_failure '/mnt/user is not mounted; runtime state cannot be opened safely.'
         return 1
     }
-    validate_common_configuration || return 1
+    validate_common_configuration || { notify_preflight_failure 'Arr delete-sync configuration or required commands failed validation; execution was stopped before application changes.'; return 1; }
     mkdir -p -- "$RUNTIME_DIR" || return 1
     [[ ! -L "$RUNTIME_DIR" ]] || {
         printf 'RUNTIME_DIR must not be a symlink: %s\n' "$RUNTIME_DIR" >&2
@@ -3446,11 +3633,6 @@ main() {
         printf 'LOG_FILE must not be a symlink: %s\n' "$LOG_FILE" >&2
         return 1
     }
-    initialize_logging || {
-        printf 'Could not initialize persistent logging: %s\n' "$LOG_FILE" >&2
-        return 1
-    }
-
     trap cleanup_main EXIT
     trap 'exit 130' INT TERM
     if acquire_main_lock; then
@@ -3462,8 +3644,28 @@ main() {
             *) die "Cannot acquire unified runtime lock." ;;
         esac
     fi
+    initialize_logging || {
+        printf 'Could not initialize persistent logging: %s\n' "$LOG_FILE" >&2
+        return 1
+    }
+
+    exec 8>"$QUARANTINE_COORDINATION_LOCK"
+    flock -n 8 || { log WARNING "Metadata quarantine is in use; scheduled run deferred without changes."; return 0; }
     remove_stale_temp_files
     initialize_grouped_notifications || die "Could not initialize grouped notification state."
+    if [[ "$mode" == --list-pending ]]; then
+        NOTIFICATION_FINALIZED=true
+        jq '.actions|to_entries|map({id:.key}+.value)' "$PENDING_ACTIONS_FILE"
+        return 0
+    elif [[ "$mode" == --resolve-pending ]]; then
+        local action_id="${2:-}" reason="${*:3}"
+        [[ "$action_id" =~ ^[a-f0-9]{64}$ && -n "$reason" ]] || { printf 'An exact ACTION_ID and verified outcome/reason are required.\n' >&2; return 2; }
+        jq -e --arg id "$action_id" '.actions[$id]!=null' "$PENDING_ACTIONS_FILE" >/dev/null || return 2
+        journal_finish "$action_id" "Operator verified: $reason" || return 1
+        queue_action_notification MAIN "Pending action resolved by operator" "Action $action_id: $reason. No API or media mutation was performed by this resolution command."
+        send_grouped_notification
+        return $?
+    fi
 
     if [[ "$QUARANTINE_KODI_SIDECARS" == true && "$DRY_RUN" == false &&
           -e "$QUARANTINE_ROOT" ]]; then
@@ -3475,7 +3677,7 @@ main() {
     [[ "$QUARANTINE_RUN_ID" =~ ^[0-9]{8}_[0-9]{6}_[0-9]+$ ]] ||
         die "Could not create a valid quarantine run ID."
 
-    log INFO "Starting unified Arr delete workflow v$SCRIPT_VERSION (mode=$mode, dry-run=$DRY_RUN)."
+    log DEBUG "Starting unified Arr delete workflow v$SCRIPT_VERSION (mode=$mode, dry-run=$DRY_RUN)."
 
     if [[ "$mode" == all || "$mode" == sonarr ]]; then
         run_sonarr || sonarr_rc=$?
@@ -3501,7 +3703,7 @@ main() {
         log WARNING "Unified Arr delete workflow completed, but its grouped notification failed."
         return 2
     fi
-    log INFO "Unified Arr delete workflow completed successfully."
+    log DEBUG "Unified Arr delete workflow completed successfully."
 }
 
 
@@ -4221,11 +4423,11 @@ cp -- "$STATE_FILE" "$WORK_STATE" || die "Cannot copy state to working file."
 # RUN
 ###############################################################################
 
-log INFO "Starting delete tagger (dry-run=$DRY_RUN, confirmations=$CONFIRMATION_RUNS)."
+log DEBUG "Starting delete tagger (dry-run=$DRY_RUN, confirmations=$CONFIRMATION_RUNS)."
 if [[ "$TRIGGER_LIBRARY_RESCAN" == true ]]; then
     log INFO "Requesting one Radarr all-library rescan before checking movies."
 else
-    log INFO "Using Radarr's current database state; no rescan will be requested."
+    log DEBUG "Using Radarr's current database state; no rescan will be requested."
 fi
 
 SYSTEM="$(api_get_json "/api/v3/system/status")" || {
@@ -4235,7 +4437,7 @@ SYSTEM="$(api_get_json "/api/v3/system/status")" || {
 if ! jq -e '.appName == "Radarr"' >/dev/null 2>&1 <<< "$SYSTEM"; then
     die "Configured RADARR_URL did not identify itself as Radarr."
 fi
-log INFO "Connected to Radarr $(jq -r '.version // "unknown"' <<< "$SYSTEM")."
+log DEBUG "Connected to Radarr $(jq -r '.version // "unknown"' <<< "$SYSTEM")."
 
 load_tag_catalog || {
     ((API_FAILURES += 1))
@@ -4257,6 +4459,7 @@ fi
 # Keep this potentially large response in a file.  Passing a full library as
 # jq --argjson would put it in exec(2)'s argument vector and can cause
 # "Argument list too long" on larger libraries.
+recover_pending_actions || die "Unresolved prior actions require review; no further $ARR_NAME mutations were attempted."
 CURRENT_SNAPSHOT_FILE="$(mktemp "$STATE_DIR/.movies.XXXXXX")" ||
     die "Cannot create temporary movie snapshot."
 if ! api_get_json "/api/v3/movie" > "$CURRENT_SNAPSHOT_FILE"; then
@@ -4359,7 +4562,7 @@ if (( MOVIES_CONFIRMED > 0 )); then
         ACTION_CANDIDATE_COUNT="$(jq length <<< "$ACTION_CANDIDATES")"
 
         if (( ACTION_CANDIDATE_COUNT == 0 )); then
-            log INFO "All $MOVIES_CONFIRMED confirmed movie(s) already have the '$PLEX_DELETED_MOVIE_TAG' tag."
+            log DEBUG "All $MOVIES_CONFIRMED confirmed movie(s) already have the '$PLEX_DELETED_MOVIE_TAG' tag."
         else
             ELIGIBLE_IDS='[]'
             while IFS= read -r MOVIE; do
@@ -4378,9 +4581,9 @@ if (( MOVIES_CONFIRMED > 0 )); then
                                 die "Could not record History evidence for $MOVIE_LABEL."
                             if [[ "$HISTORY_EVIDENCE" != null ]]; then
                                 ((HISTORY_DELETE_EVENTS += 1))
-                                log INFO "History audit: $MOVIE_LABEL has movieFileDeleted event $(jq -r '.id // "unknown"' <<< "$HISTORY_EVIDENCE") at $(jq -r '.date // "unknown"' <<< "$HISTORY_EVIDENCE")."
+                                log DEBUG "History audit: $MOVIE_LABEL has movieFileDeleted event $(jq -r '.id // "unknown"' <<< "$HISTORY_EVIDENCE") at $(jq -r '.date // "unknown"' <<< "$HISTORY_EVIDENCE")."
                             else
-                                log INFO "History audit: $MOVIE_LABEL has no movieFileDeleted event."
+                                log DEBUG "History audit: $MOVIE_LABEL has no movieFileDeleted event."
                             fi
                         else
                             ((HISTORY_FAILURES += 1))
@@ -4544,11 +4747,11 @@ if (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )); then
     (( API_FAILURES > 0 || SIDECAR_FAILURES > 0 )) && FAILURE_SEVERITY=ERROR
     queue_attention_notification "$FAILURE_SEVERITY" Radarr \
         "Daily Radarr delete-sync completed with failures" \
-        "API failures: $API_FAILURES; History failures: $HISTORY_FAILURES; sidecar failures: $SIDECAR_FAILURES. See $LOG_FILE."
+        "API failures: $API_FAILURES; history failures: $HISTORY_FAILURES; sidecar failures: $SIDECAR_FAILURES. Completed: tags applied=$TAG_ACTIONS, sidecars quarantined=$SIDECARS_QUARANTINED, empty folders removed=$FOLDERS_REMOVED, Arr removals=$ARR_REMOVALS. Pending actions were preserved for fresh verification."
     log WARNING "Completed with API, History, or sidecar failures; safe state was saved and unfinished actions will be retried."
     exit 2
 fi
-log INFO "Completed successfully."
+log DEBUG "Completed successfully."
 )
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

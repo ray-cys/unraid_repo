@@ -34,6 +34,7 @@ assert_contains() {
 
 # shellcheck disable=SC1090
 source "$SCRIPT"
+MIN_RUN_IDLE_HOURS=0
 
 # macOS realpath lacks GNU's harmless -e option used by Unraid. Keep the test
 # focused on lifecycle behavior while preserving canonical path checks.
@@ -140,6 +141,7 @@ MAX_PURGE_BYTES_PER_EXECUTION=$((1024 * 1024))
 PURGE_NOTIFICATION_FILE_LIMIT=2
 PURGE_RECEIPT_RETENTION_DAYS=365
 
+OPS_NOTIFICATION_STATE="$NOTIFICATION_STATE_FILE"
 initialize_notification_state || fail "notification state initialization failed"
 
 RUN_ID="20200101_000000_12345"

@@ -15,7 +15,7 @@
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.2"
+readonly SCRIPT_VERSION="1.3.0"
 readonly REQUIRED_PURGE_CONFIRMATION="DELETE_EXPIRED_QUARANTINE"
 
 ###############################################################################
@@ -46,12 +46,22 @@ MAX_PURGE_BYTES_PER_EXECUTION=$((10 * 1024 * 1024 * 1024))
 # Purging through /mnt/user is safe during parity checks, but defer while Mover
 # is actively changing user-share placement.
 DEFER_PURGE_WHILE_MOVER=true
+QUARANTINE_COORDINATION_LOCK="/tmp/arr_metadata_quarantine.lock"
+# Newly changed runs are protected even when their run ID is old.
+MIN_RUN_IDLE_HOURS=24
 
 LOG_DIR="/mnt/vault/cloud/logs/script/quarantine_lifecycle"
 LOG_FILE="${LOG_DIR}/quarantine-lifecycle.log"
 INDEX_FILE="${LOG_DIR}/quarantine-index.tsv"
 NOTIFICATION_STATE_FILE="${LOG_DIR}/notification-state.json"
-LOG_MAX_BYTES=$((5 * 1024 * 1024))
+OPS_NOTIFICATION_STATE="$NOTIFICATION_STATE_FILE"
+# Compact operational logs; full inventories remain in deletion receipts.
+LOG_LEVEL="${LOG_LEVEL:-INFO}"
+LOG_BACKUP_FILES=2
+LOG_RETENTION_DAYS=30
+LOG_LINE_MAX_BYTES=4096
+
+LOG_MAX_BYTES=$((1 * 1024 * 1024))
 
 # A purge receipt is committed to the vault before its corresponding run is
 # deleted. The notification stays bounded while the receipt preserves every
@@ -69,6 +79,9 @@ LOCK_FILE="/run/quarantine_lifecycle.lock"
 ###############################################################################
 
 START_EPOCH="$(date +%s)"
+NOTIFICATION_ATTEMPTED=false
+OPS_NOTIFICATION_DELIVERED=false
+AUDIT_ATTENTION_DETAILS=""
 RESULT_STATUS="FAILED"
 RESULT_SUMMARY="Quarantine lifecycle exited before completion"
 RECEIPT_WRITTEN=0
@@ -103,27 +116,138 @@ SERIES_REAL=""
 # HELPERS
 ###############################################################################
 
+OPS_SCRIPT_NAME="quarantine_lifecycle"
+OPS_SCRIPT_VERSION="1.3.0"
+OPS_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
+OPS_ATTENTION_DETAILS=""
+OPS_ATTENTION_FILE=""
+OPS_LOG_BYTES=""
+
+# Shared operational logging convention, embedded to keep User Scripts standalone.
+# INFO records actions, warnings and one completion summary. DEBUG adds routine
+# progress. Numbered backups expire by size, count and age; receipts are separate.
+ops_initialize_log() {
+    local file suffix bytes now cutoff
+    [[ ! -L "$LOG_FILE" ]] || return 1
+    now=$(date +%s); cutoff=$((now-LOG_RETENTION_DAYS*86400))
+    for file in "$LOG_FILE".[0-9]*; do
+        [[ -f "$file" ]] || continue
+        suffix=${file##*.}; [[ "$suffix" =~ ^[0-9]+$ ]] || continue
+        bytes=$(stat -c '%s' "$file") || return 1
+        if (( suffix>LOG_BACKUP_FILES || bytes>LOG_MAX_BYTES || (LOG_RETENTION_DAYS>0 && $(stat -c '%Y' "$file")<=cutoff) )); then
+            rm -f -- "$file" || return 1
+        fi
+    done
+    : >>"$LOG_FILE" || return 1
+    OPS_LOG_BYTES=$(stat -c '%s' "$LOG_FILE") || return 1
+    if (( OPS_LOG_BYTES>LOG_MAX_BYTES*4 )); then : >"$LOG_FILE"; OPS_LOG_BYTES=0; fi
+    if (( OPS_LOG_BYTES>=LOG_MAX_BYTES )); then ops_rotate_log || return 1; fi
+}
+
+ops_rotate_log() {
+    local i
+    rm -f -- "$LOG_FILE.$LOG_BACKUP_FILES" || return 1
+    for ((i=LOG_BACKUP_FILES-1;i>=1;i--)); do
+        [[ ! -f "$LOG_FILE.$i" ]] || mv -f -- "$LOG_FILE.$i" "$LOG_FILE.$((i+1))" || return 1
+    done
+    [[ ! -f "$LOG_FILE" ]] || mv -f -- "$LOG_FILE" "$LOG_FILE.1" || return 1
+    : >"$LOG_FILE" || return 1
+    OPS_LOG_BYTES=0
+}
+
+ops_log() {
+    local level="$1" message line size
+    local LC_ALL=C
+    shift; message="$*"
+    [[ "$level" != DEBUG || "${LOG_LEVEL^^}" == DEBUG ]] || return 0
+    case "$level" in
+        WARN|WARNING|ERROR|CRITICAL)
+            OPS_ATTENTION_DETAILS+="- [$level] $message"$'\n'
+            if [[ -n "${OPS_ATTENTION_FILE:-}" ]]; then printf '%s\n' "- [$level] $message" >>"$OPS_ATTENTION_FILE"; fi
+            ;;
+    esac
+    if (( ${#message}>LOG_LINE_MAX_BYTES )); then message="${message:0:LOG_LINE_MAX_BYTES} ... [line truncated]"; fi
+    printf -v line '%s | %s | %s v%s | run=%s | %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$OPS_SCRIPT_NAME" "$OPS_SCRIPT_VERSION" "$OPS_RUN_ID" "$message"
+    printf '%s\n' "$line" >&2
+    [[ -d "${LOG_FILE%/*}" ]] || return 0
+    [[ -n "${OPS_LOG_BYTES:-}" ]] || ops_initialize_log || return 1
+    size=$(( ${#line}+1 ))
+    if (( OPS_LOG_BYTES+size>LOG_MAX_BYTES )); then ops_rotate_log || return 1; fi
+    printf '%s\n' "$line" >>"$LOG_FILE" || return 1
+    OPS_LOG_BYTES=$(( OPS_LOG_BYTES+size ))
+}
+
+# Durable daily outbox. Unsent chunks survive failures, daily limits and caps.
+ops_notification_state() {
+    local tmp
+    [[ ! -L "$OPS_NOTIFICATION_STATE" ]] || return 1
+    if [[ ! -e "$OPS_NOTIFICATION_STATE" ]]; then
+        tmp=$(mktemp "${LOG_DIR}/.notify-state.XXXXXX") || return 1
+        printf '%s\n' '{"version":1,"outbox":[],"attention":{}}' >"$tmp" && mv -f -- "$tmp" "$OPS_NOTIFICATION_STATE" || return 1
+    fi
+    jq -e 'type=="object" and ((.outbox // [])|type)=="array"' "$OPS_NOTIFICATION_STATE" >/dev/null
+}
+
+ops_notify() {
+    local importance="$1" subject="$2" description="$3" message="$4" tmp message_file id
+    OPS_NOTIFICATION_DELIVERED=false
+    ops_notification_state || return 1
+    message_file=$(mktemp "${LOG_DIR}/.notify-message.XXXXXX") || return 1
+    printf '%s' "$message" >"$message_file" || return 1
+    id=$( { printf '%s\n' "$subject" "$description"; cat "$message_file"; } | sha256sum | cut -d ' ' -f1)
+    tmp=$(mktemp "${LOG_DIR}/.notify-outbox.XXXXXX") || return 1
+    jq --arg id "$id" --arg importance "$importance" --arg subject "$subject" --arg description "$description" \
+      --rawfile message "$message_file" --arg at "$(date -Iseconds)" '
+      .outbox //= []
+      | if any(.outbox[]; .eventId==$id) then . else
+          .outbox += [range(0;([$message|length,1]|max);8000) as $offset |
+            {eventId:$id,id:($id+":"+($offset|tostring)),importance:$importance,subject:$subject,description:$description,
+             message:$message[$offset:$offset+8000],offset:$offset,queuedAt:$at}]
+        end
+    ' "$OPS_NOTIFICATION_STATE" >"$tmp" && mv -f -- "$tmp" "$OPS_NOTIFICATION_STATE" || { rm -f -- "$tmp" "$message_file"; return 1; }
+    rm -f -- "$message_file"
+    ops_flush_notifications || return 1
+    if ! jq -e --arg id "$id" 'any(.outbox[]?;.eventId==$id)' "$OPS_NOTIFICATION_STATE" >/dev/null; then OPS_NOTIFICATION_DELIVERED=true; fi
+}
+
+ops_flush_notifications() {
+    local tmp selected body importance subject count today="$(date +%F)" notify_bin="${NOTIFY_BIN:-${NOTIFY:-}}"
+    ops_notification_state || return 1
+    jq -e '(.outbox // []|length)>0' "$OPS_NOTIFICATION_STATE" >/dev/null || return 0
+    [[ "$(jq -r '.lastSentAt // ""' "$OPS_NOTIFICATION_STATE")" != "$today"* ]] || return 0
+    selected=$(mktemp "${LOG_DIR}/.notify-selected.XXXXXX") || return 1
+    jq '[.outbox | sort_by((if .importance=="alert" then 0 elif .importance=="warning" then 1 else 2 end),.queuedAt,.eventId,(.offset // 0)) | .[0]]' "$OPS_NOTIFICATION_STATE" >"$selected" || return 1
+    # Each complete chunk stays below the platform argv limit, including UTF-8.
+    body=$(jq -r '.[0] | "Queued: "+.queuedAt+"\n"+.description+"\n\n"+.message' "$selected")
+    importance=$(jq -r '.[0].importance' "$selected"); subject=$(jq -r '.[0].subject' "$selected")
+    body=$(printf '%s' "$body" | jq -Rsr 'explode | map(select(.!=8205 and .!=8419 and .!=65039 and (. < 9728 or . > 10175) and (. < 126976 or . > 129791))) | implode')
+    count=$(jq '.outbox|length' "$OPS_NOTIFICATION_STATE")
+    if (( count>1 )); then body+=$'\n\n'"$((count-1)) further report chunk(s) remain queued for a later daily notification."; fi
+    if [[ ! -x "$notify_bin" ]] || ! "$notify_bin" -i "$importance" -s "$subject" -d "Operational actions and exceptions" -m "$body" >/dev/null 2>&1; then
+        rm -f -- "$selected"
+        ops_log ERROR "Notification delivery failed; detailed report retained in the daily outbox."
+        return 1
+    fi
+    tmp=$(mktemp "${LOG_DIR}/.notify-sent.XXXXXX") || return 1
+    jq --slurpfile selected "$selected" --arg now "$(date -Iseconds)" \
+      '.outbox |= map(. as $event | select(any($selected[0][]; .id==$event.id)|not)) | .lastSentAt=$now' \
+      "$OPS_NOTIFICATION_STATE" >"$tmp" && mv -f -- "$tmp" "$OPS_NOTIFICATION_STATE" || return 1
+    rm -f -- "$selected"
+    ops_log INFO "Delivered one detailed daily notification; remaining report chunks=$((count-1))."
+}
+
 log() {
-    local level="$1"
-    shift
-    local line
-    printf -v line '%s [%s] %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*"
-    printf '%s\n' "$line"
-    [[ -d "$LOG_DIR" ]] && printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null || true
+    ops_log "$@"
 }
 
 rotate_log() {
-    local size
-    [[ -f "$LOG_FILE" ]] || return 0
-    size="$(stat -c '%s' "$LOG_FILE" 2>/dev/null || printf 0)"
-    (( size < LOG_MAX_BYTES )) || mv -f -- "$LOG_FILE" "${LOG_FILE}.1"
+    ops_initialize_log
 }
 
 notify_unraid() {
     local importance="$1" description="$2" message="$3"
-    [[ -x "$NOTIFY_BIN" ]] || return 0
-    "$NOTIFY_BIN" -i "$importance" -s "Quarantine Lifecycle" \
-        -d "$description" -m "$message" >/dev/null 2>&1 || true
+    NOTIFICATION_ATTEMPTED=true
+    ops_notify "$importance" "Quarantine Lifecycle v$SCRIPT_VERSION" "$description" "$message"
 }
 
 initialize_notification_state() {
@@ -136,8 +260,12 @@ initialize_notification_state() {
         return 0
     fi
 
+    if [[ -e "$NOTIFICATION_STATE_FILE" ]]; then
+        log ERROR "Invalid notification state preserved for review; refusing to discard the durable outbox."
+        return 1
+    fi
     tmp="$(mktemp "${LOG_DIR}/.notification-state.XXXXXX")" || return 1
-    printf '%s\n' '{"version":1,"attention":{}}' >"$tmp" || {
+    printf '%s\n' '{"version":1,"attention":{},"outbox":[]}' >"$tmp" || {
         rm -f -- "$tmp"
         return 1
     }
@@ -171,8 +299,9 @@ clear_attention_state() {
     [[ -n "$previous" ]] || return 0
 
     if [[ "$send_resolution" == true ]]; then
-        notify_unraid normal "Quarantine healthy" \
-            "Previously reported quarantine lifecycle attention items are resolved."
+        notify_unraid normal "Quarantine lifecycle recovered" \
+            "Previously reported lifecycle exceptions cleared. Current audit: $RUNS_SCANNED managed runs, $FILES_SCANNED files, $(human_bytes "$TOTAL_BYTES"); expired=$EXPIRED_RUNS, unmanaged=$UNMANAGED_ENTRIES, scan errors=$SCAN_ERRORS. No unreported purge is implied." || return 1
+        [[ "$OPS_NOTIFICATION_DELIVERED" == true ]] || return 0
     fi
 
     tmp="$(mktemp "${LOG_DIR}/.notification-state.XXXXXX")" || return 1
@@ -188,8 +317,8 @@ notify_attention_once() {
     previous="$(jq -r '.attention.signature // ""' \
         "$NOTIFICATION_STATE_FILE" 2>/dev/null || true)"
     [[ "$signature" != "$previous" ]] || return 0
-    notify_unraid warning "$description" "$message"
-    set_attention_state "$signature"
+    notify_unraid warning "$description" "$message" || return 1
+    [[ "$OPS_NOTIFICATION_DELIVERED" != true ]] || set_attention_state "$signature"
 }
 
 human_bytes() {
@@ -287,6 +416,11 @@ write_run_inventory() {
     : >"$item_file" || return 1
     : >"$candidate_file" || return 1
 
+    local inventory_list="${item_file}.scan"
+    if ! find "$run" -xdev -mindepth 1 ! -type d -printf '%P\t%y\t%s\0' >"$inventory_list"; then
+        log ERROR "Incomplete inventory for $run_id; purge prohibited."; return 1
+    fi
+    sort -z "$inventory_list" -o "$inventory_list" || return 1
     while IFS= read -r -d '' record; do
         item_bytes="${record##*$'\t'}"
         record="${record%$'\t'*}"
@@ -317,10 +451,8 @@ write_run_inventory() {
                 "$item_bytes" "$run_id" "$bucket" "$escaped_path" \
                 >>"$candidate_file" || return 1
         fi
-    done < <(
-        find "$run" -xdev -mindepth 1 ! -type d \
-            -printf '%P\t%y\t%s\0' 2>/dev/null | sort -z
-    )
+    done <"$inventory_list"
+    rm -f -- "$inventory_list"
 }
 
 persist_run_inventory_before_delete() {
@@ -417,6 +549,12 @@ write_receipt() {
 
 cleanup() {
     local rc=$?
+    if (( rc!=0 )) && [[ "$NOTIFICATION_ATTEMPTED" != true && -d "$LOG_DIR" ]]; then
+        notify_unraid alert "Quarantine lifecycle failed" \
+          "Status: $RESULT_STATUS; exit=$rc"$'\n'"$RESULT_SUMMARY"$'\n'"Completed actions: purged $PURGED_RUNS run(s), $PURGED_FILES file(s), $(human_bytes "$PURGED_BYTES")."$'\n'"${OPS_ATTENTION_DETAILS:0:6000}" || true
+    elif [[ -d "$LOG_DIR" ]]; then
+        ops_flush_notifications || rc=1
+    fi
     if (( RECEIPT_WRITTEN == 0 )); then
         write_receipt "$RESULT_STATUS" "$RESULT_SUMMARY"
     fi
@@ -604,14 +742,21 @@ reset_audit_counters() {
 audit_quarantine() {
     local tmp run run_id created age_days files bytes expired
     reset_audit_counters
-    log INFO "Starting quarantine lifecycle audit v$SCRIPT_VERSION"
+    AUDIT_ATTENTION_DETAILS=""
+    log DEBUG "Starting quarantine lifecycle audit v$SCRIPT_VERSION"
     tmp="$(mktemp "${LOG_DIR}/.quarantine-index.XXXXXX")" || return 1
     printf 'run_id\tcreated_epoch\tage_days\tfiles\tbytes\texpired\n' >"$tmp"
 
+    local run_list="${RUNTIME_DIR}/audit-runs.list"
+    if ! find "$QUARANTINE_REAL" -mindepth 1 -maxdepth 1 -print0 >"$run_list"; then
+        rm -f -- "$tmp"; log ERROR "Cannot enumerate quarantine root; previous index preserved."; return 1
+    fi
+    sort -z "$run_list" -o "$run_list" || return 1
     while IFS= read -r -d '' run; do
         run_id="$(basename "$run")"
         valid_run_id "$run_id" || {
             log WARN "Ignoring non-managed quarantine entry: $run_id"
+            AUDIT_ATTENTION_DETAILS+="Unmanaged entry preserved: $run_id"$'\n'
             UNMANAGED_ENTRIES=$((UNMANAGED_ENTRIES + 1))
             continue
         }
@@ -632,9 +777,14 @@ audit_quarantine() {
         fi
         age_days=$(((START_EPOCH - created) / 86400))
         (( age_days < 0 )) && age_days=0
-        if ! files="$(tree_files "$run")" ||
-           ! bytes="$(tree_bytes "$run")" ||
-           ! [[ "$files" =~ ^[[:space:]]*[0-9]+$ && "$bytes" =~ ^[0-9]+$ ]]; then
+        local inventory_sizes="${RUNTIME_DIR}/audit-sizes.txt" inventory_summary
+        if ! find "$run" -xdev -type f -printf '%s\n' >"$inventory_sizes"; then
+            log ERROR "Incomplete file inventory for $run_id; preserving run and prior index."
+            rm -f -- "$tmp"; return 1
+        fi
+        inventory_summary=$(awk '{files++;bytes+=$1} END{printf "%d\t%.0f",files+0,bytes+0}' "$inventory_sizes")
+        IFS=$'\t' read -r files bytes <<<"$inventory_summary"
+        if ! [[ "$files" =~ ^[[:space:]]*[0-9]+$ && "$bytes" =~ ^[0-9]+$ ]]; then
             log ERROR "Unable to inventory managed quarantine run: $run_id"
             SCAN_ERRORS=$((SCAN_ERRORS + 1))
             continue
@@ -650,14 +800,11 @@ audit_quarantine() {
         TOTAL_BYTES=$((TOTAL_BYTES + bytes))
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$run_id" "$created" "$age_days" "$files" "$bytes" "$expired" >>"$tmp"
-    done < <(
-        find "$QUARANTINE_REAL" -mindepth 1 -maxdepth 1 -print0 \
-            2>/dev/null | sort -z
-    )
+    done <"$run_list"
 
     mv -f -- "$tmp" "$INDEX_FILE"
     REMAINING_EXPIRED_RUNS="$EXPIRED_RUNS"
-    log INFO "Audit: $RUNS_SCANNED managed runs, $FILES_SCANNED files, $(human_bytes "$TOTAL_BYTES"), $EXPIRED_RUNS expired, $UNMANAGED_ENTRIES unmanaged, $SCAN_ERRORS scan errors"
+    log DEBUG "Audit: $RUNS_SCANNED managed runs, $FILES_SCANNED files, $(human_bytes "$TOTAL_BYTES"), $EXPIRED_RUNS expired, $UNMANAGED_ENTRIES unmanaged, $SCAN_ERRORS scan errors"
 }
 
 ###############################################################################
@@ -709,6 +856,9 @@ restore_item() {
         return 1
     }
 
+    if [[ "$DEFER_PURGE_WHILE_MOVER" == true ]] && unraid_mover_running; then
+        log ERROR "Restore deferred while Mover is active: $source -> $destination"; return 1
+    fi
     mkdir -p -- "$(dirname "$destination")" || return 1
     mv -- "$source" "$destination" || return 1
     find "$run" -xdev -depth -type d -empty -delete \
@@ -717,7 +867,7 @@ restore_item() {
     RESULT_STATUS="OK"
     RESULT_SUMMARY="Restored $bucket/$relative from $run_id"
     log INFO "$RESULT_SUMMARY -> $destination"
-    notify_unraid normal "Quarantined item restored" "$RESULT_SUMMARY"
+    notify_unraid normal "Quarantined item restored" "$RESULT_SUMMARY"$'\n'"Source: $source"$'\n'"Restored destination: $destination"$'\n'"Existing destination files were not overwritten."
 }
 
 ###############################################################################
@@ -763,23 +913,8 @@ purge_expired() {
         (( created <= START_EPOCH + 300 )) || continue
         age_days=$(((START_EPOCH - created) / 86400))
         (( age_days >= RETENTION_DAYS )) || continue
-        bytes="$(tree_bytes "$run")" || {
-            log ERROR "Unable to size expired quarantine run: $run_id"
-            return 1
-        }
-        [[ "$bytes" =~ ^[0-9]+$ ]] || {
-            log ERROR "Invalid byte count for expired quarantine run: $run_id"
-            return 1
-        }
-        files="$(tree_files "$run")" || {
-            log ERROR "Unable to count files in expired quarantine run: $run_id"
-            return 1
-        }
-        files="${files//[[:space:]]/}"
-        [[ "$files" =~ ^[0-9]+$ ]] || {
-            log ERROR "Invalid file count for expired quarantine run: $run_id"
-            return 1
-        }
+        IFS=$'\t' read -r files bytes < <(awk -F '\t' -v id="$run_id" '$1==id {print $4 "\t" $5}' "$INDEX_FILE")
+        [[ "$files" =~ ^[0-9]+$ && "$bytes" =~ ^[0-9]+$ ]] || { log ERROR "Invalid audited inventory for $run_id"; return 1; }
 
         if (( PURGED_RUNS >= MAX_PURGE_RUNS_PER_EXECUTION ||
               PURGED_BYTES + bytes > MAX_PURGE_BYTES_PER_EXECUTION )); then
@@ -788,14 +923,35 @@ purge_expired() {
             break
         fi
 
+        if (( MIN_RUN_IDLE_HOURS>0 )); then
+            local idle_check="${RUNTIME_DIR}/idle-check.list"
+            find "$run" -xdev -cmin "-$((MIN_RUN_IDLE_HOURS*60))" -print -quit >"$idle_check" || return 1
+            if [[ -s "$idle_check" ]]; then
+                log WARN "Recently changed run $run_id was preserved; retention alone does not authorize purge."
+                continue
+            fi
+        fi
         if ! persist_run_inventory_before_delete \
             "$run" "$run_id" "$age_days" "$files" "$bytes"; then
             log ERROR "Could not commit a complete purge receipt for $run_id; run was preserved"
             return 1
         fi
 
-        log WARN "Purging expired quarantine run: $run_id"
-        rm -rf -- "$run" || {
+        if [[ "$DEFER_PURGE_WHILE_MOVER" == true ]] && unraid_mover_running; then
+            PURGE_DEFERRED_REASON="Unraid Mover became active during purge"; break
+        fi
+        validate_managed_run_path "$run" "$run_id" || return 1
+        local changed_file="${RUNTIME_DIR}/recent-changes.list"
+        if (( MIN_RUN_IDLE_HOURS>0 )); then
+            find "$run" -xdev -cmin "-$((MIN_RUN_IDLE_HOURS*60))" -print -quit >"$changed_file" || return 1
+            if [[ -s "$changed_file" ]]; then
+                log WARN "Preserved recently changed run $run_id; idle requirement=${MIN_RUN_IDLE_HOURS}h"
+                AUDIT_ATTENTION_DETAILS+="Recently changed run preserved: $run_id; requires ${MIN_RUN_IDLE_HOURS}h idle."$'\n'
+                continue
+            fi
+        fi
+        log INFO "Purging expired quarantine run: $run_id; files=$files; bytes=$bytes"
+        rm -rf --one-file-system -- "$run" || {
             log ERROR "Failed to purge: $run"
             return 1
         }
@@ -816,13 +972,10 @@ purge_expired() {
         PURGED_FILES=$((PURGED_FILES + files))
         PURGED_BYTES=$((PURGED_BYTES + bytes))
         PURGE_RUN_DETAILS+="- ${run_id} (${age_days} days): ${files} file(s), $(human_bytes "$bytes"); movies=${INVENTORY_MOVIE_FILES}, series=${INVENTORY_SERIES_FILES}"$'\n'
-    done < <(
-        find "$QUARANTINE_REAL" -mindepth 1 -maxdepth 1 -type d -print0 \
-            2>/dev/null | sort -z
-    )
+    done < <(awk -F '\t' 'NR>1 && $6=="true" {printf "%s%c", $1, 0}' "$INDEX_FILE" | sort -z | while IFS= read -r -d '' id; do printf '%s\0' "$QUARANTINE_REAL/$id"; done)
 
     if (( PURGED_RUNS > 0 )); then
-        log INFO "Refreshing quarantine index after purge"
+        log DEBUG "Refreshing quarantine index after purge"
         audit_quarantine || {
             log ERROR "Purge completed, but the remaining quarantine index could not be refreshed"
             return 1
@@ -867,13 +1020,16 @@ update_lifecycle_notifications() {
         signature+="purge-limit;"
         detail+="Per-execution purge limit reached; remaining runs will be retried."$'\n'
     fi
+    detail+="${AUDIT_ATTENTION_DETAILS:0:6000}"$'\n'
+    detail+="${OPS_ATTENTION_DETAILS:0:6000}"$'\n'
     detail+="Current index: $INDEX_FILE"
 
     if (( PURGED_RUNS > 0 )); then
         detail="$(build_purge_detail)"$'\n\n'"$detail"
         [[ -z "$signature" ]] && importance="normal"
         notify_unraid "$importance" "Quarantine purge completed" \
-            "$RESULT_SUMMARY"$'\n'"$detail"
+            "$RESULT_SUMMARY"$'\n'"$detail" || return 1
+        [[ "$OPS_NOTIFICATION_DELIVERED" == true ]] || return 0
         if [[ -n "$signature" ]]; then
             set_attention_state "$signature"
         else
@@ -893,14 +1049,25 @@ update_lifecycle_notifications() {
 main() {
     local mode="${1:-$DEFAULT_MODE}" failure_detail=""
     trap cleanup EXIT
+    case "$mode" in
+      --help|-h) printf '%s\n' 'Usage: /bin/bash SCRIPT [audit|purge|restore RUN_ID movies|series RELATIVE_PATH|--version]' 'audit changes no quarantine payload. purge defaults to scheduled retention with per-run limits.' 'restore never overwrites an existing path. All modes coordinate with the Arr producer.'; RESULT_STATUS=OK; RESULT_SUMMARY="Help displayed"; trap - EXIT; return 0 ;;
+      --version) printf 'quarantine_lifecycle.sh %s\n' "$SCRIPT_VERSION"; trap - EXIT; return 0 ;;
+    esac
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then RESULT_STATUS=DEFERRED; RESULT_SUMMARY="Another lifecycle run holds the lock"; trap - EXIT; return 0; fi
+    exec 8>"$QUARANTINE_COORDINATION_LOCK"
+    if ! flock -n 8; then RESULT_STATUS=DEFERRED; RESULT_SUMMARY="Quarantine producer is active; payloads preserved"; trap - EXIT; printf '%s\n' "$RESULT_SUMMARY"; return 0; fi
     if ! mountpoint -q /mnt/vault || ! mountpoint -q /mnt/user; then
-        printf 'Required mounts are unavailable: /mnt/vault and/or /mnt/user\n' >&2
+        RESULT_SUMMARY="Required mounts are unavailable: /mnt/vault and/or /mnt/user; no purge or restore was attempted"
+        printf '%s\n' "$RESULT_SUMMARY" >&2
+        if [[ -x "$NOTIFY_BIN" ]]; then "$NOTIFY_BIN" -i alert -s "Quarantine Lifecycle" -d "Required storage unavailable" -m "$RESULT_SUMMARY" >/dev/null 2>&1 || true; NOTIFICATION_ATTEMPTED=true; fi
         return 1
     fi
     mkdir -p -- "$LOG_DIR" || return 1
-    rotate_log
+    rotate_log || return 1
     touch "$LOG_FILE" || return 1
     validate_configuration || return 1
+    [[ "$MIN_RUN_IDLE_HOURS" =~ ^[0-9]+$ ]] || { log ERROR "MIN_RUN_IDLE_HOURS must be nonnegative"; return 1; }
     prune_purge_receipts || {
         log ERROR "Unable to apply purge receipt retention"
         return 1
@@ -909,12 +1076,7 @@ main() {
     PURGE_FILE_CANDIDATES="${RUNTIME_DIR}/purge-candidates.tsv"
     : >"$PURGE_FILE_CANDIDATES" || return 1
 
-    exec 9>"$LOCK_FILE"
-    if ! flock -n 9; then
-        RESULT_SUMMARY="Another quarantine lifecycle run is active"
-        log ERROR "$RESULT_SUMMARY"
-        return 1
-    fi
+
     initialize_notification_state || {
         log ERROR "Unable to initialize notification state"
         return 1
@@ -969,6 +1131,7 @@ main() {
             ;;
     esac
 
+    log INFO "SUMMARY | status=$RESULT_STATUS | $RESULT_SUMMARY | remaining-expired=$REMAINING_EXPIRED_RUNS | unmanaged=$UNMANAGED_ENTRIES scan-errors=$SCAN_ERRORS | runtime=$(( $(date +%s)-START_EPOCH ))s"
     write_receipt "$RESULT_STATUS" "$RESULT_SUMMARY"
 }
 

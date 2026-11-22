@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.9.2
+# ARR Health / Download / Import Monitor v3.10.0
 #
 # PURPOSE
 # -------
@@ -424,6 +424,10 @@ MONITOR_NOTIFICATION_FAILURE_NOTIFY_RUNS=1
 
 # Ignore all possible SAB leftovers younger than this.
 SAB_ORPHAN_IGNORE_HOURS=6
+# Active queue/API health remains on every run; read-only residue inventories
+# run hourly. A planned interval skip preserves prior filesystem issues.
+SAB_FILESYSTEM_SCAN_INTERVAL_MINUTES=60
+DOWNLOAD_LEDGER_FULL_REPLAY_HOURS=24
 
 # Full media still present.
 SAB_MEDIA_WARN_HOURS=12
@@ -6559,7 +6563,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.9.2 lifecycle commands' \
+        'ARR Health Monitor v3.10.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -7779,6 +7783,16 @@ record_monitor_scan_issue() {
 # DOWNLOAD CORRELATION HELPERS
 ###############################################################################
 
+prepare_arr_download_indexes() {
+    local app queue
+    for app in Sonarr Radarr; do
+        case "$app" in Sonarr) queue="$SONARR_QUEUE";; Radarr) queue="$RADARR_QUEUE";; esac
+        [[ -f "$queue" ]] || continue
+        jq 'reduce .records[]? as $item ({}; ($item.downloadId // "" | ascii_downcase) as $id | if $id!="" and .[$id]==null then .[$id]=$item else . end)' \
+          "$queue" >"${TMP_DIR}/${app,,}-download-index.json" || return 1
+    done
+}
+
 arr_queue_item_by_download_id() {
 
     local owner="$1"
@@ -7799,6 +7813,11 @@ arr_queue_item_by_download_id() {
     if [ -z "$queue" ] || [ ! -f "$queue" ]; then
         printf '{}'
         return 0
+    fi
+
+    if [[ -s "${TMP_DIR}/${owner,,}-download-index.json" ]]; then
+        jq -c --arg id "${download_id,,}" '.[$id] // {}' "${TMP_DIR}/${owner,,}-download-index.json"
+        return $?
     fi
 
     jq -c \
@@ -7902,6 +7921,11 @@ arr_tracks_download() {
 
     [ -n "$queue" ] || return 2
     [ -f "$queue" ] || return 2
+
+    if [[ -s "${TMP_DIR}/${app,,}-download-index.json" ]]; then
+        jq -e --arg id "${download_id,,}" 'has($id)' "${TMP_DIR}/${app,,}-download-index.json" >/dev/null
+        return $?
+    fi
 
     jq -e \
         --arg id "$download_id" \
@@ -10395,19 +10419,26 @@ process_sab_orphans() {
         return
     fi
 
+    prepare_sab_history_index || return 1
+    local fs_candidates="${TMP_DIR}/sab-filesystem-candidates.jsonl"
+    jq -c --arg movie "${SAB_MOVIE_CATEGORY,,}" --arg tv "${SAB_TV_CATEGORY,,}" \
+      --argjson cutoff "$((START_TIME-SAB_ORPHAN_IGNORE_HOURS*3600))" '
+      .[] | select((.status // "" | ascii_downcase)=="completed")
+      | select((.category // .cat // "" | ascii_downcase) as $cat | $cat==$movie or $cat==$tv)
+      | select(.auditEpoch<=0 or .auditEpoch <= $cutoff)
+    ' "${TMP_DIR}/sab-normalized-history.json" >"$fs_candidates" || return 1
     while IFS= read -r item; do
 
         [ -n "$item" ] || continue
+        runtime_budget_allows_optional_phase "sab-filesystem-batch" || return 1
 
         local status
         local category
         local nzo_id
         local name
 
-        status=$(echo "$item" | jq -r '.status // ""')
-        category=$(echo "$item" | jq -r '.category // .cat // ""')
-        nzo_id=$(echo "$item" | jq -r '.nzo_id // ""')
-        name=$(echo "$item" | jq -r '.name // .nzb_name // "Unknown"')
+        IFS=$'\t' read -r status category nzo_id name < <(jq -r \
+            '[.status // "unknown", .category // .cat // "unknown", .nzo_id // "unknown", .name // .nzb_name // "Unknown"] | @tsv' <<<"$item")
 
         #######################################################################
         # ONLY COMPLETED JOBS
@@ -10476,7 +10507,7 @@ process_sab_orphans() {
         local now
         local age
 
-        completed_epoch=$(sab_completed_epoch "$item")
+        completed_epoch=$(jq -r '.auditEpoch // 0' <<<"$item")
         now=$(date +%s)
 
         if (( completed_epoch <= 0 )); then
@@ -10837,7 +10868,31 @@ process_sab_orphans() {
             debug_log "Notification suppressed: stranded issue already reported"
         fi
 
-    done < <(jq -c '.history.slots[]?' "$SAB_HISTORY")
+    done <"$fs_candidates"
+}
+
+carry_deferred_filesystem_issue_counts() {
+    [[ "$SAB_FILESYSTEM_SCAN_OK" != true ]] || return 0
+    local counts info warning error
+    counts=$(jq -r --rawfile seen "$SEEN_ISSUES_FILE" '
+      ($seen|split("\n")) as $seen
+      | [.issues|to_entries[]|select(.value.active==true)
+         | select(.value.app=="SABnzbd" and (.value.classification // "" | startswith("SAB_STRANDED_")))
+         | select(.key as $key | ($seen|index($key))==null)] as $preserved
+      | [([$preserved[]|select(.value.severity=="INFO")]|length),
+         ([$preserved[]|select(.value.severity=="WARNING")]|length),
+         ([$preserved[]|select(.value.severity=="ERROR")]|length)] | @tsv
+    ' "$STATE_FILE") || return 1
+    IFS=$'\t' read -r info warning error <<<"$counts"
+    INFO_COUNT=$((INFO_COUNT+info)); WARNING_COUNT=$((WARNING_COUNT+warning)); ERROR_COUNT=$((ERROR_COUNT+error))
+    TOTAL_ISSUES=$((TOTAL_ISSUES+info+warning+error))
+}
+
+sab_filesystem_scan_due() {
+    local last
+    last=$(jq -r '.monitor.sabFilesystemLastSuccessfulAt // 0' "$STATE_FILE")
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    (( last<=0 || START_TIME-last >= SAB_FILESYSTEM_SCAN_INTERVAL_MINUTES*60 ))
 }
 
 prepare_sab_filesystem_scan() {
@@ -11843,7 +11898,13 @@ collect_arr_download_ledger() {
     local history_file="$2"
     local queue_file="$3"
 
+    local history_signature="" previous_signature="" replay_at=0
     if [ -f "$history_file" ]; then
+        history_signature=$(sha256sum "$history_file" | awk '{print $1}')
+        previous_signature=$(jq -r --arg app "$app" '.monitor.arrLedgerHistory[$app].signature // ""' "$STATE_FILE")
+        replay_at=$(jq -r --arg app "$app" '.monitor.arrLedgerHistory[$app].replayedAt // 0' "$STATE_FILE")
+    fi
+    if [ -f "$history_file" ] && { [ "$history_signature" != "$previous_signature" ] || (( START_TIME-replay_at >= DOWNLOAD_LEDGER_FULL_REPLAY_HOURS*3600 )); }; then
 
         while IFS= read -r item; do
 
@@ -11905,7 +11966,9 @@ collect_arr_download_ledger() {
                 "$event_type" \
                 "$identity"
 
-        done < <(jq -c '.[]?' "$history_file")
+        done < <(jq -c '.[]? | select(.eventType == "grabbed" or .eventType == "downloadFolderImported" or .eventType == "downloadFailed" or .eventType == "downloadIgnored")' "$history_file")
+        jq -nc --arg app "$app" --arg signature "$history_signature" --argjson now "$START_TIME" \
+          '{app:$app,signature:$signature,replayedAt:$now}' >>"${TMP_DIR}/arr-ledger-cursors.jsonl" || return 1
     fi
 
     if [ -f "$queue_file" ]; then
@@ -11953,119 +12016,63 @@ collect_arr_download_ledger() {
 }
 
 collect_sab_download_ledger() {
-
-    local discovery_cutoff=$((
-        START_TIME - DOWNLOAD_LEDGER_DISCOVERY_HOURS * 3600
-    ))
-
+    local signature="" previous="" last_replay=0 tmp
+    # Queue observations are always fresh, even if completed history is cached.
     if [ "$SAB_QUEUE_OK" = true ] && [ -f "$SAB_QUEUE" ]; then
-
-        while IFS= read -r item; do
-
-            [ -n "$item" ] || continue
-
-            local category
-            local owner
-            local download_id
-            local release
-            local status
-            local queued_at
-
-            category=$(jq -r '.cat // .category // ""' <<<"$item")
-            owner=$(sab_category_owner "$category")
-            [ -n "$owner" ] || continue
-
-            download_id=$(jq -r '.nzo_id // ""' <<<"$item")
-            [ -n "$download_id" ] || continue
-            download_id="${download_id,,}"
-
-            release=$(jq -r '.filename // .name // "Unknown SAB job"' <<<"$item")
-            status=$(jq -r '.status // "unknown"' <<<"$item")
-            queued_at=$(jq -r '.time_added // 0' <<<"$item")
-            [[ "$queued_at" =~ ^[0-9]+$ ]] || queued_at="$START_TIME"
-
-            append_download_ledger_observation \
-                "$download_id" \
-                "$owner" \
-                "$release" \
-                "$release" \
-                "sabQueue" \
-                "$queued_at" \
-                "$START_TIME" \
-                "$status"
-
-        done < <(jq -c '.queue.slots[]?' "$SAB_QUEUE")
+        jq -c --arg movie "${SAB_MOVIE_CATEGORY,,}" --arg tv "${SAB_TV_CATEGORY,,}" --argjson now "$START_TIME" '
+          .queue.slots[]? | (.cat // .category // "" | ascii_downcase) as $cat
+          | select($cat == $movie or $cat == $tv)
+          | (.nzo_id // "" | ascii_downcase) as $id | select($id != "")
+          | {id:$id,app:(if $cat==$movie then "Radarr" else "Sonarr" end),
+             release:(.filename // .name // "Unknown SAB job"),title:(.filename // .name // "Unknown SAB job"),
+             kind:"sabQueue",status:(.status // "unknown"),warning:"",identity:{},
+             eventEpoch:(.time_added | tonumber? // $now),observedAt:$now}
+        ' "$SAB_QUEUE" >>"$DOWNLOAD_LEDGER_OBSERVATIONS_FILE" || return 1
     fi
-
-    if [ "$SAB_HISTORY_OK" = true ] && [ -f "$SAB_HISTORY" ]; then
-
-        while IFS= read -r item; do
-
-            [ -n "$item" ] || continue
-
-            local category
-            local owner
-            local download_id
-            local release
-            local status
-            local event_epoch
-            local observed_at
-            local kind
-
-            category=$(jq -r '.category // .cat // ""' <<<"$item")
-            owner=$(sab_category_owner "$category")
-            [ -n "$owner" ] || continue
-
-            download_id=$(jq -r '.nzo_id // ""' <<<"$item")
-            [ -n "$download_id" ] || continue
-            download_id="${download_id,,}"
-
-            release=$(jq -r '.name // .nzb_name // "Unknown SAB job"' <<<"$item")
-            status=$(jq -r '.status // "unknown"' <<<"$item")
-            event_epoch=$(sab_history_event_epoch "$item")
-            observed_at="$event_epoch"
-
-            case "${status,,}" in
-
-                completed)
-                    kind="sabCompleted"
-                    ;;
-
-                failed)
-                    kind="sabFailed"
-                    ;;
-
-                quickcheck|verifying|repairing|fetching|extracting|moving|running|queued)
-                    kind="sabQueue"
-                    observed_at="$START_TIME"
-                    ;;
-
-                *)
-                    continue
-                    ;;
-            esac
-
-            (( event_epoch > 0 )) || event_epoch="$observed_at"
-
-            if [ "$kind" = "sabCompleted" ] &&
-               (( event_epoch < discovery_cutoff )) &&
-               ! download_ledger_id_is_enrolled "$download_id"
-            then
-                continue
-            fi
-
-            append_download_ledger_observation \
-                "$download_id" \
-                "$owner" \
-                "$release" \
-                "$release" \
-                "$kind" \
-                "$event_epoch" \
-                "$observed_at" \
-                "$status"
-
-        done < <(jq -c '.history.slots[]?' "$SAB_HISTORY")
+    [ "$SAB_HISTORY_OK" = true ] && [ -f "$SAB_HISTORY" ] || return 0
+    signature=$(sha256sum "$SAB_HISTORY" | awk '{print $1}')
+    previous=$(jq -r '.monitor.sabLedgerCacheSignature // ""' "$STATE_FILE")
+    last_replay=$(jq -r '.monitor.sabLedgerLastReplayAt // 0' "$STATE_FILE")
+    if [ "$signature" = "$previous" ] && (( START_TIME-last_replay < DOWNLOAD_LEDGER_FULL_REPLAY_HOURS*3600 )); then
+        debug_log "SAB ledger history unchanged; retained unresolved ledger records continue reconciliation"
+        return 0
     fi
+    tmp="${TMP_DIR}/sab-ledger-batch.jsonl"
+    # One JSON pass replaces per-history-item jq/date/process invocations.
+    # Preserve the original timestamp for GNU-date fallback on future formats.
+    jq -c --slurpfile state "$STATE_FILE" --arg movie "${SAB_MOVIE_CATEGORY,,}" --arg tv "${SAB_TV_CATEGORY,,}" \
+      --argjson now "$START_TIME" --argjson cutoff "$((START_TIME-DOWNLOAD_LEDGER_DISCOVERY_HOURS*3600))" '
+      def epoch: if type=="number" then floor else (tonumber? // (try (sub("\\.[0-9]+Z$";"Z") | fromdateiso8601) catch 0)) end;
+      .history.slots[]? | (.category // .cat // "" | ascii_downcase) as $cat
+      | select($cat==$movie or $cat==$tv)
+      | (.nzo_id // "" | ascii_downcase) as $id | select($id!="")
+      | (.status // "unknown" | ascii_downcase) as $status
+      | (if $status=="completed" then "sabCompleted" elif $status=="failed" then "sabFailed"
+         elif (["quickcheck","verifying","repairing","fetching","extracting","moving","running","queued"] | index($status))!=null then "sabQueue" else "" end) as $kind
+      | select($kind!="")
+      | (.completed // .completed_time // .completedTime // .completionTime // .time_completed // "") as $raw
+      | ($raw | epoch) as $epoch
+      | {id:$id,app:(if $cat==$movie then "Radarr" else "Sonarr" end),
+         release:(.name // .nzb_name // "Unknown SAB job"),title:(.name // .nzb_name // "Unknown SAB job"),
+         kind:$kind,status:(.status // "unknown"),warning:"",identity:{},
+         eventEpoch:$epoch,observedAt:(if $kind=="sabQueue" then $now else $epoch end),rawEpoch:$raw,
+         enrolled:($state[0].downloadLedger[$id].flowEnrolled // false)}
+      | select(.kind!="sabCompleted" or .eventEpoch==0 or .eventEpoch >= $cutoff or .enrolled)
+    ' "$SAB_HISTORY" >"$tmp" || return 1
+    local record raw epoch
+    # Rare fallback records retain the existing permissive date parser.
+    while IFS= read -r record; do
+        raw=$(jq -r '.rawEpoch' <<<"$record")
+        epoch=$(date_to_epoch "$raw")
+        jq -c --argjson epoch "$epoch" '.eventEpoch=(if $epoch>0 then $epoch elif .kind=="sabQueue" then .observedAt else $epoch end) | if .kind!="sabQueue" then .observedAt=$epoch else . end' <<<"$record" >>"${tmp}.fallback" || return 1
+    done < <(jq -c 'select(.eventEpoch<=0)' "$tmp")
+    jq -c 'select(.eventEpoch>0) | del(.rawEpoch,.enrolled)' "$tmp" >>"$DOWNLOAD_LEDGER_OBSERVATIONS_FILE" || return 1
+    if [ -s "${tmp}.fallback" ]; then
+        jq -c --argjson cutoff "$((START_TIME-DOWNLOAD_LEDGER_DISCOVERY_HOURS*3600))" \
+          'select(.kind!="sabCompleted" or .eventEpoch >= $cutoff or .enrolled) | del(.rawEpoch,.enrolled)' \
+          "${tmp}.fallback" >>"$DOWNLOAD_LEDGER_OBSERVATIONS_FILE" || return 1
+    fi
+    SAB_LEDGER_NEW_SIGNATURE="$signature"
 }
 
 update_download_ledger_state() {
@@ -13398,6 +13405,7 @@ perform_download_ledger_reconciliation() {
     while IFS= read -r record; do
 
         [ -n "$record" ] || continue
+        runtime_budget_allows_optional_phase "exact-history-batch" || return 1
 
         download_id=$(jq -r '.id' <<<"$record")
         app=$(jq -r '.app // ""' <<<"$record")
@@ -13451,6 +13459,7 @@ perform_download_ledger_reconciliation() {
     while IFS=$'\t' read -r download_id app; do
 
         [ -n "$download_id" ] || continue
+        runtime_budget_allows_optional_phase "exact-file-batch" || return 1
 
         refreshed_record=$(jq -c \
             --arg id "${download_id,,}" \
@@ -13513,12 +13522,15 @@ process_download_ledger_issues() {
     now=$(date +%s)
 
     jq -c \
-        '.downloadLedger // {} | to_entries[]? | .value' \
+        '.downloadLedger // {} | to_entries[]? | .value
+          | select(.flowEnrolled == true)
+          | select(([.arrImportedAt,.arrFailedAt,.arrIgnoredAt,.arrReconciledAt,.manuallyDismissedAt,.sabFailedAt] | map(. // 0) | max) <= 0)' \
         "$STATE_FILE" >"$records_file" || return 1
 
     while IFS= read -r record; do
 
         [ -n "$record" ] || continue
+        runtime_budget_allows_optional_phase "download-ledger-batch" || return 1
 
         local download_id
         local app
@@ -13684,6 +13696,7 @@ process_exact_download_ledger() {
     [ "$ACTIVITY_AUDIT_ENABLED" = true ] || return 0
 
     : >"$DOWNLOAD_LEDGER_OBSERVATIONS_FILE"
+    : >"${TMP_DIR}/arr-ledger-cursors.jsonl"
 
     if ! prepare_download_ledger_enrollment_cache; then
         log "ERROR: Unable to prepare exact download workflow enrollment cache"
@@ -13704,11 +13717,24 @@ process_exact_download_ledger() {
             "$RADARR_QUEUE"
     fi
 
-    collect_sab_download_ledger
+    SAB_LEDGER_NEW_SIGNATURE=""
+    collect_sab_download_ledger || return 1
 
     if ! update_download_ledger_state; then
         log "ERROR: Unable to update exact download workflow ledger"
         return 1
+    fi
+
+    if [ -s "${TMP_DIR}/arr-ledger-cursors.jsonl" ]; then
+        local arr_cursor_tmp="${TMP_DIR}/state.arr-ledger-cursors.json"
+        jq --slurpfile cursors "${TMP_DIR}/arr-ledger-cursors.jsonl" \
+          'reduce $cursors[] as $c (.; .monitor.arrLedgerHistory[$c.app]=$c)' "$STATE_FILE" >"$arr_cursor_tmp" && save_state "$arr_cursor_tmp" || return 1
+    fi
+    if [ -n "$SAB_LEDGER_NEW_SIGNATURE" ]; then
+        local cursor_tmp="${TMP_DIR}/state.sab-ledger-cursor.json"
+        jq --arg signature "$SAB_LEDGER_NEW_SIGNATURE" --argjson now "$START_TIME" \
+          '.monitor.sabLedgerCacheSignature=$signature | .monitor.sabLedgerLastReplayAt=$now' \
+          "$STATE_FILE" >"$cursor_tmp" && save_state "$cursor_tmp" || return 1
     fi
 
     if ! perform_download_ledger_reconciliation; then
@@ -13766,133 +13792,41 @@ sab_history_event_epoch() {
 # PROCESS RECENT SAB ACTIVITY - v2.5
 ###############################################################################
 
+prepare_sab_history_index() {
+    local output="${TMP_DIR}/sab-normalized-history.json" fallback="${TMP_DIR}/sab-date-fallback.jsonl" row ordinal raw epoch
+    [[ -s "$output" ]] && return 0
+    : >"$fallback"
+    jq '[.history.slots[]? | . + {auditEpoch:((.completed // .completed_time // .completedTime // .completionTime // .time_completed // "") | tonumber? // 0)}]' \
+        "$SAB_HISTORY" >"$output" || return 1
+    while IFS= read -r row; do
+        ordinal=$(jq -r '.key' <<<"$row")
+        raw=$(jq -r '.value | .completed // .completed_time // .completedTime // .completionTime // .time_completed // ""' <<<"$row")
+        epoch=$(date_to_epoch "$raw")
+        jq -nc --argjson ordinal "$ordinal" --argjson epoch "$epoch" '{ordinal:$ordinal,epoch:$epoch}' >>"$fallback" || return 1
+    done < <(jq -c 'to_entries[] | select(.value.auditEpoch<=0)' "$output")
+    if [[ -s "$fallback" ]]; then
+        jq --slurpfile changes "$fallback" 'reduce $changes[] as $c (.; .[$c.ordinal].auditEpoch=$c.epoch)' "$output" >"${output}.merged" && mv -f -- "${output}.merged" "$output" || return 1
+    fi
+}
+
 process_sab_activity_audit() {
-
-    if [ "$SAB_SCAN_OK" != true ] ||
-       [ -z "$SAB_HISTORY" ] ||
-       [ ! -f "$SAB_HISTORY" ]
-    then
-
-        SAB_AUDIT_OK=false
-        return
-    fi
-
-    local loaded
-    local total_available
-    local oldest_epoch=0
-
-    loaded=$(
-        jq '.history.slots // [] | length' \
-            "$SAB_HISTORY" 2>/dev/null ||
-            echo 0
-    )
-
-    total_available=$(
-        jq '.history.noofslots // (.history.slots // [] | length)' \
-            "$SAB_HISTORY" 2>/dev/null ||
-            echo "$loaded"
-    )
-
-    while IFS= read -r item; do
-
-        [ -n "$item" ] || continue
-
-        local status
-        local category
-        local event_epoch
-
-        status=$(
-            echo "$item" |
-                jq -r '.status // ""'
-        )
-
-        category=$(
-            echo "$item" |
-                jq -r '.category // .cat // ""'
-        )
-
-        event_epoch=$(sab_history_event_epoch "$item")
-
-        if (( event_epoch <= 0 )); then
-            continue
-        fi
-
-        if (( oldest_epoch == 0 || event_epoch < oldest_epoch )); then
-            oldest_epoch="$event_epoch"
-        fi
-
-        if (( event_epoch < AUDIT_CUTOFF_EPOCH )); then
-            continue
-        fi
-
-        #######################################################################
-        # F1 IS AUDIT-IGNORED
-        #######################################################################
-
-        if [ "${category,,}" = "${SAB_IGNORED_CATEGORY,,}" ]; then
-
-            ((SAB_AUDIT_F1_IGNORED++)) || true
-            continue
-        fi
-
-        #######################################################################
-        # MOVIES
-        #######################################################################
-
-        if [ "${category,,}" = "${SAB_MOVIE_CATEGORY,,}" ]; then
-
-            case "${status,,}" in
-
-                completed)
-                    ((SAB_AUDIT_MOVIE_COMPLETED++)) || true
-                    ;;
-
-                failed)
-                    ((SAB_AUDIT_MOVIE_FAILED++)) || true
-                    ;;
-            esac
-
-            continue
-        fi
-
-        #######################################################################
-        # TV
-        #######################################################################
-
-        if [ "${category,,}" = "${SAB_TV_CATEGORY,,}" ]; then
-
-            case "${status,,}" in
-
-                completed)
-                    ((SAB_AUDIT_TV_COMPLETED++)) || true
-                    ;;
-
-                failed)
-                    ((SAB_AUDIT_TV_FAILED++)) || true
-                    ;;
-            esac
-        fi
-
-    done < <(
-        jq -c '.history.slots[]?' "$SAB_HISTORY"
-    )
-
-    ###########################################################################
-    # DETECT POSSIBLY TRUNCATED HISTORY
-    #
-    # If the paginated safety cap was reached and even the oldest loaded record
-    # is newer than our requested audit cutoff, relevant records may remain.
-    ###########################################################################
-
+    SAB_AUDIT_OK=false
+    [[ "$SAB_SCAN_OK" == true && -f "$SAB_HISTORY" ]] || return 1
+    prepare_sab_history_index || return 1
+    local counts loaded total oldest
+    counts=$(jq -r --arg movie "${SAB_MOVIE_CATEGORY,,}" --arg tv "${SAB_TV_CATEGORY,,}" --arg ignored "${SAB_IGNORED_CATEGORY,,}" --argjson cutoff "$AUDIT_CUTOFF_EPOCH" '
+      . as $all | map(select(.auditEpoch >= $cutoff)) as $recent
+      | [($all|length), ([$all[].auditEpoch|select(.>0)]|min // 0),
+          ([$recent[]|select((.category // .cat // "" | ascii_downcase)==$ignored)]|length),
+          ([$recent[]|select((.category // .cat // "" | ascii_downcase)==$movie and (.status|ascii_downcase)=="completed")]|length),
+          ([$recent[]|select((.category // .cat // "" | ascii_downcase)==$movie and (.status|ascii_downcase)=="failed")]|length),
+          ([$recent[]|select((.category // .cat // "" | ascii_downcase)==$tv and (.status|ascii_downcase)=="completed")]|length),
+          ([$recent[]|select((.category // .cat // "" | ascii_downcase)==$tv and (.status|ascii_downcase)=="failed")]|length)] | @tsv
+    ' "${TMP_DIR}/sab-normalized-history.json") || return 1
+    IFS=$'\t' read -r loaded oldest SAB_AUDIT_F1_IGNORED SAB_AUDIT_MOVIE_COMPLETED SAB_AUDIT_MOVIE_FAILED SAB_AUDIT_TV_COMPLETED SAB_AUDIT_TV_FAILED <<<"$counts"
+    total=$(jq '.history.noofslots // (.history.slots|length)' "$SAB_HISTORY")
     SAB_AUDIT_WINDOW_INCOMPLETE=false
-
-    if (( loaded < total_available )) &&
-       (( oldest_epoch > AUDIT_CUTOFF_EPOCH ))
-    then
-
-        SAB_AUDIT_WINDOW_INCOMPLETE=true
-    fi
-
+    if ((loaded<total && oldest>AUDIT_CUTOFF_EPOCH)); then SAB_AUDIT_WINDOW_INCOMPLETE=true; fi
     SAB_AUDIT_OK=true
 }
 
@@ -15178,7 +15112,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.9.2"
+    "START | ARR Health Monitor v3.10.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -15191,7 +15125,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.9.2"
+debug_log "Starting ARR Health Monitor v3.10.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -15512,6 +15446,7 @@ if [ "$RADARR_ENABLED" = true ]; then
     fi
 fi
 
+prepare_arr_download_indexes || log "WARNING: Exact download index unavailable; direct queue lookups retained"
 end_monitor_phase "service-collection"
 
 ###############################################################################
@@ -15668,17 +15603,29 @@ fi
 # SAB CROSS-APP CHECK
 ###############################################################################
 
-if runtime_budget_allows_optional_phase "sab-filesystem-scan"; then
+if sab_filesystem_scan_due; then
+  if runtime_budget_allows_optional_phase "sab-filesystem-scan"; then
     start_monitor_phase "sab-filesystem-scan"
     prepare_sab_filesystem_scan || true
-    process_sab_orphans
+    if ! process_sab_orphans; then SAB_FILESYSTEM_SCAN_OK=false; fi
+    if [ "$SAB_FILESYSTEM_SCAN_OK" = true ] && [ "$SAB_HISTORY_OK" = true ] &&
+       [ "$SONARR_QUEUE_OK" = true ] && [ "$RADARR_QUEUE_OK" = true ]; then
+        fs_cursor_tmp="${TMP_DIR}/state.filesystem-cursor.json"
+        jq --argjson now "$START_TIME" '.monitor.sabFilesystemLastSuccessfulAt=$now' "$STATE_FILE" >"$fs_cursor_tmp" && save_state "$fs_cursor_tmp"
+    fi
     end_monitor_phase "sab-filesystem-scan"
-else
+  else
     SAB_FILESYSTEM_SCAN_OK=false
     SAB_FILESYSTEM_SCAN_DEFERRED=true
     SAB_FILESYSTEM_SCAN_REASON="Runtime budget deferred filesystem scan"
+  fi
+else
+    SAB_FILESYSTEM_SCAN_OK=false
+    SAB_FILESYSTEM_SCAN_DEFERRED=true
+    SAB_FILESYSTEM_SCAN_REASON="Scheduled hourly filesystem audit not due; prior issues preserved"
 fi
 
+carry_deferred_filesystem_issue_counts || log "WARNING: Could not summarize preserved filesystem issues"
 prune_sab_progress_state
 
 ###############################################################################
@@ -15765,7 +15712,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.9.2 completed"
+log "ARR Health Monitor v3.10.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""
