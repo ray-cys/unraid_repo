@@ -31,6 +31,7 @@ START_TIME=$(TZ=Asia/Singapore date -d '2026-11-23 00:05:00' +%s)
 fixture_now="$START_TIME"
 fixture_profiles='[{"id":2,"name":"HD","minFormatScore":10,"cutoff":7,"items":[{"allowed":true,"quality":{"id":7}}],"formatItems":[{"format":1,"score":100}]}]'
 fixture_formats='[{"id":1,"specifications":[]}]'
+fixture_file='{}'
 fixture_episode='{"id":11,"seriesId":1,"seasonNumber":1,"episodeNumber":1,"title":"Episode One","monitored":true,"hasFile":false,"episodeFileId":0,"airDateUtc":"2026-11-01T00:00:00Z"}'
 fixture_series='{"id":1,"title":"Show","monitored":true,"qualityProfileId":2,"tags":[],"seasons":[{"seasonNumber":1,"monitored":true}]}'
 fixture_movie='{"id":31,"title":"Movie","monitored":true,"hasFile":false,"movieFileId":0,"isAvailable":true,"added":"2026-11-01T00:00:00Z","tags":[],"qualityProfileId":2}'
@@ -134,6 +135,17 @@ jq -e '.receipts["Sonarr:abc-123"].targets["episode:11:21"].fileId==21 and .rece
 # Once a target is known to have imported, do not resurrect it through search
 # when its file later goes missing and native deletion history has aged out.
 missing_hold
+# Cache projections lacking parent resources are safely enriched from exact
+# current object/file/path identity, then retained on subsequent compact events.
+fixture_episode=$(jq '.hasFile=true|.episodeFileId=21' <<<"$fixture_episode")
+fixture_series=$(jq '.tvdbId=1001' <<<"$fixture_series")
+fixture_file='{"id":21,"seriesId":1,"path":"/data/series/show/old-name.mkv","size":1000}'
+START_TIME=$((START_TIME+86401))
+capture_durable_import_receipts
+jq -e '.receipts["Sonarr:abc-123"].targets["episode:11:21"].parentExternalId==1001' "$STATE_DIR/import-receipts.json" >/dev/null
+capture_durable_import_receipts
+jq -e '.receipts["Sonarr:abc-123"].targets["episode:11:21"].parentExternalId==1001' "$STATE_DIR/import-receipts.json" >/dev/null
+fixture_episode=$(jq '.hasFile=false|.episodeFileId=0' <<<"$fixture_episode")
 # Receipt conflicts never overwrite original payload ownership evidence.
 jq '.history.slots[0].storage="/data/net/complete/series/different"' "$SAB_HISTORY" >"$fixture/new"; mv "$fixture/new" "$SAB_HISTORY"
 capture_durable_import_receipts

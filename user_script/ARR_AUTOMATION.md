@@ -5,7 +5,7 @@ log/state directories. No shared runtime script, extra cron job, API-key file or
 watchdog is required. Keep the current schedules. New notifications use the
 existing grouped delivery, deduplication, size limits and emoji filtering.
 
-## arr_health_activity.sh 3.13.0
+## arr_health_activity.sh 3.13.1
 
 The five-minute monitor now captures native import evidence, audits quality
 configuration, retries allowlisted transient imports, and performs bounded
@@ -100,7 +100,11 @@ Native `downloadFolderImported` events are captured while history is available.
 Two older completed SAB jobs per scan are also considered for backfill; pruned
 history cannot be fabricated. Receipts retain exact download, native event,
 movie/episode/parent and **file IDs**, original paths, TVDB/TMDB identity when
-provided, import times and immutable SAB job identity. They remain for 365 days.
+provided, import times and immutable SAB job identity. If incremental history
+omits embedded resources, up to four exact native file/parent lookups per scan
+fill the identity after proving the original path, or an original native event
+that still exposes the same external ID. Enriched identity is retained when a
+later compact history entry omits it. They remain for 365 days.
 Conflicting evidence is preserved and is not used for quarantine.
 
 Accepted/completed search/scan commands do **not** prove a successful import.

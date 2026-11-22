@@ -3,7 +3,7 @@
 See [ARR_AUTOMATION.md](ARR_AUTOMATION.md) for the shared action windows,
 combined budgets, profile-change holds and the four-script integration.
 
-`arr_health_activity.sh` 3.13.0 monitors Sonarr, Radarr and SABnzbd and can
+`arr_health_activity.sh` 3.13.1 monitors Sonarr, Radarr and SABnzbd and can
 resolve narrowly proven import-policy rejections. No additional schedule is
 needed: keep its five-minute schedule and the existing four-hour import batches.
 The monitor makes no direct library filesystem checks for these decisions.

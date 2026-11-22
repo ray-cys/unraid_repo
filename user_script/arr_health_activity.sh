@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.13.0
+# ARR Health / Download / Import Monitor v3.13.1
 #
 # PURPOSE
 # -------
@@ -6583,7 +6583,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.13.0 lifecycle commands' \
+        'ARR Health Monitor v3.13.1 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -15011,6 +15011,52 @@ append_native_import_receipt_events() {
               pathAtImport:.data.importedPath,droppedPath:(.data.droppedPath // ""),importedAt:$epoch,historyId:.id}}' "$2" >>"$3" || return 1
 }
 
+# Incremental history in older Arr/cache versions may omit embedded Series /
+# Movie resources. Add stable identity only after exact native object/file/path
+# verification. Four lookups per scan bound API work; failed proofs retry daily.
+enrich_import_receipt_identities() {
+    local document="$1" list="$TMP_DIR/receipt-identity-candidates.jsonl" entry app receipt_key target_key root key kind target parent file_id
+    local current="$TMP_DIR/receipt-identity-target.json" media="$TMP_DIR/receipt-identity-file.json" owner="$TMP_DIR/receipt-identity-parent.json"
+    local expected="$TMP_DIR/receipt-identity-expected.json" history="$TMP_DIR/receipt-identity-history.json" external owner_kind tmp="$TMP_DIR/receipt-identities-updated.json"
+    jq -c --argjson now "$START_TIME" '[.receipts|to_entries[]|select(.value.conflict!=true)|. as $r|
+      .value.targets|to_entries[]|select((.value.parentExternalId // 0)==0 and $now-(.value.identityCheckedAt // 0)>=86400)|
+      {app:$r.value.app,downloadId:$r.value.downloadId,receiptKey:$r.key,targetKey:.key,target:.value}]|.[:4][]' "$document" >"$list" || return 1
+    while IFS= read -r entry; do
+        runtime_budget_allows_optional_phase import-receipt-identity || break
+        app=$(jq -r '.app' <<<"$entry"); receipt_key=$(jq -r '.receiptKey' <<<"$entry"); target_key=$(jq -r '.targetKey' <<<"$entry")
+        printf '%s' "$entry" | jq '.target' >"$expected"
+        kind=$(jq -r '.kind' "$expected"); target=$(jq -r '.targetId' "$expected"); parent=$(jq -r '.parentId' "$expected"); file_id=$(jq -r '.fileId' "$expected")
+        jq --arg r "$receipt_key" --arg t "$target_key" --argjson now "$START_TIME" '.receipts[$r].targets[$t].identityCheckedAt=$now' "$document" >"$tmp" && mv -- "$tmp" "$document" || return 1
+        IFS=$'\t' read -r root key < <(arr_reconciliation_connection "$app")
+        api_get "$root/$kind/$target" "$key" "$current" && api_get "$root/${kind}file/$file_id" "$key" "$media" || continue
+        jq -e --slurpfile e "$expected" '.id==$e[0].targetId and .hasFile==true and
+          (if $e[0].kind=="episode" then .seriesId==$e[0].parentId and .episodeFileId==$e[0].fileId and
+            ($e[0].seasonNumber==null or .seasonNumber==$e[0].seasonNumber) and ($e[0].episodeNumber==null or .episodeNumber==$e[0].episodeNumber)
+           else .movieFileId==$e[0].fileId end)' "$current" >/dev/null || continue
+        jq -e --slurpfile e "$expected" '.id==$e[0].fileId and
+          (if $e[0].kind=="episode" then .seriesId==$e[0].parentId else .movieId==$e[0].parentId end)' "$media" >/dev/null || continue
+        owner_kind=movie; [ "$kind" != episode ] || owner_kind=series
+        if [ "$kind" = movie ]; then cp -- "$current" "$owner" || return 1
+        else api_get "$root/$owner_kind/$parent" "$key" "$owner" || continue; fi
+        external=$(jq -r --arg kind "$kind" 'if $kind=="episode" then (.tvdbId // 0) else (.tmdbId // 0) end' "$owner")
+        [[ "$external" =~ ^[1-9][0-9]*$ ]] || continue
+        if ! jq -e --slurpfile e "$expected" '.path==$e[0].pathAtImport' "$media" >/dev/null; then
+            # A rename that preceded enrichment requires the ORIGINAL exact
+            # native event to expose the same stable external identity.
+            fetch_arr_history_by_download_id "$app" "$(jq -r '.downloadId' <<<"$entry")" "$history" || continue
+            jq -e --slurpfile e "$expected" --argjson external "$external" 'any(.records[]?;
+              .eventType=="downloadFolderImported" and .id==$e[0].historyId and (.data.fileId|tonumber?)==$e[0].fileId and
+              .data.importedPath==$e[0].pathAtImport and
+              (if $e[0].kind=="episode" then .seriesId==$e[0].parentId and .episodeId==$e[0].targetId and .series.tvdbId==$external
+               else .movieId==$e[0].targetId and .movie.tmdbId==$external end))' "$history" >/dev/null || continue
+        fi
+        jq --arg r "$receipt_key" --arg t "$target_key" --argjson external "$external" --slurpfile current "$current" '
+          .receipts[$r].targets[$t].parentExternalId=$external |
+          .receipts[$r].targets[$t].seasonNumber=(.receipts[$r].targets[$t].seasonNumber // $current[0].seasonNumber // null) |
+          .receipts[$r].targets[$t].episodeNumber=(.receipts[$r].targets[$t].episodeNumber // $current[0].episodeNumber // null)' "$document" >"$tmp" && mv -- "$tmp" "$document" || return 1
+    done <"$list"
+}
+
 capture_durable_import_receipts() {
     [ "$IMPORT_RECEIPTS_ENABLED" = true ] || return 0
     local file="$STATE_DIR/import-receipts.json" tmp="$TMP_DIR/import-receipts-working.json" events="$TMP_DIR/import-proof-events.jsonl"
@@ -15057,7 +15103,7 @@ capture_durable_import_receipts() {
               .monitor.importReceiptBackfill |= with_entries(select(.value>=$cutoff))' "$STATE_FILE" >"$state_tmp" && save_state "$state_tmp" || return 1
         fi
     fi
-    [ -s "$events" ] || return 0
+    # Enrich old receipts even when this scan has no new native imports.
     # SAB UUID + immutable job identity bind imported evidence to the payload.
     [ "$SAB_HISTORY_OK" = true ] && [ -f "$SAB_HISTORY" ] || return 0
     local merged="$TMP_DIR/import-receipts.merged.json"
@@ -15071,9 +15117,16 @@ capture_durable_import_receipts() {
             .sab=(.sab // $jobs[$e.downloadId]) |
             .firstImportAt=([(.firstImportAt // $e.importedAt),$e.importedAt]|min) |
             .lastImportAt=([(.lastImportAt // 0),$e.importedAt]|max) |
-            .targets[($e.target.kind+":"+($e.target.targetId|tostring)+":"+($e.target.fileId|tostring))]=$e.target)
+            ($e.target.kind+":"+($e.target.targetId|tostring)+":"+($e.target.fileId|tostring)) as $targetKey |
+            (.targets[$targetKey] // {}) as $prior |
+            .conflict=(.conflict or (($prior.parentExternalId // 0)>0 and ($e.target.parentExternalId // 0)>0 and $prior.parentExternalId!=$e.target.parentExternalId)) |
+            .targets[$targetKey]=($prior+$e.target |
+              .parentExternalId=(if ($prior.parentExternalId // 0)>0 then $prior.parentExternalId else ($e.target.parentExternalId // 0) end) |
+              .seasonNumber=($e.target.seasonNumber // $prior.seasonNumber // null) |
+              .episodeNumber=($e.target.episodeNumber // $prior.episodeNumber // null)))
         end) |
       .receipts |= with_entries(select(.value.conflict==true or .value.lastImportAt>=$cutoff))' "$tmp" >"$merged" || return 1
+    enrich_import_receipt_identities "$merged" || return 1
     automation_publish_document "$merged" "$file" receipts || return 1
     debug_log 'Captured exact download/file-ID import receipts; unchanged evidence requires no storage rewrite'
 }
@@ -16195,7 +16248,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.13.0"
+    "START | ARR Health Monitor v3.13.1"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -16208,7 +16261,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.13.0"
+debug_log "Starting ARR Health Monitor v3.13.1"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -16827,7 +16880,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.13.0 completed"
+log "ARR Health Monitor v3.13.1 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""
