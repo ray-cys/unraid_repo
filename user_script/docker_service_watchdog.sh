@@ -1,10 +1,10 @@
 #!/bin/bash
-# Docker Service Watchdog v3.2 -- Unraid service availability and bounded recovery.
+# Docker Service Watchdog v3.3 -- Unraid service availability and bounded recovery.
 # Optional schedule: every five minutes. Pi-hole and application-specific health
 # remain owned by the DNS and Arr monitors. All recovery is disabled by default.
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.2"
+readonly SCRIPT_VERSION="3.3"
 
 ###############################################################################
 # CONFIGURATION
@@ -17,7 +17,7 @@ SERVICE_SPECS=(
     "sonarr|http://192.168.50.4:8989/ping|always|0"
     "radarr|http://192.168.50.4:7878/ping|always|0"
     "sabnzbd|http://192.168.50.4:8080/|always|0"
-    "qbittorrent||always|0"
+    "qbittorrent|https://qbittorrent.taila4be9.ts.net/api/v2/app/version|always|0"
     "kometa||always|0"
     "recyclarr||always|0"
     "imagemaid||always|0"
@@ -69,6 +69,14 @@ PROBE_RULES=(
     "photoprism|2342|/|recognize|[Pp]hoto[Pp]rism"
 )
 DOCKER_HOST_IP="192.168.50.4"
+# profile|exact hostname|TCP port|verified IPv4 address
+# Per-request DNS overrides; HTTPS still validates the URL hostname/certificate.
+# Hubble cannot resolve this MagicDNS name, but this Tailscale route returned
+# v5.3.0/HTTP 200. Update/remove the entry if the Tailscale node is recreated.
+# These overrides never change system DNS, Docker ports, or VPN configuration.
+PROBE_ADDRESS_OVERRIDES=(
+    "qbittorrent|qbittorrent.taila4be9.ts.net|443|100.64.251.79"
+)
 # Optional per-container files: NAME.headers (curl header-file syntax) and
 # NAME.cookies (Netscape cookie jar). Credentials are never printed or placed
 # on curl's command line. Supply qBittorrent auth for its protected API.
@@ -663,6 +671,35 @@ safe_probe_target() {
     printf '%s\n' "$1" | sed -E 's#(https?://)[^/@]*@#\1[REDACTED]@#; s/[?#].*$//'
 }
 
+probe_address_args() {
+    local name="$1" url="$2" profile authority host port rule owner rule_host rule_port address extra octet matched=0
+    local -a octets=()
+    PROBE_ADDRESS_ARGS=(); PROBE_ADDRESS_NOTE=""
+    profile="${PROFILE_BY_NAME[$name]:-$name}"
+    [[ "$url" =~ ^https?://([^/?#]+) ]] || return 0
+    authority="${BASH_REMATCH[1]##*@}"
+    host="${authority%%:*}"; host="${host,,}"
+    if [[ "$authority" == *:* ]]; then port="${authority##*:}"
+    elif [[ "$url" == https://* ]]; then port=443
+    else port=80; fi
+    for rule in "${PROBE_ADDRESS_OVERRIDES[@]}"; do
+        IFS='|' read -r owner rule_host rule_port address extra <<<"$rule"
+        [[ "$owner" == "$profile" ]] || continue
+        [[ -z "$extra" && "$rule_host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ &&
+            "$rule_port" =~ ^[1-9][0-9]{0,4}$ && "$address" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+        (( rule_port <= 65535 )) || return 1
+        IFS='.' read -r -a octets <<<"$address"
+        for octet in "${octets[@]}"; do
+            # Reject ambiguous leading-zero forms as well as invalid octets.
+            [[ "$octet" == 0 || "$octet" != 0* ]] && (( 10#$octet <= 255 )) || return 1
+        done
+        [[ "$host" == "${rule_host,,}" && "$port" == "$rule_port" ]] || continue
+        matched=$((matched + 1)); (( matched == 1 )) || return 1
+        PROBE_ADDRESS_ARGS=(--resolve "$host:$port:$address")
+        PROBE_ADDRESS_NOTE="; address override=$address"
+    done
+}
+
 readiness_probe() {
     local name="$1" url="$2" rule profile port path kind pattern info body code rc response redirect origin target_origin redirects=0 limit target route_index=0
     local -a args=() routes=()
@@ -688,9 +725,13 @@ readiness_probe() {
     origin="${BASH_REMATCH[1]}"
     while :; do
         target="$(safe_probe_target "$url")"
+        if ! probe_address_args "$name" "$url"; then
+            PROBE_RESULT=unconfigured; PROBE_MESSAGE='Invalid or duplicate probe address override; review PROBE_ADDRESS_OVERRIDES'; return 0
+        fi
+        target+="$PROBE_ADDRESS_NOTE"
         response="$(curl --silent --noproxy '*' --proto '=http,https' --output "$body" \
             --connect-timeout "$HTTP_CONNECT_TIMEOUT" --max-time "$HTTP_MAX_TIME" \
-            --max-filesize "$limit" --write-out '%{http_code}\n%{redirect_url}' "${args[@]}" "$url")"; rc=$?
+            --max-filesize "$limit" --write-out '%{http_code}\n%{redirect_url}' "${args[@]}" "${PROBE_ADDRESS_ARGS[@]}" "$url")"; rc=$?
         code="${response%%$'\n'*}"; redirect=""
         [[ "$response" != *$'\n'* ]] || redirect="${response#*$'\n'}"
         if (( rc == 3 || rc == 60 || rc == 63 || rc == 77 )); then PROBE_RESULT=unconfigured; PROBE_MESSAGE="Probe URL/TLS/response-size configuration requires review (curl=$rc; limit=${limit}B; target=$target)"; return 0; fi
@@ -739,7 +780,7 @@ endpoint_healthy() {
 }
 
 diagnose_service() {
-    local name="$1" url="${2:-}" info rule profile port path kind pattern resolved
+    local name="$1" url="${2:-}" info rule profile port path kind pattern resolved spec configured_profile configured_url _configured_rest
     [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 2
     TMP_DIR="$(mktemp -d /tmp/docker-watchdog-diagnose.XXXXXX)" || return 1
     trap cleanup EXIT
@@ -748,6 +789,13 @@ diagnose_service() {
     jq -r '.[0] | "State: \(.State.Status); health: \(.State.Health.Status // "none")\nNetwork mode: \(.HostConfig.NetworkMode // "unknown")\nPublished ports: \(.NetworkSettings.Ports // {})"' <<<"$info"
     rule="$(probe_rule "$name" || true)"
     IFS='|' read -r profile port path kind pattern <<<"$rule"
+    if [[ -z "$url" ]]; then
+        for spec in "${SERVICE_SPECS[@]}"; do
+            IFS='|' read -r configured_profile configured_url _configured_rest <<<"$spec"
+            [[ "$configured_profile" == "${PROFILE_BY_NAME[$name]:-$name}" ]] || continue
+            url="$configured_url"; break
+        done
+    fi
     resolved="$url"
     if [[ -z "$resolved" && -n "$rule" ]]; then resolved="$(probe_url "$name" "$info" "$port" "$path" || true)"; fi
     printf 'Resolved probe: %s\n' "$(safe_probe_target "${resolved:-not configured}")"

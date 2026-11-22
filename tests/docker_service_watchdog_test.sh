@@ -8,6 +8,7 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 # shellcheck disable=SC1091
 source "$ROOT/user_script/docker_service_watchdog.sh"
 [[ "${SERVICE_SPECS[*]}" == *'lumunarr||always|0'* ]] || fail 'Lumunarr policy missing'
+DEFAULT_SERVICE_SPECS=("${SERVICE_SPECS[@]}")
 STATE_DIR="$TEST_ROOT/state"; mkdir -p "$STATE_DIR"
 HEARTBEAT_FILE="$TEST_ROOT/heartbeat/heartbeat.json"
 STATE_FILE="$STATE_DIR/state.json"; STATE_WORK="$TEST_ROOT/work.json"
@@ -150,14 +151,21 @@ resolve_inventory || fail 'inventory resolution failed'
 MOCK_HTTP_CODE=200; MOCK_HTTP_BODY='<MediaContainer machineIdentifier="fixture"/>'; MOCK_CURL_RC=0
 MOCK_REDIRECT_FIRST=""; MOCK_REDIRECT_TO=""
 MOCK_TRANSPORT_URL=""
+MOCK_DNS_HOST=""
 curl() {
-    local output="" argument previous="" limit=65536 url="${*: -1}"
+    local output="" argument previous="" limit=65536 url="${*: -1}" resolve=""
     for argument in "$@"; do
         [[ "$previous" != --output ]] || output="$argument"
         [[ "$previous" != --max-filesize ]] || limit="$argument"
+        [[ "$previous" != --resolve ]] || resolve="$argument"
+        [[ "$argument" != --insecure && "$argument" != -k ]] || fail 'probe disabled TLS verification'
         previous="$argument"
     done
+    printf '%s\n' "$resolve" >"$TEST_ROOT/probe-resolve"
     printf '%s\n' "$url" >>"$TEST_ROOT/requests"
+    if [[ -n "$MOCK_DNS_HOST" && "$url" == "https://$MOCK_DNS_HOST/"* && -z "$resolve" ]]; then
+        : >"$output"; printf '000'; return 6
+    fi
     if [[ -n "$MOCK_TRANSPORT_URL" && "$url" == "$MOCK_TRANSPORT_URL" ]]; then : >"$output"; printf '000'; return 28; fi
     printf '%s\n' "$limit" >"$TEST_ROOT/probe-limit"
     if [[ -n "$MOCK_REDIRECT_FIRST" && "$url" == "$MOCK_REDIRECT_FIRST" ]]; then
@@ -221,6 +229,45 @@ readiness_probe qbittorrent '' || fail 'metadata fallback did not recover readin
 if readiness_probe qbittorrent "$MOCK_TRANSPORT_URL"; then fail 'explicit failing URL replaced silently'; fi
 [[ "$(wc -l <"$TEST_ROOT/requests")" -eq 1 ]] || fail 'explicit URL used extra routes'
 MOCK_TRANSPORT_URL=""
+
+# Hubble's verified Tailscale HTTPS endpoint succeeds even when system DNS
+# cannot resolve MagicDNS. Keep hostname/TLS verification and scope the pin to
+# the exact profile, hostname and port; never replace an explicit test URL.
+MOCK_HTTP_BODY=v5.3.0; MOCK_DNS_HOST=qbittorrent.taila4be9.ts.net
+qbit_https="https://$MOCK_DNS_HOST/api/v2/app/version"
+readiness_probe qbittorrent "$qbit_https" || fail 'verified Tailscale DNS override failed'
+[[ "$PROBE_RESULT" == ready && "$PROBE_MESSAGE" == *'address override=100.64.251.79'* ]] || fail 'Tailscale route evidence missing'
+[[ "$(cat "$TEST_ROOT/probe-resolve")" == "$MOCK_DNS_HOST:443:100.64.251.79" ]] || fail 'wrong curl DNS override'
+readiness_probe qbittorrent "https://$MOCK_DNS_HOST:443/api/v2/app/version" || fail 'explicit default port failed'
+[[ -n "$(cat "$TEST_ROOT/probe-resolve")" ]] || fail 'explicit port lost DNS override'
+readiness_probe qbittorrent https://different-host/api/v2/app/version || fail 'explicit URL failed'
+[[ -z "$(cat "$TEST_ROOT/probe-resolve")" ]] || fail 'DNS override leaked to different host'
+readiness_probe qbittorrent "https://$MOCK_DNS_HOST:8443/api/v2/app/version" || fail 'different port failed'
+[[ -z "$(cat "$TEST_ROOT/probe-resolve")" ]] || fail 'DNS override leaked to different port'
+probe_address_args sonarr "$qbit_https" || fail 'unrelated profile rejected'
+[[ ${#PROBE_ADDRESS_ARGS[@]} == 0 ]] || fail 'DNS override leaked to different service'
+SERVICE_SPECS=("${DEFAULT_SERVICE_SPECS[@]}")
+(diagnose_service qbittorrent) >"$TEST_ROOT/diagnose.log" || fail 'configured endpoint diagnosis failed'
+grep -q "Resolved probe: $qbit_https" "$TEST_ROOT/diagnose.log" || fail 'diagnostic ignored configured service URL'
+grep -q 'Probe classification: ready' "$TEST_ROOT/diagnose.log" || fail 'diagnostic did not apply DNS override'
+saved_overrides=("${PROBE_ADDRESS_OVERRIDES[@]}")
+PROBE_ADDRESS_OVERRIDES=()
+if readiness_probe qbittorrent "$qbit_https"; then fail 'missing DNS override concealed resolution failure'; fi
+[[ "$PROBE_RESULT" == transport && "$PROBE_MESSAGE" == *curl=6* ]] || fail 'DNS failure misclassified'
+for bad_address in 999.64.251.79 010.64.251.79 '--insecure'; do
+    PROBE_ADDRESS_OVERRIDES=("qbittorrent|$MOCK_DNS_HOST|443|$bad_address")
+    : >"$TEST_ROOT/requests"
+    readiness_probe qbittorrent "$qbit_https" || fail 'invalid override treated as application failure'
+    [[ "$PROBE_RESULT" == unconfigured && ! -s "$TEST_ROOT/requests" ]] || fail 'invalid address reached curl'
+done
+PROBE_ADDRESS_OVERRIDES=("${saved_overrides[@]}" "${saved_overrides[@]}")
+readiness_probe qbittorrent "$qbit_https" || fail 'duplicate override treated as application failure'
+[[ "$PROBE_RESULT" == unconfigured ]] || fail 'duplicate DNS override accepted'
+PROBE_ADDRESS_OVERRIDES=("${saved_overrides[@]}")
+MOCK_CURL_RC=60
+readiness_probe qbittorrent "$qbit_https" || fail 'certificate error treated as application outage'
+[[ "$PROBE_RESULT" == unconfigured ]] || fail 'certificate verification failure ignored'
+MOCK_CURL_RC=0; MOCK_DNS_HOST=""
 safe="$(safe_probe_target 'http://user:password@fixture/path?apikey=secret')"
 [[ "$safe" != *password* && "$safe" != *secret* ]] || fail 'probe diagnostics expose credentials'
 
@@ -346,6 +393,6 @@ STATUS_DIR="$TEST_ROOT/status"; UPTIME_FILE="$TEST_ROOT/uptime"
 printf '99999.00 0.00\n' >"$UPTIME_FILE"
 docker() { return 0; }
 (main) >"$TEST_ROOT/main.log" 2>&1 || { cat "$TEST_ROOT/main.log" >&2; fail 'main orchestration failed'; }
-jq -e '.status == "OK" and .scriptVersion == "3.2"' "$STATUS_DIR/docker_service_watchdog.json" >/dev/null || fail 'main receipt incorrect'
+jq -e '.status == "OK" and .scriptVersion == "3.3"' "$STATUS_DIR/docker_service_watchdog.json" >/dev/null || fail 'main receipt incorrect'
 jq -e '.phase == "completed" and .executionComplete == true and .failures == 0' "$HEARTBEAT_FILE" >/dev/null || fail 'main heartbeat not finalized'
 printf 'docker_service_watchdog fixture tests passed\n'

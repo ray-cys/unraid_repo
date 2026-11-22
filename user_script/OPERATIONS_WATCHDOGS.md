@@ -4,7 +4,7 @@ These scripts are independent Unraid User Scripts. Keeping them in GitHub does
 not install, enable, or schedule them. Review container names, URLs, paths, and
 expected service states before deployment. Run scripts through `/bin/bash`.
 
-## Docker service watchdog v3.2
+## Docker service watchdog v3.3
 
 Optional schedule: `*/5 * * * *`. Each rule is
 `container|optional HTTP endpoint|always or on-demand|restart permission`.
@@ -78,6 +78,8 @@ container actions:
 /bin/bash /path/to/docker_service_watchdog.sh --diagnose qbittorrent http://HOST:PORT/api/v2/app/version
 ```
 
+Without a URL argument, diagnosis uses the same explicit `SERVICE_SPECS` URL as
+the scheduled scan, then falls back to Docker discovery when it is blank.
 Output includes network mode, published ports, resolved probe target, and the
 probe classification. Credentials and query parameters are omitted from target
 diagnostics. A timeout can still be a genuine firewall/network/service issue;
@@ -90,6 +92,20 @@ Every route is derived from that container's Docker metadata; no ports are
 scanned. An explicit URL disables fallback. HTTP/authentication errors do not
 trigger route switching. A successful fallback must still validate the expected
 qBittorrent version response; its target is included in the probe evidence.
+
+Hubble's qBittorrent uses the verified Tailscale endpoint
+`https://qbittorrent.taila4be9.ts.net/api/v2/app/version`. Unraid's system resolver
+cannot resolve this MagicDNS name, while an HTTPS request to Tailscale address
+`100.64.251.79` with the correct hostname returned `v5.3.0` and HTTP 200.
+`PROBE_ADDRESS_OVERRIDES` therefore supplies this address through curl `--resolve`.
+Each entry is `profile|exact hostname|TCP port|verified IPv4 address`; it applies
+only when all three selectors match. The URL hostname, HTTPS certificate checks,
+authentication rules, response validation and request limits remain active.
+Diagnostics display the address override. Invalid/duplicate matching rules warn
+and block recovery. No system DNS, Pi-hole, Docker port or VPN setting is changed.
+Update or remove the override if the Tailscale node/address changes; clear the
+array to use normal DNS, and clear the service URL to restore Docker discovery.
+This route also depends on Unraid's Tailscale connectivity and access rules.
 
 Optional files under `PROBE_AUTH_DIR`: `CONTAINER.headers` contains HTTP headers;
 `CONTAINER.cookies` is a Netscape cookie jar. Protect credentials with owner-only
