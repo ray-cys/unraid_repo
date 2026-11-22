@@ -4,7 +4,7 @@ These scripts are independent Unraid User Scripts. Keeping them in GitHub does
 not install, enable, or schedule them. Review container names, URLs, paths, and
 expected service states before deployment. Run scripts through `/bin/bash`.
 
-## Docker service watchdog v3.4
+## Docker service watchdog v3.5
 
 Optional schedule: `*/5 * * * *`. Each rule is
 `container|optional HTTP endpoint|always or on-demand|restart permission`.
@@ -195,6 +195,12 @@ because `Script Started` is not written to the native file in this version.
 Its finish banner **and** `Total Runtime` footer are required. Caught exceptions
 remain failures even when ImageMaid subsequently prints its normal summary.
 Native timestamps use the container's local timezone, matching its logger.
+The reader accepts the actual upstream `[filename.py:line] [LEVEL]` format
+(and bare severity labels for compatibility). v3.4 incorrectly expected bare
+labels and rejected valid decorated records. v3.5 revises the saved parser
+revision and automatically rescans existing logs, including an idle ImageMaid
+run that finished earlier in the week. No state deletion, manual processing or
+container restart is required to repair that cached parse failure.
 
 | Observed outcome | Watchdog result |
 | --- | --- |

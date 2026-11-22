@@ -35,7 +35,7 @@ fresh() {
     printf '{"version":2,"bootId":"fixture","services":{},"recovery":{},"observations":{},"notification":{"issues":{}}}\n' >"$STATE_WORK"
     SEEN=(); FROZEN=(); FROZEN_KEYS=(); RECOVERY_BLOCKED=(); PROFILE_BY_NAME=(); RECOVERY_CANDIDATES=()
 }
-emit() { printf '[%s,123] %-27s %-10s | %s |\n' "$1" "$profile.py" "$2" "$3" >>"$path"; }
+emit() { printf '[%s,123] %-27s %-10s | %s |\n' "$1" "[$profile.py:499]" "[$2]" "$3" >>"$path"; }
 begin() { emit "$1" INFO "${2:-Starting Run}"; }
 end_run() {
     emit "$1" INFO 'Finished Run'
@@ -72,7 +72,7 @@ assert_json '.result == "completed-errors"' 'unchanged log lost prior failure'
 rm "$path"; old='{}'
 begin '2026-11-22 12:10:00'
 emit '2026-11-22 12:10:01' ERROR 'Early-run failure outside tail'
-python3 -c 'import sys; open(sys.argv[1], "a").write("[2026-11-22 12:10:02,123] kometa.py DEBUG | ordinary activity |\n" * 6000)' "$path"
+python3 -c 'import sys; open(sys.argv[1], "a").write("[2026-11-22 12:10:02,123] [kometa.py:499] [DEBUG] | ordinary activity |\n" * 6000)' "$path"
 end_run '2026-11-22 12:11:00'
 JOB_LOG_SCAN_MAX_BYTES=65536
 read_log
@@ -121,7 +121,7 @@ assert_json '.result == "completed-unverified" and .success == 0' 'missing run s
 # A future/changed log-record format must not silently turn a run clean.
 : >"$path"; old='{}'
 begin '2026-11-22 14:40:00'
-printf '[2026-11-22 14:40:01] new-format [ERROR] processing failed\n' >>"$path"
+printf '[2026-11-22 14:40:01] new-format level=ERROR processing failed\n' >>"$path"
 end_run '2026-11-22 14:41:00'
 read_log
 assert_json '.result == "completed-unverified" and .success == 0 and .incomplete' 'unsupported format reported clean'
@@ -133,7 +133,7 @@ begin '2026-11-22 14:45:00'
 emit '2026-11-22 14:45:01' ERROR 'Early error in 70 MiB run'
 python3 - "$path" <<'PY'
 import sys
-line = b"[2026-11-22 14:45:02,123] kometa.py DEBUG | ordinary activity |\n"
+line = b"[2026-11-22 14:45:02,123] [kometa.py:499] [DEBUG] | ordinary activity |\n"
 chunk = line * 1024
 with open(sys.argv[1], "ab") as handle:
     for _ in range((70 * 1024 * 1024) // len(chunk) + 1):
@@ -166,6 +166,38 @@ emit '2026-11-22 15:01:00' INFO 'Total Runtime      | 0:01:00'
 read_log
 assert_json '.result == "completed-warnings" and .success == 0' 'ImageMaid warning severity incorrect'
 
+# Literal records supplied from Hubble, including fmt_filter's [filename:line]
+# and [LEVEL] decorations. An idle weekly job must resolve from its existing
+# completed native log; no new scheduled/manual processing is required.
+path="$TEST_ROOT/idle-imagemaid.log"; old='{}'
+cat >"$path" <<'LOG'
+[2026-11-22 07:00:51,335] [imagemaid.py:110]          [INFO]     |====================================================================================================|
+[2026-11-22 07:00:51,402] [imagemaid.py:111]          [INFO]     |======================================== Validating Options ========================================|
+[2026-11-22 07:02:52,479] [imagemaid.py:499]          [INFO]     |======================================== ImageMaid Finished ========================================|
+[2026-11-22 07:02:52,479] [imagemaid.py:499]          [INFO]     | Total Runtime      | 0:02:01                                                                       |
+LOG
+read_log
+assert_json '.result == "success" and .incomplete == false and .finished > 0 and .reader.parserVersion == 2' 'Hubble idle ImageMaid log rejected'
+old="$(jq -c '{runLog:(.reader | del(.parserVersion, .active) | .gap=true | .completed={} | .successfulAt=0)}' "$result")"
+read_log
+assert_json '.result == "success" and .incomplete == false and .reader.parserVersion == 2' 'v3.4 EOF/gap state prevented idle-log repair'
+
+# The running Kometa job has no normal whole-run footer yet. Collection names
+# containing "Run" must not count as completed scheduled work.
+profile=kometa; path="$TEST_ROOT/live-meta.log"; old='{}'
+cat >"$path" <<'LOG'
+[2026-11-22 16:00:45,362] [kometa.py:498]             [INFO]     |====================================================================================================|
+[2026-11-22 16:00:48,186] [kometa.py:644]             [INFO]     |                                         Starting 16:00 Run                                         |
+[2026-11-22 16:03:17,887] [kometa.py:1385]            [INFO]     |                                  Finished Blade Runner Collection                                  |
+[2026-11-22 16:04:53,071] [kometa.py:1385]            [INFO]     |                                Finished The Maze Runner Collection                                 |
+LOG
+read_log
+assert_json '.started > 0 and .finished == 0 and .success == 0 and .incomplete == false' 'running Hubble Kometa run misclassified'
+emit '2026-11-22 16:05:00' ERROR 'An actual bracketed processing error'
+end_run '2026-11-22 16:06:00'
+read_log
+assert_json '.result == "completed-errors" and .success == 0' 'bracketed ERROR did not affect outcome'
+
 # Bash integration: grouped failures recover after two clean scans. The
 # application result cannot enqueue a restart for an otherwise healthy Docker.
 fresh; profile=kometa; path="$TEST_ROOT/integrated.log"
@@ -174,7 +206,7 @@ begin '2026-11-22 16:00:00'
 emit '2026-11-22 16:00:01' ERROR 'Collection failed'
 end_run '2026-11-22 16:01:00'
 native_finished="$(date -d '2026-11-22 16:01:00' +%s)"
-mutate --argjson received "$((native_finished+2))" '.jobs={kometa:{firstSeen:$received,started:0,finished:$received,success:0,result:"completed-unverified",scanned:$received,history:[],logState:{}}}'
+mutate --argjson received "$((native_finished+2))" --arg source "$path" '.jobs={kometa:{firstSeen:$received,started:0,finished:$received,success:0,result:"completed-unverified",scanned:$received,history:[],logState:{},runLog:{version:1,source:$source,containerId:"native-1",gap:true}}}'
 for pass in 1 2; do SEEN=(); check_service 'kometa||always|1'; finish_observations; done
 jq -e '.observations["kometa:job-errors"].active == true' "$STATE_WORK" >/dev/null || fail 'partial failure not confirmed'
 jq -e --argjson native "$native_finished" '.jobs.kometa.result == "completed-errors" and .jobs.kometa.finished == $native' "$STATE_WORK" >/dev/null || fail 'Docker receive timestamp prevented native evidence upgrade'

@@ -1,10 +1,10 @@
 #!/bin/bash
-# Docker Service Watchdog v3.4 -- Unraid service availability and bounded recovery.
+# Docker Service Watchdog v3.5 -- Unraid service availability and bounded recovery.
 # Optional schedule: every five minutes. Pi-hole and application-specific health
 # remain owned by the DNS and Arr monitors. All recovery is disabled by default.
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.4"
+readonly SCRIPT_VERSION="3.5"
 
 ###############################################################################
 # CONFIGURATION
@@ -470,15 +470,20 @@ if not 1024 <= limit <= 512 * 1024 * 1024:
     raise ValueError("Invalid native log scan limit")
 saved = json.load(sys.stdin)
 state = saved if isinstance(saved, dict) and saved.get("version") == 1 and saved.get("source") == source else {}
-if state.get("containerId") != container:
+if state.get("containerId") != container or state.get("parserVersion") != 2:
     state.pop("cursor", None)
     state.pop("active", None)
-state.update(version=1, source=source, containerId=container)
+    state["gap"] = False
+state.update(version=1, parserVersion=2, source=source, containerId=container)
 state.setdefault("completed", {})
 state.setdefault("successfulAt", 0)
 state.setdefault("gap", False)
 budget, deadline = limit, time.monotonic() + 10
-record = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(?:[,.]\d+)?\]\s+\S+\s+(TRACE|DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL)\s+(.*)$")
+# Both upstream fmt_filter functions wrap filename:line and severity in square
+# brackets. Also accept the earlier bare-level layout without guessing levels
+# from arbitrary message contents.
+levels = r"TRACE|DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL"
+record = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(?:[,.]\d+)?\]\s+\S+\s+(?:\[(" + levels + r")\]|(" + levels + r"))\s+(.*)$")
 ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 def redact(message):
@@ -542,7 +547,8 @@ def consume(raw):
             if state.get("active"):
                 state["active"]["full"] = False
         return
-    stamp, level, message = match.groups()
+    stamp, bracket_level, bare_level, message = match.groups()
+    level = bracket_level or bare_level
     epoch = timestamp(stamp)
     if not 0 < epoch <= now + 300:
         state["gap"] = True
@@ -800,7 +806,7 @@ check_job() {
     # result, including errors; never apply this exception to a prior failure.
     if [[ "$source" == runlog:* && "$result" != unknown && "$result" != completed-unverified &&
         "$(jq -r '.result // "unknown"' <<<"$old")" == completed-unverified &&
-        "$(jq -c '.runLog // {}' <<<"$old")" == '{}' ]] &&
+        "$(jq -r '.evidenceSource // ""' <<<"$old")" != "$source" ]] &&
         (( finished > 0 && old_finished >= finished && old_finished - finished <= 300 )); then
         replace_unverified=true
     fi
@@ -821,9 +827,9 @@ check_job() {
     fi
     mutate --arg name "$name" --arg result "$result" --argjson first "$first" --argjson started "$started" \
         --argjson finished "$finished" --argjson success "$success" --argjson scanned "$NOW" --argjson receipt_history "$receipt_history" --argjson log_state "$log_state" \
-        --argjson run_log "$run_log" --argjson retract "$retract_success" \
+        --argjson run_log "$run_log" --argjson retract "$retract_success" --arg evidence_source "$source" \
         '.jobs //= {} | (.jobs[$name].history // []) as $history |
-            .jobs[$name]={firstSeen:$first,started:$started,finished:$finished,success:$success,result:$result,scanned:$scanned,logState:$log_state,runLog:$run_log,
+            .jobs[$name]={firstSeen:$first,started:$started,finished:$finished,success:$success,result:$result,scanned:$scanned,logState:$log_state,runLog:$run_log,evidenceSource:$evidence_source,
                 history:(($history + $receipt_history + (if $result == "success" and $success > 0 then [$success] else [] end)) | unique | map(select(. >= ($scanned - 28*86400) and (($retract | not) or . != $finished))))}' || return 1
     if [[ "$result" == failed ]]; then
         local error_detail=""
@@ -839,11 +845,14 @@ check_job() {
         observe "$name:job-failed" CRITICAL "Most recent scheduled job failed; finished_epoch=$finished; last_success_epoch=$success. ${error_detail:-Review the scheduled job log or completion record.} Container availability is checked separately" || return 1
     fi
     if [[ "$source" == runlog:* ]]; then
+        if (( started > finished )); then
+            log INFO "$name: native scheduled run active; started_epoch=$started; previous_completion_epoch=$finished; previous_result=$result" || return 1
+        fi
         if [[ "$result" == completed-errors ]]; then
             observe "$name:job-errors" WARNING "Run completed with processing errors; finished_epoch=$finished. $detail; log=${source#runlog:}. Docker availability is checked separately" || return 1
         elif [[ "$result" == completed-warnings ]]; then
             observe "$name:job-warnings" WARNING "Run completed with warnings; finished_epoch=$finished. $detail; log=${source#runlog:}" || return 1
-        elif [[ "$result" == success ]]; then
+        elif [[ "$result" == success ]] && (( started <= finished )); then
             log INFO "$name: native run completed without reported errors or warnings; finished_epoch=$finished; log=${source#runlog:}" || return 1
         fi
     fi
