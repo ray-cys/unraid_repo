@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Data Management v2
+# Data Management v3
 #
 # PURPOSE
 # -------
@@ -49,6 +49,7 @@
 ###############################################################################
 
 set -uo pipefail
+readonly SCRIPT_VERSION="3.0"
 
 umask 0002
 
@@ -203,6 +204,15 @@ VUETORRENT_DIR="/mnt/user/appdata/qbittorrent/webui"
 VUETORRENT_REPO="https://github.com/VueTorrent/VueTorrent.git"
 VUETORRENT_BRANCH="latest-release"
 VUETORRENT_CLONE_TIMEOUT=300
+# Console output only. Small durable recovery checkpoints are state, not logs.
+TRANSFER_STATE_DIR="${TRANSFER_STATE_DIR:-/mnt/vault/cloud/logs/script/torrent_download_complete/state}"
+QBIT_API_URL="${QBIT_API_URL:-https://qbittorrent.taila4be9.ts.net}"
+QBIT_RESOLVE="${QBIT_RESOLVE:-qbittorrent.taila4be9.ts.net:443:100.64.251.79}"
+QBIT_CONTAINER_ROOT="${QBIT_CONTAINER_ROOT:-/data}"
+QBIT_HOST_ROOT="${QBIT_HOST_ROOT:-/mnt/user/secure}"
+QBIT_HEADERS_FILE="${QBIT_HEADERS_FILE:-/mnt/vault/cloud/logs/script/docker_service_watchdog/probe-auth/qbittorrent.headers}"
+QBIT_RUNTIME=""
+CATEGORY_JOBS=""
 
 
 # ---------------------------------------------------------------------------
@@ -1222,6 +1232,11 @@ process_category() {
     fi
 
     log info "------------------------------------------------------------"
+    if ! category_completion_proven "$source"; then
+        log warn "CATEGORY: '$category' deferred; existing files and torrent state preserved."
+        return 0
+    fi
+    transfer_checkpoint category_intent "$source" "$destination" || return 1
     log info "CATEGORY: processing '$category'"
     log info "CATEGORY: source      '$source'"
     log info "CATEGORY: destination '$destination'"
@@ -1258,7 +1273,7 @@ process_category() {
 
         log info \
             "CATEGORY: '$category' contains no files after cleanup"
-
+        transfer_checkpoint category_complete "$source" "$destination" || return 1
         return 0
     fi
 
@@ -1267,12 +1282,13 @@ process_category() {
     # Move
     ###########################################################################
 
+    transfer_checkpoint moving "$source" "$destination" || return 1
     safe_move "$source" "$destination" || {
         log error \
             "CATEGORY: move failed for '$category'"
         return 1
     }
-
+    transfer_checkpoint category_complete "$source" "$destination" || return 1
     return 0
 }
 
@@ -1416,12 +1432,115 @@ update_vuetorrent() {
 # MAIN
 ###############################################################################
 
+# Shared maintenance protocol. Hold through API/filesystem mutations so appdata
+# cannot stop dependencies midway through this run. Export lock protects a
+# consistent per-service operational-state snapshot, never bulk application data.
+qbit_request() {
+    local endpoint="$1" output="$2"
+    local -a args=(--noproxy '*' --connect-timeout 4 --max-time 20 --max-filesize 16777216 --fail --silent --show-error)
+    [[ "$QBIT_API_URL" == https://* && "$QBIT_API_URL" != *'@'* && "$QBIT_API_URL" != *'?'* ]] || return 1
+    [[ -z "$QBIT_RESOLVE" ]] || args+=(--resolve "$QBIT_RESOLVE")
+    [[ ! -f "$QBIT_HEADERS_FILE" ]] || args+=(--header "@$QBIT_HEADERS_FILE")
+    curl "${args[@]}" "$QBIT_API_URL/api/v2/$endpoint" -o "$output"
+}
+
+transfer_checkpoint() {
+    local phase="$1" source="${2:-}" target="${3:-}" temp
+    temp=$(mktemp "$TRANSFER_STATE_DIR/.checkpoint.XXXXXX") || return 1
+    jq -n --arg phase "$phase" --arg source "$source" --arg destination "$target" --argjson epoch "$(date +%s)" \
+       '{schema:1,phase:$phase,source:$source,destination:$destination,epoch:$epoch,policy:"console-only; no automatic pending mutation replay"}' >"$temp" &&
+       mv "$temp" "$TRANSFER_STATE_DIR/state.json" || return 1
+}
+
+category_completion_proven() {
+    local source="$1" native mapped file eligible=0 matched false_path
+    qbit_request torrents/info "$QBIT_RUNTIME/jobs.json" || { log error 'qBittorrent API unavailable; category files preserved.'; return 1; }
+    jq -e 'type=="array" and all(.[]; (.hash|type)=="string" and (.content_path|type)=="string" and (.progress|type)=="number" and (.state|type)=="string")' "$QBIT_RUNTIME/jobs.json" >/dev/null || return 1
+    CATEGORY_JOBS="$QBIT_RUNTIME/category-jobs.tsv"
+    : >"$CATEGORY_JOBS"
+    while IFS=$'\t' read -r native matched false_path; do
+        [[ "$native" == "$QBIT_CONTAINER_ROOT/"* && "$native" != *'/../'* && "$native" != */.. ]] || continue
+        mapped="$QBIT_HOST_ROOT/${native#"$QBIT_CONTAINER_ROOT/"}"
+        [[ "$mapped" == "$source" || "$mapped" == "$source/"* ]] || continue
+        # Stop/queued/checking/moving/download states are not assumed complete.
+        # Only complete, already stopped payloads are eligible; this script never
+        # changes seeding policy, stops torrents, or deletes torrent records.
+        if [[ "$matched" != true || ! "$false_path" =~ ^(stoppedUP|pausedUP)$ ]]; then
+            log warn "Category retained: an owned torrent is incomplete, active, queued or checking ($false_path)."; return 1
+        fi
+        printf '%s\n' "$mapped" >>"$CATEGORY_JOBS"
+        eligible=$((eligible+1))
+    done < <(jq -r '.[] | [.content_path,((.progress==1 and (.amount_left // 0)==0)|tostring),.state] | @tsv' "$QBIT_RUNTIME/jobs.json")
+    (( eligible>0 )) || { log warn 'Category retained: exact completed qBittorrent ownership could not be proven (including unregistered/orphan files).'; return 1; }
+    while IFS= read -r -d '' file; do
+        matched=false
+        while IFS= read -r mapped; do [[ "$file" != "$mapped" && "$file" != "$mapped/"* ]] || matched=true; done <"$CATEGORY_JOBS"
+        [[ "$matched" == true ]] || { log warn "Category retained: file has no exact completed API owner: $file"; return 1; }
+    done < <(find "$source" -type f -print0)
+}
+
+torrent_storage_ready() {
+    mountpoint -q /mnt/user && mountpoint -q /mnt/vault || { log error 'Required user/vault storage unavailable; no changes performed.'; return 1; }
+    if pgrep -f '(^|/)(mover|mover\.old)([[:space:]]|$)' >/dev/null; then log info 'Mover active; transfer and Web UI update deferred.'; return 75; fi
+    [[ ! -L "$TRANSFER_STATE_DIR" ]] || return 1
+    mkdir -p "$TRANSFER_STATE_DIR" || return 1
+    chmod 700 "$TRANSFER_STATE_DIR" || return 1
+    if [[ -f "$TRANSFER_STATE_DIR/state.json" ]]; then
+        jq -e '.schema==1 and (.phase|type)=="string"' "$TRANSFER_STATE_DIR/state.json" >/dev/null || return 1
+        local phase
+        phase=$(jq -r .phase "$TRANSFER_STATE_DIR/state.json")
+        if [[ "$phase" != complete && "$phase" != webui_failed && "$phase" != category_complete ]]; then
+            log error "Previous transfer checkpoint=$phase is unfinished. Files preserved; inspect exact recorded source/destination before retrying. No automatic ambiguous replay."
+            return 1
+        fi
+    fi
+    QBIT_RUNTIME=$(mktemp -d /tmp/torrent-completion.XXXXXX) || return 1
+    trap 'rm -rf -- "$QBIT_RUNTIME"' EXIT
+}
+
+refresh_vuetorrent_if_due() {
+    local last=0 now
+    [[ ! -f "$TRANSFER_STATE_DIR/webui-updated-at" ]] || read -r last <"$TRANSFER_STATE_DIR/webui-updated-at"
+    [[ "$last" =~ ^[0-9]+$ ]] || return 1
+    now=$(date +%s)
+    if (( now>=last && now-last<604800 )); then log info 'VueTorrent refresh not due; data processing outcome remains independent.'; return 0; fi
+    update_vuetorrent || return 1
+    printf '%s\n' "$now" >"$TRANSFER_STATE_DIR/.webui-updated-at" && mv "$TRANSFER_STATE_DIR/.webui-updated-at" "$TRANSFER_STATE_DIR/webui-updated-at"
+}
+
+acquire_operation_coordination() {
+    local now until version_file="${UNRAID_VERSION_FILE:-/etc/unraid-version}" version
+    if [[ -r "$version_file" ]]; then
+        version=$(sed -n 's/^version="\([^"]*\)"/\1/p' "$version_file")
+        if [[ "$version" != 7.* ]]; then printf 'Unvalidated Unraid version %s; mutations deferred pending compatibility validation.\n' "$version" >&2; return 75; fi
+    fi
+    exec {ARR_OPERATION_FD}>"${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}" || return 1
+    flock -s -n "$ARR_OPERATION_FD" || return 75
+    now=$(date +%s)
+    until=$(cat "${ARR_BACKUP_GRACE:-/run/arr-appdata-recovery-until}" 2>/dev/null || true)
+    if [[ "$until" =~ ^[0-9]+$ ]] && (( until>now && until<=now+120 )); then return 75; fi
+    exec {STATE_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
+    flock -s -n "$STATE_EXPORT_FD" || return 75
+}
+
 main() {
+    case "${1:-}" in
+        --version) printf 'completed_torrent_download.sh %s\n' "$SCRIPT_VERSION"; return 0;;
+        --help|-h) printf '%s\n' 'Usage: bash script [--help|--version]' 'Normal run: console-only processing of configured categories with exact complete/stopped qBittorrent ownership.' 'Active, incomplete or unregistered files are preserved. Unfinished checkpoints require review before retry.' 'VueTorrent refresh is weekly and independent of the media-transfer result.'; return 0;;
+        "") ;;
+        *) printf 'Unknown option: %s; use --help.\n' "$1" >&2; return 2;;
+    esac
     ###########################################################################
     # Environment validation
     ###########################################################################
 
+    local coordination_rc=0
+    acquire_operation_coordination || coordination_rc=$?
+    if (( coordination_rc==75 )); then printf 'MAINTENANCE: run deferred for appdata/startup/state export; no mutations performed.\n'; return 0; fi
+    (( coordination_rc==0 )) || return 1
+
     require_commands \
+        curl jq mountpoint pgrep mktemp realpath \
         flock \
         find \
         grep \
@@ -1461,6 +1580,11 @@ main() {
     fi
 
 
+    local storage_rc=0
+    torrent_storage_ready || storage_rc=$?
+    if (( storage_rc==75 )); then return 0; fi
+    (( storage_rc==0 )) || return 1
+
     ###########################################################################
     # Build filename cleanup rules
     ###########################################################################
@@ -1473,7 +1597,7 @@ main() {
     ###########################################################################
 
     log info "============================================================"
-    log info "Data Management v2 started"
+    log info "Data Management v3 started"
     log info "Completed dir : $COMPLETE_DIR"
     log info "Destination   : $DEST_DIR"
     log info "============================================================"
@@ -1489,8 +1613,9 @@ main() {
        ! has_files "$COMPLETE_DIR"
     then
 
-        finish 0 \
-            "No completed downloads found; nothing to process"
+        refresh_vuetorrent_if_due || { transfer_checkpoint webui_failed; finish 0 "No completed files; VueTorrent refresh failed independently; existing Web UI retained"; }
+        transfer_checkpoint complete || return 1
+        finish 0 "No completed downloads found; nothing to process"
     fi
 
 
@@ -1535,9 +1660,11 @@ main() {
 
     log info "PHASE 3: updating VueTorrent"
 
-    update_vuetorrent ||
-        finish 1 \
-            "Data processing succeeded but VueTorrent update failed"
+    if ! refresh_vuetorrent_if_due; then
+        transfer_checkpoint webui_failed || return 1
+        finish 0 "Data processing completed; VueTorrent update failed independently and existing Web UI was retained"
+    fi
+    transfer_checkpoint complete || return 1
 
 
     ###########################################################################
@@ -1545,8 +1672,8 @@ main() {
     ###########################################################################
 
     finish 0 \
-        "Data Management v2 completed successfully"
+        "Data Management v3 completed successfully"
 }
 
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

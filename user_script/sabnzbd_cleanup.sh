@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# SABnzbd Cleanup v2.5.0
+# SABnzbd Cleanup v2.6.0
 #
 # PURPOSE / PERSONAL USE CASE
 # ---------------------------
@@ -117,7 +117,7 @@ set -uo pipefail
 # CONFIGURATION
 ###############################################################################
 
-VERSION="2.5.0"
+VERSION="2.6.0"
 
 # ---------------------------------------------------------------------------
 # Execution behavior
@@ -346,7 +346,7 @@ is_false() {
 }
 
 OPS_SCRIPT_NAME="arr_sabnzbd_cleanup"
-OPS_SCRIPT_VERSION="2.5.0"
+OPS_SCRIPT_VERSION="2.6.0"
 OPS_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
 OPS_ATTENTION_DETAILS=""
 OPS_ATTENTION_FILE=""
@@ -2738,6 +2738,24 @@ print_summary() {
 # ENTRY POINT
 ###############################################################################
 
+# Shared maintenance protocol. Hold through API/filesystem mutations so appdata
+# cannot stop dependencies midway through this run. Export lock protects a
+# consistent per-service operational-state snapshot, never bulk application data.
+acquire_operation_coordination() {
+    local now until version_file="${UNRAID_VERSION_FILE:-/etc/unraid-version}" version
+    if [[ -r "$version_file" ]]; then
+        version=$(sed -n 's/^version="\([^"]*\)"/\1/p' "$version_file")
+        if [[ "$version" != 7.* ]]; then printf 'Unvalidated Unraid version %s; mutations deferred pending compatibility validation.\n' "$version" >&2; return 75; fi
+    fi
+    exec {ARR_OPERATION_FD}>"${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}" || return 1
+    flock -s -n "$ARR_OPERATION_FD" || return 75
+    now=$(date +%s)
+    until=$(cat "${ARR_BACKUP_GRACE:-/run/arr-appdata-recovery-until}" 2>/dev/null || true)
+    if [[ "$until" =~ ^[0-9]+$ ]] && (( until>now && until<=now+120 )); then return 75; fi
+    exec {STATE_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
+    flock -s -n "$STATE_EXPORT_FD" || return 75
+}
+
 main() {
   local operation_status
   local quarantine_ready=false
@@ -2746,6 +2764,11 @@ main() {
   parse_args "$@"
   if [[ "$CLI_OPERATION" == inspect ]]; then inspect_quarantines; return $?; fi
   if [[ "$CLI_OPERATION" == pending ]]; then ops_list_pending_operations; return $?; fi
+    local coordination_rc=0
+    acquire_operation_coordination || coordination_rc=$?
+    if (( coordination_rc==75 )); then printf 'MAINTENANCE: run deferred for appdata/startup/state export; no mutations performed.\n'; return 0; fi
+    (( coordination_rc==0 )) || return 1
+
   initialize || return 1
   if [[ "$CLI_OPERATION" == resolve ]]; then
     ops_resolve_operation "$CLI_OPERATION_ID" "$CLI_OPERATION_NOTE" || return $?

@@ -24,7 +24,9 @@ MOCK_RESTART_HEALTH=healthy
 docker_cmd() {
     if [[ "$1" == exec && "$2" == -i ]]; then shift 3; "$@"
     elif [[ "$1" == inspect ]]; then printf '%s\n' "$MOCK_INFO"
-    elif [[ "$1" == restart ]]; then
+    elif [[ "$1" == events ]]; then
+        printf '{"Actor":{"ID":"native-1"},"Action":"die","time":%s}\n' "$((NOW-60))"
+    elif [[ "$1" == restart || "$1" == start ]]; then
         printf 'restart\n' >>"$TEST_ROOT/restarts"
         MOCK_INFO="$(jq --arg health "$MOCK_RESTART_HEALTH" '.[0].State.Status="running" | if $health == "none" then del(.[0].State.Health) else .[0].State.Health.Status=$health end' <<<"$MOCK_INFO")"
     else return 1; fi
@@ -244,15 +246,21 @@ attempt_recovery kometa '' running 0
 attempt_recovery kometa '' running 1
 [[ "$(wc -l <"$TEST_ROOT/restarts")" -eq 1 ]] || fail 'Docker health recovery no longer works'
 
-# Stopped-container recovery remains an explicit opt-in. Images with no health
+# Unknown stopped containers stay stopped; native exit proof is required. Images with no health
 # check/probe can verify Docker state only and must say so in the notification.
 fresh; MOCK_RESTART_HEALTH=none
 MOCK_INFO="$(jq '.[0].State.Status="exited" | del(.[0].State.Health)' <<<"$MOCK_INFO")"
 check_service 'kometa||always|1' || fail 'stopped container scan failed'
+RECOVER_UNEXPECTED_EXITS=false
 RESTART_STOPPED_CONTAINERS=false
 attempt_recovery kometa '' exited 1
 [[ "$(wc -l <"$TEST_ROOT/restarts")" -eq 1 ]] || fail 'stopped container restarted without permission'
 RESTART_STOPPED_CONTAINERS=true
+attempt_recovery kometa '' exited 1
+[[ "$(wc -l <"$TEST_ROOT/restarts")" -eq 1 ]] || fail 'blanket stopped opt-in bypassed missing history'
+RECOVER_UNEXPECTED_EXITS=true; RESTART_STOPPED_CONTAINERS=false
+MOCK_INFO="$(jq --arg finished "$(date -d "@$((NOW-60))" -Iseconds)" '.[0].State.FinishedAt=$finished' <<<"$MOCK_INFO")"
+mutate --argjson last "$((NOW-120))" '.services.kometa.lastRunningAt=$last'
 attempt_recovery kometa '' exited 1
 [[ "$(wc -l <"$TEST_ROOT/restarts")" -eq 2 ]] || fail 'permitted stopped-container recovery failed'
 jq -e '.observations["kometa:recovery-action"].message | contains("no Docker healthcheck")' "$STATE_WORK" >/dev/null || fail 'state-only recovery claimed application readiness'

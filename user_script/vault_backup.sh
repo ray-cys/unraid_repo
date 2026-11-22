@@ -14,7 +14,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.6"
+readonly SCRIPT_VERSION="1.7"
 
 ###############################################################################
 # CONFIGURATION
@@ -36,6 +36,7 @@ BACKUP_JOBS=(
     "user_scripts|/boot/config/plugins/user.scripts"
     "github|/mnt/vault/cloud/github"
     "photos|/mnt/vault/cloud/photos"
+    "operations_state|/mnt/vault/backup/operations_state"
 )
 
 # Each generation is a complete independent copy.
@@ -69,7 +70,24 @@ ISS_REQUEST_GENERATION=""
 RUN_REMOTE_RESTORE_DRILL=true
 RESTORE_DRILL_SCRIPT="${RESTORE_DRILL_SCRIPT:-/boot/config/plugins/user.scripts/scripts/backup_restore_drill/script}"
 RESTORE_DRILL_INTERVAL_SECONDS=604800
+# Compact state only: no logs, cache/history backups, credentials from apps or
+# transient heartbeat/maintenance files. Scripts remain standalone.
+OPERATIONS_STATE_ROOT="${OPERATIONS_STATE_ROOT:-/mnt/vault/backup/operations_state}"
+OPERATIONS_STATE_MAX_BYTES=$((128 * 1024 * 1024))
+OPERATIONS_STATE_MOUNT_ROOT="${OPERATIONS_STATE_MOUNT_ROOT:-/mnt/vault}"
+OPERATIONS_SCRIPT_ROOT="${OPERATIONS_SCRIPT_ROOT:-/mnt/vault/cloud/logs/script}"
+OPERATIONS_EXPORT_TEMP=""
+# Required state for this personal installation; missing/renamed state must not
+# become a silently empty "successful" export after an OS/path change.
+OPERATIONS_REQUIRED_STATE_FILES=(
+    arr_health_activity/state.json
+    arr_delete_sync_tag/sonarr-state.json
+    arr_delete_sync_tag/radarr-state.json
+    docker_service_watchdog/state.json
+    dns_redundancy_watchdog/state.json
+)
 RESTORE_DRILL_RESULT="not_due"
+RESTORE_DRILL_EPOCH=0
 RESTORE_DRILL_SUMMARY=""
 
 USE_LOW_PRIORITY_IO=true
@@ -278,14 +296,15 @@ Log: $LOG_FILE" >/dev/null 2>&1; then NOTIFICATION_RESULT=sent; else NOTIFICATIO
     if mountpoint -q /mnt/vault && command -v jq >/dev/null; then
         mkdir -p -- "$STATUS_DIR"
         temp=$(mktemp "$STATUS_DIR/.${SCRIPT_ID}.XXXXXX") &&
-            jq -n --arg drill "$RESTORE_DRILL_RESULT" --arg drillSummary "$RESTORE_DRILL_SUMMARY" --arg name "$SCRIPT_ID" --arg status "$status" --arg summary "$summary" --arg phase "$BACKUP_PHASE" --arg copy "$BACKUP_RESULT" --arg verification "$VERIFICATION_RESULT" --arg retention "$RETENTION_RESULT" --arg notification "$NOTIFICATION_RESULT" --arg shutdown "$SHUTDOWN_RESULT" --arg shutdown_reason "${REMOTE_SHUTDOWN_SKIPPED_REASON:-}" --arg version "$SCRIPT_VERSION" --arg log "$LOG_FILE" --argjson duration "$(( $(date +%s)-BACKUP_STARTED ))" --argjson epoch "$(date +%s)" \
-            '{restoreDrill:$drill,restoreDrillSummary:$drillSummary,name:$name,status:$status,summary:$summary,phase:$phase,copy:$copy,verification:$verification,retention:$retention,notification:$notification,shutdown:$shutdown,shutdown_reason:$shutdown_reason,scriptVersion:$version,duration_seconds:$duration,log:$log,epoch:$epoch}' >"$temp" && mv -f -- "$temp" "$STATUS_DIR/$SCRIPT_ID.json"
+            jq -n --argjson drillEpoch "$RESTORE_DRILL_EPOCH" --arg drill "$RESTORE_DRILL_RESULT" --arg drillSummary "$RESTORE_DRILL_SUMMARY" --arg name "$SCRIPT_ID" --arg status "$status" --arg summary "$summary" --arg phase "$BACKUP_PHASE" --arg copy "$BACKUP_RESULT" --arg verification "$VERIFICATION_RESULT" --arg retention "$RETENTION_RESULT" --arg notification "$NOTIFICATION_RESULT" --arg shutdown "$SHUTDOWN_RESULT" --arg shutdown_reason "${REMOTE_SHUTDOWN_SKIPPED_REASON:-}" --arg version "$SCRIPT_VERSION" --arg log "$LOG_FILE" --argjson duration "$(( $(date +%s)-BACKUP_STARTED ))" --argjson epoch "$(date +%s)" \
+            '{restoreDrillEpoch:$drillEpoch,restoreDrill:$drill,restoreDrillSummary:$drillSummary,name:$name,status:$status,summary:$summary,phase:$phase,copy:$copy,verification:$verification,retention:$retention,notification:$notification,shutdown:$shutdown,shutdown_reason:$shutdown_reason,scriptVersion:$version,duration_seconds:$duration,log:$log,epoch:$epoch}' >"$temp" && mv -f -- "$temp" "$STATUS_DIR/$SCRIPT_ID.json"
     fi
     [[ -z "$LEASE_INPUT" ]] || exec {LEASE_INPUT}>&-
     [[ -z "$LEASE_PID" ]] || { kill "$LEASE_PID" 2>/dev/null || true; wait "$LEASE_PID" 2>/dev/null || true; }
     [[ ${#TRANSPORT_OPTIONS[@]} == 0 ]] || ssh "${TRANSPORT_OPTIONS[@]}" -O exit "$REMOTE" >/dev/null 2>&1 || true
     [[ -z "$BACKUP_TMP" ]] || rm -rf -- "$BACKUP_TMP"
     [[ -z "${TMP_DIR:-}" ]] || rm -rf -- "$TMP_DIR"
+    if [[ -n "$OPERATIONS_EXPORT_TEMP" && "$OPERATIONS_EXPORT_TEMP" == "${OPERATIONS_STATE_ROOT%/*}"/.operations-state.*.partial ]]; then rm -rf -- "$OPERATIONS_EXPORT_TEMP"; fi
     [[ ! -f "${LOG_FILE:-}" ]] || backup_bound_log "$LOG_FILE" "$MAX_MAIN_LOG_BYTES" || true
     exit "$rc"
 }
@@ -636,6 +655,7 @@ vault_remote_restore_drill() {
     }
     last=$(ssh_exec "if test -f $(shell_quote "$root/status/backup_restore_drill.json"); then jq -r 'if .status==\"OK\" or .status==\"WARNING\" then .epoch else 0 end' $(shell_quote "$root/status/backup_restore_drill.json"); else printf 0; fi") || return 1
     [[ "$last" =~ ^[0-9]+$ ]] || return 1
+    RESTORE_DRILL_EPOCH=$last
     if (( last <= $(date +%s) && $(date +%s)-last < RESTORE_DRILL_INTERVAL_SECONDS )); then
         RESTORE_DRILL_SUMMARY="Weekly ISS restore drill not due; last completed epoch=$last"; return 0
     fi
@@ -651,9 +671,110 @@ vault_remote_restore_drill() {
     if (( rc != 0 )); then
         RESTORE_DRILL_SUMMARY="ISS extraction/database drill failed (exit=$rc); verified backup retained. Evidence: $root/logs"; return 1
     fi
+    RESTORE_DRILL_EPOCH=$(ssh_exec "jq -r '.epoch' $(shell_quote "$root/status/backup_restore_drill.json")") || return 1
     RESTORE_DRILL_SUMMARY=$(ssh_exec "jq -r '.summary' $(shell_quote "$root/status/backup_restore_drill.json")") || return 1
     RESTORE_DRILL_RESULT=$(ssh_exec "jq -r '.status' $(shell_quote "$root/status/backup_restore_drill.json")") || return 1
     [[ "$RESTORE_DRILL_RESULT" == OK || "$RESTORE_DRILL_RESULT" == WARNING ]]
+}
+
+vault_export_operations_state() {
+    local fd spec name source file base size total=0 temp previous current_hash copied_hash
+    local scripts="$OPERATIONS_SCRIPT_ROOT"
+    local -a sources=(
+        "arr_health_activity|$scripts/arr_health_activity"
+        "arr_delete_sync_tag|$scripts/arr_delete_sync_tag"
+        "arr_sabnzbd_cleanup|$scripts/arr_sabnzbd_cleanup"
+        "docker_service_watchdog|$scripts/docker_service_watchdog"
+        "dns_redundancy_watchdog|$scripts/dns_redundancy_watchdog"
+        "plex_dbrepair|$scripts/plex_dbrepair"
+        "quarantine_lifecycle|$scripts/quarantine_lifecycle"
+        "kometa_preflight|$scripts/kometa_preflight"
+        "imagemaid_restore_archive|$scripts/imagemaid_restore_archive"
+        "backup_health_audit|$scripts/backup_health_audit"
+        "torrent_download_complete|$scripts/torrent_download_complete/state"
+    )
+    [[ "$OPERATIONS_STATE_ROOT" == "$OPERATIONS_STATE_MOUNT_ROOT"/backup/* && ! -L "$OPERATIONS_STATE_ROOT" &&
+       $(realpath -m "$OPERATIONS_STATE_ROOT") == "$OPERATIONS_STATE_ROOT" ]] || return 1
+    if [[ -e "$OPERATIONS_STATE_ROOT" ]]; then
+        [[ -d "$OPERATIONS_STATE_ROOT" && -f "$OPERATIONS_STATE_ROOT/.owner" && $(cat "$OPERATIONS_STATE_ROOT/.owner") == vault_operations_state ]] || {
+            log ERROR 'Existing operational-state directory is unowned; preserved without changes'; return 1;
+        }
+    fi
+    exec {fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
+    if ! flock -x -w 600 "$fd"; then exec {fd}>&-; log ERROR 'Operational-state writers did not quiesce; no ISS wake performed'; return 1; fi
+    temp=$(mktemp -d "${OPERATIONS_STATE_ROOT%/*}/.operations-state.XXXXXX.partial") || { exec {fd}>&-; return 1; }
+    OPERATIONS_EXPORT_TEMP="$temp"
+    chmod 700 "$temp"
+    printf 'vault_operations_state\n' >"$temp/.owner" || { exec {fd}>&-; return 1; }
+    for spec in "${sources[@]}"; do
+        IFS='|' read -r name source <<<"$spec"
+        [[ -d "$source" && ! -L "$source" ]] || continue
+        mkdir "$temp/$name" || { exec {fd}>&-; return 1; }
+        while IFS= read -r -d '' file; do
+            base=${file##*/}
+            # Explicit current files, never dated backup snapshots or generic logs.
+            case "$base" in
+                state.json|notification-state.json|import-receipts.json|automation-actions.json|policy-actions.json|sonarr-state.json|radarr-state.json|pending-actions.json|pending-operations.json|action-receipts.jsonl|pending-notifications.jsonl|operation-recovery.jsonl|quarantine-index.tsv|transfer-manifest.tsv) ;;
+                *) continue;;
+            esac
+            size=$(stat -c %s "$file") || { exec {fd}>&-; return 1; }
+            total=$((total+size))
+            (( total<=OPERATIONS_STATE_MAX_BYTES )) || { exec {fd}>&-; log ERROR 'Operational state exceeds export budget; previous snapshot retained'; return 1; }
+            [[ "$base" != *.json ]] || jq -e . "$file" >/dev/null || { exec {fd}>&-; return 1; }
+            cp -p -- "$file" "$temp/$name/$base" || { exec {fd}>&-; return 1; }
+            chmod 600 "$temp/$name/$base"
+            current_hash=$(sha256sum "$file" | awk '{print $1}')
+            copied_hash=$(sha256sum "$temp/$name/$base" | awk '{print $1}')
+            [[ "$current_hash" == "$copied_hash" ]] || { exec {fd}>&-; return 1; }
+        done < <(find "$source" -maxdepth 1 -type f -print0)
+    done
+    local required
+    for required in "${OPERATIONS_REQUIRED_STATE_FILES[@]}"; do
+        if [[ ! -f "$temp/$required" ]]; then
+            exec {fd}>&-
+            log ERROR "Required operational state is missing: $required; previous export retained"
+            return 1
+        fi
+    done
+    (( total>0 )) || { exec {fd}>&-; log ERROR 'No current operational state found; empty export refused'; return 1; }
+    # Point 7 remains excluded: do not change disk-health scheduling/code. Its
+    # private config is copied under its existing lock, independently of logs.
+    local health_source="$scripts/health_monitoring/state/health_monitoring.conf" health_fd
+    if [[ -f "$health_source" && ! -L "$health_source" ]]; then
+        exec {health_fd}>/run/health_monitoring.lock || { exec {fd}>&-; return 1; }
+        if ! flock -n "$health_fd"; then exec {health_fd}>&-; exec {fd}>&-; return 1; fi
+        mkdir "$temp/health_monitoring" && cp -p "$health_source" "$temp/health_monitoring/health_monitoring.conf" || { exec {health_fd}>&-; exec {fd}>&-; return 1; }
+        exec {health_fd}>&-
+    fi
+    cat >"$temp/RESTORE.txt" <<'RESTORE'
+Operational state export; bulk logs and volatile locks/leases are excluded.
+Stop the corresponding User Script before restoring its matching state files.
+Keep restored Sonarr/Radarr/SAB app state and script state from compatible times.
+Do not replay pending mutations or clear ambiguous journals: existing scripts
+must reconcile them against current exact API/file IDs. Restoring state does not
+prove actions were completed. Preserve owner/mode and review paths first.
+Never restore /run heartbeats, process IDs or maintenance leases across boots.
+Private disk-health configuration is included; keep this snapshot access private.
+RESTORE
+    jq -n --argjson createdAt "$(date +%s)" --argjson bytes "$total" '{schema:1,createdAt:$createdAt,stateBytes:$bytes,scope:"quiescent script state; no application databases or logs"}' >"$temp/export.json" || { exec {fd}>&-; return 1; }
+    previous="${OPERATIONS_STATE_ROOT}.previous"
+    [[ ! -L "$previous" ]] || { exec {fd}>&-; return 1; }
+    if [[ -e "$previous" ]]; then
+        [[ -d "$previous" && -f "$previous/.owner" && $(cat "$previous/.owner") == vault_operations_state ]] || { exec {fd}>&-; return 1; }
+    fi
+    # Recover only our known previous rename after interruption. Never delete
+    # the sole usable export merely to make room for a replacement.
+    if [[ ! -e "$OPERATIONS_STATE_ROOT" && -d "$previous" ]]; then mv "$previous" "$OPERATIONS_STATE_ROOT" || { exec {fd}>&-; return 1; }; fi
+    if [[ -e "$previous" ]]; then rm -rf -- "$previous" || { exec {fd}>&-; return 1; }; fi
+    if [[ -d "$OPERATIONS_STATE_ROOT" ]]; then mv "$OPERATIONS_STATE_ROOT" "$previous" || { exec {fd}>&-; return 1; }; fi
+    if ! mv "$temp" "$OPERATIONS_STATE_ROOT"; then
+        [[ ! -d "$previous" ]] || mv "$previous" "$OPERATIONS_STATE_ROOT"
+        exec {fd}>&-; return 1
+    fi
+    rm -rf -- "$previous"
+    OPERATIONS_EXPORT_TEMP=""
+    exec {fd}>&-
+    log INFO "Exported $total bytes of quiescent operational state; bulk logs excluded"
 }
 
 vault_inventory() {
@@ -965,6 +1086,12 @@ main() {
     build_priority_prefix
     TMP_DIR="$(mktemp -d /tmp/vault-to-iss.XXXXXX)" || return 1
     vault_producer_locks || return 1
+    for job in "${BACKUP_JOBS[@]}"; do
+        if [[ "$job" == "operations_state|$OPERATIONS_STATE_ROOT" ]]; then
+            # Dry run also captures local state consistently; remote remains read-only.
+            vault_export_operations_state || return 1
+        fi
+    done
     vault_select_sources || return 1
     if [[ -n "$ISS_REQUEST_ID" ]]; then
         local matched=false

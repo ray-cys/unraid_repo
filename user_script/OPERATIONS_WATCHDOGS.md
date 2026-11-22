@@ -4,7 +4,7 @@ These scripts are independent Unraid User Scripts. Keeping them in GitHub does
 not install, enable, or schedule them. Review container names, URLs, paths, and
 expected service states before deployment. Run scripts through `/bin/bash`.
 
-## Docker service watchdog v3.5
+## Docker service watchdog v3.6
 
 Optional schedule: `*/5 * * * *`. Each rule is
 `container|optional HTTP endpoint|always or on-demand|restart permission`.
@@ -140,7 +140,7 @@ Container uptime is independent of successful scheduled processing. Defaults:
 
 | Profile | Expected schedule | Audit policy |
 | --- | --- | --- |
-| Imagemaid | Weekly | Completion within 192 hours (weekly plus 24-hour grace) |
+| Imagemaid | Wednesday/Sunday 07:00 | Completion within 120 hours (96-hour gap plus 24-hour grace); warnings/errors assessed separately |
 | Kometa | Every four hours | Completion within six hours |
 | Metafusion | Every four hours before Kometa | Completion within six hours |
 | Recyclarr | Wednesday/Sunday 06:00 Singapore time | Completion within 120 hours; two successes per rolling 192 hours |
@@ -381,3 +381,5 @@ Both scripts write status receipts for the optional weekly operations audit.
 Neither script repairs configuration, changes disk assignments, or updates Docker
 images. These scripts should be verified on the target host before enabling
 automatic recovery or relying on reboot audit coverage.
+
+See [operations integration](OPERATIONS_INTEGRATION.md) for proven unexpected-exit recovery, shared maintenance and state exports.

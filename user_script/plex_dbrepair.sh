@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Plex DBRepair Scheduler Wrapper v3.3
+# Plex DBRepair Scheduler Wrapper v3.4
 #
 # Unraid 7.4-focused scheduler for the current standalone DBRepair executable.
 # It verifies the official GitHub release, stages updates safely inside each
@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-readonly VERSION="3.3"
+readonly VERSION="3.4"
 
 ###############################################################################
 # CONFIGURATION
@@ -1070,6 +1070,11 @@ update_notifications() {
 ###############################################################################
 
 main() {
+    local platform_version
+    if [[ -r "${UNRAID_VERSION_FILE:-/etc/unraid-version}" ]]; then
+        platform_version=$(sed -n 's/^version="\([^"]*\)"/\1/p' "${UNRAID_VERSION_FILE:-/etc/unraid-version}")
+        [[ "$platform_version" == 7.* ]] || { printf 'Unvalidated Unraid %s; maintenance/config mutations deferred.\n' "$platform_version"; return 0; }
+    fi
     local container final_status="OK" final_summary
     umask 022
     trap cleanup EXIT
@@ -1096,6 +1101,13 @@ main() {
     fi
     acquire_lock || return 0
 
+    exec {APPDATA_EXCLUSION_FD}>"${APPDATA_LOCK_FILE:-/tmp/appdata_backup.lock}" || return 1
+    if ! flock -s -n "$APPDATA_EXCLUSION_FD"; then
+        printf 'MAINTENANCE: appdata backup owns the producer lock; DBRepair deferred without database changes.\n'
+        return 0
+    fi
+    exec {STATE_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
+    flock -s -n "$STATE_EXPORT_FD" || return 0
     RUNTIME_DIR="$(mktemp -d /tmp/plex_dbrepair.XXXXXX)" || return 1
     cleanup_legacy_logs
     prune_reports || warn "Old DBRepair reports could not be pruned"

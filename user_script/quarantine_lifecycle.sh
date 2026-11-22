@@ -96,7 +96,7 @@
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.5.0"
+readonly SCRIPT_VERSION="1.6.0"
 readonly REQUIRED_PURGE_CONFIRMATION="DELETE_EXPIRED_QUARANTINE"
 
 ###############################################################################
@@ -202,7 +202,7 @@ SERIES_REAL=""
 ###############################################################################
 
 OPS_SCRIPT_NAME="quarantine_lifecycle"
-OPS_SCRIPT_VERSION="1.5.0"
+OPS_SCRIPT_VERSION="1.6.0"
 OPS_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
 OPS_ATTENTION_DETAILS=""
 OPS_ATTENTION_FILE=""
@@ -1484,6 +1484,13 @@ main() {
     esac
     if [[ "$mode" == restore && $# != 4 ]]; then printf 'restore requires RUN_ID movies|series RELATIVE_PATH.\n' >&2; trap - EXIT; return 2; fi
     if [[ "$mode" == --resolve-operation && $# -lt 3 ]]; then printf 'resolution requires an exact operation ID and verified outcome.\n' >&2; trap - EXIT; return 2; fi
+    local platform_version
+    if [[ "$mode" != audit && -r "${UNRAID_VERSION_FILE:-/etc/unraid-version}" ]]; then
+        platform_version=$(sed -n 's/^version="\([^"]*\)"/\1/p' "${UNRAID_VERSION_FILE:-/etc/unraid-version}")
+        if [[ "$platform_version" != 7.* ]]; then printf 'Unvalidated Unraid major; purge/restore deferred.\n'; trap - EXIT; return 0; fi
+    fi
+    exec {STATE_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
+    if ! flock -s -n "$STATE_EXPORT_FD"; then printf 'Operational-state export active; lifecycle deferred without changes.\n'; trap - EXIT; return 0; fi
     exec 9>"$LOCK_FILE"
     if ! flock -n 9; then RESULT_STATUS=DEFERRED; RESULT_SUMMARY="Another lifecycle run holds the lock"; trap - EXIT; return 0; fi
     exec 8>"$QUARANTINE_COORDINATION_LOCK"

@@ -13,7 +13,7 @@
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.0"
+readonly SCRIPT_VERSION="1.1"
 
 ###############################################################################
 # CONFIGURATION
@@ -138,6 +138,7 @@ CURRENT_SIGNATURE=""
 NOTIFICATION_SENT=false
 IN_BOOT_GRACE=false
 PRIMARY_STARTING=false
+PRIMARY_IN_MAINTENANCE=false
 
 QUERY_OK=false
 QUERY_REASON=""
@@ -269,8 +270,35 @@ integer_at_least() {
 
 
 maintenance_active() {
-    local target="$1"
-    [[ -e "${MAINTENANCE_DIR}/all" || -e "${MAINTENANCE_DIR}/${target}" ]]
+    local target="$1" lease boot pid start actual expires now
+    [[ -e "${MAINTENANCE_DIR}/all" || -e "${MAINTENANCE_DIR}/${target}" ]] && return 0
+    [[ "$target" == primary ]] || return 1
+    [[ "$PRIMARY_IN_MAINTENANCE" != true ]] || return 0
+    boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true); now=$(date +%s)
+    for lease in "${DOCKER_MAINTENANCE_DIR:-/run/docker-service-maintenance}/$PRIMARY_CONTAINER."*.json; do
+        [[ -f "$lease" && ! -L "$lease" ]] || continue
+        jq -e '(.boot|type)=="string" and (.pid|type)=="number" and (.expires|type)=="number"' "$lease" >/dev/null 2>&1 || continue
+        [[ $(jq -r .boot "$lease") == "$boot" ]] || continue
+        pid=$(jq -r .pid "$lease"); expires=$(jq -r .expires "$lease")
+        [[ "$pid" =~ ^[0-9]+$ && "$expires" =~ ^[0-9]+$ ]] || continue
+        if (( pid==0 && expires>now && expires<=now+86400 )); then return 0; fi
+        if (( pid>0 )) && kill -0 "$pid" 2>/dev/null; then
+            start=$(jq -r '.processStart // ""' "$lease")
+            actual=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')
+            # An overlong but live producer must never be restarted mid-archive.
+            [[ -n "$actual" && "$actual" == "$start" ]] && return 0
+        fi
+    done
+    return 1
+}
+
+primary_maintenance_gate() {
+    local now until
+    exec {ARR_DNS_GATE_FD}>"${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}" || return 1
+    if ! flock -s -n "$ARR_DNS_GATE_FD"; then PRIMARY_IN_MAINTENANCE=true; fi
+    now=$(date +%s); until=$(cat "${ARR_BACKUP_GRACE:-/run/arr-appdata-recovery-until}" 2>/dev/null || true)
+    if [[ "$until" =~ ^[0-9]+$ ]] && (( until>now && until<=now+120 )); then PRIMARY_IN_MAINTENANCE=true; fi
+    if maintenance_active primary; then PRIMARY_IN_MAINTENANCE=true; fi
 }
 
 
@@ -678,6 +706,10 @@ collect_runtime_findings() {
 
 
 classify_dns_state() {
+    if [[ "$PRIMARY_IN_MAINTENANCE" == true ]]; then
+        if [[ "$FALLBACK_DNS_OK" == true ]]; then CLASSIFICATION=PRIMARY_MAINTENANCE; else CLASSIFICATION=FALLBACK_FAILED; fi
+        return 0
+    fi
     if [[ "$PRIMARY_DNS_OK" == true && "$FALLBACK_DNS_OK" == true ]]; then
         CLASSIFICATION="HEALTHY"
     elif [[ "$PRIMARY_DNS_OK" != true && "$FALLBACK_DNS_OK" == true ]]; then
@@ -699,7 +731,9 @@ update_failure_counters() {
         return
     fi
 
-    if [[ "$PRIMARY_DNS_OK" == true || "$PRIMARY_STARTING" == true ]]; then
+    if [[ "$PRIMARY_IN_MAINTENANCE" == true ]]; then
+        : # Preserve earlier primary failures; planned downtime is no evidence.
+    elif [[ "$PRIMARY_DNS_OK" == true || "$PRIMARY_STARTING" == true ]]; then
         PRIMARY_FAILURES=0
     else
         PRIMARY_FAILURES=$((PRIMARY_FAILURES + 1))
@@ -732,6 +766,7 @@ fallback_recovery_needed() {
 
 
 recover_primary() {
+    maintenance_active primary && return 0
     local action="restart"
     local success=false
 
@@ -756,7 +791,12 @@ recover_primary() {
 
     sleep "$PRIMARY_RESTART_WAIT_SECONDS"
     inspect_primary_container || true
-    check_dns_endpoint PRIMARY "$PRIMARY_DNS_IP" "$PRIMARY_LOCAL_EXPECTED"
+    if [[ "$PRIMARY_IN_MAINTENANCE" == true ]]; then
+        PRIMARY_UDP_REASON="planned maintenance; not tested"; PRIMARY_TCP_REASON="$PRIMARY_UDP_REASON"; PRIMARY_LOCAL_REASON="$PRIMARY_UDP_REASON"
+        log INFO 'Primary planned maintenance; primary checks/recovery deferred; fallback remains monitored'
+    else
+        check_dns_endpoint PRIMARY "$PRIMARY_DNS_IP" "$PRIMARY_LOCAL_EXPECTED"
+    fi
 
     if [[ "$PRIMARY_DNS_OK" == true ]]; then
         PRIMARY_FAILURES=0
@@ -1054,6 +1094,7 @@ build_notification_body() {
 
     body+="Classification: ${CLASSIFICATION}"$'\n'
     body+=$'\n'
+    body+="Primary maintenance: ${PRIMARY_IN_MAINTENANCE}"$'\n'
     body+="Primary Unraid Pi-hole (${PRIMARY_DNS_IP}): ${PRIMARY_DNS_OK}"$'\n'
     body+="  UDP: ${PRIMARY_UDP_OK} (${PRIMARY_UDP_REASON}, ${PRIMARY_UDP_MS} ms)"$'\n'
     body+="  TCP: ${PRIMARY_TCP_OK} (${PRIMARY_TCP_REASON}, ${PRIMARY_TCP_MS} ms)"$'\n'
@@ -1178,6 +1219,9 @@ main() {
         return 0
     fi
 
+    exec {STATE_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
+    if ! flock -s -n "$STATE_EXPORT_FD"; then printf 'State export active; DNS scan deferred.\n'; return 0; fi
+    primary_maintenance_gate || return 1
     TMP_DIR="$(mktemp -d /tmp/dns-redundancy-watchdog.XXXXXX)" || return 1
     initialize_state
 
@@ -1201,8 +1245,9 @@ main() {
         fi
     fi
 
-    inspect_primary_container ||
-        log WARN "Unable to inspect primary container: $PRIMARY_CONTAINER"
+    if [[ "$PRIMARY_IN_MAINTENANCE" != true ]]; then
+        inspect_primary_container || log WARN "Unable to inspect primary container: $PRIMARY_CONTAINER"
+    fi
 
     classify_dns_state
     update_failure_counters
@@ -1210,11 +1255,16 @@ main() {
     log INFO \
         "Initial classification=${CLASSIFICATION}; primary=${PRIMARY_DNS_OK} (${PRIMARY_FAILURES}), fallback=${FALLBACK_DNS_OK} (${FALLBACK_FAILURES})"
 
+    local platform_version
+    if [[ -r "${UNRAID_VERSION_FILE:-/etc/unraid-version}" ]]; then
+        platform_version=$(sed -n 's/^version="\([^"]*\)"/\1/p' "${UNRAID_VERSION_FILE:-/etc/unraid-version}")
+        if [[ "$platform_version" != 7.* ]]; then ENABLE_PRIMARY_RECOVERY=false; ENABLE_FALLBACK_RECOVERY=false; log WARN 'Unvalidated Unraid major; DNS recovery prohibited; probes continue'; fi
+    fi
     run_recovery_actions
 
     collect_runtime_findings
 
-    if [[ "$IN_BOOT_GRACE" != true ]] && deep_check_due; then
+    if [[ "$IN_BOOT_GRACE" != true && "$PRIMARY_IN_MAINTENANCE" != true ]] && deep_check_due; then
         run_deep_check
     fi
 
@@ -1228,6 +1278,7 @@ main() {
     fi
 
     case "$CLASSIFICATION" in
+        PRIMARY_MAINTENANCE) RESULT_STATUS="MAINTENANCE" ;;
         HEALTHY)
             if (( ${#DEEP_FINDINGS[@]} > 0 || ${#RUNTIME_FINDINGS[@]} > 0 )); then
                 RESULT_STATUS="WARNING"
@@ -1246,7 +1297,9 @@ main() {
             ;;
     esac
 
-    RESULT_SUMMARY="${CLASSIFICATION}; primary=${PRIMARY_DNS_OK}; fallback=${FALLBACK_DNS_OK}; actions=${#ACTIONS[@]}; findings=$(( ${#DEEP_FINDINGS[@]} + ${#RUNTIME_FINDINGS[@]} ))"
+    local primary_report="$PRIMARY_DNS_OK"
+    [[ "$PRIMARY_IN_MAINTENANCE" != true ]] || primary_report="maintenance (not tested)"
+    RESULT_SUMMARY="${CLASSIFICATION}; primary=${primary_report}; fallback=${FALLBACK_DNS_OK}; actions=${#ACTIONS[@]}; findings=$(( ${#DEEP_FINDINGS[@]} + ${#RUNTIME_FINDINGS[@]} ))"
     log INFO "$RESULT_SUMMARY"
     write_receipt "$RESULT_STATUS" "$RESULT_SUMMARY"
 

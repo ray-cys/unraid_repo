@@ -115,7 +115,7 @@ umask 077
 # Release version for logs, notifications, and the HTTP User-Agent. State-file
 # version fields below are independent schema versions and must not be changed
 # merely when this release version changes.
-readonly SCRIPT_VERSION="2.4.0"
+readonly SCRIPT_VERSION="2.5.0"
 
 ###############################################################################
 # CONFIGURATION
@@ -3906,6 +3906,24 @@ acquire_main_lock() {
     LOCK_HELD=true
 }
 
+# Shared maintenance protocol. Hold through API/filesystem mutations so appdata
+# cannot stop dependencies midway through this run. Export lock protects a
+# consistent per-service operational-state snapshot, never bulk application data.
+acquire_operation_coordination() {
+    local now until version_file="${UNRAID_VERSION_FILE:-/etc/unraid-version}" version
+    if [[ -r "$version_file" ]]; then
+        version=$(sed -n 's/^version="\([^"]*\)"/\1/p' "$version_file")
+        if [[ "$version" != 7.* ]]; then printf 'Unvalidated Unraid version %s; mutations deferred pending compatibility validation.\n' "$version" >&2; return 75; fi
+    fi
+    exec {ARR_OPERATION_FD}>"${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}" || return 1
+    flock -s -n "$ARR_OPERATION_FD" || return 75
+    now=$(date +%s)
+    until=$(cat "${ARR_BACKUP_GRACE:-/run/arr-appdata-recovery-until}" 2>/dev/null || true)
+    if [[ "$until" =~ ^[0-9]+$ ]] && (( until>now && until<=now+120 )); then return 75; fi
+    exec {STATE_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
+    flock -s -n "$STATE_EXPORT_FD" || return 75
+}
+
 main() {
     local mode="${1:-all}"
     local sonarr_rc=0 radarr_rc=0 lock_rc=0 notification_rc=0
@@ -3928,6 +3946,11 @@ main() {
     if [[ "$mode" == all || "$mode" == sonarr || "$mode" == radarr ]]; then
         case "${2:-}" in --dry-run) DRY_RUN=true;; --execute) DRY_RUN=false;; "") ;; *) printf 'Unknown override: %s\n' "$2" >&2; return 2;; esac
     fi
+    local coordination_rc=0
+    acquire_operation_coordination || coordination_rc=$?
+    if (( coordination_rc==75 )); then printf 'MAINTENANCE: run deferred for appdata/startup/state export; no mutations performed.\n'; return 0; fi
+    (( coordination_rc==0 )) || return 1
+
     command -v mountpoint >/dev/null 2>&1 || {
         printf 'Required command not found: mountpoint\n' >&2
         return 1

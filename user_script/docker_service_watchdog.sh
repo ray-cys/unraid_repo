@@ -1,10 +1,10 @@
 #!/bin/bash
-# Docker Service Watchdog v3.5 -- Unraid service availability and bounded recovery.
+# Docker Service Watchdog v3.6 -- Unraid service availability and bounded recovery.
 # Optional schedule: every five minutes. Pi-hole and application-specific health
 # remain owned by the DNS and Arr monitors. All recovery is disabled by default.
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.5"
+readonly SCRIPT_VERSION="3.6"
 
 ###############################################################################
 # CONFIGURATION
@@ -36,13 +36,13 @@ EXTERNAL_SERVICES=(pihole) # Owned by dns_redundancy_watchdog.sh.
 DISABLED_SERVICES=()       # Explicitly ignored, intentionally disabled services.
 DISCOVER_UNCLASSIFIED=true
 # profile|max completion age hours|max runtime hours|evidence source
-# User schedule + grace: weekly Imagemaid -> 192h; 4-hour jobs -> 6h.
+# Actual schedule + grace: Wed/Sun Imagemaid -> 120h; four-hour jobs -> 6h.
 # Recyclarr: Wed/Sun 06:00; longest gap 96h + 24h grace, two successes per 8 days.
 # Sources: runlog:/container/path (Kometa/ImageMaid full native run logs);
 # native:/container/path (Metafusion); log:/container/path; a host JSON
 # receipt; or docker (one-shot containers only). Change log paths to your mounts.
 JOB_RULES=(
-    "imagemaid|192|24|runlog:/config/logs/imagemaid.log"
+    "imagemaid|120|24|runlog:/config/logs/imagemaid.log"
     "kometa|6|24|runlog:/config/logs/meta.log"
     "metafusion|6|24|native:/tmp/metafusion-status.json"
     "recyclarr|120|24|dockerlogs"
@@ -118,7 +118,9 @@ LOG_SIZE_WARNING_BYTES=$((1024 * 1024 * 1024))
 DOCKER_MAINTENANCE_DIR="${DOCKER_MAINTENANCE_DIR:-/run/docker-service-maintenance}"
 MAX_MAINTENANCE_SECONDS=86400
 AUTO_RESTART=false
-RESTART_STOPPED_CONTAINERS=false
+RESTART_STOPPED_CONTAINERS=false # Legacy opt-in; unexpected-exit proof still mandatory.
+RECOVER_UNEXPECTED_EXITS=true    # Only known running always-on containers with die events.
+STOP_EVENT_MAX_AGE_SECONDS=3600
 CONSECUTIVE_FAILURES_BEFORE_RESTART=3
 RESTART_COOLDOWN_SECONDS=21600
 RESTART_BUDGET_WINDOW_SECONDS=86400
@@ -1121,11 +1123,43 @@ verify_service() {
     else return 1; fi
 }
 
+# Docker autostart is not crash recovery. Use native event evidence rather than
+# assuming that any stopped container should be started. Explicit stop/kill
+# events are retained as stop intent; missing/expired evidence prohibits action.
+unexpected_exit_proven() {
+    local name="$1" info="$2" finished epoch id known last events="$TMP_DIR/exit-events.jsonl"
+    [[ "$RECOVER_UNEXPECTED_EXITS" == true || "$RESTART_STOPPED_CONTAINERS" == true ]] || return 1
+    [[ $(jq -r '.[0].State.Status' <<<"$info") == exited ]] || return 1
+    id=$(jq -r '.[0].Id' <<<"$info")
+    known=$(jq -r --arg n "$name" '.services[$n].id // ""' "$STATE_WORK")
+    last=$(jq -r --arg n "$name" '.services[$n].lastRunningAt // 0' "$STATE_WORK")
+    [[ "$last" =~ ^[0-9]+$ && "$id" == "$known" ]] && (( last>0 )) || return 1
+    finished=$(jq -r '.[0].State.FinishedAt // ""' <<<"$info")
+    epoch=$(epoch_value "$finished")
+    (( epoch>0 && epoch<=NOW && NOW-epoch<=STOP_EVENT_MAX_AGE_SECONDS && last<=epoch )) || return 1
+    # Native Docker history is volatile. If it cannot prove the event, preserve
+    # the stopped state. Read only the small time window around this exact exit.
+    if ! docker_cmd events --since "$((epoch-5))" --until "$((epoch+5<NOW ? epoch+5 : NOW))" \
+        --filter "container=$id" --filter type=container --format '{{json .}}' | head -c 65537 >"$events"; then return 1; fi
+    (( $(stat -c %s "$events")<=65536 )) || return 1
+    jq -es --arg id "$id" --argjson t "$epoch" '
+      all(.[]; type=="object") and
+      ([.[] | select((.Actor.ID // .id // "")==$id and (.time // 0)>=$t-5 and (.time // 0)<=$t+5)] as $events |
+       any($events[]; (.Action // .status)=="die") and
+       (any($events[]; (.Action // .status)=="stop" or (.Action // .status)=="kill")|not))' "$events" >/dev/null
+}
+
 attempt_recovery() {
     local name="$1" url="$2" status="$3" permitted="$4" count last window attempts fd elapsed=0 latest lease_rc
     [[ "$AUTO_RESTART" == true && "$RECOVERY_SAFE" == true && "$permitted" == 1 ]] || return 0
+    local platform_version
+    if [[ -r "${UNRAID_VERSION_FILE:-/etc/unraid-version}" ]]; then
+        platform_version=$(sed -n 's/^version="\([^"]*\)"/\1/p' "${UNRAID_VERSION_FILE:-/etc/unraid-version}")
+        [[ "$platform_version" == 7.* ]] || { log WARNING 'Unvalidated Unraid major; Docker recovery prohibited; availability monitoring continues'; return 0; }
+    fi
     [[ -z "${RECOVERY_BLOCKED[$name]+yes}" ]] || return 0
-    [[ "$status" == running || "$RESTART_STOPPED_CONTAINERS" == true ]] || return 0
+    # Initial eligibility is rechecked from fresh inspection under the lease lock.
+    [[ "$status" == running || "$RECOVER_UNEXPECTED_EXITS" == true || "$RESTART_STOPPED_CONTAINERS" == true ]] || return 0
     count="$(jq -r --arg name "$name" '.services[$name].failures // 0' "$STATE_WORK")"
     (( count >= CONSECUTIVE_FAILURES_BEFORE_RESTART )) || return 0
     read -r last window attempts < <(jq -r --arg name "$name" '(.recovery[$name] // {last:0,window:0,attempts:0}) | [.last,.window,.attempts] | @tsv' "$STATE_WORK")
@@ -1146,8 +1180,15 @@ attempt_recovery() {
     latest="$(docker_cmd inspect "$name" 2>/dev/null)" && inspect_valid "$latest" || { exec {fd}>&-; return 0; }
     if [[ "$(jq -r '.[0].Id' <<<"$latest")" != "$(jq -r --arg name "$name" '.services[$name].id // ""' "$STATE_WORK")" ]]; then exec {fd}>&-; return 0; fi
     # A service may have been stopped manually since the observation.
-    if [[ "$(jq -r '.[0].State.Status' <<<"$latest")" != running && "$RESTART_STOPPED_CONTAINERS" != true ]]; then exec {fd}>&-; return 0; fi
-    if [[ -n "$(probe_rule "$name" || true)" ]]; then
+    local recovery_command=restart
+    if [[ "$(jq -r '.[0].State.Status' <<<"$latest")" != running ]]; then
+        if ! unexpected_exit_proven "$name" "$latest"; then
+            log INFO "$name: stopped state preserved; no proof of an unexpected exit (manual stop/kill, missing event history or unknown container)"
+            exec {fd}>&-; return 0
+        fi
+        recovery_command=start
+    fi
+    if [[ "$recovery_command" == restart && -n "$(probe_rule "$name" || true)" ]]; then
         readiness_probe "$name" "$url" || true
         if [[ "$PROBE_RESULT" == authentication || "$PROBE_RESULT" == unconfigured || "$PROBE_RESULT" == inspection ]]; then
             observe "$name:probe-configuration" WARNING "$PROBE_MESSAGE; recovery skipped" || { exec {fd}>&-; return 1; }
@@ -1160,10 +1201,10 @@ attempt_recovery() {
         '.recovery[$name]={last:$now,window:$window,attempts:$attempts}' && save_state || { exec {fd}>&-; return 1; }
     # Reserve the attempt durably BEFORE executing Docker, even on timeout or
     # failure. An interrupted watchdog cannot create an unlimited restart loop.
-    if docker_cmd restart "$name" >/dev/null 2>&1; then
+    if docker_cmd "$recovery_command" "$name" >/dev/null 2>&1; then
         while (( elapsed <= RECOVERY_TIMEOUT_SECONDS )); do
             if verify_service "$name" "$url"; then
-                observe "$name:recovery-action" WARNING "Container restarted; $VERIFY_MESSAGE; awaiting stable recovery scans" 1
+                observe "$name:recovery-action" WARNING "Container $recovery_command completed; $VERIFY_MESSAGE; awaiting stable recovery scans" 1
                 exec {fd}>&-
                 return 0
             fi
@@ -1171,7 +1212,7 @@ attempt_recovery() {
             elapsed=$((elapsed + RECOVERY_POLL_SECONDS))
         done
     fi
-    observe "$name:recovery-failed" CRITICAL "Restart failed or service did not pass post-restart verification; attempt budget consumed" 1
+    observe "$name:recovery-failed" CRITICAL "Container $recovery_command failed or service did not pass post-restart verification; attempt budget consumed" 1
     exec {fd}>&-
 }
 
@@ -1251,7 +1292,10 @@ check_service() {
     if [[ "$id" != "$previous_id" ]]; then failures=0; fi
     if [[ "$bad" == true ]]; then failures=$((failures + 1)); else failures=0; fi
     mutate --arg name "$name" --arg id "$id" --argjson count "$count" --argjson oom "$oom" --argjson failures "$failures" \
-        '.services[$name]={id:$id,restartCount:$count,oom:$oom,failures:$failures}' || return 1
+        --arg status "$status" --argjson now "$NOW" \
+        'if (.services[$name].id // "")!=$id then .services[$name]={lastRunningAt:0} else . end |
+         .services[$name]=((.services[$name] // {})+{id:$id,restartCount:$count,oom:$oom,failures:$failures}) |
+         if $status=="running" then .services[$name].lastRunningAt=$now else . end' || return 1
     check_job "$name" "$info" || return 1
     if [[ "$bad" == true ]]; then RECOVERY_CANDIDATES+=("$name|$url|$status|$allowed"); fi
 }
@@ -1331,6 +1375,10 @@ write_receipt() {
 }
 
 main() {
+    case "${1:-}" in --diagnose|--version|--help|-h|--maintenance) ;;
+        *) exec {STATE_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
+           if ! flock -s -n "$STATE_EXPORT_FD"; then printf 'State export active; watchdog invocation deferred.\n'; return 0; fi;;
+    esac
     local spec name url expected allowed uptime status=OK failed=false command
     case "${1:-}" in
         --help|-h) printf '%s\n' 'Usage: bash docker_service_watchdog.sh [--version|--diagnose CONTAINER [URL]|--maintenance CONTAINER MINUTES REASON|--record-job PROFILE EXIT_CODE [START_EPOCH]]'
@@ -1365,7 +1413,7 @@ main() {
     done
     (( JOB_LOG_SCAN_MAX_BYTES >= 1024 && JOB_LOG_SCAN_MAX_BYTES <= 512 * 1024 * 1024 )) || return 2
     for number in "$BOOT_GRACE_SECONDS" "$CONTAINER_GRACE_SECONDS" "$LOG_SIZE_WARNING_BYTES" "$PROBE_MAX_REDIRECTS"; do [[ "$number" =~ ^[0-9]+$ ]] || return 2; done
-    for flag in "$AUTO_RESTART" "$RESTART_STOPPED_CONTAINERS" "$CHECK_LOG_SIZE" "$DISCOVER_UNCLASSIFIED" "$REQUIRE_VERIFIED_JOB_SUCCESS"; do [[ "$flag" == true || "$flag" == false ]] || return 2; done
+    for flag in "$AUTO_RESTART" "$RESTART_STOPPED_CONTAINERS" "$RECOVER_UNEXPECTED_EXITS" "$CHECK_LOG_SIZE" "$DISCOVER_UNCLASSIFIED" "$REQUIRE_VERIFIED_JOB_SUCCESS"; do [[ "$flag" == true || "$flag" == false ]] || return 2; done
     local profile max_age runtime source
     for spec in "${JOB_RULES[@]}"; do
         IFS='|' read -r profile max_age runtime source <<<"$spec"

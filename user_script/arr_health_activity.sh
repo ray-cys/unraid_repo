@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.13.2
+# ARR Health / Download / Import Monitor v3.14.0
 #
 # PURPOSE
 # -------
@@ -6701,7 +6701,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.13.2 lifecycle commands' \
+        'ARR Health Monitor v3.14.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -16318,6 +16318,11 @@ MONITOR_PHASE_TIMINGS_FILE="${TMP_DIR}/phase_timings.jsonl"
 # STATE
 ###############################################################################
 
+exec {STATE_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || exit 3
+if ! flock -s -n "$STATE_EXPORT_FD"; then
+    log "MAINTENANCE: operational-state export active; scan deferred without observations or actions"
+    exit 0
+fi
 ensure_state_storage_ready
 
 initialize_state
@@ -16381,6 +16386,13 @@ case "${1:-}" in
         ;;
 esac
 
+if [[ -r "${UNRAID_VERSION_FILE:-/etc/unraid-version}" ]]; then
+    arr_platform_version=$(sed -n 's/^version="\([^"]*\)"/\1/p' "${UNRAID_VERSION_FILE:-/etc/unraid-version}")
+    if [[ "$arr_platform_version" != 7.* ]]; then
+        ARR_AUTOMATION_ENABLED=false; POLICY_AUTOMATION_ENABLED=false
+        log 'COMPATIBILITY: unvalidated Unraid major; new Arr mutations disabled; monitoring and read-only reconciliation continue'
+    fi
+fi
 start_monitor_phase "startup"
 
 if ! begin_monitor_run; then
@@ -16402,7 +16414,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.13.2"
+    "START | ARR Health Monitor v3.14.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -16415,7 +16427,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.13.2"
+debug_log "Starting ARR Health Monitor v3.14.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -17034,7 +17046,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.13.2 completed"
+log "ARR Health Monitor v3.14.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""
