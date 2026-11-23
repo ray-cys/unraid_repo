@@ -31,6 +31,19 @@ existing opt-ins. Docker restart policies are not changed to bypass these limits
 
 ## Operational-state backup
 
+The installed `vault_remote_backup` entry uses GitHub's `vault_backup.sh`.
+Schedule `10 * * * *`: each hourly invocation checks the appdata completion
+request; it is not a resident daemon or an hourly full copy. No request or an
+already delivered identity exits before SSH/WOL, new backup logs or notifications.
+A new verified producer generation triggers all configured backup labels.
+Pending delivery retries on later checks, so variable producer runtimes and
+temporary ISS/transport failures do not require a second fixed backup time.
+Photos/GitHub/flash changes alone do not trigger delivery in this mode.
+Delivery is acknowledged before retention, drill and shutdown; warnings from
+those later phases do not automatically repeat an already verified generation.
+`bash script --help` and `--version` are local-only diagnostics; `--force` can
+wake ISS and repeat the current valid request while retaining freshness checks.
+
 Vault v1.7 adds `operations_state` to each ISS generation. Before waking ISS, it
 takes `/run/user-script-state-export.lock` exclusively and exports current state
 from cooperating writers. These writers hold that lock shared. Export waits up

@@ -1,20 +1,63 @@
 #!/bin/bash
 
 ###############################################################################
-# Hubble -> ISS Versioned Backup
+# Hubble -> ISS: completion-driven vault backup consumer
 #
-# Creates independent timestamped generations on ISS without Btrfs snapshots
-# or hard links. A generation is built in a hidden .partial directory, every
-# regular file is verified against a SHA-256 manifest, and only then is the
-# generation atomically promoted. Previous generations are pruned after a new
-# generation succeeds.
+# GitHub source: user_script/vault_backup.sh
+# Installed Unraid User Scripts entry: vault_remote_backup (its file is "script").
+#
+# PURPOSE
+# Keep a separately restorable copy on ISS if Hubble or its local vault fails.
+# Back up the newest completed appdata generation, flash backup, User Scripts,
+# GitHub working directories, photos and compact operational state. This script
+# transfers existing backups; appdata_backup.sh remains the appdata producer.
+#
+# WHY IT IS SCHEDULED HOURLY
+# Use 10 * * * * (hourly at minute 10, Singapore time). Each invocation is a short
+# queue check, not a resident daemon or an unconditional hourly full backup.
+# appdata_backup.sh publishes iss-backup-request.json only after completing and
+# verifying a local generation and checking container restart requirements.
+# With no request, or an already acknowledged generation, exit before transport,
+# WOL, backup log creation, payload enumeration, pruning or notifications.
+#
+# REAL BACKUP WORKFLOW (only for a new, valid, fresh request)
+# 1. Validate the exact producer generation/manifest; acquire producer/state
+#    locks and prepare the compact operational-state export.
+# 2. Wake ISS if needed; wait for SSH/array readiness and acquire the shared ISS
+#    backup lease, also used by the separate remote_backup.sh media mirror.
+# 3. Transfer every configured BACKUP_JOBS source into a hidden .partial remote
+#    generation; verify regular files against the expected SHA-256 manifest.
+# 4. Atomically promote the verified generation and acknowledge its request.
+# 5. Prune only after success (REMOTE_KEEP=3); perform a bounded restore drill on
+#    ISS when its seven-day interval is due, then request guarded clean shutdown.
+# 6. Retain bounded logs/status and send the operational result notification.
+# Generations are independent: no Btrfs snapshot or cross-generation hard-link
+# dependency. Existing source hard links may be preserved within one generation.
+#
+# RETRIES AND LIMITS
+# An undelivered request is checked again next hour after a producer/transport/
+# verification failure. Malformed, changed, future-dated or >72-hour-old requests
+# require investigation/a fresh successful producer run; they are not bypassed.
+# Acknowledgement occurs BEFORE retention/drill/shutdown. Those later warnings do
+# not automatically recopy an already verified generation on the next poll.
+# GitHub/photos/flash changes alone do not trigger a new generation in this mode;
+# their current contents are included with the next appdata completion request.
+#
+# CLI (help/version do not acquire locks, contact ISS or start backup work)
+#   bash script             Consume a new completion request, otherwise no-op.
+#   bash script --help      Explain scheduling, triggers and operational limits.
+#   bash script --version   Show this script version.
+#   bash script --force     Repeat delivery of the current valid request even if
+#                           acknowledged; still enforce freshness/integrity.
+# --force may wake ISS and transfer all jobs. It cannot manufacture a request.
+# Repository DRY_RUN defaults to true for review; preserve the installed value.
 ###############################################################################
 
 set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.7"
+readonly SCRIPT_VERSION="1.8"
 
 ###############################################################################
 # CONFIGURATION
@@ -57,8 +100,9 @@ DEFER_REMOTE_SHUTDOWN_DURING_CRITICAL_ARRAY_OPERATION=true
 
 # Keep true for the first manually reviewed run.
 DRY_RUN=true
-# Schedule hourly. No request/new generation means no network traffic or WOL.
-# --force bypasses deduplication only; producer/freshness/integrity checks remain.
+# Schedule: 10 * * * *. Poll for a producer request, not an hourly full copy.
+# Same delivered identity/no request -> local no-op; no SSH/WOL or backup log.
+# --force bypasses delivery deduplication only; a valid fresh request is required.
 COMPLETION_DRIVEN=true
 ISS_REQUEST_FILE="${ISS_REQUEST_FILE:-/mnt/vault/cloud/logs/script/user_scripts_status/iss-backup-request.json}"
 ISS_DELIVERED_FILE="${ISS_DELIVERED_FILE:-/mnt/vault/cloud/logs/script/user_scripts_status/iss-backup-delivered.json}"
@@ -1052,12 +1096,42 @@ shutdown_remote() {
 # MAIN
 ###############################################################################
 
+vault_usage() {
+    cat <<'HELP'
+Usage: bash script [--help|--version|--force]
+Installed Unraid entry: vault_remote_backup; GitHub source: vault_backup.sh.
+
+Schedule: 10 * * * * (hourly at minute 10, Singapore time).
+This is a scheduled completion-request check, not a continuously running daemon.
+No request/already delivered: local no-op; no ISS SSH/WOL, new backup log or email.
+
+A successful appdata_backup publishes a request for its verified local generation.
+A new valid request causes all configured jobs (appdata, flash, User Scripts,
+GitHub, photos and operational state) to be copied into a new ISS generation.
+Verify SHA-256, promote atomically, acknowledge delivery, retain three successful
+remote generations, run the weekly drill when due, then request guarded shutdown.
+
+Undelivered requests retry on later checks. Requests older than 72 hours, changed
+sources or invalid manifests fail safely. Retention/drill/shutdown warnings after
+delivery acknowledgement do not automatically trigger another full copy.
+Photos/GitHub/flash changes alone do not trigger delivery in completion-driven mode.
+
+--force repeats the current request despite delivery acknowledgement, while keeping
+source/freshness/integrity checks. It may wake ISS and transfer every backup job.
+Help/version perform no backup work. Preserve the installed DRY_RUN setting.
+HELP
+}
 main() {
     local job label source manifest notification_message
+    case "${1:-}" in
+        --help|-h) vault_usage; return 0;;
+        --version) printf 'vault_backup.sh %s (Unraid entry: vault_remote_backup)\n' "$SCRIPT_VERSION"; return 0;;
+        ""|--force) ;;
+        *) vault_usage >&2; return 2;;
+    esac
     exec 9>"$LOCK_FILE" || return 1
     flock -n 9 || { printf 'Another vault backup is active\n' >&2; return 1; }
     local pending_rc=0
-    case "${1:-}" in ""|--force) ;; *) printf 'Usage: bash script [--force]\nHourly default consumes successful appdata requests; --force repeats a pending/delivered generation.\n'; return 2;; esac
     if [[ "$COMPLETION_DRIVEN" == true ]]; then
         vault_pending_request "${1:-}" || pending_rc=$?
         if (( pending_rc == 10 )); then printf 'No new completed appdata generation; ISS remains undisturbed\n'; return 0; fi
