@@ -122,21 +122,18 @@ and publishes through its validated writer. Reconciliation runs during successfu
 untargeted incremental jobs as well as full jobs. Native counts/actions appear in
 runtime metrics; preflight groups successful deferral/restoration results once.
 
-Both producers and the resident Kometa coordinator use the same
-`<Kometa root>/.metafusion/output.lock`. The consumer launcher replaces Kometa's
-internal scheduler, retaining four-hour local boundaries and `--run` children.
-Preflight requires a fresh coordinator receipt and the same exclusive lock; an
-old image, busy producer/consumer or missing coordinator cannot trigger YAML edits.
-The wrapper only maintains recognised personal resolution-overlay filters and
-explicit inherited TMDb collection order. It never rewrites generated metadata
-files or the native deferred catalogue. Original personal-file backups retain
-five sets. No overlays are disabled or general validation switched off.
+MetaFusion and preflight share `<Kometa root>/.metafusion/output.lock` as a
+writer lock. Kometa retains its original image, entrypoint and native scheduler;
+no custom consumer launcher is deployed. Preflight v2.1 observes native run logs
+and checks the writer lock before editing recognised personal overlay/collection
+templates. It never rewrites generated metadata files or the native deferred
+catalogue. Original personal-file backups retain five sets.
 
-The native launcher lives in MetaFusion's `tools/kometa_coordinator.py` and is
-installed in Kometa's mounted `.metafusion/` directory. Its entrypoint override
-must also be retained in the Unraid template for future container updates. Keep
-only one Kometa scheduler. Native coordination details and migration rules are
-in MetaFusion's `docs/runtime-safeguards.md`.
+Stock Kometa does not acquire this lock. Scheduling and native activity checks
+reduce overlap but do not guarantee producer/consumer mutual exclusion. Changing
+a third-party container's startup is outside this installation's ownership
+boundary. Keep all automation changes confined to owned MetaFusion and personal
+User Scripts unless the user explicitly authorizes another application's change.
 
 Application warnings need their underlying evidence checked before remediation:
 

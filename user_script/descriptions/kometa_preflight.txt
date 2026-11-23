@@ -2,6 +2,6 @@ Purpose: Coordinate personal Kometa configuration checks with native MetaFusion 
 
 Schedule: Custom 55 3,7,11,15,19,23 * * * (03:55, 07:55, 11:55, 15:55, 19:55 and 23:55, Singapore time).
 
-Requires MetaFusion develop with native reconciliation capabilities and the coordinated Kometa launcher. Honour host backup maintenance; require both applications idle and acquire their shared output lock. Maintain recognised personal resolution-overlay and collection-order templates. Generated metadata and deferred catalogues are owned by MetaFusion and are never rewritten by this wrapper.
+Requires MetaFusion develop with native reconciliation capabilities. Kometa keeps its original image, entrypoint and internal scheduler. Honour host backup maintenance; require both applications idle and acquire the MetaFusion/wrapper writer lock. Maintain recognised personal resolution-overlay and collection-order templates. Generated metadata and deferred catalogues are owned by MetaFusion and are never rewritten by this wrapper.
 
-Report configuration changes, failures, and successful native metadata deferral/restoration actions once per changed result. Quiet unchanged runs. Does not start Kometa, delete media or change Arr policies. Upgrade/capability failures defer edits.
+Report configuration changes, failures, and successful native metadata deferral/restoration actions once per changed result. Quiet unchanged runs. Does not start Kometa, delete media or change Arr policies. Upgrade/capability failures defer edits. Native log checks and scheduling reduce overlap; stock Kometa does not participate in this lock, so exclusive consumer coordination is not guaranteed.

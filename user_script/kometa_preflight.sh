@@ -1,13 +1,13 @@
 #!/bin/bash
 # shellcheck disable=SC2034
 arrayStarted=true
-# Kometa configuration reconciliation v2.0. Schedule 55 3,7,11,15,19,23 * * *.
+# Kometa configuration reconciliation v2.1. Schedule 55 3,7,11,15,19,23 * * *.
 # Run after MetaFusion and before the four-hour Kometa boundaries. MetaFusion
 # owns generated metadata; this wrapper only maintains personal overlay and
-# collection templates, under the shared producer/consumer output lock.
+# collection templates, under the MetaFusion/wrapper write lock.
 # Incomplete Plex identity inventories/active producers prohibit edits.
 set -uo pipefail
-readonly SCRIPT_VERSION="2.0"
+readonly SCRIPT_VERSION="2.1"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/kometa_preflight}"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 NOTIFY_BIN="${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}"
@@ -51,15 +51,13 @@ try:
         print(json.dumps({'status':'DEFERRED','summary':'Kometa run active or native completion evidence unavailable; files unchanged','changed':False})); sys.exit(0)
     cfg=yaml.safe_load((root/'config.yml').read_text())
     if not isinstance(cfg,dict) or not isinstance(cfg.get('libraries'),dict):raise SafetyError('Unsupported Kometa configuration')
-    # Producer and consumer participate in this same inode lock. Atomic file
-    # writes alone do not prevent Kometa reading multiple generations in a run.
-    native=json.loads((root/'.metafusion/kometa-coordinator.json').read_text())
-    if native.get('schema')!=1 or not 0<=time.time()-native.get('epoch',0)<90:
-        raise SafetyError('Coordinated Kometa launcher missing/stale; no configuration edits')
+    # This lock coordinates our own writers only. Stock Kometa does not
+    # participate; its native log and the schedule provide observational guards.
+    # Never require a custom consumer launcher or change its Docker startup.
     output_lock=(root/'.metafusion/output.lock').open('a+')
     try:fcntl.flock(output_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError:
-        print(json.dumps({'status':'DEFERRED','summary':'MetaFusion/Kometa owns shared output lock; no edits','changed':False}));sys.exit(0)
+        print(json.dumps({'status':'DEFERRED','summary':'MetaFusion owns write lock; no edits','changed':False}));sys.exit(0)
     staged=[]
     # Native per-item regex filters allow a legitimate empty resolution class.
     # Keep builder validation elsewhere and preserve all configured overlays.
@@ -153,7 +151,7 @@ try:
         import shutil
         for old_dir in sorted((state/'backups').iterdir(),reverse=True)[5:]:
             if old_dir.is_dir() and re.fullmatch(r'\d{8}_\d{6}(?:_\d+)?',old_dir.name):shutil.rmtree(old_dir)
-    summary=f'Native MetaFusion owns metadata reconciliation; wrapper changed {len(staged)} personal configuration file(s). Shared producer/consumer lock verified. Plex, media and Arr settings unchanged.'
+    summary=f'Native MetaFusion owns metadata reconciliation; wrapper changed {len(staged)} personal configuration file(s). MetaFusion/wrapper writer lock verified; Kometa retains its native scheduler. Plex, media and Arr settings unchanged.'
     reported=json.loads(os.environ.get('NATIVE_RECONCILIATION','{}'))
     reconciliation=reported.get('result') or {}
     native_changed=False

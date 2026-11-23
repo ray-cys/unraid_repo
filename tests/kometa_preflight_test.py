@@ -1,5 +1,6 @@
 """Run embedded preflight in an isolated Kometa-compatible runtime."""
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -21,10 +22,12 @@ with tempfile.TemporaryDirectory(prefix='kometa-preflight-fixture-') as folder:
     (root/'overlays/media_info.yml').write_text('templates:\n  resolution_info:\n    conditionals:\n      resolution:\n        conditions: []\n    plex_search:\n      all:\n        resolution: <<resolution>>\n\n  next_template:\n    plex_all: true\n')
     os.environ['KOMETA_CONFIG_ROOT']=str(root)
     def run():
-        out=io.StringIO()
+        out=io.StringIO();scope={'__name__':'__main__'}
         with contextlib.redirect_stdout(out):
-            try:exec(compile(PREFLIGHT_SOURCE,'embedded-preflight','exec'),{'__name__':'__main__'})
+            try:exec(compile(PREFLIGHT_SOURCE,'embedded-preflight','exec'),scope)
             except SystemExit:pass
+            finally:
+                if scope.get('output_lock') is not None:scope['output_lock'].close()
         return json.loads(out.getvalue())
     os.chmod(root/'overlays/media_info.yml',0o640)
     result=run();assert result['status']=='OK',result
@@ -41,7 +44,10 @@ with tempfile.TemporaryDirectory(prefix='kometa-preflight-fixture-') as folder:
     (root/'logs/meta.log').write_text('[INFO] | Starting 00:00 Run |\n')
     assert run()['status']=='DEFERRED'
     (root/'logs/meta.log').write_text('[INFO] | Starting 00:00 Run |\n[INFO] | Finished 00:00 Run |\n')
-    (root/'.metafusion/kometa-coordinator.json').write_text('{"schema":1,"epoch":1}')
-    assert run()['status']=='FAILED'
+    (root/'.metafusion/kometa-coordinator.json').unlink()
+    result=run();assert result['status']=='OK',result  # Stock Kometa needs no installed launcher.
+    with (root/'.metafusion/output.lock').open('a+') as holder:
+        fcntl.flock(holder,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        assert run()['status']=='DEFERRED'
     assert (root/'metadata/movie_metadata.yml').read_bytes()==generated
-    print('Preflight native handoff, manual YAML preservation, ownership, configuration-only edits and idle/freshness guards passed')
+    print('Preflight native handoff, manual YAML preservation, ownership, configuration-only edits and native idle/writer-lock guards passed')
