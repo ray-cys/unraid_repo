@@ -7,7 +7,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../user_script/health_monitoring.sh
 source "$REPO_ROOT/user_script/health_monitoring.sh"
 
-readonly REGRESSION_FIXTURE_COUNT=96
+readonly REGRESSION_FIXTURE_COUNT=99
 
 self_test_result() {
     local passed="$1" name="$2" detail="${3:-}"
@@ -40,6 +40,50 @@ run_regression_tests() (
         "$SCRIPT_VERSION"
     printf '%d fixtures are isolated under %s and removed automatically.\n\n' \
         "$REGRESSION_FIXTURE_COUNT" "$fixture_dir"
+
+    if (
+        local retired state_file
+        for retired in capacity_history.log disk_cap_history.log heavy_writer_history.log \
+            parity_progress.state poh_history.log risk_scores_history.log risk_tier_history.log \
+            share_usage_history.log storage_discrepancy_streak.log tbw_daysleft_history.log; do
+            for state_file in "${STATE_FILES_ALERT_RUNTIME[@]}" "${STATE_FILES_TREND_HISTORY[@]}"; do
+                [[ "${state_file##*/}" != "$retired" ]] || exit 1
+            done
+        done
+    ); then
+        self_test_result 1 "The monitor no longer initializes retired report files"
+    else
+        self_test_result 0 "The monitor no longer initializes retired report files"
+    fi
+
+    if (
+        local RUN_EPOCH=100 NVME_TEMP_WARNING=70
+        local -A FRESH_SMART=([/dev/nvme9n1]=1)
+        local alerts=0
+        record_alert() { [[ "$1" == warning ]] && alerts=$((alerts + 1)); }
+        record_temperature_approach /dev/nvme9n1 60 100 8 2 HIGH
+        record_temperature_approach /dev/nvme9n1 67 99 8 2 HIGH
+        record_temperature_approach /dev/nvme9n1 67 100 8 2 LOW
+        record_temperature_approach /dev/nvme9n1 67 100 2 2 HIGH
+        record_temperature_approach /dev/nvme9n1 70 100 8 2 HIGH
+        [[ "$alerts" == 0 ]] || exit 1
+        record_temperature_approach /dev/nvme9n1 67 100 8 2 HIGH
+        [[ "$alerts" == 1 ]]
+    ); then
+        self_test_result 1 "Temperature trend alerts require a fresh fast rise near the warning limit"
+    else
+        self_test_result 0 "Temperature trend alerts require a fresh fast rise near the warning limit"
+    fi
+
+    if (
+        local HEALTH_ALERTS_SECTION="" NOTIFICATION_RECOVERY_SECTION="Recovered: cache temperature"
+        local STORAGE_TOP_LINES="Pool usage context"
+        compose_notification && [[ "$NOTIFY_BODY" == "$NOTIFICATION_RECOVERY_SECTION" ]]
+    ); then
+        self_test_result 1 "Recovery-only emails omit routine storage totals"
+    else
+        self_test_result 0 "Recovery-only emails omit routine storage totals"
+    fi
 
     local topology_fixture="$fixture_dir/disks.ini" parity_fixture="$fixture_dir/parity-checks.log"
     printf '%s\n' '["disk1"]' 'type="Data"' 'status="DISK_OK"' 'device="sda"' 'fsType="xfs"' \
