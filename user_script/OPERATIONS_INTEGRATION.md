@@ -106,6 +106,13 @@ the latest notification failed. The receipt separates an attempted run from a
 completed check, so an early exit or stalled run cannot refresh the completion
 timestamp. The audit uses the existing schedule and only watches while Hubble
 is online and its vault is mounted.
+
+Disk Health Monitor v2.18.0 keeps the regression fixtures in
+`tests/health_monitoring_test.sh`. Run that file with Bash from a checkout on
+Unraid or a Linux environment with the monitor's fixture dependencies. Only
+`user_script/health_monitoring.sh` is required for the installed User Script.
+Use `bash script --diagnostics` on the installed copy to inspect configuration,
+dependencies, and soak status without running SMART tests.
 | `imagemaid_restore_archive` | Disabled with native clear-before-move | Optional archival alternative, retained in GitHub. Enable only when dated restore-image retention is wanted; do not combine it with native clear-before-move. |
 | `kometa_preflight` | `55 3,7,11,15,19,23 * * *` | After idle MetaFusion, before Kometa's four-hour boundaries, reconcile exact Plex GUIDs and supported resolution filters. Active/unsupported producers defer without edits. |
 
