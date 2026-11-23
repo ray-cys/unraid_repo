@@ -188,3 +188,17 @@ The existing disk-health schedule and parity policy are unchanged. `daily_digest
 
 References: [qBittorrent API](https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-%28qBittorrent-5.0%29),
 [Kometa native filters](https://kometa.wiki/en/nightly/files/filters/).
+
+
+## Media Integrity Audit v1.0.0
+
+`media_integrity_audit` runs `30 9 * * 3` (Wednesday 09:30 SGT), with a two-hour
+read-only budget through Bazarr. Movies, series and Formula 1 video containers
+receive quick probes and resumable overlapping decode ranges; pending coverage
+is never called healthy. No new installation, Docker setting or media mutation.
+One grouped run summary reports findings, exact paths, progress and recoveries.
+Backup/runtime audit watches the weekly receipt and delivery failure; vault state
+export optionally includes the compressed queue under its existing short lock.
+Individual media warnings are not duplicated in hourly backup notifications.
+See [Media Integrity Audit](../docs/media-integrity-audit.md) for scope, limitations,
+retention, scheduling and operator CLI.

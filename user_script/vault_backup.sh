@@ -57,7 +57,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.10"
+readonly SCRIPT_VERSION="1.11"
 
 ###############################################################################
 # CONFIGURATION
@@ -867,7 +867,7 @@ RUNBOOK
 }
 
 vault_export_operations_state() {
-    local fd spec name source file base size total=0 temp previous current_hash copied_hash
+    local fd spec name source file base size total=0 temp previous current_hash copied_hash optional_media_bytes=0
     local scripts="$OPERATIONS_SCRIPT_ROOT"
     local -a sources=(
         "arr_health_activity|$scripts/arr_health_activity"
@@ -881,6 +881,7 @@ vault_export_operations_state() {
         "imagemaid_restore_archive|$scripts/imagemaid_restore_archive"
         "backup_health_audit|$scripts/backup_health_audit"
         "torrent_download_complete|$scripts/torrent_download_complete/state"
+        "media_integrity_audit|$scripts/media_integrity_audit"
     )
     [[ "$OPERATIONS_STATE_ROOT" == "$OPERATIONS_STATE_MOUNT_ROOT"/backup/* && ! -L "$OPERATIONS_STATE_ROOT" &&
        $(realpath -m "$OPERATIONS_STATE_ROOT") == "$OPERATIONS_STATE_ROOT" ]] || return 1
@@ -903,11 +904,22 @@ vault_export_operations_state() {
             base=${file##*/}
             # Explicit current files, never dated backup snapshots or generic logs.
             case "$base" in
+                state.json.gz|notified.json|pending-notification.json)
+                    [[ "$name" == media_integrity_audit ]] || continue
+                    # Read-only audit progress is optional recovery material.
+                    # A damaged queue must not block the actual data backup.
+                    if [[ "$base" == *.gz ]]; then
+                        if ! gzip -t "$file" 2>/dev/null; then log WARNING 'Optional media integrity queue invalid; excluded from state export';continue;fi
+                    elif ! jq -e . "$file" >/dev/null 2>&1; then log WARNING 'Optional media integrity delivery state invalid; excluded from export';continue;fi;;
                 state.json|notification-state.json|import-receipts.json|automation-actions.json|policy-actions.json|sonarr-state.json|radarr-state.json|pending-actions.json|pending-operations.json|action-receipts.jsonl|pending-notifications.jsonl|operation-recovery.jsonl|quarantine-index.tsv|transfer-manifest.tsv) ;;
                 *) continue;;
             esac
             size=$(stat -c %s "$file") || { exec {fd}>&-; return 1; }
+            if [[ "$name" == media_integrity_audit ]] && (( total+size>OPERATIONS_STATE_MAX_BYTES )); then
+                log WARNING 'Optional media integrity queue exceeds export budget; omitted without blocking data backup';continue
+            fi
             total=$((total+size))
+            [[ "$name" != media_integrity_audit ]] || optional_media_bytes=$((optional_media_bytes+size))
             (( total<=OPERATIONS_STATE_MAX_BYTES )) || { exec {fd}>&-; log ERROR 'Operational state exceeds export budget; previous snapshot retained'; return 1; }
             [[ "$base" != *.json ]] || jq -e . "$file" >/dev/null || { exec {fd}>&-; return 1; }
             cp -p -- "$file" "$temp/$name/$base" || { exec {fd}>&-; return 1; }
@@ -951,6 +963,11 @@ RESTORE
         size=$(stat -c %s "$file") || { exec {fd}>&-; return 1; }
         recovery_bytes=$((recovery_bytes+size))
     done < <(find "$temp/recovery" -type f -print0)
+    if (( total+recovery_bytes>OPERATIONS_STATE_MAX_BYTES && optional_media_bytes>0 )); then
+        rm -rf -- "$temp/media_integrity_audit"
+        total=$((total-optional_media_bytes))
+        log WARNING 'Optional media integrity queue omitted to preserve recovery-bundle export capacity'
+    fi
     (( total+recovery_bytes <= OPERATIONS_STATE_MAX_BYTES )) || { exec {fd}>&-; log ERROR 'State and recovery capture exceed export budget; previous export retained'; return 1; }
     jq -n --argjson createdAt "$(date +%s)" --argjson bytes "$total" --argjson recoveryBytes "$recovery_bytes" '{schema:2,createdAt:$createdAt,stateBytes:$bytes,recoveryBytes:$recoveryBytes,totalBytes:($bytes+$recoveryBytes),scope:"quiescent script state plus private recovery inventory; no application databases or logs"}' >"$temp/export.json" || { exec {fd}>&-; return 1; }
     previous="${OPERATIONS_STATE_ROOT}.previous"

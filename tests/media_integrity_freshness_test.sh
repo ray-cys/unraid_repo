@@ -1,0 +1,17 @@
+#!/bin/bash
+# shellcheck disable=SC2034
+set -euo pipefail
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$repo/user_script/backup_health_audit.sh"
+fixture=$(mktemp -d /tmp/media-integrity-freshness.XXXXXX)
+trap 'rm -rf -- "$fixture"' EXIT
+STATUS_DIR="$fixture";NOW=1000000
+jq -n --argjson first "$((NOW+86400))" '{schema:1,lastCompletedScanAt:0,firstScheduledAt:$first,notification:"not_attempted"}' >"$fixture/media_integrity_audit.json"
+FINDINGS=();audit_media_integrity_monitor;[[ ${#FINDINGS[@]} == 0 ]]
+jq '.firstScheduledAt=1' "$fixture/media_integrity_audit.json" >"$fixture/next";mv "$fixture/next" "$fixture/media_integrity_audit.json"
+FINDINGS=();audit_media_integrity_monitor;[[ ${#FINDINGS[@]} == 1 ]]
+jq --argjson now "$NOW" '.lastCompletedScanAt=$now|.notification="sent"|.activeFindings=42' "$fixture/media_integrity_audit.json" >"$fixture/next";mv "$fixture/next" "$fixture/media_integrity_audit.json"
+FINDINGS=();audit_media_integrity_monitor;[[ ${#FINDINGS[@]} == 0 ]]
+jq '.notification="failed"' "$fixture/media_integrity_audit.json" >"$fixture/next";mv "$fixture/next" "$fixture/media_integrity_audit.json"
+FINDINGS=();audit_media_integrity_monitor;[[ ${#FINDINGS[@]} == 1 ]]
+printf 'Initial-schedule grace, missed completion, no duplicate media findings and delivery-failure monitoring passed\n'

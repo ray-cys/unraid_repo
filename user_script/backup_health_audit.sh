@@ -1,13 +1,13 @@
 #!/bin/bash
 # shellcheck disable=SC2034
 arrayStarted=true
-# Backup freshness, delivery and runtime-compatibility audit v1.4.
+# Backup freshness, delivery and runtime-compatibility audit v1.5.
 # Schedule: 20 * * * *. Reads local receipts/manifests only: no WOL, remote
 # connection, media hashing, container actions or cleanup. One lifecycle email
 # for changed findings, recovery, or a 24-hour reminder. Failed delivery retries.
 # CLI: bash script [--help|--version]. No CLI modifies backup or application data.
 set -uo pipefail
-readonly SCRIPT_VERSION="1.4"
+readonly SCRIPT_VERSION="1.5"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/backup_health_audit}"
 APPDATA_ROOT="${APPDATA_ROOT:-/mnt/vault/backup/cache}"
@@ -49,6 +49,19 @@ audit_disk_health_monitor() {
         finding 'Disk health monitor: the latest notification could not be delivered'
     fi
 }
+audit_media_integrity_monitor() {
+    local receipt="$STATUS_DIR/media_integrity_audit.json" completed first
+    if ! jq -e '.schema==1 and (.lastCompletedScanAt|type)=="number" and (.firstScheduledAt|type)=="number"' "$receipt" >/dev/null 2>&1; then
+        finding 'Media integrity audit: completion/schedule receipt missing or invalid';return
+    fi
+    completed=$(jq -r .lastCompletedScanAt "$receipt");first=$(jq -r .firstScheduledAt "$receipt")
+    if (( completed>0 )); then check_age 'Media integrity audit invocation' "$completed" "$((8*86400))"
+    elif (( first<=0 || NOW>first+86400 )); then finding 'Media integrity audit: first scheduled scan has not completed within its grace period';fi
+    if jq -e '.notification=="failed"' "$receipt" >/dev/null; then finding 'Media integrity audit: grouped notification delivery failed; pending report retained';fi
+    # Individual media findings remain owned by the weekly audit, not repeated
+    # in this hourly backup/runtime notification stream.
+}
+
 audit_runtime() {
     local command version major missing=false
     for command in bash curl jq flock timeout rsync tar unzip sha256sum find sort stat df realpath docker smartctl findmnt mountpoint; do
@@ -74,7 +87,7 @@ audit_runtime() {
         mountpoint -q "$path" || { finding "Compatibility: required filesystem is not mounted: $path"; missing=true; }
     done
     cron=$(timeout 8 crontab -c /etc/cron.d -l 2>/dev/null) || { cron=""; finding 'Compatibility: active Unraid cron inventory unavailable'; missing=true; }
-    for path in appdata_backup flash_disk_backup remote_backup vault_remote_backup arr_health_activity arr_delete_sync_tag arr_sabnzbd_cleanup quarantine_lifecycle docker_service_watchdog dns_redundancy_watchdog ramlog_monitor torrent_download_complete backup_health_audit media_metadata_audit; do
+    for path in appdata_backup flash_disk_backup remote_backup vault_remote_backup arr_health_activity arr_delete_sync_tag arr_sabnzbd_cleanup quarantine_lifecycle docker_service_watchdog dns_redundancy_watchdog ramlog_monitor torrent_download_complete backup_health_audit media_metadata_audit media_integrity_audit; do
         if [[ ! -f "/boot/config/plugins/user.scripts/scripts/$path/script" ]] ||
            ! grep -Fq "/scripts/$path/script" <<<"$cron"; then
             finding "Scheduling: required User Script missing or not scheduled: $path"; missing=true
@@ -164,7 +177,7 @@ main() {
     exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
     flock -s -n "$export_fd" || return 0
     local previous='' last=0 fingerprint temp status=OK importance=normal body
-    audit_runtime; audit_backups; audit_recovery_inventory; audit_disk_health_monitor
+    audit_runtime; audit_backups; audit_recovery_inventory; audit_disk_health_monitor; audit_media_integrity_monitor
     fingerprint=$(printf '%s\n' "${FINDINGS[@]}" | sort | sha256sum | awk '{print $1}')
     if [[ -f "$STATE_DIR/state.json" ]]; then
         jq -e '.fingerprint|type=="string"' "$STATE_DIR/state.json" >/dev/null || { printf 'Invalid audit state preserved.\n' >&2; return 1; }
