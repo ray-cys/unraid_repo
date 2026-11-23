@@ -7,7 +7,7 @@ arrayStarted=true
 # for changed findings, recovery, or a 24-hour reminder. Failed delivery retries.
 # CLI: bash script [--help|--version]. No CLI modifies backup or application data.
 set -uo pipefail
-readonly SCRIPT_VERSION="1.1"
+readonly SCRIPT_VERSION="1.2"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/backup_health_audit}"
 APPDATA_ROOT="${APPDATA_ROOT:-/mnt/vault/backup/cache}"
@@ -70,6 +70,21 @@ audit_runtime() {
     done
     [[ "$missing" != true ]] || RUNTIME_SAFE=false
 }
+# Only inspect metadata after the first recovery-enabled export. Old snapshots
+# are not retroactively treated as broken, and this audit never wakes ISS.
+audit_recovery_inventory() {
+    local root="${RECOVERY_BUNDLE_ROOT:-/mnt/vault/backup/operations_state/recovery}" status volumes
+    [[ -e "$root" ]] || return 0
+    if [[ -L "$root" ]] || ! jq -e '.schema==1 and (.runtimeStatus|type=="string") and (.namedVolumeMounts|type=="number")' "$root/inventory.json" >/dev/null 2>&1; then
+        finding 'Recovery inventory: missing or invalid metadata; previous data backups are not reclassified'; return
+    fi
+    status=$(jq -r .runtimeStatus "$root/inventory.json")
+    volumes=$(jq -r .namedVolumeMounts "$root/inventory.json")
+    [[ "$status" == complete ]] || finding "Recovery inventory: Docker capture $status; runtime reconstruction evidence incomplete"
+    (( volumes==0 )) || finding "Recovery inventory: $volumes named-volume mount(s) need explicit payload-backup review"
+    ACTIONS+=("Recovery inventory: runtime=$status; named-volume mounts=$volumes. Metadata read only; payload checks remain the producer/restore drill responsibility.")
+}
+
 audit_backups() {
     local latest path created epoch=0 request delivered requested source manifest old_digest new_digest log copy_epoch=0
     latest=$(latest_path "$APPDATA_ROOT" d 'backup_[0-9]*_[0-9]*')
@@ -137,7 +152,7 @@ main() {
     exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
     flock -s -n "$export_fd" || return 0
     local previous='' last=0 fingerprint temp status=OK importance=normal body
-    audit_runtime; audit_backups
+    audit_runtime; audit_backups; audit_recovery_inventory
     fingerprint=$(printf '%s\n' "${FINDINGS[@]}" | sort | sha256sum | awk '{print $1}')
     if [[ -f "$STATE_DIR/state.json" ]]; then
         jq -e '.fingerprint|type=="string"' "$STATE_DIR/state.json" >/dev/null || { printf 'Invalid audit state preserved.\n' >&2; return 1; }

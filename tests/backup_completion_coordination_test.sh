@@ -109,6 +109,7 @@ source "$ROOT/user_script/backup_restore_drill.sh"
 VAULT_MOUNT="$TEST_ROOT"; DRILL_ROOT="$TEST_ROOT/drills"
 APPDATA_BACKUP_ROOT="$TEST_ROOT/completed"; FLASH_BACKUP_ROOT="$TEST_ROOT/flash"
 LOG_DIR="$TEST_ROOT/full-logs"; STATUS_DIR="$TEST_ROOT/full-status"
+RECOVERY_BUNDLE_ROOT="$TEST_ROOT/no-legacy-recovery"; STATE_EXPORT_LOCK="$TEST_ROOT/state-export.lock"
 LOCK_FILE="$TEST_ROOT/full.lock"; APPDATA_LOCK_FILE="$TEST_ROOT/appdata.lock"; FLASH_LOCK_FILE="$TEST_ROOT/flash.lock"
 WORK_DIR="$DRILL_ROOT/drill_$RUN_STAMP.partial"; FINAL_DIR="$DRILL_ROOT/drill_$RUN_STAMP"; LOG_FILE="$LOG_DIR/drill.log"
 NOTIFY_BIN=/nonexistent; EXTRA_FREE_MARGIN_BYTES=0
@@ -126,9 +127,9 @@ for i in {1..10}; do printf 'fixture' >"$TEST_ROOT/boot/config/$i.cfg"; done
 (cd "$FLASH_BACKUP_ROOT" && sha256sum test-boot-backup-fixture.zip >test-boot-backup-fixture.zip.sha256)
 mountpoint() { return 0; }
 (main)
-jq -e '.status=="OK" and (.summary|contains("app"))' "$STATUS_DIR/backup_restore_drill.json" >/dev/null
+jq -e '.status=="WARNING" and (.summary|contains("app")) and (.summary|contains("older backup has no recovery bundle"))' "$STATUS_DIR/backup_restore_drill.json" >/dev/null
 [[ -f "$FINAL_DIR/result.txt" && ! -e "$FINAL_DIR/flash" ]]
-printf 'complete bounded restore workflow passed\n'
+printf 'complete bounded restore workflow passed; legacy control-plane gaps correctly reported as unverified\n'
 FULL
 # Execute the real SSH command construction against a local simulated receiver.
 bash <<'REMOTE_DRILL'

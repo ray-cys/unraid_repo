@@ -7,3 +7,5 @@ appdata_backup publishes a request after successful local completion. No request
 Undelivered requests retry on later checks; invalid/changed/stale requests fail safely. Acknowledged delivery is not repeated merely because later retention/drill/shutdown reports a warning. Photos/GitHub/flash changes alone wait for the next appdata completion request.
 
 CLI: bash script --help or --version performs no backup work. --force repeats the current valid request and may wake ISS/transfer all jobs. GitHub source: user_script/vault_backup.sh; installed entry: vault_remote_backup. Preserve the installed DRY_RUN setting.
+
+Recovery inventory (v1.9): Before waking ISS, privately capture read-only Docker definitions, image digests, networks/volume metadata, compact Docker templates/User Scripts/schedules and a recovery runbook inside operations_state/recovery. The existing transfer verifies and replicates these files. No image pulls or container changes occur. Credentials can be present: keep the bundle private. Coverage identifies configured sources and named-volume gaps; it does not certify external mount contents or application startup.

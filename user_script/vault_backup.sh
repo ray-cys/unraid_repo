@@ -57,7 +57,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.8"
+readonly SCRIPT_VERSION="1.9"
 
 ###############################################################################
 # CONFIGURATION
@@ -114,8 +114,8 @@ ISS_REQUEST_GENERATION=""
 RUN_REMOTE_RESTORE_DRILL=true
 RESTORE_DRILL_SCRIPT="${RESTORE_DRILL_SCRIPT:-/boot/config/plugins/user.scripts/scripts/backup_restore_drill/script}"
 RESTORE_DRILL_INTERVAL_SECONDS=604800
-# Compact state only: no logs, cache/history backups, credentials from apps or
-# transient heartbeat/maintenance files. Scripts remain standalone.
+# Compact operational state plus private recovery configuration (may contain
+# credentials). No bulk logs/cache, databases or transient leases. Standalone.
 OPERATIONS_STATE_ROOT="${OPERATIONS_STATE_ROOT:-/mnt/vault/backup/operations_state}"
 OPERATIONS_STATE_MAX_BYTES=$((128 * 1024 * 1024))
 OPERATIONS_STATE_MOUNT_ROOT="${OPERATIONS_STATE_MOUNT_ROOT:-/mnt/vault}"
@@ -311,7 +311,7 @@ backup_bound_log() {
     [[ -f "$file" ]] || return 0
     (( $(stat -c %s "$file") > limit )) || return 0
     temp=$(mktemp "${file}.bounded.XXXXXX") || return 1
-    tail -c "$limit" -- "$file" >"$temp" && mv -f -- "$temp" "$file" || { rm -f -- "$temp"; return 1; }
+    tail --bytes="$limit" -- "$file" >"$temp" && mv -f -- "$temp" "$file" || { rm -f -- "$temp"; return 1; }
 }
 backup_phase() {
     local now
@@ -721,6 +721,151 @@ vault_remote_restore_drill() {
     [[ "$RESTORE_DRILL_RESULT" == OK || "$RESTORE_DRILL_RESULT" == WARNING ]]
 }
 
+# Read-only control-plane capture. Private Docker inspect output can contain
+# credentials; never print it or publish it to GitHub. No container is changed.
+RECOVERY_SUMMARY="not captured"
+RECOVERY_CAPTURE_WARNING=false
+RECOVERY_BOOT_ROOT="${RECOVERY_BOOT_ROOT:-/boot}"
+recovery_docker() { timeout 30 docker "$@"; }
+vault_capture_recovery() {
+    local root="$1" boot="$RECOVERY_BOOT_ROOT" file rel before after size total=0
+    local status=complete spec label source container_count=0 uncovered=0
+    mkdir -m 700 "$root" "$root/boot-config" || return 1
+    printf '[]\n' >"$root/files.json"
+    # Explicit control files only: omit plugin binaries, logs and backup ZIPs.
+    if [[ -d "$boot/config" && ! -L "$boot/config" ]]; then
+        while IFS= read -r -d '' file; do
+            rel=${file#"$boot/"}
+            case "$rel" in
+                config/docker.cfg|config/network.cfg|config/network-rules.cfg|config/ident.cfg|config/shares/*.cfg|config/plugins/dockerMan/templates-user/*.xml|config/plugins/user.scripts/schedule.json|config/plugins/user.scripts/customSchedule.cron|config/plugins/user.scripts/scripts/*/script|config/plugins/user.scripts/scripts/*/name|config/plugins/user.scripts/scripts/*/description) ;;
+                *) continue;;
+            esac
+            [[ "$rel" != *$'\n'* && "$rel" != *$'\r'* && $(realpath -e "$file") == "$file" ]] || return 1
+            size=$(stat -c %s "$file") || return 1
+            total=$((total+size)); ((total <= OPERATIONS_STATE_MAX_BYTES)) || return 1
+            before=$(sha256sum "$file" | awk '{print $1}') || return 1
+            mkdir -p -- "$root/boot-config/${rel%/*}" || return 1
+            cp -p -- "$file" "$root/boot-config/$rel" || return 1
+            after=$(sha256sum "$file" | awk '{print $1}') || return 1
+            [[ "$before" == "$after" && "$before" == "$(sha256sum "$root/boot-config/$rel" | awk '{print $1}')" ]] || return 1
+            jq --arg path "$rel" --arg hash "$before" --argjson bytes "$size" \
+                --arg owner "$(stat -c '%u:%g:%a' "$file")" \
+                '. + [{path:$path,sha256:$hash,bytes:$bytes,originalOwnerGroupMode:$owner}]' \
+                "$root/files.json" >"$root/files.next" && mv "$root/files.next" "$root/files.json" || return 1
+        done < <(find "$boot/config" -type f -print0)
+    else
+        status=partial
+    fi
+    for file in containers images networks volumes; do printf '[]\n' >"$root/$file.json"; done
+    # Lists are stored in files, not expanded into one enormous argv.
+    if recovery_docker ps -aq --no-trunc >"$root/container-ids.txt" 2>/dev/null; then
+        while IFS= read -r file; do
+            [[ "$file" =~ ^[a-f0-9]{12,64}$ ]] || { status=partial; continue; }
+            if recovery_docker inspect "$file" >"$root/inspect.tmp" 2>/dev/null && jq -e 'type=="array" and length==1' "$root/inspect.tmp" >/dev/null; then
+                jq -s '.[0]+.[1]' "$root/containers.json" "$root/inspect.tmp" >"$root/merge.tmp" && mv "$root/merge.tmp" "$root/containers.json" || return 1
+            else status=partial; fi
+        done <"$root/container-ids.txt"
+        if recovery_docker ps -aq --no-trunc >"$root/container-ids-after.txt" 2>/dev/null; then
+            sort "$root/container-ids.txt" >"$root/ids-before.tmp"
+            sort "$root/container-ids-after.txt" >"$root/ids-after.tmp"
+            cmp -s "$root/ids-before.tmp" "$root/ids-after.tmp" || status=partial
+        else status=partial; fi
+        jq -r '.[].Image' "$root/containers.json" | sort -u >"$root/image-ids.txt"
+        for spec in images networks volumes; do
+            case "$spec" in
+                images) source="$root/image-ids.txt";;
+                networks) source="$root/network-ids.txt"; recovery_docker network ls -q >"$source" 2>/dev/null || status=partial;;
+                volumes) source="$root/volume-names.txt"; recovery_docker volume ls -q >"$source" 2>/dev/null || status=partial;;
+            esac
+            while IFS= read -r file; do
+                [[ -n "$file" && "$file" != -* ]] || continue
+                case "$spec" in images) label=image;; networks) label=network;; volumes) label=volume;; esac
+                if recovery_docker "$label" inspect "$file" >"$root/inspect.tmp" 2>/dev/null && jq -e 'type=="array" and length==1' "$root/inspect.tmp" >/dev/null; then
+                    jq -s '.[0]+.[1]' "$root/$spec.json" "$root/inspect.tmp" >"$root/merge.tmp" && mv "$root/merge.tmp" "$root/$spec.json" || return 1
+                else status=partial; fi
+            done <"$source"
+        done
+    else status=unavailable; fi
+    # Policies are evidence, not a claim of payload verification. Never source
+    # another script or infer /mnt/user aliases or named-volume data coverage.
+    printf '[]\n' >"$root/policies.json"
+    for spec in "${BACKUP_JOBS[@]}"; do
+        IFS='|' read -r label source <<<"$spec"
+        jq --arg label "$label" --arg source "$source" '.+[{label:$label,source:$source,evidence:"configured ISS source; transfer verification occurs later"}]' \
+            "$root/policies.json" >"$root/merge.tmp" && mv "$root/merge.tmp" "$root/policies.json" || return 1
+    done
+    if [[ -f "${ISS_REQUEST_GENERATION:-}/backup_manifest.tsv" ]]; then
+        cp -- "$ISS_REQUEST_GENERATION/backup_manifest.tsv" "$root/appdata-producer-manifest.tsv" || return 1
+    fi
+    jq --slurpfile policies "$root/policies.json" '
+        [.[] | .Name as $name | .Mounts[]? | . as $m |
+        {container:$name,type:.Type,source:.Source,destination:.Destination,readWrite:.RW,
+         matchingConfiguredSources:[$policies[0][] | select(.source as $s | $m.Source==$s or ($m.Source|startswith($s+"/"))) | .label],
+         payloadStatus:(if .Type=="volume" then "named-volume contents require explicit backup"
+           elif (.Source|test("^/(dev|proc|sys|run|tmp)(/|$)")) then "system or transient mount; review dependency"
+           else "unverified: check appdata manifest, exclusions and media mirror separately" end)}]' \
+        "$root/containers.json" >"$root/coverage.json" || return 1
+    if [[ -f "$root/appdata-producer-manifest.tsv" ]]; then
+        source=$(sed -n 's/^# source=//p' "$root/appdata-producer-manifest.tsv")
+        jq -n --arg source "$source" --rawfile manifest "$root/appdata-producer-manifest.tsv" \
+            '{source:$source,archivedNames:[$manifest|split("\n")[]|select(length>0 and (startswith("#")|not))|split("\t")|.[3]],scope:"producer archive names only; per-path exclusions still apply"}' \
+            >"$root/appdata-coverage.json" || return 1
+    fi
+    container_count=$(jq length "$root/containers.json")
+    uncovered=$(jq '[.[]|select(.payloadStatus|startswith("named-volume"))]|length' "$root/coverage.json")
+    jq -n --arg status "$status" --arg host "$(hostname)" --arg kernel "$(uname -r)" \
+        --arg generation "${ISS_REQUEST_GENERATION:-}" --argjson epoch "$(date +%s)" \
+        --argjson containers "$container_count" --argjson namedVolumes "$uncovered" \
+        '{schema:1,capturedAt:$epoch,host:$host,kernel:$kernel,producerGeneration:$generation,
+          runtimeStatus:$status,containerCount:$containers,namedVolumeMounts:$namedVolumes,
+          scope:"read-only configuration capture; not an application startup test or proof of mount payload coverage"}' >"$root/inventory.json" || return 1
+    cat >"$root/RESTORE.md" <<'RUNBOOK'
+# Hubble recovery runbook
+
+This private bundle contains credentials in Docker environment/template settings.
+Keep it off public repositories. Inventory commands never modify Docker.
+
+1. Keep the original failed disks and backups intact. Install a compatible Unraid
+   release on replacement flash; restore flash configuration deliberately. Confirm
+   disk serials and assignments before starting the array; never blindly apply
+   super.dat to different disks. Restore network access and licensing as required.
+2. Disable Docker autostart, User Scripts schedules and automatic download/import,
+   metadata and cleanup jobs until paths and restored data have been checked.
+3. Choose a completed SHA-verified backup generation. Restore appdata, flash
+   control files, User Scripts, GitHub, photos and operational state from compatible
+   times. The media/secure mirror is separate from vault generations. Check its
+   exclusions and latest transfer result; deleted mirrored data is not versioned.
+4. Review files.json for original owner/group/mode. boot-config contains a compact
+   control-plane copy, not a complete flash backup. Docker templates and schedules
+   supplement the full flash ZIP. Restore only the selected settings you need.
+5. Review containers.json, images.json, networks.json and volumes.json. Recreate
+   required network drivers/IPAM and mount paths first. Inspect recorded image IDs,
+   RepoDigests and architecture; tags can change and digests may become unavailable.
+   This bundle contains no image layers and no named-volume contents. Do not
+   automatically execute captured environment values or blindly replay inspect.
+6. Check coverage.json, policies.json and the producer manifest. Configured paths
+   do not prove payload coverage. Appdata exclusions, external mounts, named
+   volumes and the separate remote media mirror need individual review. Do not
+   assume /mnt/user and pool paths are aliases without checking the restored layout.
+7. Restore databases and configuration before starting one service at a time.
+   Validate application access and actual media paths; the bounded restore drill
+   does not start containers or certify a complete working system.
+8. Restore script state with its matching application state. Let mutation journals
+   reconcile exact API/file IDs; do not blindly replay actions or restore /run
+   locks, PIDs, heartbeats or maintenance leases. Verify a new backup and monitor
+   baseline, then deliberately re-enable schedules, imports and cleanup policies.
+RUNBOOK
+    rm -f -- "$root/"*.tmp "$root/container-ids-after.txt"
+    # Secure copied files beneath a private parent. Original modes are recorded.
+    find "$root" -type d -exec chmod 700 {} + || return 1
+    find "$root" -type f -exec chmod 600 {} + || return 1
+    (cd "$root" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS) || return 1
+    chmod 600 "$root/SHA256SUMS"
+    [[ "$status" == complete && "$uncovered" == 0 ]] || RECOVERY_CAPTURE_WARNING=true
+    RECOVERY_SUMMARY="runtime=$status; containers=$container_count; named-volume mounts needing payload review=$uncovered; mount coverage requires policy review"
+    log INFO "Recovery inventory: $RECOVERY_SUMMARY"
+}
+
 vault_export_operations_state() {
     local fd spec name source file base size total=0 temp previous current_hash copied_hash
     local scripts="$OPERATIONS_SCRIPT_ROOT"
@@ -800,7 +945,14 @@ prove actions were completed. Preserve owner/mode and review paths first.
 Never restore /run heartbeats, process IDs or maintenance leases across boots.
 Private disk-health configuration is included; keep this snapshot access private.
 RESTORE
-    jq -n --argjson createdAt "$(date +%s)" --argjson bytes "$total" '{schema:1,createdAt:$createdAt,stateBytes:$bytes,scope:"quiescent script state; no application databases or logs"}' >"$temp/export.json" || { exec {fd}>&-; return 1; }
+    vault_capture_recovery "$temp/recovery" || { exec {fd}>&-; log ERROR 'Recovery capture failed; previous export retained'; return 1; }
+    local recovery_bytes=0
+    while IFS= read -r -d '' file; do
+        size=$(stat -c %s "$file") || { exec {fd}>&-; return 1; }
+        recovery_bytes=$((recovery_bytes+size))
+    done < <(find "$temp/recovery" -type f -print0)
+    (( total+recovery_bytes <= OPERATIONS_STATE_MAX_BYTES )) || { exec {fd}>&-; log ERROR 'State and recovery capture exceed export budget; previous export retained'; return 1; }
+    jq -n --argjson createdAt "$(date +%s)" --argjson bytes "$total" --argjson recoveryBytes "$recovery_bytes" '{schema:2,createdAt:$createdAt,stateBytes:$bytes,recoveryBytes:$recoveryBytes,totalBytes:($bytes+$recoveryBytes),scope:"quiescent script state plus private recovery inventory; no application databases or logs"}' >"$temp/export.json" || { exec {fd}>&-; return 1; }
     previous="${OPERATIONS_STATE_ROOT}.previous"
     [[ ! -L "$previous" ]] || { exec {fd}>&-; return 1; }
     if [[ -e "$previous" ]]; then
@@ -818,7 +970,7 @@ RESTORE
     rm -rf -- "$previous"
     OPERATIONS_EXPORT_TEMP=""
     exec {fd}>&-
-    log INFO "Exported $total bytes of quiescent operational state; bulk logs excluded"
+    log INFO "Exported $total state bytes and $recovery_bytes recovery bytes; bulk logs excluded"
 }
 
 vault_inventory() {
@@ -910,7 +1062,7 @@ transfer_job() {
         backup_phase "transfer-$label"
         started=$(date +%s); args=("${RSYNC_ARGS[@]}")
         [[ "$force_checksum" != true ]] || args+=(--checksum)
-        "${PRIORITY_PREFIX[@]}" rsync "${args[@]}" "$source/" "$REMOTE:$destination/" 2>&1 | tail -c "$MAX_RAW_LOG_BYTES" >"$output"
+        "${PRIORITY_PREFIX[@]}" rsync "${args[@]}" "$source/" "$REMOTE:$destination/" 2>&1 | tail --bytes="$MAX_RAW_LOG_BYTES" >"$output"
         rc=${PIPESTATUS[0]}; elapsed=$(( $(date +%s)-started ))
         tail -n 30 -- "$output" >>"$LOG_FILE"
         log INFO "$label attempt=$attempt duration=${elapsed}s rsync_exit=$rc"
@@ -1244,8 +1396,10 @@ main() {
     elif (( REMOTE_SHUTDOWN_FAILED == 1 )); then
         notification_message+=$'\n'"Remote shutdown: request failed"
     fi
+    notification_message+=$'\n'"Recovery inventory: $RECOVERY_SUMMARY"
     notification_message+=$'\n'"Restore drill: $RESTORE_DRILL_RESULT. $RESTORE_DRILL_SUMMARY"
     local importance=normal
+    [[ "$RECOVERY_CAPTURE_WARNING" != true ]] || importance=warning
     case "$RESTORE_DRILL_RESULT" in FAILED|WARNING) importance=warning;; esac
     if [[ -n "$REMOTE_SHUTDOWN_SKIPPED_REASON" && "$SHUTDOWN_RESULT" != deferred ]] || (( REMOTE_SHUTDOWN_FAILED != 0 )); then importance=warning; fi
     notify_unraid "$importance" "Backup completed" "$notification_message"

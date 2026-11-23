@@ -36,6 +36,8 @@ source "$ROOT/user_script/vault_backup.sh"
 OPERATIONS_STATE_MOUNT_ROOT="$TEST_ROOT/vault"; OPERATIONS_STATE_ROOT="$TEST_ROOT/vault/backup/operations_state"
 OPERATIONS_REQUIRED_STATE_FILES=(arr_health_activity/state.json arr_delete_sync_tag/pending-operations.json)
 OPERATIONS_SCRIPT_ROOT="$TEST_ROOT/live"; LOG_FILE="$TEST_ROOT/export.log"
+RECOVERY_BOOT_ROOT="$TEST_ROOT/no-host-boot"
+recovery_docker() { return 1; }
 mkdir -p "$OPERATIONS_STATE_MOUNT_ROOT/backup" "$OPERATIONS_SCRIPT_ROOT/arr_health_activity" "$OPERATIONS_SCRIPT_ROOT/arr_delete_sync_tag"
 printf '{"issues":{"ack":"preserved"}}' >"$OPERATIONS_SCRIPT_ROOT/arr_health_activity/state.json"
 printf '{"operations":{}}' >"$OPERATIONS_SCRIPT_ROOT/arr_delete_sync_tag/pending-operations.json"

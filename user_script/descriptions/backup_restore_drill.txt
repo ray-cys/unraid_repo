@@ -5,3 +5,5 @@ Schedule: Disabled in User Scripts. The completion-driven vault_remote_backup in
 Rotate two appdata archives by default, enforce extraction-space limits, check selected SQLite databases and flash-backup evidence, remove temporary restored payload and retain compact results. Oversized/unchecked archives are reported as untested.
 
 Never writes restored data to live appdata or the boot device. This tests the selected backup contents; it does not certify every application starts or that the flash device can boot.
+
+Control-plane checks (v1.3): Validate copied Docker template XML when PHP is available, Bash syntax without executing scripts, schedule JSON and known active script references. Verify the recovery bundle's complete SHA-256 manifest and inventory counts. Missing legacy recovery bundles or unavailable checks are reported as unverified warnings. No Docker service is started or changed.

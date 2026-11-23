@@ -22,7 +22,7 @@
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.2"
+readonly SCRIPT_VERSION="1.3"
 
 ###############################################################################
 # CONFIGURATION
@@ -466,6 +466,105 @@ drill_appdata() {
     done
 }
 
+# Syntax/schema checks only: never execute restored scripts/templates.
+CONTROL_SCRIPTS_CHECKED=0
+CONTROL_TEMPLATES_CHECKED=0
+RECOVERY_CHECK_RESULT="not checked"
+drill_control_plane() {
+    local config="$1" file schedule entry frequency script normalized
+    if [[ ! -f "$config/docker.cfg" ]]; then
+        log WARN 'Docker configuration absent from control-plane copy'; DRILL_WARNINGS=$((DRILL_WARNINGS+1))
+    fi
+    if [[ -d "$config/plugins/dockerMan/templates-user" ]]; then
+        while IFS= read -r -d '' file; do
+            if command -v php >/dev/null 2>&1; then
+                php -r '
+                  $s=file_get_contents($argv[1]);
+                  if (preg_match("/<!DOCTYPE|<!ENTITY/i",$s)) exit(1);
+                  libxml_use_internal_errors(true);
+                  $x=simplexml_load_string($s,"SimpleXMLElement",LIBXML_NONET);
+                  exit($x!==false && $x->getName()==="Container" && trim((string)$x->Name)!=="" && trim((string)$x->Repository)!=="" ? 0:1);
+                ' "$file" >/dev/null 2>&1 || { log ERROR "Invalid Docker template: ${file##*/}"; return 1; }
+                CONTROL_TEMPLATES_CHECKED=$((CONTROL_TEMPLATES_CHECKED+1))
+            else
+                log WARN 'PHP unavailable; Docker XML syntax not verified'; DRILL_WARNINGS=$((DRILL_WARNINGS+1)); break
+            fi
+        done < <(find "$config/plugins/dockerMan/templates-user" -type f -name '*.xml' -print0)
+    else
+        log WARN 'Docker templates absent from control-plane copy'; DRILL_WARNINGS=$((DRILL_WARNINGS+1))
+    fi
+    if [[ -d "$config/plugins/user.scripts/scripts" ]]; then
+        while IFS= read -r -d '' file; do
+            normalized="$WORK_DIR/control-script.tmp"
+            tr -d '\r' <"$file" >"$normalized" || return 1
+            IFS= read -r script <"$normalized" || true
+            case "$script" in
+                '#!'*bash*|'#!'*'/sh'|'') bash -n "$normalized" >/dev/null 2>&1 || { log ERROR "User Script syntax failed: ${file%/script}"; return 1; }; CONTROL_SCRIPTS_CHECKED=$((CONTROL_SCRIPTS_CHECKED+1));;
+                '#!'*) log WARN "Non-shell User Script not syntax-tested: ${file%/script}"; DRILL_WARNINGS=$((DRILL_WARNINGS+1));;
+                *) bash -n "$normalized" >/dev/null 2>&1 || return 1; CONTROL_SCRIPTS_CHECKED=$((CONTROL_SCRIPTS_CHECKED+1));;
+            esac
+            rm -f "$normalized"
+        done < <(find "$config/plugins/user.scripts/scripts" -type f -name script -print0)
+    else
+        log WARN 'User Scripts absent from control-plane copy'; DRILL_WARNINGS=$((DRILL_WARNINGS+1))
+    fi
+    schedule="$config/plugins/user.scripts/schedule.json"
+    if [[ -f "$schedule" ]]; then
+        jq -e 'type=="object" and all(.[]; type=="object" and (.script|type=="string") and (.frequency|type=="string"))' "$schedule" >/dev/null || {
+            log ERROR 'User Scripts schedule JSON schema invalid'; return 1;
+        }
+        while IFS= read -r entry; do
+            script=$(jq -r .script <<<"$entry"); frequency=$(jq -r .frequency <<<"$entry")
+            case "$frequency" in ''|disabled|Disabled) continue;; esac
+            # Validate known absolute plugin paths without executing any schedule.
+            case "$script" in
+                /boot/config/plugins/user.scripts/scripts/*/script)
+                    [[ "$script" != *'/../'* && -f "$config/${script#/boot/config/}" ]] || { log ERROR 'Active schedule references a missing User Script'; return 1; };;
+                *) log WARN 'Schedule uses an unrecognized script path; manual mapping required'; DRILL_WARNINGS=$((DRILL_WARNINGS+1));;
+            esac
+            if [[ "$frequency" == custom && ! -s "$config/plugins/user.scripts/customSchedule.cron" ]]; then
+                log WARN 'Custom schedule present without customSchedule.cron'; DRILL_WARNINGS=$((DRILL_WARNINGS+1))
+            fi
+        done < <(jq -c '.[]' "$schedule")
+    else
+        log WARN 'User Scripts schedule absent from control-plane copy'; DRILL_WARNINGS=$((DRILL_WARNINGS+1))
+    fi
+}
+
+drill_recovery_bundle() {
+    local root="${RECOVERY_BUNDLE_ROOT:-/mnt/vault/backup/operations_state/recovery}" file line hash rel count=0 expected
+    [[ -z "$GENERATION_ROOT" ]] || root="$GENERATION_ROOT/operations_state/recovery"
+    if [[ ! -d "$root" ]]; then
+        RECOVERY_CHECK_RESULT="absent; older backup has no recovery bundle"
+        log WARN "$RECOVERY_CHECK_RESULT"; DRILL_WARNINGS=$((DRILL_WARNINGS+1)); return 0
+    fi
+    [[ ! -L "$root" && $(realpath -e "$root") == "$root" && -f "$root/SHA256SUMS" ]] || return 1
+    [[ -z $(find "$root" -type l -print -quit) ]] || return 1
+    : >"$WORK_DIR/recovery-checked-paths.txt" || return 1
+    # Check each path before hashing. Do not trust checksum-file path arguments.
+    while IFS= read -r line; do
+        hash=${line%% *}; rel=${line#*  }
+        [[ "$hash" =~ ^[a-f0-9]{64}$ && "$rel" == ./* && "$rel" != *'/../'* && "$rel" != */.. && "$rel" != *'/./'* && "$rel" != ./SHA256SUMS ]] || return 1
+        [[ -f "$root/$rel" && $(realpath -e "$root/$rel") == "$root/${rel#./}" ]] || return 1
+        [[ $(sha256sum "$root/$rel" | awk '{print $1}') == "$hash" ]] || { log ERROR 'Recovery bundle checksum mismatch'; return 1; }
+        printf '%s\n' "$rel" >>"$WORK_DIR/recovery-checked-paths.txt"
+        count=$((count+1))
+    done <"$root/SHA256SUMS"
+    expected=$(find "$root" -type f ! -path "$root/SHA256SUMS" | wc -l)
+    [[ "$count" -eq "$expected" && $(sort -u "$WORK_DIR/recovery-checked-paths.txt" | wc -l) -eq "$count" ]] || return 1
+    jq -e '.schema==1 and (.containerCount|type=="number") and (.runtimeStatus=="complete" or .runtimeStatus=="partial" or .runtimeStatus=="unavailable")' "$root/inventory.json" >/dev/null || return 1
+    for file in containers images networks volumes files policies coverage; do
+        jq -e 'type=="array"' "$root/$file.json" >/dev/null || return 1
+    done
+    [[ $(jq length "$root/containers.json") -eq $(jq .containerCount "$root/inventory.json") ]] || return 1
+    RECOVERY_CHECK_RESULT="SHA-256 verified $count recovery files; runtime=$(jq -r .runtimeStatus "$root/inventory.json"); named-volume mounts=$(jq .namedVolumeMounts "$root/inventory.json")"
+    if [[ $(jq -r .runtimeStatus "$root/inventory.json") != complete ]] || (( $(jq .namedVolumeMounts "$root/inventory.json") > 0 )); then
+        log WARN "$RECOVERY_CHECK_RESULT"; DRILL_WARNINGS=$((DRILL_WARNINGS+1))
+    fi
+    drill_control_plane "$root/boot-config/config" || return 1
+    log INFO "$RECOVERY_CHECK_RESULT"
+}
+
 drill_flash() {
     local required found checksum_file checksum_name expected_hash actual_hash list_file
     log INFO "Testing boot-device backup: $FLASH_BACKUP"
@@ -532,6 +631,7 @@ drill_flash() {
         }
     done
 
+    drill_control_plane "$(find "$WORK_DIR/flash" -type d -name config -print -quit)" || return 1
     log INFO "Boot-device restore verified $FLASH_ARCHIVE_FILES files"
     rm -rf -- "$WORK_DIR/flash" || return 1
 }
@@ -631,6 +731,12 @@ main() {
     flock -s -n "$APPDATA_LOCK_FD" || { RESULT_SUMMARY="Appdata producer active; retry the drill later"; return 1; }
     exec {FLASH_LOCK_FD}>"${FLASH_LOCK_FILE:-/tmp/flash_backup.lock}" || return 1
     flock -s -n "$FLASH_LOCK_FD" || { RESULT_SUMMARY="Flash producer active; retry the drill later"; return 1; }
+    # Export replacement takes this lock exclusively. Keep the local bundle
+    # stable while hashing; immutable ISS generations need no Hubble lock.
+    if [[ -z "$GENERATION_ROOT" ]]; then
+        exec {RECOVERY_LOCK_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
+        flock -s -n "$RECOVERY_LOCK_FD" || { RESULT_SUMMARY="Recovery export active; retry later"; return 1; }
+    fi
     validate_environment || return 1
     RESULT_SUMMARY="Producer manifest missing or invalid"
     select_appdata_archives || return 1
@@ -645,6 +751,8 @@ main() {
     drill_appdata || return 1
     RESULT_SUMMARY="Boot-device archive validation failed"
     drill_flash || return 1
+    RESULT_SUMMARY="Recovery inventory/control-plane validation failed"
+    drill_recovery_bundle || return 1
     promote_drill || return 1
     prune_drills || {
         RESULT_STATUS="WARNING"
@@ -658,6 +766,7 @@ main() {
     local importance=normal
     if (( DRILL_WARNINGS > 0 )); then RESULT_STATUS="WARNING"; importance=warning; fi
     RESULT_SUMMARY="Restored and removed temporary payload: ${CHECKED_NAMES[*]}. SQLite databases checked: ${DATABASES_CHECKED}. Boot ZIP restored: ${FLASH_ARCHIVE_FILES} files; checksum ${FLASH_CHECKSUM_STATUS}. Scope: rotating selection, not a full application/boot recovery test."
+    RESULT_SUMMARY+=" Templates syntax-checked: $CONTROL_TEMPLATES_CHECKED; shell scripts syntax-checked: $CONTROL_SCRIPTS_CHECKED. Recovery: $RECOVERY_CHECK_RESULT."
     if (( ARCHIVES_SKIPPED > 0 )); then RESULT_SUMMARY+=" Outside extraction budget: ${SKIPPED_NAMES[*]}."; fi
     if (( DRILL_WARNINGS > 0 )); then RESULT_SUMMARY+=" Warnings/unverified checks: $DRILL_WARNINGS; review drill log for affected checks."; fi
     log INFO "$RESULT_SUMMARY"
