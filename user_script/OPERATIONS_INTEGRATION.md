@@ -113,6 +113,14 @@ Unraid or a Linux environment with the monitor's fixture dependencies. Only
 `user_script/health_monitoring.sh` is required for the installed User Script.
 Use `bash script --diagnostics` on the installed copy to inspect configuration,
 dependencies, and soak status without running SMART tests.
+
+Disk Health Monitor v2.20.0 reads the legacy SMART, NVMe and command-timeout
+baselines when `state/smart_baselines.json` is absent. A successful SMART
+collection writes the combined file atomically. An invalid JSON file stops
+the run so a corrupted baseline cannot silently reset counters. Keep the
+pre-upgrade state backup when retiring the three original files. To downgrade
+after retirement, use that state backup and the matching script version.
+The soak report counts runs from the installed version only.
 | `imagemaid_restore_archive` | Disabled with native clear-before-move | Optional archival alternative, retained in GitHub. Enable only when dated restore-image retention is wanted; do not combine it with native clear-before-move. |
 | `kometa_preflight` | `55 3,7,11,15,19,23 * * *` | After idle MetaFusion, before Kometa's four-hour boundaries, reconcile exact Plex GUIDs and supported resolution filters. Active/unsupported producers defer without edits. |
 
