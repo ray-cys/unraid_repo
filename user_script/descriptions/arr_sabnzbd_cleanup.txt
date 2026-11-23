@@ -1,0 +1,9 @@
+Purpose: Maintain SABnzbd backups and safely quarantine leftover completed-download payloads after exact Sonarr/Radarr import or verified disposition checks.
+
+Keep the existing schedule; no additional User Script is required. Backup retention, completed-download cleanup and quarantine purge retain their existing settings, Mover guard, execution limits and durable daily grouped notification.
+
+Working-folder audit (v2.7): While completed-download cleanup is enabled, inspect top-level _UNPACK_* and _FAILED_* folders under the configured movie/series completed roots. Protect queued, processing, retryable, unknown-status and matching Arr jobs, even when SAB's download queue is Idle. Bare administrative folders are always preserved. Require at least two stable observations four hours apart and a minimum 48-hour hold; any content/identity change restarts the hold. Therefore a daily schedule normally needs at least two days after first observation before an abandoned folder can qualify.
+
+Only completely empty, unreferenced working folders can qualify without import proof. Nonempty folders require a unique exact reported storage path, the normal 14-day completed age and fresh existing import/disposition proof. Missing history or a familiar folder name never proves that media is disposable. Set SAB_CONTAINER_COMPLETE_ROOT to SAB's actual container-side completed root for exact path mapping; no basename fallback authorizes an orphan move.
+
+Eligible folders enter the same quarantine with their source, reason and destination in the daily notification; existing retention controls later purge. Unknown/ambiguous payloads remain in place and are reported through the deduplicated outbox. Observation state is kept in the existing log/state directory as orphan-folders.json. Dry-run records observations and previews actions without moving folders. Existing inspect/restore CLI remains available; use /bin/bash on Unraid flash.

@@ -47,6 +47,19 @@
 # 8. Report the real actions, named source/destination paths, retained items and
 #    errors. Failed/ambiguous work stays protected and can be revisited later.
 #
+# ORPHAN WORKING FOLDERS (v2.7)
+# Within completed cleanup, inspect only top-level _UNPACK_*, _FAILED_*, _ADMIN_
+# and __ADMIN__ below the configured TV/movie roots. Bare admin folders are never
+# moved. Names only veto cleanup; they never prove ownership. Queued/processing/
+# failed/unknown-status SAB jobs and matching Arr queues remain protected, even
+# when SAB's download queue is Idle. Require two observations >=4h apart and a
+# 48h stable hold. Nonempty folders additionally need an exact reported storage
+# path and fresh existing import/disposition proof (normal 14-day gate remains).
+# Only wholly empty unreferenced working folders can qualify without import
+# proof. Unknown/nonempty or retryable leftovers are reported and preserved.
+# Quarantine/restore/purge use the existing journal, limits, retention and outbox.
+# DRY RUN records observations but never moves folders. No prefix wildcard delete.
+#
 # QUARANTINE / RETENTION / LIMITS
 # ------------------------------
 # Default root: /mnt/user/media/net/quarantine/items/Sonarr|Radarr/WRAPPER/payload.
@@ -117,7 +130,7 @@ set -uo pipefail
 # CONFIGURATION
 ###############################################################################
 
-VERSION="2.6.0"
+VERSION="2.7.0"
 
 # ---------------------------------------------------------------------------
 # Execution behavior
@@ -144,6 +157,14 @@ APP_BACKUP_RETENTION_DAYS="${APP_BACKUP_RETENTION_DAYS:-7}"
 # A conservative grace period. Radarr/Sonarr also regard aggressive SAB
 # history retention (less than 14 days) as unsafe.
 MIN_COMPLETED_AGE_HOURS="${MIN_COMPLETED_AGE_HOURS:-336}"
+
+# Special working-folder audit runs inside completed-download cleanup, using the
+# same APIs, locks, quarantine limits and daily outbox. No separate schedule.
+CLEAN_ORPHAN_FOLDERS="${CLEAN_ORPHAN_FOLDERS:-true}"
+ORPHAN_MIN_STABLE_HOURS="${ORPHAN_MIN_STABLE_HOURS:-48}"
+ORPHAN_OBSERVATION_GAP_HOURS="${ORPHAN_OBSERVATION_GAP_HOURS:-4}"
+# At least two observations are mandatory even if this is configured lower.
+ORPHAN_CONFIRMATION_RUNS="${ORPHAN_CONFIRMATION_RUNS:-2}"
 
 # Even an old job is protected if anything below its path changed recently.
 MIN_PATH_STABLE_HOURS="${MIN_PATH_STABLE_HOURS:-24}"
@@ -219,7 +240,9 @@ SAB_TV_DIR="${SAB_TV_DIR:-${SAB_COMPLETE_ROOT}/series}"
 
 # SAB may return its container-side path. Configure the completed root exactly
 # as SAB sees it. Leave empty to disable prefix mapping; basename fallback under
-# the category root remains available and is still root-validated.
+# the category root remains available for ordinary completed cleanup. Orphan
+# ownership never uses that fallback: set the exact container root to allow
+# nonempty working-folder proof (this installation uses /data/net/complete).
 SAB_CONTAINER_COMPLETE_ROOT="${SAB_CONTAINER_COMPLETE_ROOT:-}"
 
 # ---------------------------------------------------------------------------
@@ -314,6 +337,11 @@ BYTES_PURGED=0
 
 BACKUP_DETAILS=()
 QUARANTINE_DETAILS=()
+ORPHANS_SCANNED=0
+ORPHANS_PROTECTED=0
+ORPHANS_WAITING=0
+ORPHANS_UNVERIFIED=0
+ORPHANS_QUARANTINED=0
 PURGE_DETAILS=()
 
 RECOVERED=0
@@ -346,7 +374,7 @@ is_false() {
 }
 
 OPS_SCRIPT_NAME="arr_sabnzbd_cleanup"
-OPS_SCRIPT_VERSION="2.6.0"
+OPS_SCRIPT_VERSION="2.7.0"
 OPS_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
 OPS_ATTENTION_DETAILS=""
 OPS_ATTENTION_FILE=""
@@ -997,6 +1025,10 @@ validate_common_environment() {
   validate_boolean "DRY_RUN" "$DRY_RUN" || valid=false
   validate_boolean "CLEAN_BACKUPS" "$CLEAN_BACKUPS" || valid=false
   validate_boolean "CLEAN_STRANDED_DOWNLOADS" "$CLEAN_STRANDED_DOWNLOADS" || valid=false
+  validate_boolean "CLEAN_ORPHAN_FOLDERS" "$CLEAN_ORPHAN_FOLDERS" || valid=false
+  validate_integer "ORPHAN_MIN_STABLE_HOURS" "$ORPHAN_MIN_STABLE_HOURS" || valid=false
+  validate_integer "ORPHAN_OBSERVATION_GAP_HOURS" "$ORPHAN_OBSERVATION_GAP_HOURS" || valid=false
+  validate_integer "ORPHAN_CONFIRMATION_RUNS" "$ORPHAN_CONFIRMATION_RUNS" || valid=false
   validate_boolean "PURGE_QUARANTINE" "$PURGE_QUARANTINE" || valid=false
   validate_boolean "MOVER_GUARD_ENABLED" "$MOVER_GUARD_ENABLED" || valid=false
   validate_boolean "NOTIFY_MOVER_SKIP" "$NOTIFY_MOVER_SKIP" || valid=false
@@ -1159,6 +1191,11 @@ validate_stranded_environment() {
     valid=false
   fi
 
+  if is_true "$CLEAN_ORPHAN_FOLDERS" &&
+     { ((ORPHAN_MIN_STABLE_HOURS<48)) || ((ORPHAN_OBSERVATION_GAP_HOURS<4)); }; then
+    log ERROR 'Orphan cleanup requires at least a 48-hour hold and four-hour observation gap.'
+    valid=false
+  fi
   validate_api_key "SABnzbd" "$SAB_API_KEY" || valid=false
 
   if is_true "$SONARR_ENABLED"; then
@@ -1783,7 +1820,17 @@ download_is_active_anywhere() {
 
   sab_queue_contains_download "$download_id" || \
     queue_contains_download "$SONARR_QUEUE_FILE" "$download_id" || \
-    queue_contains_download "$RADARR_QUEUE_FILE" "$download_id"
+    queue_contains_download "$RADARR_QUEUE_FILE" "$download_id" || \
+    sab_history_download_pending "$download_id"
+}
+
+sab_history_download_pending() {
+  [[ -f "${SAB_HISTORY_FILE:-}" ]] || return 1
+  local rc=0
+  jq -e --arg id "${1,,}" 'any(.[]; ((.nzo_id // ""|ascii_downcase)==$id) and
+    ((.status // ""|ascii_downcase)!="completed"))' "$SAB_HISTORY_FILE" >/dev/null 2>&1 || rc=$?
+  # Unknown states and parse failures remain protected.
+  ((rc!=1))
 }
 
 ###############################################################################
@@ -2257,6 +2304,7 @@ quarantine_payload() {
     return 1
   fi
 
+  orphan_move_guard "$source_path" "$proof_file" || { log WARNING "Orphan changed immediately before intent; preserved: $source_path"; return 1; }
   local prepared="$wrapper/.manifest-prepared.$$" committed="$wrapper/.manifest-committed.$$"
   if ! jq -n --arg version "$VERSION" --arg runId "$RUN_ID" --arg quarantinedAt "$(timestamp)" \
     --arg owner "$owner" --arg category "$category" --arg downloadId "$download_id" --arg jobName "$job_name" \
@@ -2268,6 +2316,7 @@ quarantine_payload() {
      ! ops_publish_checkpoint "$prepared" "$manifest"; then
       log ERROR "Cannot commit quarantine intent; source was preserved: $source_path"; return 1
   fi
+  orphan_move_guard "$source_path" "$proof_file" || { log WARNING "Orphan changed after intent; source and recovery manifest preserved: $source_path"; return 1; }
   if ! mv -- "$source_path" "$wrapper/payload"; then
     log ERROR "Quarantine move was unsuccessful; recovery manifest retained: $manifest"; return 1
   fi
@@ -2460,6 +2509,199 @@ purge_quarantine() {
 # MAIN CANDIDATE PROCESSING
 ###############################################################################
 
+verify_download_cleanup_proof() {
+  local owner="$1" id="$2" path="$3" proof="$4" item="$5" rc=0
+  verify_arr_import "$owner" "$id" "$path" "$proof" || rc=$?
+  if ((rc!=0)) && verify_durable_import_receipt "$owner" "$id" "$path" "$proof" "$item"; then rc=0; fi
+  if ((rc==11)); then verify_policy_disposition "$owner" "$id" "$path" "$proof" "$item"; return $?; fi
+  return "$rc"
+}
+
+# A malformed/missing reference snapshot protects rather than authorizes work.
+orphan_reference_query() {
+  local rc=0
+  jq -e "$@" >/dev/null 2>&1 || rc=$?
+  ((rc!=1))
+}
+
+# Names are used only to veto cleanup, never to establish ownership or import.
+# SAB exposes pending post-processing in history, even when queue says Idle.
+orphan_has_live_reference() {
+  local path="$1" owner="$2" base stem refs="$TMP_DIR/orphan-reference.json" app_file
+  base=${path##*/}; stem="$base"
+  case "$stem" in _UNPACK_*) stem=${stem#_UNPACK_};; _FAILED_*) stem=${stem#_FAILED_};; esac
+  jq -n --arg path "$path" --arg base "$base" --arg stem "$stem" \
+    '{path:$path,base:($base|ascii_downcase),stem:($stem|ascii_downcase)}' >"$refs" || return 0
+  # A failed job is still retryable. Only an explicitly Completed row may
+  # supply proof; all other statuses (including unknown future ones) protect.
+  orphan_reference_query --slurpfile ref "$refs" '
+    def matches: . as $j | any([.name,.filename,.nzb_name,.storage,.path][]?;
+      type=="string" and (ascii_downcase | .==$ref[0].base or .==$ref[0].stem or
+        (split("/")|last)==$ref[0].base or (split("/")|last)==$ref[0].stem));
+    any(.[]; ((.status // ""|ascii_downcase)!="completed") and matches)' "$SAB_HISTORY_FILE" >/dev/null && return 0
+  orphan_reference_query --slurpfile ref "$refs" '
+    any(.queue.slots[]?; any([.filename,.name,.storage,.path][]?;
+      type=="string" and (ascii_downcase | .==$ref[0].base or .==$ref[0].stem or
+       (split("/")|last)==$ref[0].base or (split("/")|last)==$ref[0].stem)))' "$SAB_QUEUE_FILE" >/dev/null && return 0
+  for app_file in "$SONARR_QUEUE_FILE" "$RADARR_QUEUE_FILE"; do
+    orphan_reference_query --slurpfile ref "$refs" 'any(.records[]?;
+      any([.title,.outputPath][]?; type=="string" and
+        (ascii_downcase | .==$ref[0].base or .==$ref[0].stem or
+         (split("/")|last)==$ref[0].base or (split("/")|last)==$ref[0].stem)))' "$app_file" >/dev/null && return 0
+  done
+  return 1
+}
+
+orphan_fingerprint() {
+  local path="$1" list="$TMP_DIR/orphan-fingerprint.list" unsafe="$TMP_DIR/orphan-unsafe.list"
+  [[ -d "$path" && ! -L "$path" ]] || return 1
+  find "$path" -xdev ! -type d ! -type f -print0 >"$unsafe" || return 1
+  [[ ! -s "$unsafe" ]] || return 1
+  # Refuse nested mount points. Record ctime too: archive mtimes may be old.
+  find "$path" -xdev -type d -printf '%D\n' >"$unsafe" || return 1
+  [[ $(sort -u "$unsafe" | wc -l) == 1 ]] || return 1
+  find "$path" -xdev -printf '%P\0%y:%i:%s:%T@:%C@\0' >"$list" || return 1
+  sort -z "$list" | sha256sum | awk '{print $1}'
+}
+
+# Exact storage paths only: no basename/title inference can authorize a move.
+orphan_exact_storage() {
+  local item="$1" storage candidate
+  storage=$(jq -r '.storage // empty' <<<"$item") || return 1
+  [[ "$storage" == /* && "$storage" != *'/../'* && "$storage" != */.. ]] || return 1
+  if [[ "$storage" == "$SAB_COMPLETE_ROOT/"* ]]; then candidate="$storage"
+  elif [[ -n "$SAB_CONTAINER_COMPLETE_ROOT" && "$storage" == "$SAB_CONTAINER_COMPLETE_ROOT/"* ]]; then
+    candidate="$SAB_COMPLETE_ROOT${storage#"$SAB_CONTAINER_COMPLETE_ROOT"}"
+  else return 1; fi
+  [[ -d "$candidate" && ! -L "$candidate" ]] || return 1
+  realpath -e -- "$candidate"
+}
+
+orphan_move_guard() {
+  local path="$1" proof="$2" expected entries
+  expected=$(jq -r '.orphanFingerprint // empty' "$proof") || return 1
+  [[ -n "$expected" ]] || return 0
+  [[ $(orphan_fingerprint "$path") == "$expected" ]] || return 1
+  if jq -e '.proofKind=="empty-orphan"' "$proof" >/dev/null; then
+    entries="$TMP_DIR/orphan-final-entries"
+    find "$path" -mindepth 1 -print0 >"$entries" || return 1
+    [[ ! -s "$entries" ]] || return 1
+  fi
+}
+
+process_orphan_folders() {
+  is_true "$CLEAN_ORPHAN_FOLDERS" || return 0
+  local state="$LOG_DIR/orphan-folders.json" work="$TMP_DIR/orphan-state.json" list="$TMP_DIR/orphan-list"
+  local owner root path base id fingerprint old first last count now required empty item row mapped matches
+  local proof="$TMP_DIR/orphan-proof.json" selected="$TMP_DIR/orphan-selected.json" candidates="$TMP_DIR/orphan-jobs.jsonl" rc size category epoch detail
+  [[ ! -L "$state" ]] || return 1
+  if [[ -f "$state" ]]; then
+    jq -e '.version==1 and (.folders|type=="object") and all(.folders[];
+      (.fingerprint|type=="string") and (.firstSeen|type=="number") and
+      (.lastCounted|type=="number") and (.observations|type=="number"))' "$state" >/dev/null || return 1
+    cp "$state" "$work" || return 1
+  else printf '{"version":1,"folders":{}}\n' >"$work"; fi
+  now=$(date +%s); required=$ORPHAN_CONFIRMATION_RUNS; ((required>=2)) || required=2
+  for owner in Sonarr Radarr; do
+    case "$owner" in Sonarr) is_true "$SONARR_ENABLED" || continue; category="$SAB_TV_CATEGORY";; Radarr) is_true "$RADARR_ENABLED" || continue; category="$SAB_MOVIE_CATEGORY";; esac
+    root=$(root_for_owner "$owner")
+    [[ -d "$root" && ! -L "$root" ]] || return 1
+    find "$root" -mindepth 1 -maxdepth 1 -type d \( -name '_UNPACK_*' -o -name '_FAILED_*' -o -name '__ADMIN__' -o -name '_ADMIN_' \) -print0 >"$list" || return 1
+    sort -z -o "$list" "$list" || return 1
+    while IFS= read -r -d '' path; do
+      ((ORPHANS_SCANNED++)) || true
+      base=${path##*/}; id=$(printf '%s' "$path" | sha256sum | awk '{print $1}')
+      # A bare admin directory has no payload-job boundary. Never remove it.
+      if [[ "$base" == __ADMIN__ || "$base" == _ADMIN_ ]] || orphan_has_live_reference "$path" "$owner"; then
+        ((ORPHANS_PROTECTED++)) || true
+        jq --arg id "$id" 'del(.folders[$id])' "$work" >"$work.next" && mv "$work.next" "$work" || return 1
+        log DEBUG "Working folder protected by SAB/Arr ownership or administrative role: $path"
+        continue
+      fi
+      fingerprint=$(orphan_fingerprint "$path") || { ((ORPHANS_UNVERIFIED++)) || true; log WARNING "Orphan folder inventory unsafe/incomplete; preserved: $path"; continue; }
+      old=$(jq -r --arg id "$id" '.folders[$id].fingerprint // ""' "$work")
+      if [[ "$old" == "$fingerprint" ]]; then
+        first=$(jq -r --arg id "$id" '.folders[$id].firstSeen' "$work")
+        last=$(jq -r --arg id "$id" '.folders[$id].lastCounted' "$work")
+        count=$(jq -r --arg id "$id" '.folders[$id].observations' "$work")
+        if ((now>=last && now-last>=ORPHAN_OBSERVATION_GAP_HOURS*3600)); then count=$((count+1)); last=$now; fi
+      else first=$now; last=$now; count=1; fi
+      # A backwards clock cannot shorten the hold or count another observation.
+      if ((first>now || last>now)); then first=$now; last=$now; count=1; fi
+      jq --arg id "$id" --arg path "$path" --arg hash "$fingerprint" --argjson first "$first" --argjson last "$last" --argjson count "$count" \
+        '.folders[$id]={path:$path,fingerprint:$hash,firstSeen:$first,lastCounted:$last,observations:$count}' "$work" >"$work.next" && mv "$work.next" "$work" || return 1
+      if ((now-first<ORPHAN_MIN_STABLE_HOURS*3600 || count<required)); then ((ORPHANS_WAITING++)) || true; continue; fi
+      # Include durable exact-ID import receipts when native history was pruned.
+      jq -c --arg base "$base" '.[]|select((.status // ""|ascii_downcase)=="completed" and ((.storage // ""|split("/")|last)==$base))' "$SAB_HISTORY_FILE" >"$candidates" || return 1
+      if [[ -f "$IMPORT_RECEIPT_FILE" ]]; then
+        jq -e '.version==1 and (.receipts|type=="object")' "$IMPORT_RECEIPT_FILE" >/dev/null || return 1
+        jq -c --arg owner "$owner" --arg base "$base" '.receipts[]|select(.app==$owner and .conflict!=true and ((.sab.storage // ""|split("/")|last)==$base))|.sab+{status:"Completed"}' "$IMPORT_RECEIPT_FILE" >>"$candidates" || return 1
+      fi
+      : >"$selected"; matches=0
+      while IFS= read -r row; do
+        [[ $(owner_for_category "$(jq -r '.category // ""' <<<"$row")") == "$owner" ]] || continue
+        mapped=$(orphan_exact_storage "$row") || continue
+        [[ "$mapped" == "$path" ]] || continue
+        # Same immutable SAB identity from history/receipt is one candidate.
+        jq -c '{nzo_id,name,storage,completed,category}' <<<"$row" >>"$selected" || return 1
+      done <"$candidates"
+      sort -u "$selected" >"$selected.unique"; matches=$(wc -l <"$selected.unique")
+      empty=false
+      find "$path" -mindepth 1 -print0 >"$TMP_DIR/orphan-contents" || return 1
+      if [[ ! -s "$TMP_DIR/orphan-contents" ]]; then empty=true; fi
+      if [[ "$matches" == 1 ]]; then
+        item=$(jq -c '.+{status:"Completed"}' "$selected.unique")
+        row=$(jq -r '.nzo_id // empty' <<<"$item"); [[ -n "$row" ]] || continue
+        epoch=$(sab_completed_epoch "$item")
+        if ! [[ "$epoch" =~ ^[0-9]+$ ]] || ((epoch<=0 || now-epoch<MIN_COMPLETED_AGE_HOURS*3600)); then ((ORPHANS_WAITING++)) || true; continue; fi
+        if download_is_active_anywhere "$row" || ! verify_download_cleanup_proof "$owner" "$row" "$path" "$proof" "$item" || ! proof_paths_still_valid "$proof"; then
+          ((ORPHANS_UNVERIFIED++)) || true; log WARNING "Orphan folder preserved: exact job $row lacks current cleanup proof: $path"; continue
+        fi
+      elif [[ "$empty" == true && "$matches" == 0 ]]; then
+        row="orphan-empty-$id"; epoch=0
+        jq -n --arg path "$path" --arg hash "$fingerprint" --argjson count "$count" \
+          '{proofKind:"empty-orphan",originalPath:$path,fingerprint:$hash,observations:$count,importedPaths:[]}' >"$proof" || return 1
+      else
+        ((ORPHANS_UNVERIFIED++)) || true
+        log WARNING "Orphan folder preserved: nonempty or ambiguous ownership; no unique exact-path import/disposition proof: $path"
+        continue
+      fi
+      # Refresh history as well as queue: an Idle queue can hide Queued PP jobs.
+      fetch_required_state || { log ERROR 'Orphan cleanup stopped: fresh API state unavailable; remaining folders preserved'; return 1; }
+      if orphan_has_live_reference "$path" "$owner" || download_is_active_anywhere "$row"; then
+        ((ORPHANS_PROTECTED++)) || true
+        jq --arg id "$id" 'del(.folders[$id])' "$work" >"$work.next" && mv "$work.next" "$work" || return 1
+        continue
+      fi
+      [[ $(orphan_fingerprint "$path") == "$fingerprint" ]] || { ((ORPHANS_WAITING++)) || true; continue; }
+      if [[ "$empty" == true ]]; then
+        find "$path" -mindepth 1 -print0 >"$TMP_DIR/orphan-contents" || return 1
+        [[ ! -s "$TMP_DIR/orphan-contents" ]] || continue
+      else
+        verify_download_cleanup_proof "$owner" "$row" "$path" "$proof" "$item" && proof_paths_still_valid "$proof" || continue
+      fi
+      if ((MAX_QUARANTINES_PER_RUN>0 && QUARANTINED>=MAX_QUARANTINES_PER_RUN)); then break; fi
+      jq --arg hash "$fingerprint" '.+{orphanFingerprint:$hash}' "$proof" >"$proof.next" && mv "$proof.next" "$proof" || return 1
+      size=$(path_size "$path") || return 1
+      quarantine_payload "$owner" "$category" "$row" "$base" "$epoch" "$path" "$size" "$proof"; rc=$?
+      if ((rc==20)); then return 20; elif ((rc!=0)); then log ERROR "Orphan quarantine failed; recovery manifest retained: $path"; return 1; fi
+      ((ORPHANS_QUARANTINED++)) || true; ((QUARANTINED++)) || true; ((BYTES_QUARANTINED+=size)) || true
+      detail="Orphan working folder $(is_true "$DRY_RUN" && printf 'would be quarantined' || printf 'quarantined'): $path -> $LAST_QUARANTINE_DESTINATION; $(bytes_human "$size"); proof=$(jq -r .proofKind "$proof"); $count stable observations and ${ORPHAN_MIN_STABLE_HOURS}h hold passed; fresh SAB/Arr protections passed."
+      QUARANTINE_DETAILS+=("$detail")
+      log INFO "$detail"
+      if ! is_true "$DRY_RUN"; then jq --arg id "$id" 'del(.folders[$id])' "$work" >"$work.next" && mv "$work.next" "$work" || return 1; fi
+    done <"$list"
+  done
+  # Prune only observation records for paths now absent; never touch payloads.
+  jq -c '.folders|to_entries[]' "$work" >"$TMP_DIR/orphan-records" || return 1
+  while IFS= read -r item; do
+    path=$(jq -r '.value.path' <<<"$item"); [[ ! -e "$path" ]] || continue
+    id=$(jq -r .key <<<"$item")
+    jq --arg id "$id" 'del(.folders[$id])' "$work" >"$work.next" && mv "$work.next" "$work" || return 1
+  done <"$TMP_DIR/orphan-records"
+  ops_publish_checkpoint "$work" "$state"
+}
+
 process_completed_jobs() {
   local item
   local status
@@ -2551,19 +2793,8 @@ process_completed_jobs() {
     fi
 
     proof_file="$TMP_DIR/proof_${SCANNED}.json"
-    verify_arr_import "$owner" "$download_id" "$source_path" "$proof_file"
+    verify_download_cleanup_proof "$owner" "$download_id" "$source_path" "$proof_file" "$item"
     proof_status=$?
-    if ((proof_status!=0)); then
-      # Fresh exact-ID APIs and physical destination checks remain mandatory.
-      # An unavailable/pruned history endpoint alone no longer discards proof.
-      if verify_durable_import_receipt "$owner" "$download_id" "$source_path" "$proof_file" "$item"; then
-        proof_status=0
-      fi
-    fi
-    if [[ "$proof_status" == 11 ]]; then
-      verify_policy_disposition "$owner" "$download_id" "$source_path" "$proof_file" "$item"
-      proof_status=$?
-    fi
 
     case "$proof_status" in
       0) ;;
@@ -2696,6 +2927,7 @@ notify_summary() {
   message="SABnzbd Cleanup v$VERSION | Mode: $mode"$'\n'
   message+="Backup cleanup: $BACKUP_CLEANUP_STATUS; removed $NZB_BACKUPS_REMOVED NZB backup(s), $APP_BACKUPS_REMOVED application backup(s), $(bytes_human "$((NZB_BACKUP_BYTES+APP_BACKUP_BYTES))") eligible."$'\n'
   message+="Completed downloads: $STRANDED_CLEANUP_STATUS; quarantined $QUARANTINED payload(s), $(bytes_human "$BYTES_QUARANTINED")."$'\n'
+  message+="Working folders: inspected=$ORPHANS_SCANNED; protected=$ORPHANS_PROTECTED; awaiting stable observations=$ORPHANS_WAITING; unverified=$ORPHANS_UNVERIFIED; quarantined=$ORPHANS_QUARANTINED."$'\n'
   message+="Quarantine purge: $QUARANTINE_PURGE_STATUS; purged $PURGED payload(s), $(bytes_human "$BYTES_PURGED"). Recovered interrupted actions: $RECOVERED."$'\n'
   message+="Protected/skipped: active queue=$QUEUE_PROTECTED; recently changed=$PATH_UNSTABLE; import history unproven=$HISTORY_UNPROVEN; destination unverified=$DESTINATION_UNVERIFIED; source media unaccounted=$SOURCE_UNACCOUNTED; Mover stops=$MOVER_PROTECTED. Errors: $ERRORS."$'\n'
   for detail in "${RECOVERY_DETAILS[@]}" "${QUARANTINE_DETAILS[@]}" "${PURGE_DETAILS[@]}" "${BACKUP_DETAILS[@]}"; do
@@ -2726,7 +2958,7 @@ log_detail_list() {
 }
 
 print_summary() {
-  log INFO "SUMMARY | backups=$BACKUP_CLEANUP_STATUS removed=$((NZB_BACKUPS_REMOVED+APP_BACKUPS_REMOVED)) | stranded=$STRANDED_CLEANUP_STATUS quarantined=$QUARANTINED bytes=$BYTES_QUARANTINED | purge=$QUARANTINE_PURGE_STATUS purged=$PURGED bytes=$BYTES_PURGED | recovered=$RECOVERED errors=$ERRORS runtime=$(runtime)"
+  log INFO "SUMMARY | backups=$BACKUP_CLEANUP_STATUS removed=$((NZB_BACKUPS_REMOVED+APP_BACKUPS_REMOVED)) | stranded=$STRANDED_CLEANUP_STATUS quarantined=$QUARANTINED bytes=$BYTES_QUARANTINED | purge=$QUARANTINE_PURGE_STATUS purged=$PURGED bytes=$BYTES_PURGED | orphans=$ORPHANS_SCANNED protected=$ORPHANS_PROTECTED waiting=$ORPHANS_WAITING unverified=$ORPHANS_UNVERIFIED quarantined=$ORPHANS_QUARANTINED | recovered=$RECOVERED errors=$ERRORS runtime=$(runtime)"
   if [[ "${LOG_LEVEL^^}" == DEBUG ]]; then
     log_detail_list "Quarantine details:" "${QUARANTINE_DETAILS[@]}"
     log_detail_list "Purge details:" "${PURGE_DETAILS[@]}"
@@ -2782,6 +3014,10 @@ main() {
     fetch_required_state || { log ERROR "Cannot validate active queues for restore; payload preserved."; return 1; }
     local restore_id
     restore_id=$(jq -r '.downloadId' "$CLI_WRAPPER/.sabnzbd-cleanup-manifest.json") || return 1
+    if jq -e '.importProof.orphanFingerprint|type=="string"' "$CLI_WRAPPER/.sabnzbd-cleanup-manifest.json" >/dev/null &&
+       orphan_has_live_reference "$(jq -r .originalPath "$CLI_WRAPPER/.sabnzbd-cleanup-manifest.json")" "$(jq -r .owner "$CLI_WRAPPER/.sabnzbd-cleanup-manifest.json")"; then
+      log ERROR 'Restore refused: orphan source path is referenced by current SAB/Arr work.'; return 1
+    fi
     if download_is_active_anywhere "$restore_id"; then log ERROR "Restore refused: exact download is active in an Arr/SAB queue ($restore_id)."; return 1; fi
     restore_quarantine_payload "$CLI_WRAPPER"
     return $?
@@ -2858,6 +3094,7 @@ main() {
       STRANDED_CLEANUP_STATUS="RUNNING"
       process_completed_jobs
       operation_status=$?
+      if ((operation_status==0)); then process_orphan_folders; operation_status=$?; fi
 
       if (( operation_status == 20 )); then
         STRANDED_CLEANUP_STATUS="MOVER_STOPPED"
