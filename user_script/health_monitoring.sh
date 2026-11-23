@@ -4,7 +4,7 @@ noParity=true
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.15.6"
+readonly SCRIPT_VERSION="2.16.0"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -15,7 +15,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.15.6
+# Disk Health Monitor for Unraid v2.16.0
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
@@ -44,6 +44,8 @@ fi
 # v2.15.6 makes aggregate array/pool capacity the default notification view,
 # keeps the legacy per-device inventory available as an explicit opt-in, and
 # labels aggregate pool counts as pools rather than disks.
+# v2.16.0 adds monitor receipts, assigned storage and completed parity checks,
+# and requires fresh observations before reporting recovery.
 ################################################################################
 # ---------------- Configuration ----------------
 # Disks health script settings. Tuned for performance and reliability.
@@ -228,7 +230,7 @@ SOAK_REQUIRE_NOTIFICATION_SUPPRESSION=1        # Require at least one lifecycle-
 SOAK_REQUIRE_PARITY=0                          # Optionally require a run observed during parity activity
 
 # === Paths / Integration ===
-LOG_DIR="/mnt/vault/cloud/logs/script/disk_health"       # Run logs and persistent state
+LOG_DIR="/mnt/vault/cloud/logs/script/health_monitoring" # Deployed run logs and persistent state
 LOCK_FILE="/run/health_monitoring.lock"          # Root-controlled non-blocking single-instance lock
 NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
 
@@ -565,6 +567,14 @@ declare -A FINDING_SCOPE=()                       # Stable device, mount, pool, 
 declare -A FINDING_TITLE=() FINDING_EVIDENCE=()   # User-facing finding content
 declare -A FINDING_ACTION=()                      # Canonical recommended action
 declare -A SATA_POWER_STATE=() SMART_DEFERRED=()  # Cached SATA power state and deferred SMART checks
+declare -A FRESH_SMART=() FRESH_STORAGE=() FRESH_FILESYSTEM=()
+declare -A NOTIFY_PREV_DEVICE_ID=() NOTIFY_CURRENT_DEVICE_ID=()
+ARRAY_RUNTIME_STATE=""
+ARRAY_TOPOLOGY_OBSERVED=0
+PARITY_RESULT_OBSERVED=0
+PARITY_HISTORY_OBSERVED=0
+RUN_COMPLETION_READY=0
+MONITOR_LAST_COMPLETE_EPOCH=0
 declare -A PREVIOUS_RISK=()                       # Previous persisted risk, retained when a disk stays asleep
 declare -A DEVICE_ID_BY_PATH=() DEVICE_PATH_BY_ID=() # Runtime path <-> stable persistent identity
 declare -A DEVICE_ID_SOURCE=()                    # Identity source: WWN, by-id, serial, or path fallback
@@ -609,7 +619,7 @@ SYSLOG_CHUNK_FILE=""
 SYSLOG_CURSOR_MODE="not_run"
 RUN_MODE="monitor"
 ROLLBACK_BACKUP_ID=""
-REGRESSION_FIXTURE_COUNT=106
+REGRESSION_FIXTURE_COUNT=110
 CONFIG_ERROR_COUNT=0
 CONFIG_WARNING_COUNT=0
 DEPENDENCY_ERROR_COUNT=0
@@ -672,6 +682,8 @@ SUBSYSTEM_MONITORING_STATE="OK"
 
 # === Logs Paths ===
 STATE_DIR="${LOG_DIR:-}/state"
+MONITOR_RECEIPT_FILE="$STATE_DIR/monitor_receipt.json"
+SMART_COVERAGE_FILE="$STATE_DIR/smart_coverage.tsv"
 EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
 LEGACY_EXTERNAL_CONFIG_FILE="$LOG_DIR/health_monitoring.conf"
 STATE_BACKUP_DIR="$STATE_DIR/backups"
@@ -763,6 +775,7 @@ RISK_SCORES_HISTORY_FILE="$STATE_DIR/risk_scores_history.log"       # Historical
 TEMP_HISTORY_FILE="$STATE_DIR/temp_history.log"                     # Temperature samples (rate & exposure)
 SELFTEST_HISTORY_FILE="$STATE_DIR/selftest_events.log"              # SMART self-test lifecycle history (frequency/volatility)
 STATE_FILES_ALERT_RUNTIME=(
+    "$MONITOR_RECEIPT_FILE" "$SMART_COVERAGE_FILE"
     "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$NVME_STATE_FILE" "$PREV_ATTR_FILE" "$ALERT_NEW_SEEN_FILE" "$RISK_PREV_FILE" "$CMD_TIMEOUT_LAST_FILE" "$XFS_PROC_PREV_FILE" "$BTRFS_DEV_PREV_FILE" "$SYSLOG_CURSOR_STATE_FILE" "$STORAGE_DISCREPANCY_STATE_FILE" "$RISK_SPIKE_FILE" "$REPLACEMENT_EVENTS_FILE" "$SATA_LINK_HISTORY_FILE" "$NOTIFICATION_JOURNAL_FILE" "$NOTIFICATION_RECOVERY_STATE_FILE" "$SOAK_RUN_HISTORY_FILE"
 )
 STATE_FILES_TREND_HISTORY=(
@@ -2355,7 +2368,7 @@ forecast_confidence_is_actionable() {
 }
 
 acquire_lock() {
-    local parent
+    local parent lock_rc
 
     if ! command -v flock >/dev/null 2>&1; then
         printf '%s [LOCK][ERROR] flock is unavailable\n' \
@@ -2381,16 +2394,32 @@ acquire_lock() {
         return 1
     fi
 
-    exec 9<>"$LOCK_FILE"
-
-    if ! flock -n 9; then
+    exec 9<>"$LOCK_FILE" || return 1
+    if flock -n -E 75 9; then
+        return 0
+    else
+        lock_rc=$?
+    fi
+    if (( lock_rc == 75 )); then
         printf '%s [LOCK][INFO] Another health_monitoring.sh run is active; exiting (lock: %s)\n' \
             "$(date '+%Y-%m-%d %H:%M:%S')" \
             "$LOCK_FILE" >&2
-        return 1
+        return 75
     fi
+    printf '[LOCK][ERROR] Unable to acquire %s (flock status %s)\n' "$LOCK_FILE" "$lock_rc" >&2
+    return 1
+}
 
-    return 0
+write_monitor_receipt() {
+    local status="$1" exit_code="$2" outcome finished=0
+    set_soak_notification_outcome
+    outcome="$SOAK_NOTIFICATION_OUTCOME_RESULT"
+    if [[ "$status" != running ]]; then finished=$(date +%s); fi
+    if [[ "$status" == complete ]]; then MONITOR_LAST_COMPLETE_EPOCH="$finished"; fi
+    atomic_write_text "$MONITOR_RECEIPT_FILE" "$(printf \
+        '{"schema":1,"status":"%s","version":"%s","lastAttemptEpoch":%d,"finishedEpoch":%d,"lastCompleteEpoch":%d,"notification":"%s","exitCode":%d}\n' \
+        "$status" "$SCRIPT_VERSION" "$RUN_EPOCH" "$finished" \
+        "$MONITOR_LAST_COMPLETE_EPOCH" "$outcome" "$exit_code")"
 }
 
 initialize_runtime() {
@@ -2452,12 +2481,20 @@ initialize_runtime() {
 }
 
 cleanup() {
-    local exit_code="$1"
+    local exit_code="$1" receipt_status=incomplete
 
     if (( CLEANUP_DONE == 1 )); then
         return 0
     fi
     CLEANUP_DONE=1
+
+    if (( RUN_EPOCH > 0 )); then
+        if (( RUN_COMPLETION_READY == 1 )); then receipt_status=complete; fi
+        if ! write_monitor_receipt "$receipt_status" "$exit_code"; then
+            log "STATE" "ERROR" "Unable to persist monitor completion receipt"
+            (( exit_code != 0 )) || exit_code=1
+        fi
+    fi
 
     if (( SOAK_RUN_STARTED == 1 && SOAK_TELEMETRY_ENABLED == 1 )); then
         persist_soak_observation "$exit_code" ||
@@ -2473,6 +2510,7 @@ cleanup() {
     else
         log "RUN" "ERROR" "Health monitoring exited with status $exit_code"
     fi
+    return "$exit_code"
 }
 
 handle_signal() {
@@ -3556,7 +3594,7 @@ record_finding() {
     local evidence="$6"
     local action="$7"
     local code="$8"
-    local scope="global"
+    local scope="${9:-global}"
     local mount_ref=""
     local pool_ref=""
     local id old_severity requested_severity should_log=0
@@ -3566,7 +3604,7 @@ record_finding() {
     if [[ -n "$device" ]]; then
         device="$(base_device "$device")"
         scope="device:${device:-unknown}"
-    else
+    elif [[ "$scope" == global ]]; then
         mount_ref=$(printf '%s' "$evidence" | grep -Eo '/mnt/[A-Za-z0-9_.-]+' | head -n1 || true)
         if [[ -n "$mount_ref" ]]; then
             scope="mount:$mount_ref"
@@ -4586,6 +4624,14 @@ get_all_disks() {
 build_mount_device_map() {
     MOUNT_TO_DEV=()
     local ini="/var/local/emhttp/disks.ini" cfg="/boot/config/disk.cfg" src=""
+    local slot type status device fstype
+    if [[ -r "$ini" ]]; then
+        while IFS='|' read -r slot type status device fstype; do
+            [[ "$type" == Data && "$device" =~ ^[[:alnum:]_.-]+$ ]] || continue
+            MOUNT_TO_DEV["/mnt/$slot"]="/dev/$device"
+        done < <(unraid_assigned_slots "$ini")
+        return 0
+    fi
     if [[ -f "$ini" ]]; then src="$ini"; elif [[ -f "$cfg" ]]; then src="$cfg"; else return 0; fi
     # First pass: device fields
     while IFS=$'\t' read -r name dev; do
@@ -4632,6 +4678,101 @@ derive_parity_activity() {
     fi
 }
 
+# Keep empty fields and handle Unraid's quoted INI section names.
+unraid_assigned_slots() {
+    awk -F= '
+        function emit() {
+            if (slot ~ /^[[:alnum:]_.-]+$/ && type ~ /^(Data|Parity|Cache)$/ &&
+                (device != "" || saved != "" || id != "" || (status != "" && status !~ /^DISK_NP/)))
+                print slot "|" type "|" status "|" device "|" fstype
+        }
+        /^\[/ {
+            emit()
+            slot=$0; gsub(/[\[\]"\r]/, "", slot)
+            type=status=device=fstype=saved=id=""
+            next
+        }
+        { value=$2; gsub(/["\r]/, "", value) }
+        $1=="type"   {type=value}
+        $1=="status" {status=value}
+        $1=="device" {device=value}
+        $1=="fsType" {fstype=value}
+        $1=="idSb"   {saved=value}
+        $1=="id"     {id=value}
+        END {emit()}
+    ' "$1"
+}
+
+check_expected_storage() {
+    local slots slot type status device fstype mount evidence
+    case "$ARRAY_RUNTIME_STATE" in
+        stopped)
+            record_collector_event DEFERRED "Array topology" "array stopped"
+            return 0
+            ;;
+        started) ;;
+        *) return 1 ;;
+    esac
+    slots=$(unraid_assigned_slots /var/local/emhttp/disks.ini) || return 1
+    [[ -n "$slots" ]] || return 1
+    while IFS='|' read -r slot type status device fstype; do
+        mount=""
+        if [[ "$type" == Data || ( "$type" == Cache && -n "$fstype" ) ]]; then
+            mount="/mnt/$slot"
+        fi
+        case "$status" in
+            DISK_OK) evidence="" ;;
+            *) evidence="Unraid reports ${status:-unknown status}" ;;
+        esac
+        if [[ -z "$evidence" && ( ! "$device" =~ ^[[:alnum:]_.-]+$ || ! -b "/dev/$device" ) ]]; then
+            evidence="Assigned $type device is missing"
+        fi
+        if [[ -z "$evidence" && -n "$mount" ]] && ! mountpoint -q -- "$mount"; then
+            evidence="Expected filesystem $mount is not mounted"
+        fi
+        if [[ -z "$evidence" ]]; then
+            FRESH_STORAGE["slot:$slot"]=1
+            continue
+        fi
+        record_finding critical storage storage.availability "" \
+            "Assigned storage unavailable" "$slot: $evidence" \
+            "Open Unraid Main, verify the slot and connections, and confirm backups before rebuilding." \
+            "storage_unavailable" "slot:$slot"
+    done <<< "$slots"
+    ARRAY_TOPOLOGY_OBSERVED=1
+    return 0
+}
+
+check_completed_parity() {
+    local file="$1" rows stamp duration speed result errors action size epoch last="" recent=""
+    local year month day clock
+    [[ -e "$file" ]] || return 0
+    [[ -r "$file" && -f "$file" ]] || return 1
+    rows=$(tail -n 200 -- "$file") || return 1
+    while IFS='|' read -r stamp duration speed result errors action size; do
+        [[ "$result" == 0 && "$errors" =~ ^(0|[1-9][0-9]{0,14})$ ]] || continue
+        [[ -z "$action" || "$action" == check || "$action" == 'check '* ]] || continue
+        read -r year month day clock <<< "$stamp"
+        [[ "$year" =~ ^[0-9]{4}$ && "$month" =~ ^[A-Za-z]{3}$ &&
+           "$day" =~ ^[0-9]{1,2}$ && "$clock" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]] || continue
+        epoch=$(LC_ALL=C date -d "$month $day $year $clock" +%s 2>/dev/null) || continue
+        last="$stamp|$errors"
+        if (( errors >= PARITY_SYNC_ERR_WARN && epoch >= MONITOR_LAST_COMPLETE_EPOCH )); then
+            recent="$last"
+        fi
+    done <<< "$rows"
+    [[ -n "$last" ]] || return 0
+    PARITY_HISTORY_OBSERVED=1
+    (( MONITOR_LAST_COMPLETE_EPOCH > 0 )) || recent=""
+    IFS='|' read -r stamp errors <<< "${recent:-$last}"
+    if (( errors >= PARITY_SYNC_ERR_WARN )); then
+        local severity=warning
+        (( errors < PARITY_SYNC_ERR_CRIT )) || severity=critical
+        record_alert "$severity" "Completed Parity Check" \
+            "Parity check completed $stamp with $errors sync errors. Review the history and disk or controller evidence."
+    fi
+}
+
 # Populate global parity progress/validity variables once per run.
 parity_state() {
     if (( PARITY_STATE_LOADED == 1 )); then
@@ -4652,6 +4793,7 @@ parity_state() {
     local ini="/var/local/emhttp/var.ini"
     if [[ -r "$ini" ]]; then
         local sb
+        ARRAY_RUNTIME_STATE=$(awk -F= 'tolower($1)=="mdstate" {gsub(/[" \r]/,"",$2); print tolower($2); exit}' "$ini")
         sb=$(awk -F= 'tolower($1)=="sbclean" {gsub(/"| |\r|\n/,"",$2); print tolower($2); exit}' "$ini" 2>/dev/null)
         case "$sb" in
             1|yes|true) PARITY_VALID_FLAG="1";;
@@ -4664,7 +4806,7 @@ parity_state() {
     if command -v "$cmd" >/dev/null 2>&1; then
         out=$("$cmd" status 2>/dev/null | tr -d '\r') || out=""
         if [[ -n "$out" ]]; then
-            local sb st act corr pos size errs spk rem
+            local sb st act corr pos size errs spk rem resync
             sb=$(echo "$out" | awk -F= 'tolower($1)=="sbclean" {print tolower($2); exit}')
             st=$(echo "$out" | awk -F= 'tolower($1)=="mdstate" {print tolower($2); exit}')
             act=$(echo "$out" | awk -F= 'tolower($1)=="mdresyncaction" {print tolower($2); exit}')
@@ -4674,31 +4816,10 @@ parity_state() {
             errs=$(echo "$out"| awk -F= 'tolower($1)=="mdsyncerrs" {print $2; exit}')
             spk=$(echo "$out" | awk -F= 'tolower($1)=="mdresyncspeed" {print $2; exit}')
             rem=$(echo "$out" | awk -F= 'tolower($1)=="mdresyncrem" {print $2; exit}')
+            [[ -z "$st" ]] || ARRAY_RUNTIME_STATE="$st"
+            resync=$(echo "$out" | awk -F= 'tolower($1)=="mdresync" {print $2; exit}')
             if [[ -n "$sb" ]]; then
                 case "$sb" in 1|yes|true) PARITY_VALID_FLAG="1";; 0|no|false) PARITY_VALID_FLAG="0";; esac
-            else
-                # Derive validity without sbclean: treat as active only if metrics indicate progress
-                local _act_lc _is_active=0
-                _act_lc=$(printf "%s" "$act" | awk '{print tolower($1)}')
-                if [[ -n "$_act_lc" && "$_act_lc" != "idle" ]]; then
-                    if [[ -n "$spk" && "$spk" =~ ^[0-9]+$ && $((10#$spk)) -gt 0 ]]; then _is_active=1
-                    elif [[ -n "$rem" && "$rem" =~ ^[0-9]+$ && $((10#$rem)) -gt 0 ]]; then _is_active=1
-                    elif [[ -n "$pos" && -n "$size" && "$pos" =~ ^[0-9]+$ && "$size" =~ ^[0-9]+$ && $((10#$pos)) -gt 0 && $((10#$pos)) -lt $((10#$size)) ]]; then _is_active=1
-                    fi
-                fi
-                if (( _is_active == 1 )); then
-                    PARITY_VALID_FLAG="0"
-                else
-                    local _errs_ok=""
-                    if [[ -n "$errs" && "$errs" =~ ^[0-9]+$ && $((10#$errs)) -eq 0 ]]; then _errs_ok=1; fi
-                    local _completed=""
-                    if [[ -n "$pos" && -n "$size" && "$pos" =~ ^[0-9]+$ && "$size" =~ ^[0-9]+$ && $((10#$pos)) -eq $((10#$size)) ]]; then _completed=1; fi
-                    if [[ "$st" == "started" || -n "$_errs_ok" || -n "$_completed" ]]; then
-                        PARITY_VALID_FLAG="1"
-                    else
-                        PARITY_VALID_FLAG=""
-                    fi
-                fi
             fi
             PARITY_ACTION="$act"
             PARITY_CORR="$corr"
@@ -4708,6 +4829,7 @@ parity_state() {
             PARITY_SPEED_K="$spk"
             PARITY_REM="$rem"
             derive_parity_activity
+            if [[ "$resync" =~ ^[0-9]+$ ]] && (( 10#$resync > 0 )); then PARITY_ACTIVE=1; fi
             return 0
         fi
     fi
@@ -4722,6 +4844,10 @@ discover_parity_and_status() {
     # Init output containers (status line, detail section)
     PARITY_STATUS_LINE=""
     PARITY_DETAILS_SECTION=""
+    if [[ "$ARRAY_RUNTIME_STATE" == stopped ]]; then
+        PARITY_STATUS_LINE="Parity: array stopped"
+        return 0
+    fi
 
     # Source metadata file used by Unraid for disk assignments
     local ini="/var/local/emhttp/disks.ini"
@@ -4748,9 +4874,11 @@ discover_parity_and_status() {
             esac
         done < <(awk -F= '
             BEGIN{sec=""; dev=""; idv=""}
-            /^\[(parity|parity2|parity[0-9]+)\]/ {
+            /^\[/ {
                 if (sec!="") { printf "%s\t%s\t%s\n", sec, dev, idv }
-                sec=$0; gsub(/^[\[]|[\]]$/, "", sec); dev=""; idv=""; next
+                sec=$0; gsub(/[\[\]"]/, "", sec); dev=""; idv=""
+                if (sec !~ /^parity([0-9]+)?$/) sec=""
+                next
             }
             tolower($1)=="device" && sec!="" {val=$2; gsub(/"/, "", val); sub(/^[ \t]+/, "", val); sub(/[ \t]+$/, "", val); dev=val; next}
             tolower($1)=="id" && sec!="" {val=$2; gsub(/"/, "", val); sub(/^[ \t]+/, "", val); sub(/[ \t]+$/, "", val); idv=val; next}
@@ -4768,6 +4896,9 @@ discover_parity_and_status() {
     # main() captured parity state once before any subsystem collectors run.
     local clean_flag="${PARITY_VALID_FLAG:-}" 
     PARITY_CLEAN_FLAG="$clean_flag"
+    if [[ "$ARRAY_RUNTIME_STATE" == started && -n "$clean_flag" ]] && (( PARITY_ACTIVE == 0 )); then
+        PARITY_RESULT_OBSERVED=1
+    fi
 
     # Derive high-level status line based on validity flag and active operation
     local is_active=$PARITY_ACTIVE
@@ -6701,7 +6832,15 @@ monitor_btrfs() {
             fi
         fi
         local status corrected uncorrectable msg
-        status=$(btrfs_bounded scrub status "$m" 2>/dev/null || true)
+        if ! status=$(btrfs_bounded scrub status "$m" 2>/dev/null); then
+            record_collector_event FAILED "Btrfs scrub $m" "unable to read scrub status"
+            continue
+        fi
+        if grep -qiE 'Status:[[:space:]]+finished|scrub finished' <<< "$status" &&
+           grep -qiE 'no errors found|uncorrectable:|unrecoverable errors' <<< "$status"
+        then
+            FRESH_FILESYSTEM["scrub:$m"]=1
+        fi
         # If kernel has no recorded stats (e.g., post-reboot), load our persisted last status for this mount
         if echo "$status" | grep -qi "no stats available"; then
             if [[ -s "$file" ]]; then
@@ -6732,8 +6871,10 @@ monitor_btrfs() {
         if echo "$status" | grep -qi "no stats available"; then
             log_btrfs "$m: Last scrub: none recorded"
         fi
-        corrected=$(echo "$status" | awk -F'[: ]+' '/corrected errors/ {print $NF; exit}'); corrected=${corrected:-0}
-        uncorrectable=$(echo "$status" | awk -F'[: ]+' '/unrecoverable errors/ {print $NF; exit}'); uncorrectable=${uncorrectable:-0}
+        corrected=$(awk '{for(i=1;i<NF;i++) if ($i=="Corrected:" || ($i=="corrected" && $(i+1)=="errors:")) {print $(i+($i=="Corrected:"?1:2)); exit}}' <<< "$status")
+        uncorrectable=$(awk '{for(i=1;i<NF;i++) if ($i=="Uncorrectable:" || ($i=="unrecoverable" && $(i+1)=="errors:")) {print $(i+($i=="Uncorrectable:"?1:2)); exit}}' <<< "$status")
+        [[ "$corrected" =~ ^[0-9]+$ ]] || corrected=0
+        [[ "$uncorrectable" =~ ^[0-9]+$ ]] || uncorrectable=0
         if [[ $uncorrectable -gt 0 ]]; then
             if [[ "$data_raid" =~ RAID0 || "$meta_raid" =~ RAID0 ]]; then
                 msg="CRITICAL: $m RAID0 segment unrecoverable errors=$uncorrectable"
@@ -6762,8 +6903,13 @@ monitor_xfs() {
     fi
     # Enumerate current XFS mounts
     local -a mountpoints=()
-    local mp
+    local mp kernel_tail
     mapfile -t mountpoints < <(mount | awk '$5=="xfs" {print $3}')
+    (( ${#mountpoints[@]} > 0 )) || return 0
+    if ! kernel_tail=$(dmesg_bounded | tail -n 3000); then
+        record_collector_event FAILED "XFS kernel log" "unable to read dmesg"
+        return 1
+    fi
     for mp in "${mountpoints[@]}"; do
         log_xfs "$(date '+%Y-%m-%d %H:%M:%S') - XFS check $mp"
         # Optional offline repair (-n) metadata inspection for corruption indicators
@@ -6783,7 +6929,8 @@ monitor_xfs() {
         fi
         # Scan recent kernel ring buffer for XFS / I/O error patterns referencing mount; raise warning
         # shellcheck disable=SC2119
-        if dmesg_bounded | tail -n 3000 | grep -qiE "$(basename "$mp").*(XFS|I/O error)|XFS ERROR|xfs_repair"; then
+        FRESH_FILESYSTEM["xfs:$mp"]=1
+        if grep -qiE "$(basename "$mp").*(XFS|I/O error)|XFS ERROR|xfs_repair" <<< "$kernel_tail"; then
             msg="WARNING: Kernel/XFS I/O messages for $mp"
             log_xfs "$(date '+%Y-%m-%d %H:%M:%S') - $msg"
             record_alert warning "$NOTIFY_TITLE_XFS" "$msg"
@@ -6833,9 +6980,16 @@ evaluate_per_mount_thresholds() {
     for mp in "${uniq[@]}"; do
         mountpoint -q "$mp" || continue
         local sz used pct mount
-        read -r sz used pct mount < <(df_bounded -h --output=size,used,pcent,target "$mp" 2>/dev/null | tail -n1) || continue
+        read -r sz used pct mount < <(df_bounded -h --output=size,used,pcent,target "$mp" 2>/dev/null | tail -n1) || {
+            record_collector_event FAILED "Capacity $mp" "df returned no sample"
+            continue
+        }
         local usep=${pct%%%}
-        [[ -n "$usep" ]] || continue
+        if [[ ! "$usep" =~ ^[0-9]+$ ]]; then
+            record_collector_event FAILED "Capacity $mp" "df returned invalid usage"
+            continue
+        fi
+        FRESH_STORAGE[$mp]=1
         if [[ $usep -ge $CRITICAL_THRESHOLD_PERCENT ]]; then
             record_alert critical "Storage Critical" "$mp usage ${usep}% >= ${CRITICAL_THRESHOLD_PERCENT}%"
         elif [[ $usep -ge $WARN_THRESHOLD_PERCENT ]]; then
@@ -6846,6 +7000,33 @@ evaluate_per_mount_thresholds() {
 
 # === Main Collection Phase ===
 # Run SMART tests, record daily SMART history, and calculate NVMe wear projection.
+update_smart_coverage() {
+    local disk identity first last rows="" age=0
+    local -A first_seen=() last_fresh=()
+    if [[ -s "$SMART_COVERAGE_FILE" ]]; then
+        while IFS=$'\t' read -r identity first last; do
+            [[ -n "$identity" && "$first" =~ ^[1-9][0-9]{0,11}$ && "$last" =~ ^(0|[1-9][0-9]{0,11})$ ]] || continue
+            first_seen[$identity]="$first"
+            last_fresh[$identity]="$last"
+        done < "$SMART_COVERAGE_FILE"
+    fi
+    for disk in "$@"; do
+        identity=$(persistent_device_key "$disk")
+        first="${first_seen[$identity]:-$RUN_EPOCH}"
+        last="${last_fresh[$identity]:-0}"
+        if [[ -n "${FRESH_SMART[$disk]:-}" ]]; then last="$RUN_EPOCH"; fi
+        printf -v rows '%s%s\t%s\t%s\n' "$rows" "$identity" "$first" "$last"
+        age=$(( RUN_EPOCH - (last > 0 ? last : first) ))
+        if (( age >= 14 * 86400 )); then
+            record_finding warning monitoring monitoring.smart_coverage "$disk" \
+                "SMART data overdue" "No fresh SMART sample for $((age / 86400)) days." \
+                "Arrange one SMART read while the disk is awake and check controller access if it fails." \
+                smart_coverage
+        fi
+    done
+    atomic_write_text "$SMART_COVERAGE_FILE" "$rows"
+}
+
 # shellcheck disable=SC2329
 collect_smart_health() {
     local -a disks=()
@@ -6865,8 +7046,11 @@ collect_smart_health() {
             retain_previous_smart_snapshot "$disk" "collection-unavailable"
             log "SMART" "WARN" \
                 "Live SMART data was incomplete for $disk; retained its previous known baseline"
+        elif [[ -z "${SMART_DEFERRED[$disk]:-}" && -n "${SMART_STATE[$disk]:-}" ]]; then
+            FRESH_SMART[$disk]=1
         fi
     done
+    update_smart_coverage "${disks[@]}" || return 1
     log_smart "SMART tests completed"
     augment_messages_with_deltas
 
@@ -7933,6 +8117,7 @@ set_finding_target_label() {
             mount_path="${scope#mount:}"
             FINDING_TARGET_LABEL_RESULT="$mount_path"
             ;;
+        slot:*) FINDING_TARGET_LABEL_RESULT="${scope#slot:}" ;;
         pool:*)
             FINDING_TARGET_LABEL_RESULT="Pool ${scope#pool:}"
             ;;
@@ -7987,7 +8172,7 @@ build_health_alerts() {
 
     if (( ${#group_keys[@]} == 0 )); then
         HEALTH_ALERTS_SECTION="$rec
- - None detected; all monitored disks and filesystems nominal."
+ - No actionable findings in the data collected."
         return 0
     fi
 
@@ -8065,6 +8250,7 @@ load_notification_journal() {
     NOTIFY_PREV_SEVERITY=()
     NOTIFY_PREV_FINGERPRINT=()
     NOTIFY_PREV_LABEL=()
+    NOTIFY_PREV_DEVICE_ID=()
     NOTIFICATION_JOURNAL_LOADED=0
     NOTIFICATION_LAST_SUCCESS_EPOCH=0
     NOTIFICATION_LAST_SUCCESS_SEVERITY="normal"
@@ -8097,7 +8283,7 @@ load_notification_journal() {
                 NOTIFICATION_LAST_SUCCESS_SEVERITY="${fields[3]}"
                 ;;
             finding)
-                if (( ${#fields[@]} != 5 )) ||
+                if (( ${#fields[@]} != 5 && ${#fields[@]} != 6 )) ||
                    [[ -z "${fields[1]:-}" ||
                       ! "${fields[2]:-}" =~ ^(warning|critical)$ ||
                       ! "${fields[3]:-}" =~ ^[0-9a-f]{40}$ ||
@@ -8118,6 +8304,7 @@ load_notification_journal() {
                 NOTIFY_PREV_SEVERITY[$id]="$severity"
                 NOTIFY_PREV_FINGERPRINT[$id]="$fingerprint"
                 NOTIFY_PREV_LABEL[$id]="$label"
+                NOTIFY_PREV_DEVICE_ID[$id]="${fields[5]:-}"
                 finding_count=$((finding_count + 1))
                 ;;
             *)
@@ -8224,6 +8411,7 @@ build_current_notification_state() {
     NOTIFY_CURRENT_SEVERITY=()
     NOTIFY_CURRENT_FINGERPRINT=()
     NOTIFY_CURRENT_LABEL=()
+    NOTIFY_CURRENT_DEVICE_ID=()
 
     while IFS= read -r id; do
         [[ -n "$id" ]] || continue
@@ -8242,6 +8430,10 @@ build_current_notification_state() {
         NOTIFY_CURRENT_SEVERITY[$id]="${FINDING_SEVERITY[$id]:-warning}"
         NOTIFY_CURRENT_FINGERPRINT[$id]="$fingerprint"
         NOTIFY_CURRENT_LABEL[$id]="$label"
+        local device="${FINDING_DEVICE[$id]:-}"
+        if [[ -n "$device" ]]; then
+            NOTIFY_CURRENT_DEVICE_ID[$id]="${DEVICE_ID_BY_PATH[$device]:-}"
+        fi
     done < <(emit_sorted_finding_ids)
 
     if (( FINDING_CRITICAL_COUNT > 0 )); then
@@ -8260,6 +8452,47 @@ notification_reminder_due() {
     elapsed=$((now - NOTIFICATION_LAST_SUCCESS_EPOCH))
     (( elapsed < 0 )) && elapsed=0
     (( elapsed >= interval_hours * 3600 ))
+}
+
+finding_has_fresh_recovery_evidence() {
+    local id="$1" scope="${1%%|*}" code="${1#*|}" device identity key
+    case "$scope" in
+        device:*)
+            device="${scope#device:}"
+            identity="${NOTIFY_PREV_DEVICE_ID[$id]:-}"
+            if [[ -n "$identity" ]]; then
+                device="${DEVICE_PATH_BY_ID[$identity]:-}"
+                [[ -n "$device" ]] || return 1
+                [[ -z "${NOTIFY_CURRENT_FINGERPRINT["device:$device|$code"]:-}" ]] || return 1
+            fi
+            case "$code" in
+                btrfs_device_*|btrfs_burst_*)
+                    key="${code#btrfs_device_}"; key="${key#btrfs_burst_}"
+                    [[ -n "${FRESH_FILESYSTEM["btrfs:$device:$key"]:-}" ]] ;;
+                disk_i_o_*|disk_io_*)
+                    [[ -n "${DEVICE_ID_BY_PATH[$device]:-}" && -n "${SYSLOG_CHUNK_FILE:-}" ]] &&
+                        collector_status_is_safe syslog_io ;;
+                *)
+                    [[ -n "${FRESH_SMART[$device]:-}" ]] ;;
+            esac
+            ;;
+        mount:*)
+            case "$code" in
+                btrfs_scrub_alert) [[ -n "${FRESH_FILESYSTEM["scrub:${scope#mount:}"]:-}" ]] ;;
+                xfs_alert*) [[ -n "${FRESH_FILESYSTEM["xfs:${scope#mount:}"]:-}" ]] ;;
+                *) [[ -n "${FRESH_STORAGE["${scope#mount:}"]:-}" ]] ;;
+            esac
+            ;;
+        slot:*) [[ -n "${FRESH_STORAGE[$scope]:-}" ]] ;;
+        *)
+            case "$code" in
+                completed_parity_check) (( PARITY_HISTORY_OBSERVED == 1 )) ;;
+                parity_status|parity_sync_errors) (( PARITY_RESULT_OBSERVED == 1 )) ;;
+                array_capacity|pools_capacity|storage_validation) (( ARRAY_TOPOLOGY_OBSERVED == 1 )) ;;
+                *) return 0 ;;
+            esac
+            ;;
+    esac
 }
 
 prepare_notification_lifecycle() {
@@ -8310,6 +8543,7 @@ prepare_notification_lifecycle() {
         [[ -z "${NOTIFY_CURRENT_FINGERPRINT[$id]+present}" ]] || continue
         absent_ids+=("$id")
         (( safe_state == 1 )) || continue
+        finding_has_fresh_recovery_evidence "$id" || continue
         previous_count="${NOTIFY_RECOVERY_PREV_COUNT[$id]:-0}"
         previous_fingerprint="${NOTIFY_RECOVERY_PREV_FINGERPRINT[$id]:-}"
         [[ "$previous_count" =~ ^[0-9]+$ ]] || previous_count=0
@@ -8334,7 +8568,7 @@ prepare_notification_lifecycle() {
     fi
 
     for id in "${absent_ids[@]}"; do
-        if (( safe_state == 0 )); then
+        if (( safe_state == 0 )) || ! finding_has_fresh_recovery_evidence "$id"; then
             NOTIFICATION_RECOVERY_DEFERRED_COUNT=$((NOTIFICATION_RECOVERY_DEFERRED_COUNT + 1))
             NOTIFY_CARRY_IDS+=("$id")
         elif (( recovery_state_ok == 0 )); then
@@ -8410,9 +8644,9 @@ persist_notification_journal() {
     while IFS= read -r id; do
         [[ -n "$id" ]] || continue
         label="${NOTIFY_CURRENT_LABEL[$id]}"
-        printf 'finding\t%s\t%s\t%s\t%s\n' \
+        printf 'finding\t%s\t%s\t%s\t%s\t%s\n' \
             "$id" "${NOTIFY_CURRENT_SEVERITY[$id]}" \
-            "${NOTIFY_CURRENT_FINGERPRINT[$id]}" "$label" >> "$temp_file" || {
+            "${NOTIFY_CURRENT_FINGERPRINT[$id]}" "$label" "${NOTIFY_CURRENT_DEVICE_ID[$id]:-}" >> "$temp_file" || {
             rm -f -- "$temp_file" 2>/dev/null || true
                 return 1
             }
@@ -8422,9 +8656,9 @@ persist_notification_journal() {
     # journal even if another finding causes a notification in the meantime.
     for id in "${NOTIFY_CARRY_IDS[@]}"; do
         [[ -n "$id" && -z "${written[$id]+present}" ]] || continue
-        printf 'finding\t%s\t%s\t%s\t%s\n' \
+        printf 'finding\t%s\t%s\t%s\t%s\t%s\n' \
             "$id" "${NOTIFY_PREV_SEVERITY[$id]}" \
-            "${NOTIFY_PREV_FINGERPRINT[$id]}" "${NOTIFY_PREV_LABEL[$id]}" \
+            "${NOTIFY_PREV_FINGERPRINT[$id]}" "${NOTIFY_PREV_LABEL[$id]}" "${NOTIFY_PREV_DEVICE_ID[$id]:-}" \
             >> "$temp_file" || {
                 rm -f -- "$temp_file" 2>/dev/null || true
                 return 1
@@ -8456,6 +8690,7 @@ process_notification_delivery() {
             else
                 log "NOTIFY" "WARN" \
                     "Notification delivered but journal update failed; the next run may repeat it"
+                return 1
             fi
         else
             log "NOTIFY" "WARN" \
@@ -8464,6 +8699,7 @@ process_notification_delivery() {
     else
         log "NOTIFY" "ERROR" \
             "Notification delivery failed after $NOTIFICATION_DELIVERY_ATTEMPTS attempt(s); journal unchanged"
+        return 1
     fi
     return 0
 }
@@ -11308,6 +11544,7 @@ collect_btrfs_device_stats() {
 
         while IFS=$'\t' read -r dev key val; do
             [[ -n "$dev" && -n "$key" && "$val" =~ ^[0-9]+$ ]] || continue
+            FRESH_FILESYSTEM["btrfs:$(base_device "$dev"):$key"]=1
             state_key=$(persistent_device_key "$dev")
             printf '%s %s %s\n' "$state_key" "$key" "$val" >> "$snapshot_temp"
             out_has=1
@@ -12836,6 +13073,8 @@ self_test_result() {
     fi
 }
 
+# The whole suite and its nested cases intentionally isolate fixture globals.
+# shellcheck disable=SC2030,SC2031
 run_regression_tests() (
     local fixture_dir="" history_file source_file chunk_file actual count
     SELF_TEST_TOTAL=0
@@ -12853,6 +13092,58 @@ run_regression_tests() (
     printf '%d fixtures are isolated under %s and removed automatically.\n\n' \
         "$REGRESSION_FIXTURE_COUNT" "$fixture_dir"
 
+    local topology_fixture="$fixture_dir/disks.ini" parity_fixture="$fixture_dir/parity-checks.log"
+    printf '%s\n' '["disk1"]' 'type="Data"' 'status="DISK_OK"' 'device="sda"' 'fsType="xfs"' \
+        '["disk2"]' 'type="Data"' 'status="DISK_NP"' 'device=""' 'idSb=""' \
+        '["vault2"]' 'type="Cache"' 'status="DISK_DSBL"' 'device=""' 'idSb="assigned"' > "$topology_fixture"
+    if [[ "$(unraid_assigned_slots "$topology_fixture")" == $'disk1|Data|DISK_OK|sda|xfs\nvault2|Cache|DISK_DSBL||' ]]; then
+        self_test_result 1 "Quoted Unraid slots preserve missing assigned members and exclude unused slots"
+    else
+        self_test_result 0 "Quoted Unraid slots preserve missing assigned members and exclude unused slots"
+    fi
+    if (
+        log() { :; }
+        printf '%s\n' '2026 Nov 21 00:00:00|100|200|0|12|check P|400' \
+            '2026 Nov 22 00:00:00|10|0|-4|0|check P|400' > "$parity_fixture"
+        check_completed_parity "$parity_fixture" &&
+            [[ "${FINDING_SEVERITY['global|completed_parity_check']:-}" == critical ]] &&
+            (( PARITY_HISTORY_OBSERVED == 1 ))
+    ); then
+        self_test_result 1 "Completed parity errors survive a newer cancelled check"
+    else
+        self_test_result 0 "Completed parity errors survive a newer cancelled check"
+    fi
+    if (
+        local fixture_id='device:/dev/sda|pending_sectors'
+        NOTIFY_PREV_DEVICE_ID[$fixture_id]=fixture-disk
+        FRESH_SMART[/dev/sda]=1
+        ! finding_has_fresh_recovery_evidence "$fixture_id" || exit 1
+        DEVICE_PATH_BY_ID[fixture-disk]=/dev/sdb
+        ! finding_has_fresh_recovery_evidence "$fixture_id" || exit 1
+        FRESH_SMART[/dev/sdb]=1
+        finding_has_fresh_recovery_evidence "$fixture_id" || exit 1
+        local -A NOTIFY_CURRENT_FINGERPRINT=(['device:/dev/sdb|pending_sectors']=active)
+        ! finding_has_fresh_recovery_evidence "$fixture_id"
+    ); then
+        self_test_result 1 "Recovery requires fresh evidence from the original disk after device renumbering"
+    else
+        self_test_result 0 "Recovery requires fresh evidence from the original disk after device renumbering"
+    fi
+    if (
+        local MONITOR_RECEIPT_FILE="$fixture_dir/monitor-receipt.json"
+        local RUN_EPOCH=100 MONITOR_LAST_COMPLETE_EPOCH=90
+        write_monitor_receipt running 0 &&
+            [[ "$(<"$MONITOR_RECEIPT_FILE")" == *'"lastCompleteEpoch":90'* ]] &&
+        write_monitor_receipt incomplete 1 &&
+            [[ "$(<"$MONITOR_RECEIPT_FILE")" == *'"lastCompleteEpoch":90'* ]] &&
+        write_monitor_receipt complete 0 &&
+            [[ "$(<"$MONITOR_RECEIPT_FILE")" != *'"lastCompleteEpoch":90'* ]]
+    ); then
+        self_test_result 1 "Receipt keeps last completed run across start and failure"
+    else
+        self_test_result 0 "Receipt keeps last completed run across start and failure"
+    fi
+
     actual=$(safe_state_name '/dev/disk/by-id/ata-Test Drive')
     if [[ "$actual" == "disk_by-id_ata-Test_Drive" ]]; then
         self_test_result 1 "Stable state filename sanitization"
@@ -12861,7 +13152,7 @@ run_regression_tests() (
     fi
 
     if declare -F load_builtin_defaults >/dev/null 2>&1 &&
-       [[ "$SCRIPT_VERSION" == "2.15.6" &&
+       [[ "$SCRIPT_VERSION" == "2.16.0" &&
           "$STATE_SCHEMA_VERSION" == "2" &&
           "$HISTORY_SCHEMA_VERSION" == "3" &&
           "$DEVICE_ID_SCHEMA_VERSION" == "2" &&
@@ -14446,10 +14737,11 @@ run_regression_tests() (
     NOTIFICATION_DECISION="SEND"
     NOTIFICATION_JOURNAL_COMMIT_ALLOWED=1
     NOTIFICATION_DRY_RUN=0
-    process_notification_delivery "Fixture failure" "Fixture body" warning
+    local fixture_delivery_rc=0
+    process_notification_delivery "Fixture failure" "Fixture body" warning || fixture_delivery_rc=$?
     journal_after="$(sha1sum "$NOTIFICATION_JOURNAL_FILE" | awk '{print $1}')"
     local failure_preserved=0 dry_run_preserved=0
-    [[ "$journal_before" == "$journal_after" &&
+    [[ "$fixture_delivery_rc" == 1 && "$journal_before" == "$journal_after" &&
        "$NOTIFICATION_DELIVERY_ATTEMPTS" == "2" ]] && failure_preserved=1
 
     NOTIFY_BIN="$dry_notify"
@@ -14908,10 +15200,16 @@ collect_btrfs_filesystem_phase() {
 
 # shellcheck disable=SC2329
 collect_capacity_phase() {
+    collector_step "Assigned storage" check_expected_storage
+    if [[ "$ARRAY_RUNTIME_STATE" == stopped ]]; then
+        STORAGE_TOP_LINES="Array: stopped; mounted storage coverage deferred."
+        return 0
+    fi
     collector_step "Storage utilization" build_storage_and_disk_lines
     collector_step "Capacity thresholds" evaluate_capacity_alerts
     collector_step "Per-mount thresholds" evaluate_per_mount_thresholds
     collector_step "Parity status" discover_parity_and_status
+    collector_step "Completed parity history" check_completed_parity /boot/config/parity-checks.log
     return 0
 }
 
@@ -14956,7 +15254,7 @@ run_notification_test() {
 
 
 main() {
-    local exit_code
+    local exit_code previous_complete
 
     parse_arguments "$@" || return $?
     case "$RUN_MODE" in
@@ -15023,15 +15321,24 @@ main() {
     validate_configuration || return 1
     validate_runtime_dependencies monitor || return 1
 
-    if ! acquire_lock; then
-        return 0
-    fi
+    acquire_lock || {
+        exit_code=$?
+        (( exit_code != 75 )) || return 0
+        return "$exit_code"
+    }
 
-    trap 'exit_code=$?; cleanup "$exit_code"' EXIT
+    trap 'exit_code=$?; cleanup "$exit_code"; exit $?' EXIT
     trap 'handle_signal INT' INT
     trap 'handle_signal TERM' TERM
 
     initialize_runtime || return 1
+    # shellcheck disable=SC2031
+    previous_complete=$(sed -nE 's/.*"lastCompleteEpoch":([0-9]{1,12}),.*/\1/p' "$MONITOR_RECEIPT_FILE")
+    # shellcheck disable=SC2031
+    if [[ "$previous_complete" =~ ^(0|[1-9][0-9]{0,11})$ ]] && (( previous_complete <= RUN_EPOCH )); then
+        MONITOR_LAST_COMPLETE_EPOCH="$previous_complete"
+    fi
+    write_monitor_receipt running 0 || return 1
 
     log "RUN" "INFO" "Starting Unraid disk health monitoring"
 
@@ -15095,19 +15402,25 @@ main() {
     # shellcheck disable=SC2031
     log "NOTIFY" "INFO" \
         "Processing consolidated notification (decision=$NOTIFICATION_DECISION, severity=$FINAL_NOTIFICATION_SEVERITY, critical=$FINDING_CRITICAL_COUNT, warning=$FINDING_WARNING_COUNT, resolved=$NOTIFICATION_RESOLVED_COUNT)"
+    exit_code=0
     # Notification composition is intentionally performed in the main shell;
     # ShellCheck cannot infer that through every helper call above.
     # shellcheck disable=SC2031
     process_notification_delivery \
         "${SUBJECT:-Disk Health Summary}" \
         "$NOTIFY_BODY" \
-        "$FINAL_NOTIFICATION_SEVERITY"
+        "$FINAL_NOTIFICATION_SEVERITY" || exit_code=1
 
     persist_all_state
     prune_history_files
     prune_old_run_logs
 
-    return 0
+    if (( exit_code == 0 )) && all_collectors_state_safe; then
+        RUN_COMPLETION_READY=1
+    else
+        exit_code=1
+    fi
+    return "$exit_code"
 }
 
 

@@ -1,19 +1,21 @@
 #!/bin/bash
 # shellcheck disable=SC2034
 arrayStarted=true
-# Backup freshness, delivery and runtime-compatibility audit v1.0.
+# Backup freshness, delivery and runtime-compatibility audit v1.3.
 # Schedule: 20 * * * *. Reads local receipts/manifests only: no WOL, remote
 # connection, media hashing, container actions or cleanup. One lifecycle email
 # for changed findings, recovery, or a 24-hour reminder. Failed delivery retries.
 # CLI: bash script [--help|--version]. No CLI modifies backup or application data.
 set -uo pipefail
-readonly SCRIPT_VERSION="1.2"
+readonly SCRIPT_VERSION="1.3"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/backup_health_audit}"
 APPDATA_ROOT="${APPDATA_ROOT:-/mnt/vault/backup/cache}"
 FLASH_ROOT="${FLASH_ROOT:-/mnt/vault/backup/flash}"
 REMOTE_LOG_ROOT="${REMOTE_LOG_ROOT:-/mnt/vault/cloud/logs/script/remote_backup}"
 UNRAID_VERSION_FILE="${UNRAID_VERSION_FILE:-/etc/unraid-version}"
+DISK_HEALTH_RECEIPT="${DISK_HEALTH_RECEIPT:-/mnt/vault/cloud/logs/script/health_monitoring/state/monitor_receipt.json}"
+DISK_HEALTH_MAX_AGE_SECONDS=$((30*3600))
 NOTIFY_BIN="${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}"
 APPDATA_MAX_AGE_SECONDS=$((80*3600))
 FLASH_MAX_AGE_SECONDS=$((80*3600))
@@ -39,6 +41,14 @@ check_age() {
     if (( epoch>NOW+300 )); then finding "$label: future-dated receipt; clock/evidence review required"
     elif (( NOW-epoch>limit )); then finding "$label: completion is overdue (limit=$((limit/3600)) hours)"; ACTIONS+=("$label: last completion $(((NOW-epoch)/3600)) hours ago."); fi
 }
+audit_disk_health_monitor() {
+    local epoch
+    epoch=$(jq -er 'select(.schema == 1) | .lastCompleteEpoch | numbers' "$DISK_HEALTH_RECEIPT" 2>/dev/null) || epoch=0
+    check_age 'Disk health monitor' "$epoch" "$DISK_HEALTH_MAX_AGE_SECONDS"
+    if jq -e '.schema == 1 and .notification == "failed"' "$DISK_HEALTH_RECEIPT" >/dev/null 2>&1; then
+        finding 'Disk health monitor: the latest notification could not be delivered'
+    fi
+}
 audit_runtime() {
     local command version major missing=false
     for command in bash curl jq flock timeout rsync tar unzip sha256sum find sort stat df realpath docker smartctl findmnt mountpoint; do
@@ -51,6 +61,8 @@ audit_runtime() {
         finding "Compatibility: Unraid $PLATFORM_VERSION is outside the validated 7.x family. Validate User Scripts scheduling, notification/boot hooks, Docker permissions and Mover interfaces before destructive automation. No compatibility approval inferred."
         missing=true
     fi
+    # GNU find version is a standalone option, without a starting path.
+    # shellcheck disable=SC2185
     if ! find --version 2>/dev/null | head -n 1 | grep -q GNU; then finding 'Compatibility: GNU find interface unavailable'; missing=true; fi
     if ! stat --version 2>/dev/null | head -n 1 | grep -q GNU; then finding 'Compatibility: GNU stat interface unavailable'; missing=true; fi
     version=$(rsync --version 2>/dev/null | head -n 1)
@@ -152,7 +164,7 @@ main() {
     exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
     flock -s -n "$export_fd" || return 0
     local previous='' last=0 fingerprint temp status=OK importance=normal body
-    audit_runtime; audit_backups; audit_recovery_inventory
+    audit_runtime; audit_backups; audit_recovery_inventory; audit_disk_health_monitor
     fingerprint=$(printf '%s\n' "${FINDINGS[@]}" | sort | sha256sum | awk '{print $1}')
     if [[ -f "$STATE_DIR/state.json" ]]; then
         jq -e '.fingerprint|type=="string"' "$STATE_DIR/state.json" >/dev/null || { printf 'Invalid audit state preserved.\n' >&2; return 1; }

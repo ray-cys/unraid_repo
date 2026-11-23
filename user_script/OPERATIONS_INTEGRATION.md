@@ -97,7 +97,15 @@ its failure is reported independently of completed data processing.
 
 | User Script | Schedule (Singapore time) | Responsibility |
 | --- | --- | --- |
-| `backup_health_audit` | `20 * * * *` | Local-only freshness, pending ISS delivery, drill and runtime/schedule audit. No ISS wake, media hashing or repair actions. Changed incidents/recovery and at most daily reminders. |
+| `backup_health_audit` | `20 * * * *` | Local freshness, pending ISS delivery, restore drills, runtime compatibility, and disk-monitor completion. Changed incidents/recovery and at most daily reminders. |
+
+Hubble's `health_monitoring` runs at 06:30 daily and writes
+`/mnt/vault/cloud/logs/script/health_monitoring/state/monitor_receipt.json`.
+The hourly audit alerts if the monitor has no completed run in 30 hours or if
+the latest notification failed. The receipt separates an attempted run from a
+completed check, so an early exit or stalled run cannot refresh the completion
+timestamp. The audit uses the existing schedule and only watches while Hubble
+is online and its vault is mounted.
 | `imagemaid_restore_archive` | Disabled with native clear-before-move | Optional archival alternative, retained in GitHub. Enable only when dated restore-image retention is wanted; do not combine it with native clear-before-move. |
 | `kometa_preflight` | `55 3,7,11,15,19,23 * * *` | After idle MetaFusion, before Kometa's four-hour boundaries, reconcile exact Plex GUIDs and supported resolution filters. Active/unsupported producers defer without edits. |
 
