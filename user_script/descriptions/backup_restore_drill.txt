@@ -1,0 +1,7 @@
+Purpose: Verify that selected completed appdata and flash backups can be extracted and checked in isolated staging.
+
+Schedule: Disabled in User Scripts. The completion-driven vault_remote_backup invokes this script ON ISS after successful backup delivery when the seven-day interval is due. No separate cron is required. Manual local execution remains available.
+
+Rotate two appdata archives by default, enforce extraction-space limits, check selected SQLite databases and flash-backup evidence, remove temporary restored payload and retain compact results. Oversized/unchecked archives are reported as untested.
+
+Never writes restored data to live appdata or the boot device. This tests the selected backup contents; it does not certify every application starts or that the flash device can boot.

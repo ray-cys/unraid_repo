@@ -1,0 +1,7 @@
+Purpose: Prepare ImageMaid move mode without deleting retained restore images.
+
+Schedule: Custom 50 6 * * 3,7 (Wednesday and Sunday at 06:50, Singapore time), before ImageMaid's native 07:00 runs.
+
+When the previous job is confirmed idle, briefly stop its resident scheduler, rename the existing ImageMaid Restore directory into a dated ImageMaid Restore Archives generation on the same filesystem, then restart and verify the container. Active jobs or backup maintenance defer preparation.
+
+Reports archival actions and failures. Never purges archived images or changes Plex's active Metadata/Media directories. Retained archives continue to consume appdata space.

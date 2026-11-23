@@ -88,6 +88,12 @@ its failure is reported independently of completed data processing.
 | `imagemaid_restore_archive` | `50 6 * * 3,7` | Prepare before actual Wed/Sun 07:00 native ImageMaid runs. Archive an idle previous restore tree, briefly stop/restart the scheduler under maintenance and verify same-directory identity after atomic rename. |
 | `kometa_preflight` | `55 3,7,11,15,19,23 * * *` | After idle MetaFusion, before Kometa's four-hour boundaries, reconcile exact Plex GUIDs and supported resolution filters. Active/unsupported producers defer without edits. |
 
+Keep `backup_restore_drill` unscheduled in User Scripts: the successful ISS backup
+handoff invokes it on ISS when its seven-day interval is due. Its time follows
+backup completion rather than a fixed weekly clock time. Repository files under
+`user_script/descriptions/` supply the separate `description` file displayed by
+the User Scripts plugin; comments inside a script do not populate that field.
+
 ImageMaid images remain under the same Plex appdata filesystem in
 `ImageMaid Restore Archives/restore_TIMESTAMP_PID`. No archive images are purged;
 this preserves undo data while allowing the next move run a fresh active root.

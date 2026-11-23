@@ -1,0 +1,7 @@
+Purpose: Reconcile generated Kometa metadata and supported overlay configuration before scheduled processing.
+
+Schedule: Custom 55 3,7,11,15,19,23 * * * (03:55, 07:55, 11:55, 15:55, 19:55 and 23:55, Singapore time).
+
+Requires MetaFusion and Kometa to be idle. Compare exact Plex external IDs, preserve absent-target definitions in a deferred catalogue and restore them when their exact target returns. Maintain supported resolution filters and explicit inherited TMDb collection ordering. Retain original configuration backups and notify about changes or failures.
+
+Does not run Kometa, delete media, alter Arr monitoring/download policies or repair damaged media. Active producers or backup maintenance defer edits.
