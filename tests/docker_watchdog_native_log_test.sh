@@ -179,10 +179,10 @@ cat >"$path" <<'LOG'
 [2026-11-22 07:02:52,479] [imagemaid.py:499]          [INFO]     | Total Runtime      | 0:02:01                                                                       |
 LOG
 read_log
-assert_json '.result == "success" and .incomplete == false and .finished > 0 and .reader.parserVersion == 2' 'Hubble idle ImageMaid log rejected'
+assert_json '.result == "success" and .incomplete == false and .finished > 0 and .reader.parserVersion == 3' 'Hubble idle ImageMaid log rejected'
 old="$(jq -c '{runLog:(.reader | del(.parserVersion, .active) | .gap=true | .completed={} | .successfulAt=0)}' "$result")"
 read_log
-assert_json '.result == "success" and .incomplete == false and .reader.parserVersion == 2' 'v3.4 EOF/gap state prevented idle-log repair'
+assert_json '.result == "success" and .incomplete == false and .reader.parserVersion == 3' 'v3.4 EOF/gap state prevented idle-log repair'
 
 # The running Kometa job has no normal whole-run footer yet. Collection names
 # containing "Run" must not count as completed scheduled work.

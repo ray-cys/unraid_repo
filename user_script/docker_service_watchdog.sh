@@ -1,10 +1,10 @@
 #!/bin/bash
-# Docker Service Watchdog v3.6 -- Unraid service availability and bounded recovery.
+# Docker Service Watchdog v3.7 -- Unraid service availability and bounded recovery.
 # Optional schedule: every five minutes. Pi-hole and application-specific health
 # remain owned by the DNS and Arr monitors. All recovery is disabled by default.
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.6"
+readonly SCRIPT_VERSION="3.7"
 
 ###############################################################################
 # CONFIGURATION
@@ -53,6 +53,10 @@ JOB_READ_MAX_BYTES=262144
 # catch-up without copying the log to vault or RAM. Backlogs resume next scan.
 JOB_LOG_SCAN_MAX_BYTES=$((128 * 1024 * 1024))
 REQUIRE_VERIFIED_JOB_SUCCESS=true
+# Preflight owns routine Kometa warnings/errors. Delegate emails only while its
+# weekly-report heartbeat/deadline is healthy; operational/fatal alerts stay here.
+KOMETA_WEEKLY_REPORTING=true
+KOMETA_WEEKLY_STATE="/mnt/vault/cloud/logs/script/kometa_preflight/weekly-report-state.json"
 RECYCLARR_JOB_COMMAND="/cron.sh"
 RECYCLARR_JOB_POSITION=0
 # profile|container TCP port|readiness path|validation type|expected body
@@ -472,11 +476,11 @@ if not 1024 <= limit <= 512 * 1024 * 1024:
     raise ValueError("Invalid native log scan limit")
 saved = json.load(sys.stdin)
 state = saved if isinstance(saved, dict) and saved.get("version") == 1 and saved.get("source") == source else {}
-if state.get("containerId") != container or state.get("parserVersion") != 2:
+if state.get("containerId") != container or state.get("parserVersion") != 3:
     state.pop("cursor", None)
     state.pop("active", None)
     state["gap"] = False
-state.update(version=1, parserVersion=2, source=source, containerId=container)
+state.update(version=1, parserVersion=3, source=source, containerId=container)
 state.setdefault("completed", {})
 state.setdefault("successfulAt", 0)
 state.setdefault("gap", False)
@@ -488,18 +492,22 @@ levels = r"TRACE|DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL|FATAL"
 record = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(?:[,.]\d+)?\]\s+\S+\s+(?:\[(" + levels + r")\]|(" + levels + r"))\s+(.*)$")
 ansi = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
-def redact(message):
+def redact(message, maximum=240):
+    message = re.sub(r"""(?is)(["']?(?:api[_-]?key|token|password|secret|authorization)["']?\s*[:=]\s*)(["'])(.*?)\2""", r'\1"[REDACTED]"', message)
     message = re.sub(r"(?i)authorization[=: ]+(?:bearer\s+|basic\s+)?[^\s,;|]+", "authorization=[REDACTED]", message)
     message = re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1[REDACTED]@", message)
     message = re.sub(r"(?i)(api[_-]?key|token|password|secret)[=: ]+[^\s,;|]+", r"\1=[REDACTED]", message)
     # Arbitrary URL query strings can also contain credentials or signed URLs.
     message = re.sub(r"(https?://[^\s?#|]+)[?#][^\s|]*", r"\1?[REDACTED]", message)
-    return message[:240]
+    message = re.sub(r"(?i)([\"']?(?:api[_-]?key|token|password|secret|authorization)[\"']?\s*[:=]\s*)[\"']?[^\s,;|]+", r"\1[REDACTED]", message)
+    return message[:maximum]
 
 def new_run(epoch=0, full=False, mode="normal", prelude=None):
     return {"startedAt": epoch, "full": full, "mode": mode, "terminal": False,
             "closed": False, "summary": False, "previousSuccess": state["successfulAt"],
-            "findings": copy.deepcopy(prelude or {})}
+            "findings": copy.deepcopy(prelude or {}),
+            "maintenanceContext": {}, "maintenanceFindings": {}, "maintenanceDone": [],
+            "maintenanceLoaded": [], "maintenanceSummary": False}
 
 @functools.lru_cache(maxsize=512)
 def timestamp(stamp):
@@ -526,10 +534,119 @@ def outcome(run):
         return "completed-unverified"
     return "completed-warnings" if flags.get("warnings", {}).get("keys") else "success"
 
+# Compact maintenance catalogue: one reader, no second scan/copy of full logs.
+# It records observed log context only; missing file/library context stays unknown.
+if profile == "kometa":
+    maintenance = state.setdefault("maintenance", {"schema": 1, "trackingSince": now, "issues": {}, "runs": [], "dropped": 0})
+    if maintenance.get("schema") != 1:
+        raise ValueError("Unsupported maintenance catalogue")
+    maintenance["lastScanAt"] = now
+
+def maintenance_scope(context):
+    return hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()[:24]
+
+def maintenance_context(run, banner):
+    if profile != "kometa":
+        return
+    ctx = run.setdefault("maintenanceContext", {})
+    loaded = re.match(r"Loading (Collection|Overlay|Metadata|Playlist) File(?:\s+\d+)?(?: File)?:\s*(.+)$", banner)
+    external = re.match(r"Loading (Collection|Overlay|Metadata|Playlist) File(?:\s+\d+)? (Default|URL|Git|Repo|Folder):\s*(.+)$", banner)
+    library = re.match(r"(?:Loading (?:All .+ from )?Library:|Library:)\s*(.+)$", banner)
+    library_banner = re.fullmatch(r"(.+?) Library", banner)
+    started = re.fullmatch(r"Running (.+) (Collection|Overlay|Playlist)", banner)
+    finished = re.fullmatch(r"Finished (.+) (Collection|Overlay|Playlist)", banner)
+    finished_library = re.fullmatch(r"Finished (.+) Library", banner)
+    if banner in ("Error Summary", "Warning Summary", "Critical Summary"):
+        run["maintenanceSummary"] = True
+    if loaded:
+        kind, path = loaded.groups()
+        ctx = {"library": "", "file": redact(path, 300), "kind": "file", "item": ""}
+        run["maintenanceLoaded"] = list(dict.fromkeys(run.get("maintenanceLoaded", []) + [maintenance_scope(ctx)]))[-512:]
+    elif external:
+        kind, origin, value = external.groups()
+        ctx = {"library": "", "file": origin.lower()+":"+redact(value, 260), "kind": "file", "item": ""}
+        run["maintenanceLoaded"] = list(dict.fromkeys(run.get("maintenanceLoaded", []) + [maintenance_scope(ctx)]))[-512:]
+    elif library:
+        ctx = {"library": redact(library.group(1), 180), "file": "", "kind": "library", "item": ""}
+    elif library_banner and not re.match(r"(?:Mapping|Loading|Finished|No |Metadata Backup|Scanning|Connecting|Processing|Running)\b", banner):
+        ctx = {"library": redact(library_banner.group(1), 180), "file": "", "kind": "library", "item": ""}
+    elif started:
+        item, kind = started.groups()
+        # Previously loaded metadata/overlay files are not necessarily this
+        # collection's source file. Do not carry that path across phases.
+        ctx = {"library": ctx.get("library", ""), "file": "", "kind": kind.lower(), "item": redact(item, 220)}
+    elif finished:
+        item, kind = finished.groups()
+        if ctx.get("kind") == kind.lower() and ctx.get("item") == redact(item, 220):
+            run["maintenanceDone"] = list(dict.fromkeys(run.get("maintenanceDone", []) + [maintenance_scope(ctx)]))[-512:]
+        ctx = {"library": ctx.get("library", ""), "file": "", "kind": "library", "item": ""}
+    if finished_library and ctx.get("library")==finished_library.group(1):
+        library_context = {"library": ctx["library"], "file": "", "kind": "library", "item": ""}
+        run["maintenanceDone"] = list(dict.fromkeys(run.get("maintenanceDone", []) + [maintenance_scope(library_context)]))[-512:]
+    run["maintenanceContext"] = ctx
+
+def maintenance_finding(run, level, message, epoch):
+    if profile != "kometa" or run.get("maintenanceSummary") or run.get("mode") != "normal":
+        return
+    message = redact(message, 900)
+    if not message.strip(" |-=*\t"):
+        return
+    ctx = copy.deepcopy(run.get("maintenanceContext", {}))
+    normalized = re.sub(r"\b\d+(?:\.\d+)?\s*(?:milliseconds|seconds|minutes|ms)\b", "<duration>", message, flags=re.I)
+    key = hashlib.sha256((maintenance_scope(ctx) + normalized).encode()).hexdigest()[:24]
+    findings = run.setdefault("maintenanceFindings", {})
+    if key not in findings and len(findings) >= 128:
+        run["maintenanceDropped"] = run.get("maintenanceDropped", 0) + 1
+        return
+    issue = findings.setdefault(key, {"id": key, "message": message, "context": ctx, "scope": maintenance_scope(ctx),
+                                     "severity": level, "firstSeen": epoch, "lastSeen": epoch, "occurrences": 0})
+    issue["lastSeen"] = epoch
+    issue["occurrences"] += 1
+    if level in ("FATAL", "CRITICAL", "ERROR"):
+        issue["severity"] = level
+
+def maintenance_finish(run, epoch):
+    if profile != "kometa" or not run.get("full") or run.get("mode") != "normal":
+        return
+    catalogue = state["maintenance"]
+    issues = catalogue["issues"]
+    run_id = str(run["startedAt"]) + ":" + str(epoch)
+    catalogue["runs"] = [r for r in catalogue.get("runs", []) if r["id"] != run_id]
+    catalogue["runs"].append({"id": run_id, "started": run["startedAt"], "finished": epoch,
+                              "complete": not state.get("gap", False), "result": outcome(run)})
+    catalogue["runs"] = sorted([r for r in catalogue["runs"] if r["finished"] >= now - 21*86400], key=lambda r: r["finished"])[-150:]
+    findings = run.get("maintenanceFindings", {})
+    scopes_with_findings = {issue["scope"] for issue in findings.values()}
+    for key, value in findings.items():
+        entry = issues.setdefault(key, {**copy.deepcopy(value), "affectedRuns": [], "resolvedAt": 0, "cleanRuns": []})
+        entry["lastSeen"] = max(entry.get("lastSeen", 0), value["lastSeen"])
+        entry["firstSeen"] = min(entry.get("firstSeen", value["firstSeen"]), value["firstSeen"])
+        entry["severity"] = value["severity"]
+        entry["affectedRuns"] = sorted(set(entry.get("affectedRuns", []) + [run["startedAt"]]))[-150:]
+        entry["resolvedAt"] = 0
+        entry["cleanRuns"] = []
+        entry["occurrencesInLatestRun"] = value["occurrences"]
+    done = set(run.get("maintenanceDone", []))
+    if not run.get("findings", {}).get("errors") and not run.get("findings", {}).get("fatal"):
+        done.update(run.get("maintenanceLoaded", []))
+    if not state.get("gap") and not run.get("maintenanceDropped"):
+        for key, entry in issues.items():
+            if key not in findings and entry.get("scope") in done and entry["scope"] not in scopes_with_findings and epoch > entry["lastSeen"]:
+                entry["cleanRuns"] = sorted(set(entry.get("cleanRuns", []) + [run["startedAt"]]))[-2:]
+                if len(entry["cleanRuns"]) >= 2 and not entry.get("resolvedAt"):
+                    entry["resolvedAt"] = epoch
+    catalogue["dropped"] = catalogue.get("dropped", 0) + run.get("maintenanceDropped", 0)
+    catalogue["issues"] = {key: entry for key, entry in issues.items() if not entry.get("resolvedAt") or entry.get("resolvedAt", 0) >= now - 21*86400}
+    if len(catalogue["issues"]) > 256:
+        ordered = sorted(catalogue["issues"], key=lambda key: catalogue["issues"][key]["lastSeen"], reverse=True)
+        catalogue["dropped"] += len(ordered) - 256
+        catalogue["issues"] = {key: catalogue["issues"][key] for key in ordered[:256]}
+
 def finish(run, epoch):
     if run["mode"] != "normal":
         return
     result = outcome(run)
+    maintenance_finish(run, epoch)
     state["completed"] = {"startedAt": run["startedAt"], "finishedAt": epoch,
                           "result": result, "findings": copy.deepcopy(run["findings"])}
     if result == "success":
@@ -563,7 +680,12 @@ def consume(raw):
         state["active"] = run = new_run()
     if profile == "kometa" and re.fullmatch(r"Starting (?:\d{1,2}:\d{2} )?Run", banner):
         prelude = run["findings"] if not run["startedAt"] else None
+        previous = run
         state["active"] = run = new_run(epoch, True, prelude=prelude)
+        if not previous["startedAt"]:
+            for key in ("maintenanceContext", "maintenanceFindings", "maintenanceLoaded", "maintenanceDropped"):
+                if key in previous:
+                    run[key] = previous[key]
     elif profile == "kometa" and re.fullmatch(r"Starting .+ Run", banner):
         state["active"] = run = new_run(epoch, False, "excluded")
     elif profile == "imagemaid" and banner == "Validating Options":
@@ -574,7 +696,10 @@ def consume(raw):
         run["summary"] = True
     elif profile == "imagemaid" and banner == "ImageMaid Summary":
         run["summary"] = False
+    if level == "INFO":
+        maintenance_context(run, banner)
     if level in ("WARNING", "WARN", "ERROR", "CRITICAL", "FATAL") and not run["summary"]:
+        maintenance_finding(run, level, message, epoch)
         finding(run, level, message)
         if run["closed"]:
             finish(run, state["completed"].get("finishedAt", epoch))
@@ -706,8 +831,8 @@ check_job() {
                     (.findings | type == "object") and (.activeFatal | type == "object") and
                     (.result | IN("unknown", "success", "failed", "completed-errors", "completed-warnings", "completed-unverified"))' "$file" >/dev/null; then
                 run_log="$(jq -c .reader "$file")"
-                mutate --arg name "$name" --argjson reader "$run_log" --argjson now "$NOW" \
-                    '.jobs //= {} | .jobs[$name] = ((.jobs[$name] // {firstSeen:$now,started:0,finished:0,success:0,result:"unknown",scanned:$now,logState:{},history:[]}) | .runLog=$reader)' || return 1
+                mutate --arg name "$name" --slurpfile evidence "$file" --argjson now "$NOW" \
+                    '.jobs //= {} | .jobs[$name] = ((.jobs[$name] // {firstSeen:$now,started:0,finished:0,success:0,result:"unknown",scanned:$now,logState:{},history:[]}) | .runLog=$evidence[0].reader)' || return 1
                 if [[ "$(jq -r .backlog "$file")" == true ]]; then
                     log INFO "$name: native-log scan in progress; saved cursor, retaining previous job findings" || return 1
                     job_deadlines "$name" "$first" "$(jq -r '.started // 0' <<<"$old")" "$old_finished" "$max_age" "$runtime" || return 1
@@ -827,10 +952,11 @@ check_job() {
     else
         (( success >= old_success )) || success="$old_success"
     fi
+    printf '%s' "$run_log" >"$TMP_DIR/$name.reader.json" || return 1
     mutate --arg name "$name" --arg result "$result" --argjson first "$first" --argjson started "$started" \
         --argjson finished "$finished" --argjson success "$success" --argjson scanned "$NOW" --argjson receipt_history "$receipt_history" --argjson log_state "$log_state" \
-        --argjson run_log "$run_log" --argjson retract "$retract_success" --arg evidence_source "$source" \
-        '.jobs //= {} | (.jobs[$name].history // []) as $history |
+        --slurpfile run_log_file "$TMP_DIR/$name.reader.json" --argjson retract "$retract_success" --arg evidence_source "$source" \
+        '$run_log_file[0] as $run_log | .jobs //= {} | (.jobs[$name].history // []) as $history |
             .jobs[$name]={firstSeen:$first,started:$started,finished:$finished,success:$success,result:$result,scanned:$scanned,logState:$log_state,runLog:$run_log,evidenceSource:$evidence_source,
                 history:(($history + $receipt_history + (if $result == "success" and $success > 0 then [$success] else [] end)) | unique | map(select(. >= ($scanned - 28*86400) and (($retract | not) or . != $finished))))}' || return 1
     if [[ "$result" == failed ]]; then
@@ -1341,19 +1467,27 @@ evaluate_shared_failure() {
     fi
 }
 
+kometa_weekly_delegate_ready() {
+    [[ "$KOMETA_WEEKLY_REPORTING" == true && -f "$KOMETA_WEEKLY_STATE" && ! -L "$KOMETA_WEEKLY_STATE" ]] || return 1
+    jq -e --argjson now "$NOW" '.schema==1 and (.lastCheckedAt|type=="number") and (.nextDue|type=="number") and
+      .lastCheckedAt<=($now+300) and .lastCheckedAt>=($now-8*3600) and .nextDue>=($now-8*3600)' "$KOMETA_WEEKLY_STATE" >/dev/null 2>&1
+}
+
 notify_changes() {
-    local current previous body importance=normal description
-    current="$(jq -cS '. as $state | .observations | with_entries(select(.value.active) |
+    local current previous body importance=normal description delegate=false
+    kometa_weekly_delegate_ready && delegate=true
+    current="$(jq -cS --argjson delegate "$delegate" '. as $state | .observations | with_entries(select(.value.active) |
+        select(($delegate and (.key|test("^(kometa|lometa):job-(errors|warnings)$")))|not) |
         select((.key | test(":(availability|missing)$") | not) or
             (($state.flapping[(.key | split(":")[0])].unstable // false | not) and
              ($state.observations["monitor:shared-dependency"].active // false | not)))) | map_values(.severity)' "$STATE_WORK")" || return 1
-    previous="$(jq -cS '.notification.issues' "$STATE_WORK")" || return 1
-    [[ "$current" != "$previous" ]] || return 0
+    previous="$(jq -cS --argjson delegate "$delegate" '.notification.issues | with_entries(select(($delegate and (.key|test("^(kometa|lometa):job-(errors|warnings)$")))|not))' "$STATE_WORK")" || return 1
+    if [[ "$current" == "$previous" ]]; then mutate --argjson current "$current" '.notification.issues=$current'; return $?; fi
     description="Docker watchdog UPDATED"
     [[ "$current" != '{}' ]] || description="Docker watchdog RESOLVED"
     if jq -e 'any(.[]; . == "CRITICAL")' <<<"$current" >/dev/null; then importance=alert
     elif [[ "$current" != '{}' ]]; then importance=warning; fi
-    body="$(jq -r --argjson now "$NOW" '.observations | to_entries[] | select(.value.active) |
+    body="$(jq -r --argjson now "$NOW" --argjson current "$current" '.observations | to_entries[] | .key as $key | select($current|has($key)) |
         "[\(.value.severity)] \(.key)\n  Condition: \(.value.message)\n  Observed duration: \(($now - .value.first) / 60 | floor)m; consecutive failures: \(.value.bad)"' "$STATE_WORK")"
     body+=$'\n'"$(jq -nr --argjson current "$current" --argjson previous "$previous" \
         '($previous | keys) - ($current | keys) | .[] | "Resolved: " + .')"
@@ -1413,7 +1547,7 @@ main() {
     done
     (( JOB_LOG_SCAN_MAX_BYTES >= 1024 && JOB_LOG_SCAN_MAX_BYTES <= 512 * 1024 * 1024 )) || return 2
     for number in "$BOOT_GRACE_SECONDS" "$CONTAINER_GRACE_SECONDS" "$LOG_SIZE_WARNING_BYTES" "$PROBE_MAX_REDIRECTS"; do [[ "$number" =~ ^[0-9]+$ ]] || return 2; done
-    for flag in "$AUTO_RESTART" "$RESTART_STOPPED_CONTAINERS" "$RECOVER_UNEXPECTED_EXITS" "$CHECK_LOG_SIZE" "$DISCOVER_UNCLASSIFIED" "$REQUIRE_VERIFIED_JOB_SUCCESS"; do [[ "$flag" == true || "$flag" == false ]] || return 2; done
+    for flag in "$AUTO_RESTART" "$RESTART_STOPPED_CONTAINERS" "$RECOVER_UNEXPECTED_EXITS" "$CHECK_LOG_SIZE" "$DISCOVER_UNCLASSIFIED" "$REQUIRE_VERIFIED_JOB_SUCCESS" "$KOMETA_WEEKLY_REPORTING"; do [[ "$flag" == true || "$flag" == false ]] || return 2; done
     local profile max_age runtime source
     for spec in "${JOB_RULES[@]}"; do
         IFS='|' read -r profile max_age runtime source <<<"$spec"

@@ -9,6 +9,8 @@ import tempfile
 import time
 import yaml
 
+PREFLIGHT_SOURCE=(Path(__file__).resolve().parents[1]/"user_script/kometa_preflight.sh").read_text().split("<<'PY'\n",1)[1].split("\nPY\n",1)[0]
+
 with tempfile.TemporaryDirectory(prefix='kometa-preflight-fixture-') as folder:
     root=Path(folder)
     for name in ['logs','metadata','overlays','collections','.metafusion']: (root/name).mkdir()

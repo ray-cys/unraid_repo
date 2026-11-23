@@ -398,6 +398,6 @@ STATUS_DIR="$TEST_ROOT/status"; UPTIME_FILE="$TEST_ROOT/uptime"
 printf '99999.00 0.00\n' >"$UPTIME_FILE"
 docker() { return 0; }
 (main) >"$TEST_ROOT/main.log" 2>&1 || { cat "$TEST_ROOT/main.log" >&2; fail 'main orchestration failed'; }
-jq -e '.status == "OK" and .scriptVersion == "3.6"' "$STATUS_DIR/docker_service_watchdog.json" >/dev/null || fail 'main receipt incorrect'
+jq -e '.status == "OK" and .scriptVersion == "3.7"' "$STATUS_DIR/docker_service_watchdog.json" >/dev/null || fail 'main receipt incorrect'
 jq -e '.phase == "completed" and .executionComplete == true and .failures == 0' "$HEARTBEAT_FILE" >/dev/null || fail 'main heartbeat not finalized'
 printf 'docker_service_watchdog fixture tests passed\n'
