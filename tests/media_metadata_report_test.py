@@ -45,9 +45,14 @@ assert 'future_reason' in report(unknown)['body']
 # No loss of native recoveries on a skipped/unchanged run and no repeated old recovery.
 old=copy.deepcopy(native);old['recently_resolved'][0]['resolved_at']=stamp(9*86400)
 assert report(old)['metafusionResolved']==0
-many=copy.deepcopy(native);many['open']=[dict(base_row,finding_id=str(i),title='Item '+str(i),evidence={'error_type':'PermissionError','destination':'x'*1500}) for i in range(100)]
+many=copy.deepcopy(native);many['open']=[dict(base_row,finding_id=str(i),title='Item '+str(i),operation='field/'+str(i),evidence={'error_type':'PermissionError','destination':'x'*1500}) for i in range(100)]
 cat=copy.deepcopy(catalogue);cat['issues']={'k':dict(id='k',severity='ERROR',message='YAML Error: duplicate key',firstSeen=now-100,lastSeen=now-50,context={},affectedRuns=[],resolvedAt=0)}
 r=report(many,cat)
 assert '[Kometa]' in r['body'] and '[MetaFusion]' in r['body'] and len(r['body'].encode())<=24000
-assert 'additional entries' in r['body'] and 'Item 99' in r['fullBody']
+assert 'additional entries/groups' in r['body'] and 'Item 99' in r['fullBody']
 print('Native identity/evidence/recovery, skipped scopes, stale/missing/unknown schemas, redaction, quiet-empty and shared email budget tests passed')
+
+grouped=copy.deepcopy(native);grouped['open']=[dict(base_row,finding_id=str(i),title='Example '+str(i)) for i in range(100)]
+r=report(grouped)
+assert 'Related native findings: 100' in r['body'] and 'Example 99' in r['fullBody']
+print('Repeated native observations grouped for email without losing individual full-report records')

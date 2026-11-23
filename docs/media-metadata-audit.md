@@ -91,6 +91,8 @@ Only producer-verified recoveries since the previous report/week are included.
 Run action and cleanup counts are explicitly producer summaries, not unique-item
 counts or actions performed by this audit.
 
+Native findings with the same library/operation/reason/lifecycle are grouped for email, with an exact example, total count and the complete per-identity detail in the full report. Episode/season indices are generalized for presentation only. Provider-missing fields are not called runtime errors or a direct Plex-field audit.
+
 One combined weekly notification interleaves MetaFusion and Kometa entries so one
 source cannot monopolize all 20 positions. It retains the 24-KB bound, explicit
 omission counts, one overwritten full report, redaction and failed-delivery retry.

@@ -182,6 +182,7 @@ def metafusion_review():
     snapshot=wrapper.get("snapshot")
     problem=None
     mf_blocks=[]
+    email_groups={}
     summaries=[]
     opened=[]; fixed=[]
     try:
@@ -230,6 +231,7 @@ def metafusion_review():
         histories=[r for r in snapshot["run_history"] if isinstance(r,dict) and iso_epoch(r.get("finished_at"))>=cutoff]
         histories=list({r["run_id"]:r for r in histories if isinstance(r.get("run_id"),str)}.values())
         summaries=["MetaFusion native findings: "+str(len(opened))+" open; "+str(len(fixed))+" newly reported verified recoveries.",
+                   "MetaFusion open reasons (native observations, not an error total): "+safe(json.dumps(snapshot.get("open_by_reason",{}),ensure_ascii=False),1500),
                    "MetaFusion export: "+stamp(generated)+"; latest run: "+run["status"]+"; mode: "+safe(run.get("mode","unknown"),30)+"; targeted: "+str(bool(run.get("targeted")))+".",
                    "MetaFusion recorded runs this week: "+str(len(histories))+"; completed: "+str(sum(r.get("status")=="completed" for r in histories))+". Counts describe recorded runs, not unique items.",
                    "MetaFusion producer build: "+safe(json.dumps(run.get("build",{}),ensure_ascii=False),600),
@@ -238,6 +240,7 @@ def metafusion_review():
                    "Latest artwork-present evaluations by action: "+safe(json.dumps(run.get("artwork_present_by_action",{}),ensure_ascii=False),800),
                    "Latest cleanup counts: "+safe(json.dumps(run.get("cleanup",{}),ensure_ascii=False),800),
                    "Enabled operations: "+safe(json.dumps(run.get("enabled_operations",{}),ensure_ascii=False),1000)+"; full-scan libraries: "+safe(json.dumps(run.get("full_scan_libraries",[]),ensure_ascii=False),500),
+                   "Native source-missing observations concern provider/generated fields; they are not a direct audit of every field currently stored in Plex.",
                    "Native history is limited to retained producer runs; missing historical exports are not reconstructed from logs."]
         if run.get("unreadable_audits"):
             problem=(problem+" " if problem else "")+"MetaFusion reported unreadable application audits; inspect native reports."
@@ -264,7 +267,7 @@ def metafusion_review():
             lifecycle="RESOLVED" if resolved_row else ("NEW" if iso_epoch(row["first_seen"])>=max(cutoff,saved.get("lastReportAt",0)+1) else "PERSISTENT")
             code=row["reason_code"]
             block=["", "[MetaFusion] "+lifecycle+" | "+safe(row["operation"],120)+" | "+safe(code,100),
-                   "Library: "+safe(row.get("library") or "not identified",180)+"; item: "+safe(row.get("title") or "library/job scope",220),
+                   "Library: "+safe(row.get("library") or "not identified",180)+"; item: "+safe(row.get("title") or ("title not supplied; use exact Plex ID" if row.get("plex_rating_key") else "library/job scope"),220),
                    "Identity: server="+safe(row.get("server_id") or "unknown",120)+"; library UUID="+safe(row.get("library_uuid") or "unknown",120)+"; Plex="+safe(row.get("plex_rating_key") or "unknown",50)+"; TMDb="+safe(row.get("tmdb_id") or "unknown",50)+"; season="+safe(row.get("season_number"),20)+"; episode="+safe(row.get("episode_number"),20),
                    "Finding ID: "+safe(row["finding_id"],100)+"; component: "+safe(row.get("component") or "core",50)+"; mode: "+safe(row.get("mode") or "unknown",30),
                    "First observed: "+stamp(iso_epoch(row["first_seen"]))+"; last checked: "+stamp(checked)+"; observations: "+safe(row.get("observations",0),20),
@@ -285,16 +288,31 @@ def metafusion_review():
                     block.append("Field update held by the configured lock/policy; an intentional hold is not a failed download.")
                 block.append("Recommended action: "+action_map.get(row.get("next_action"),"Review the exact native reason code and evidence. Unknown future reasons are retained for review."))
             mf_blocks.append(block)
+            # Email groups are presentation only. The full report and producer
+            # retain every identity/occurrence and its own recovery evidence.
+            grouped_operation=re.sub(r"(?<=\.)[0-9]+(?=\.|$)","*",row["operation"])
+            grouped_operation=re.sub(r"^season [0-9]+ poster$","season * poster",grouped_operation)
+            key=(row.get("server_id"),row.get("library_uuid"),row.get("library"),grouped_operation,code,lifecycle,row.get("mode"),row.get("resolution"))
+            if key not in email_groups:
+                email_groups[key]={"count":0,"block":block.copy(),"operation":grouped_operation}
+            email_groups[key]["count"]+=1
     except (ValueError,TypeError,KeyError,OverflowError) as error:
         problem="Native findings unavailable/unverified: "+safe(error,200)+". Await the next non-dry MetaFusion run or inspect its native exporter. No missing file is interpreted as a clean result."
-        opened=[]; fixed=[]; mf_blocks=[]
+        opened=[]; fixed=[]; mf_blocks=[]; email_groups={}
         summaries=["MetaFusion findings coverage: UNVERIFIED."]
+    email_blocks=[]
+    for group in email_groups.values():
+        block=group["block"]
+        if group["count"]>1:
+            block.insert(2,"Related native findings: "+str(group["count"])+"; grouped operation: "+safe(group["operation"],150)+"; one detailed example shown. Every exact finding ID/evidence is retained in weekly-report.txt.")
+        email_blocks.append(block)
     if problem:
-        mf_blocks.insert(0,["","[MetaFusion] COVERAGE UNVERIFIED",problem,
-                            "Recommended action: check the producer run, findings export freshness/schema and native application-audit availability; no automatic fix was inferred."])
-    return mf_blocks,summaries,len(opened),len(fixed),bool(problem)
+        warning=["","[MetaFusion] COVERAGE UNVERIFIED",problem,
+                 "Recommended action: check the producer run, findings export freshness/schema and native application-audit availability; no automatic fix was inferred."]
+        mf_blocks.insert(0,warning); email_blocks.insert(0,warning)
+    return mf_blocks,email_blocks,summaries,len(opened),len(fixed),bool(problem)
 
-mf_blocks,mf_summary,mf_active,mf_resolved,mf_partial=metafusion_review()
+mf_blocks,mf_email_blocks,mf_summary,mf_active,mf_resolved,mf_partial=metafusion_review()
 
 issues = [dict(value) for value in catalogue.get("issues", {}).values()
           if not value.get("resolvedAt") or value.get("resolvedAt", 0) >= max(cutoff, saved.get("lastReportAt",0)+1)]
@@ -348,14 +366,20 @@ for index in range(max(len(blocks),len(mf_blocks))):
     if index<len(mf_blocks): all_blocks.append(mf_blocks[index])
     if index<len(blocks): all_blocks.append(blocks[index])
 footer=["", "Reporting performed no YAML edits, restarts or corrective actions. Native verified recoveries above describe MetaFusion's actions. Urgent availability/job failures remain with Docker Service Watchdog."]
+email_candidates=[]
+if kometa_problem:
+    email_candidates.append(["","[Kometa] COVERAGE UNVERIFIED",kometa_problem])
+for index in range(max(len(blocks),len(mf_email_blocks))):
+    if index<len(mf_email_blocks): email_candidates.append(mf_email_blocks[index])
+    if index<len(blocks): email_candidates.append(blocks[index])
 email_lines=header.copy()
 shown=0
-for block in all_blocks[:maximum]:
+for block in email_candidates[:maximum]:
     if len("\n".join(email_lines+block+footer).encode())>22000:
         break
     email_lines.extend(block); shown+=1
-if shown<len(all_blocks):
-    email_lines += ["",f"Email includes {shown} of {len(all_blocks)} complete entries. {len(all_blocks)-shown} additional entries are retained with details in weekly-report.txt. Both producers share the item/byte budget."]
+if shown<len(email_candidates):
+    email_lines += ["",f"Email includes {shown} of {len(email_candidates)} review entries/groups. {len(email_candidates)-shown} additional entries/groups are retained with details in weekly-report.txt. Both producers share the item/byte budget."]
 if not all_blocks:
     footer.insert(0,"No actionable findings recorded. This does not certify unprocessed items or disabled operations.")
 full_body="\n".join(header+[line for block in all_blocks for line in block]+footer)
@@ -384,7 +408,7 @@ PYWEEKLY
     if [[ $(jq -r .send "$result") == true ]]; then
         local importance=warning
         if jq -e '.actionable==0 and .coverageWarnings==0' "$result" >/dev/null; then importance=normal; fi
-        if [[ ! -x "$NOTIFY_BIN" ]] || ! timeout 30 "$NOTIFY_BIN" -i "$importance" -s 'Media Metadata Weekly Review' -d "Weekly actionable findings: $(jq -r .actionable "$result"); verified resolved: $(jq -r .resolved "$result"); coverage warnings: $(jq -r .coverageWarnings "$result")" -m "$(jq -r .body "$result")"; then
+        if [[ ! -x "$NOTIFY_BIN" ]] || ! timeout 30 "$NOTIFY_BIN" -i "$importance" -s 'Media Metadata Weekly Review' -d "Weekly findings: $(jq -r .actionable "$result"); verified resolved: $(jq -r .resolved "$result"); coverage warnings: $(jq -r .coverageWarnings "$result")" -m "$(jq -r .body "$result")"; then
             rm -f "$result" "$saved"; printf 'Weekly media metadata notification failed; deadline unchanged for retry.\n' >&2; return 1
         fi
         printf 'Weekly media metadata maintenance notification delivered.\n'
