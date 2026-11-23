@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Data Management v3
+# Data Management v3.1
 #
 # PURPOSE
 # -------
@@ -28,7 +28,10 @@
 #   3. Remove unwanted files.
 #   4. Move ポルノ content to its destination.
 #   5. Move private performer categories to their individual destinations.
-#   6. Update VueTorrent only after all data processing succeeds.
+#   6. Refresh VueTorrent on its separate weekly cadence.
+#
+# v3.1 applies the same immediate, per-payload policy to both category phases.
+# Run with --help for console-only usage; no notification emails are sent.
 #
 #
 # SAFETY
@@ -37,6 +40,10 @@
 # - Only explicitly configured qBittorrent categories are processed.
 # - Unknown non-empty categories stop the script before anything is moved.
 # - Existing destination files are never silently overwritten.
+# - A healthy API is required. Empty torrent lists permit immediate orphan transfer.
+# - Active/incomplete/seeding payload units are retained without blocking siblings.
+# - Completed-folder location is trusted for unregistered payloads in both phases.
+# - No age/stability wait applies; this cannot prove an orphan file is complete.
 # - Identical duplicates are removed from the source.
 # - Different files with the same destination name are preserved as .dupN.
 # - VueTorrent is updated only after successful data processing.
@@ -49,7 +56,7 @@
 ###############################################################################
 
 set -uo pipefail
-readonly SCRIPT_VERSION="3.0"
+readonly SCRIPT_VERSION="3.1"
 
 umask 0002
 
@@ -212,7 +219,7 @@ QBIT_CONTAINER_ROOT="${QBIT_CONTAINER_ROOT:-/data}"
 QBIT_HOST_ROOT="${QBIT_HOST_ROOT:-/mnt/user/secure}"
 QBIT_HEADERS_FILE="${QBIT_HEADERS_FILE:-/mnt/vault/cloud/logs/script/docker_service_watchdog/probe-auth/qbittorrent.headers}"
 QBIT_RUNTIME=""
-CATEGORY_JOBS=""
+QBIT_API_UNAVAILABLE=false
 
 
 # ---------------------------------------------------------------------------
@@ -712,7 +719,7 @@ resolve_collision() {
     local candidate="$base"
     local i=1
 
-    while [[ -e "$candidate" ]]; do
+    while [[ -e "$candidate" || -L "$candidate" ]]; do
         candidate="${base}.dup${i}"
         ((i++))
     done
@@ -914,7 +921,7 @@ remove_unwanted_content() {
     local removed_bytes=0
     local had_error=0
 
-    [[ -d "$root" ]] || return 0
+    [[ -e "$root" ]] || return 0
 
     log info "PRUNE: scanning '$root'"
 
@@ -1217,79 +1224,70 @@ safe_move() {
 # CATEGORY PROCESSING
 ###############################################################################
 
+process_payload_file() {
+    local source="$1" destination="$2" name target
+    name=$(clean_name "${source##*/}") || return 1
+    [[ -n "$name" && "$name" != . && "$name" != .. && "$name" != */* ]] || return 1
+    mkdir -p -- "$destination" || return 1
+    [[ ! -L "$destination" ]] || return 1
+    chown "$OWN_USER:$OWN_GROUP" "$destination" && chmod "$DIR_MODE" "$destination" || return 1
+    target="$destination/$name"
+    if [[ -e "$target" || -L "$target" ]]; then
+        if [[ ! -L "$target" && -f "$target" ]] && is_same_file "$source" "$target"; then
+            log info "MV: identical destination verified; removing source duplicate '$source'"
+            rm -f -- "$source"
+            return $?
+        fi
+        target=$(resolve_collision "$target") || return 1
+        log warn "MV: destination collision; incoming file preserved as '$target'"
+    fi
+    log info "MV: transferring file '$source' -> '$target'"
+    rsync -a --remove-source-files --chown="$OWN_USER:$OWN_GROUP" \
+        --chmod="D${DIR_MODE},F${FILE_MODE}" -- "$source" "$target"
+}
+
 process_category() {
-    local category="$1"
-    local destination="$2"
-
-    local source="${COMPLETE_DIR}/${category}"
-
+    local category="$1" destination="$2" source="${COMPLETE_DIR}/$1"
+    local unit name target rc listing moved=0 deferred=0
     if ! has_files "$source"; then
-
-        log info \
-            "CATEGORY: '$category' has no completed files; skipping"
-
+        log info "CATEGORY: '$category' has no completed files; skipping"
         return 0
     fi
-
-    log info "------------------------------------------------------------"
-    if ! category_completion_proven "$source"; then
-        log warn "CATEGORY: '$category' deferred; existing files and torrent state preserved."
-        return 0
-    fi
-    transfer_checkpoint category_intent "$source" "$destination" || return 1
-    log info "CATEGORY: processing '$category'"
-    log info "CATEGORY: source      '$source'"
-    log info "CATEGORY: destination '$destination'"
-    log info "------------------------------------------------------------"
-
-
-    ###########################################################################
-    # Normalize names
-    ###########################################################################
-
-    normalize_names "$source" || {
-        log error \
-            "CATEGORY: filename normalization failed for '$category'"
-        return 1
-    }
-
-
-    ###########################################################################
-    # Remove unwanted content
-    ###########################################################################
-
-    remove_unwanted_content "$source" || {
-        log error \
-            "CATEGORY: unwanted-file cleanup failed for '$category'"
-        return 1
-    }
-
-
-    ###########################################################################
-    # Cleanup may legitimately remove everything
-    ###########################################################################
-
-    if ! has_files "$source"; then
-
-        log info \
-            "CATEGORY: '$category' contains no files after cleanup"
-        transfer_checkpoint category_complete "$source" "$destination" || return 1
-        return 0
-    fi
-
-
-    ###########################################################################
-    # Move
-    ###########################################################################
-
-    transfer_checkpoint moving "$source" "$destination" || return 1
-    safe_move "$source" "$destination" || {
-        log error \
-            "CATEGORY: move failed for '$category'"
-        return 1
-    }
-    transfer_checkpoint category_complete "$source" "$destination" || return 1
-    return 0
+    [[ -d "$source" && ! -L "$source" && ! -L "$destination" ]] || return 1
+    listing=$(mktemp "$QBIT_RUNTIME/category-units.XXXXXX") || return 1
+    # Capture the worklist before changes. Units that arrive later wait only
+    # until the next normal schedule, never for an age or repeated observation.
+    find "$source" -mindepth 1 -maxdepth 1 -print0 >"$listing" || return 1
+    while IFS= read -r -d '' unit; do
+        [[ -e "$unit" || -L "$unit" ]] || continue
+        rc=0
+        payload_completion_proven "$unit" || rc=$?
+        if (( rc!=0 )); then
+            ((deferred++)) || true
+            continue
+        fi
+        name=$(clean_name "${unit##*/}") || return 1
+        [[ -n "$name" && "$name" != . && "$name" != .. && "$name" != */* ]] || return 1
+        target="$destination/$name"
+        [[ ! -L "$target" ]] || { log error "MV: symlink destination retained: $target"; return 1; }
+        transfer_checkpoint category_intent "$unit" "$target" || return 1
+        if [[ -d "$unit" ]]; then
+            normalize_names "$unit" || return 1
+        fi
+        remove_unwanted_content "$unit" || return 1
+        if [[ -d "$unit" ]]; then
+            transfer_checkpoint moving "$unit" "$target" || return 1
+            safe_move "$unit" "$target" || return 1
+            rmdir -- "$unit" 2>/dev/null || true
+        elif [[ -f "$unit" ]]; then
+            transfer_checkpoint moving "$unit" "$target" || return 1
+            process_payload_file "$unit" "$destination" || return 1
+        fi
+        transfer_checkpoint category_complete "$unit" "$target" || return 1
+        ((moved++)) || true
+    done <"$listing"
+    rm -f -- "$listing"
+    log info "CATEGORY: '$category' processed=$moved retained=$deferred; unregistered completed-folder payloads require no age or repeat observation"
 }
 
 
@@ -1452,31 +1450,57 @@ transfer_checkpoint() {
        mv "$temp" "$TRANSFER_STATE_DIR/state.json" || return 1
 }
 
-category_completion_proven() {
-    local source="$1" native mapped file eligible=0 matched false_path
-    qbit_request torrents/info "$QBIT_RUNTIME/jobs.json" || { log error 'qBittorrent API unavailable; category files preserved.'; return 1; }
-    jq -e 'type=="array" and all(.[]; (.hash|type)=="string" and (.content_path|type)=="string" and (.progress|type)=="number" and (.state|type)=="string")' "$QBIT_RUNTIME/jobs.json" >/dev/null || return 1
-    CATEGORY_JOBS="$QBIT_RUNTIME/category-jobs.tsv"
-    : >"$CATEGORY_JOBS"
-    while IFS=$'\t' read -r native matched false_path; do
-        [[ "$native" == "$QBIT_CONTAINER_ROOT/"* && "$native" != *'/../'* && "$native" != */.. ]] || continue
-        mapped="$QBIT_HOST_ROOT/${native#"$QBIT_CONTAINER_ROOT/"}"
-        [[ "$mapped" == "$source" || "$mapped" == "$source/"* ]] || continue
-        # Stop/queued/checking/moving/download states are not assumed complete.
-        # Only complete, already stopped payloads are eligible; this script never
-        # changes seeding policy, stops torrents, or deletes torrent records.
-        if [[ "$matched" != true || ! "$false_path" =~ ^(stoppedUP|pausedUP)$ ]]; then
-            log warn "Category retained: an owned torrent is incomplete, active, queued or checking ($false_path)."; return 1
+payload_completion_proven() {
+    local source="$1" job native mapped state complete matched=false markers
+    if [[ "${QBIT_API_UNAVAILABLE:-false}" == true ]]; then
+        log warn "RETAIN: API unavailable earlier in this run; payload untouched: $source"
+        return 1
+    fi
+    if ! qbit_request torrents/info "$QBIT_RUNTIME/jobs.json" ||
+       ! jq -e 'type=="array" and all(.[]; (.hash|type)=="string" and (.hash|length)>0
+          and (.content_path|type)=="string" and (.content_path|startswith("/"))
+          and (.progress|type)=="number" and (.amount_left|type)=="number"
+          and (.state|type)=="string")' "$QBIT_RUNTIME/jobs.json" >/dev/null 2>&1; then
+        QBIT_API_UNAVAILABLE=true
+        log error "RETAIN: qBittorrent API unavailable or invalid; no empty-list assumption; payload untouched: $source"
+        return 1
+    fi
+    while IFS= read -r job; do
+        native=$(jq -r '.content_path' <<<"$job") || return 1
+        # This host has one verified payload bind mount. Unmapped/path-traversal
+        # records cannot safely rule out ownership, so defer without guessing.
+        if [[ "$native" != "$QBIT_CONTAINER_ROOT/"* || "$native" == *'/../'* || "$native" == */.. || "$native" == *'/./'* ]]; then
+            log warn "RETAIN: qBittorrent path cannot be mapped through configured payload root; payload untouched: $source"
+            return 1
         fi
-        printf '%s\n' "$mapped" >>"$CATEGORY_JOBS"
-        eligible=$((eligible+1))
-    done < <(jq -r '.[] | [.content_path,((.progress==1 and (.amount_left // 0)==0)|tostring),.state] | @tsv' "$QBIT_RUNTIME/jobs.json")
-    (( eligible>0 )) || { log warn 'Category retained: exact completed qBittorrent ownership could not be proven (including unregistered/orphan files).'; return 1; }
-    while IFS= read -r -d '' file; do
-        matched=false
-        while IFS= read -r mapped; do [[ "$file" != "$mapped" && "$file" != "$mapped/"* ]] || matched=true; done <"$CATEGORY_JOBS"
-        [[ "$matched" == true ]] || { log warn "Category retained: file has no exact completed API owner: $file"; return 1; }
-    done < <(find "$source" -type f -print0)
+        mapped=$(realpath -m -s -- "$QBIT_HOST_ROOT/${native#"$QBIT_CONTAINER_ROOT/"}") || return 1
+        if [[ "$mapped" == "$source" || "$mapped" == "$source/"* || "$source" == "$mapped/"* ]]; then
+            matched=true
+            state=$(jq -r '.state' <<<"$job") || return 1
+            complete=$(jq -r '.progress==1 and .amount_left==0' <<<"$job") || return 1
+            if [[ "$complete" != true || ! "$state" =~ ^(stoppedUP|pausedUP)$ ]]; then
+                log warn "RETAIN: payload overlaps registered torrent state=$state complete=$complete; other units remain eligible: $source"
+                return 1
+            fi
+        fi
+    done < <(jq -c '.[]' "$QBIT_RUNTIME/jobs.json")
+    # Never move symlinks or obvious qBittorrent partial payloads, even if the
+    # corresponding record has disappeared. No timers/stability counters used.
+    markers=$(mktemp "$QBIT_RUNTIME/payload-markers.XXXXXX") || return 1
+    if ! find "$source" \( -type l -o -name '*.\!qB' \) -print0 >"$markers"; then
+        rm -f -- "$markers"; return 1
+    fi
+    if [[ -s "$markers" || ( ! -f "$source" && ! -d "$source" ) ]]; then
+        rm -f -- "$markers"
+        log warn "RETAIN: payload contains a symlink, partial-download marker, or unsupported entry: $source"
+        return 1
+    fi
+    rm -f -- "$markers"
+    if [[ "$matched" == true ]]; then
+        log info "ELIGIBLE: exact registered torrent is complete and stopped: $source"
+    else
+        log info "ELIGIBLE: unregistered payload in configured completed category; immediate scheduled transfer: $source"
+    fi
 }
 
 torrent_storage_ready() {
@@ -1526,7 +1550,7 @@ acquire_operation_coordination() {
 main() {
     case "${1:-}" in
         --version) printf 'completed_torrent_download.sh %s\n' "$SCRIPT_VERSION"; return 0;;
-        --help|-h) printf '%s\n' 'Usage: bash script [--help|--version]' 'Normal run: console-only processing of configured categories with exact complete/stopped qBittorrent ownership.' 'Active, incomplete or unregistered files are preserved. Unfinished checkpoints require review before retry.' 'VueTorrent refresh is weekly and independent of the media-transfer result.'; return 0;;
+        --help|-h) printf '%s\n' 'Usage: bash script [--help|--version]' 'Normal run: console-only processing of configured categories, one top-level download/file at a time.' 'Unregistered completed-folder payloads move immediately at the schedule; no age or repeat-scan delay in either phase.' 'Active/incomplete/checking/seeding torrents, symlinks and partial markers are preserved. API failure defers transfers.' 'Unfinished checkpoints require review before retry. VueTorrent refresh is weekly and independent of transfers.'; return 0;;
         "") ;;
         *) printf 'Unknown option: %s; use --help.\n' "$1" >&2; return 2;;
     esac
@@ -1597,7 +1621,7 @@ main() {
     ###########################################################################
 
     log info "============================================================"
-    log info "Data Management v3 started"
+    log info "Data Management v3.1 started"
     log info "Completed dir : $COMPLETE_DIR"
     log info "Destination   : $DEST_DIR"
     log info "============================================================"
@@ -1672,7 +1696,7 @@ main() {
     ###########################################################################
 
     finish 0 \
-        "Data Management v3 completed successfully"
+        "Data Management v3.1 completed successfully"
 }
 
 
