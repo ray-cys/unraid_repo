@@ -4,7 +4,7 @@ noParity=true
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.18.0"
+readonly SCRIPT_VERSION="2.18.1"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -15,7 +15,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.18.0
+# Disk Health Monitor for Unraid v2.18.1
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
@@ -49,6 +49,7 @@ fi
 # v2.17.0 removes legacy tables and advisory rankings from notifications.
 # v2.18.0 ships monitoring separately from its regression suite and keeps
 # calendar age and planned maintenance in the run log.
+# v2.18.1 reads full SMART identity responses before parsing model names.
 ################################################################################
 # ---------------- Configuration ----------------
 # Disks health script settings. Tuned for performance and reliability.
@@ -3989,19 +3990,24 @@ select_latest_long_selftest_line() {
 # === Helper Function ===
 # Return device model string using smartctl (cached when possible)
 get_device_model() {
-    local d
+    local d identity
     d=$(base_device "$1")
     [[ -z "$d" ]] && echo "" && return 0
     # Model lookup uses smartctl and can wake a SATA HDD. Defer it along with
     # the rest of SMART collection when this run intentionally kept it asleep.
     [[ -n "${SMART_DEFERRED[$d]:-}" ]] && echo "" && return 0
     if [[ "$d" == /dev/nvme* ]]; then
-        smartctl_cached -i -d nvme "$d" 2>/dev/null |
-            awk -F: '/Model Number/ {sub(/^ +/,"",$2); print $2; exit}'
+        identity=$(smartctl_cached -i -d nvme "$d" 2>/dev/null) || return
     else
-        smartctl_cached -i "$d" 2>/dev/null |
-            awk -F: '/Device Model|Model Family/ {sub(/^ +/,"",$2); print $2; exit}'
+        identity=$(smartctl_cached -i "$d" 2>/dev/null) || return
     fi
+    # Let smartctl finish before parsing so a short read cannot turn into
+    # SIGPIPE and a spurious collector failure.
+    awk '
+        /^(Model Number|Device Model):/ && !model {sub(/^[^:]+:[[:space:]]*/, ""); model=$0}
+        /^Model Family:/ && !family {sub(/^[^:]+:[[:space:]]*/, ""); family=$0}
+        END {if (model) print model; else if (family) print family}
+    ' <<< "$identity"
 }
 
 # === Helper Function ===
@@ -6123,13 +6129,8 @@ run_smart_test() {
         fi
     fi
     # Determine model/vendor and apply hardcoded pattern expansion
-    local model_raw=""
-    if [[ $disk == /dev/nvme* ]]; then
-        model_raw=$(smartctl_bounded -i -d nvme "$disk" 2>/dev/null | awk -F: '/^Model Number/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
-    else
-        model_raw=$(smartctl_bounded -i "$disk" 2>/dev/null | awk -F: '/Device Model/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
-        [[ -z "$model_raw" ]] && model_raw=$(smartctl_bounded -i "$disk" 2>/dev/null | awk -F: '/Model Family/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
-    fi
+    local model_raw
+    model_raw=$(get_device_model "$disk") || model_raw=""
     # Include generic "Extended" to cover NVMe long tests as well as SATA variants
     local patterns=("Extended" "Extended offline" "Extended self-test" "Long")
     if echo "$model_raw" | grep -qi 'ultrastar' && echo "$model_raw" | grep -qi 'wd\|western'; then
@@ -6421,12 +6422,10 @@ check_completed_long_tests() {
         if [[ $disk == /dev/nvme* ]]; then
             log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART self-test log read (-l selftest) on $disk"
             out=$(smartctl_bounded -l selftest -d nvme "$disk" 2>/dev/null || true)
-            model_raw=$(smartctl_bounded -i -d nvme "$disk" 2>/dev/null | awk -F: '/^Model Number/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
         else
             out=$(smartctl_bounded -l selftest "$disk" 2>/dev/null || true)
-            model_raw=$(smartctl_bounded -i "$disk" 2>/dev/null | awk -F: '/Device Model/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
-            [[ -z "$model_raw" ]] && model_raw=$(smartctl_bounded -i "$disk" 2>/dev/null | awk -F: '/Model Family/ {sub(/^[ \t]+/,"",$2); print $2; exit}')
         fi
+        model_raw=$(get_device_model "$disk") || model_raw=""
         # Build unified long-test pattern list (include generic "Extended" for NVMe devices)
         local patterns=("Extended" "Extended offline" "Extended self-test" "Long" "Extended-Offline" "Long offline" "Offline")
         if echo "$model_raw" | grep -qi 'ultrastar' && echo "$model_raw" | grep -qi 'wd\|western'; then

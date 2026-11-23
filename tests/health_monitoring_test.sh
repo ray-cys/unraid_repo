@@ -7,7 +7,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../user_script/health_monitoring.sh
 source "$REPO_ROOT/user_script/health_monitoring.sh"
 
-readonly REGRESSION_FIXTURE_COUNT=106
+readonly REGRESSION_FIXTURE_COUNT=107
 
 self_test_result() {
     local passed="$1" name="$2" detail="${3:-}"
@@ -1079,6 +1079,20 @@ run_regression_tests() (
         self_test_result 1 "Drive age is advisory while actual overheating stays critical"
     else
         self_test_result 0 "Drive age is advisory while actual overheating stays critical"
+    fi
+
+    if (
+        smartctl_cached() {
+            printf '%s\n' 'Model Family: Generic array' 'Device Model: Fixture Storage'
+            printf '%131072s\n' end || return 141
+        }
+        local model=""
+        model=$(get_device_model /dev/sdz) &&
+            [[ "$model" == 'Fixture Storage' ]]
+    ); then
+        self_test_result 1 "SMART model parsing reads full output and prefers the exact model"
+    else
+        self_test_result 0 "SMART model parsing reads full output and prefers the exact model"
     fi
 
     local nvme_fixture nvme_ext_fixture
