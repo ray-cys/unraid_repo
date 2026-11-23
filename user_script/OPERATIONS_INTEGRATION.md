@@ -101,26 +101,29 @@ Native start/finish/runtime evidence and an unchanged log after stopping protect
 active jobs. No container image/env/schedule is recreated. Archive growth remains
 visible to existing capacity monitoring and appdata backups.
 
-Kometa preflight moves absent exact-ID definitions from the two MetaFusion metadata
-files into `/config/.preflight/*.deferred.yml`. A complete Plex GUID inventory is
-required; matching-title identity ambiguity stays active for review. Definitions
-return when their exact target ID returns. Fresh generated definitions take
-precedence over stale deferred aliases. Original files have five retained backup
-sets, and the deferred catalogue is never expired. A durable catalogue superset is published before active definitions are removed; restored definitions are published durably before catalogue compaction. The mutating Python process has its own inside-container timeout. Plex items/files, Arr download
-policy and identifiers are unchanged.
+Kometa preflight v2 delegates generated metadata reconciliation to MetaFusion.
+Develop images advertise capability version 1 and the artwork byte ceiling in
+native status. MetaFusion imports the legacy deferred catalogues without removing
+them, tracks owned definitions, protects incomplete inventories/manual entries,
+and publishes through its validated writer. Reconciliation runs during successful
+untargeted incremental jobs as well as full jobs. Native counts/actions appear in
+runtime metrics; preflight groups successful deferral/restoration results once.
 
-Resolution overlays use supported native regex filters instead of requiring Plex
-to advertise an otherwise valid empty resolution class. Movies/episodes filter
-directly; shows/seasons explicitly require one matching child episode, preserving
-the old search semantics instead of changing to the default 50% filter threshold.
-No overlays are disabled and general validation is not switched off. Existing
-warnings remain until the next normal application run proves a clean result.
+Both producers and the resident Kometa coordinator use the same
+`<Kometa root>/.metafusion/output.lock`. The consumer launcher replaces Kometa's
+internal scheduler, retaining four-hour local boundaries and `--run` children.
+Preflight requires a fresh coordinator receipt and the same exclusive lock; an
+old image, busy producer/consumer or missing coordinator cannot trigger YAML edits.
+The wrapper only maintains recognised personal resolution-overlay filters and
+explicit inherited TMDb collection order. It never rewrites generated metadata
+files or the native deferred catalogue. Original personal-file backups retain
+five sets. No overlays are disabled or general validation switched off.
 
-Preflight v1.1 also gives the native TMDb dynamic-collection template an explicit
-copy of the effective `default_collection_order`. This avoids a warning for each
-generated collection while preserving its inherited order, native two-item
-minimum, membership, exclusions and sync policy. Existing custom templates are
-left alone; an edited managed template stops reconciliation for review.
+The native launcher lives in MetaFusion's `tools/kometa_coordinator.py` and is
+installed in Kometa's mounted `.metafusion/` directory. Its entrypoint override
+must also be retained in the Unraid template for future container updates. Keep
+only one Kometa scheduler. Native coordination details and migration rules are
+in MetaFusion's `docs/runtime-safeguards.md`.
 
 Application warnings need their underlying evidence checked before remediation:
 

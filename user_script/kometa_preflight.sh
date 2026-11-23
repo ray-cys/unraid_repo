@@ -1,13 +1,13 @@
 #!/bin/bash
 # shellcheck disable=SC2034
 arrayStarted=true
-# Kometa configuration reconciliation v1.1. Schedule 55 3,7,11,15,19,23 * * *.
-# Run after MetaFusion and before the four-hour Kometa boundaries. Never changes
-# Plex/Arr media, identity, monitoring or download policy. Missing exact-ID
-# metadata is retained in a deferred catalogue and restored when Plex has it.
+# Kometa configuration reconciliation v2.0. Schedule 55 3,7,11,15,19,23 * * *.
+# Run after MetaFusion and before the four-hour Kometa boundaries. MetaFusion
+# owns generated metadata; this wrapper only maintains personal overlay and
+# collection templates, under the shared producer/consumer output lock.
 # Incomplete Plex identity inventories/active producers prohibit edits.
 set -uo pipefail
-readonly SCRIPT_VERSION="1.1"
+readonly SCRIPT_VERSION="2.0"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/kometa_preflight}"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 NOTIFY_BIN="${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}"
@@ -18,7 +18,7 @@ main() {
         platform_version=$(sed -n 's/^version="\([^"]*\)"/\1/p' "${UNRAID_VERSION_FILE:-/etc/unraid-version}")
         [[ "$platform_version" == 7.* ]] || { printf 'Unvalidated Unraid %s; maintenance/config mutations deferred.\n' "$platform_version"; return 0; }
     fi
-    local rc=0 temp status summary changed previous='' signature
+    local rc=0 temp status summary changed previous='' signature native_report
     mountpoint -q /mnt/vault || return 1
     mkdir -p "$STATE_DIR" "$STATUS_DIR" || return 1
     exec 9>"$STATE_DIR/preflight.lock"; flock -n 9 || return 0
@@ -26,15 +26,19 @@ main() {
     exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}"; flock -s -n "$export_fd" || return 0
     # Never compete with an active or unobservable MetaFusion producer.
     if ! timeout 8 docker exec metafusion cat /tmp/metafusion-status.json | jq -e '.state=="idle"' >/dev/null; then printf 'MetaFusion is active/unverified; configuration edits deferred.\n'; return 0; fi
+    if ! timeout 8 docker exec metafusion cat /tmp/metafusion-status.json | jq -e '.capabilities.kometa_metadata_reconciliation==1 and .capabilities.kometa_output_lock==1' >/dev/null; then
+        printf 'Native MetaFusion reconciliation capability unavailable; upgrade develop image before enabling preflight v2. No YAML files changed.\n'; return 0
+    fi
+    native_report=$(timeout 8 docker exec metafusion cat /tmp/metafusion-status.json | jq -c '{finished:.last_run_finished,status:.last_run_status,result:(.metrics.kometa_reconciliation // {})} | .result.actions=((.result.actions // [])[:10])') || return 1
     temp=$(mktemp "$STATE_DIR/.result.XXXXXX") || return 1
-    timeout --signal=TERM --kill-after=5 180 docker exec -i kometa timeout --signal=TERM --kill-after=5 165 python3 - >"$temp" <<'PY'
+    timeout --signal=TERM --kill-after=5 180 docker exec -i -e "NATIVE_RECONCILIATION=$native_report" kometa timeout --signal=TERM --kill-after=5 165 python3 - >"$temp" <<'PY'
 import json, os, re, stat, sys, time
 from pathlib import Path
 import yaml
-from plexapi.server import PlexServer
+import fcntl
 root=Path(os.environ.get('KOMETA_CONFIG_ROOT','/config')); state=root/'.preflight'; state.mkdir(mode=0o700,exist_ok=True)
 class SafetyError(Exception): pass
-changes=[]; deferred_count=restored_count=0
+changes=[]
 try:
     log=root/'logs/meta.log'
     active=None
@@ -47,58 +51,16 @@ try:
         print(json.dumps({'status':'DEFERRED','summary':'Kometa run active or native completion evidence unavailable; files unchanged','changed':False})); sys.exit(0)
     cfg=yaml.safe_load((root/'config.yml').read_text())
     if not isinstance(cfg,dict) or not isinstance(cfg.get('libraries'),dict):raise SafetyError('Unsupported Kometa configuration')
+    # Producer and consumer participate in this same inode lock. Atomic file
+    # writes alone do not prevent Kometa reading multiple generations in a run.
+    native=json.loads((root/'.metafusion/kometa-coordinator.json').read_text())
+    if native.get('schema')!=1 or not 0<=time.time()-native.get('epoch',0)<90:
+        raise SafetyError('Coordinated Kometa launcher missing/stale; no configuration edits')
+    output_lock=(root/'.metafusion/output.lock').open('a+')
+    try:fcntl.flock(output_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(json.dumps({'status':'DEFERRED','summary':'MetaFusion/Kometa owns shared output lock; no edits','changed':False}));sys.exit(0)
     staged=[]
-    for library, file_name, provider in [('Movies','movie_metadata.yml','tmdb'),('TV Shows','tv_metadata.yml','tvdb')]:
-        local=cfg['libraries'].get(library)
-        if not isinstance(local,dict):raise SafetyError('Configured library identity unavailable: '+library)
-        creds=dict(cfg.get('plex') or {});creds.update(local.get('plex') or {})
-        server=PlexServer(creds['url'],creds['token'],timeout=30)
-        section=server.library.section(library)
-        items=section.all(includeGuids=True)
-        if not items:raise SafetyError('Empty Plex library inventory; metadata preserved')
-        ids=set(); titles=set(); complete=True
-        for item in items:
-            titles.add(re.sub(r'\W+','',item.title).casefold())
-            found=[]
-            for guid in getattr(item,'guids',[]) or []:
-                m=re.fullmatch(provider+r'://(\d+)',guid.id)
-                if m:found.append(m.group(1))
-            if not found:complete=False
-            ids.update(found)
-        # An incomplete external-ID inventory cannot prove absence. A matching
-        # title is also an identity ambiguity, never permission to discard it.
-        if not complete:raise SafetyError('Incomplete '+provider+' Plex GUID inventory; no metadata reconciliation')
-        path=root/'metadata'/file_name; old=path.read_bytes(); data=yaml.safe_load(old) or {}
-        entries=data.get('metadata')
-        if not isinstance(entries,dict):raise SafetyError('Unsupported metadata file schema')
-        catalogue=state/(file_name+'.deferred.yml')
-        old_catalogue=catalogue.read_bytes() if catalogue.exists() else b''
-        pending=yaml.safe_load(old_catalogue) or {}
-        if not isinstance(pending,dict):raise SafetyError('Invalid deferred catalogue preserved')
-        combined=dict(pending);combined.update(entries); active_entries={};next_pending={}
-        def identity_of(name,value):
-            if not isinstance(value,dict):return None
-            return str((value.get('match') or {}).get('mapping_id',value.get('mapping_id',name)))
-        fresh_ids={identity_of(k,v) for k,v in entries.items()}
-        latest_by_id={identity_of(k,v):k for k,v in combined.items()}
-        for name,value in combined.items():
-            if not isinstance(value,dict):active_entries[name]=value;continue
-            identity=(value.get('match') or {}).get('mapping_id',value.get('mapping_id',name))
-            if name not in entries and (str(identity) in fresh_ids or latest_by_id.get(str(identity))!=name):
-                next_pending[name]=value;continue
-            if not str(identity).isdigit():active_entries[name]=value;continue
-            if str(identity) in ids:
-                active_entries[name]=value
-                if name in pending and name not in entries:restored_count+=1;changes.append('Restored metadata: '+str(name))
-            elif re.sub(r'\W+','',str(name).split(' (')[0]).casefold() in titles:
-                active_entries[name]=value
-            else:
-                next_pending[name]=value
-                if name in entries:deferred_count+=1;changes.append('Deferred absent '+provider+' '+str(identity)+': '+str(name))
-        if active_entries!=entries or next_pending!=pending:
-            data['metadata']=active_entries
-            staged.extend([(path,old,yaml.safe_dump(data,sort_keys=False,allow_unicode=True).encode()),
-                           (catalogue,old_catalogue,yaml.safe_dump(next_pending,sort_keys=False,allow_unicode=True).encode())])
     # Native per-item regex filters allow a legitimate empty resolution class.
     # Keep builder validation elsewhere and preserve all configured overlays.
     overlay=root/'overlays/media_info.yml'; old=overlay.read_bytes(); data=yaml.safe_load(old)
@@ -184,28 +146,24 @@ try:
             directory=os.open(path.parent,os.O_RDONLY)
             try:os.fsync(directory)
             finally:os.close(directory)
-        unions={}
         for path,old,new in staged:
-            if path.parent==state:
-                merged=dict(yaml.safe_load(old) or {});merged.update(yaml.safe_load(new) or {})
-                union=yaml.safe_dump(merged,sort_keys=False,allow_unicode=True).encode()
-                tmp=path.with_name('.'+path.name+'.preflight-union');tmp.write_bytes(union);os.chmod(tmp,0o600)
-                if (path.read_bytes() if path.exists() else b'')!=old:raise SafetyError('Concurrent catalogue change; originals retained')
-                publish_file(tmp,path);unions[path]=union
-        for path,old,new in staged:
-            if path.parent==state:continue
             if (path.read_bytes() if path.exists() else b'')!=old:raise SafetyError('Concurrent write detected; prepared originals retained')
-            publish_file(path.with_name('.'+path.name+'.preflight-new'),path)
-        for path,old,new in staged:
-            if path.parent!=state:continue
-            if path.read_bytes()!=unions[path]:raise SafetyError('Concurrent catalogue change; superset retained')
             publish_file(path.with_name('.'+path.name+'.preflight-new'),path)
         # Keep five original-file sets; the deferred catalogue is never pruned.
         import shutil
         for old_dir in sorted((state/'backups').iterdir(),reverse=True)[5:]:
             if old_dir.is_dir() and re.fullmatch(r'\d{8}_\d{6}(?:_\d+)?',old_dir.name):shutil.rmtree(old_dir)
-    summary=f'Metadata deferred={deferred_count}, restored={restored_count}; changed files={len(staged)}. Deferred definitions preserved for future exact-ID restoration. Plex, media and Arr settings unchanged.'
-    print(json.dumps({'status':'OK','summary':summary,'changed':bool(staged),'actions':changes[:20]}))
+    summary=f'Native MetaFusion owns metadata reconciliation; wrapper changed {len(staged)} personal configuration file(s). Shared producer/consumer lock verified. Plex, media and Arr settings unchanged.'
+    reported=json.loads(os.environ.get('NATIVE_RECONCILIATION','{}'))
+    reconciliation=reported.get('result') or {}
+    native_changed=False
+    if reported.get('status')=='success' and reconciliation.get('status')=='ok':
+        deferred=reconciliation.get('deferred',0);restored=reconciliation.get('restored',0);imported=reconciliation.get('imported',0)
+        summary+=f' Native run {reported.get("finished")}: deferred={deferred}, restored={restored}, legacy imported={imported}.'
+        native_changed=bool(deferred or restored or imported)
+        changes.extend(reconciliation.get('actions') or [])
+
+    print(json.dumps({'status':'OK','summary':summary,'changed':bool(staged) or native_changed,'actions':changes[:20]}))
 except Exception as error:
     # Exception text from HTTP clients can contain URLs/tokens: never echo it.
     print(json.dumps({'status':'FAILED','summary':'Preflight stopped: '+(str(error) if isinstance(error,SafetyError) else type(error).__name__)+'; existing files/backups retained.','changed':False}));sys.exit(1)
