@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.14.0
+# ARR Health / Download / Import Monitor v3.15.0
 #
 # PURPOSE
 # -------
@@ -548,6 +548,11 @@ SAB_ORPHAN_IGNORE_HOURS=6
 # Active queue/API health remains on every run; read-only residue inventories
 # run hourly. A planned interval skip preserves prior filesystem issues.
 SAB_FILESYSTEM_SCAN_INTERVAL_MINUTES=60
+# Resume an hourly audit in small slices on subsequent five-minute runs.
+# Unchecked/failed paths never count as proof that a prior issue recovered.
+SAB_FILESYSTEM_BATCH_ITEMS=20
+SAB_FILESYSTEM_BATCH_SECONDS=15
+SAB_FILESYSTEM_PATH_TIMEOUT_SECONDS=5
 DOWNLOAD_LEDGER_FULL_REPLAY_HOURS=24
 
 # Full media still present.
@@ -6701,7 +6706,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.14.0 lifecycle commands' \
+        'ARR Health Monitor v3.15.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -6887,7 +6892,8 @@ source_can_resolve() {
                     [ "$SAB_HISTORY_OK" = true ] &&
                     [ "$SONARR_QUEUE_OK" = true ] &&
                     [ "$RADARR_QUEUE_OK" = true ] &&
-                    [ "$SAB_FILESYSTEM_SCAN_OK" = true ]
+                    [ "$SAB_FILESYSTEM_SCAN_OK" = true ] &&
+                    grep -Fxq -- "$issue_key" "${TMP_DIR}/sab-filesystem-checked-keys"
                     ;;
             esac
             ;;
@@ -7316,14 +7322,26 @@ send_notification_page() {
 
     body+=$'\n'
 
-    while IFS= read -r record; do
-
-        [ -n "$record" ] || continue
-
-        entry=$(notification_record_text "$record")
-        body+="$entry"$'\n\n'
-
-    done <"$page_file"
+    # Presentation groups only: never combine identity, acknowledgement,
+    # resolution, or per-record delivery state merely because titles match.
+    local group_file="${TMP_DIR}/notification-groups.jsonl" group count member
+    jq -sc 'group_by([.source,.title,.classification,.severity,.event]) | .[]' "$page_file" >"$group_file" || return 1
+    while IFS= read -r group; do
+        count=$(jq 'length' <<<"$group")
+        if (( count > 1 )); then
+            body+="$(jq -r '.[0] | "- ["+.source+"] "+.title+"\n  "+.classification+" ["+.severity+"] ["+(.event // "new")+"]"' <<<"$group")"$'\n'
+            body+="  Related records: $count. Each download retains its own lifecycle and Ack ID."$'\n'
+            while IFS= read -r member; do
+                entry=$(notification_record_text "$member")
+                body+="$(printf '%s\n' "$entry" | tail -n +3)"$'\n'
+            done < <(jq -c '.[]' <<<"$group")
+            body+=$'\n'
+        else
+            record=$(jq -c '.[0]' <<<"$group")
+            entry=$(notification_record_text "$record")
+            body+="$entry"$'\n\n'
+        fi
+    done <"$group_file"
 
     body+="Monitor schedule: every five minutes recommended"$'\n'
     body+="Runtime: $(runtime)"
@@ -7400,7 +7418,8 @@ send_grouped_notification() {
             ),
             (.source // ""),
             (.title // ""),
-            (.classification // "")
+            (.classification // ""),
+            (.event // "new")
         )
         | .[]
         ' "$NOTIFICATION_BATCH" >"$sorted_file" || return 1
@@ -7413,7 +7432,7 @@ send_grouped_notification() {
         [ -n "$record" ] || continue
 
         entry=$(notification_record_text "$record")
-        entry_bytes=$(notification_text_bytes "$entry")
+        entry_bytes=$(( $(notification_text_bytes "$entry") + 512 ))
 
         if (( current_items > 0 )) &&
            { (( current_items >= GROUP_NOTIFICATION_MAX_ITEMS )) ||
@@ -10217,14 +10236,21 @@ analyze_sab_path() {
     local size
     local lower
     local base
+    local listing
+    listing=$(mktemp "${TMP_DIR}/sab-path.XXXXXX") || return 1
+    # One bounded traversal supplies names AND sizes. No per-file stat process,
+    # no following symlinks, and no partial enumeration interpreted as recovery.
+    if ! timeout -k 1 "$SAB_FILESYSTEM_PATH_TIMEOUT_SECONDS" \
+        find "$path" -type f -printf '%s\0%p\0' >"$listing" 2>/dev/null; then
+        rm -f -- "$listing"
+        return 1
+    fi
 
     ###########################################################################
     # FILE ITERATOR
     ###########################################################################
 
-    while IFS= read -r -d '' file; do
-
-        size=$(stat -c '%s' "$file" 2>/dev/null || echo 0)
+    while IFS= read -r -d '' size && IFS= read -r -d '' file; do
 
         if ! [[ "$size" =~ ^[0-9]+$ ]]; then
             size=0
@@ -10340,20 +10366,8 @@ analyze_sab_path() {
         ((other_files++)) || true
         ((other_bytes += size)) || true
 
-    done < <(
-
-        if [ -f "$path" ]; then
-
-            printf '%s\0' "$path"
-
-        elif [ -d "$path" ]; then
-
-            find "$path" \
-                -type f \
-                -print0 2>/dev/null
-
-        fi
-    )
+    done <"$listing"
+    rm -f -- "$listing"
 
     ###########################################################################
     # RETURN JSON
@@ -10553,6 +10567,10 @@ sab_leftover_reason() {
 # PROCESS SAB CROSS-APP ISSUES - v2.2
 ###############################################################################
 
+mark_sab_filesystem_checked() {
+    printf 'SAB:%s\nSABnzbd:policy-cleanup:%s\n' "$1" "${1,,}" >>"${TMP_DIR}/sab-filesystem-checked-keys"
+}
+
 process_sab_orphans() {
 
     [ "$SAB_ENABLED" = true ] || return
@@ -10570,16 +10588,27 @@ process_sab_orphans() {
 
     prepare_sab_history_index || return 1
     local fs_candidates="${TMP_DIR}/sab-filesystem-candidates.jsonl"
+    local fs_cursor fs_started=$SECONDS fs_last="" fs_total fs_processed=0
+    fs_cursor=$(jq -r '.monitor.sabFilesystemCursor // ""' "$STATE_FILE") || return 1
+    : >"${TMP_DIR}/sab-filesystem-checked-keys"
     jq -c --arg movie "${SAB_MOVIE_CATEGORY,,}" --arg tv "${SAB_TV_CATEGORY,,}" \
       --argjson cutoff "$((START_TIME-SAB_ORPHAN_IGNORE_HOURS*3600))" '
       .[] | select((.status // "" | ascii_downcase)=="completed")
       | select((.category // .cat // "" | ascii_downcase) as $cat | $cat==$movie or $cat==$tv)
       | select(.auditEpoch<=0 or .auditEpoch <= $cutoff)
-    ' "${TMP_DIR}/sab-normalized-history.json" >"$fs_candidates" || return 1
+      | . + {auditKey:(.nzo_id // ((.category // .cat // "")+":"+(.name // .nzb_name // "")))}
+    ' "${TMP_DIR}/sab-normalized-history.json" >"$fs_candidates.all" || return 1
+    jq -sc --arg cursor "$fs_cursor" 'sort_by(.auditKey) | .[] | select(.auditKey>$cursor)' \
+      "$fs_candidates.all" >"$fs_candidates" || return 1
+    fs_total=$(wc -l <"$fs_candidates")
+    head -n "$SAB_FILESYSTEM_BATCH_ITEMS" "$fs_candidates" >"$fs_candidates.batch"
     while IFS= read -r item; do
 
         [ -n "$item" ] || continue
+        if (( fs_processed > 0 && SECONDS-fs_started >= SAB_FILESYSTEM_BATCH_SECONDS )); then break; fi
         runtime_budget_allows_optional_phase "sab-filesystem-batch" || return 1
+        fs_last=$(jq -r '.auditKey' <<<"$item") || return 1
+        ((fs_processed++)) || true
 
         local status
         local category
@@ -10681,7 +10710,7 @@ process_sab_orphans() {
         if [ -n "$nzo_id" ] &&
            arr_tracks_download "$owner" "$nzo_id"
         then
-
+            mark_sab_filesystem_checked "$fs_last"
             continue
         fi
 
@@ -10701,10 +10730,10 @@ process_sab_orphans() {
         # This is normally a successful Arr import.
         #
 
-        if [ -z "$completed_path" ] ||
-           [ ! -e "$completed_path" ]
-        then
-
+        # An unresolved path is not proof of absence. Preserve prior issues.
+        if [ -z "$completed_path" ]; then continue; fi
+        if [ ! -e "$completed_path" ]; then
+            mark_sab_filesystem_checked "$fs_last"
             continue
         fi
 
@@ -10712,6 +10741,7 @@ process_sab_orphans() {
         # not a missing import. Keep exact SAB identity binding; warn if the
         # cleanup deadline passes instead of suppressing a stuck cleanup forever.
         if policy_disposition_matches "$owner" "$nzo_id" "$item"; then
+            mark_sab_filesystem_checked "$fs_last"
             if (( age >= POLICY_CLEANUP_EXPECTED_HOURS )); then
                 record_normalized_issue "SABnzbd:policy-cleanup:${nzo_id,,}" SABnzbd "$name" \
                   SAB_STRANDED_POLICY_CLEANUP WARNING waiting \
@@ -10729,8 +10759,12 @@ process_sab_orphans() {
 
         local stats
 
-        stats=$(analyze_sab_path "$completed_path")
+        if ! stats=$(analyze_sab_path "$completed_path"); then
+            log "WARNING: SAB path audit incomplete or timed out; prior filesystem issues preserved: $completed_path"
+            return 1
+        fi
 
+        mark_sab_filesystem_checked "$fs_last"
         local total_files
         local total_bytes
 
@@ -10745,19 +10779,11 @@ process_sab_orphans() {
         local other_files
         local other_bytes
 
-        total_files=$(echo "$stats" | jq -r '.totalFiles')
-        total_bytes=$(echo "$stats" | jq -r '.totalBytes')
+        IFS=$'\t' read -r total_files total_bytes media_files media_bytes sample_files \
+            archive_files repair_files metadata_files other_files other_bytes < <(
+            jq -r '[.totalFiles,.totalBytes,.mediaFiles,.mediaBytes,.sampleFiles,
+              .archiveFiles,.repairFiles,.metadataFiles,.otherFiles,.otherBytes] | @tsv' <<<"$stats")
 
-        media_files=$(echo "$stats" | jq -r '.mediaFiles')
-        media_bytes=$(echo "$stats" | jq -r '.mediaBytes')
-
-        sample_files=$(echo "$stats" | jq -r '.sampleFiles')
-        archive_files=$(echo "$stats" | jq -r '.archiveFiles')
-        repair_files=$(echo "$stats" | jq -r '.repairFiles')
-        metadata_files=$(echo "$stats" | jq -r '.metadataFiles')
-
-        other_files=$(echo "$stats" | jq -r '.otherFiles')
-        other_bytes=$(echo "$stats" | jq -r '.otherBytes')
 
         #######################################################################
         # EMPTY
@@ -11032,11 +11058,18 @@ process_sab_orphans() {
             debug_log "Notification suppressed: stranded issue already reported"
         fi
 
-    done <"$fs_candidates"
+    done <"$fs_candidates.batch"
+    local fs_state="${TMP_DIR}/state.fs-progress.json"
+    # End-of-pass means all records after the previous cursor were inspected.
+    # New/changed records sorting before it are picked up on the next hourly pass.
+    if (( fs_processed >= fs_total )); then
+        fs_last=""
+    fi
+    jq --arg cursor "$fs_last" '.monitor.sabFilesystemCursor=$cursor' "$STATE_FILE" >"$fs_state" && save_state "$fs_state" || return 1
+    log "SAB filesystem slice: checked=$fs_processed remaining=$((fs_total-fs_processed)); unchecked issues preserved"
 }
 
 carry_deferred_filesystem_issue_counts() {
-    [[ "$SAB_FILESYSTEM_SCAN_OK" != true ]] || return 0
     local counts info warning error
     counts=$(jq -r --rawfile seen "$SEEN_ISSUES_FILE" '
       ($seen|split("\n")) as $seen
@@ -11056,7 +11089,9 @@ sab_filesystem_scan_due() {
     local last
     last=$(jq -r '.monitor.sabFilesystemLastSuccessfulAt // 0' "$STATE_FILE")
     [[ "$last" =~ ^[0-9]+$ ]] || last=0
-    (( last<=0 || START_TIME-last >= SAB_FILESYSTEM_SCAN_INTERVAL_MINUTES*60 ))
+    local cursor
+    cursor=$(jq -r '.monitor.sabFilesystemCursor // ""' "$STATE_FILE")
+    [[ -n "$cursor" ]] || (( last<=0 || START_TIME-last >= SAB_FILESYSTEM_SCAN_INTERVAL_MINUTES*60 ))
 }
 
 prepare_sab_filesystem_scan() {
@@ -16414,7 +16449,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.14.0"
+    "START | ARR Health Monitor v3.15.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -16427,7 +16462,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.14.0"
+debug_log "Starting ARR Health Monitor v3.15.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -16933,7 +16968,8 @@ if sab_filesystem_scan_due; then
     prepare_sab_filesystem_scan || true
     if ! process_sab_orphans; then SAB_FILESYSTEM_SCAN_OK=false; fi
     if [ "$SAB_FILESYSTEM_SCAN_OK" = true ] && [ "$SAB_HISTORY_OK" = true ] &&
-       [ "$SONARR_QUEUE_OK" = true ] && [ "$RADARR_QUEUE_OK" = true ]; then
+       [ "$SONARR_QUEUE_OK" = true ] && [ "$RADARR_QUEUE_OK" = true ] &&
+       [ -z "$(jq -r '.monitor.sabFilesystemCursor // ""' "$STATE_FILE")" ]; then
         fs_cursor_tmp="${TMP_DIR}/state.filesystem-cursor.json"
         jq --argjson now "$START_TIME" '.monitor.sabFilesystemLastSuccessfulAt=$now' "$STATE_FILE" >"$fs_cursor_tmp" && save_state "$fs_cursor_tmp"
     fi
@@ -17046,7 +17082,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.14.0 completed"
+log "ARR Health Monitor v3.15.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""

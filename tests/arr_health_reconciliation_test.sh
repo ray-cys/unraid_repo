@@ -103,7 +103,7 @@ for app in Sonarr Radarr; do
     jq -n --arg app "$app" --argjson now "$START_TIME" '{downloadLedger:{id:{id:"id",app:$app,flowEnrolled:true,sabQueuedAt:1000,sabQueueLastSeen:1000,reconciliationLastScanOk:true,reconciliationLastCheckedAt:$now}}}' >"$STATE_FILE"
     : >"$test_root/classifications"
     process_download_ledger_issues
-    rg -q "$app"$'\tDOWNLOAD_FLOW_REVIEW_REQUIRED\tWARNING' "$test_root/classifications"
+    grep -q "$app"$'\tDOWNLOAD_FLOW_REVIEW_REQUIRED\tWARNING' "$test_root/classifications"
     printf 'id\n' >"$SAB_PRIMARY_DOWNLOADS_FILE"
     : >"$test_root/classifications"
     process_download_ledger_issues
@@ -112,6 +112,6 @@ for app in Sonarr Radarr; do
     jq '.downloadLedger.id.sabCompletedAt=1000' "$STATE_FILE" >"$test_root/edit.json"
     cp "$test_root/edit.json" "$STATE_FILE"
     process_download_ledger_issues
-    rg -q 'DOWNLOAD_FLOW_IMPORT_MISSING'$'\tERROR' "$test_root/classifications"
+    grep -q 'DOWNLOAD_FLOW_IMPORT_MISSING'$'\tERROR' "$test_root/classifications"
 done
 printf 'Shared Sonarr/Radarr/SAB classifier integration tests passed\n'

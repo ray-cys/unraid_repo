@@ -41,6 +41,7 @@
 ###############################################################################
 
 set -uo pipefail
+readonly SCRIPT_VERSION="1.1"
 
 
 ###############################################################################
@@ -61,7 +62,12 @@ SYSLOG_FILE="/var/log/syslog"
 #   failed
 #   failure
 #
-ERROR_REGEX="corrupt|error|fail|tainted"
+ERROR_REGEX="corrupt|error|fail|tainted|out of memory|oom-kill|invoked oom-killer|killed process|blocked for more than|soft lockup|hard lockup|NETDEV WATCHDOG|transmit queue.*timed out|reset adapter|resetting (chip|adapter)"
+# Event deduplication; repeats after this interval are reminders, not new faults.
+# Silence is not proof of recovery from an OOM or hardware fault.
+INCIDENT_REMINDER_SECONDS=86400
+INCIDENT_RETENTION_SECONDS=604800
+INCIDENT_MAX_ENTRIES=2000
 
 
 # ---------------------------------------------------------------------------
@@ -200,17 +206,6 @@ TEMP_FILES=()
 ###############################################################################
 # LOCKING
 ###############################################################################
-
-exec 9>"$LOCK_FILE"
-
-if ! flock -n 9; then
-    printf '%s %s\n' \
-        "$(date '+%Y-%m-%d %H:%M:%S')" \
-        "Another syslog_notification.sh run is active, exiting (lock: $LOCK_FILE)"
-
-    exit 1
-fi
-
 
 ###############################################################################
 # GENERIC HELPERS
@@ -697,13 +692,23 @@ filter_matching_errors() {
     local chunk_file="$1"
     local match_file="$2"
 
-    local line=""
-
+    local line="" scrubbed key now previous
+    now=$(date +%s)
+    INCIDENT_NEXT="${STATE_DIR}/incidents.pending"
+    local history="${STATE_DIR}/incidents.tsv"
+    : >"$INCIDENT_NEXT"
+    if [ -f "$history" ]; then
+        awk -F '\t' -v cutoff="$((now-INCIDENT_RETENTION_SECONDS))" '$2>=cutoff' "$history" | tail -n "$INCIDENT_MAX_ENTRIES" >"$INCIDENT_NEXT"
+    fi
     : >"$match_file"
 
     while IFS= read -r line; do
         [ -n "$line" ] || continue
 
+        # Remove only explicit zero-valued counters, then re-evaluate. An OOM
+        # on a line also containing failures=0 must still alert.
+        scrubbed=$(printf '%s\n' "$line" | sed -E 's/(errors?|failures?|failed)[=:][[:space:]]*0([^0-9]|$)/ /gI')
+        printf '%s\n' "$scrubbed" | grep -Eiq "$ERROR_REGEX" || continue
         if is_ignored_line "$line"; then
             if [ "$LOG_IGNORED_LINES" = "true" ]; then
                 log "SYSLOG" "INFO" \
@@ -713,8 +718,12 @@ filter_matching_errors() {
             continue
         fi
 
-        printf '%s\n' "$line" \
-            >>"$match_file"
+        key=$(printf '%s\n' "$line" | sed -E \
+          's/^[A-Z][a-z]{2} +[0-9]+ [0-9:]+ [^ ]+ //; s/^[0-9]{4}-[0-9T:.+-]+ [^ ]+ //; s/\[[0-9]+\]/[PID]/g; s/Killed process [0-9]+/Killed process PID/g; s/task [^ ]+:[0-9]+/task PROCESS:PID/g' | sha256sum | awk '{print $1}')
+        previous=$(awk -F '\t' -v key="$key" '$1==key {v=$2} END {print v+0}' "$INCIDENT_NEXT")
+        if (( previous>0 && now-previous<INCIDENT_REMINDER_SECONDS )); then continue; fi
+        printf '%s\t%s\n' "$key" "$now" >>"$INCIDENT_NEXT"
+        printf '%s\n' "$line" >>"$match_file"
 
     done < <(
         grep \
@@ -739,7 +748,7 @@ check_syslog_errors() {
     local omitted_count=0
 
     local keyword_summary=""
-    local body=""
+    local body="" importance=warning critical=0
 
     chunk_file="$(
         mktemp /tmp/syslog_notification_chunk.XXXXXX
@@ -808,6 +817,11 @@ check_syslog_errors() {
 
     done <"$match_file"
 
+    critical=$(grep -Eic 'out of memory|oom-kill|killed process|blocked for more than|soft lockup|hard lockup|corrupt' "$match_file" || true)
+    (( critical==0 )) || importance=alert
+    body+="Host events: ${match_count}; critical matches: ${critical}"$'\n'
+    body+="Action: new syslog events detected and grouped; no process, container or network settings were changed."$'\n'
+    body+="Repeated identical events are limited to one reminder per 24 hours. Absence of new log entries does not establish recovery."$'\n'
     body+="Keywords: ${keyword_summary}"$'\n'
     body+="New matches: ${match_count}"$'\n'
     body+=$'\n'
@@ -827,8 +841,8 @@ check_syslog_errors() {
     fi
 
     if ! notify_unraid \
-        "alert" \
-        "${match_count} new syslog alert(s): ${keyword_summary}" \
+        "$importance" \
+        "${match_count} new/reminder syslog event(s): ${keyword_summary}" \
         "$body"
     then
         # Do NOT advance the cursor if notification delivery failed.
@@ -837,6 +851,13 @@ check_syslog_errors() {
         return 1
     fi
 
+    # Commit event delivery only after notification succeeds. A failed send
+    # keeps the old cursor and old incident ledger for a safe retry.
+    local bounded="${STATE_DIR}/incidents.bounded"
+    if ! awk -F '\t' '{seen[$1]=$2} END {for (key in seen) print key "\t" seen[key]}' "$INCIDENT_NEXT" | \
+      sort -k2,2n | tail -n "$INCIDENT_MAX_ENTRIES" >"$bounded"; then return 1; fi
+    if ! mv -f -- "$bounded" "${STATE_DIR}/incidents.tsv"; then return 1; fi
+    rm -f -- "$INCIDENT_NEXT"
     # Advance to the exact point captured before scanning.
     #
     # Lines written after CURRENT_LINE_COUNT will therefore still be processed
@@ -953,6 +974,8 @@ check_log_usage() {
     if [ -f "$USAGE_ALERT_FILE" ] &&
        [ "$usage" -le "$SYSLOG_USAGE_RECOVER_PERCENT" ]
     then
+        if ! notify_unraid normal "/var/log utilization recovered (${usage}%)" \
+          "Current /var/log usage: ${usage}%. Recovery threshold: ${SYSLOG_USAGE_RECOVER_PERCENT}%. The utilization incident is cleared; no files were deleted by this monitor."; then return 1; fi
         rm -f -- "$USAGE_ALERT_FILE"
 
         log "SPACE" "INFO" \
@@ -969,6 +992,13 @@ check_log_usage() {
 
 main() {
     local final_exit=0
+    case "${1:-}" in
+      --version) printf 'syslog_notification.sh %s\n' "$SCRIPT_VERSION"; return 0 ;;
+      '') ;;
+      *) return 2 ;;
+    esac
+    exec 9>"$LOCK_FILE" || return 1
+    flock -n 9 || { printf 'Another syslog monitor is running; scan deferred.\n'; return 0; }
 
     # -----------------------------------------------------------------------
     # State initialization
@@ -1043,4 +1073,4 @@ main() {
 # ENTRY POINT
 ###############################################################################
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

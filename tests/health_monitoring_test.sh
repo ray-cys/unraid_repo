@@ -7,7 +7,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../user_script/health_monitoring.sh
 source "$REPO_ROOT/user_script/health_monitoring.sh"
 
-readonly REGRESSION_FIXTURE_COUNT=107
+readonly REGRESSION_FIXTURE_COUNT=96
 
 self_test_result() {
     local passed="$1" name="$2" detail="${3:-}"
@@ -665,14 +665,34 @@ run_regression_tests() (
             "unexpected rate=$COUNTER_WINDOW_RATE"
     fi
 
-    actual=$(smart_growth_description 'nvme0n1 W+2.00% PCIE US WT+300s')
-    if [[ "$actual" == \
-          'nvme0n1: wear used increased by 2.00 percentage points, PCIe correctable-error counter increased, unsafe-shutdown counter increased, warning-temperature exposure increased by 300s' ]]
-    then
-        self_test_result 1 "Expanded SMART trend vocabulary"
-    else
-        self_test_result 0 "Expanded SMART trend vocabulary" "found '$actual'"
-    fi
+    (
+        local alerts=0
+        record_alert() { alerts=$((alerts+1)); }
+        lsblk_rota_cached() { printf '1\n'; }
+        TEMP_RATE_ALERT_ENABLED=1; HDD_TEMP_WARNING=45
+        RUN_EPOCH=123456; FRESH_SMART[/dev/sdz]=1
+        record_temperature_approach /dev/sdz 30 "$RUN_EPOCH" 10 2 HIGH
+        (( alerts==0 ))
+    ) && self_test_result 1 "Cool drives do not raise temperature-rate warnings" || self_test_result 0 "Cool drives do not raise temperature-rate warnings"
+    (
+        local alerts=0
+        record_alert() { alerts=$((alerts+1)); }
+        lsblk_rota_cached() { printf '1\n'; }
+        TEMP_RATE_ALERT_ENABLED=1; HDD_TEMP_WARNING=45
+        RUN_EPOCH=123456; FRESH_SMART[/dev/sdz]=1
+        record_temperature_approach /dev/sdz 42 "$RUN_EPOCH" 10 2 HIGH
+        (( alerts==1 ))
+    ) && self_test_result 1 "Fresh hot drives retain temperature approach warnings" || self_test_result 0 "Fresh hot drives retain temperature approach warnings"
+    (
+        local alerts=0
+        record_alert() { alerts=$((alerts+1)); }
+        lsblk_rota_cached() { printf '1\n'; }
+        TEMP_RATE_ALERT_ENABLED=1; HDD_TEMP_WARNING=45
+        RUN_EPOCH=123456; FRESH_SMART[/dev/sdz]=1
+        record_temperature_approach /dev/sdz 42 100000 10 2 HIGH
+        record_temperature_approach /dev/sdz 42 "$RUN_EPOCH" 10 2 STALE
+        (( alerts==0 ))
+    ) && self_test_result 1 "Stale readings cannot raise temperature approach warnings" || self_test_result 0 "Stale readings cannot raise temperature approach warnings"
 
     local temperature_quality_history="$fixture_dir/temperature-quality.log"
     local temperature_quality_run="$fixture_dir/temperature-quality-run"
@@ -709,50 +729,6 @@ run_regression_tests() (
     DEVICE_ID_BY_PATH=()
     DEVICE_PATH_BY_ID=()
 
-    local poh_quality_history="$fixture_dir/poh-quality.log"
-    local poh_quality_run="$fixture_dir/poh-quality-run"
-    local poh_first_epoch poh_last_epoch poh_first_date poh_last_date
-    poh_last_epoch=$(date +%s)
-    poh_first_epoch=$((poh_last_epoch - 3*86400))
-    poh_first_date=$(date -d "@$poh_first_epoch" '+%Y-%m-%d')
-    poh_last_date=$(date -d "@$poh_last_epoch" '+%Y-%m-%d')
-    printf '%s\n' \
-        "$poh_first_date poh_valid poh=1000 captured_epoch=$poh_first_epoch schema=3" \
-        "$poh_last_date poh_valid poh=1072 captured_epoch=$poh_last_epoch schema=3" \
-        "$poh_first_date poh_invalid poh=1000 captured_epoch=$poh_first_epoch schema=3" \
-        "$poh_last_date poh_invalid poh=1300 captured_epoch=$poh_last_epoch schema=3" \
-        > "$poh_quality_history"
-    mkdir -p "$poh_quality_run"
-    DEVICE_ID_BY_PATH[/dev/sdx]="poh_valid"
-    DEVICE_PATH_BY_ID[poh_valid]="/dev/sdx"
-    DEVICE_ID_BY_PATH[/dev/sdy]="poh_invalid"
-    DEVICE_PATH_BY_ID[poh_invalid]="/dev/sdy"
-    POH_HISTORY_FILE="$poh_quality_history"
-    RUN_DIR="$poh_quality_run"
-    RUN_EPOCH="$poh_last_epoch"
-    TREND_HISTORY_CACHE=()
-    POH_TREND_ENABLED=1
-    TBW_TREND_ENABLED=0
-    POH_GROWTH_LINE=""
-    POH_INVALID_LINE=""
-    analyze_endurance_trends
-    if [[ "$POH_GROWTH_LINE" == \
-          'sdx accumulated 72 power-on hours over 3.00 days (24.00 hours/day)' ]]
-    then
-        self_test_result 1 "Capture-time-normalized power-on-hour trend"
-    else
-        self_test_result 0 "Capture-time-normalized power-on-hour trend" \
-            "found '$POH_GROWTH_LINE'"
-    fi
-    if [[ "$POH_INVALID_LINE" == 'sdy 100.00 hours/day' ]]; then
-        self_test_result 1 "Physically impossible power-on-hour rate rejection"
-    else
-        self_test_result 0 "Physically impossible power-on-hour rate rejection" \
-            "found '$POH_INVALID_LINE'"
-    fi
-    DEVICE_ID_BY_PATH=()
-    DEVICE_PATH_BY_ID=()
-
     local trend_history="$fixture_dir/trend-history.log"
     printf '%s\n' \
         'corrupted row' \
@@ -767,211 +743,6 @@ run_regression_tests() (
     else
         self_test_result 0 "Normalized bounded trend-history streaming" "found '$actual'"
     fi
-
-    parse_btrfs_trend_row \
-        'disk_wwn mount=/mnt/cache key=write_io_errs delta=4 rate_day=2.5 event=growth'
-    actual="$TREND_ROW_DEVICE_KEY|$TREND_ROW_MOUNT|$TREND_ROW_KEY|$TREND_ROW_DELTA|$TREND_ROW_RATE_DAY|$TREND_ROW_EVENT"
-    parse_btrfs_trend_row \
-        'disk_wwn mount=/mnt/cache key=write_io_errs event=reset'
-    if [[ "$actual" == \
-          'disk_wwn|/mnt/cache|write_io_errs|4|2.5|growth' &&
-          -z "$TREND_ROW_DELTA" && -z "$TREND_ROW_RATE_DAY" &&
-          "$TREND_ROW_EVENT" == "reset" ]]
-    then
-        self_test_result 1 "Btrfs trend-row decoding and reset isolation"
-    else
-        self_test_result 0 "Btrfs trend-row decoding and reset isolation" "found '$actual'"
-    fi
-
-    local btrfs_empty_history="$fixture_dir/btrfs-empty-history.log"
-    local btrfs_reset_history="$fixture_dir/btrfs-reset-history.log"
-    local btrfs_empty_run="$fixture_dir/btrfs-empty-run"
-    mkdir -p "$btrfs_empty_run"
-    : > "$btrfs_empty_history"
-    RUN_DIR="$btrfs_empty_run"
-    BTRFS_DEV_TREND_ENABLED=1
-    BTRFS_TREND_WINDOW_DAYS=7
-    BTRFS_DEV_HIST_FILE="$btrfs_empty_history"
-    TREND_HISTORY_CACHE=()
-    BTRFS_SUM_LINE=""
-    if analyze_btrfs_cumulative_trends && [[ -z "$BTRFS_SUM_LINE" ]]; then
-        self_test_result 1 "Empty Btrfs trend history under nounset"
-    else
-        self_test_result 0 "Empty Btrfs trend history under nounset" \
-            "found '$BTRFS_SUM_LINE'"
-    fi
-
-    printf '%s disk_wwn mount=/mnt/cache key=write_io_errs event=reset captured_epoch=1 schema=3\n' \
-        "$(date '+%Y-%m-%d')" > "$btrfs_reset_history"
-    BTRFS_DEV_HIST_FILE="$btrfs_reset_history"
-    TREND_HISTORY_CACHE=()
-    BTRFS_SUM_LINE=""
-    if analyze_btrfs_cumulative_trends && [[ -z "$BTRFS_SUM_LINE" ]]; then
-        self_test_result 1 "Reset-only Btrfs trend history under nounset"
-    else
-        self_test_result 0 "Reset-only Btrfs trend history under nounset" \
-            "found '$BTRFS_SUM_LINE'"
-    fi
-
-    parse_xfs_trend_row 'key=extent_alloc delta=7 rate_day=3.5 event=growth'
-    actual="$TREND_ROW_KEY|$TREND_ROW_DELTA|$TREND_ROW_RATE_DAY|$TREND_ROW_EVENT"
-    parse_xfs_trend_row 'key=extent_alloc event=reset corrupted'
-    if [[ "$actual" == 'extent_alloc|7|3.5|growth' &&
-          -z "$TREND_ROW_DELTA" && -z "$TREND_ROW_RATE_DAY" &&
-          "$TREND_ROW_EVENT" == "reset" ]]
-    then
-        self_test_result 1 "XFS trend-row decoding and corrupted-field isolation"
-    else
-        self_test_result 0 "XFS trend-row decoding and corrupted-field isolation" "found '$actual'"
-    fi
-
-    local trend_now
-    trend_now=$(date -d '2026-08-20 00:00:00' +%s)
-    if evaluate_weighted_acceleration \
-           '2026-08-20:6 2026-08-15:1 2026-08-17:2 2026-08-17:2 malformed' \
-           100 2 "$trend_now" 7 &&
-       [[ "$TREND_ACCEL_SAMPLES" == "3" && "$TREND_ACCEL_RATIO" == "3.00" ]]
-    then
-        self_test_result 1 "Weighted acceleration with sparse and duplicate dates"
-    else
-        self_test_result 0 "Weighted acceleration with sparse and duplicate dates" \
-            "samples=$TREND_ACCEL_SAMPLES ratio=$TREND_ACCEL_RATIO"
-    fi
-
-    if ! evaluate_weighted_acceleration \
-           '2026-08-15:1 2026-08-17:2 2026-08-20:3' \
-           100 2 "$trend_now" 7 &&
-       [[ "$TREND_ACCEL_SAMPLES" == "3" && "$TREND_ACCEL_RATIO" == "1.50" ]] &&
-       ! evaluate_weighted_acceleration \
-           '2026-08-15:1 corrupted 2026-08-17:not-numeric 2026-08-20:2' \
-           100 2 "$trend_now" 7 &&
-       [[ "$TREND_ACCEL_SAMPLES" == "2" ]]
-    then
-        self_test_result 1 "Stable and corrupted acceleration-series rejection"
-    else
-        self_test_result 0 "Stable and corrupted acceleration-series rejection" \
-            "samples=$TREND_ACCEL_SAMPLES ratio=$TREND_ACCEL_RATIO"
-    fi
-
-    if evaluate_depletion_acceleration \
-           '2026-08-20:84 2026-08-15:100 2026-08-17:96 2026-08-17:96 corrupted' \
-           50 0.5 &&
-       [[ "$TREND_DEPLETION_SAMPLES" == "3" &&
-          "$TREND_DEPLETION_LAST_RATE" == "4.000000" &&
-          "$TREND_DEPLETION_AVERAGE_RATE" == "2.000000" &&
-          "$TREND_DEPLETION_RATIO" == "2.00" ]]
-    then
-        self_test_result 1 "Calendar-normalized days-left acceleration"
-    else
-        self_test_result 0 "Calendar-normalized days-left acceleration" \
-            "samples=$TREND_DEPLETION_SAMPLES latest=$TREND_DEPLETION_LAST_RATE average=$TREND_DEPLETION_AVERAGE_RATE ratio=$TREND_DEPLETION_RATIO"
-    fi
-
-    local btrfs_trend_history="$fixture_dir/btrfs-trend-history.log"
-    local trend_date_first trend_date_middle trend_date_last
-    trend_date_first=$(date -d '-5 days' '+%Y-%m-%d')
-    trend_date_middle=$(date -d '-3 days' '+%Y-%m-%d')
-    trend_date_last=$(date '+%Y-%m-%d')
-    printf '%s\n' \
-        "$trend_date_last disk_wwn mount=/mnt/cache key=write_io_errs delta=6 rate_day=6 event=growth" \
-        "$trend_date_first disk_wwn mount=/mnt/cache key=write_io_errs delta=1 rate_day=1 event=growth" \
-        "$trend_date_middle disk_wwn mount=/mnt/cache key=write_io_errs delta=2 rate_day=2 event=growth" \
-        'corrupted Btrfs trend row' > "$btrfs_trend_history"
-    DEVICE_ID_BY_PATH=()
-    DEVICE_PATH_BY_ID=()
-    DEVICE_ID_BY_PATH[/dev/sdz]="disk_wwn"
-    DEVICE_PATH_BY_ID[disk_wwn]="/dev/sdz"
-    BTRFS_DEV_HIST_FILE="$btrfs_trend_history"
-    XFS_PROC_HISTORY_FILE="$fixture_dir/missing-xfs-trend-history.log"
-    ERROR_RATE_TREND_ENABLED=1
-    BTRFS_DEV_TREND_ENABLED=1
-    ERROR_RATE_TREND_WINDOW_DAYS=7
-    BTRFS_TREND_WINDOW_DAYS=7
-    RUN_EPOCH=$(date +%s)
-    RUN_DIR="$fixture_dir/trend-analysis-run"
-    mkdir -p "$RUN_DIR"
-    TREND_HISTORY_CACHE=()
-    EARLY_ERR_LINE=""
-    BTRFS_SUM_LINE=""
-    analyze_error_rate_trends
-    analyze_btrfs_cumulative_trends
-    if [[ "$EARLY_ERR_LINE" == *'BtrfsDev: sdz:write_io_errs x3.00'* &&
-          "$EARLY_ERR_LINE" == *'BtrfsMnt: /mnt/cache:write_io_errs x3.00'* &&
-          "$BTRFS_SUM_LINE" == 'sdz:+9' ]]
-    then
-        self_test_result 1 "End-to-end Btrfs acceleration and cumulative trends"
-    else
-        self_test_result 0 "End-to-end Btrfs acceleration and cumulative trends" \
-            "rate='$EARLY_ERR_LINE' cumulative='$BTRFS_SUM_LINE'"
-    fi
-    DEVICE_ID_BY_PATH=()
-    DEVICE_PATH_BY_ID=()
-
-    local days_left_trend_history="$fixture_dir/days-left-trend-history.log"
-    printf '%s\n' \
-        "$trend_date_last nvme_fixture days_left=84 confidence=HIGH" \
-        "$trend_date_first nvme_fixture days_left=100 confidence=HIGH" \
-        "$trend_date_middle nvme_fixture days_left=96 confidence=HIGH" > "$days_left_trend_history"
-    DEVICE_ID_BY_PATH[/dev/nvme9n1]="nvme_fixture"
-    DEVICE_PATH_BY_ID[nvme_fixture]="/dev/nvme9n1"
-    POH_TREND_ENABLED=0
-    TBW_TREND_ENABLED=1
-    ENDURANCE_TREND_WINDOW_DAYS=7
-    TBW_DAYSLEFT_HISTORY_FILE="$days_left_trend_history"
-    RUN_DIR="$fixture_dir/endurance-analysis-run"
-    mkdir -p "$RUN_DIR"
-    TREND_HISTORY_CACHE=()
-    DL_SHRINK_LINE=""
-    analyze_endurance_trends
-    if [[ "$DL_SHRINK_LINE" == \
-          'nvme9n1 endurance estimate decreased by 16.0% (16.0 days) over 5 days (high forecast confidence; decline is accelerating)' ]]
-    then
-        self_test_result 1 "Human-readable days-left acceleration rendering"
-    else
-        self_test_result 0 "Human-readable days-left acceleration rendering" \
-            "found '$DL_SHRINK_LINE'"
-    fi
-    printf '%s\n' \
-        "$trend_date_last nvme_fixture days_left=84 confidence=RESET" \
-        "$trend_date_first nvme_fixture days_left=100 confidence=HIGH" \
-        "$trend_date_middle nvme_fixture days_left=96 confidence=HIGH" > "$days_left_trend_history"
-    RUN_DIR="$fixture_dir/endurance-reset-run"
-    mkdir -p "$RUN_DIR"
-    TREND_HISTORY_CACHE=()
-    DL_SHRINK_LINE=""
-    TREND_DIAGNOSTIC_ITEMS=()
-    analyze_endurance_trends
-    if [[ -z "$DL_SHRINK_LINE" &&
-          "${TREND_DIAGNOSTIC_ITEMS[*]:-}" == \
-              *'endurance trajectory suppressed: device=nvme9n1 confidence=RESET'* ]]
-    then
-        self_test_result 1 "Reset endurance forecast excluded from notification ranking"
-    else
-        self_test_result 0 "Reset endurance forecast excluded from notification ranking" \
-            "line='$DL_SHRINK_LINE' diagnostics='${TREND_DIAGNOSTIC_ITEMS[*]:-}'"
-    fi
-
-    printf '%s\n' \
-        "$trend_date_last nvme_fixture days_left=1800000 confidence=HIGH" \
-        "$trend_date_first nvme_fixture days_left=2000000 confidence=HIGH" \
-        "$trend_date_middle nvme_fixture days_left=1900000 confidence=HIGH" > "$days_left_trend_history"
-    RUN_DIR="$fixture_dir/endurance-negligible-run"
-    mkdir -p "$RUN_DIR"
-    TREND_HISTORY_CACHE=()
-    TREND_DIAGNOSTIC_ITEMS=()
-    DL_SHRINK_LINE=""
-    analyze_endurance_trends
-    if [[ -z "$DL_SHRINK_LINE" &&
-          "${TREND_DIAGNOSTIC_ITEMS[*]:-}" == \
-              *'reason=negligible-write-forecast'* ]]
-    then
-        self_test_result 1 "Negligible-write endurance artifacts stay out of notifications"
-    else
-        self_test_result 0 "Negligible-write endurance artifacts stay out of notifications" \
-            "line='$DL_SHRINK_LINE' diagnostics='${TREND_DIAGNOSTIC_ITEMS[*]:-}'"
-    fi
-    DEVICE_ID_BY_PATH=()
-    DEVICE_PATH_BY_ID=()
 
     local trend_cache_source="$fixture_dir/trend-cache-source.log"
     RUN_DIR="$fixture_dir/trend-run"

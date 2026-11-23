@@ -1,10 +1,11 @@
 #!/bin/bash
-# Docker Service Watchdog v3.7 -- Unraid service availability and bounded recovery.
+# Docker Service Watchdog v3.8 -- Unraid service availability and bounded recovery.
 # Optional schedule: every five minutes. Pi-hole and application-specific health
-# remain owned by the DNS and Arr monitors. All recovery is disabled by default.
+# remain owned by the DNS and Arr monitors. Recovery follows Hubble's existing
+# per-service permissions; VPN/configuration findings never request restarts.
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.7"
+readonly SCRIPT_VERSION="3.8"
 
 ###############################################################################
 # CONFIGURATION
@@ -12,20 +13,20 @@ readonly SCRIPT_VERSION="3.7"
 # name|HTTP endpoint (optional)|always/on-demand|restart permission (0/1)
 # on-demand containers may stop normally, but must remain installed.
 SERVICE_SPECS=(
-    "plex-media-server||always|0"
-    "plex-media||always|0"
-    "sonarr|http://192.168.50.4:8989/ping|always|0"
-    "radarr|http://192.168.50.4:7878/ping|always|0"
-    "sabnzbd|http://192.168.50.4:8080/|always|0"
+    "plex-media-server||always|1"
+    "plex-media||always|1"
+    "sonarr|http://192.168.50.4:8989/ping|always|1"
+    "radarr|http://192.168.50.4:7878/ping|always|1"
+    "sabnzbd|http://192.168.50.4:8080/|always|1"
     "qbittorrent|https://qbittorrent.taila4be9.ts.net/api/v2/app/version|always|0"
-    "kometa||always|0"
+    "kometa||always|1"
     "recyclarr||always|0"
     "imagemaid||always|0"
-    "metafusion||always|0"
-    "bazarr||always|0"
+    "metafusion||always|1"
+    "bazarr||always|1"
     "tautulli||always|0"
-    "seerr||always|0"
-    "prowlarr||always|0"
+    "seerr||always|1"
+    "prowlarr||always|1"
     "photoprism||always|0"
     "lumunarr||always|0"
 )
@@ -85,6 +86,14 @@ DOCKER_HOST_IP="192.168.50.4"
 PROBE_ADDRESS_OVERRIDES=(
     "qbittorrent|qbittorrent.taila4be9.ts.net|443|100.64.251.79"
 )
+# Read-only VPN evidence for Hubble's Tailscale/Mullvad qBittorrent setup.
+# Verify the node ID again if you deliberately change Mullvad location/node.
+# Canary requests are tiny HTTPS requests from inside the container; they do
+# not read media, edit application settings, or infer privacy from Web UI health.
+VPN_EGRESS_CHECK_ENABLED=true
+VPN_CONTAINER="qbittorrent"
+VPN_EXPECTED_INTERFACE="tailscale0"
+VPN_EXPECTED_EXIT_NODE_ID="n4voE47CNTRL"
 # Optional per-container files: NAME.headers (curl header-file syntax) and
 # NAME.cookies (Netscape cookie jar). Credentials are never printed or placed
 # on curl's command line. Supply qBittorrent auth for its protected API.
@@ -121,7 +130,7 @@ LOG_SIZE_WARNING_BYTES=$((1024 * 1024 * 1024))
 # per-container lock serializes lease creation against watchdog recovery.
 DOCKER_MAINTENANCE_DIR="${DOCKER_MAINTENANCE_DIR:-/run/docker-service-maintenance}"
 MAX_MAINTENANCE_SECONDS=86400
-AUTO_RESTART=false
+AUTO_RESTART=true
 RESTART_STOPPED_CONTAINERS=false # Legacy opt-in; unexpected-exit proof still mandatory.
 RECOVER_UNEXPECTED_EXITS=true    # Only known running always-on containers with die events.
 STOP_EVENT_MAX_AGE_SECONDS=3600
@@ -1342,6 +1351,93 @@ attempt_recovery() {
     exec {fd}>&-
 }
 
+# Read-only VPN audit. It never changes Docker, qBittorrent, Tailscale, or routes.
+# The canary proves only a small request bound to the configured interface, not
+# every torrent socket. Mullvad's endpoint supplies attribution, not a geo-IP guess.
+collect_vpn_evidence() {
+    local name="$1" family="$2" interface="$3"
+    docker_cmd exec "$name" sh -c '
+      case "$1" in
+        status) tailscale status --json ;;
+        prefs) tailscale debug prefs ;;
+        binding) sed -n "s/^Session\\\\Interface=//p" /config/config/qBittorrent.conf /config/qBittorrent.conf /config/qBittorrent/qBittorrent.conf /config/qBittorrent/config/qBittorrent.conf 2>/dev/null | head -n 1 ;;
+        dns) getent ahostsv4 am.i.mullvad.net | head -n 1 | cut -d " " -f 1 ;;
+        route4) ip -j route get 1.1.1.1 ;;
+        route6) ip -j -6 route get 2606:4700:4700::1111 ;;
+        canary4|canary6)
+          family=-4; [ "$1" != canary6 ] || family=-6
+          curl "$family" --noproxy "*" --interface "$2" --proto "=https" \
+            --connect-timeout 2 --max-time 4 --max-filesize 4096 --silent --fail \
+            https://am.i.mullvad.net/json ;;
+      esac' sh "$family" "$interface" 2>/dev/null
+}
+
+vpn_finding() {
+    RECOVERY_BLOCKED["${1%%:*}"]=1
+    observe "$@"
+}
+
+diagnose_vpn() (
+    # Isolated output-only diagnostic: no state, notifications, or actions.
+    log() { shift; printf '%s\n' "$*"; }
+    vpn_finding() { printf '%s [%s] %s\n' "$1" "$2" "$3"; }
+    printf 'Watchdog: %s; read-only VPN audit\n' "$SCRIPT_VERSION"
+    check_vpn_egress "$VPN_CONTAINER"
+)
+
+check_vpn_egress() {
+    local name="$1" ts prefs binding route device canary family ipv6 dns result=""
+    [[ "$VPN_EGRESS_CHECK_ENABLED" == true && "$name" == "$VPN_CONTAINER" ]] || return 0
+    if ! ts=$(collect_vpn_evidence "$name" status "") ||
+       ! prefs=$(collect_vpn_evidence "$name" prefs "") ||
+       ! jq -e 'type=="object" and .BackendState=="Running" and .ExitNodeStatus.Online==true' <<<"$ts" >/dev/null; then
+        vpn_finding "$name:vpn-exit" WARNING 'VPN exit-node evidence unavailable or node offline; torrent egress unverified. No configuration or container action performed.'
+        return
+    fi
+    if ! jq -e --arg id "$VPN_EXPECTED_EXIT_NODE_ID" '.ExitNodeStatus.ID==$id' <<<"$ts" >/dev/null ||
+       ! jq -e --arg id "$VPN_EXPECTED_EXIT_NODE_ID" '.ExitNodeID==$id and .WantRunning==true' <<<"$prefs" >/dev/null; then
+        vpn_finding "$name:vpn-exit" WARNING 'Selected exit node differs from the approved Mullvad node; verify Tailscale settings. No automatic reconfiguration performed.' || return 1
+    fi
+    binding=$(collect_vpn_evidence "$name" binding "") || binding=""
+    if [[ ! "$binding" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+        vpn_finding "$name:vpn-binding" WARNING 'qBittorrent interface binding missing or unreadable; explicit VPN binding required. Torrent egress unverified.'
+        return
+    fi
+    route=$(collect_vpn_evidence "$name" route4 "") || route='[]'
+    device=$(jq -r '.[0].dev // "unknown"' <<<"$route" 2>/dev/null) || device=unknown
+    if [[ "$binding" != "$VPN_EXPECTED_INTERFACE" || "$device" != "$VPN_EXPECTED_INTERFACE" ]]; then
+        vpn_finding "$name:vpn-binding" WARNING "qBittorrent binds $binding; default IPv4 route=$device; expected=$VPN_EXPECTED_INTERFACE. Set qBittorrent Advanced > Network interface to $VPN_EXPECTED_INTERFACE and leave Optional IP address on All addresses. A working Web UI does not verify torrent routing." || return 1
+    fi
+    dns=$(collect_vpn_evidence "$name" dns "") || dns=""
+    case "$dns" in
+      ""|0.0.0.0|127.*)
+        vpn_finding "$name:vpn-canary-dns" WARNING "Mullvad check hostname resolves to ${dns:-no address} inside qBittorrent. DNS blocking/override prevents egress verification; allow am.i.mullvad.net in the responsible resolver if intended. Watchdog does not bypass DNS policy or infer a VPN leak."
+        return ;;
+    esac
+    for family in 4 6; do
+        if [[ "$family" == 6 ]]; then
+            if ! ipv6=$(collect_vpn_evidence "$name" route6 "") || ! jq -e 'length>0' <<<"$ipv6" >/dev/null 2>&1; then
+                log INFO "$name: IPv6 has no usable route; IPv6 egress not tested"
+                continue
+            fi
+            if ! jq -e --arg dev "$VPN_EXPECTED_INTERFACE" '.[0].dev==$dev' <<<"$ipv6" >/dev/null; then
+                vpn_finding "$name:vpn-ipv6" WARNING 'IPv6 route bypasses the expected VPN interface; review IPv6 before relying on VPN isolation.' || return 1
+            fi
+        fi
+        if ! canary=$(collect_vpn_evidence "$name" "canary$family" "$binding") ||
+           ! jq -e 'type=="object" and (.mullvad_exit_ip|type)=="boolean"' <<<"$canary" >/dev/null 2>&1; then
+            vpn_finding "$name:vpn-egress$family" WARNING "IPv$family interface-bound Mullvad canary unavailable; DNS/TLS/routing or endpoint may be unavailable. Egress is unverified; this does not prove a leak." || return 1
+        elif ! jq -e '.mullvad_exit_ip==true' <<<"$canary" >/dev/null; then
+            vpn_finding "$name:vpn-egress$family" CRITICAL "IPv$family request bound to $binding was not identified as Mullvad egress. Review torrent binding and VPN routing; watchdog made no container or network changes." || return 1
+        else
+            result+=" IPv$family=Mullvad"
+        fi
+    done
+    if [[ -n "$result" ]]; then
+        log INFO "$name: VPN canary results:$result; binding=$binding default-route=$device (torrent sockets not inspected)"
+    fi
+}
+
 check_service() {
     local name url expected allowed info status health id previous_id previous_count count oom previous_oom
     local started epoch uptime log_path size failures bad=false missing rc
@@ -1422,6 +1518,7 @@ check_service() {
         'if (.services[$name].id // "")!=$id then .services[$name]={lastRunningAt:0} else . end |
          .services[$name]=((.services[$name] // {})+{id:$id,restartCount:$count,oom:$oom,failures:$failures}) |
          if $status=="running" then .services[$name].lastRunningAt=$now else . end' || return 1
+    if [[ "$status" == running ]]; then check_vpn_egress "$name" || return 1; fi
     check_job "$name" "$info" || return 1
     if [[ "$bad" == true ]]; then RECOVERY_CANDIDATES+=("$name|$url|$status|$allowed"); fi
 }
@@ -1509,20 +1606,22 @@ write_receipt() {
 }
 
 main() {
-    case "${1:-}" in --diagnose|--version|--help|-h|--maintenance) ;;
+    case "${1:-}" in --diagnose|--diagnose-vpn|--version|--help|-h|--maintenance) ;;
         *) exec {STATE_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
            if ! flock -s -n "$STATE_EXPORT_FD"; then printf 'State export active; watchdog invocation deferred.\n'; return 0; fi;;
     esac
     local spec name url expected allowed uptime status=OK failed=false command
     case "${1:-}" in
-        --help|-h) printf '%s\n' 'Usage: bash docker_service_watchdog.sh [--version|--diagnose CONTAINER [URL]|--maintenance CONTAINER MINUTES REASON|--record-job PROFILE EXIT_CODE [START_EPOCH]]'
+        --help|-h) printf '%s\n' 'Usage: bash docker_service_watchdog.sh [--version|--diagnose-vpn|--diagnose CONTAINER [URL]|--maintenance CONTAINER MINUTES REASON|--record-job PROFILE EXIT_CODE [START_EPOCH]]'
             printf '%s\n' 'Schedule every five minutes. Recovery requires global AND per-service permission.' \
                 'Maintenance suppresses availability checks/restarts, freezes active findings, and expires within 24h.' \
                 'Remove /run/docker-service-maintenance/CONTAINER.manual.json to end a manual lease early.' \
                 'Healthy/unchanged runs stay silent. Failures and recovery require consecutive scans.' \
                 'Internal schedulers need native status, timestamped whole-run evidence, or producer receipts.' \
-                'Run docker_watchdog_liveness.sh independently every five minutes to monitor this script.'; return 0 ;;
+                'Run docker_watchdog_liveness.sh independently every five minutes to monitor this script.' \
+                '--diagnose-vpn prints read-only binding, exit-node, DNS and egress evidence; no state or notifications.'; return 0 ;;
         --version) printf 'docker_service_watchdog.sh %s\n' "$SCRIPT_VERSION"; return 0 ;;
+        --diagnose-vpn) [[ $# == 1 ]] || return 2; diagnose_vpn; return $? ;;
         --diagnose) [[ $# == 2 || $# == 3 ]] || return 2; diagnose_service "$2" "${3:-}"; return $? ;;
         --maintenance) [[ $# == 4 ]] || return 2; set_manual_maintenance "$2" "$3" "$4"; return $? ;;
         --record-job) [[ $# == 3 || $# == 4 ]] || return 2; record_job "$2" "$3" "${4:-0}"; return $? ;;
@@ -1547,7 +1646,7 @@ main() {
     done
     (( JOB_LOG_SCAN_MAX_BYTES >= 1024 && JOB_LOG_SCAN_MAX_BYTES <= 512 * 1024 * 1024 )) || return 2
     for number in "$BOOT_GRACE_SECONDS" "$CONTAINER_GRACE_SECONDS" "$LOG_SIZE_WARNING_BYTES" "$PROBE_MAX_REDIRECTS"; do [[ "$number" =~ ^[0-9]+$ ]] || return 2; done
-    for flag in "$AUTO_RESTART" "$RESTART_STOPPED_CONTAINERS" "$RECOVER_UNEXPECTED_EXITS" "$CHECK_LOG_SIZE" "$DISCOVER_UNCLASSIFIED" "$REQUIRE_VERIFIED_JOB_SUCCESS" "$KOMETA_WEEKLY_REPORTING"; do [[ "$flag" == true || "$flag" == false ]] || return 2; done
+    for flag in "$AUTO_RESTART" "$RESTART_STOPPED_CONTAINERS" "$RECOVER_UNEXPECTED_EXITS" "$CHECK_LOG_SIZE" "$DISCOVER_UNCLASSIFIED" "$REQUIRE_VERIFIED_JOB_SUCCESS" "$KOMETA_WEEKLY_REPORTING" "$VPN_EGRESS_CHECK_ENABLED"; do [[ "$flag" == true || "$flag" == false ]] || return 2; done
     local profile max_age runtime source
     for spec in "${JOB_RULES[@]}"; do
         IFS='|' read -r profile max_age runtime source <<<"$spec"
