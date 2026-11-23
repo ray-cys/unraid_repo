@@ -7,7 +7,7 @@ arrayStarted=true
 # for changed findings, recovery, or a 24-hour reminder. Failed delivery retries.
 # CLI: bash script [--help|--version]. No CLI modifies backup or application data.
 set -uo pipefail
-readonly SCRIPT_VERSION="1.0"
+readonly SCRIPT_VERSION="1.1"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/backup_health_audit}"
 APPDATA_ROOT="${APPDATA_ROOT:-/mnt/vault/backup/cache}"
@@ -62,7 +62,7 @@ audit_runtime() {
         mountpoint -q "$path" || { finding "Compatibility: required filesystem is not mounted: $path"; missing=true; }
     done
     cron=$(timeout 8 crontab -c /etc/cron.d -l 2>/dev/null) || { cron=""; finding 'Compatibility: active Unraid cron inventory unavailable'; missing=true; }
-    for path in appdata_backup flash_disk_backup remote_backup vault_remote_backup arr_health_activity arr_delete_sync_tag arr_sabnzbd_cleanup quarantine_lifecycle docker_service_watchdog dns_redundancy_watchdog ramlog_monitor torrent_download_complete backup_health_audit kometa_preflight imagemaid_restore_archive; do
+    for path in appdata_backup flash_disk_backup remote_backup vault_remote_backup arr_health_activity arr_delete_sync_tag arr_sabnzbd_cleanup quarantine_lifecycle docker_service_watchdog dns_redundancy_watchdog ramlog_monitor torrent_download_complete backup_health_audit kometa_preflight; do
         if [[ ! -f "/boot/config/plugins/user.scripts/scripts/$path/script" ]] ||
            ! grep -Fq "/scripts/$path/script" <<<"$cron"; then
             finding "Scheduling: required User Script missing or not scheduled: $path"; missing=true

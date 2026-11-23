@@ -85,7 +85,7 @@ its failure is reported independently of completed data processing.
 | User Script | Schedule (Singapore time) | Responsibility |
 | --- | --- | --- |
 | `backup_health_audit` | `20 * * * *` | Local-only freshness, pending ISS delivery, drill and runtime/schedule audit. No ISS wake, media hashing or repair actions. Changed incidents/recovery and at most daily reminders. |
-| `imagemaid_restore_archive` | `50 6 * * 3,7` | Prepare before actual Wed/Sun 07:00 native ImageMaid runs. Archive an idle previous restore tree, briefly stop/restart the scheduler under maintenance and verify same-directory identity after atomic rename. |
+| `imagemaid_restore_archive` | Disabled with native clear-before-move | Optional archival alternative, retained in GitHub. Enable only when dated restore-image retention is wanted; do not combine it with native clear-before-move. |
 | `kometa_preflight` | `55 3,7,11,15,19,23 * * *` | After idle MetaFusion, before Kometa's four-hour boundaries, reconcile exact Plex GUIDs and supported resolution filters. Active/unsupported producers defer without edits. |
 
 Keep `backup_restore_drill` unscheduled in User Scripts: the successful ISS backup

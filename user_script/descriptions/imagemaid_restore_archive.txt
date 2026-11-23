@@ -1,6 +1,6 @@
 Purpose: Prepare ImageMaid move mode without deleting retained restore images.
 
-Schedule: Custom 50 6 * * 3,7 (Wednesday and Sunday at 06:50, Singapore time), before ImageMaid's native 07:00 runs.
+Schedule: Disabled when native ImageMaid clear-before-move or remove mode is used. Optional archival alternative only: 50 6 * * 3,7 before the Wed/Sun 07:00 move jobs. Do not enable both lifecycle approaches.
 
 When the previous job is confirmed idle, briefly stop its resident scheduler, rename the existing ImageMaid Restore directory into a dated ImageMaid Restore Archives generation on the same filesystem, then restart and verify the container. Active jobs or backup maintenance defer preparation.
 
