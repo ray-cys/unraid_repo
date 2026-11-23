@@ -1,11 +1,11 @@
 #!/bin/bash
-# Docker Service Watchdog v3.8 -- Unraid service availability and bounded recovery.
+# Docker Service Watchdog v3.9 -- Unraid service availability and bounded recovery.
 # Optional schedule: every five minutes. Pi-hole and application-specific health
 # remain owned by the DNS and Arr monitors. Recovery follows Hubble's existing
 # per-service permissions; VPN/configuration findings never request restarts.
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.8"
+readonly SCRIPT_VERSION="3.9"
 
 ###############################################################################
 # CONFIGURATION
@@ -57,7 +57,7 @@ REQUIRE_VERIFIED_JOB_SUCCESS=true
 # Preflight owns routine Kometa warnings/errors. Delegate emails only while its
 # weekly-report heartbeat/deadline is healthy; operational/fatal alerts stay here.
 KOMETA_WEEKLY_REPORTING=true
-KOMETA_WEEKLY_STATE="/mnt/vault/cloud/logs/script/kometa_preflight/weekly-report-state.json"
+KOMETA_WEEKLY_STATE="/mnt/vault/cloud/logs/script/media_metadata_audit/weekly-report-state.json"
 RECYCLARR_JOB_COMMAND="/cron.sh"
 RECYCLARR_JOB_POSITION=0
 # profile|container TCP port|readiness path|validation type|expected body
@@ -1566,7 +1566,7 @@ evaluate_shared_failure() {
 
 kometa_weekly_delegate_ready() {
     [[ "$KOMETA_WEEKLY_REPORTING" == true && -f "$KOMETA_WEEKLY_STATE" && ! -L "$KOMETA_WEEKLY_STATE" ]] || return 1
-    jq -e --argjson now "$NOW" '.schema==1 and (.lastCheckedAt|type=="number") and (.nextDue|type=="number") and
+    jq -e --argjson now "$NOW" '.schema==1 and (.kometaEvidenceOk != false) and (.lastCheckedAt|type=="number") and (.nextDue|type=="number") and
       .lastCheckedAt<=($now+300) and .lastCheckedAt>=($now-8*3600) and .nextDue>=($now-8*3600)' "$KOMETA_WEEKLY_STATE" >/dev/null 2>&1
 }
 

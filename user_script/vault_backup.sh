@@ -57,7 +57,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.9"
+readonly SCRIPT_VERSION="1.10"
 
 ###############################################################################
 # CONFIGURATION
@@ -877,7 +877,7 @@ vault_export_operations_state() {
         "dns_redundancy_watchdog|$scripts/dns_redundancy_watchdog"
         "plex_dbrepair|$scripts/plex_dbrepair"
         "quarantine_lifecycle|$scripts/quarantine_lifecycle"
-        "kometa_preflight|$scripts/kometa_preflight"
+        "media_metadata_audit|$scripts/media_metadata_audit"
         "imagemaid_restore_archive|$scripts/imagemaid_restore_archive"
         "backup_health_audit|$scripts/backup_health_audit"
         "torrent_download_complete|$scripts/torrent_download_complete/state"

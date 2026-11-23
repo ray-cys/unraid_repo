@@ -2,7 +2,7 @@
 import copy, datetime as dt, json, os, pathlib, subprocess, sys, tempfile, time
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 reader=(ROOT/'user_script/docker_service_watchdog.sh').read_text().split("program=\"$(cat <<'PY'\n",1)[1].split('\nPY\n',1)[0]
-reporter=(ROOT/'user_script/kometa_preflight.sh').read_text().split("<<'PYWEEKLY'\n",1)[1].split('\nPYWEEKLY\n',1)[0]
+reporter=(ROOT/'user_script/media_metadata_audit.sh').read_text().split("<<'PYWEEKLY'\n",1)[1].split('\nPYWEEKLY\n',1)[0]
 os.environ['TZ']='UTC';time.tzset()
 def epoch(s):return int(dt.datetime.fromisoformat(s).replace(tzinfo=dt.timezone.utc).timestamp())
 now=epoch('2026-11-23T01:00:00')
@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory() as temp:
     run_log(4);scan();assert state['maintenance']['issues'][example['id']]['resolvedAt']==fixed
     print('Catalogue context/redaction, repeat grouping, summary deduplication, skipped-scope protection and two-run recovery passed')
     def report(at,saved,catalogue=cat,partial=False):
-        value={'saved':saved,'catalogue':{**catalogue,'lastScanAt':at-10},'gap':partial,'backlog':False}
+        value={'metafusion':{'status':'available','snapshot':{'schema_version':1,'generated_at':dt.datetime.fromtimestamp(at,dt.timezone.utc).isoformat(),'run':{'run_id':'empty','status':'completed','finished_at':dt.datetime.fromtimestamp(at,dt.timezone.utc).isoformat()},'open':[],'recently_resolved':[],'run_history':[]}},'saved':saved,'catalogue':{**catalogue,'lastScanAt':at-10},'gap':partial,'backlog':False}
         return json.loads(subprocess.check_output([sys.executable,'-c',reporter,str(at),'Asia/Singapore','7','11','55','20','false'],input=json.dumps(value).encode()))
     start=report(now,{})
     assert not start['due'] and not start['send']

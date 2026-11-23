@@ -1,0 +1,13 @@
+Purpose: Weekly operational review of MetaFusion metadata/artwork findings and Kometa errors, plus existing guarded personal-template reconciliation.
+
+Schedule: Custom 55 3,7,11,15,19,23 * * * (03:55, 07:55, 11:55, 15:55, 19:55 and 23:55 Singapore time). Weekly email deadline: Sunday 11:55; one combined notification, retried after delivery failure. No empty all-clear email when both evidence sources are verified quiet.
+
+MetaFusion source: native /config/reports/findings-latest.json, read from its existing host mount. Include exact server/library/Plex identities, title, missing field or artwork, reason, provider/destination/ownership evidence, suggested next action, first/last checks and verified recoveries. Preserve native distinctions between provider absence, policy holds, errors, files present and outputs applied in Plex. Skipped items stay open. Unknown future reasons remain visible.
+
+Kometa source: the watchdog's existing incremental catalogue, with library/YAML/scope, errors/warnings, affected runs and recommended actions. No duplicate full-log scan. Routine Kometa emails delegate only while the report heartbeat and Kometa evidence are healthy. Urgent service, fatal and overdue-job alerts remain with Docker watchdog.
+
+The email includes up to 20 detailed entries within 24 KB, sharing space between both producers. It explicitly states omissions. weekly-report.txt is overwritten with all retained details. State, delivery deadline and prior report history are preserved when renaming the former User Script. Missing, malformed, oversized, stale or incomplete producer evidence is coverage-unverified, never healthy-by-default. MetaFusion may not create its first export until its next non-dry run.
+
+Existing reconciliation continues after reporting under its maintenance/idle/capability/writer-lock guards. It maintains recognized personal resolution-overlay and collection templates; native MetaFusion owns generated metadata. The reporting module does not edit YAML, change Docker settings, restart apps, download artwork or fix metadata.
+
+CLI: /bin/bash SCRIPT --version shows the installed version. --report-preview prints the full current review without email, delivery-state changes or YAML edits. --weekly-report checks the existing weekly deadline only and performs no YAML edits. Normal invocation also runs the existing guarded reconciliation. Failed email keeps the deadline pending; a successful weekly review advances it once.

@@ -1,8 +1,8 @@
-# Kometa weekly maintenance review
+# Media metadata weekly maintenance review
 
-The Docker watchdog remains the single native-log reader. Its v3.7 parser extends
+The Docker watchdog remains the single native-log reader. Its native parser extends
 its existing incremental cursor with a redacted catalogue of configuration and
-processing findings. Kometa preflight v2.2 owns weekly presentation and delivery.
+processing findings. Media metadata audit v3.0 owns combined weekly presentation and delivery.
 No Docker image, entrypoint, scheduler or application configuration is changed by
 the reporting module. Existing guarded personal-template edits remain separate.
 
@@ -49,7 +49,7 @@ and again before rendering. All report/state files remain private.
 Manual review on Unraid:
 
 ```bash
-preflight=/boot/config/plugins/user.scripts/scripts/kometa_preflight/script
+preflight=/boot/config/plugins/user.scripts/scripts/media_metadata_audit/script
 /bin/bash "$preflight" --report-preview
 /bin/bash "$preflight" --weekly-report
 ```
@@ -59,3 +59,40 @@ Preview sends no email, updates no report state and performs no YAML edits.
 invocation also performs the existing reconciliation afterward. Bootstrap starts
 from the available previous/current logs; seven-day coverage becomes available
 only as new runs are observed, not by inventing missing history.
+
+## Combined native MetaFusion review (media_metadata_audit v3.0)
+
+The installed User Script is now `media_metadata_audit`. Its source filename,
+state root, status receipt, watchdog handoff, backup-state export and scheduler
+reference use the same name. The old state directory is moved once during
+installation, preserving `nextDue` and delivery history; no duplicate job remains.
+Docker images, startup, environment, native schedulers and app configuration are
+not changed by the rename. Existing personal-template reconciliation remains
+behind its existing guards; reporting runs independently before those guards.
+
+The second source is MetaFusion `schema_version:1`
+`/config/reports/findings-latest.json` on its existing host bind mount. It contains
+`run`, 30-day `run_history`, persistent `open` findings and `recently_resolved`
+findings. No native log parser or duplicate report collector is introduced.
+The native export is read-only and may not exist until the first non-dry run
+following the producer upgrade. Missing, invalid, future-dated, over-32-MiB,
+stale (eight-hour) or incomplete coverage is explicitly reported. Kometa evidence
+can fail independently: MetaFusion findings still render, while the watchdog
+retains immediate routine Kometa reporting.
+
+MetaFusion detail includes exact server/library/Plex/TMDb/season/episode identity,
+component/mode, operation, reason code, provider and destination/ownership evidence,
+observation counts, first/last checks, suggested actions and native resolution
+proof. Stable IDs plus first-seen times distinguish recurrences. Open findings
+are never aged out by the consumer or resolved because a later run skipped them.
+Provider-no-candidate, field-unavailable, policy-held and processing-failure cases
+remain distinct. A local artwork file is not reported as proof of Plex application.
+Only producer-verified recoveries since the previous report/week are included.
+Run action and cleanup counts are explicitly producer summaries, not unique-item
+counts or actions performed by this audit.
+
+One combined weekly notification interleaves MetaFusion and Kometa entries so one
+source cannot monopolize all 20 positions. It retains the 24-KB bound, explicit
+omission counts, one overwritten full report, redaction and failed-delivery retry.
+Missing coverage is reportable even if there are no findings. When both sources
+are fresh and have no findings/recoveries, no all-clear email is sent.

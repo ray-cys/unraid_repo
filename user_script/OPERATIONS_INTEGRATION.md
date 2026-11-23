@@ -114,7 +114,7 @@ Unraid or a Linux environment with the monitor's fixture dependencies. Only
 Use `bash script --diagnostics` on the installed copy to inspect configuration,
 dependencies, and soak status without running SMART tests.
 | `imagemaid_restore_archive` | Disabled with native clear-before-move | Optional archival alternative, retained in GitHub. Enable only when dated restore-image retention is wanted; do not combine it with native clear-before-move. |
-| `kometa_preflight` | `55 3,7,11,15,19,23 * * *` | After idle MetaFusion, before Kometa's four-hour boundaries, reconcile exact Plex GUIDs and supported resolution filters. Active/unsupported producers defer without edits. |
+| `media_metadata_audit` | `55 3,7,11,15,19,23 * * *` | Combine native MetaFusion findings and Kometa catalogue into one Sunday 11:55 review; retain guarded template reconciliation before four-hour boundaries. Missing coverage is explicit; active/unsupported producers defer edits. |
 
 Keep `backup_restore_drill` unscheduled in User Scripts: the successful ISS backup
 handoff invokes it on ISS when its seven-day interval is due. Its time follows

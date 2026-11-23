@@ -9,9 +9,9 @@ import tempfile
 import time
 import yaml
 
-PREFLIGHT_SOURCE=(Path(__file__).resolve().parents[1]/"user_script/kometa_preflight.sh").read_text().split("<<'PY'\n",1)[1].split("\nPY\n",1)[0]
+PREFLIGHT_SOURCE=(Path(__file__).resolve().parents[1]/"user_script/media_metadata_audit.sh").read_text().split("<<'PY'\n",1)[1].split("\nPY\n",1)[0]
 
-with tempfile.TemporaryDirectory(prefix='kometa-preflight-fixture-') as folder:
+with tempfile.TemporaryDirectory(prefix='media-metadata-audit-fixture-') as folder:
     root=Path(folder)
     for name in ['logs','metadata','overlays','collections','.metafusion']: (root/name).mkdir()
     (root/'.metafusion/kometa-coordinator.json').write_text(json.dumps({'schema':1,'epoch':int(time.time()),'state':'scheduled'}))
