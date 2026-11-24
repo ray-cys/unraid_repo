@@ -1,21 +1,22 @@
 #!/bin/bash
 clearLog=true
 arrayStarted=true
-# System Update Coordinator v1.1.1 -- personal Hubble maintenance.
+# System Update Coordinator v1.2.0 -- personal Hubble maintenance.
 # PURPOSE: Detect Docker/plugin/Unraid OS updates; automatically install only
 # explicitly approved, still-installed items during a bounded maintenance window.
 # Native DockerMan/plugin installers retain their normal configuration semantics.
 # No OS installation/reboot, image-channel change, forced import or DB rollback.
 # SCHEDULE: */15 * * * *; registry polling has its own six-hour per-item cache.
-# New installs: 13:15-15:30 Singapore; at most one/run and three/rolling 24h.
+# New installs: 13:15-15:30 Singapore; at most one/run, six Docker + two plugins/rolling 24h.
 # Default allowlist seeds once, bound to exact installed repository/source URL.
 # Retired items leave policy automatically after two complete inventory scans;
 # stopped items stay stopped. Reinstalling a retired/changed identity needs review.
 # New items default to notify-only, never inherit a broad wildcard approval.
 # STATE/LOG: /mnt/vault/cloud/logs/script/system_update_coordinator; atomic JSON,
 # private per-action recovery evidence, 2MiB log + two rotations, 30-day age bound.
-# Reports: normal actions and every installed/deferred item grouped at 15:45;
-# urgent failures bypass the cutoff. Undelivered pages stay in a durable outbox.
+# Reports: actions, available/deferred updates and unverified checks at 15:45.
+# Up-to-date entries and empty reports stay quiet; urgent failures bypass batching.
+# Undelivered pages stay in a durable outbox.
 # Recovery: journal before native recreation. Uncertain installs are inspected,
 # never blindly repeated. Previous image/config archived before update; latest
 # two finished recovery sets retained, plus any unresolved set (new work stops).
@@ -75,7 +76,7 @@ usr_ops_append_log() {
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="1.1.1"
+readonly SCRIPT_VERSION="1.2.0"
 # Keep configured per-item holds when approving the same installed identity.
 # Daily rolling tags need a shorter hold to avoid perpetually chasing rebuilds.
 readonly APPROVAL_JQ='def approval($old;$identity;$allow;$kind;$epoch):
@@ -126,9 +127,11 @@ policy_valid(){ jq -e '
  all(.docker[],.plugins[];(.allow|type)=="boolean" and (.identity|type)=="string" and (.candidateHoldHours==null or ((.candidateHoldHours|type)=="number" and .candidateHoldHours==(.candidateHoldHours|floor) and .candidateHoldHours>=1 and .candidateHoldHours<=168))) and
  (.window.start|type)=="string" and (.window.end|type)=="string" and
  (.window.start|test("^([01][0-9]|2[0-3]):[0-5][0-9]$")) and (.window.end|test("^([01][0-9]|2[0-3]):[0-5][0-9]$")) and .window.start<.window.end and
- ((.limits.dailyTotal // 3)|type)=="number" and ((.limits.dailyPlugins // 1)|type)=="number" and ((.limits.candidateHoldHours // 24)|type)=="number" and
- ((.limits.dailyTotal // 3)|floor)==(.limits.dailyTotal // 3) and (.limits.dailyTotal // 3)>=1 and (.limits.dailyTotal // 3)<=5 and
- ((.limits.dailyPlugins // 1)|floor)==(.limits.dailyPlugins // 1) and (.limits.dailyPlugins // 1)>=0 and (.limits.dailyPlugins // 1)<=2 and (.limits.dailyPlugins // 1)<=(.limits.dailyTotal // 3) and
+ ((.limits.dailyTotal // 8)|type)=="number" and ((.limits.dailyDocker // .limits.dailyTotal // 6)|type)=="number" and ((.limits.dailyPlugins // 2)|type)=="number" and ((.limits.candidateHoldHours // 24)|type)=="number" and
+ ((.limits.dailyTotal // 8)|floor)==(.limits.dailyTotal // 8) and (.limits.dailyTotal // 8)>=1 and (.limits.dailyTotal // 8)<=16 and
+ ((.limits.dailyDocker // .limits.dailyTotal // 6)|floor)==(.limits.dailyDocker // .limits.dailyTotal // 6) and (.limits.dailyDocker // .limits.dailyTotal // 6)>=1 and (.limits.dailyDocker // .limits.dailyTotal // 6)<=12 and
+ (.limits.dailyDocker==null or .limits.dailyTotal==(.limits.dailyDocker+(.limits.dailyPlugins // 2))) and
+ ((.limits.dailyPlugins // 2)|floor)==(.limits.dailyPlugins // 2) and (.limits.dailyPlugins // 2)>=0 and (.limits.dailyPlugins // 2)<=4 and (.limits.dailyPlugins // 2)<=(.limits.dailyTotal // 8) and
  ((.limits.candidateHoldHours // 24)|floor)==(.limits.candidateHoldHours // 24) and (.limits.candidateHoldHours // 24)>=1 and (.limits.candidateHoldHours // 24)<=168 and
  ((.reportTime // "15:45")|type)=="string" and ((.reportTime // "15:45")|test("^([01][0-9]|2[0-3]):[0-5][0-9]$")) and
  ((.limits.imageMaxBytes // 4294967296)|type)=="number" and ((.limits.imageMaxBytes // 4294967296)|floor)==(.limits.imageMaxBytes // 4294967296) and
@@ -233,7 +236,7 @@ initialize() {
     if [[ ! -f "$POLICY_FILE" ]];then
       adapter inventory >"$TMP_DIR/initial-inventory" || return 1
       jq "$APPROVAL_JQ"' (now|floor) as $epoch |
-        {schema:1,enabled:true,window:{start:"13:15",end:"15:30"},reportTime:"15:45",limits:{dailyTotal:3,dailyPlugins:1,candidateHoldHours:24,imageMaxBytes:4294967296},
+        {schema:1,enabled:true,window:{start:"13:15",end:"15:30"},reportTime:"15:45",limits:{dailyTotal:8,dailyDocker:6,dailyPlugins:2,candidateHoldHours:24,imageMaxBytes:4294967296},
          docker:(.docker|with_entries(.value=approval({};.value.repository;(.value.repository|length>0);"docker";$epoch))),
          plugins:(.plugins|with_entries(.value=approval({};.value.installed.url;(.key!="unRAIDServer.plg" and (.value.installed.url|startswith("https://")));"plugin";$epoch)))}' "$TMP_DIR/initial-inventory" >"$TMP_DIR/policy.initial" || return 1
       policy_valid "$TMP_DIR/policy.initial" && publish "$TMP_DIR/policy.initial" "$POLICY_FILE" || return 1
@@ -529,6 +532,15 @@ clean_recovery_sets() {
     done < <(jq -r '.jobs|to_entries|sort_by(-(.value.verifiedAt // .value.closedAt // 0))|.[]|select(.value.status=="COMPLETED" or .value.status=="RETIRED" or .value.status=="CLOSED_BY_OPERATOR")|.key' "$STATE_FILE")
 }
 
+# Independent Docker/plugin budgets; an exhausted Docker budget must not
+# prevent eligible plugins from using their own allowance, or vice versa.
+quota_available() {
+    local kind="$1" count limit
+    case "$kind" in docker) limit=$(jq -r '.limits.dailyDocker // .limits.dailyTotal // 6' "$POLICY_FILE");;plugin) limit=$(jq -r '.limits.dailyPlugins // 2' "$POLICY_FILE");;*) return 1;;esac
+    count=$(jq --arg kind "$kind" --argjson cutoff "$(( $(date +%s)-86400 ))" '[.jobs[]|select(.kind==$kind and (.dispatchedAt // 0)>=$cutoff)]|length' "$STATE_FILE") || return 1
+    ((count<limit))
+}
+
 install_one() {
     local key kind name identity candidate approved now count job_id old_id='' old_image='' recovery_path native_rc=0 post_guard_failed=false fresh
     [[ $(jq -r .enabled "$POLICY_FILE") == true ]] && window_open && within_budget 630 || return 0
@@ -536,7 +548,7 @@ install_one() {
     jq -e 'all(.jobs[];.status!="INTENT" and .status!="VERIFYING" and .status!="ATTENTION")' "$STATE_FILE" >/dev/null || { RESULT=DEFERRED;jq -e 'any(.jobs[];.status=="INTENT" or .status=="ATTENTION")' "$STATE_FILE" >/dev/null && RESULT=ATTENTION;SUMMARY='Automatic installs held for pending verification; reconciliation continues';return 0; }
     now=$(date +%s)
     count=$(jq --argjson cutoff "$((now-86400))" '[.jobs[]|select((.dispatchedAt // 0)>=$cutoff)]|length' "$STATE_FILE")
-    ((count<$(jq -r '.limits.dailyTotal // 3' "$POLICY_FILE"))) || return 0
+    ((count<$(jq -r '.limits.dailyTotal // 8' "$POLICY_FILE"))) || return 0
     adapter_compatible || { RESULT=DEFERRED;SUMMARY='Native update adapter unverified on this OS/interface; no automatic install';event warning 'Automatic installation deferred' "$SUMMARY; read-only evidence and existing intents retained. Validate native interfaces before enabling a new OS adapter." adapter-unverified;return 0; }
     while IFS=$'\t' read -r key kind name identity candidate;do
       [[ "$name" != unRAIDServer.plg ]] || continue
@@ -545,6 +557,7 @@ install_one() {
       # Failed/rejected digest/version stays quarantined until it changes or an
       # operator explicitly resolves the job; no reinstall loops.
       jq -e --arg key "$key" --arg candidate "$candidate" --argjson cutoff "$((now-6*3600))" 'all(.jobs[];.item!=$key or .candidate!=$candidate or (.status=="DEFERRED" and .startedAt<$cutoff))' "$STATE_FILE" >/dev/null || continue
+      quota_available "$kind" || { decision "$key" "Rolling 24-hour $kind update limit reached";continue; }
       backup_evidence "$kind" || { decision "$key" "Recent verified backup evidence unavailable";log INFO "$name: DEFERRED; recent verified backup evidence unavailable";continue; }
       if [[ "$kind" == docker ]];then
         jq -e --arg name "$name" '.docker[$name].running==true and .docker[$name].managed=="dockerman"' "$TMP_DIR/inventory.json" >/dev/null || { decision "$key" "Container stopped or not managed by DockerMan";continue; }
@@ -557,7 +570,6 @@ install_one() {
         same_repository "$(jq -r .runtimeImage "$TMP_DIR/definition-before.json")" "$identity" || { decision "$key" "Running image channel differs from saved template";log WARNING "$name: DEFERRED; running image channel differs from saved template; no update started";continue; }
         old_id=$(jq -r .id "$TMP_DIR/definition-before.json");old_image=$(jq -r .imageId "$TMP_DIR/definition-before.json")
       else
-        count=$(jq --argjson cutoff "$((now-86400))" '[.jobs[]|select(.kind=="plugin" and (.dispatchedAt // 0)>=$cutoff)]|length' "$STATE_FILE");((count<$(jq -r '.limits.dailyPlugins // 1' "$POLICY_FILE"))) || { decision "$key" "Rolling 24-hour plugin limit reached";continue; }
         bounded 120 "$NATIVE_PLUGIN" check "$name" >"$TMP_DIR/plugin-final-check.log" 2>&1 && adapter plugin-check "$name" >"$TMP_DIR/fresh.json" || { decision "$key" "Fresh plugin evidence unavailable";continue; }
         jq -e --arg version "$candidate" --arg identity "$identity" '.available==true and .compatible==true and .busy==false and .candidate.version==$version and .candidate.url==$identity' "$TMP_DIR/fresh.json" >/dev/null || { decision "$key" "Plugin candidate incompatible, busy, changed or no longer available";continue; }
         [[ $(jq -r .candidate.sha256 "$TMP_DIR/fresh.json") == "$(jq -r --arg key "$key" '.items[$key].evidence.candidate.sha256' "$STATE_FILE")" ]] || { decision "$key" "Plugin manifest changed; waiting for fresh stable candidate evidence";continue; }
@@ -679,12 +691,13 @@ render_update_report() {
         elif $now-($i.candidateSeenAt // $now)<(hold($i)*3600) then "Candidate stability hold: "+((($now-($i.candidateSeenAt // $now))/3600|floor)|tostring)+"/"+(hold($i)|tostring)+"h"
         elif ($i.decision.at // 0)>=$start and $i.decision.candidate==$i.candidate then $i.decision.reason
         elif any($s.jobs[];.status=="INTENT" or .status=="VERIFYING" or .status=="ATTENTION") then "Waiting for another installation to finish verification"
-        elif ([$s.jobs[]|select((.dispatchedAt // 0)>$now-86400)]|length)>=($p.limits.dailyTotal // 3) then "Rolling 24-hour update limit reached"
-        elif $i.kind=="plugin" and ([$s.jobs[]|select(.kind=="plugin" and (.dispatchedAt // 0)>$now-86400)]|length)>=($p.limits.dailyPlugins // 1) then "Rolling 24-hour plugin limit reached"
+        elif ([$s.jobs[]|select((.dispatchedAt // 0)>$now-86400)]|length)>=($p.limits.dailyTotal // 8) then "Rolling 24-hour update limit reached"
+        elif $i.kind=="docker" and ([$s.jobs[]|select(.kind=="docker" and (.dispatchedAt // 0)>$now-86400)]|length)>=($p.limits.dailyDocker // $p.limits.dailyTotal // 6) then "Rolling 24-hour Docker update limit reached"
+        elif $i.kind=="plugin" and ([$s.jobs[]|select(.kind=="plugin" and (.dispatchedAt // 0)>$now-86400)]|length)>=($p.limits.dailyPlugins // 2) then "Rolling 24-hour plugin limit reached"
         elif $i.kind=="docker" and $s.inventory.docker[$i.name].running!=true then "Installed container is stopped; left stopped"
         else "Queued for the next eligible maintenance slot; one installer per run" end;
       "Daily system update report - "+$day+" (Singapore)",
-      "Policy: "+(if $p.enabled then "automatic" else "paused" end)+"; starts "+$p.window.start+"-"+$p.window.end+"; daily limits "+(($p.limits.dailyTotal // 3)|tostring)+" total / "+(($p.limits.dailyPlugins // 1)|tostring)+" plugin(s).",
+      "Policy: "+(if $p.enabled then "automatic" else "paused" end)+"; starts "+$p.window.start+"-"+$p.window.end+"; daily limits "+(($p.limits.dailyDocker // $p.limits.dailyTotal // 6)|tostring)+" Docker / "+(($p.limits.dailyPlugins // 2)|tostring)+" plugin(s).",
       "", "UPDATED AND VERIFIED:",
       ([$s.jobs[]|select(.status=="COMPLETED" and (.verifiedAt // 0)>=$start)] as $done |
         if ($done|length)==0 then "- None verified today."
@@ -693,10 +706,11 @@ render_update_report() {
       ([$s.jobs[]|select(.status|IN("INTENT","VERIFYING","ATTENTION"))] as $pending |
         if ($pending|length)==0 then "- None."
         else $pending[]|"- "+.kind+"/"+.name+": "+.status+"; candidate "+(.candidate|short)+". "+(.reason // "Digest/version, retained configuration and readiness require confirmation")+". Recovery: "+(.recoveryPath // "not recorded") end),
-      "", "NOT UPDATED / INSTALLED INVENTORY STATUS:",
+      "", "AVAILABLE UPDATES / DEFERRED OR UNVERIFIED:",
       ($s.items|to_entries|sort_by(.key)|.[]|
         .key as $key|.value as $i|
-        if any($s.jobs[];.item==$key and ((.status|IN("INTENT","VERIFYING","ATTENTION")) or (.status=="COMPLETED" and .candidate==$i.candidate and (.verifiedAt // 0)>=$start))) then empty
+        if ($i.checkStatus=="VERIFIED" and $i.available!=true and ($i.missingScans // 0)==0) then empty
+        elif any($s.jobs[];.item==$key and ((.status|IN("INTENT","VERIFYING","ATTENTION")) or (.status=="COMPLETED" and .candidate==$i.candidate and (.verifiedAt // 0)>=$start))) then empty
         else "- "+$i.kind+"/"+$i.name+": "+reason($key;$i)+". Last check: "+(if ($i.checkedAt // 0)>0 then ($i.checkedAt|strflocaltime("%Y-%m-%d %H:%M SGT")) else "not yet performed" end) end),
       "", "Removed items retire after two complete inventories. No OS installation, reboot or automatic database rollback is performed."'
 }
@@ -706,6 +720,18 @@ daily_update_report() {
     day=$(TZ=Asia/Singapore date +%F);clock=$(TZ=Asia/Singapore date +%H:%M)
     [[ "$clock" > "$(jq -r '.reportTime // "15:45"' "$POLICY_FILE")" || "$clock" == "$(jq -r '.reportTime // "15:45"' "$POLICY_FILE")" ]] || return 0
     [[ $(jq -r '.lastDailyReportDay // ""' "$STATE_FILE") != "$day" ]] || return 0
+    local start content_rc=0
+    start=$(TZ=Asia/Singapore date -d "$day 00:00:00" +%s)
+    jq -e --argjson start "$start" '
+      any(.items[];.available==true or .checkStatus!="VERIFIED" or (.missingScans // 0)>0) or
+      any(.jobs[];(.status|IN("INTENT","VERIFYING","ATTENTION")) or (.status=="COMPLETED" and (.verifiedAt // 0)>=$start)) or
+      (.outbox|length)>0' "$STATE_FILE" >/dev/null || content_rc=$?
+    ((content_rc<=1)) || return 1
+    if ((content_rc==1));then
+      mutate --arg day "$day" '.lastDailyReportDay=$day' || return 1
+      log INFO 'No available updates, update outcomes or unverified checks to report; routine notification suppressed'
+      return 0
+    fi
     report=$(render_update_report) || return 1
     event normal 'Daily update summary' "$report" "daily-update-report:$day" && mutate --arg day "$day" '.lastDailyReportDay=$day | .normalDeliveryIds=[.outbox[]|select(.importance=="normal")|.id]'
 }
@@ -780,7 +806,7 @@ No command: automatic policy evaluation, bounded checks, approved installation i
 --report-time HH:MM             Set the daily grouped report time (default 15:45).
 --hold docker|plugin NAME H     Override one installed identity hold (1-168 hours).
 --archive-limit GIB             Bound previous-image size/archive (1-8 GiB; default 4).
---limits TOTAL PLUGINS HOLD_H   Set daily caps (1-5 total, 0-2 plugins) and
+--limits DOCKER PLUGINS HOLD_H  Set independent daily caps (1-12 Docker, 0-4 plugins) and
                                candidate hold (1-168 hours); one update/run stays fixed.
 --resolve JOB_ID NOTE           Close a reviewed failed/uncertain job without
                                claiming success; no installer/recovery is executed.
@@ -814,7 +840,7 @@ main() {
     case "${1:-}" in
       --status) QUIET_FINISH=true;jq -n --slurpfile p "$POLICY_FILE" --slurpfile s "$STATE_FILE" '{policy:$p[0],items:$s[0].items,jobs:$s[0].jobs,pendingNotifications:($s[0].outbox|length)}';return 0;;
       --pause|--resume) local enabled=false;[[ "$1" != --resume ]] || enabled=true;policy_update --argjson enabled "$enabled" '.enabled=$enabled';return $?;;
-      --limits) [[ $# == 4 && "$2" =~ ^[1-5]$ && "$3" =~ ^[0-2]$ && "$4" =~ ^[0-9]+$ ]] && ((10#$4>=1 && 10#$4<=168 && 10#$3<=10#$2)) || return 2;policy_update --argjson total "$2" --argjson plugins "$3" --argjson hold "$((10#$4))" '.limits += {dailyTotal:$total,dailyPlugins:$plugins,candidateHoldHours:$hold}';return $?;;
+      --limits) [[ $# == 4 && "$2" =~ ^([1-9]|1[0-2])$ && "$3" =~ ^[0-4]$ && "$4" =~ ^[0-9]+$ ]] && ((10#$4>=1 && 10#$4<=168)) || return 2;policy_update --argjson docker "$2" --argjson plugins "$3" --argjson hold "$((10#$4))" '.limits += {dailyDocker:$docker,dailyPlugins:$plugins,dailyTotal:($docker+$plugins),candidateHoldHours:$hold}';return $?;;
       --hold)
         [[ $# == 4 && ( "$2" == docker || "$2" == plugin ) && "$4" =~ ^[0-9]+$ ]] && valid_name "$3" && ((10#$4>=1 && 10#$4<=168)) || return 2
         jq -e --arg kind "$2" --arg name "$3" '((if $kind=="docker" then .docker[$name] else .plugins[$name] end).identity|type)=="string"' "$POLICY_FILE" >/dev/null || return 2

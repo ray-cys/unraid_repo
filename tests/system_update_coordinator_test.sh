@@ -36,6 +36,16 @@ jq '.complete=true' "$fixture/inventory" >"$fixture/next";mv "$fixture/next" "$f
 cp "$POLICY_FILE" "$fixture/policy.good"
 jq '.limits.dailyTotal="invalid"' "$POLICY_FILE" >"$fixture/policy.invalid"
 if policy_valid "$fixture/policy.invalid";then exit 1;fi
+# Independent rolling budgets must not consume the other application type.
+mutate --argjson now "$(date +%s)" '.jobs=([range(0;6)|{key:("docker"+tostring),value:{kind:"docker",dispatchedAt:$now,status:"COMPLETED"}}]|from_entries)'
+if quota_available docker;then exit 1;fi
+quota_available plugin
+mutate --argjson now "$(date +%s)" '.jobs=([range(0;2)|{key:("plugin"+tostring),value:{kind:"plugin",dispatchedAt:$now,status:"COMPLETED"}}]|from_entries)'
+quota_available docker
+if quota_available plugin;then exit 1;fi
+mutate --argjson now "$(date +%s)" '.jobs={old:{kind:"plugin",dispatchedAt:($now-86401),status:"COMPLETED"}}'
+quota_available plugin
+mutate '.jobs={}'
 printf 'Automatic identity-bound allowlist, stopped preservation, confirmed retirement and partial-inventory veto passed\n'
 # Full native-action orchestration uses a fake installer with actual journal writes.
 now=$(date +%s);candidate="sha256:$(printf '%064d' 1)"

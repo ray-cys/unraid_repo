@@ -27,8 +27,11 @@ from first observation. Docker tags explicitly named `nightly`, `develop` or
 next maintenance window. More frequent rebuilds still defer. Per-item holds are
 configurable, survive reapproval of the same identity, and appear in the report.
 A changed repository gets a fresh approval/hold policy.
-Install one item per invocation, at most **three in a rolling 24 hours**, including
-at most **one plugin**. Registry checks remain cached for six hours per item with
+Install one item per invocation, with independent rolling 24-hour ceilings of
+**six Docker updates and two plugin updates** (eight combined). Dispatched
+attempts consume their own application-type budget; one exhausted budget does
+not prevent the other type from updating. The maintenance window and all safety
+gates still apply, so the ceiling is not a requirement to install eight items. Registry checks remain cached for six hours per item with
 four due checks per run and bounded failure backoff. Inventory is published in
 bulk to reduce repeated state-file writes.
 
@@ -36,10 +39,11 @@ Normal installation/verification receipts are grouped into **one 15:45 daily
 summary**. Failures and attention reports bypass the cutoff. Routine events recorded after
 the daily summary wait for the next summary; failed pages of an already sealed
 report remain eligible for prompt retries, including across midnight. The report lists
-verified updates with previous/new version or digest, pending outcomes, and every
-remaining installed item with its last-check time and reason for staying unchanged.
-Unverified checks are not described as up to date. No-update days still receive
-this requested daily inventory summary. Pending normal receipts before the cutoff
+verified updates with previous/new version or digest, pending outcomes, available
+updates that were deferred, and unverified checks that require attention.
+Successfully checked, up-to-date apps/plugins are omitted. If there are no update
+actions, available updates, unknown checks or queued events, the routine report
+is suppressed entirely. Unknown/failed checks are never hidden as up to date. Pending normal receipts before the cutoff
 are expected, not notification failures in the backup audit.
 
 ## Installation and reconciliation
@@ -97,12 +101,40 @@ check and that pull; the coordinator detects an unexpected installed digest and
 holds further work rather than reporting success. Updating can migrate app
 state/databases: retaining an image does not guarantee a safe rollback. Recovery
 is intentionally manual for incompatible database changes. The two most recent
-finished recovery sets are retained alongside unresolved evidence; no broad image
+finished recovery sets are retained **globally across all apps/plugins**, alongside
+unresolved evidence; no broad image
 pruning or application-data deletion is performed. Native plugin verification
 establishes its version/source/manifest and finished installer task, not every
 plugin feature's behavior. Manual GUI updates are external writers: avoid starting
 one during this coordinator's active installation; process checks cannot make
 independent native interfaces transactional.
+
+## What is saved and pruned
+
+Immediately before dispatch, `/mnt/vault/backup/system_updates/JOB_ID/` contains:
+
+| Update type | Recovery evidence |
+|---|---|
+| Docker | Previous `docker image save` output compressed as `image.tar.gz`, its SHA-256, `template.xml`, selected runtime/configuration JSON, and existing appdata-backup evidence |
+| Plugin | Previous `installed.plg`, the proposed `candidate.plg`, and existing boot-backup evidence |
+
+The Docker archive is checked before installation. Plugin recovery is a retained
+manifest/installer definition and backup reference; it is **not an independent
+archive of every old plugin binary or dependency**. No fresh full appdata/boot
+backup is created for every update. Existing producer backups are required.
+
+After verified completion, owned recovery sets beyond the two newest finished
+sets are pruned on subsequent coordinator processing. This is two sets in total,
+not per app or per type. Pending/uncertain sets stay protected; unrecognized or
+unowned paths are preserved. A preparation failure before installer dispatch can
+clean its own known partial archive because the installed app was never changed.
+
+Unraid's native Docker updater attempts to remove the superseded local image
+when its image ID changes. The separate vault archive survives that local image
+cleanup until its recovery-set retention expires. The coordinator never runs
+`docker image prune`/`docker system prune`, uninstalls current plugins, or broadly
+cleans plugin package caches. Native plugin installation replaces its active
+plugin definition; cached-package cleanup remains specific to Unraid/the plugin.
 
 ## Retirement and policy changes without script edits
 
@@ -128,7 +160,7 @@ updater=/boot/config/plugins/user.scripts/scripts/system_update_coordinator/scri
 /bin/bash "$updater" --pause
 /bin/bash "$updater" --resume
 /bin/bash "$updater" --window 13:15 15:30
-/bin/bash "$updater" --limits 3 1 24
+/bin/bash "$updater" --limits 6 2 24
 /bin/bash "$updater" --hold docker kometa 12
 /bin/bash "$updater" --archive-limit 4
 /bin/bash "$updater" --report-time 15:45
@@ -136,8 +168,11 @@ updater=/boot/config/plugins/user.scripts/scripts/system_update_coordinator/scri
 /bin/bash "$updater" --allow-installed
 ```
 
-`--limits TOTAL PLUGINS HOLD_H` accepts 1–5 total updates/day, 0–2 plugins/day
-(no more than total), and a 1–168 hour candidate hold. One update/run remains fixed.
+`--limits DOCKER PLUGINS HOLD_H` sets **independent** ceilings: 1–12 Docker
+updates, 0–4 plugin updates per rolling 24 hours, and a 1–168 hour default hold.
+For example, `--limits 6 2 24` allows six Docker updates plus two plugins; its
+combined ceiling is derived as eight. Older saved policies without `dailyDocker`
+retain their previous combined ceiling until the CLI explicitly changes it. One update/run remains fixed.
 `--check-only` never installs, but still reconciles pending work and sends queued
 reports. Pausing stops new installation, not checks or reconciliation. Only the OS is excluded. `--allow-installed` explicitly approves
 current identities;

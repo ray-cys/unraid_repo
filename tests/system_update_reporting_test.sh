@@ -11,7 +11,7 @@ jq -n --argjson now "$now" '{schema:1,items:{"docker:current":{kind:"docker",nam
 jq -n '{schema:1,enabled:true,window:{start:"13:15",end:"15:30"},reportTime:"00:00",limits:{dailyTotal:3,dailyPlugins:1,candidateHoldHours:24},docker:{held:{identity:"repo:latest",allow:true,candidateHoldHours:12}},plugins:{}}' >"$POLICY_FILE"
 render_update_report >"$fixture/report"
 grep -q 'old -> new' "$fixture/report"
-grep -q 'Up to date at last successful check' "$fixture/report"
+if grep -q 'docker/current:' "$fixture/report";then exit 1;fi
 grep -q 'Candidate stability hold: 0/12h' "$fixture/report"
 grep -q 'Update status unverified: UNVERIFIED' "$fixture/report"
 grep -q 'OS update is manual' "$fixture/report"
@@ -57,4 +57,11 @@ mutate 'del(.lastDailyReportDay)'
 daily_update_report;flush_notifications
 [[ $(jq '.outbox|length' "$STATE_FILE") == 0 ]]
 grep -q 'Late verification completed' "$fixture/mail"
+# A completely current fleet needs no routine email; unknown checks still do.
+mutate '.items={"docker:current":{kind:"docker",name:"current",checkStatus:"VERIFIED",available:false,missingScans:0}} | .jobs={} | .outbox=[] | .normalDeliveryIds=[] | del(.lastDailyReportDay)'
+daily_update_report
+[[ $(jq '.outbox|length' "$STATE_FILE") == 0 ]]
+mutate '.items["docker:current"].checkStatus="UNVERIFIED" | .delivered={} | del(.lastDailyReportDay)'
+daily_update_report
+[[ $(jq '.outbox|length' "$STATE_FILE") -gt 0 ]]
 printf 'Daily updated/deferred/current/unknown classification, single report, UTF-8 pagination, failure retry and urgent bypass passed\n'
