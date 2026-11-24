@@ -12,6 +12,7 @@ def select(job,release):
   with contextlib.redirect_stdout(out):exec(compile(s,'selector','exec'),{})
  finally:sys.stdin=old
  return json.loads(out.getvalue())
+blocked=copy.deepcopy(j);blocked['failedReleases']=[{'guid':'new','title':'failed'}];assert select(blocked,r) is None
 assert select(j,r)['payload']=={'guid':'new','indexerId':1,'movieId':10}
 for field,value in [('protocol','torrent'),('customFormatScore',99),('mappedMovieId',11),('movieRequested',False),('languages',[{'id':2}]),('title','Old.Release'),('rejections',['Unknown future rejection']),('downloadAllowed',False),('history',{'grabbed':'2026-01-01'})]:
  bad=copy.deepcopy(r);bad[field]=value;assert select(j,bad) is None,(field,value)

@@ -2,7 +2,7 @@
 # shellcheck disable=SC2034
 arrayStarted=true
 ###############################################################################
-# Media Integrity Audit v2.0.0 -- personal Unraid User Script
+# Media Integrity Audit v2.1.0 -- personal Unraid User Script
 #
 # PURPOSE / USE CASE
 # ------------------
@@ -87,7 +87,7 @@ arrayStarted=true
 ###############################################################################
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 BAZARR_CONTAINER="bazarr"
 MEDIA_HOST_ROOT="/mnt/user/media"
 MEDIA_CONTAINER_ROOT="/data"
@@ -128,6 +128,10 @@ RADARR_API_KEY="${RADARR_API_KEY:-PUT_YOUR_RADARR_API_KEY_HERE}"
 SONARR_MEDIA_ROOT="/data"
 RADARR_MEDIA_ROOT="/data"
 RECOVERY_FILE="$STATE_DIR/recovery.json"
+RECOVERY_PREVIOUS_FILE="$STATE_DIR/recovery.previous.json"
+RECOVERY_DOWNLOAD_ROOTS=(/mnt/user/media/net/incomplete /mnt/user/media/net/complete)
+RECOVERY_MAX_ATTEMPTS=2
+RECOVERY_RETRY_SECONDS=14400
 RECOVERY_MAX_NEW_PER_RUN=1
 RECOVERY_MAX_NEW_PER_WEEK=3
 RECOVERY_WAIT_DAYS=28
@@ -311,11 +315,11 @@ render_report() {
     jq -n --slurpfile state "$TMP_DIR/state.json" --slurpfile stats "$TMP_DIR/stats.json" --slurpfile journal "$TMP_DIR/recovery-report.json" --slurpfile receipt "$TMP_DIR/delivery.json" \
       --argjson enabled "$AUTO_RECOVERY_ENABLED" --argjson now "$now" --argjson max "$NOTIFY_MAX_ITEMS" --arg status "$status" --arg reason "$reason" --arg mode "$MODE" --arg note "$RECOVERY_NOTE" '
       [$state[0].files|to_entries[]|select(.value.issue!=null)] as $issues |
-      [$journal[0].actions|to_entries[]|.notice=(.key+":"+.value.status+":"+.value.reason)] as $jobs |
-      [$jobs[]|select(.value.status=="required" or .value.status=="downloading" or .value.status=="blocked" or .value.status=="review" or .value.status=="recovered" or
-        (.value.status=="verifying" and $now-(.value.importedAt // .value.startedAt)>86400))|
+      [$journal[0].actions|to_entries[]|.notice=(.key+":"+.value.status+":"+.value.reason+(if .value.status=="verifying" and (.value.verificationDeadlineAt // 0)>0 and $now>=.value.verificationDeadlineAt then ":native_retention_elapsed" else "" end))] as $jobs |
+      [$jobs[]|select(.value.status=="required" or .value.status=="downloading" or .value.status=="blocked" or .value.status=="review" or .value.status=="recovered" or .value.status=="cancelled" or .value.status=="resolved" or .value.status=="retry_wait" or
+        (.value.status=="verifying" and $now>=(.value.verificationAttentionAt // ((.value.importedAt // .value.startedAt)+86400))))|
         select(.notice as $k|($receipt[0].recoveryEvents // []|index($k))==null)] as $notices |
-      [$jobs[]|select(.value.status=="required" or .value.status=="blocked" or .value.status=="review" or (.value.status=="verifying" and $now-(.value.importedAt // .value.startedAt)>86400))] as $attention |
+      [$jobs[]|select(.value.status=="required" or .value.status=="blocked" or .value.status=="review" or .value.status=="retry_wait" or (.value.status=="verifying" and $now>=(.value.verificationAttentionAt // ((.value.importedAt // .value.startedAt)+86400))))] as $attention |
       (if $status=="FAILED" then "FAILED" elif ($issues|length)>0 or ($attention|length)>0 or $note!="" then "WARNING" else $status end) as $effective |
       {schema:1,name:"media_integrity_audit",status:$effective,epoch:$now,mode:$mode,recoveryEnabled:$enabled,stats:$stats[0],
        recoveryActions:($jobs|length),recoveryAttention:($attention|length),activeFindings:($issues|length),recoveries:([$jobs[]|select(.value.status=="recovered")]|length),
@@ -330,13 +334,15 @@ render_report() {
         "\n  Action/evidence: "+.value.reason+"\n  Target IDs: "+(.value.targets|tostring)+"; original file ID: "+(.value.fileId|tostring)+
         "\n  Selected release: "+(.value.selected.title // "none; original retained")+"; download ID: "+(.value.downloadId // "none")+
         "\n  Replacement files: "+((.value.replacementFiles // []|map({path,fileId}))|tostring)+
-        "\n  Recent transitions: "+((.value.events[-5:] // []|map(.status+": "+.reason))|join("; "))]+
+        "\n  Attempts: "+((.value.attempts // []|length)|tostring)+"; retry no earlier than epoch: "+((.value.retryAt // 0)|tostring)+
+        "\n  Native recycling retention days: "+((.value.binRetentionDays // "unknown")|tostring)+"; verification deadline: "+(if (.value.verificationDeadlineAt // 0)>0 then (.value.verificationDeadlineAt|strftime("%Y-%m-%d %H:%M UTC")) else "no timed native cleanup verified" end)+
+        "\n  Last API diagnostic: "+((.value.lastError // {})|tostring)+"\n  Recent transitions: "+((.value.events[-5:] // []|map(.status+": "+.reason))|join("; "))]+
        ["", "Current media findings:"]+
        [$issues[:$max][]|"- "+.key+" | "+.value.issue.kind+"\n  Finding ID: "+.value.issue.id+"; separate confirming runs: "+((.value.issue.confirmedRuns // 0)|tostring)+
         "\n  Evidence: "+((.value.issue.evidence // "")|.[0:650])+"\n  Next action: "+
         (if .value.issue.kind=="decode_error" and .value.issue.confirmed then "Replacement required after two separate confirming runs. "+(if $enabled then "Exact-rule selection is bounded; see job outcome." else "Recovery disabled; review evidence before enabling automation." end)
          else "Review access/tool/resource evidence. This issue does not authorize automatic replacement." end)]+
-       ["", "Full verification requires all planned decode ranges; a download/import event alone does not prove integrity. Native bin retention continues independently. Verification exceeding 24 hours needs attention; no rollback is guaranteed. --recovery-status includes bounded transition history."]|join("\n"))}' >"$temp" || return 1
+       ["", "Full verification requires all planned decode ranges; a download/import event alone does not prove integrity. Native bin retention continues independently. Verification alerts before the observed native retention expires (or after 24 hours when no deadline applies); no rollback is guaranteed. --recovery-status includes bounded transition history."]|join("\n"))}' >"$temp" || return 1
     body=$(jq -r .body "$temp"|head -c 23000|iconv -f UTF-8 -t UTF-8 -c || true)
     printf '%s\n' "$body" >"$STATE_DIR/latest-report.txt.new" && mv "$STATE_DIR/latest-report.txt.new" "$STATE_DIR/latest-report.txt" || return 1
     signature=$(jq -c '{status,findingKeys,recoveryAttentionKeys,note:$note,reason:$reason}' --arg note "$RECOVERY_NOTE" --arg reason "$( [[ "$status" != FAILED ]] || printf '%s' "$reason" )" "$temp"|sha256sum|awk '{print $1}')
@@ -362,19 +368,21 @@ render_report() {
 
 # Arr-native recovery never moves/unlinks library media, deletes file records,
 # changes monitoring, forces imports or purges bins. Only POST /release is allowed.
-recovery_valid() {
-    [[ -f "$RECOVERY_FILE" && ! -L "$RECOVERY_FILE" ]] || return 1
+recovery_valid() { recovery_document_valid "$RECOVERY_FILE"; }
+recovery_document_valid() {
+    local document="$1"
+    [[ -f "$document" && ! -L "$document" ]] || return 1
     jq -e '.schema==1 and .workflow=="arr-native" and (.actions|type)=="object" and all(.actions|to_entries[];
       (.key|test("^[a-f0-9]{64}$")) and (.value.app=="Sonarr" or .value.app=="Radarr") and
       (.value.parentId|type)=="number" and .value.parentId>0 and (.value.fileId|type)=="number" and .value.fileId>0 and
       (.value.path|type)=="string" and (.value.path|startswith("/")|not) and all(.value.path|split("/")[];.!="" and .!="." and .!="..") and
       (.value.identity|type)=="array" and (.value.identity|length)==5 and all(.value.identity[];type=="string" and test("^[0-9]+$")) and
       (.value.targets|type)=="array" and (.value.targets|length)>0 and all(.value.targets[];type=="number" and .>0) and
-      (.value.status as $s|["required","selected","grab_intent","downloading","imported","verifying","recovered","blocked","review"]|index($s))!=null and
-      (.value.events|type)=="array" and (.value.events|length)<=32)' "$RECOVERY_FILE" >/dev/null
+      (.value.status as $s|["required","selected","grab_intent","downloading","imported","verifying","recovered","blocked","review","cancelled","resolved","retry_wait"]|index($s))!=null and
+      (.value.events|type)=="array" and (.value.events|length)<=32)' "$document" >/dev/null
 }
 recovery_update() {
-    local filter="$1" tmp fd;shift
+    local filter="$1" tmp fd previous="${RECOVERY_FILE%.json}.previous.json";shift
     tmp=$(mktemp "$STATE_DIR/.recovery.XXXXXX") || return 1
     jq "$@" "$filter" "$RECOVERY_FILE" >"$tmp" || { rm -f "$tmp";return 1; }
     # Journal only meaningful transitions, capped per action; polling/progress
@@ -382,25 +390,41 @@ recovery_update() {
     jq --slurpfile old "$RECOVERY_FILE" --argjson now "$(date +%s)" '.actions |= with_entries(
       .key as $id | if ($old[0].actions[$id].status!="" and ($old[0].actions[$id].status!=.value.status or $old[0].actions[$id].reason!=.value.reason)) then
        .value.events=((.value.events // [])+[{at:$now,status:.value.status,reason:.value.reason}]|.[-32:]) else . end)' "$tmp" >"$tmp.events" && mv "$tmp.events" "$tmp" || return 1
+    recovery_document_valid "$tmp" || { rm -f "$tmp";return 1; }
+    if jq -e --slurpfile next "$tmp" '.==$next[0]' "$RECOVERY_FILE" >/dev/null;then rm -f "$tmp";return 0;fi
     exec {fd}>"$STATE_EXPORT_LOCK" || return 1
-    flock -s -w 5 "$fd" && sync -f "$tmp" && mv -f "$tmp" "$RECOVERY_FILE" && sync -f "$RECOVERY_FILE"
+    flock -s -w 5 "$fd" && recovery_valid && cp "$RECOVERY_FILE" "$previous.new" && sync -f "$previous.new" && mv -f "$previous.new" "$previous" && sync -f "$tmp" && mv -f "$tmp" "$RECOVERY_FILE" && sync -f "$RECOVERY_FILE"
     local rc=$?;exec {fd}>&-;rm -f "$tmp";return "$rc"
 }
 recovery_set() {
-    recovery_update '.actions[$id].status=$status | .actions[$id].reason=$reason | .actions[$id].updatedAt=$now' \
+    recovery_update 'if .actions[$id].status==$status and .actions[$id].reason==$reason then . else .actions[$id].status=$status | .actions[$id].reason=$reason | .actions[$id].updatedAt=$now end' \
       --arg id "$1" --arg status "$2" --arg reason "$3" --argjson now "$(date +%s)"
 }
+# Retry idempotent reads only. Requests and diagnostics never include API keys.
 recovery_api() {
-    local method="$1" endpoint="$2" output="$3" payload="${4:-}" rc=0 args=()
-    RECOVERY_HTTP=000
-    # Enforce the mutation boundary here, not merely at callers.
+    local method="$1" endpoint="$2" output="$3" payload="${4:-}" rc=0 attempt limit=1 remaining seconds args=()
+    RECOVERY_HTTP=000;RECOVERY_LAST_OPERATION="$method $endpoint";RECOVERY_LAST_EXIT=0
     [[ "$method" == GET || ( "$method" == POST && "$endpoint" == /release ) ]] || return 2
-    ((RECOVERY_DEADLINE==0 || $(date +%s)<RECOVERY_DEADLINE)) || return 124
+    [[ "$method" != GET ]] || limit=2
     [[ "$method" != POST ]] || args+=(--header 'Content-Type: application/json' --data-binary "@$payload")
-    RECOVERY_HTTP=$(curl --silent --show-error --retry 0 --connect-timeout 4 --max-time 15 --max-filesize 67108864 \
-      --request "$method" --header "X-Api-Key: $RECOVERY_KEY" --output "$output" --write-out '%{http_code}' \
-      "${args[@]}" "$RECOVERY_ROOT$endpoint" 2>"$TMP_DIR/recovery-curl.error") || rc=$?
-    ((rc==0)) && [[ "$RECOVERY_HTTP" == 2?? || ( "$method" == GET && "$RECOVERY_HTTP" == 404 ) ]]
+    for ((attempt=1;attempt<=limit;attempt++));do
+        seconds=10;[[ "$endpoint" != /release\?* ]] || seconds=30
+        if ((RECOVERY_DEADLINE>0));then remaining=$((RECOVERY_DEADLINE-$(date +%s)));((remaining>0)) || { RECOVERY_LAST_EXIT=124;return 124; };((remaining>=seconds)) || seconds=$remaining;fi
+        rc=0
+        RECOVERY_HTTP=$(curl --silent --show-error --retry 0 --connect-timeout 4 --max-time "$seconds" --max-filesize 67108864 \
+          --request "$method" --header "X-Api-Key: $RECOVERY_KEY" --output "$output" --write-out '%{http_code}' \
+          "${args[@]}" "$RECOVERY_ROOT$endpoint" 2>"$TMP_DIR/recovery-curl.error") || rc=$?
+        RECOVERY_LAST_EXIT=$rc
+        if ((rc==0)) && [[ "$RECOVERY_HTTP" == 2?? || ( "$method" == GET && "$RECOVERY_HTTP" == 404 ) ]];then return 0;fi
+        [[ "$method" == GET && ( "$rc" == 28 || "$rc" == 7 || "$rc" == 6 || "$RECOVERY_HTTP" == 429 || "$RECOVERY_HTTP" == 502 || "$RECOVERY_HTTP" == 503 || "$RECOVERY_HTTP" == 504 ) ]] || break
+        ((attempt>=limit)) || sleep 1
+    done
+    return 1
+}
+recovery_api_diagnostic() {
+    local id="$1" detail="$2"
+    recovery_update '.actions[$id].lastError={at:$now,detail:$detail,operation:$operation,http:$http,exit:$exit}' --arg id "$id" --arg detail "$detail" \
+      --arg operation "${RECOVERY_LAST_OPERATION:-native response validation}" --arg http "${RECOVERY_HTTP:-000}" --argjson exit "${RECOVERY_LAST_EXIT:-0}" --argjson now "$(date +%s)"
 }
 recovery_connection() {
     case "$1" in Sonarr) RECOVERY_ROOT="$SONARR_API_ROOT";RECOVERY_KEY="$SONARR_API_KEY";;Radarr) RECOVERY_ROOT="$RADARR_API_ROOT";RECOVERY_KEY="$RADARR_API_KEY";;*) return 1;;esac
@@ -425,11 +449,6 @@ recovery_quiet_app() {
       (.records|type)=="array" and (.totalRecords|type)=="number" and .totalRecords==(.records|length)
       and all(.records[]; (.[$field] // 0)>0 and .[$field]!=$parent)' "$queue" >/dev/null || return 1
     recovery_api GET '/command' "$commands" && [[ "$RECOVERY_HTTP" == 200 ]] && jq -e 'type=="array" and all(.[]; ((.status // ""|ascii_downcase) as $s | ["completed","failed","cancelled","aborted"] | index($s))!=null)' "$commands" >/dev/null
-}
-recovery_capacity_ready() {
-    local bytes="$1" available
-    available=$(df -PB1 -- "$MEDIA_HOST_ROOT" | awk 'NR==2 {print $4}') || return 1
-    [[ "$bytes" =~ ^[0-9]+$ && "$available" =~ ^[0-9]+$ ]] && ((available>=bytes+10*1024*1024*1024))
 }
 recovery_platform_ready() {
     local version
@@ -511,6 +530,7 @@ for r in x['\''releases'\'']:
   revision=lambda z:(z.get('\''real'\'',0),z.get('\''version'\'',1),bool(z.get('\''isRepack'\'',False)))
   if qid==oldq and revision(q.get('\''revision'\'',{}))<revision(old['\''quality'\''].get('\''revision'\'',{})):continue
   if old.get('\''languages'\'') and sorted(v['\''id'\''] for v in r.get('\''languages'\'',[]))!=sorted(v['\''id'\''] for v in old['\''languages'\'']):continue
+  if any(v.get('\''guid'\'')==release['\''guid'\''] or v.get('\''title'\'')==release['\''title'\''] for v in j.get('\''failedReleases'\'',[])):continue
   if release['\''title'\'']==old.get('\''sceneName'\'') or (r.get('\''history'\'') or {}).get('\''grabbed'\''):continue
   reasons=decision.get('\''rejections'\'')
   if not isinstance(reasons,list):continue
@@ -552,11 +572,21 @@ recovery_plan() {
        .targetDetails=(if .app=="Sonarr" then [$details[0][]|{id,seriesId,seasonNumber,episodeNumber}] else [] end) | .events=[]' "$base" >"$output" || return 1
     jq -e '.externalId>0' "$output" >/dev/null
 }
+# Bound complete pagination. Duplicate IDs or changing totals fail closed.
 recovery_history() {
-    local job="$1" output="$2" download="${3:-}" query
+    local job="$1" output="$2" download="${3:-}" query page count total=-1 loaded=0 expected part="$TMP_DIR/history-page.json" rows="$TMP_DIR/history-rows.jsonl"
     if [[ -n "$download" ]];then query="downloadId=$download";elif [[ $(jq -r .app "$job") == Sonarr ]];then query="episodeId=$(jq -r '.targets[0]' "$job")";else query="movieIds=$(jq -r .parentId "$job")";fi
-    recovery_api GET "/history?page=1&pageSize=1000&sortKey=date&sortDirection=descending&$query" "$output" && [[ "$RECOVERY_HTTP" == 200 ]] || return 1
-    jq -e '(.records|type)=="array" and .totalRecords==(.records|length)' "$output" >/dev/null
+    : >"$rows"
+    for ((page=1;page<=10;page++));do
+        recovery_api GET "/history?page=$page&pageSize=200&sortKey=date&sortDirection=descending&$query" "$part" && [[ "$RECOVERY_HTTP" == 200 ]] || return 1
+        jq -e '(.records|type)=="array" and (.totalRecords|type)=="number" and .totalRecords>=0 and all(.records[];(.id|type)=="number" and .id>0)' "$part" >/dev/null || return 1
+        expected=$(jq .totalRecords "$part");count=$(jq '.records|length' "$part")
+        ((expected<=2000 && (total<0 || expected==total))) || return 1;total=$expected
+        jq -c '.records[]' "$part" >>"$rows" || return 1;loaded=$((loaded+count))
+        ((loaded<total)) || break;((count>0)) || return 1
+    done
+    jq -s --argjson total "$total" 'unique_by(.id)|select(length==$total)|{totalRecords:$total,records:.}' "$rows" >"$output" || return 1
+    jq -e --arg download "$download" '.totalRecords==(.records|length) and (if $download!="" then all(.records[];.downloadId==$download) else true end)' "$output" >/dev/null
 }
 recovery_correlate() {
     local id="$1" job="$2" history="$TMP_DIR/native-history.json" download selected="$TMP_DIR/native-grabs.json"
@@ -571,7 +601,7 @@ recovery_correlate() {
       ($g|length)>0 and all($g[];.downloadId==$download and .sourceTitle==$j[0].selected.title and .data.guid==$j[0].selected.guid and
       (if $j[0].app=="Sonarr" then .seriesId==$j[0].parentId else .movieId==$j[0].parentId end)) and
       (if $j[0].app=="Sonarr" then ([$g[].episodeId]|sort|unique)==($j[0].targets|sort) else true end)' "$history" >/dev/null || return 1
-    recovery_update '.actions[$id].downloadId=$download' --arg id "$id" --arg download "$download" || return 1
+    recovery_update '.actions[$id].downloadId=$download | if (.actions[$id].attempts // []|length)>0 then .actions[$id].attempts[-1].downloadId=$download | .actions[$id].attempts[-1].outcome="grab_verified" else . end' --arg id "$id" --arg download "$download" || return 1
     recovery_set "$id" downloading 'Selected release correlated through exact native grab history and download ID; original retained while Arr downloads/imports. No repeated grab.'
 }
 recovery_followup() {
@@ -582,18 +612,24 @@ recovery_followup() {
     recovery_api GET '/queue?page=1&pageSize=1000&includeUnknownSeriesItems=true&includeUnknownMovieItems=true' "$queue" && [[ "$RECOVERY_HTTP" == 200 ]] || return 1
     jq -e '(.records|type)=="array" and .totalRecords==(.records|length)' "$queue" >/dev/null || return 1
     jq --slurpfile j "$job" '[.records[]|select((.downloadId // ""|ascii_downcase)==($j[0].downloadId|ascii_downcase))|{status,trackedDownloadState,trackedDownloadStatus,sizeleft,statusMessages}]' "$queue" >"$progress" || return 1
-    recovery_update '.actions[$id].nativeQueue=$p[0] | .actions[$id].downloadCompletedAt=(if any($p[0][];.status=="completed") then (.actions[$id].downloadCompletedAt // $now) else .actions[$id].downloadCompletedAt end)' --arg id "$id" --slurpfile p "$progress" --argjson now "$(date +%s)" || return 1
+    recovery_update 'if (.actions[$id].nativeQueue // []|map({status,trackedDownloadState,trackedDownloadStatus,statusMessages}))==($p[0]|map({status,trackedDownloadState,trackedDownloadStatus,statusMessages})) and $now-(.actions[$id].progressSavedAt // 0)<900 then . else .actions[$id].progressSavedAt=$now | .actions[$id].nativeQueue=$p[0] | .actions[$id].downloadCompletedAt=(if any($p[0][];.status=="completed") then (.actions[$id].downloadCompletedAt // $now) else .actions[$id].downloadCompletedAt end) end' --arg id "$id" --slurpfile p "$progress" --argjson now "$(date +%s)" || return 1
     recovery_history "$job" "$history" "$(jq -r .downloadId "$job")" || return 1
-    if jq -e 'any(.records[];.eventType=="downloadFailed" or .eventType=="downloadIgnored")' "$history" >/dev/null;then recovery_set "$id" review 'Selected download was failed/ignored by native Arr. No automatic second release or blocklist change; original/replacement state retained for review.';return 0;fi
+    if jq -e 'any(.records[];.eventType=="downloadFailed" or .eventType=="downloadIgnored")' "$history" >/dev/null;then
+        if recovery_prepare_retry "$id" "$job" "$history";then return 0;fi
+        recovery_set "$id" review 'Native download failed/ignored; automatic alternative was not authorised. Requires exact archive-failure evidence, unchanged monitored original and fewer than two attempts. Storage/manual/unknown failures stay protected; no blocklist or forced import.';return 0;fi
     local owner="$TMP_DIR/native-followup-owner.json" parent_kind=movie
     [[ "$app" != Sonarr ]] || parent_kind=series
     recovery_api GET "/$parent_kind/$parent" "$owner" && [[ "$RECOVERY_HTTP" == 200 ]] || return 1
     jq -e --slurpfile j "$job" '.id==$j[0].parentId and (if $j[0].app=="Sonarr" then .tvdbId else .tmdbId end)==$j[0].externalId' "$owner" >/dev/null || return 1
+    if jq -e '.monitored==false' "$owner" >/dev/null;then
+        if recovery_observe_external "$id" "$job";then return 0;fi
+    fi
     : >"$rows"
     while read -r target;do
         recovery_api GET "/$kind/$target" "$refs" && [[ "$RECOVERY_HTTP" == 200 ]] || return 1
         jq -e --argjson target "$target" --argjson parent "$parent" --arg app "$app" '.id==$target and .hasFile==true and (if $app=="Sonarr" then .seriesId==$parent else .id==$parent end)' "$refs" >/dev/null || { valid=false;break; }
         file=$(jq -r --arg app "$app" 'if $app=="Sonarr" then .episodeFileId else .movieFileId end' "$refs")
+        if [[ "$file" == "$(jq -r .fileId "$job")" ]] && jq -e '.monitored==false' "$refs" >/dev/null;then recovery_observe_external "$id" "$job";return $?;fi
         [[ "$file" =~ ^[1-9][0-9]*$ && "$file" != "$(jq -r .fileId "$job")" ]] || { valid=false;break; }
         recovery_api GET "/$endpoint/$file" "$refs" && [[ "$RECOVERY_HTTP" == 200 ]] || return 1
         jq -e --argjson file "$file" --argjson parent "$parent" --arg app "$app" '.id==$file and (if $app=="Sonarr" then .seriesId==$parent else .movieId==$parent end)' "$refs" >/dev/null || return 1
@@ -604,7 +640,7 @@ recovery_followup() {
           (.data.fileId|tonumber?)==$file and .data.importedPath==$path and (if $j[0].app=="Sonarr" then .seriesId==$j[0].parentId and .episodeId==$target else .movieId==$target end))' "$history" >/dev/null || return 1
         recovery_file_tool identity "$path" >"$TMP_DIR/native-current-identity.json" || return 1
         jq -e --slurpfile j "$job" '.[0:4]!=$j[0].identity[0:4]' "$TMP_DIR/native-current-identity.json" >/dev/null || return 1
-        jq -cn --arg path "$path" --argjson file "$file" --slurpfile identity "$TMP_DIR/native-current-identity.json" '{path:$path,fileId:$file,identity:$identity[0]}' >>"$rows"
+        jq -cn --arg path "$path" --argjson file "$file" --argjson added "$added" --slurpfile identity "$TMP_DIR/native-current-identity.json" '{path:$path,fileId:$file,identity:$identity[0],importedAt:$added}' >>"$rows"
     done < <(jq -r '.targets[]' "$job")
     if [[ "$valid" != true ]];then
         if (( $(date +%s)-$(jq -r .startedAt "$job")>RECOVERY_WAIT_DAYS*86400 ));then recovery_set "$id" review 'Replacement not imported by the recovery deadline. No original was moved/deleted by this script; inspect the exact native download/import outcome.';fi
@@ -613,28 +649,149 @@ recovery_followup() {
         fi
         return 0
     fi
-    recovery_update '.actions[$id].replacementPaths=[$rows[].path] | .actions[$id].replacementFiles=$rows' --arg id "$id" --slurpfile rows "$rows" || return 1
+    recovery_update '.actions[$id].replacementPaths=[$rows[].path] | .actions[$id].replacementFiles=$rows | .actions[$id].importedAt=([$rows[].importedAt]|min)' --arg id "$id" --slurpfile rows "$rows" || return 1
+    recovery_retention "$id" "$job" || return 1
     if jq -e --slurpfile rows "$rows" --slurpfile j "$job" 'all($rows[];. as $r|$r.path as $p| .identity as $i|
        $state[0].files[$p] as $f|$f!=null and $f.identity==$i and $f.issue==null and ($f.verifiedAt // 0)>=$j[0].startedAt)' \
        --slurpfile state "$TMP_DIR/state.json" -n >/dev/null;then
-        recovery_update '.actions[$id].replacementVerifiedAt=$now' --arg id "$id" --argjson now "$(date +%s)" || return 1
+        recovery_update '.actions[$id].replacementVerifiedAt=$now | .actions[$id].lastError=null' --arg id "$id" --argjson now "$(date +%s)" || return 1
         recovery_set "$id" recovered 'Replacement completed: exact native download/import/file IDs and current filesystem version passed all planned decode ranges. Arr performed replacement and owns original recycling; script performed no media move/delete.'
     else
         recovery_update '.actions[$id].importedAt=(.actions[$id].importedAt // $now)' --arg id "$id" --argjson now "$(date +%s)" || return 1
         recovery_set "$id" verifying 'Arr imported the exact replacement. Priority resumable integrity verification pending; original recycling is owned by Arr. Native bin retention continues during verification.'
     fi
 }
+# Selected-release capacity includes packed/unpacked download space plus an
+# import copy. Shared filesystem budgets are combined instead of double-counted.
+recovery_capacity_ready() {
+    local bytes="$1" selected="${2:-false}" path device available need library_device="" reserve=$((10*1024*1024*1024))
+    local -a paths=("$MEDIA_HOST_ROOT")
+    local -A required=() free=()
+    [[ "$bytes" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "$selected" != true ]] || paths+=("${RECOVERY_DOWNLOAD_ROOTS[@]}")
+    for path in "${paths[@]}";do
+        [[ "$path" == "$MEDIA_HOST_ROOT" || "$path" == "$MEDIA_HOST_ROOT/"* ]] && [[ -d "$path" && ! -L "$path" ]] || return 1
+        device=$(stat -c %d -- "$path") || return 1
+        available=$(df -PB1 -- "$path"|awk 'NR==2 {print $4}') || return 1
+        [[ "$available" =~ ^[0-9]+$ ]] || return 1
+        need=$bytes;[[ "$path" == "$MEDIA_HOST_ROOT" ]] || need=$((bytes*2))
+        if [[ "$path" == "$MEDIA_HOST_ROOT" ]];then library_device=$device
+        elif ((need>${required[$device]:-0}));then required[$device]=$need;fi
+        if [[ -z "${free[$device]+set}" ]] || ((available<free[$device]));then free[$device]=$available;fi
+    done
+    required[$library_device]=$(( ${required[$library_device]:-0}+bytes ))
+    for device in "${!required[@]}";do
+        # Ten percent allows for native size estimates/filesystem overhead.
+        ((free[$device]>=required[$device]+required[$device]/10+reserve)) || return 1
+    done
+}
+recovery_retention() {
+    local id="$1" job="$2" cfg="$TMP_DIR/native-retention.json" endpoint=/config/mediamanagement now days imported deadline attention
+    now=$(date +%s)
+    if (( now-$(jq -r '.binPolicyCheckedAt // 0' "$job")>=43200 ));then
+        [[ "$RECOVERY_ROOT" != */v5 ]] || endpoint=/settings/mediamanagement
+        recovery_api GET "$endpoint" "$cfg" && [[ "$RECOVERY_HTTP" == 200 ]] || return 1
+        jq -e '(.recycleBin|type)=="string" and (.recycleBin|startswith("/")) and (.recycleBinCleanupDays|type)=="number" and .recycleBinCleanupDays>=0 and .recycleBinCleanupDays==(.recycleBinCleanupDays|floor)' "$cfg" >/dev/null || return 1
+        recovery_update '.actions[$id].binRetentionDays=$c[0].recycleBinCleanupDays | .actions[$id].binPolicyCheckedAt=$now' --arg id "$id" --slurpfile c "$cfg" --argjson now "$now" || return 1
+    fi
+    days=$(jq -r --arg id "$id" '.actions[$id].binRetentionDays // 0' "$RECOVERY_FILE")
+    imported=$(jq -r --arg id "$id" '.actions[$id].importedAt // 0' "$RECOVERY_FILE")
+    if ((imported>0 && days>0));then
+        deadline=$((imported+days*86400));attention=$((deadline-(days*86400/2<43200 ? days*86400/2 : 43200)))
+    else deadline=0;attention=$(( (imported>0 ? imported : now)+86400 ));fi
+    recovery_update '.actions[$id].verificationDeadlineAt=$deadline | .actions[$id].verificationAttentionAt=$attention' --arg id "$id" --argjson deadline "$deadline" --argjson attention "$attention"
+}
+# Read current native/physical identities independently of the selected download.
+# Full audit proof can close externally fixed media without claiming our grab
+# caused the fix. Native unmonitoring cancels only while the original still exists.
+recovery_observe_external() {
+    local id="$1" job="$2" refs="$TMP_DIR/external-target.json" owner="$TMP_DIR/external-owner.json" rows="$TMP_DIR/external-rows.jsonl" app parent kind endpoint parent_kind target file path root added old_same=true monitored=true all_verified=true
+    app=$(jq -r .app "$job");parent=$(jq -r .parentId "$job")
+    if [[ "$app" == Sonarr ]];then kind=episode;endpoint=episodefile;parent_kind=series;root="$SONARR_MEDIA_ROOT";else kind=movie;endpoint=moviefile;parent_kind=movie;root="$RADARR_MEDIA_ROOT";fi
+    recovery_api GET "/$parent_kind/$parent" "$owner" && [[ "$RECOVERY_HTTP" == 200 ]] || return 1
+    jq -e --slurpfile j "$job" '.id==$j[0].parentId and (if $j[0].app=="Sonarr" then .tvdbId else .tmdbId end)==$j[0].externalId' "$owner" >/dev/null || return 1
+    jq -e '.monitored==true' "$owner" >/dev/null || monitored=false
+    : >"$rows"
+    while read -r target;do
+        recovery_api GET "/$kind/$target" "$refs" && [[ "$RECOVERY_HTTP" == 200 ]] || return 1
+        jq -e --argjson target "$target" --argjson parent "$parent" --arg app "$app" '.id==$target and .hasFile==true and (if $app=="Sonarr" then .seriesId==$parent else .id==$parent end)' "$refs" >/dev/null || return 1
+        jq -e '.monitored==true' "$refs" >/dev/null || monitored=false
+        file=$(jq -r --arg app "$app" 'if $app=="Sonarr" then .episodeFileId else .movieFileId end' "$refs")
+        [[ "$file" =~ ^[1-9][0-9]*$ ]] || return 1
+        recovery_api GET "/$endpoint/$file" "$refs" && [[ "$RECOVERY_HTTP" == 200 ]] || return 1
+        jq -e --argjson file "$file" --argjson parent "$parent" --arg app "$app" '.id==$file and (if $app=="Sonarr" then .seriesId==$parent else .movieId==$parent end)' "$refs" >/dev/null || return 1
+        path=$(jq -r '.path // ""' "$refs");[[ "$path" == "$root/"* ]] || return 1;path=${path#"$root/"}
+        added=$(date -d "$(jq -r '.dateAdded // ""' "$refs")" +%s 2>/dev/null) || added=0
+        recovery_file_tool identity "$path" >"$TMP_DIR/external-identity.json" || return 1
+        jq -cn --arg path "$path" --argjson file "$file" --argjson added "$added" --slurpfile i "$TMP_DIR/external-identity.json" '{path:$path,fileId:$file,identity:$i[0],importedAt:$added}' >>"$rows"
+        [[ "$file" == "$(jq -r .fileId "$job")" ]] && jq -e --slurpfile j "$job" '.==$j[0].identity' "$TMP_DIR/external-identity.json" >/dev/null || old_same=false
+        jq -e --arg path "$path" --slurpfile i "$TMP_DIR/external-identity.json" --slurpfile j "$job" '.files[$path] as $f|$f.identity==$i[0] and $f.issue==null and ($f.verifiedAt // 0)>=$j[0].startedAt and $f.coverage=="all_planned_segments_decoded"' "$TMP_DIR/state.json" >/dev/null || all_verified=false
+    done < <(jq -r '.targets[]' "$job")
+    if [[ "$old_same" == true && "$monitored" == false ]];then
+        recovery_set "$id" cancelled 'Recovery cancelled: native monitoring is now off while the exact original remains present. Monitoring/user intent preserved; no replacement or deletion performed.';return $?
+    fi
+    if [[ "$all_verified" == true ]];then
+        recovery_update '.actions[$id].replacementFiles=$rows | .actions[$id].replacementPaths=[$rows[].path] | .actions[$id].replacementVerifiedAt=$now | .actions[$id].resolutionSource="external" | .actions[$id].lastError=null' --arg id "$id" --slurpfile rows "$rows" --argjson now "$(date +%s)" || return 1
+        if [[ "$old_same" == true ]];then recovery_set "$id" resolved 'Recovery no longer required: the unchanged current original completed all planned decode ranges successfully. No replacement attributed to this script.'
+        else recovery_set "$id" recovered 'External recovery verified: exact current Arr/external IDs and physical replacement completed all planned decode ranges. Recovery guards released; replacement was not attributed to this script.';fi
+        return $?
+    fi
+    [[ "$old_same" != true ]] || return 1
+    recovery_update '.actions[$id].replacementFiles=$rows | .actions[$id].replacementPaths=[$rows[].path] | .actions[$id].resolutionSource="external" | .actions[$id].importedAt=([$rows[].importedAt|select(.>0)]|min // $now)' --arg id "$id" --slurpfile rows "$rows" --argjson now "$(date +%s)" || return 1
+    recovery_retention "$id" "$job" || return 1
+    recovery_set "$id" verifying 'External/current replacement detected by exact Arr and physical identities. Attribution is unproven; priority full verification pending. No download replay or monitoring override.'
+}
+# An alternative is permitted only for an exact, proven native archive/download
+# failure, with unchanged monitored original, cooldown, fresh evidence and budgets.
+recovery_prepare_retry() {
+    local id="$1" job="$2" history="$3" message original="$TMP_DIR/retry-original.json" candidate="$TMP_DIR/retry-candidate.json" now
+    now=$(date +%s)
+    jq -e --slurpfile j "$job" '[.records[]|select(.eventType=="downloadFailed")] as $fail|($fail|length)>0 and all(.records[];.eventType!="downloadIgnored" and .eventType!="downloadFolderImported") and
+      all($fail[];.downloadId==$j[0].downloadId and (if $j[0].app=="Sonarr" then .seriesId==$j[0].parentId and (.episodeId as $e|$j[0].targets|index($e))!=null else .movieId==$j[0].parentId end)) and
+      (if $j[0].app=="Sonarr" then ([$fail[].episodeId]|sort|unique)==($j[0].targets|sort) else true end)' "$history" >/dev/null || return 1
+    message=$(jq -r '[.records[]|select(.eventType=="downloadFailed")|.data.message // ""]|join("; ")' "$history")
+    [[ "$message" =~ [Cc][Rr][Cc]|[Cc]hecksum|[Uu]npack|[Rr]epair|[Mm]issing\ articles|[Ee]ncrypted|[Pp]assword|[Dd]amaged\ archive ]] || return 1
+    grep -Eiq 'permission|denied|space|disk|I/O|input/output|manually|ignored|cancel' <<<"$message" && return 1
+    jq -e --argjson limit "$RECOVERY_MAX_ATTEMPTS" '(.attempts // []|length)<$limit and .selected.guid!=null' "$job" >/dev/null || return 1
+    jq '{key:.path,value:{identity,issue:.finding}}' "$job" >"$candidate"
+    recovery_plan "$candidate" "$original" || return 1
+    jq -e --slurpfile j "$job" '{identity,fileId,parentId,targets,externalId,profile}==($j[0]|{identity,fileId,parentId,targets,externalId,profile})' "$original" >/dev/null || return 1
+    recovery_update '.actions[$id].attempts=(if (.actions[$id].attempts // []|length)==0 then [{at:.actions[$id].grabSentAt,guid:.actions[$id].selected.guid,title:.actions[$id].selected.title,downloadId:.actions[$id].downloadId}] else .actions[$id].attempts end) | .actions[$id].attempts[-1].outcome="native_download_failed" | .actions[$id].failedReleases=((.actions[$id].failedReleases // [])+[{guid:.actions[$id].selected.guid,title:.actions[$id].selected.title}]) |
+      .actions[$id].retryAt=$retry | .actions[$id].selected=null | .actions[$id].downloadId=null | .actions[$id].selectionAt=0' --arg id "$id" --argjson retry "$((now+RECOVERY_RETRY_SECONDS))" || return 1
+    recovery_set "$id" retry_wait "Verified native download failure: ${message:0:500}. Original unchanged; one alternative may be selected after the four-hour cooldown, fresh evidence and shared budgets. Failed release excluded."
+}
+
+# Fair, deadline-aware targeted work. Three replacement slots plus one stale
+# evidence slot when needed; timestamps come from actual decoder work, not polls.
+recovery_schedule() {
+    jq -n --slurpfile j "$RECOVERY_FILE" --slurpfile state "$TMP_DIR/state.json" --argjson now "$(date +%s)" '
+      [$j[0].actions|to_entries[]|select(.value.status=="verifying")|. as $job|
+       .value.replacementPaths[]? as $path|{path:$path,deadline:($job.value.verificationDeadlineAt // 0),attempt:($state[0].files[$path].lastAttemptAt // 0)}]|
+      unique_by(.path)|sort_by(.attempt,(if .deadline>0 then .deadline else 9999999999 end)) as $replacements|
+      [$j[0].actions[]|select(.status=="required" or .status=="blocked" or .status=="retry_wait")|. as $job|
+       $state[0].files[.path] as $f|select($f.identity==$job.identity and $f.issue.kind=="decode_error" and $f.issue.confirmed==true and
+       ($f.issue.lastSeen // 0)<$now-48*3600 and ($f.lastAttemptAt // 0)<$now-86400)|{path:.path,attempt:($f.lastAttemptAt // 0)}]|
+      unique_by(.path)|sort_by(.attempt) as $evidence|
+      {evidencePaths:[$evidence[:1][].path],paths:([$replacements[:(if ($evidence|length)>0 then 3 else 4 end)][].path]+[$evidence[:1][].path])}' >"$TMP_DIR/recovery-schedule.json"
+}
+
 recovery_resume() {
     local id="$1" job="$TMP_DIR/native-job.json" status response="$TMP_DIR/native-response.json" query selected="$TMP_DIR/native-selected.json" fresh="$TMP_DIR/native-fresh.json" candidate="$TMP_DIR/native-candidate.json" history="$TMP_DIR/native-baseline.json" ready
     jq --arg id "$id" '.actions[$id]' "$RECOVERY_FILE" >"$job" || return 1
-    status=$(jq -r .status "$job");[[ "$status" != recovered ]] || return 0
+    status=$(jq -r .status "$job");[[ "$status" != recovered && "$status" != cancelled && "$status" != resolved ]] || return 0
     recovery_connection "$(jq -r .app "$job")" || return 1
     if [[ "$status" == grab_intent || "$status" == review ]] && jq -e '.selected!=null and .grabSentAt>0 and (.downloadId // "")==""' "$job" >/dev/null;then
-        recovery_correlate "$id" "$job" || { recovery_set "$id" review 'Grab outcome uncertain: exact native download identity not established. Request not replayed; original remains in place.';return 0; }
+        recovery_correlate "$id" "$job" || { if recovery_observe_external "$id" "$job";then return 0;fi;recovery_set "$id" review 'Grab outcome uncertain: exact native download identity not established. Request not replayed; original remains in place.';return 0; }
         jq --arg id "$id" '.actions[$id]' "$RECOVERY_FILE" >"$job";status=downloading
     fi
-    if jq -e '(.downloadId // "")!=""' "$job" >/dev/null;then recovery_followup "$id" "$job";return $?;fi
-    [[ "$status" == required || "$status" == selected || "$status" == blocked ]] || return 0
+    if jq -e '(.downloadId // "")!=""' "$job" >/dev/null;then
+        if recovery_followup "$id" "$job";then return 0;fi
+        recovery_api_diagnostic "$id" 'Native download/import correlation unavailable; checking exact current media without attributing the replacement' || return 1
+        recovery_observe_external "$id" "$job";return $?
+    fi
+    if recovery_observe_external "$id" "$job";then return 0;fi
+    [[ "$status" != retry_wait ]] || (( $(date +%s)>=$(jq -r '.retryAt // 0' "$job") )) || return 0
+    [[ "$status" == required || "$status" == selected || "$status" == blocked || "$status" == retry_wait ]] || return 0
     [[ "$RECOVERY_ALLOW_GRAB" == true ]] && recovery_new_window_open || return 0
     jq -e --slurpfile j "$job" --argjson cutoff "$(( $(date +%s)-48*3600 ))" '.files[$j[0].path] as $f|$f.identity==$j[0].identity and $f.issue.confirmed==true and $f.issue.confirmedRuns>=2 and $f.issue.lastSeen>=$cutoff' "$TMP_DIR/state.json" >/dev/null || { recovery_set "$id" blocked 'Fresh unchanged-file corruption evidence required before release selection; original retained';return 0; }
     local last
@@ -647,6 +804,8 @@ recovery_resume() {
     recovery_api GET "/release?$query" "$response" && [[ "$RECOVERY_HTTP" == 200 ]] && jq -e 'type=="array"' "$response" >/dev/null || { recovery_set "$id" blocked 'Native interactive release search unavailable; original retained; selection retries at most daily inside approved windows.';return 0; }
     jq -n --slurpfile job "$job" --slurpfile releases "$response" '{job:$job[0],releases:$releases[0]}' | recovery_select_release >"$selected" || return 1
     jq -e 'type=="object"' "$selected" >/dev/null || { recovery_set "$id" blocked 'No exact alternative release satisfies profile, language, quality/revision, score and identity safeguards. Original retained; no fallback deletion or forced import.';return 0; }
+    recovery_capacity_ready "$(jq -r .size "$selected")" true || { recovery_set "$id" blocked 'Selected replacement exceeds download/destination filesystem budget or a configured download mount is unavailable. Original retained; no grab.';return 0; }
+    recovery_retention "$id" "$job" || { recovery_api_diagnostic "$id" 'Native recycling retention could not be validated';return 1; }
     recovery_update '.actions[$id].selected=$selected[0]' --arg id "$id" --slurpfile selected "$selected" || return 1
     recovery_set "$id" selected 'Exact alternative selected; only existing-file upgrade/cutoff rejections may be bypassed. Profile minimums and identity remain enforced.' || return 1
     # Search may take time. Re-read quiet native state and exact original again
@@ -654,9 +813,9 @@ recovery_resume() {
     recovery_runtime_matches && recovery_new_window_open && workload_guard && recovery_plan "$candidate" "$fresh" || return 0
     jq -e --slurpfile j "$job" '{parentId,fileId,identity,targets,externalId,profile}==($j[0]|{parentId,fileId,identity,targets,externalId,profile})' "$fresh" >/dev/null || return 1
     ((RECOVERY_NEW_GRABS<RECOVERY_MAX_NEW_PER_RUN)) || return 0
-    jq -e --argjson cutoff "$(( $(date +%s)-7*86400 ))" --argjson limit "$RECOVERY_MAX_NEW_PER_WEEK" '[.actions[]|select((.grabSentAt // 0)>=$cutoff and .status!="selected")]|length<$limit' "$RECOVERY_FILE" >/dev/null || return 0
+    jq -e --argjson cutoff "$(( $(date +%s)-7*86400 ))" --argjson limit "$RECOVERY_MAX_NEW_PER_WEEK" '[.actions[]|if (.attempts // []|length)>0 then .attempts[]|select(.at>=$cutoff) else select((.grabSentAt // 0)>=$cutoff) end]|length<$limit' "$RECOVERY_FILE" >/dev/null || return 0
     recovery_history "$job" "$history" || return 1
-    recovery_update '.actions[$id].baselineGrabs=[$h[0].records[]|select(.eventType=="grabbed")|.id] | .actions[$id].grabSentAt=$now' --arg id "$id" --argjson now "$(date +%s)" --slurpfile h "$history" || return 1
+    recovery_update '.actions[$id].baselineGrabs=[$h[0].records[]|select(.eventType=="grabbed")|.id] | .actions[$id].grabSentAt=$now | .actions[$id].attempts=((.actions[$id].attempts // [])+[{at:$now,guid:.actions[$id].selected.guid,title:.actions[$id].selected.title,indexerId:.actions[$id].selected.indexerId,outcome:"intent"}])' --arg id "$id" --argjson now "$(date +%s)" --slurpfile h "$history" || return 1
     RECOVERY_NEW_GRABS=$((RECOVERY_NEW_GRABS+1))
     recovery_set "$id" grab_intent 'Release grab intent saved before one POST /release. Original remains in library; uncertain outcomes will not be replayed.' || return 1
     jq '.payload' "$selected" >"$TMP_DIR/native-grab-payload.json"
@@ -668,18 +827,21 @@ recovery_resume() {
 recovery_process() {
     [[ "$AUTO_RECOVERY_ENABLED" == true ]] || return 0
     recovery_platform_ready && recovery_valid || { RECOVERY_NOTE='Recovery platform/journal unavailable; no mutation allowed';return 1; }
-    recovery_update '.actions |= with_entries(select(.value.status!="recovered" or (.value.replacementVerifiedAt // 0)>=$cutoff))' --argjson cutoff "$(( $(date +%s)-365*86400 ))" || return 1
+    recovery_update '.actions |= with_entries(select((.value.status!="recovered" and .value.status!="resolved" and .value.status!="cancelled") or (.value.replacementVerifiedAt // .value.updatedAt // .value.startedAt // 0)>=$cutoff))' --argjson cutoff "$(( $(date +%s)-365*86400 ))" || return 1
     RECOVERY_DEADLINE=$(( $(date +%s)+RECOVERY_MAX_SECONDS ))
     local fd hold id row count=0 rc=0 candidate="$TMP_DIR/native-candidate-plan.json" plan="$TMP_DIR/native-new-plan.json" now
     exec {fd}>"$ARR_BACKUP_GATE" || return 1;flock -s -n "$fd" || { exec {fd}>&-;return 0; }
     exec {hold}>/tmp/arr_metadata_quarantine.lock || { exec {fd}>&-;return 1; };flock -n "$hold" || { exec {fd}>&-;exec {hold}>&-;return 0; }
     RECOVERY_NEW_GRABS=0
-    while read -r id;do (( $(date +%s)<RECOVERY_DEADLINE )) || break;recovery_update ' .actions[$id].checkedAt=$now ' --arg id "$id" --argjson now "$(date +%s)" || break;recovery_resume "$id" || rc=1;done < <(jq -r '.actions|to_entries|sort_by(.value.checkedAt // 0)|.[]|select(.value.status!="recovered")|.key' "$RECOVERY_FILE"|sed -n '1,4p')
+    while read -r id;do (( $(date +%s)<RECOVERY_DEADLINE )) || break;recovery_update ' if $now-(.actions[$id].checkedAt // 0)>=900 then .actions[$id].checkedAt=$now else . end ' --arg id "$id" --argjson now "$(date +%s)" || break;if ! recovery_resume "$id";then
+        if ! jq -e --arg id "$id" --argjson cutoff "$(( $(date +%s)-120 ))" '(.actions[$id].lastError.at // 0)>=$cutoff' "$RECOVERY_FILE" >/dev/null;then recovery_api_diagnostic "$id" 'Bounded native API or identity/history evidence step incomplete' || true;fi
+        rc=1
+    fi;done < <(jq -r '.actions|to_entries|sort_by(.value.checkedAt // 0)|.[]|select(.value.status!="recovered" and .value.status!="resolved" and .value.status!="cancelled")|.key' "$RECOVERY_FILE"|sed -n '1,4p')
     now=$(date +%s)
     if [[ "$RECOVERY_ALLOW_GRAB" == true ]] && recovery_new_window_open && recovery_runtime_matches;then
       while IFS= read -r row;do
         ((count<RECOVERY_MAX_NEW_PER_RUN && $(date +%s)<RECOVERY_DEADLINE)) || break
-        jq -e --argjson cutoff "$((now-7*86400))" --argjson limit "$RECOVERY_MAX_NEW_PER_WEEK" '[.actions[]|select((.grabSentAt // 0)>=$cutoff)]|length<$limit' "$RECOVERY_FILE" >/dev/null || break
+        jq -e --argjson cutoff "$((now-7*86400))" --argjson limit "$RECOVERY_MAX_NEW_PER_WEEK" '[.actions[]|if (.attempts // []|length)>0 then .attempts[]|select(.at>=$cutoff) else select((.grabSentAt // 0)>=$cutoff) end]|length<$limit' "$RECOVERY_FILE" >/dev/null || break
         printf '%s\n' "$row" >"$candidate";id=$(jq -c '[.key,.value.identity]' "$candidate"|sha256sum|awk '{print $1}')
         jq -e --arg id "$id" '.actions[$id]!=null' "$RECOVERY_FILE" >/dev/null && continue
         recovery_plan "$candidate" "$plan" || continue
@@ -843,6 +1005,11 @@ class Audit:
                     if not old or old['identity']!=current:
                         self.state['files'][rel]={'identity':current,'probeAt':0,'verifiedAt':0,'offset':0,'chunkSeconds':self.cfg['segmentSeconds'],'notBefore':0,'cycleLane':'new'}
                 except OSError:self.stats['inventoryErrors']+=1
+            for rel in self.cfg.get('evidencePaths',[]):
+                e=self.state['files'].get(rel)
+                if rel in self.found and e and e.get('issue') and e['issue'].get('identity')==e['identity']:
+                    e['notBefore']=0
+                    if e['issue'].get('offset') is not None:e['offset']=e['issue']['offset']
             self.stats.update(inventoryFiles=len(self.found),inventoryComplete=False,targeted=True)
             self.checkpoint(True);return
         for library in self.cfg['libraries']:
@@ -992,6 +1159,7 @@ class Audit:
                 outcome=self.segment(path,entry,fd)
                 self.checkpoint()
                 if outcome=='changed':entry['notBefore']=int(time.time())+300;entry['deferredReason']='File identity changed during decoding; no range credit'
+                if path in self.cfg.get('evidencePaths',[]) and outcome!='recheck':break
                 if outcome not in ('next','recheck'):break
         except FileNotFoundError:
             entry['notBefore']=int(time.time())+300;entry['deferredReason']='File removed/changed before opening; no range credit'
@@ -1016,6 +1184,8 @@ class Audit:
     def execute(self):
         self.inventory()
         if self.cfg['mode']=='inventory':self.stats['reason']='Inventory only; no media content read or decoded';self.finish();return
+        for path in self.cfg.get('evidencePaths',[]):
+            if path in self.found and not self.stopped():self.work(path);self.checkpoint()
         quick_deadline=self.start+min(self.cfg.get('quickBudgetSeconds',1800),self.cfg['budgetSeconds']*.25)
         for path in sorted(self.found,key=lambda p:(self.state['files'][p].get('lastAttemptAt',0),p)):
             if self.stopped() or time.monotonic()>=quick_deadline:break
@@ -1026,6 +1196,7 @@ class Audit:
         while not self.stopped():
             now=int(time.time());new=[];old=[]
             for path in self.found:
+                if path in self.cfg.get('evidencePaths',[]):continue
                 f=self.state['files'][path]
                 if f.get('notBefore',0)>now:continue
                 if f.get('issue'):new.append(path)
@@ -1126,7 +1297,7 @@ main() {
     }
     [[ "$STATE_DIR" == "$VAULT_MOUNT"/cloud/logs/script/media_integrity_audit && ! -L "$STATE_DIR" && ! -L "$STATUS_DIR" ]] || return 1
     mkdir -p "$STATE_DIR" "$STATUS_DIR" || return 1
-    for flag in "$LOG_FILE" "$LOG_FILE.1" "$LOG_FILE.2" "$STATE_DIR/notified.json" "$STATE_DIR/pending-notification.json" "$STATE_DIR/latest-report.txt" "$RECOVERY_FILE"; do [[ ! -L "$flag" ]] || return 1;done
+    for flag in "$LOG_FILE" "$LOG_FILE.1" "$LOG_FILE.2" "$STATE_DIR/notified.json" "$STATE_DIR/pending-notification.json" "$STATE_DIR/latest-report.txt" "$RECOVERY_FILE" "$RECOVERY_PREVIOUS_FILE"; do [[ ! -L "$flag" ]] || return 1;done
     exec 9>"$LOCK_FILE" || return 1
     flock -n 9 || { printf 'Another media integrity audit is active; invocation deferred.\n';return 0; }
     TMP_DIR=$(mktemp -d /tmp/media-integrity-audit.XXXXXX) || return 1
@@ -1145,7 +1316,8 @@ main() {
     if [[ "$MODE" != inventory ]]; then
         if ! recovery_process; then RECOVERY_NOTE='Native recovery follow-up incomplete; original/library state remains Arr-managed. Exact job/checkpoints retained; no uncertain request replayed';fi
     fi
-    if [[ "$MODE" == recover ]] && ! jq -e 'any(.actions[];.status=="verifying")' "$RECOVERY_FILE" >/dev/null;then
+    recovery_schedule || return 1
+    if [[ "$MODE" == recover ]] && ! jq -e '.paths|length>0' "$TMP_DIR/recovery-schedule.json" >/dev/null;then
         write_report OK 'Bounded native recovery follow-up; no imported replacement awaiting decoder work';return $?
     fi
     toolset=$(timeout 12 docker exec --user 99:100 "$BAZARR_CONTAINER" sh -c \
@@ -1157,14 +1329,14 @@ main() {
     libraries=$(printf '%s\n' "${LIBRARY_SUBDIRS[@]}" | jq -Rsc 'split("\n")|map(select(length>0))')
     input="$TMP_DIR/input.json"
     if [[ -f "$RECOVERY_FILE" ]]; then cp "$RECOVERY_FILE" "$TMP_DIR/recovery-input.json";else printf '{"schema":1,"actions":{}}' >"$TMP_DIR/recovery-input.json";fi
-    jq -n --slurpfile state "$TMP_DIR/state.json" --slurpfile recovery "$TMP_DIR/recovery-input.json" --arg root "$MEDIA_CONTAINER_ROOT" --arg hostRoot "$MEDIA_HOST_ROOT" \
+    jq -n --slurpfile state "$TMP_DIR/state.json" --slurpfile recovery "$TMP_DIR/recovery-input.json" --slurpfile schedule "$TMP_DIR/recovery-schedule.json" --arg root "$MEDIA_CONTAINER_ROOT" --arg hostRoot "$MEDIA_HOST_ROOT" \
       --argjson libraries "$libraries" --arg toolset "$toolset" --arg mode "$MODE" \
       --argjson targeted "$( [[ "$MODE" == recover ]] && printf true || printf false )" --argjson budget "$worker_budget" --argjson quick "$QUICK_PASS_MAX_SECONDS" --argjson threads "$VIDEO_THREADS" --argjson memory "$DECODER_MEMORY_MIB" \
       --argjson segment "$SEGMENT_MEDIA_SECONDS" --argjson wall "$SEGMENT_WALL_SECONDS" --argjson slice "$FILE_SLICE_SECONDS" \
       --argjson recheck "$RECHECK_DAYS" --argjson settle "$SETTLE_SECONDS" --argjson max "$MAX_STATE_BYTES" \
       '{state:$state[0],config:{root:$root,hostRoot:$hostRoot,libraries:$libraries,toolset:$toolset,mode:$mode,
        targeted:$targeted,budgetSeconds:$budget,quickBudgetSeconds:$quick,threads:$threads,memoryMiB:$memory,segmentSeconds:$segment,segmentWallSeconds:$wall,
-       fileSliceSeconds:$slice,recheckDays:$recheck,settleSeconds:$settle,maxStateBytes:$max,recoveryPriority:[$recovery[0].actions[]?|select(.status=="verifying")|.replacementPaths[]?]}}' >"$input" || return 1
+       fileSliceSeconds:$slice,recheckDays:$recheck,settleSeconds:$settle,maxStateBytes:$max,recoveryPriority:$schedule[0].paths,evidencePaths:$schedule[0].evidencePaths}}' >"$input" || return 1
     program=$(worker_program) || return 1
     WORKER_TOKEN=$(cat /proc/sys/kernel/random/uuid)
     mkfifo "$TMP_DIR/events" || return 1

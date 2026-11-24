@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.19.0
+# ARR Health / Download / Import Monitor v3.20.0
 #
 # PURPOSE
 # -------
@@ -6706,7 +6706,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.19.0 lifecycle commands' \
+        'ARR Health Monitor v3.20.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -15547,7 +15547,7 @@ automation_action_budget() {
     fi
     local recovery_file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}"
     media_recovery_journal_valid || return 1
-    jq -c '.actions[]|select((.grabSentAt // 0)>0)|{startedAt:.grabSentAt}' "$recovery_file" >>"$counter" || return 1
+    jq -c '.actions[]|if (.attempts // []|length)>0 then .attempts[]|{startedAt:.at} else select((.grabSentAt // 0)>0)|{startedAt:.grabSentAt} end' "$recovery_file" >>"$counter" || return 1
     IFS=$'\t' read -r today run < <(jq -sr --argjson now "$START_TIME" '[([.[]|select(.startedAt>=$now-86400)]|length),([.[]|select(.startedAt>=$now)]|length)]|@tsv' "$counter")
     (( today<POLICY_MAX_ACTIONS_PER_DAY && run<POLICY_MAX_ACTIONS_PER_RUN ))
 }
@@ -15659,17 +15659,17 @@ media_recovery_journal_valid() {
     [[ -f "$file" && ! -L "$file" ]] || return 1
     jq -e '.schema==1 and .workflow=="arr-native" and (.actions|type)=="object" and all(.actions[];
       (.app=="Sonarr" or .app=="Radarr") and (.parentId|type)=="number" and .parentId>0 and
-      (.status as $s|["required","selected","grab_intent","downloading","imported","verifying","recovered","blocked","review"]|index($s))!=null)' "$file" >/dev/null 2>&1
+      (.status as $s|["required","selected","grab_intent","downloading","imported","verifying","recovered","blocked","review","cancelled","resolved","retry_wait"]|index($s))!=null)' "$file" >/dev/null 2>&1
 }
 media_recovery_ids() {
     local app="$1" output="$2" file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}"
     media_recovery_journal_valid || return 1
-    jq --arg app "$app" '[.actions[]|select(.app==$app and .status!="recovered")|.parentId]|unique' "$file" >"$output"
+    jq --arg app "$app" '[.actions[]|select(.app==$app and (.status as $s|["recovered","resolved","cancelled"]|index($s))==null)|.parentId]|unique' "$file" >"$output"
 }
 media_recovery_app_held() {
     local app="$1" parent="${2:-0}" file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}" rc=0
     media_recovery_journal_valid || return 0
-    jq -e --arg app "$app" --argjson parent "$parent" 'any(.actions[];.app==$app and ($parent==0 or .parentId==$parent) and .status!="recovered")' "$file" >/dev/null 2>&1 || rc=$?
+    jq -e --arg app "$app" --argjson parent "$parent" 'any(.actions[];.app==$app and ($parent==0 or .parentId==$parent) and (.status as $s|["recovered","resolved","cancelled"]|index($s))==null)' "$file" >/dev/null 2>&1 || rc=$?
     ((rc!=1))
 }
 
@@ -16530,7 +16530,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.19.0"
+    "START | ARR Health Monitor v3.20.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -16543,7 +16543,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.19.0"
+debug_log "Starting ARR Health Monitor v3.20.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -17164,7 +17164,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.19.0 completed"
+log "ARR Health Monitor v3.20.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""

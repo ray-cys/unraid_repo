@@ -133,7 +133,7 @@ gzip -dc /mnt/vault/cloud/logs/script/media_integrity_audit/state.json.gz |
 
 Do not delete state to hide findings or claim previously unchecked media healthy.
 
-## Arr-native replacement (v2.0.0, disabled by default)
+## Arr-native replacement (v2.1.0, disabled by default)
 
 `AUTO_RECOVERY_ENABLED=false` remains installed on Hubble. Observe several weekly
 runs before enabling it in the script. No CLI/environment argument overrides
@@ -221,8 +221,8 @@ jobs expire after one year; unresolved jobs do not silently expire. Raw download
 URLs, full API responses and API keys are not logged in events/notifications.
 The existing ISS operational-state export includes the required recovery journal.
 
-Native bin retention on Hubble is currently two days. Verification older than
-24 hours produces attention so it can be investigated before that period ends.
+Native bin retention on Hubble is currently two days. Verification alerts up to
+twelve hours before the observed retention deadline, then escalates if it elapses.
 Workload deferrals, long/slow files and errors may exceed retention; **there is no
 guaranteed original rollback**. A 28-day missing-import deadline requires review.
 The script never changes bin retention or Plex configuration. Leaving originals
@@ -243,3 +243,49 @@ replacement IDs and bounded event history. Unknown/blocked cases retain the
 original, stay protected and report why automation stopped. They never trigger a
 fallback deletion or forced import. Release metadata and SAB completion cannot
 prove an uncorrupted source; post-import decoding supplies the integrity evidence.
+
+## Recovery reliability enhancements (v2.1.0)
+
+- External recovery: match stable external IDs, exact targets and physical files.
+  A current external replacement receives priority verification and closes only
+  after full planned-range proof; the notification does not attribute it to our
+  grab. Native monitoring switched off cancels only while the exact original
+  remains present. An unchanged original that passes a full later cycle can
+  resolve without falsely claiming a replacement. These terminal states release
+  only their own series/movie guards; unrelated automation continues normally.
+- Capacity: recheck the selected release size against the real configured
+  incomplete/complete directories and library filesystem. Allow packed/unpacked
+  download space, an import copy, ten percent estimate overhead and 10 GiB reserve.
+  Combine paths on a common device, avoiding duplicate reserve accounting.
+  This checks visible filesystem free space, not a guarantee of Unraid placement,
+  share minimum-free settings, or unexpected archive expansion.
+- Native retention: read the existing Arr bin policy without changing it. Use the
+  native import timestamp for the verification deadline and alert before expiry
+  (up to twelve hours early; at most half the native retention). Escalate once
+  when retention has elapsed. A zero-day policy means native timed cleanup is
+  disabled; unknown/no deadline falls back to a 24-hour attention threshold.
+- Fair verification: select up to four exact paths by oldest actual decoder
+  attempt, then retention deadline. When stale corruption evidence needs refresh,
+  reserve one slot for its original failing range; at most one original per pass,
+  at least 24 hours between attempts and only when evidence is older than 48 hours.
+  No full-library walk or lowering the two-confirmation/freshness safeguards.
+- API reads: at most two attempts for transient GET failures, with request and
+  executor deadlines. POST is never retried. History reads use at most ten pages
+  of 200 records, reject unstable totals/duplicate IDs and require exact download
+  IDs. Per-job diagnostics include operation, HTTP result and transport exit,
+  without keys or full API responses.
+- State: skip structurally unchanged writes, coalesce routine progress/poll
+  heartbeats to fifteen minutes, validate before publication and retain one
+  validated `recovery.previous.json`. Required intents and outcomes are still
+  synced immediately. Never automatically restore an older journal to permit
+  mutations: an older copy may predate a submitted request. The existing ISS state
+  export carries both journals when present, giving them priority over bulk scan
+  progress. Missing/corrupt current state remains a protective stop.
+- Alternatives: initial grab plus at most one alternative per job, after at least
+  four hours, inside an approved action window and the shared action/week budgets.
+  Require exact native download/target failure history, an eligible archive/repair
+  failure, no prior successful import, and the unchanged monitored original under
+  the original profile. Storage, permission, manual, ignored and unknown failures
+  require review. Failed GUID/title is excluded, no automatic blocklist/profile
+  change, and lost responses are not replayed. Retry-wait/failure/completion
+  updates remain grouped and delivery-tracked.

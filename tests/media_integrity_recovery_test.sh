@@ -21,6 +21,7 @@ recovery_api() {
  case "$method:$url" in
  GET:/health|GET:/command) printf '[]' >"$output";;
  GET:/queue*) printf '{"totalRecords":0,"records":[]}' >"$output";;
+ GET:/config/mediamanagement|GET:/settings/mediamanagement) printf '{"recycleBin":"/data/arr_bin","recycleBinCleanupDays":2}' >"$output";;
  GET:/qualityprofile/1) printf '%s' "$fixture_profile" >"$output";;
  GET:/movie) jq -n --argjson q "$quality" '[{id:10,tmdbId:99,monitored:true,tags:[],qualityProfileId:1,hasFile:true,movieFileId:100,movieFile:{id:100,path:"/data/movies/Example/film.mkv",quality:$q}}]' >"$output";;
  GET:/movie/10) jq -n --argjson replacement "$replacement" '{id:10,tmdbId:99,monitored:true,tags:[],qualityProfileId:1,hasFile:true,movieFileId:(if $replacement then 101 else 100 end)}' >"$output";;
@@ -28,7 +29,7 @@ recovery_api() {
  GET:/series/20) printf '{"id":20,"tvdbId":88,"monitored":true,"tags":[],"qualityProfileId":1,"seasons":[{"seasonNumber":1,"monitored":true}]}' >"$output";;
  GET:/episodefile?seriesId=20) printf '[{"id":100,"seriesId":20,"path":"/data/series/Example/film.mkv"}]' >"$output";;
  GET:/episode?seriesId=20) printf '[{"id":201,"seriesId":20,"seasonNumber":1,"episodeNumber":1,"monitored":true,"hasFile":true,"episodeFileId":100},{"id":202,"seriesId":20,"seasonNumber":1,"episodeNumber":2,"monitored":true,"hasFile":true,"episodeFileId":100}]' >"$output";;
- GET:/episode/201|GET:/episode/202) jq -n --argjson id "${url##*/}" --argjson rep "$replacement" '{id:$id,seriesId:20,hasFile:true,episodeFileId:(if $rep then 101 else 100 end)}' >"$output";;
+ GET:/episode/201|GET:/episode/202) jq -n --argjson id "${url##*/}" --argjson rep "$replacement" '{id:$id,seriesId:20,monitored:true,hasFile:true,episodeFileId:(if $rep then 101 else 100 end)}' >"$output";;
  GET:/moviefile/100|GET:/episodefile/100|GET:/moviefile/101|GET:/episodefile/101)
   jq -n --arg app "$app" --arg path "$api_path" --argjson id "${url##*/}" --argjson q "$quality" --arg added "$(date -u +%FT%TZ)" '{id:$id,path:$path,quality:$q,customFormatScore:100,sceneName:"Old.Release",dateAdded:$added}+(if $app=="Sonarr" then {seriesId:20} else {movieId:10} end)' >"$output";;
  GET:/release*)
@@ -62,7 +63,7 @@ for app in Radarr Sonarr;do
  replacement=true;printf healthy-replacement-longer >"$MEDIA_HOST_ROOT/$relative"
  recovery_process;jq -e 'all(.actions[];.status=="verifying")' "$RECOVERY_FILE" >/dev/null
  recovery_file_tool identity "$relative" >"$fixture/new-identity"
- jq --arg path "$relative" --slurpfile i "$fixture/new-identity" --argjson now "$(date +%s)" '.files[$path]={identity:$i[0],verifiedAt:$now}' "$TMP_DIR/state.json" >"$fixture/new";mv "$fixture/new" "$TMP_DIR/state.json"
+ jq --arg path "$relative" --slurpfile i "$fixture/new-identity" --argjson now "$(date +%s)" '.files[$path]={identity:$i[0],verifiedAt:$now,coverage:"all_planned_segments_decoded"}' "$TMP_DIR/state.json" >"$fixture/new";mv "$fixture/new" "$TMP_DIR/state.json"
  recovery_process;jq -e 'all(.actions[];.status=="recovered" and .replacementVerifiedAt>0 and (.events|length)>0)' "$RECOVERY_FILE" >/dev/null
  [[ $(rg -c '^POST /release' "$requests") == 1 && ! -e "$MEDIA_HOST_ROOT/repair_hold" ]]
 done

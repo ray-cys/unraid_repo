@@ -301,7 +301,7 @@ LOCK_FILE="/tmp/remote_backup.lock"
 
 
 readonly SCRIPT_ID="remote_backup"
-readonly SCRIPT_VERSION="2.4"
+readonly SCRIPT_VERSION="2.5"
 
 ###############################################################################
 # SHARED ISS COORDINATION AND TRANSPORT (embedded; standalone User Script)
@@ -361,25 +361,57 @@ backup_source_ready() {
     [[ "$canonical" == "$source" ]] || return 1
     [[ -n "$(find "$source" -mindepth 1 -maxdepth 1 -print -quit)" ]] || return 1
 }
+# Feature probe, deliberately independent of package/Unraid version numbers.
+# Only private /tmp fixtures are touched; configured backup paths are not used.
+backup_rsync_probe() (
+    local side="$1" links="$2" probe result a b
+    export LC_ALL=C
+    probe=$(mktemp -d /tmp/hubble-rsync-capability.XXXXXX) || return 1
+    trap 'rm -rf -- "$probe"' EXIT
+    mkdir "$probe/source" "$probe/destination" || return 1
+    printf 'Hubble ISS rsync capability fixture\n' >"$probe/source/file with spaces [1].txt"
+    printf '%s: %s\n' "$side" "$(rsync --version | sed -n '1p')"
+    local -a options=(-a --delete-delay --delete-excluded --partial --partial-dir=.rsync-partial --protect-args --stats --timeout=15 --max-delete=1 '--filter=P /.hubble-backup-identity')
+    [[ "$links" != true ]] || options+=(-H)
+    if ! rsync "${options[@]}" "$probe/source/" "$probe/destination/" >"$probe/result" 2>&1; then
+        printf '%s rsync required-feature probe failed:\n' "$side" >&2
+        tail -n 12 "$probe/result" >&2
+        return 1
+    fi
+    a=$(sha256sum "$probe/source/file with spaces [1].txt");b=$(sha256sum "$probe/destination/file with spaces [1].txt")
+    [[ "${a%% *}" == "${b%% *}" ]] || { printf '%s rsync probe content verification failed\n' "$side" >&2;return 1; }
+    # Resumption/checksum repair is also used by the vault workflow.
+    rsync "${options[@]}" --checksum --dry-run "$probe/source/" "$probe/destination/" >"$probe/result" 2>&1 || { printf '%s checksum probe failed\n' "$side" >&2;tail -n 12 "$probe/result" >&2;return 1; }
+    printf '%s rsync required features and temporary copy verified\n' "$side"
+)
 backup_capabilities() {
     local cmd value
     for value in "$RSYNC_IO_TIMEOUT" "$MAX_MAIN_LOG_BYTES" "$MAX_RAW_LOG_BYTES"; do [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1; done
     [[ "$PRESERVE_HARD_LINKS" == true || "$PRESERVE_HARD_LINKS" == false ]] || return 1
     [[ "$SSH_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( SSH_PORT <= 65535 )) || return 1
     for cmd in ssh rsync jq timeout flock realpath sha256sum stat find sort awk sed tail head tee date mktemp xargs grep cat du mountpoint; do command -v "$cmd" >/dev/null || return 1; done
-    # The options used here are supported by rsync >= 3.1, on BOTH ends.
-    printf 'Local: %s\n' "$(rsync --version | sed -n '1p')" >>"$LOG_FILE"
-    rsync --version | awk 'NR==1 {split($3,v,"."); supported=(v[1]>3 || (v[1]==3 && v[2]>=1))} END {exit !supported}' || return 1
+    # Version banners are diagnostic only. Native Unraid packages may differ
+    # between Hubble and ISS; negotiate protocols normally and test real flags.
+    if ! backup_rsync_probe Hubble "$PRESERVE_HARD_LINKS" >>"$LOG_FILE" 2>&1;then
+        printf 'Hubble rsync feature validation failed; see %s\n' "$LOG_FILE" >&2;return 1
+    fi
     local remote_boot
     remote_boot=$(BACKUP_SSH_COMMAND_TIMEOUT=30 backup_ssh 'cat /proc/sys/kernel/random/boot_id') || return 1
     [[ -n "$remote_boot" && "$remote_boot" != "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]] || return 1
-    BACKUP_SSH_COMMAND_TIMEOUT=30 backup_ssh bash -s <<'CAPABILITIES'
+    {
+        declare -f backup_rsync_probe
+        cat <<'CAPABILITIES'
 set -euo pipefail
 export LC_ALL=C
-for cmd in bash rsync flock realpath sha256sum stat find sort awk sed df mktemp du mv cat; do command -v "$cmd" >/dev/null; done
-rsync --version | awk 'NR==1 {split($3,v,"."); supported=(v[1]>3 || (v[1]==3 && v[2]>=1))} END {exit !supported}'
-rsync --version | sed -n '1p'
+for cmd in bash rsync flock realpath sha256sum stat find sort awk sed df mktemp du mv cat tail mkdir rm;do
+    command -v "$cmd" >/dev/null || { printf 'ISS missing required command: %s\n' "$cmd" >&2;exit 1; }
+done
 CAPABILITIES
+        printf 'backup_rsync_probe ISS %q\n' "$PRESERVE_HARD_LINKS"
+    } | BACKUP_SSH_COMMAND_TIMEOUT=45 backup_ssh bash -s >>"$LOG_FILE" 2>&1 || {
+        printf 'ISS command/rsync feature validation failed; see %s\n' "$LOG_FILE" >&2;return 1
+    }
+
 }
 backup_acquire_lease() {
     local ready output_fd remote_script original_input original_output

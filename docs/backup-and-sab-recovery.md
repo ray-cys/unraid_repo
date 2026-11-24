@@ -47,3 +47,16 @@ record or Completed history record was created after the warning. It records the
 original warning/acknowledgement ID and queues a grouped recovery notification.
 Missing APIs, older records, failed jobs and an orphan still present keep the
 warning active. Other download/import problems continue to be monitored.
+
+## ISS rsync compatibility
+
+`remote_backup.sh` and `vault_backup.sh` (Unraid entry `vault_remote_backup`)
+accept the native rsync on the older ISS Unraid installation based on its actual
+features. Version banners are diagnostic only; no exact-match or minimum-number
+gate and no host package/OS upgrade is imposed. Each end copies and checksums a
+tiny fixture using the required flags in a private `/tmp` directory, then removes
+only its own fixture. Configured backup destinations are untouched by this test.
+Missing commands/options or failed fixture verification still stop the backup
+before real transfer; logs identify Hubble versus ISS and the actual error.
+Normal SSH transport negotiates a shared rsync protocol. This feature check is
+not a guarantee against unrelated network/storage failures during real transfer.

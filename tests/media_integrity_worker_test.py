@@ -60,6 +60,14 @@ with tempfile.TemporaryDirectory() as folder:
     assert issue['confirmed'] and issue['kind']=='decode_error' and calls==2
     assert broken.state['files']['movies/Example.mkv']['offset']==0
     assert issue['confirmedRuns']==1
+    # Stale confirmed failures can be refreshed at the recorded failing range
+    # even while ordinary seven-day error backoff remains set.
+    refresh_cfg=copy.deepcopy(cfg);refresh_cfg.update(targeted=True,recoveryPriority=['movies/Example.mkv'],evidencePaths=['movies/Example.mkv'])
+    stale=copy.deepcopy(broken.state);stale['files']['movies/Example.mkv']['issue']['lastSeen']=int(time.time())-3*86400
+    refreshed=m.Audit(refresh_cfg,stale)
+    with contextlib.redirect_stdout(io.StringIO()):refreshed.execute()
+    assert refreshed.state['files']['movies/Example.mkv']['issue']['lastSeen']>=int(time.time())-5
+    assert refreshed.stats['targeted'] and refreshed.found=={'movies/Example.mkv'}
     # Same-invocation decoder repeats are not independent weekly observations.
     again=m.Audit(cfg,copy.deepcopy(broken.state));again.runEpoch=issue['lastConfirmedRunAt']
     e=again.state['files']['movies/Example.mkv']

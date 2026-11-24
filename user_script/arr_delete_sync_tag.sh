@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 ###############################################################################
-# Sonarr + Radarr - Plex Delete Sync and Tagger v2.9.0
+# Sonarr + Radarr - Plex Delete Sync and Tagger v2.10.0
 #
 # PURPOSE / PERSONAL USE CASE
 # ---------------------------
@@ -115,7 +115,7 @@ umask 077
 # Release version for logs, notifications, and the HTTP User-Agent. State-file
 # version fields below are independent schema versions and must not be changed
 # merely when this release version changes.
-readonly SCRIPT_VERSION="2.9.0"
+readonly SCRIPT_VERSION="2.10.0"
 
 ###############################################################################
 # CONFIGURATION
@@ -702,17 +702,17 @@ media_recovery_journal_valid() {
     [[ -f "$file" && ! -L "$file" ]] || return 1
     jq -e '.schema==1 and .workflow=="arr-native" and (.actions|type)=="object" and all(.actions[];
       (.app=="Sonarr" or .app=="Radarr") and (.parentId|type)=="number" and .parentId>0 and
-      (.status as $s|["required","selected","grab_intent","downloading","imported","verifying","recovered","blocked","review"]|index($s))!=null)' "$file" >/dev/null 2>&1
+      (.status as $s|["required","selected","grab_intent","downloading","imported","verifying","recovered","blocked","review","cancelled","resolved","retry_wait"]|index($s))!=null)' "$file" >/dev/null 2>&1
 }
 media_recovery_ids() {
     local app="$1" output="$2" file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}"
     media_recovery_journal_valid || return 1
-    jq --arg app "$app" '[.actions[]|select(.app==$app and .status!="recovered")|.parentId]|unique' "$file" >"$output"
+    jq --arg app "$app" '[.actions[]|select(.app==$app and (.status as $s|["recovered","resolved","cancelled"]|index($s))==null)|.parentId]|unique' "$file" >"$output"
 }
 media_recovery_app_held() {
     local app="$1" parent="${2:-0}" file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}" rc=0
     media_recovery_journal_valid || return 0
-    jq -e --arg app "$app" --argjson parent "$parent" 'any(.actions[];.app==$app and ($parent==0 or .parentId==$parent) and .status!="recovered")' "$file" >/dev/null 2>&1 || rc=$?
+    jq -e --arg app "$app" --argjson parent "$parent" 'any(.actions[];.app==$app and ($parent==0 or .parentId==$parent) and (.status as $s|["recovered","resolved","cancelled"]|index($s))==null)' "$file" >/dev/null 2>&1 || rc=$?
     ((rc!=1))
 }
 
