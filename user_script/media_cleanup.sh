@@ -17,7 +17,7 @@ arrayStarted=true
 # schemas preserve pending operations, receipts, two-observation confirmations,
 # retirement clocks and notification lifecycle. Payloads stay in their existing
 # /mnt/user/media/bin and /mnt/user/media/net/quarantine locations. They are NOT
-# state directories. Metadata and SAB retention remain independent (45 / 14 days).
+# state directories. Metadata and SAB retention remain independent (15 / 14 days).
 # Never delete a journal to clear an unresolved operation.
 #
 # LOG: media-cleanup.log, capped at 2 MiB, two backups, 30-day backup retention.
@@ -738,7 +738,7 @@ SONARR_UNMONITOR_SERIES=false
 # the normal confirmation policy. Continuing series additionally require the
 # opt-in tag unless SONARR_RETIRE_CONTINUING_SERIES is explicitly enabled.
 SONARR_RETIRE_FULLY_DELETED_SERIES=true
-SONARR_RETIRE_CONTINUING_SERIES=false
+SONARR_RETIRE_CONTINUING_SERIES=true
 SONARR_RETIREMENT_REQUIRED_TAG="retire-series"
 SONARR_RETIREMENT_EXEMPT_TAG="keep-in-arr"
 SONARR_RETIREMENT_PENDING_TAG="retirement-pending"
@@ -5747,7 +5747,7 @@ SAB_TV_DIR="${SAB_TV_DIR:-${SAB_COMPLETE_ROOT}/series}"
 # the category root remains available for ordinary completed cleanup. Orphan
 # ownership never uses that fallback: set the exact container root to allow
 # nonempty working-folder proof (this installation uses /data/net/complete).
-SAB_CONTAINER_COMPLETE_ROOT="${SAB_CONTAINER_COMPLETE_ROOT:-}"
+SAB_CONTAINER_COMPLETE_ROOT="${SAB_CONTAINER_COMPLETE_ROOT:-/data/net/complete}"
 
 # ---------------------------------------------------------------------------
 # Quarantine, logs, notifications, and APIs
@@ -8452,7 +8452,7 @@ QUARANTINE_ROOT="/mnt/user/media/bin"
 MOVIES_ROOT="/mnt/user/media/movies"
 SERIES_ROOT="/mnt/user/media/series"
 
-RETENTION_DAYS=45
+RETENTION_DAYS=15
 WARNING_TOTAL_BYTES=$((500 * 1024 * 1024 * 1024))
 
 # Unraid User Scripts normally invokes scheduled scripts without arguments.
