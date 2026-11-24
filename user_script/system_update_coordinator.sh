@@ -1,7 +1,7 @@
 #!/bin/bash
 clearLog=true
 arrayStarted=true
-# System Update Coordinator v1.0.0 -- personal Hubble maintenance.
+# System Update Coordinator v1.0.1 -- personal Hubble maintenance.
 # PURPOSE: Detect Docker/plugin/Unraid OS updates; automatically install only
 # explicitly approved, still-installed items during a bounded maintenance window.
 # Native DockerMan/plugin installers retain their normal configuration semantics.
@@ -75,7 +75,7 @@ usr_ops_append_log() {
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.0.1"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/system_update_coordinator}"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 VAULT_MOUNT="${VAULT_MOUNT:-/mnt/vault}"
@@ -162,7 +162,7 @@ try {
  }
  if($mode==='docker-check'||$mode==='docker-local'){
   $repo=$argv[2]??'';if(!$repo||strlen($repo)>512)throw new RuntimeException('Invalid repository');$u=new DockerUpdate();
-  $local=$u->inspectLocalVersion($repo);if($mode==='docker-local')output(['schema'=>1,'local'=>$local]);$remote=$u->getRemoteVersionV2($repo);
+  $local=$u->inspectLocalVersion($repo);if(!is_string($local)||!preg_match('/^sha256:[a-f0-9]{64}$/D',$local))throw new RuntimeException('Installed digest unavailable');if($mode==='docker-local')output(['schema'=>1,'local'=>$local]);$remote=$u->getRemoteVersionV2($repo);
   if(!is_string($remote)||!preg_match('/^sha256:[a-f0-9]{64}$/D',$remote))throw new RuntimeException('Registry digest unavailable');
   output(['schema'=>1,'remote'=>$remote,'local'=>$local,'available'=>$local!==$remote]);
  }

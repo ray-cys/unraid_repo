@@ -22,7 +22,7 @@ try {
  }
  if($mode==='docker-check'||$mode==='docker-local'){
   $repo=$argv[2]??'';if(!$repo||strlen($repo)>512)throw new RuntimeException('Invalid repository');$u=new DockerUpdate();
-  $local=$u->inspectLocalVersion($repo);if($mode==='docker-local')output(['schema'=>1,'local'=>$local]);$remote=$u->getRemoteVersionV2($repo);
+  $local=$u->inspectLocalVersion($repo);if(!is_string($local)||!preg_match('/^sha256:[a-f0-9]{64}$/D',$local))throw new RuntimeException('Installed digest unavailable');if($mode==='docker-local')output(['schema'=>1,'local'=>$local]);$remote=$u->getRemoteVersionV2($repo);
   if(!is_string($remote)||!preg_match('/^sha256:[a-f0-9]{64}$/D',$remote))throw new RuntimeException('Registry digest unavailable');
   output(['schema'=>1,'remote'=>$remote,'local'=>$local,'available'=>$local!==$remote]);
  }
