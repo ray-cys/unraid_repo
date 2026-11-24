@@ -2,7 +2,7 @@
 # shellcheck disable=SC2034
 clearLog=true
 arrayStarted=true
-# Backup freshness, delivery and runtime-compatibility audit v1.8.
+# Backup freshness, delivery and runtime-compatibility audit v1.9.
 # Schedule: 20 * * * *. Reads local receipts/manifests only: no WOL, remote
 # connection, media hashing, container actions or cleanup. One lifecycle email
 # for changed findings, recovery, or a 24-hour reminder. Failed delivery retries.
@@ -56,7 +56,7 @@ usr_ops_append_log() {
 }
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
-readonly SCRIPT_VERSION="1.8"
+readonly SCRIPT_VERSION="1.9"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/backup_health_audit}"
 APPDATA_ROOT="${APPDATA_ROOT:-/mnt/vault/backup/cache}"
@@ -122,17 +122,22 @@ audit_media_coordination() {
 }
 
 audit_update_coordinator() {
-    local state="${UPDATE_COORDINATOR_STATE_FILE:-/mnt/vault/cloud/logs/script/system_update_coordinator/state.json}" epoch installed
+    local state="${UPDATE_COORDINATOR_STATE_FILE:-/mnt/vault/cloud/logs/script/system_update_coordinator/state.json}" epoch installed cutoff day_start report_time
     if ! jq -e '.schema==1 and (.jobs|type)=="object" and (.installedAt|type)=="number"' "$state" >/dev/null 2>&1;then
       finding 'System update coordinator: valid journal missing; automatic-update supervision unavailable';return
     fi
     epoch=$(jq -r '.lastAutomaticRunAt // 0' "$state");installed=$(jq -r .installedAt "$state")
     if ((epoch>0));then check_age 'System update coordinator scheduled run' "$epoch" 10800
     elif ((NOW>installed+10800));then finding 'System update coordinator: first automatic run overdue; CLI inspection does not count as scheduled execution';fi
-    if jq -e 'any(.jobs[];.status=="INTENT" or .status=="ATTENTION")' "$state" >/dev/null;then
+    if jq -e --argjson now "$NOW" 'any(.jobs[];.status=="ATTENTION" or (.status=="INTENT" and (.dispatchedAt // 0)<$now-1200))' "$state" >/dev/null;then
       finding 'System update coordinator: unresolved installation outcome; further updates and affected watchdog recovery held for review'
     fi
-    if jq -e '(.outbox|length)>0' "$state" >/dev/null;then
+    report_time=$(jq -r '.reportTime // "15:45"' "${state%/*}/policy.json" 2>/dev/null) || report_time=15:45
+    [[ "$report_time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || report_time=15:45
+    day_start=$(TZ=Asia/Singapore date -d "$(TZ=Asia/Singapore date +%F) 00:00:00" +%s)
+    cutoff=$(TZ=Asia/Singapore date -d "$(TZ=Asia/Singapore date +%F) $report_time:00" +%s)
+    # Normal action receipts deliberately wait for the grouped daily cutoff.
+    if jq -e --argjson now "$NOW" --argjson cutoff "$cutoff" --argjson start "$day_start" 'any(.outbox[];(.at // 0)<$now-1800 and (.importance!="normal" or .at<$start or $now>=$cutoff))' "$state" >/dev/null;then
       finding 'System update coordinator: action report pending delivery; exact evidence remains queued'
     fi
 }

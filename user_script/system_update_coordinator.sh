@@ -1,21 +1,21 @@
 #!/bin/bash
 clearLog=true
 arrayStarted=true
-# System Update Coordinator v1.0.1 -- personal Hubble maintenance.
+# System Update Coordinator v1.1.0 -- personal Hubble maintenance.
 # PURPOSE: Detect Docker/plugin/Unraid OS updates; automatically install only
 # explicitly approved, still-installed items during a bounded maintenance window.
 # Native DockerMan/plugin installers retain their normal configuration semantics.
 # No OS installation/reboot, image-channel change, forced import or DB rollback.
-# SCHEDULE: 15,45 * * * *; registry polling has its own six-hour per-item cache.
-# New installs: 13:15-15:30 Singapore; at most one/run and two/rolling 24h.
+# SCHEDULE: */15 * * * *; registry polling has its own six-hour per-item cache.
+# New installs: 13:15-15:30 Singapore; at most one/run and three/rolling 24h.
 # Default allowlist seeds once, bound to exact installed repository/source URL.
 # Retired items leave policy automatically after two complete inventory scans;
 # stopped items stay stopped. Reinstalling a retired/changed identity needs review.
 # New items default to notify-only, never inherit a broad wildcard approval.
 # STATE/LOG: /mnt/vault/cloud/logs/script/system_update_coordinator; atomic JSON,
 # private per-action recovery evidence, 2MiB log + two rotations, 30-day age bound.
-# Reports: one grouped weekly availability digest; installed/failed/recovered work
-# reported after each bounded run. Undelivered reports stay in an existing outbox.
+# Reports: normal actions and every installed/deferred item grouped at 15:45;
+# urgent failures bypass the cutoff. Undelivered pages stay in a durable outbox.
 # Recovery: journal before native recreation. Uncertain installs are inspected,
 # never blindly repeated. Previous image/config archived before update; latest
 # two finished recovery sets retained, plus any unresolved set (new work stops).
@@ -75,7 +75,14 @@ usr_ops_append_log() {
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="1.0.1"
+readonly SCRIPT_VERSION="1.1.0"
+# Keep configured per-item holds when approving the same installed identity.
+# Daily rolling tags need a shorter hold to avoid perpetually chasing rebuilds.
+readonly APPROVAL_JQ='def approval($old;$identity;$allow;$kind;$epoch):
+ (if ($old.identity // "")==$identity then $old else {} end) |
+ .+{identity:$identity,allow:$allow,approvedAt:$epoch} |
+ if $kind=="docker" and .candidateHoldHours==null and ($identity|test(":(nightly|develop|unstable)$")) then .candidateHoldHours=12 else . end;'
+
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/system_update_coordinator}"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 VAULT_MOUNT="${VAULT_MOUNT:-/mnt/vault}"
@@ -96,7 +103,7 @@ MAX_CHECKS_PER_RUN=4
 CHECK_INTERVAL_SECONDS=21600
 BACKUP_MAX_AGE_SECONDS=$((80*3600))
 DOCKER_MAINTENANCE_DIR="${DOCKER_MAINTENANCE_DIR:-/run/docker-service-maintenance}"
-TMP_DIR='' START_EPOCH=0 RUN_ID='' RESULT=OK SUMMARY='' INSTALL_ACTIVE=false UPDATE_FD='' EXPORT_FD='' LEASE_FILE='' OWN_GATE_FD='' MAINT_FD='' EVENTS=0
+TMP_DIR='' START_EPOCH=0 RUN_ID='' RESULT=OK SUMMARY='' RECOVERY_REASON='' INSTALL_ACTIVE=false UPDATE_FD='' EXPORT_FD='' LEASE_FILE='' OWN_GATE_FD='' MAINT_FD='' EVENTS=0
 log(){ local level="$1";shift;local line;line=$(OPS_RUN_ID="${RUN_ID:-$$}" usr_ops_log_line "$level" "${PHASE:-MAIN}" "$*");printf '%s\n' "$line";[[ ! -d "$STATE_DIR" ]] || usr_ops_append_log "$LOG_FILE" "$line"; }
 valid_name(){ [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; }
 same_repository(){
@@ -116,22 +123,31 @@ state_valid(){ jq -e '.schema==1 and (.items|type)=="object" and (.jobs|type)=="
 mutate(){ jq "$@" "$STATE_FILE" >"$TMP_DIR/state.next" && state_valid "$TMP_DIR/state.next" && publish "$TMP_DIR/state.next" "$STATE_FILE"; }
 policy_valid(){ jq -e '
  .schema==1 and (.enabled|type)=="boolean" and (.docker|type)=="object" and (.plugins|type)=="object" and
- all(.docker[],.plugins[];(.allow|type)=="boolean" and (.identity|type)=="string") and
+ all(.docker[],.plugins[];(.allow|type)=="boolean" and (.identity|type)=="string" and (.candidateHoldHours==null or ((.candidateHoldHours|type)=="number" and .candidateHoldHours==(.candidateHoldHours|floor) and .candidateHoldHours>=1 and .candidateHoldHours<=168))) and
  (.window.start|type)=="string" and (.window.end|type)=="string" and
  (.window.start|test("^([01][0-9]|2[0-3]):[0-5][0-9]$")) and (.window.end|test("^([01][0-9]|2[0-3]):[0-5][0-9]$")) and .window.start<.window.end and
- ((.limits.dailyTotal // 2)|type)=="number" and ((.limits.dailyPlugins // 1)|type)=="number" and ((.limits.candidateHoldHours // 24)|type)=="number" and
- ((.limits.dailyTotal // 2)|floor)==(.limits.dailyTotal // 2) and (.limits.dailyTotal // 2)>=1 and (.limits.dailyTotal // 2)<=5 and
- ((.limits.dailyPlugins // 1)|floor)==(.limits.dailyPlugins // 1) and (.limits.dailyPlugins // 1)>=0 and (.limits.dailyPlugins // 1)<=2 and (.limits.dailyPlugins // 1)<=(.limits.dailyTotal // 2) and
- ((.limits.candidateHoldHours // 24)|floor)==(.limits.candidateHoldHours // 24) and (.limits.candidateHoldHours // 24)>=1 and (.limits.candidateHoldHours // 24)<=168
+ ((.limits.dailyTotal // 3)|type)=="number" and ((.limits.dailyPlugins // 1)|type)=="number" and ((.limits.candidateHoldHours // 24)|type)=="number" and
+ ((.limits.dailyTotal // 3)|floor)==(.limits.dailyTotal // 3) and (.limits.dailyTotal // 3)>=1 and (.limits.dailyTotal // 3)<=5 and
+ ((.limits.dailyPlugins // 1)|floor)==(.limits.dailyPlugins // 1) and (.limits.dailyPlugins // 1)>=0 and (.limits.dailyPlugins // 1)<=2 and (.limits.dailyPlugins // 1)<=(.limits.dailyTotal // 3) and
+ ((.limits.candidateHoldHours // 24)|floor)==(.limits.candidateHoldHours // 24) and (.limits.candidateHoldHours // 24)>=1 and (.limits.candidateHoldHours // 24)<=168 and
+ ((.reportTime // "15:45")|type)=="string" and ((.reportTime // "15:45")|test("^([01][0-9]|2[0-3]):[0-5][0-9]$")) and
+ ((.limits.imageMaxBytes // 4294967296)|type)=="number" and ((.limits.imageMaxBytes // 4294967296)|floor)==(.limits.imageMaxBytes // 4294967296) and
+ (.limits.imageMaxBytes // 4294967296)>=1073741824 and (.limits.imageMaxBytes // 4294967296)<=8589934592
  ' "$1" >/dev/null 2>&1; }
 policy_update(){ jq "$@" "$POLICY_FILE" >"$TMP_DIR/policy.next" && policy_valid "$TMP_DIR/policy.next" && publish "$TMP_DIR/policy.next" "$POLICY_FILE"; }
 event(){
  local importance="$1" subject="$2" detail="$3" key="$4" id
  id=$(printf '%s' "$key"|sha256sum|cut -d' ' -f1)
- mutate --arg id "$id" --arg importance "$importance" --arg subject "$subject" --arg detail "$detail" --argjson now "$(date +%s)" \
-  'if any(.outbox[];.id==$id) or (.delivered[$id] // 0)>$now-86400 then . else .outbox+=[{id:$id,importance:$importance,subject:$subject,detail:$detail,at:$now}] end' || return 1
+ jq -n --arg detail "$detail" --arg subject "$subject" --arg id "$id" --arg importance "$importance" --argjson now "$(date +%s)" '
+   def pieces: if utf8bytelength>10000 then [range(0;length;2000) as $i | .[$i:$i+2000]] else [.] end;
+   ($detail|split("\n")|map(pieces)|add) as $lines |
+   (reduce $lines[] as $line ([""]; if ((.[-1]+"\n"+$line)|utf8bytelength)>11000 then .+[$line] else .[-1]+=(if .[-1]=="" then "" else "\n" end)+$line end)) as $pages |
+   [range(0;$pages|length) as $i|{id:($id+(if ($pages|length)>1 then ":"+($i|tostring) else "" end)),importance:$importance,subject:($subject+(if ($pages|length)>1 then " (part "+(($i+1)|tostring)+"/"+($pages|length|tostring)+")" else "" end)),detail:$pages[$i],at:$now}]' >"$TMP_DIR/events.next" || return 1
+ mutate --slurpfile events "$TMP_DIR/events.next" --argjson now "$(date +%s)" '
+   reduce $events[0][] as $e (.;if any(.outbox[];.id==$e.id) or (.delivered[$e.id] // 0)>$now-86400 then . else .outbox+=[$e] end)' || return 1
  EVENTS=$((EVENTS+1))
 }
+
 window_open(){
  local now start end;now=$(TZ=Asia/Singapore date +%H:%M);start=$(jq -r .window.start "$POLICY_FILE");end=$(jq -r .window.end "$POLICY_FILE")
  [[ "$now" > "$start" || "$now" == "$start" ]] && [[ "$now" < "$end" ]]
@@ -162,9 +178,24 @@ try {
  }
  if($mode==='docker-check'||$mode==='docker-local'){
   $repo=$argv[2]??'';if(!$repo||strlen($repo)>512)throw new RuntimeException('Invalid repository');$u=new DockerUpdate();
-  $local=$u->inspectLocalVersion($repo);if(!is_string($local)||!preg_match('/^sha256:[a-f0-9]{64}$/D',$local))throw new RuntimeException('Installed digest unavailable');if($mode==='docker-local')output(['schema'=>1,'local'=>$local]);$remote=$u->getRemoteVersionV2($repo);
+  $name=$argv[3]??'';$reference=$repo;
+  if($name!=='') {if(!preg_match('/^[A-Za-z0-9][A-Za-z0-9_.-]*$/D',$name))throw new RuntimeException('Invalid container');$d=$client->getContainerDetails($name);$reference=$d['Image']??'';if(!$reference)throw new RuntimeException('Container image unavailable');}
+  // The installed container, not a shared mutable tag, owns this evidence.
+  // A Plex pull must not make a second, older Plex container look current.
+  $inspect=$client->getDockerJSON('/images/'.$reference.'/json');$local=null;
+  $normalize=static function(string $v):string {$v=preg_replace('/:[^\/]+$/','',explode('@',$v)[0]);$v=preg_replace('#^(docker.io|index.docker.io|registry-1.docker.io)/#','',$v);if(!str_contains($v,'/'))$v='library/'.$v;return $v;};
+  foreach($inspect['RepoDigests']??[] as $digest){$parts=explode('@',$digest,2);if(count($parts)===2&&$normalize($parts[0])===$normalize($repo))$local=$parts[1];}
+  $provenance='docker-image-metadata';$cachePath=$argv[4]??'';
+  // Native image cleanup can remove RepoDigests from an image still used by
+  // the other Plex container. Reuse only evidence bound to this exact image,
+  // container and repository; a newly recreated container cannot inherit it.
+  if(!$local&&$name!==''&&$cachePath!==''&&is_file($cachePath)&&!is_link($cachePath)&&filesize($cachePath)<8388608){
+   $cache=json_decode(file_get_contents($cachePath),true);$old=$cache['items']['docker:'.$name]['evidence']??[];
+   if(($old['imageId']??'')===$reference&&($old['containerId']??'')===($d['Id']??null)&&($old['identity']??'')===$repo&&in_array($old['installedDigestSource']??'',['docker-image-metadata','verified-image-cache'],true)){$local=$old['local']??null;$provenance='verified-image-cache';}
+  }
+  if(!is_string($local)||!preg_match('/^sha256:[a-f0-9]{64}$/D',$local))throw new RuntimeException('Installed digest unavailable');if($mode==='docker-local')output(['schema'=>1,'local'=>$local,'imageId'=>$reference,'containerId'=>$d['Id']??null,'identity'=>$repo,'installedDigestSource'=>$provenance]);$remote=$u->getRemoteVersionV2($repo);
   if(!is_string($remote)||!preg_match('/^sha256:[a-f0-9]{64}$/D',$remote))throw new RuntimeException('Registry digest unavailable');
-  output(['schema'=>1,'remote'=>$remote,'local'=>$local,'available'=>$local!==$remote]);
+  output(['schema'=>1,'remote'=>$remote,'local'=>$local,'available'=>$local!==$remote,'imageId'=>$reference,'containerId'=>$d['Id']??null,'identity'=>$repo,'installedDigestSource'=>$provenance]);
  }
  if($mode==='plugin-check'){
   $name=$argv[2]??'';if(!preg_match('/^[a-zA-Z0-9_.-]+\.plg$/D',$name))throw new RuntimeException('Invalid plugin name');
@@ -201,9 +232,10 @@ initialize() {
     state_valid "$STATE_FILE" || { log ERROR 'State invalid; preserved; updates prohibited';return 1; }
     if [[ ! -f "$POLICY_FILE" ]];then
       adapter inventory >"$TMP_DIR/initial-inventory" || return 1
-      jq 'def entry($identity;$allow):{identity:$identity,allow:$allow,approvedAt:now|floor};
-        {schema:1,enabled:true,window:{start:"13:15",end:"15:30"},limits:{dailyTotal:2,dailyPlugins:1,candidateHoldHours:24},docker:(.docker|with_entries(.value=entry(.value.repository;(.key|IN("prowlarr","bazarr","tautulli","seerr","lumunarr"))))),
-         plugins:(.plugins|with_entries(.value=entry(.value.installed.url;(.key|IN("community.applications.plg","fix.common.problems.plg","dynamix.system.info.plg")))))}' "$TMP_DIR/initial-inventory" >"$TMP_DIR/policy.initial" || return 1
+      jq "$APPROVAL_JQ"' (now|floor) as $epoch |
+        {schema:1,enabled:true,window:{start:"13:15",end:"15:30"},reportTime:"15:45",limits:{dailyTotal:3,dailyPlugins:1,candidateHoldHours:24,imageMaxBytes:4294967296},
+         docker:(.docker|with_entries(.value=approval({};.value.repository;(.value.repository|length>0);"docker";$epoch))),
+         plugins:(.plugins|with_entries(.value=approval({};.value.installed.url;(.key!="unRAIDServer.plg" and (.value.installed.url|startswith("https://")));"plugin";$epoch)))}' "$TMP_DIR/initial-inventory" >"$TMP_DIR/policy.initial" || return 1
       policy_valid "$TMP_DIR/policy.initial" && publish "$TMP_DIR/policy.initial" "$POLICY_FILE" || return 1
     fi
     policy_valid "$POLICY_FILE" || { log ERROR 'Policy invalid; preserved; updates prohibited';return 1; }
@@ -229,15 +261,14 @@ collect_inventory() {
     policy_update --slurpfile state "$STATE_FILE" '
       .docker |= with_entries(select($state[0].retired["docker:"+.key]==null)) |
       .plugins |= with_entries(select($state[0].retired["plugin:"+.key]==null))' || return 1
-    local kind name identity key
-    for kind in docker plugin;do
-      while IFS=$'\t' read -r name identity;do
-        key="$kind:$name"
-        mutate --arg key "$key" --arg kind "$kind" --arg name "$name" --arg identity "$identity" --argjson now "$(date +%s)" '
-          .items[$key] = ((.items[$key] // {kind:$kind,name:$name,identity:$identity,firstSeen:$now,checkedAt:0,missingScans:0}) |
-            if .identity!=$identity then {kind:$kind,name:$name,identity:$identity,firstSeen:$now,checkedAt:0,missingScans:0,identityChanged:true} else . end) | del(.retired[$key])' || return 1
-      done < <(if [[ "$kind" == docker ]];then jq -r '.docker|to_entries[]|[.key,.value.repository]|@tsv' "$TMP_DIR/inventory.json";else jq -r '.plugins|to_entries[]|[.key,.value.installed.url]|@tsv' "$TMP_DIR/inventory.json";fi)
-    done
+    mutate --slurpfile inv "$TMP_DIR/inventory.json" --argjson now "$(date +%s)" '
+      [($inv[0].docker|to_entries[]|{kind:"docker",name:.key,identity:.value.repository}),
+       ($inv[0].plugins|to_entries[]|{kind:"plugin",name:.key,identity:.value.installed.url})] as $live |
+      reduce $live[] as $v (.;($v.kind+":"+$v.name) as $key |
+        .items[$key]=((.items[$key] // ($v+{firstSeen:$now,checkedAt:0,missingScans:0})) |
+          if .identity!=$v.identity then $v+{firstSeen:$now,checkedAt:0,missingScans:0,identityChanged:true} else . end) |
+        del(.retired[$key]))'
+
 }
 
 adapter_compatible() {
@@ -263,7 +294,7 @@ check_updates() {
           mutate --arg key "$key" --argjson now "$now" '.items[$key].checkedAt=$now | .items[$key].available=false | .items[$key].checkStatus="PINNED_OR_UNMANAGED"' || return 1
           continue
         fi
-        adapter docker-check "$identity" >"$TMP_DIR/check.json" 2>"$TMP_DIR/check.err" || check_rc=$?
+        adapter docker-check "$identity" "$name" "$STATE_FILE" >"$TMP_DIR/check.json" 2>"$TMP_DIR/check.err" || check_rc=$?
       elif [[ "$name" == unRAIDServer.plg ]];then
         bounded 100 env QUERY_STRING=json=true "$NATIVE_OS_CHECK" >"$TMP_DIR/os-check.json" 2>"$TMP_DIR/os-check.err" || check_rc=$?
         # The native OS result is retained as evidence; never route OS through a plugin installer.
@@ -331,8 +362,24 @@ maintenance_guard() {
 
 readiness() {
     local name="$1"
-    bounded 50 /bin/bash "$WATCHDOG_SCRIPT" --readiness "$name" >"$TMP_DIR/readiness.json" 2>"$TMP_DIR/readiness.err" || return 1
+    bounded 50 /bin/bash "$WATCHDOG_SCRIPT" "${2:---update-readiness}" "$name" >"$TMP_DIR/readiness.json" 2>"$TMP_DIR/readiness.err" || return 1
     jq -e '.schema==1 and .ready==true' "$TMP_DIR/readiness.json" >/dev/null
+}
+
+# Native plugin versions are not enough for host-network/GPU dependencies.
+plugin_service_guard() {
+    local name="$1" mode="${2:-before}" service
+    docker_cmd info >/dev/null 2>&1 || return 1
+    case "$name" in
+      tailscale.plg)
+        bounded 12 tailscale status --json | jq -e '.BackendState=="Running" and .Self.Online==true' >/dev/null || return 1;;
+      gpustat.plg|intel-gpu-top.plg)
+        for service in plex-media plex-media-server;do
+          jq -e --arg n "$service" '.inventory.docker[$n].running==true' "$STATE_FILE" >/dev/null || continue
+          if [[ "$mode" == before ]];then readiness "$service" || return 1
+          else readiness "$service" --readiness || return 1;fi
+        done;;
+    esac
 }
 
 start_container_lease() {
@@ -354,7 +401,9 @@ start_container_lease() {
 job_update() { local id="$1" expression="$2";shift 2;mutate --arg id "$id" "$@" "$expression"; }
 
 prepare_recovery_set() {
-    local kind="$1" name="$2" id="$3" old_image="${4:-}" old_size free target
+    local kind="$1" name="$2" id="$3" old_image="${4:-}" old_size free target max_bytes
+    RECOVERY_REASON="Previous-image export, configuration copy or archive validation did not complete"
+    max_bytes=$(jq -r '.limits.imageMaxBytes // 4294967296' "$POLICY_FILE")
     [[ "$ROLLBACK_ROOT" == "$VAULT_MOUNT"/backup/system_updates && ! -L "$ROLLBACK_ROOT" ]] || return 1
     if [[ -e "$ROLLBACK_ROOT" ]];then [[ -f "$ROLLBACK_ROOT/.owner" && $(cat "$ROLLBACK_ROOT/.owner") == system_update_coordinator ]] || return 1
     else mkdir -m 700 "$ROLLBACK_ROOT" && printf 'system_update_coordinator\n' >"$ROLLBACK_ROOT/.owner" || return 1;fi
@@ -363,13 +412,14 @@ prepare_recovery_set() {
     cp "$TMP_DIR/backup-evidence.json" "$target/backup-evidence.json" || return 1
     if [[ "$kind" == docker ]];then
       old_size=$(docker_cmd image inspect "$old_image" --format '{{.Size}}') || return 1
-      [[ "$old_size" =~ ^[0-9]+$ && "$old_size" -le 2147483648 ]] || return 1
-      free=$(df -PB1 "$ROLLBACK_ROOT"|awk 'NR==2{print $4}');((free>=old_size+10*1024*1024*1024)) || return 1
+      [[ "$old_size" =~ ^[0-9]+$ ]] || return 1
+      ((old_size<=max_bytes)) || { RECOVERY_REASON="Image size $old_size bytes exceeds recovery archive limit $max_bytes bytes";return 1; }
+      free=$(df -PB1 "$ROLLBACK_ROOT"|awk 'NR==2{print $4}');((free>=old_size+10*1024*1024*1024)) || { RECOVERY_REASON="Vault free $free bytes does not cover previous image $old_size bytes plus 10 GiB reserve";return 1; }
       cp "$TMP_DIR/definition-before.json" "$target/definition-before.json"
       cp "$(jq -r .template "$TMP_DIR/definition-before.json")" "$target/template.xml" || return 1
       # Native DockerMan can force-remove the previous image. Archive it before
       # invoking that installer; never assume a temporary tag protects it.
-      bounded 180 /bin/bash -c 'set -o pipefail;set +o posix;ulimit -f 2097152;docker image save "$1" | gzip -1 >"$2"' _ "$old_image" "$target/image.tar.gz.partial" || return 1
+      bounded 180 /bin/bash -c 'set -o pipefail;set +o posix;ulimit -f "$3";docker image save "$1" | gzip -1 >"$2"' _ "$old_image" "$target/image.tar.gz.partial" "$((max_bytes/1024))" || return 1
       bounded 90 gzip -t "$target/image.tar.gz.partial" || return 1
       mv "$target/image.tar.gz.partial" "$target/image.tar.gz"
       sha256sum "$target/image.tar.gz" >"$target/image.sha256";sync -f "$target/image.tar.gz" || return 1
@@ -387,15 +437,16 @@ job_verified() {
       adapter definition "$name" >"$TMP_DIR/definition-after.json" || return 1
       identity=$(jq -r --arg id "$id" '.jobs[$id].identity' "$STATE_FILE")
       same_repository "$(jq -r .runtimeImage "$TMP_DIR/definition-after.json")" "$identity" || return 1
-      current=$(adapter docker-local "$identity") || return 1
+      current=$(adapter docker-local "$identity" "$name" "$STATE_FILE") || return 1
       # Require installed digest exactly equal to the approved observed candidate.
       [[ $(jq -r .local <<<"$current") == "$expected" ]] || return 1
       [[ $(jq -r .id "$TMP_DIR/definition-after.json") != "$(jq -r --arg id "$id" '.jobs[$id].oldId' "$STATE_FILE")" ]] || return 1
       jq -e --slurpfile old "$(jq -r --arg id "$id" '.jobs[$id].recoveryPath' "$STATE_FILE")/definition-before.json" '.running==true and .definition==$old[0].definition and .templateHash==$old[0].templateHash' "$TMP_DIR/definition-after.json" >/dev/null || return 1
-      if readiness "$name";then return 0;else VERIFY_REASON=readiness;return 1;fi
+      if readiness "$name" --readiness;then return 0;else VERIFY_REASON=readiness;return 1;fi
     else
       adapter plugin-check "$name" >"$TMP_DIR/plugin-after.json" || return 1
       jq -e '.busy==false' "$TMP_DIR/plugin-after.json" >/dev/null || return 1
+      enforce_single_installer && plugin_service_guard "$name" after || return 1
       adapter inventory >"$TMP_DIR/recheck-inventory.json" || return 1
       identity=$(jq -r --arg id "$id" '.jobs[$id].identity' "$STATE_FILE")
       jq -e --arg name "$name" --arg version "$expected" --arg identity "$identity" --arg hash "$(jq -r --arg id "$id" '.jobs[$id].candidateHash' "$STATE_FILE")" '.complete==true and .plugins[$name].installed.version==$version and .plugins[$name].installed.url==$identity and .plugins[$name].installed.sha256==$hash' "$TMP_DIR/recheck-inventory.json" >/dev/null
@@ -433,7 +484,7 @@ reconcile_jobs() {
           local evidence='Expected image digest, retained configuration and application readiness verified on two observations'
           [[ $(jq -r --arg id "$id" '.jobs[$id].kind' "$STATE_FILE") != plugin ]] || evidence='Exact installed plugin version/source/manifest and finished native plugin task verified on two observations; plugin feature behavior was not independently certified'
           job_update "$id" '.jobs[$id].status="COMPLETED" | .jobs[$id].verifiedAt=$now' --argjson now "$(date +%s)" || return 1
-          event normal 'Update verified' "$name: $evidence. Previous image/config retained in its recovery set; no database rollback performed." "verified:$id" || return 1
+          event normal 'Update verified' "$name: $evidence. Recovery evidence retained at $(jq -r --arg id "$id" '.jobs[$id].recoveryPath' "$STATE_FILE"); no automatic restore or database rollback was performed." "verified:$id" || return 1
         fi
       else
         if [[ "${VERIFY_REASON:-}" == readiness ]] && (( $(date +%s)-$(jq -r --arg id "$id" '.jobs[$id].dispatchedAt // 0' "$STATE_FILE")<1200 ));then
@@ -475,49 +526,51 @@ clean_recovery_sets() {
 }
 
 install_one() {
-    local key kind name identity candidate approved now count job_id old_id='' old_image='' recovery_path native_rc=0 fresh
+    local key kind name identity candidate approved now count job_id old_id='' old_image='' recovery_path native_rc=0 post_guard_failed=false fresh
     [[ $(jq -r .enabled "$POLICY_FILE") == true ]] && window_open && within_budget 630 || return 0
     # Never continue a batch after an unverified or interrupted native mutation.
     jq -e 'all(.jobs[];.status!="INTENT" and .status!="VERIFYING" and .status!="ATTENTION")' "$STATE_FILE" >/dev/null || { RESULT=DEFERRED;jq -e 'any(.jobs[];.status=="INTENT" or .status=="ATTENTION")' "$STATE_FILE" >/dev/null && RESULT=ATTENTION;SUMMARY='Automatic installs held for pending verification; reconciliation continues';return 0; }
     now=$(date +%s)
     count=$(jq --argjson cutoff "$((now-86400))" '[.jobs[]|select((.dispatchedAt // 0)>=$cutoff)]|length' "$STATE_FILE")
-    ((count<$(jq -r '.limits.dailyTotal // 2' "$POLICY_FILE"))) || return 0
+    ((count<$(jq -r '.limits.dailyTotal // 3' "$POLICY_FILE"))) || return 0
     adapter_compatible || { RESULT=DEFERRED;SUMMARY='Native update adapter unverified on this OS/interface; no automatic install';event warning 'Automatic installation deferred' "$SUMMARY; read-only evidence and existing intents retained. Validate native interfaces before enabling a new OS adapter." adapter-unverified;return 0; }
     while IFS=$'\t' read -r key kind name identity candidate;do
-      [[ "$name" != unRAIDServer.plg && "$name" != ca.update.applications.plg && "$name" != user.scripts.plg && "$name" != user.scripts.enhanced.plg ]] || continue
+      [[ "$name" != unRAIDServer.plg ]] || continue
       approved=$(jq -r --arg kind "$kind" --arg name "$name" --arg identity "$identity" '(if $kind=="docker" then .docker[$name] else .plugins[$name] end) as $p | ($p.allow==true and $p.identity==$identity)' "$POLICY_FILE")
       [[ "$approved" == true ]] || continue
       # Failed/rejected digest/version stays quarantined until it changes or an
       # operator explicitly resolves the job; no reinstall loops.
       jq -e --arg key "$key" --arg candidate "$candidate" --argjson cutoff "$((now-6*3600))" 'all(.jobs[];.item!=$key or .candidate!=$candidate or (.status=="DEFERRED" and .startedAt<$cutoff))' "$STATE_FILE" >/dev/null || continue
-      backup_evidence "$kind" || { log INFO "$name: DEFERRED; recent verified backup evidence unavailable";continue; }
+      backup_evidence "$kind" || { decision "$key" "Recent verified backup evidence unavailable";log INFO "$name: DEFERRED; recent verified backup evidence unavailable";continue; }
       if [[ "$kind" == docker ]];then
-        jq -e --arg name "$name" '.docker[$name].running==true and .docker[$name].managed=="dockerman"' "$TMP_DIR/inventory.json" >/dev/null || continue
+        jq -e --arg name "$name" '.docker[$name].running==true and .docker[$name].managed=="dockerman"' "$TMP_DIR/inventory.json" >/dev/null || { decision "$key" "Container stopped or not managed by DockerMan";continue; }
         # Require readiness before taking down an already unhealthy application.
-        readiness "$name" || { log INFO "$name: DEFERRED; strong application readiness not established";continue; }
-        adapter docker-check "$identity" >"$TMP_DIR/fresh.json" || continue
-        [[ $(jq -r .remote "$TMP_DIR/fresh.json") == "$candidate" ]] || continue
-        adapter definition "$name" >"$TMP_DIR/definition-before.json" || continue
-        [[ $(jq -r .templateHash "$TMP_DIR/definition-before.json") == "$(jq -r --arg name "$name" '.docker[$name].templateHash' "$TMP_DIR/inventory.json")" ]] || continue
-        same_repository "$(jq -r .runtimeImage "$TMP_DIR/definition-before.json")" "$identity" || { log WARNING "$name: DEFERRED; running image channel differs from saved template; no update started";continue; }
+        readiness "$name" || { decision "$key" "$(jq -r '.detail // "Strong application readiness not established"' "$TMP_DIR/readiness.json" 2>/dev/null)";log INFO "$name: DEFERRED; busy or application readiness unverified";continue; }
+        adapter docker-check "$identity" "$name" "$STATE_FILE" >"$TMP_DIR/fresh.json" || { decision "$key" "Fresh registry/container digest could not be verified";continue; }
+        [[ $(jq -r .remote "$TMP_DIR/fresh.json") == "$candidate" ]] || { decision "$key" "Registry candidate changed; stability hold restarts on the next check";continue; }
+        adapter definition "$name" >"$TMP_DIR/definition-before.json" || { decision "$key" "Current container/template definition unavailable";continue; }
+        [[ $(jq -r .templateHash "$TMP_DIR/definition-before.json") == "$(jq -r --arg name "$name" '.docker[$name].templateHash' "$TMP_DIR/inventory.json")" ]] || { decision "$key" "Template changed during preflight; current settings preserved";continue; }
+        same_repository "$(jq -r .runtimeImage "$TMP_DIR/definition-before.json")" "$identity" || { decision "$key" "Running image channel differs from saved template";log WARNING "$name: DEFERRED; running image channel differs from saved template; no update started";continue; }
         old_id=$(jq -r .id "$TMP_DIR/definition-before.json");old_image=$(jq -r .imageId "$TMP_DIR/definition-before.json")
       else
-        count=$(jq --argjson cutoff "$((now-86400))" '[.jobs[]|select(.kind=="plugin" and (.dispatchedAt // 0)>=$cutoff)]|length' "$STATE_FILE");((count<$(jq -r '.limits.dailyPlugins // 1' "$POLICY_FILE"))) || continue
-        bounded 120 "$NATIVE_PLUGIN" check "$name" >"$TMP_DIR/plugin-final-check.log" 2>&1 && adapter plugin-check "$name" >"$TMP_DIR/fresh.json" || continue
-        jq -e --arg version "$candidate" --arg identity "$identity" '.available==true and .compatible==true and .busy==false and .candidate.version==$version and .candidate.url==$identity' "$TMP_DIR/fresh.json" >/dev/null || continue
-        [[ $(jq -r .candidate.sha256 "$TMP_DIR/fresh.json") == "$(jq -r --arg key "$key" '.items[$key].evidence.candidate.sha256' "$STATE_FILE")" ]] || continue
-        bounded 30 "$NATIVE_PLUGIN" validate "/tmp/plugins/$name" >"$TMP_DIR/plugin-validate.log" 2>&1 || continue
+        count=$(jq --argjson cutoff "$((now-86400))" '[.jobs[]|select(.kind=="plugin" and (.dispatchedAt // 0)>=$cutoff)]|length' "$STATE_FILE");((count<$(jq -r '.limits.dailyPlugins // 1' "$POLICY_FILE"))) || { decision "$key" "Rolling 24-hour plugin limit reached";continue; }
+        bounded 120 "$NATIVE_PLUGIN" check "$name" >"$TMP_DIR/plugin-final-check.log" 2>&1 && adapter plugin-check "$name" >"$TMP_DIR/fresh.json" || { decision "$key" "Fresh plugin evidence unavailable";continue; }
+        jq -e --arg version "$candidate" --arg identity "$identity" '.available==true and .compatible==true and .busy==false and .candidate.version==$version and .candidate.url==$identity' "$TMP_DIR/fresh.json" >/dev/null || { decision "$key" "Plugin candidate incompatible, busy, changed or no longer available";continue; }
+        [[ $(jq -r .candidate.sha256 "$TMP_DIR/fresh.json") == "$(jq -r --arg key "$key" '.items[$key].evidence.candidate.sha256' "$STATE_FILE")" ]] || { decision "$key" "Plugin manifest changed; waiting for fresh stable candidate evidence";continue; }
+        bounded 30 "$NATIVE_PLUGIN" validate "/tmp/plugins/$name" >"$TMP_DIR/plugin-validate.log" 2>&1 || { decision "$key" "Native plugin package/hash validation failed";continue; }
       fi
-      maintenance_guard || { log INFO "${SUMMARY:-Maintenance conditions unavailable; installation deferred}";return 0; }
+      if [[ "$kind" == plugin ]];then plugin_service_guard "$name" || { decision "$key" "Host network or Plex/GPU dependency is active/unverified; plugin update deferred";continue; };fi
+      maintenance_guard || { decision "$key" "${SUMMARY:-Maintenance guard unavailable}";log INFO "${SUMMARY:-Maintenance conditions unavailable; installation deferred}";return 0; }
+      decision "$key" "Recovery preparation started"
       PHASE=install;job_id="$(date +%Y%m%d_%H%M%S)_${kind}_${name}_$$"
       recovery_path="$ROLLBACK_ROOT/$job_id"
       mutate --arg id "$job_id" --arg item "$key" --arg kind "$kind" --arg name "$name" --arg identity "$identity" --arg candidate "$candidate" \
-        --arg oldId "$old_id" --arg oldImage "$old_image" --arg path "$recovery_path" --argjson now "$now" \
-        '.jobs[$id]={item:$item,kind:$kind,name:$name,identity:$identity,candidate:$candidate,status:"PREPARING",startedAt:$now,oldId:$oldId,oldImage:$oldImage,recoveryPath:$path,verifiedScans:0}' || return 1
+        --arg previous "$(jq -r '.local // .installed.version // "unknown"' "$TMP_DIR/fresh.json")" --arg oldId "$old_id" --arg oldImage "$old_image" --arg path "$recovery_path" --argjson now "$now" \
+        '.jobs[$id]={previous:$previous,item:$item,kind:$kind,name:$name,identity:$identity,candidate:$candidate,status:"PREPARING",startedAt:$now,oldId:$oldId,oldImage:$oldImage,recoveryPath:$path,verifiedScans:0}' || return 1
       if ! prepare_recovery_set "$kind" "$name" "$job_id" "$old_image";then
         job_update "$job_id" '.jobs[$id].status="DEFERRED" | .jobs[$id].reason="Recovery evidence preparation failed; native installer not called"' || return 1
         cleanup_unissued_set "$job_id" || true
-        event warning 'Update deferred before installation' "$name: recovery evidence could not be prepared; native installer was not called and the current application was retained. Check available vault space and the bounded image archive." "prepare:$key:$candidate" || return 1
+        event warning 'Update deferred before installation' "$name: recovery evidence could not be prepared; native installer was not called and the current application was retained. Reason: ${RECOVERY_REASON:-Recovery preparation did not complete}." "prepare:$key:$candidate" || return 1
         return 0
       fi
       if [[ "$kind" == docker ]];then start_container_lease "$name" "$old_id" || { defer_prepared "$job_id" 'Existing maintenance lease; native installer not called';return 0; };fi
@@ -526,6 +579,7 @@ install_one() {
       if ! window_open || ! within_budget 480 || ! adapter_compatible;then defer_prepared "$job_id" 'Final window/runtime/interface guard deferred before native installer';return 0;fi
       if [[ "$kind" == docker ]];then
         fresh=$(docker_cmd inspect "$name" --format '{{.Id}}') || return 1
+        readiness "$name" || { decision "$key" "$(jq -r '.detail // "Application busy or readiness unverified"' "$TMP_DIR/readiness.json" 2>/dev/null)";defer_prepared "$job_id" 'Final application readiness/busy guard deferred before dispatch';return 0; }
         [[ "$fresh" == "$old_id" ]] || { defer_prepared "$job_id" 'Installed identity changed; native installer not called';return 0; }
       fi
       job_update "$job_id" '.jobs[$id].status="INTENT" | .jobs[$id].dispatchedAt=$now | .jobs[$id].candidateHash=$hash' --arg hash "$( [[ "$kind" != plugin ]] || jq -r .candidate.sha256 "$TMP_DIR/fresh.json" )" --argjson now "$(date +%s)" || return 1
@@ -533,10 +587,13 @@ install_one() {
       if [[ "$kind" == docker ]];then bounded 420 "$NATIVE_DOCKER_UPDATE" "$name" >"$TMP_DIR/native-install.log" 2>&1 || native_rc=$?
       else bounded 300 "$NATIVE_PLUGIN" update "$name" >"$TMP_DIR/native-install.log" 2>&1 || native_rc=$?;fi
       INSTALL_ACTIVE=false
+      if [[ "$kind" == plugin ]];then
+        enforce_single_installer || post_guard_failed=true
+      fi
       tail -c 16384 "$TMP_DIR/native-install.log" >"$recovery_path/native-install.log" || true
       # Native helpers can return zero despite a failed recreation. Read-back,
       # not the exit code or an HTML completion banner, establishes completion.
-      job_update "$job_id" '.jobs[$id].status="VERIFYING" | .jobs[$id].nativeExit=$exit' --argjson exit "$native_rc" || return 1
+      job_update "$job_id" '.jobs[$id].status="VERIFYING" | .jobs[$id].nativeExit=$exit | .jobs[$id].postInstallGuardFailed=$guard' --argjson guard "$post_guard_failed" --argjson exit "$native_rc" || return 1
       if job_verified "$job_id";then
         job_update "$job_id" '.jobs[$id].verifiedScans=1' || return 1
         local first_evidence='expected image digest, retained settings and initial readiness verified'
@@ -547,34 +604,130 @@ install_one() {
       else
         RESULT=ATTENTION
         job_update "$job_id" '.jobs[$id].status="ATTENTION"' || return 1
-        event alert 'Update outcome requires attention' "$name: native installer exit=$native_rc; expected version/digest, configuration or readiness could not be confirmed. Further updates are held. The original image/config and backup reference are retained at $recovery_path. No blind replay or database rollback was attempted." "attention:$job_id" || return 1
+        event alert 'Update outcome requires attention' "$name: native installer exit=$native_rc; expected version/digest, configuration or readiness could not be confirmed. Further updates are held. Previous-image/configuration or plugin-definition recovery evidence and the backup reference are retained at $recovery_path. No blind replay or database rollback was attempted." "attention:$job_id" || return 1
       fi
       return 0
-    done < <(jq -r --argjson cutoff "$((now-$(jq -r '.limits.candidateHoldHours // 24' "$POLICY_FILE")*3600))" '.items|to_entries|sort_by(.value.candidateSeenAt // 0)|.[]|select(.value.missingScans==0 and .value.available==true and .value.checkStatus=="VERIFIED" and .value.candidateSeenAt<=$cutoff)|[.key,.value.kind,.value.name,.value.identity,.value.candidate]|@tsv' "$STATE_FILE")
+    done < <(jq -r --slurpfile policy "$POLICY_FILE" --argjson now "$now" '
+      .items|to_entries|sort_by(.value.candidateSeenAt // 0)|.[]|.value as $i|
+      (if $i.kind=="docker" then $policy[0].docker[$i.name] else $policy[0].plugins[$i.name] end) as $p|
+      (($p.candidateHoldHours // $policy[0].limits.candidateHoldHours // 24)*3600) as $hold|
+      select($i.missingScans==0 and $i.available==true and $i.checkStatus=="VERIFIED" and $i.candidateSeenAt<=$now-$hold)|
+      [.key,$i.kind,$i.name,$i.identity,$i.candidate]|@tsv' "$STATE_FILE")
 }
 
-availability_digest() {
-    local now previous body
-    now=$(date +%s);previous=$(jq -r '.lastAvailabilityReportAt // 0' "$STATE_FILE")
-    ((now-previous>=7*86400)) || return 0
-    body=$(jq -r '.items[]|select(.available==true)|"- "+.kind+"/"+.name+": candidate "+.candidate+"; last check="+(.checkStatus // "UNVERIFIED")+"; policy approval and maintenance/backup/readiness gates determine installation."' "$STATE_FILE")
-    [[ -n "$body" ]] || return 0
-    event normal 'Available updates review' "$body" "availability:$((now/(7*86400)))" && mutate --argjson now "$now" '.lastAvailabilityReportAt=$now'
+# One explicit decision per candidate; daily reporting retains the actual guard.
+decision() {
+    mutate --arg key "$1" --arg reason "${2:-Update deferred by safety guard}" --argjson now "$(date +%s)" '
+      .items[$key].decision={at:$now,candidate:.items[$key].candidate,reason:($reason[0:1200])}'
+}
+
+# CA may regenerate its cron files during a plugin upgrade. Keep a single
+# automatic installer and verify User Scripts did not lose the coordinator job.
+enforce_single_installer() {
+    local ca="${CA_SETTINGS_ROOT:-/boot/config/plugins/ca.update.applications}" root="${USER_SCRIPTS_ROOT:-/boot/config/plugins/user.scripts}" file temp cron changed=false launcher="${USER_SCRIPTS_LAUNCHER:-/usr/local/emhttp/plugins/user.scripts/startCustom.php}"
+    if [[ -d "$ca" ]];then
+      for file in DockerUpdateSettings.json AutoUpdateSettings.json;do
+        if [[ ! -e "$ca/$file" && ! -e /var/log/plugins/ca.update.applications.plg ]];then continue;fi
+        [[ -f "$ca/$file" && ! -L "$ca/$file" ]] && jq -e 'type=="object" and (.cron|type)=="object"' "$ca/$file" >/dev/null || return 1
+        if [[ "$file" == DockerUpdateSettings.json ]];then
+          jq -e '.cron.dockerCronFrequency=="disabled" and .global.dockerUpdateAll=="no"' "$ca/$file" >/dev/null && continue
+        else jq -e '.cron.pluginCronFrequency=="disabled" and .Global=="false"' "$ca/$file" >/dev/null && continue;fi
+        temp=$(mktemp "$ca/.coordinator.XXXXXX") || return 1
+        if [[ "$file" == DockerUpdateSettings.json ]];then
+          jq '.cron.dockerCronFrequency="disabled" | .global.dockerUpdateAll="no"' "$ca/$file" >"$temp" || return 1
+        else jq '.cron.pluginCronFrequency="disabled" | .Global="false"' "$ca/$file" >"$temp" || return 1;fi
+        if cmp -s "$temp" "$ca/$file";then rm -f "$temp";else mv "$temp" "$ca/$file" || return 1;changed=true;fi
+      done
+      for file in docker_update.cron plugin_update.cron;do
+        [[ ! -L "$ca/$file" ]] || return 1
+        if [[ ! -f "$ca/$file" ]] || grep -Eq '^[[:space:]]*[^#[:space:]]' "$ca/$file";then printf '# Automatic installations delegated to system_update_coordinator\n' >"$ca/$file" || return 1;changed=true;fi
+      done
+    fi
+    [[ -f "$root/scripts/system_update_coordinator/script" && -r "$launcher" && ! -L "$launcher" ]] || return 1
+    bounded 8 php -l "$launcher" >/dev/null 2>&1 || return 1
+    jq -e '.["/boot/config/plugins/user.scripts/scripts/system_update_coordinator/script"].frequency=="custom"' "$root/schedule.json" >/dev/null || return 1
+    [[ "$changed" != true ]] || update_cron || return 1
+    cron=$(bounded 8 crontab -c /etc/cron.d -l) || return 1
+    if ! grep -Fq '/scripts/system_update_coordinator/script' <<<"$cron";then update_cron || return 1;cron=$(bounded 8 crontab -c /etc/cron.d -l) || return 1;grep -Fq '/scripts/system_update_coordinator/script' <<<"$cron" || return 1;fi
+    ! grep -Eq 'ca.update.applications/.+(updateDocker|updatePlugins)' <<<"$cron"
+}
+
+render_update_report() {
+    local now day start
+    now=$(date +%s);day=$(TZ=Asia/Singapore date +%F);start=$(TZ=Asia/Singapore date -d "$day 00:00:00" +%s)
+    TZ=Asia/Singapore jq -nr --slurpfile state "$STATE_FILE" --slurpfile policy "$POLICY_FILE" --argjson now "$now" --argjson start "$start" --arg day "$day" '
+      $state[0] as $s | $policy[0] as $p |
+      def short: if startswith("sha256:") then .[0:19] else . end;
+      def approval($i): (if $i.kind=="docker" then $p.docker[$i.name] else $p.plugins[$i.name] end) as $a | $a.allow==true and $a.identity==$i.identity;
+      def hold($i): (if $i.kind=="docker" then $p.docker[$i.name] else $p.plugins[$i.name] end).candidateHoldHours // $p.limits.candidateHoldHours // 24;
+      def latest($key): [$s.jobs[]|select(.item==$key)]|sort_by(.dispatchedAt // .startedAt // 0)|last;
+      def reason($key;$i): latest($key) as $j |
+        if $i.name=="unRAIDServer.plg" then "OS update is manual; no OS installation or reboot"
+        elif ($i.missingScans // 0)>0 then "Presence unconfirmed; waiting for a second complete inventory"
+        elif $j!=null and ($j.status|IN("INTENT","VERIFYING","ATTENTION")) then "Update outcome: "+$j.status+"; "+($j.reason // "scheduled verification/reconciliation pending")
+        elif $i.checkStatus=="PINNED_OR_UNMANAGED" then "Digest-pinned or unmanaged image; no mutable update channel is available"
+        elif $i.checkStatus!="VERIFIED" then "Update status unverified: "+($i.checkStatus // "not checked yet")+"; installed app left unchanged"
+        elif $i.available!=true then "Up to date at last successful check"
+        elif (approval($i)|not) then "Identity is not approved; reporting only"
+        elif $p.enabled!=true then "Automatic installation paused"
+        elif $j!=null and $j.candidate==$i.candidate and ($j.status|IN("CLOSED_BY_OPERATOR","RETIRED","COMPLETED")) then "This candidate already handled; no automatic reinstall"
+        elif $j!=null and $j.candidate==$i.candidate and $j.status=="DEFERRED" and $j.startedAt>$now-21600 then "Retry backoff after: "+($j.reason // "pre-installation deferral")
+        elif $now-($i.candidateSeenAt // $now)<(hold($i)*3600) then "Candidate stability hold: "+((($now-($i.candidateSeenAt // $now))/3600|floor)|tostring)+"/"+(hold($i)|tostring)+"h"
+        elif ($i.decision.at // 0)>=$start and $i.decision.candidate==$i.candidate then $i.decision.reason
+        elif any($s.jobs[];.status=="INTENT" or .status=="VERIFYING" or .status=="ATTENTION") then "Waiting for another installation to finish verification"
+        elif ([$s.jobs[]|select((.dispatchedAt // 0)>$now-86400)]|length)>=($p.limits.dailyTotal // 3) then "Rolling 24-hour update limit reached"
+        elif $i.kind=="plugin" and ([$s.jobs[]|select(.kind=="plugin" and (.dispatchedAt // 0)>$now-86400)]|length)>=($p.limits.dailyPlugins // 1) then "Rolling 24-hour plugin limit reached"
+        elif $i.kind=="docker" and $s.inventory.docker[$i.name].running!=true then "Installed container is stopped; left stopped"
+        else "Queued for the next eligible maintenance slot; one installer per run" end;
+      "Daily system update report - "+$day+" (Singapore)",
+      "Policy: "+(if $p.enabled then "automatic" else "paused" end)+"; starts "+$p.window.start+"-"+$p.window.end+"; daily limits "+(($p.limits.dailyTotal // 3)|tostring)+" total / "+(($p.limits.dailyPlugins // 1)|tostring)+" plugin(s).",
+      "", "UPDATED AND VERIFIED:",
+      ([$s.jobs[]|select(.status=="COMPLETED" and (.verifiedAt // 0)>=$start)] as $done |
+        if ($done|length)==0 then "- None verified today."
+        else $done[]|"- "+.kind+"/"+.name+": "+((.previous // "unknown")|short)+" -> "+(.candidate|short)+"; native result and follow-up verification passed. Recovery: "+(.recoveryPath // "not recorded") end),
+      "", "INSTALLED / OUTCOME PENDING:",
+      ([$s.jobs[]|select(.status|IN("INTENT","VERIFYING","ATTENTION"))] as $pending |
+        if ($pending|length)==0 then "- None."
+        else $pending[]|"- "+.kind+"/"+.name+": "+.status+"; candidate "+(.candidate|short)+". "+(.reason // "Digest/version, retained configuration and readiness require confirmation")+". Recovery: "+(.recoveryPath // "not recorded") end),
+      "", "NOT UPDATED / INSTALLED INVENTORY STATUS:",
+      ($s.items|to_entries|sort_by(.key)|.[]|
+        .key as $key|.value as $i|
+        if any($s.jobs[];.item==$key and ((.status|IN("INTENT","VERIFYING","ATTENTION")) or (.status=="COMPLETED" and .candidate==$i.candidate and (.verifiedAt // 0)>=$start))) then empty
+        else "- "+$i.kind+"/"+$i.name+": "+reason($key;$i)+". Last check: "+(if ($i.checkedAt // 0)>0 then ($i.checkedAt|strflocaltime("%Y-%m-%d %H:%M SGT")) else "not yet performed" end) end),
+      "", "Removed items retire after two complete inventories. No OS installation, reboot or automatic database rollback is performed."'
+}
+
+daily_update_report() {
+    local day clock report
+    day=$(TZ=Asia/Singapore date +%F);clock=$(TZ=Asia/Singapore date +%H:%M)
+    [[ "$clock" > "$(jq -r '.reportTime // "15:45"' "$POLICY_FILE")" || "$clock" == "$(jq -r '.reportTime // "15:45"' "$POLICY_FILE")" ]] || return 0
+    [[ $(jq -r '.lastDailyReportDay // ""' "$STATE_FILE") != "$day" ]] || return 0
+    report=$(render_update_report) || return 1
+    event normal 'Daily update summary' "$report" "daily-update-report:$day" && mutate --arg day "$day" '.lastDailyReportDay=$day'
 }
 
 flush_notifications() {
-    local body count importance rc=0
+    local body count importance rc=0 now day_start clock after=false urgent=false total
+    now=$(date +%s);clock=$(TZ=Asia/Singapore date +%H:%M);day_start=$(TZ=Asia/Singapore date -d "$(TZ=Asia/Singapore date +%F) 00:00:00" +%s)
+    [[ "$clock" < "$(jq -r '.reportTime // "15:45"' "$POLICY_FILE")" ]] || after=true
+    jq -e 'any(.outbox[];.importance!="normal")' "$STATE_FILE" >/dev/null && urgent=true
     jq -e '.outbox|length>0' "$STATE_FILE" >/dev/null || return 0
     # Whole bounded events only. Any remainder is retained for a later run.
-    jq 'reduce .outbox[] as $e ({bytes:0,items:[]};(($e.subject+"\n"+$e.detail)|utf8bytelength) as $n|if .bytes+$n<22000 then .bytes+=$n|.items+=[$e] else . end)|.items' "$STATE_FILE" >"$TMP_DIR/notify-selected.json" || return 1
-    count=$(jq length "$TMP_DIR/notify-selected.json");((count>0)) || return 1
+    jq --argjson after "$after" --argjson urgent "$urgent" --argjson start "$day_start" '
+      reduce ((.outbox|sort_by(if .importance=="alert" then 0 elif .importance=="warning" then 1 else 2 end))[]|select($after or $urgent or .at<$start)) as $e ({bytes:0,items:[]};
+        (($e.subject+"\nObserved: "+($e.at|tostring)+"\n"+$e.detail+"\n")|utf8bytelength) as $n |
+        if .bytes+$n+300<19000 then .bytes+=($n+300)|.items+=[$e] else . end)|.items' "$STATE_FILE" >"$TMP_DIR/notify-selected.json" || return 1
+    count=$(jq length "$TMP_DIR/notify-selected.json");((count>0)) || { log INFO "Routine update events retained for the daily report cutoff; urgent attention bypasses batching";return 0; }
+    total=$(jq '.outbox|length' "$STATE_FILE")
     body=$(jq -r '.[]|"["+.importance+"] "+.subject+"\nObserved: "+(.at|strflocaltime("%Y-%m-%d %H:%M:%S"))+"\n"+.detail+"\n"' "$TMP_DIR/notify-selected.json") || return 1
+    body+=$'\n'"Delivery: $count of $total queued event(s); any remainder is retained for the next scheduled delivery."
     importance=$(jq -r 'if any(.[];.importance=="alert") then "alert" elif any(.[];.importance=="warning") then "warning" else "normal" end' "$TMP_DIR/notify-selected.json")
-    usr_ops_notify timeout 30 "$NOTIFY_BIN" -i "$importance" -s 'System Update Coordinator' -d 'Update actions, verification and attention' -m "$body" || rc=$?
+    usr_ops_notify timeout 30 "$NOTIFY_BIN" -i "$importance" -s 'System Update Coordinator' -d "Update report: $count event(s), $((total-count)) retained" -m "$body" || rc=$?
     if ((rc==0));then mutate --slurpfile sent "$TMP_DIR/notify-selected.json" --argjson now "$(date +%s)" '
       reduce $sent[0][] as $e (.;.delivered[$e.id]=$now) |
       .outbox=([.outbox[]|. as $e|select(all($sent[0][];.id!=$e.id))]) |
       .delivered |= with_entries(select(.value>=$now-30*86400))' || return 1;fi
+    if ((rc==0));then log INFO "Notification accepted; acknowledged $count event(s); $((total-count)) retained";else log ERROR "Notification delivery failed; $total queued event(s) retained for retry";fi
     return "$rc"
 }
 
@@ -610,15 +763,19 @@ usage() {
  cat <<'HELP'
 Usage: /bin/bash /boot/config/plugins/user.scripts/scripts/system_update_coordinator/script [COMMAND]
 No command: automatic policy evaluation, bounded checks, approved installation in
-13:15-15:30 Singapore, reconciliation and grouped reporting. Schedule: 15,45 * * * *.
+13:15-15:30 Singapore, reconciliation and grouped reporting. Schedule: */15 * * * *.
 --status                       Saved policy and update status; no registry/install.
 --check-only                   Refresh due evidence; no installation.
 --allow docker NAME             Approve exact installed image repository/channel.
---allow plugin NAME.plg         Approve exact installed plugin source (protected
-                               OS/updater/User Scripts plugins cannot be approved).
+--allow plugin NAME.plg         Approve exact installed plugin source (OS excluded).
+--allow-installed              Approve current installed identities; OS stays manual.
+--report-preview               Print saved update/defer summary; no install or email.
 --deny docker|plugin NAME       Disable approval; retain reporting.
 --pause / --resume              Pause/resume all new installations; checks continue.
 --window HH:MM HH:MM            Set same-day Singapore maintenance window.
+--report-time HH:MM             Set the daily grouped report time (default 15:45).
+--hold docker|plugin NAME H     Override one installed identity hold (1-168 hours).
+--archive-limit GIB             Bound previous-image size/archive (1-8 GiB; default 4).
 --limits TOTAL PLUGINS HOLD_H   Set daily caps (1-5 total, 0-2 plugins) and
                                candidate hold (1-168 hours); one update/run stays fixed.
 --resolve JOB_ID NOTE           Close a reviewed failed/uncertain job without
@@ -628,7 +785,8 @@ Removing an app/plugin needs no command: two complete inventories retire its ent
 New/reinstalled identities default to reporting only and can be approved with CLI.
 No command changes Docker startup/template/application settings or image channels.
 Approval enables native updates within the existing configured channel. The age
-hold is 24h from this coordinator's first observation, not registry publication.
+hold defaults to 24h; nightly/develop/unstable Docker tags default to 12h.
+Both measure this coordinator's observation, not registry publication.
 Unknown major OS/interface: installation stops. No OS install/reboot or automatic
 DB rollback is provided. Old image/config evidence does not guarantee DB rollback.
 HELP
@@ -652,12 +810,25 @@ main() {
     case "${1:-}" in
       --status) QUIET_FINISH=true;jq -n --slurpfile p "$POLICY_FILE" --slurpfile s "$STATE_FILE" '{policy:$p[0],items:$s[0].items,jobs:$s[0].jobs,pendingNotifications:($s[0].outbox|length)}';return 0;;
       --pause|--resume) local enabled=false;[[ "$1" != --resume ]] || enabled=true;policy_update --argjson enabled "$enabled" '.enabled=$enabled';return $?;;
-      --limits) [[ $# == 4 && "$2" =~ ^[1-5]$ && "$3" =~ ^[0-2]$ && "$4" =~ ^[0-9]+$ ]] && ((10#$4>=1 && 10#$4<=168 && 10#$3<=10#$2)) || return 2;policy_update --argjson total "$2" --argjson plugins "$3" --argjson hold "$((10#$4))" '.limits={dailyTotal:$total,dailyPlugins:$plugins,candidateHoldHours:$hold}';return $?;;
+      --limits) [[ $# == 4 && "$2" =~ ^[1-5]$ && "$3" =~ ^[0-2]$ && "$4" =~ ^[0-9]+$ ]] && ((10#$4>=1 && 10#$4<=168 && 10#$3<=10#$2)) || return 2;policy_update --argjson total "$2" --argjson plugins "$3" --argjson hold "$((10#$4))" '.limits += {dailyTotal:$total,dailyPlugins:$plugins,candidateHoldHours:$hold}';return $?;;
+      --hold)
+        [[ $# == 4 && ( "$2" == docker || "$2" == plugin ) && "$4" =~ ^[0-9]+$ ]] && valid_name "$3" && ((10#$4>=1 && 10#$4<=168)) || return 2
+        jq -e --arg kind "$2" --arg name "$3" '((if $kind=="docker" then .docker[$name] else .plugins[$name] end).identity|type)=="string"' "$POLICY_FILE" >/dev/null || return 2
+        policy_update --arg kind "$2" --arg name "$3" --argjson hours "$((10#$4))" 'if $kind=="docker" then .docker[$name].candidateHoldHours=$hours else .plugins[$name].candidateHoldHours=$hours end';return $?;;
+      --archive-limit) [[ $# == 2 && "$2" =~ ^[1-8]$ ]] || return 2;policy_update --argjson bytes "$((10#$2*1073741824))" '.limits.imageMaxBytes=$bytes';return $?;;
+      --report-time) [[ $# == 2 && "$2" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || return 2;policy_update --arg time "$2" '.reportTime=$time';return $?;;
       --window) [[ $# == 3 && "$2" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ && "$3" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ && "$2" < "$3" ]] || return 2;policy_update --arg start "$2" --arg end "$3" '.window={start:$start,end:$end}';return $?;;
       --resolve) [[ $# == 3 && -n "$3" && ${#3} -le 2000 ]] || return 2;jq -e --arg id "$2" '.jobs[$id]!=null and (.jobs[$id].status|IN("ATTENTION","VERIFYING","INTENT"))' "$STATE_FILE" >/dev/null || return 2;job_update "$2" '.jobs[$id].status="CLOSED_BY_OPERATOR" | .jobs[$id].resolutionNote=$note | .jobs[$id].closedAt=$now' --arg note "$3" --argjson now "$(date +%s)";return $?;;
+      --report-preview) QUIET_FINISH=true;render_update_report;return $?;;
+      --allow-installed)
+        [[ $# == 1 ]] || return 2;collect_inventory || return 1
+        policy_update --slurpfile inv "$TMP_DIR/inventory.json" --argjson now "$(date +%s)" "$APPROVAL_JQ"'
+          . as $old |
+          .docker=($inv[0].docker|with_entries(.key as $name|.value=approval(($old.docker[$name] // {});.value.repository;(.value.repository|length>0);"docker";$now))) |
+          .plugins=($inv[0].plugins|with_entries(.key as $name|.value=approval(($old.plugins[$name] // {});.value.installed.url;(.key!="unRAIDServer.plg" and (.value.installed.url|startswith("https://")));"plugin";$now)))';return $?;;
       --allow|--deny)
         [[ $# == 3 && ( "$2" == docker || "$2" == plugin ) ]] && valid_name "$3" || return 2
-        [[ "$3" != unRAIDServer.plg && "$3" != ca.update.applications.plg && "$3" != user.scripts.plg && "$3" != user.scripts.enhanced.plg ]] || return 2
+        [[ "$3" != unRAIDServer.plg ]] || return 2
         if [[ "$1" == --deny ]];then
           policy_update --arg kind "$2" --arg name "$3" 'if $kind=="docker" then .docker[$name]=((.docker[$name] // {identity:""})+{allow:false}) else .plugins[$name]=((.plugins[$name] // {identity:""})+{allow:false}) end';return $?
         fi
@@ -666,7 +837,7 @@ main() {
         if [[ "$2" == docker ]];then identity=$(jq -er --arg name "$3" '.docker[$name].repository|select(length>0)' "$TMP_DIR/inventory.json") || return 2
         else identity=$(jq -er --arg name "$3" '.plugins[$name].installed.url|select(startswith("https://"))' "$TMP_DIR/inventory.json") || return 2;fi
         policy_update --arg kind "$2" --arg name "$3" --arg identity "$identity" --argjson allow "$allow" --argjson now "$(date +%s)" \
-          'if $kind=="docker" then .docker[$name]={identity:$identity,allow:$allow,approvedAt:$now} else .plugins[$name]={identity:$identity,allow:$allow,approvedAt:$now} end';return $?;;
+          "$APPROVAL_JQ"'if $kind=="docker" then .docker[$name]=approval((.docker[$name] // {});$identity;$allow;$kind;$now) else .plugins[$name]=approval((.plugins[$name] // {});$identity;$allow;$kind;$now) end';return $?;;
       ''|--check-only) ;;
       *) return 2;;
     esac
@@ -677,7 +848,7 @@ main() {
     [[ "${1:-}" == --check-only ]] || install_one || return 1
     if jq -e 'any(.jobs[];.status=="ATTENTION" or .status=="INTENT")' "$STATE_FILE" >/dev/null;then RESULT=ATTENTION;fi
     clean_recovery_sets || log WARNING 'Recovery-set retention deferred; existing evidence retained'
-    availability_digest || return 1
+    daily_update_report || return 1
     flush_notifications || { RESULT=ATTENTION;SUMMARY='Notification delivery failed; report retained for retry'; }
     mutate --arg mode "$MODE" --argjson now "$(date +%s)" '.lastCompletedAt=$now | (if $mode=="automatic" then .lastAutomaticRunAt=$now else . end) | .jobs |= with_entries(select(.value.status=="INTENT" or .value.status=="VERIFYING" or .value.status=="ATTENTION" or (.value.startedAt // 0)>=$now-90*86400 or ((.value.recoveryPath // "")!="" and (.value.recoveryPrunedAt // 0)==0)))'
 }

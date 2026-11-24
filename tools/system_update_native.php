@@ -22,9 +22,24 @@ try {
  }
  if($mode==='docker-check'||$mode==='docker-local'){
   $repo=$argv[2]??'';if(!$repo||strlen($repo)>512)throw new RuntimeException('Invalid repository');$u=new DockerUpdate();
-  $local=$u->inspectLocalVersion($repo);if(!is_string($local)||!preg_match('/^sha256:[a-f0-9]{64}$/D',$local))throw new RuntimeException('Installed digest unavailable');if($mode==='docker-local')output(['schema'=>1,'local'=>$local]);$remote=$u->getRemoteVersionV2($repo);
+  $name=$argv[3]??'';$reference=$repo;
+  if($name!=='') {if(!preg_match('/^[A-Za-z0-9][A-Za-z0-9_.-]*$/D',$name))throw new RuntimeException('Invalid container');$d=$client->getContainerDetails($name);$reference=$d['Image']??'';if(!$reference)throw new RuntimeException('Container image unavailable');}
+  // The installed container, not a shared mutable tag, owns this evidence.
+  // A Plex pull must not make a second, older Plex container look current.
+  $inspect=$client->getDockerJSON('/images/'.$reference.'/json');$local=null;
+  $normalize=static function(string $v):string {$v=preg_replace('/:[^\/]+$/','',explode('@',$v)[0]);$v=preg_replace('#^(docker.io|index.docker.io|registry-1.docker.io)/#','',$v);if(!str_contains($v,'/'))$v='library/'.$v;return $v;};
+  foreach($inspect['RepoDigests']??[] as $digest){$parts=explode('@',$digest,2);if(count($parts)===2&&$normalize($parts[0])===$normalize($repo))$local=$parts[1];}
+  $provenance='docker-image-metadata';$cachePath=$argv[4]??'';
+  // Native image cleanup can remove RepoDigests from an image still used by
+  // the other Plex container. Reuse only evidence bound to this exact image,
+  // container and repository; a newly recreated container cannot inherit it.
+  if(!$local&&$name!==''&&$cachePath!==''&&is_file($cachePath)&&!is_link($cachePath)&&filesize($cachePath)<8388608){
+   $cache=json_decode(file_get_contents($cachePath),true);$old=$cache['items']['docker:'.$name]['evidence']??[];
+   if(($old['imageId']??'')===$reference&&($old['containerId']??'')===($d['Id']??null)&&($old['identity']??'')===$repo&&in_array($old['installedDigestSource']??'',['docker-image-metadata','verified-image-cache'],true)){$local=$old['local']??null;$provenance='verified-image-cache';}
+  }
+  if(!is_string($local)||!preg_match('/^sha256:[a-f0-9]{64}$/D',$local))throw new RuntimeException('Installed digest unavailable');if($mode==='docker-local')output(['schema'=>1,'local'=>$local,'imageId'=>$reference,'containerId'=>$d['Id']??null,'identity'=>$repo,'installedDigestSource'=>$provenance]);$remote=$u->getRemoteVersionV2($repo);
   if(!is_string($remote)||!preg_match('/^sha256:[a-f0-9]{64}$/D',$remote))throw new RuntimeException('Registry digest unavailable');
-  output(['schema'=>1,'remote'=>$remote,'local'=>$local,'available'=>$local!==$remote]);
+  output(['schema'=>1,'remote'=>$remote,'local'=>$local,'available'=>$local!==$remote,'imageId'=>$reference,'containerId'=>$d['Id']??null,'identity'=>$repo,'installedDigestSource'=>$provenance]);
  }
  if($mode==='plugin-check'){
   $name=$argv[2]??'';if(!preg_match('/^[a-zA-Z0-9_.-]+\.plg$/D',$name))throw new RuntimeException('Invalid plugin name');

@@ -62,7 +62,7 @@ usr_ops_append_log() {
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.2"
+readonly SCRIPT_VERSION="1.3"
 
 ###############################################################################
 # CONFIGURATION
@@ -321,6 +321,11 @@ maintenance_active() {
     local target="$1" lease boot pid start actual expires now
     [[ -e "${MAINTENANCE_DIR}/all" || -e "${MAINTENANCE_DIR}/${target}" ]] && return 0
     [[ "$target" == primary ]] || return 1
+    local journal="${UPDATE_COORDINATOR_STATE_FILE:-/mnt/vault/cloud/logs/script/system_update_coordinator/state.json}"
+    if [[ -e "$journal" ]];then
+      if [[ -L "$journal" ]] || ! jq -e '.schema==1 and (.jobs|type)=="object"' "$journal" >/dev/null 2>&1;then return 0;fi
+      if jq -e --arg name "$PRIMARY_CONTAINER" 'any(.jobs[];(.kind=="docker" and .name==$name and (.status|IN("INTENT","VERIFYING","ATTENTION"))) or (.kind=="plugin" and (.status|IN("INTENT","ATTENTION"))))' "$journal" >/dev/null;then return 0;fi
+    fi
     [[ "$PRIMARY_IN_MAINTENANCE" != true ]] || return 0
     boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true); now=$(date +%s)
     for lease in "${DOCKER_MAINTENANCE_DIR:-/run/docker-service-maintenance}/$PRIMARY_CONTAINER."*.json; do

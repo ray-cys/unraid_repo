@@ -16,7 +16,8 @@ adapter(){ case "$1" in inventory) cat "$fixture/inventory";;*) return 1;;esac; 
 docker_cmd(){ case "$1 ${2:-}" in 'info ') return 0;;'container ls') jq -r '.docker|keys[]' "$fixture/inventory";;*) return 1;;esac; }
 initialize
 trap 'rm -rf -- "$TMP_DIR"' EXIT
-jq -e '.enabled==true and .docker.prowlarr.allow==true and .docker.seerr.allow==true and .docker.sabnzbd.allow==false and .plugins["community.applications.plg"].allow==true and .plugins["tailscale.plg"].allow==false' "$POLICY_FILE" >/dev/null
+jq -e '.enabled==true and .docker.prowlarr.allow==true and .docker.seerr.allow==true and .docker.sabnzbd.allow==true and .docker.sabnzbd.candidateHoldHours==12 and .plugins["community.applications.plg"].allow==true and .plugins["tailscale.plg"].allow==true' "$POLICY_FILE" >/dev/null
+policy_update '.reportTime="00:00"'
 collect_inventory
 # Installed-but-stopped does not mean retired and never grants an autostart.
 jq -e '.items["docker:seerr"].missingScans==0' "$STATE_FILE" >/dev/null
@@ -61,6 +62,8 @@ install_one;[[ ! -e "$fixture/native-calls" ]]
 mutate --argjson now "$now" '.items["docker:prowlarr"].candidateSeenAt=($now-90000)'
 backup_evidence(){ return 1; };install_one;[[ ! -e "$fixture/native-calls" ]]
 backup_evidence(){ printf '{"verified":true}' >"$TMP_DIR/backup-evidence.json"; }
+policy_update '.docker.prowlarr.candidateHoldHours=12'
+mutate --argjson now "$now" '.items["docker:prowlarr"].candidateSeenAt=($now-13*3600)'
 install_one
 [[ $(wc -l <"$fixture/native-calls") == 1 ]]
 id=$(jq -r '.jobs|keys[0]' "$STATE_FILE")

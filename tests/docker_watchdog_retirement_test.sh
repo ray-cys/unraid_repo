@@ -41,3 +41,11 @@ maintenance_active seerr
 printf '{"schema":1,"jobs":{"one":{"kind":"docker","name":"seerr","status":"COMPLETED"}}}' >"$UPDATE_COORDINATOR_STATE_FILE"
 if maintenance_active seerr;then exit 1;fi
 printf 'Pending native-update journal suppresses watchdog recovery; completed update releases that protection\n'
+
+printf '{"schema":1,"jobs":{"plugin":{"kind":"plugin","name":"tailscale.plg","status":"INTENT"}}}' >"$UPDATE_COORDINATOR_STATE_FILE"
+maintenance_active seerr
+printf '{"schema":1,"jobs":{"plugin":{"kind":"plugin","name":"tailscale.plg","status":"VERIFYING"}}}' >"$UPDATE_COORDINATOR_STATE_FILE"
+if maintenance_active seerr;then exit 1;fi
+printf '{"schema":1,"jobs":{"plugin":{"kind":"plugin","name":"tailscale.plg","status":"ATTENTION"}}}' >"$UPDATE_COORDINATOR_STATE_FILE"
+maintenance_active seerr
+printf 'Host-plugin dispatch/uncertainty protects unrelated Docker apps without suppressing normal post-install monitoring\n'

@@ -1,6 +1,6 @@
 #!/bin/bash
 clearLog=true
-# Docker Service Watchdog v3.11 -- Unraid service availability and bounded recovery.
+# Docker Service Watchdog v3.12 -- Unraid service availability and bounded recovery.
 # Optional schedule: every five minutes. Pi-hole and application-specific health
 # remain owned by the DNS and Arr monitors. Recovery follows Hubble's existing
 # per-service permissions; VPN/configuration findings never request restarts.
@@ -54,7 +54,7 @@ usr_ops_append_log() {
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.11"
+readonly SCRIPT_VERSION="3.12"
 
 ###############################################################################
 # CONFIGURATION
@@ -379,7 +379,7 @@ maintenance_active() {
       if [[ -L "$update_journal" ]] || ! jq -e '.schema==1 and (.jobs|type)=="object"' "$update_journal" >/dev/null 2>&1;then
         RECOVERY_BLOCKED["$name"]=1
         observe monitor:update-journal WARNING 'Update coordinator journal invalid; automatic restart prohibited until its state is verified' 1 || return 2
-      elif jq -e --arg name "$name" 'any(.jobs[];.kind=="docker" and .name==$name and (.status|IN("INTENT","VERIFYING","ATTENTION")))' "$update_journal" >/dev/null;then
+      elif jq -e --arg name "$name" 'any(.jobs[];(.kind=="docker" and .name==$name and (.status|IN("INTENT","VERIFYING","ATTENTION"))) or (.kind=="plugin" and (.status|IN("INTENT","ATTENTION"))))' "$update_journal" >/dev/null;then
         return 0
       fi
     fi
@@ -1084,8 +1084,98 @@ retire_inventory_service() {
       else . end' || return 1
 }
 
+# Read-only scheduler evidence. A scheduler can be healthy while its last job
+# reported findings; job outcome remains monitored separately. Update readiness
+# additionally requires an idle job so a native recreation does not interrupt it.
+scheduler_readiness() {
+    local name="$1" purpose="$2" processes file profile="$1"
+    processes=$(docker_cmd top "$name" -eo pid,comm,args) || return 1
+    if [[ "$name" == recyclarr ]];then
+      grep -q 'supercronic' <<<"$processes" || return 1
+      docker_cmd exec "$name" sh -c 'test -r /tmp/crontab && recyclarr --version >/dev/null' >/dev/null 2>&1 || return 1
+      if [[ "$purpose" == update ]] && grep -Eq '(^|[ /])(cron\.sh|recyclarr[[:space:]]+sync)([[:space:]]|$)' <<<"$processes";then
+        jq -n '{ready:false,classification:"busy",source:"native-scheduler",detail:"Recyclarr scheduled sync is active; update deferred"}'
+      else jq -n '{ready:true,classification:"ready",source:"native-scheduler",detail:"Recyclarr cron scheduler, crontab and application binary verified; job outcome is monitored separately"}';fi
+      return
+    fi
+    case "$name" in kometa) file=/config/logs/meta.log;;imagemaid) file=/config/logs/imagemaid.log;;*) return 1;;esac
+    grep -Eq "(^|[ /])$name\\.py([[:space:]]|$)" <<<"$processes" || return 1
+    docker_cmd exec -i "$name" python3 - "$profile" "$file" "$purpose" <<'PY'
+import datetime, json, os, re, stat, sys, time
+from zoneinfo import ZoneInfo
+profile, path, purpose = sys.argv[1:]
+fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+with os.fdopen(fd,'rb') as f:
+    info=os.fstat(f.fileno());assert stat.S_ISREG(info.st_mode)
+    assert 0 <= time.time()-info.st_mtime <= (6 if profile=='kometa' else 120)*3600
+    head=f.read(65536).decode('utf-8','replace')
+    f.seek(max(0,info.st_size-262144));tail=f.read(262144).decode('utf-8','replace')
+zone=ZoneInfo('Asia/Singapore')
+def stamp(line):
+    m=re.match(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})',line)
+    return datetime.datetime.strptime(m[1],'%Y-%m-%d %H:%M:%S').replace(tzinfo=zone).timestamp() if m else 0
+started=finished=0;runtime=False
+for line in (head+'\n'+tail).splitlines():
+    t=stamp(line)
+    if profile=='kometa':
+        if re.search(r'\|\s*Starting (?:\d{2}:\d{2} )?Run\s*\|',line):started=max(started,t)
+        if re.search(r'Start Time:.*Finished:.*Run Time:',line):finished=max(finished,t);runtime=True
+    else:
+        if 'Validating Options' in line:started=max(started,t)
+        if 'ImageMaid Finished' in line:finished=max(finished,t)
+        if 'Total Runtime' in line:runtime=True
+assert started>0,'Native run start is not recognized'
+idle=runtime and finished>=started
+ready=idle if purpose=='update' else True
+print(json.dumps({'ready':bool(ready),'classification':'ready' if ready else 'busy','source':'native-scheduler',
+ 'detail':('Scheduler process and native whole-run completion verified; job findings remain independently monitored' if idle else 'Native scheduled job is active or completion is unproven; update deferred')}))
+PY
+}
+
+plex_update_readiness() {
+    local name="$1" count
+    # Token stays inside the container and curl configuration on standard input;
+    # it is never printed, persisted or passed in a process argument.
+    count=$(docker_cmd exec "$name" sh -c '
+      token=$(sed -n "s/.*PlexOnlineToken=\"\([^\"]*\)\".*/\1/p" "/config/Library/Application Support/Plex Media Server/Preferences.xml")
+      case "$token" in ""|*[!A-Za-z0-9_-]*) exit 1;;esac
+      printf "header = \"X-Plex-Token: %s\"\n" "$token" | curl --config - --silent --fail --noproxy "*" --max-time 5 --max-filesize 262144 http://127.0.0.1:32400/status/sessions' 2>/dev/null |
+      php -r '$x=@simplexml_load_string(stream_get_contents(STDIN),"SimpleXMLElement",LIBXML_NONET);if(!$x||$x->getName()!=="MediaContainer"||!isset($x["size"]))exit(1);echo (int)$x["size"];') || return 1
+    [[ "$count" =~ ^[0-9]+$ ]] || return 1
+    jq -n --argjson count "$count" '{ready:($count==0),classification:(if $count==0 then "ready" else "busy" end),source:"plex-sessions",detail:(if $count==0 then "No active Plex playback sessions" else ($count|tostring)+" active Plex session(s); update deferred" end)}'
+}
+
+sab_readiness() {
+    local purpose="$1"
+    docker_cmd exec -i sabnzbd /lsiopy/bin/python3 - "$purpose" <<'PY'
+import configobj,json,sys,urllib.parse,urllib.request
+c=configobj.ConfigObj('/config/sabnzbd.ini',interpolation=False)['misc']
+q=urllib.parse.urlencode({'mode':'queue','output':'json','apikey':c['api_key'],'limit':1000})
+url='http://127.0.0.1:'+str(c.get('port',8080))+'/api?'+q
+with urllib.request.urlopen(url,timeout=5) as r:d=json.load(r)['queue']
+assert isinstance(d,dict) and isinstance(d.get('status'),str) and isinstance(d.get('slots'),list)
+busy=d['status'].lower()=='downloading' or any(str(s.get('status','')).lower() not in ('queued','paused','completed') for s in d['slots'])
+# SAB can post-process while downloads are paused; the native history endpoint
+# includes these jobs even when there is no currently downloading queue item.
+q=urllib.parse.urlencode({'mode':'history','output':'json','apikey':c['api_key'],'limit':1000})
+with urllib.request.urlopen('http://127.0.0.1:'+str(c.get('port',8080))+'/api?'+q,timeout=5) as r:h=json.load(r)['history']
+assert isinstance(h.get('slots'),list)
+busy=busy or any(str(s.get('status','')).lower() not in ('completed','failed','deleted','queued') for s in h['slots'])
+ready=not busy if sys.argv[1]=='update' else True
+print(json.dumps({'ready':ready,'classification':'ready' if ready else 'busy','source':'native-sab-api','detail':'Authenticated SAB queue/history verified; active download or post-processing defers installation' if ready else 'SAB download/post-processing active; update deferred'}))
+PY
+}
+
+vpn_readiness_json() (
+    local reason=''
+    log(){ :; }
+    vpn_finding(){ reason+="$3 "; }
+    check_vpn_egress "$1" || reason+='VPN verification could not complete. '
+    jq -n --arg reason "$reason" '{ready:($reason==""),classification:(if $reason=="" then "ready" else "unverified" end),source:"native-vpn",detail:(if $reason=="" then "Approved VPN exit node, binding, route and interface-bound egress verified" else $reason end)}'
+)
+
 readiness_json() {
-    local name="$1" info url='' spec health ready=false source=unverified detail='Application readiness unverified' result=unconfigured
+    local name="$1" purpose="${2:-health}" info url='' spec health ready=false source=unverified detail='Application readiness unverified' result=unconfigured evidence=''
     valid_service_name "$name" || return 2
     TMP_DIR=$(mktemp -d /tmp/watchdog-readiness.XXXXXX) || return 1
     trap cleanup EXIT
@@ -1110,7 +1200,38 @@ r=urllib.request.urlopen(urllib.request.Request(u,headers={"X-API-KEY":key}),tim
 d=json.load(r);d=d.get("data",d);assert isinstance(d,dict) and d.get("bazarr_version")
 ' >/dev/null 2>&1;then ready=true;source=native-bazarr-api;detail='Bazarr authenticated native system status validated';result=ready;fi
         fi
+        if [[ "$ready" == false ]];then
+          case "$name" in
+            kometa|imagemaid|recyclarr) evidence=$(scheduler_readiness "$name" "$purpose" 2>/dev/null) || evidence='{"ready":false,"classification":"unverified","source":"native-scheduler","detail":"Scheduler process/native completion evidence could not be verified; update deferred"}';;
+            sabnzbd) evidence=$(sab_readiness "$purpose" 2>/dev/null) || evidence='{"ready":false,"classification":"unverified","source":"native-sab-api","detail":"Authenticated SAB queue/history could not be verified; update deferred"}';;
+            photoprism)
+              if docker_cmd exec photoprism curl --noproxy '*' --silent --fail --max-time 5 --max-filesize 65536 http://127.0.0.1:2342/api/v1/status 2>/dev/null | jq -e '.status=="operational"' >/dev/null;then
+                evidence='{"ready":true,"classification":"ready","source":"native-photoprism-api","detail":"PhotoPrism native status is operational"}'
+              else evidence='{"ready":false,"classification":"unverified","source":"native-photoprism-api","detail":"PhotoPrism native status API unavailable/unrecognized; update deferred"}';fi;;
+          esac
+        fi
       else detail="Docker health: $health";result="$health";fi
+      if [[ "$purpose" == update && "$ready" == true ]];then
+        case "$name" in
+          kometa|imagemaid|recyclarr) [[ -n "$evidence" ]] || evidence=$(scheduler_readiness "$name" "$purpose" 2>/dev/null) || evidence='{"ready":false,"classification":"unverified","source":"native-scheduler","detail":"Scheduler readiness could not be verified"}';;
+          sabnzbd) [[ -n "$evidence" ]] || evidence=$(sab_readiness "$purpose" 2>/dev/null) || evidence='{"ready":false,"classification":"unverified","source":"native-sab-api","detail":"SAB activity state could not be verified"}';;
+          plex-media|plex-media-server) evidence=$(plex_update_readiness "$name" 2>/dev/null) || evidence='{"ready":false,"classification":"unverified","source":"plex-sessions","detail":"Plex sessions could not be verified; update deferred"}';;
+          metafusion)
+            if ! docker_cmd exec metafusion cat /tmp/metafusion-status.json | jq -e '.state=="idle"' >/dev/null 2>&1;then evidence='{"ready":false,"classification":"busy","source":"native-metafusion","detail":"MetaFusion is active or idle state unavailable; update deferred"}';fi;;
+          pihole)
+            local transport answer
+            for transport in udp tcp;do
+              local -a dns_args=();[[ "$transport" != tcp ]] || dns_args=(+tcp)
+              answer=$(timeout --kill-after=2 5 dig @"${UPDATE_FALLBACK_DNS:-192.168.50.100}" example.com A "${dns_args[@]}" +time=2 +tries=1 +noall +answer) || answer=''
+              if ! grep -Eq '[[:space:]]IN[[:space:]]+A[[:space:]]+[0-9]' <<<"$answer";then evidence='{"ready":false,"classification":"unverified","source":"fallback-dns","detail":"Raspberry Pi fallback DNS did not answer both UDP and TCP; primary update deferred"}';fi
+            done
+            [[ -n "$evidence" ]] || evidence='{"ready":true,"classification":"ready","source":"dns-fallback","detail":"Pi-hole health and independent Raspberry Pi fallback DNS verified over UDP and TCP"}';;
+        esac
+      fi
+      if [[ "$name" == qbittorrent && "$ready" == true ]];then evidence=$(vpn_readiness_json "$name") || evidence='';fi
+      if [[ -n "$evidence" ]] && jq -e '(.ready|type)=="boolean" and (.detail|type)=="string"' <<<"$evidence" >/dev/null 2>&1;then
+        ready=$(jq -r .ready <<<"$evidence");source=$(jq -r .source <<<"$evidence");detail=$(jq -r .detail <<<"$evidence");result=$(jq -r .classification <<<"$evidence")
+      fi
     else detail='Container stopped, paused or OOM-killed';result=unavailable;fi
     jq -n --arg name "$name" --arg source "$source" --arg detail "$detail" --arg result "$result" --argjson ready "$ready" '{schema:1,name:$name,ready:$ready,source:$source,classification:$result,detail:$detail}'
 }
@@ -1733,13 +1854,13 @@ write_receipt() {
 }
 
 main() {
-    case "${1:-}" in --readiness|--diagnose|--diagnose-vpn|--version|--help|-h|--maintenance) ;;
+    case "${1:-}" in --readiness|--update-readiness|--diagnose|--diagnose-vpn|--version|--help|-h|--maintenance) ;;
         *) exec {STATE_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
            if ! flock -s -n "$STATE_EXPORT_FD"; then printf 'State export active; watchdog invocation deferred.\n'; return 0; fi;;
     esac
     local spec name url expected allowed uptime status=OK failed=false command
     case "${1:-}" in
-        --help|-h) printf '%s\n' 'Usage: bash docker_service_watchdog.sh [--readiness CONTAINER|--version|--diagnose-vpn|--diagnose CONTAINER [URL]|--maintenance CONTAINER MINUTES REASON|--record-job PROFILE EXIT_CODE [START_EPOCH]]'
+        --help|-h) printf '%s\n' 'Usage: bash docker_service_watchdog.sh [--readiness CONTAINER|--update-readiness CONTAINER|--version|--diagnose-vpn|--diagnose CONTAINER [URL]|--maintenance CONTAINER MINUTES REASON|--record-job PROFILE EXIT_CODE [START_EPOCH]]'
             printf '%s\n' 'Schedule every five minutes. Recovery requires global AND per-service permission.' \
                 'Maintenance suppresses availability checks/restarts, freezes active findings, and expires within 24h.' \
                 'Remove /run/docker-service-maintenance/CONTAINER.manual.json to end a manual lease early.' \
@@ -1747,7 +1868,7 @@ main() {
                 'Internal schedulers need native status, timestamped whole-run evidence, or producer receipts.' \
                 'Run docker_watchdog_liveness.sh independently every five minutes to monitor this script.' \
                 '--diagnose-vpn prints read-only binding, exit-node, DNS and egress evidence; no state or notifications.'; return 0 ;;
-        --readiness) [[ $# == 2 ]] || return 2;readiness_json "$2";return $?;;
+        --readiness|--update-readiness) [[ $# == 2 ]] || return 2;local purpose=health;[[ "$1" != --update-readiness ]] || purpose=update;readiness_json "$2" "$purpose";return $?;;
         --version) printf 'docker_service_watchdog.sh %s\n' "$SCRIPT_VERSION"; return 0 ;;
         --diagnose-vpn) [[ $# == 1 ]] || return 2; diagnose_vpn; return $? ;;
         --diagnose) [[ $# == 2 || $# == 3 ]] || return 2; diagnose_service "$2" "${3:-}"; return $? ;;
