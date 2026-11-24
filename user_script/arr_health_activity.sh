@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.17.0
+# ARR Health / Download / Import Monitor v3.18.0
 #
 # PURPOSE
 # -------
@@ -6706,7 +6706,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.17.0 lifecycle commands' \
+        'ARR Health Monitor v3.18.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -15646,17 +15646,30 @@ automation_fetch_missing() {
 
 # Media integrity recovery owns this hold until a replacement passes full
 # planned-range verification. Review/uncertain states never expire silently.
+# Library protection ends after full replacement verification. Disposal problems
+# concern the retired original only and must not block healthy library media.
+media_recovery_journal_valid() {
+    local file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}"
+    [[ ! -L "$file" ]] || return 1
+    [[ -e "$file" ]] || return 0
+    jq -e '.schema==1 and (.actions|type)=="object" and all(.actions[];
+      ((.replacementVerifiedAt // 0)|type)=="number" and (.app=="Sonarr" or .app=="Radarr") and (.parentId|type)=="number" and .parentId>0 and
+      (.status as $s | ["prepared","moved","delete_intent","deleted","monitor_intent","search_intent","search_submitted","replacement_detected","verified","review","handoff_pending","handoff_intent","handoff_review","handed_off","bin_removed"]|index($s))!=null and
+      (if (.status|startswith("handoff_")) or .status=="handed_off" or .status=="bin_removed" then (.replacementVerifiedAt // 0)>0 else true end))' "$file" >/dev/null 2>&1
+}
+media_recovery_ids() {
+    local app="$1" output="$2" file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}"
+    media_recovery_journal_valid || return 1
+    if [[ ! -f "$file" ]]; then printf '[]\n' >"$output";return 0;fi
+    jq --arg app "$app" '[.actions[]|select(.app==$app and .status!="verified" and (.replacementVerifiedAt // 0)<=0)|.parentId]|unique' "$file" >"$output"
+}
 media_recovery_app_held() {
     local app="$1" parent="${2:-0}" file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}" rc=0
-    [[ -e "$file" || -L "$file" ]] || return 1
-    [[ ! -L "$file" ]] || return 0
-    jq -e --arg app "$app" --argjson parent "$parent" '
-      if .schema!=1 or (.actions|type)!="object" then true
-      elif any(.actions[]; (.app!="Sonarr" and .app!="Radarr") or (.parentId|type)!="number" or .parentId<=0 or
-        (.status as $s | ["prepared","moved","delete_intent","deleted","monitor_intent","search_intent","search_submitted","replacement_detected","verified","review"]|index($s))==null) then true
-      else any(.actions[]; .app==$app and ($parent==0 or .parentId==$parent) and .status!="verified") end' "$file" >/dev/null 2>&1 || rc=$?
-    # jq false is 1; parse/I/O failure protects rather than permitting deletion.
-    ((rc!=1))
+    media_recovery_journal_valid || return 0
+    [[ -f "$file" ]] || return 1
+    jq -e --arg app "$app" --argjson parent "$parent" 'any(.actions[];
+      .app==$app and ($parent==0 or .parentId==$parent) and .status!="verified" and (.replacementVerifiedAt // 0)<=0)' "$file" >/dev/null 2>&1 || rc=$?
+    ((rc!=1)) # malformed/unreadable state protects instead of permitting actions
 }
 
 process_media_integrity_recovery() {
@@ -15679,7 +15692,7 @@ automation_missing_searches() {
     local item target parent kind candidate="$TMP_DIR/automation-missing-candidate.json" hash previous survey_error
     window=$(TZ="$AUTOMATION_TIMEZONE" date -d "@$START_TIME" +%Y%m%d%H)
     for app in Sonarr Radarr; do
-        if media_recovery_app_held "$app"; then debug_log "Missing search deferred for $app: media integrity recovery owns an unresolved hold";continue;fi
+        if [[ "$app" == Sonarr ]] && media_recovery_app_held "$app"; then debug_log "Missing search deferred for $app: media integrity recovery owns an unresolved hold";continue;fi
         surveyed=$(jq -r --arg app "$app" '.missing[$app].surveyedAt // 0' "$AUTOMATION_STATE_FILE")
         previous=$(jq -r --arg app "$app" '.missing[$app].window // ""' "$AUTOMATION_STATE_FILE")
         survey_error=$(jq -r --arg app "$app" '.missing[$app].surveyError // ""' "$AUTOMATION_STATE_FILE")
@@ -15714,6 +15727,7 @@ automation_missing_searches() {
             automation_action_budget || return 0
             target=$(jq -r '.id' <<<"$item")
             if [ "$app" = Sonarr ]; then parent=$(jq -r '.seriesId' <<<"$item"); kind=episode; else parent="$target"; kind=movie; fi
+            if media_recovery_app_held "$app" "$parent"; then debug_log "Missing search deferred for recovery-held $app parent $parent";continue;fi
             jq -e --arg app "$app" --argjson target "$target" --argjson cutoff "$((START_TIME-7*86400))" 'all(.actions[]; .app!=$app or .kind!="missing-search" or .targetId!=$target or .startedAt<$cutoff)' "$AUTOMATION_STATE_FILE" >/dev/null || continue
             automation_build_missing_candidate "$app" "$target" "$parent" "$kind" "$root" "$key" "$candidate" || continue
             hash=$(jq -Sc 'del(.identity.lastSearchTime,.owner.statistics,.owner.nextAiring,.owner.previousAiring)' "$candidate" | sha256sum | awk '{print $1}')
@@ -16511,7 +16525,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.17.0"
+    "START | ARR Health Monitor v3.18.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -16524,7 +16538,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.17.0"
+debug_log "Starting ARR Health Monitor v3.18.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -17145,7 +17159,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.17.0 completed"
+log "ARR Health Monitor v3.18.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""

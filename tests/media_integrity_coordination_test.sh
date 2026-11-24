@@ -29,4 +29,4 @@ process_media_integrity_recovery
 automation_window_open() { return 0; }
 process_media_integrity_recovery
 [[ $(cat "$fixture/calls") == --recover-only ]]
-printf 'Exact-series holds, conservative Radarr holds, review persistence, corrupt-journal protection and four-hour executor gating passed\n'
+printf 'Exact-series/movie holds, review persistence, corrupt-journal protection and four-hour executor gating passed\n'

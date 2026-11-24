@@ -170,7 +170,7 @@ For each recovery, the script:
    action. Takes the existing backup and metadata mutation locks briefly.
 2. Records a durable plan and preserves the exact original using Linux
    `renameat2(RENAME_NOREPLACE)`, with a same-filesystem no-overwrite hard-link/unlink fallback for Unraid shfs, under
-   `/mnt/user/media/integrity_quarantine/ACTION_ID/ORIGINAL_FILENAME`.
+   `/mnt/user/media/repair_hold/ACTION_ID/ORIGINAL_FILENAME`.
    Cross-filesystem/unsupported/failed preservation stops; interruption with both names preserves both for review; a completed move can be resumed using exact identity without moving again; there is no bulk-copy fallback,
    overwriting or automatic purge. A changed identity prevents further mutation.
 3. Records deletion intent, removes only the exact obsolete Arr **file record**
@@ -187,7 +187,17 @@ For each recovery, the script:
 5. Holds deletion-sync until new exact Arr file IDs, import dates and paths match
    a later **complete planned-range decode cycle**. Replacement paths receive
    priority within the audit's new-work lane. Search completion or a new filename
-   alone does not count as recovered. The damaged original remains retained.
+   alone does not count as recovered. The damaged original remains in `repair_hold`
+   until verification completes.
+6. Re-read exact current Arr IDs and match each current file identity to completed
+   audit coverage. Read the configured native recycling bin and cleanup policy;
+   no application setting is changed. Refresh only the retired original's
+   retention timestamp **before** publishing it under
+   `arr_bin/media_audit/sonarr/ACTION_ID/ORIGINAL_FILENAME` or the equivalent
+   `radarr` subfolder. The actual configured bin path is used, not hardcoded.
+7. Record the handoff and let native Arr cleanup remove the retired original.
+   The script sends no second file-delete, search, or monitoring request during
+   handoff. The current healthy library file is never moved into the bin.
 
 The executor has a three-minute budget, examines at most four candidates per pass, and reserves the final three minutes of each action window for in-flight work. New preservation also requires free media space for the current file size plus 10 GiB. Capacity is a conservative share-level estimate, not a guarantee about every disk/download client.
 
@@ -195,8 +205,13 @@ Limits: one new recovery per pass, three per rolling seven days, and one attempt
 per exact parent/target set per 30 days. An unsuccessful command, uncertain
 request, changed monitoring or a 28-day verification deadline requires review.
 Unresolved holds never expire silently. Review actions can close automatically through read-only follow-up once the exact current/restored file passes a later complete audit; no mutation is retried to obtain that result. Sonarr holds only its affected series;
-Radarr delete-sync and generic missing searches conservatively defer the affected
-application while a hold exists. Existing Arr queue/import monitoring continues.
+Radarr delete-sync excludes only protected movie IDs from observation updates,
+sidecar/tag plans, watchdog rescans and retirements. Other movies continue. The
+full unfiltered catalog is retained for state pruning, so a held movie is never
+mistaken for an absent movie. Radarr generic missing searches also skip only the
+held target. Existing Arr queue/import monitoring continues. Once replacement
+verification passes, any remaining bin-disposal problem does not keep the library
+hold active.
 No automatic blocklisting is inferred from a local decoder error: the release
 might be sound and the local file might have suffered storage damage.
 
@@ -215,11 +230,47 @@ rollback that might overwrite a newly imported replacement.
 
 Further tuning should follow several real runs: choose the runtime/segment size
 from observed coverage and timeout rates, review codec-specific false positives,
-and only then consider retention for **verified** recovery originals. Current
-preserved originals are pinned, so inspect their total space before enabling
-recovery at scale.
+and verify that any new retention/cleanup policy is appropriate before enabling
+recovery at scale. Pending or unverified originals are pinned; verified originals
+use the native Arr bin policy described below.
 
 Implementation references: [Sonarr file-delete controller](https://github.com/Sonarr/Sonarr/blob/develop/src/Sonarr.Api.V5/EpisodeFiles/EpisodeFileController.cs),
 [Sonarr monitoring lifecycle](https://github.com/Sonarr/Sonarr/blob/develop/src/NzbDrone.Core/Tv/EpisodeService.cs),
 [Radarr file-delete controller](https://github.com/Radarr/Radarr/blob/develop/src/Radarr.Api.V3/MovieFiles/MovieFileController.cs), and
 [Radarr monitoring lifecycle](https://github.com/Radarr/Radarr/blob/develop/src/NzbDrone.Core/Movies/MovieService.cs).
+
+## Retired-original handoff and normal Arr upgrades
+
+`repair_hold` is outside all audited library folders and outside the native Arr
+bin. Nothing is purged there while a replacement is pending. Recovery remains
+**disabled by default**; this deployment does not start any replacement or handoff.
+
+Normal Arr processing can recycle a file that it replaces during an ordinary
+upgrade. Recovery first removes its damaged original from the library and then
+removes that old file record from Arr. That detached original is therefore a
+separate object from the new imported replacement. The later handoff operates
+only on the owned `repair_hold/ACTION_ID` original, using exact filesystem
+identity and the durable journal. It does not ask Arr to delete the replacement
+or process the same original twice.
+
+Both live applications currently share `/data/arr_bin/` with two-day cleanup.
+Both native cleanup tasks scan recursively, so either can remove an expired
+handed-off original. The application subfolder documents origin; it does not
+create separate cleanup policies. Fresh file modification time is set while the
+original is still outside the bin, preventing an old media timestamp from making
+it immediately eligible for cleanup. Native settings are never changed.
+
+If the preserved original has other hard links, handoff waits without modifying
+its timestamps. This protects downloader files and other quarantine manifests
+that may reference the same inode. It uses no payload-copy fallback. After other
+links are released, handoff can proceed; a wait beyond 35 days produces a grouped
+review warning. A bin collision, changed original/replacement, unavailable native
+bin or uncertain move retains the journal and reports the named action/reason.
+An interrupted completed move can be verified without moving again. If both
+source and destination exist, neither is overwritten or unlinked automatically.
+
+Successful handoff and observed bin removal remain quiet and visible locally in
+`--recovery-status`/the report. `bin_removed` means the handed-off path is now
+absent; it does not claim the script itself deleted it. `quarantine_lifecycle.sh`
+continues to manage metadata under its existing `bin` root and does not purge
+`repair_hold` or take over native `arr_bin` cleanup.

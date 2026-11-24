@@ -34,7 +34,7 @@ source "$SCRIPT"
 declare -F cleanup_main >/dev/null || fail "exit cleanup handler is missing"
 declare -F notify_preflight_failure >/dev/null || fail "preflight handler is missing"
 
-[[ "$SCRIPT_VERSION" == "2.7.0" ]] || fail "unexpected script version"
+[[ "$SCRIPT_VERSION" == "2.8.0" ]] || fail "unexpected script version"
 [[ "$USER_AGENT" == "Arr-Delete-Sync-Tag/$SCRIPT_VERSION" ]] ||
     fail "HTTP User-Agent does not contain the release version"
 

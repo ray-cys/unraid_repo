@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 ###############################################################################
-# Sonarr + Radarr - Plex Delete Sync and Tagger v2.7.0
+# Sonarr + Radarr - Plex Delete Sync and Tagger v2.8.0
 #
 # PURPOSE / PERSONAL USE CASE
 # ---------------------------
@@ -115,7 +115,7 @@ umask 077
 # Release version for logs, notifications, and the HTTP User-Agent. State-file
 # version fields below are independent schema versions and must not be changed
 # merely when this release version changes.
-readonly SCRIPT_VERSION="2.7.0"
+readonly SCRIPT_VERSION="2.8.0"
 
 ###############################################################################
 # CONFIGURATION
@@ -693,17 +693,38 @@ mark_notification_batch_delivered() {
 # durable log rather than relying on an in-memory last-error variable.
 # Media integrity recovery owns this hold until a replacement passes full
 # planned-range verification. Review/uncertain states never expire silently.
+# Library protection ends after full replacement verification. Disposal problems
+# concern the retired original only and must not block healthy library media.
+media_recovery_journal_valid() {
+    local file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}"
+    [[ ! -L "$file" ]] || return 1
+    [[ -e "$file" ]] || return 0
+    jq -e '.schema==1 and (.actions|type)=="object" and all(.actions[];
+      ((.replacementVerifiedAt // 0)|type)=="number" and (.app=="Sonarr" or .app=="Radarr") and (.parentId|type)=="number" and .parentId>0 and
+      (.status as $s | ["prepared","moved","delete_intent","deleted","monitor_intent","search_intent","search_submitted","replacement_detected","verified","review","handoff_pending","handoff_intent","handoff_review","handed_off","bin_removed"]|index($s))!=null and
+      (if (.status|startswith("handoff_")) or .status=="handed_off" or .status=="bin_removed" then (.replacementVerifiedAt // 0)>0 else true end))' "$file" >/dev/null 2>&1
+}
+media_recovery_ids() {
+    local app="$1" output="$2" file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}"
+    media_recovery_journal_valid || return 1
+    if [[ ! -f "$file" ]]; then printf '[]\n' >"$output";return 0;fi
+    jq --arg app "$app" '[.actions[]|select(.app==$app and .status!="verified" and (.replacementVerifiedAt // 0)<=0)|.parentId]|unique' "$file" >"$output"
+}
 media_recovery_app_held() {
     local app="$1" parent="${2:-0}" file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}" rc=0
-    [[ -e "$file" || -L "$file" ]] || return 1
-    [[ ! -L "$file" ]] || return 0
-    jq -e --arg app "$app" --argjson parent "$parent" '
-      if .schema!=1 or (.actions|type)!="object" then true
-      elif any(.actions[]; (.app!="Sonarr" and .app!="Radarr") or (.parentId|type)!="number" or .parentId<=0 or
-        (.status as $s | ["prepared","moved","delete_intent","deleted","monitor_intent","search_intent","search_submitted","replacement_detected","verified","review"]|index($s))==null) then true
-      else any(.actions[]; .app==$app and ($parent==0 or .parentId==$parent) and .status!="verified") end' "$file" >/dev/null 2>&1 || rc=$?
-    # jq false is 1; parse/I/O failure protects rather than permitting deletion.
-    ((rc!=1))
+    media_recovery_journal_valid || return 0
+    [[ -f "$file" ]] || return 1
+    jq -e --arg app "$app" --argjson parent "$parent" 'any(.actions[];
+      .app==$app and ($parent==0 or .parentId==$parent) and .status!="verified" and (.replacementVerifiedAt // 0)<=0)' "$file" >/dev/null 2>&1 || rc=$?
+    ((rc!=1)) # malformed/unreadable state protects instead of permitting actions
+}
+
+# Preserve the complete catalog for pruning/existence checks. Only this RAM
+# action view excludes exact protected IDs; held movie state is never falsified.
+radarr_action_snapshot() {
+    local source="$1" output="$2" holds="$3"
+    media_recovery_ids Radarr "$holds" || return 1
+    jq --slurpfile holds "$holds" '[.[]|select(.id as $id | ($holds[0]|index($id))==null)]' "$source" >"$output"
 }
 
 current_workflow_error_details() {
@@ -4387,6 +4408,7 @@ radarr_process_monitored_fileless_watchdog() {
     while IFS= read -r key; do
         [[ -n "$key" ]] || continue
         key_movie_id="${key##*:}"
+        media_recovery_app_held Radarr "$key_movie_id" && continue
         still_active="$(jq --argjson id "$key_movie_id" \
             'any(.[]; .id == $id and .hasFile != true and .monitored == true)' \
             "$movies_file")" || still_active=false
@@ -4793,10 +4815,7 @@ cp -- "$STATE_FILE" "$WORK_STATE" || die "Cannot copy state to working file."
 ###############################################################################
 
 log DEBUG "Starting delete tagger (dry-run=$DRY_RUN, confirmations=$CONFIRMATION_RUNS)."
-if media_recovery_app_held Radarr; then
-    log INFO 'Radarr delete/tag/retirement workflow deferred: integrity recovery owns unresolved movie holds; existing state preserved.'
-    return 0
-fi
+media_recovery_journal_valid || die 'Media recovery hold journal invalid; Radarr state and media preserved.'
 if [[ "$TRIGGER_LIBRARY_RESCAN" == true ]]; then
     log INFO "Requesting one Radarr all-library rescan before checking movies."
 else
@@ -4843,7 +4862,13 @@ jq -e 'type == "array"' "$CURRENT_SNAPSHOT_FILE" >/dev/null ||
     die "Radarr /movie did not return an array."
 
 MOVIES_LISTED="$(jq length "$CURRENT_SNAPSHOT_FILE")"
-MOVIES_SCANNED="$MOVIES_LISTED"
+RADARR_ACTION_SNAPSHOT_FILE=$(mktemp "$VERIFY_RUNTIME_DIR/.radarr-action-snapshot.XXXXXX") || die 'Cannot prepare Radarr action snapshot.'
+RADARR_HOLD_IDS_FILE=$(mktemp "$VERIFY_RUNTIME_DIR/.radarr-recovery-holds.XXXXXX") || die 'Cannot prepare movie hold IDs.'
+radarr_action_snapshot "$CURRENT_SNAPSHOT_FILE" "$RADARR_ACTION_SNAPSHOT_FILE" "$RADARR_HOLD_IDS_FILE" || die 'Cannot validate/filter exact movie recovery holds.'
+RECOVERY_HELD_COUNT=$(jq --slurpfile active "$RADARR_ACTION_SNAPSHOT_FILE" 'length-($active[0]|length)' "$CURRENT_SNAPSHOT_FILE")
+MOVIES_SCANNED=$(jq length "$RADARR_ACTION_SNAPSHOT_FILE")
+((RECOVERY_HELD_COUNT==0)) || log INFO "Radarr recovery holds: $RECOVERY_HELD_COUNT current movie(s) protected; $MOVIES_SCANNED unrelated movie(s) continue normally."
+
 FILES_PRESENT="$(jq '[.[] | select(.hasFile == true)] | length' "$CURRENT_SNAPSHOT_FILE")"
 
 SIDECAR_BATCH_FILE="$(mktemp "$STATE_DIR/.sidecars.batch.XXXXXX")" ||
@@ -4891,10 +4916,10 @@ if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( FILES_PRESENT > 0 )); then
         fi
         rm -f -- "$SIDECAR_ENTRY_FILE"
         SIDECAR_ENTRY_FILE=""
-    done < <(jq -c '.[] | select(.hasFile == true)' "$CURRENT_SNAPSHOT_FILE")
+    done < <(jq -c '.[] | select(.hasFile == true)' "$RADARR_ACTION_SNAPSHOT_FILE")
 fi
 
-radarr_apply_snapshot "$CURRENT_SNAPSHOT_FILE" "$SIDECAR_BATCH_FILE" ||
+radarr_apply_snapshot "$RADARR_ACTION_SNAPSHOT_FILE" "$SIDECAR_BATCH_FILE" ||
     die "Could not update temporary state."
 rm -f -- "$SIDECAR_BATCH_FILE"
 SIDECAR_BATCH_FILE=""
@@ -4914,7 +4939,7 @@ if [[ "$RADARR_RETIRE_FULLY_DELETED_MOVIES" == true ]]; then
     fi
 fi
 
-radarr_process_monitored_fileless_watchdog "$CURRENT_SNAPSHOT_FILE" || {
+radarr_process_monitored_fileless_watchdog "$RADARR_ACTION_SNAPSHOT_FILE" || {
     ((API_FAILURES += 1))
     log ERROR "Radarr monitored-fileless watchdog failed."
     queue_attention_notification ERROR Radarr "Monitored-fileless watchdog failed" \
@@ -4924,7 +4949,7 @@ radarr_process_monitored_fileless_watchdog "$CURRENT_SNAPSHOT_FILE" || {
 FIRST_MISSING="$(radarr_new_candidate_count)"
 (( FIRST_MISSING == 0 )) || radarr_log_new_candidates
 
-CONFIRMED="$(radarr_confirmed_movies "$CURRENT_SNAPSHOT_FILE")" ||
+CONFIRMED="$(radarr_confirmed_movies "$RADARR_ACTION_SNAPSHOT_FILE")" ||
     die "Could not calculate tag action plan."
 MOVIES_CONFIRMED="$(jq length <<< "$CONFIRMED")"
 
@@ -5101,7 +5126,7 @@ if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( MOVIES_CONFIRMED > 0 )); then
     done < <(jq -c '.[]' <<< "$CONFIRMED")
 fi
 
-radarr_process_retirements "$CURRENT_SNAPSHOT_FILE" || {
+radarr_process_retirements "$RADARR_ACTION_SNAPSHOT_FILE" || {
     ((API_FAILURES += 1))
     log ERROR "Radarr retirement processing failed; unfinished work will be retried."
     queue_attention_notification ERROR Radarr "Radarr retirement processing failed" \
@@ -5113,7 +5138,7 @@ WORK_STATE=""
 
 ACTION_LABEL=applied
 [[ "$DRY_RUN" == true ]] && ACTION_LABEL=would-apply
-log INFO "Summary: movies-listed=$MOVIES_LISTED, movies-scanned=$MOVIES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$MOVIES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, tag-actions-$ACTION_LABEL=$TAG_ACTIONS, retirements-started=$RETIREMENTS_STARTED, retirements-cancelled=$RETIREMENTS_CANCELLED, arr-removals=$ARR_REMOVALS, state-pruned=$STATE_PRUNED, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, late-sidecar-candidates=$SIDECARS_LATE_CANDIDATES, late-sidecars-confirmed-$ACTION_LABEL=$SIDECARS_LATE_CONFIRMED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, folder-cleanup-pending=$FOLDER_CLEANUP_PENDING, mover-deferrals=$MOVER_DEFERRALS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
+log INFO "Summary: movies-listed=$MOVIES_LISTED, movies-scanned=$MOVIES_SCANNED, recovery-held=$RECOVERY_HELD_COUNT, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$MOVIES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, tag-actions-$ACTION_LABEL=$TAG_ACTIONS, retirements-started=$RETIREMENTS_STARTED, retirements-cancelled=$RETIREMENTS_CANCELLED, arr-removals=$ARR_REMOVALS, state-pruned=$STATE_PRUNED, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, late-sidecar-candidates=$SIDECARS_LATE_CANDIDATES, late-sidecars-confirmed-$ACTION_LABEL=$SIDECARS_LATE_CONFIRMED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, folder-cleanup-pending=$FOLDER_CLEANUP_PENDING, mover-deferrals=$MOVER_DEFERRALS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
 
 if (( API_FAILURES > 0 || HISTORY_FAILURES > 0 || SIDECAR_FAILURES > 0 )); then
     FAILURE_SEVERITY=WARNING
