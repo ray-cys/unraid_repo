@@ -4,7 +4,7 @@ Schedule: 10 * * * * (hourly at minute 10, Singapore time). This is a short comp
 
 appdata_backup publishes a request after successful local completion. No request/already delivered means a local no-op: no ISS connection, Wake-on-LAN, new backup log or notification. A new valid request transfers appdata, flash backup, User Scripts, GitHub directories, photos and compact operational state. Wait for ISS readiness; use the shared backup lease; verify SHA-256 before promoting the remote generation. Retain three successful generations, run a bounded weekly restore drill when due, then request guarded shutdown.
 
-Undelivered requests retry on later checks; invalid/changed/stale requests fail safely. Acknowledged delivery is not repeated merely because later retention/drill/shutdown reports a warning. Photos/GitHub/flash changes alone wait for the next appdata completion request.
+Undelivered requests retry on later checks; invalid/changed/stale requests fail safely. Identical generation/failure notifications have a 24-hour cooldown; new failures or generations notify immediately. Verified completion includes recovery from a previously reported failure. Failed sends do not advance the cooldown. Acknowledged delivery is not repeated merely because later retention/drill/shutdown reports a warning. Photos/GitHub/flash changes alone wait for the next appdata completion request.
 
 CLI: bash script --help or --version performs no backup work. --force repeats the current valid request and may wake ISS/transfer all jobs. GitHub source: user_script/vault_backup.sh; installed entry: vault_remote_backup. Preserve the installed DRY_RUN setting.
 

@@ -57,7 +57,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.15"
+readonly SCRIPT_VERSION="1.16"
 
 ###############################################################################
 # CONFIGURATION
@@ -147,6 +147,12 @@ LOG_DIR="/mnt/vault/cloud/logs/script/vault_backup"
 MAX_LOGS=5
 STATUS_DIR="/mnt/vault/cloud/logs/script/user_scripts_status"
 NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
+# Same pending generation + failure reason: initial alert, then one reminder/day.
+# New generations/reasons/severity notify immediately; verified completion includes
+# recovery in its normal report. Failed sends never consume the reminder budget.
+VAULT_FAILURE_REMINDER_SECONDS=86400
+VAULT_NOTIFICATION_STATE=""
+VAULT_NOTIFICATION_REASON=""
 LOCK_FILE="/run/vault_backup.lock"
 
 readonly SCRIPT_ID="vault_backup"
@@ -370,10 +376,13 @@ backup_finish() {
     if (( rc == 0 )); then BACKUP_PHASE=completed; fi
     summary="${SCRIPT_ID} v${SCRIPT_VERSION}; copy=$BACKUP_RESULT; verify=$VERIFICATION_RESULT; retention=$RETENTION_RESULT; phase=$BACKUP_PHASE; duration=$(( $(date +%s)-BACKUP_STARTED ))s; shutdown=$SHUTDOWN_RESULT ${REMOTE_SHUTDOWN_SKIPPED_REASON:-}"
     if (( rc != 0 )) && [[ "$BACKUP_NOTIFIED" != true && -x "${NOTIFY_BIN:-}" ]]; then
-        if timeout 30 "$NOTIFY_BIN" -i alert -s "$NOTIFY_SUBJECT" -d 'Backup failed' -m "$summary
-Last error: $(awk '/\[ERROR\]/ {last=$0} END {print last}' "$LOG_FILE" 2>/dev/null)
+        local last_error
+        last_error=$(awk '/\[ERROR\]/ {last=$0} END {sub(/^.*\[ERROR\] /,"",last); print last}' "$LOG_FILE" 2>/dev/null)
+        VAULT_NOTIFICATION_REASON="$BACKUP_PHASE|$BACKUP_RESULT|$VERIFICATION_RESULT|$RETENTION_RESULT|$last_error"
+        notify_unraid alert 'Backup failed' "$summary
+Last error: $last_error
 ISS shutdown was not forced after this failure; any undelivered appdata request remains eligible for retry.
-Log: $LOG_FILE" >/dev/null 2>&1; then NOTIFICATION_RESULT=sent; else NOTIFICATION_RESULT=failed; fi
+Log: $LOG_FILE"
     fi
     [[ "$NOTIFICATION_RESULT" != failed && "$NOTIFICATION_RESULT" != unavailable || "$status" != OK ]] || status=WARNING
     if mountpoint -q /mnt/vault && command -v jq >/dev/null; then
@@ -442,15 +451,64 @@ log() {
         { backup_bound_log "$LOG_FILE" "$MAX_MAIN_LOG_BYTES" && printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null || true
 }
 
+# Durable across hourly invocations. The outer vault lock serializes this state;
+# only accepted notifications advance its clock. No log or request-age counter is
+# used as an incident identity, so an unchanged failure cannot become new hourly.
+vault_notification_state_ready() {
+    [[ -n "${VAULT_NOTIFICATION_STATE:-}" ]] || VAULT_NOTIFICATION_STATE="$LOG_DIR/notification-state.json"
+    [[ "$VAULT_NOTIFICATION_STATE" != /mnt/vault/* ]] || mountpoint -q /mnt/vault || return 1
+    [[ ! -L "$VAULT_NOTIFICATION_STATE" && ! -L "${VAULT_NOTIFICATION_STATE%/*}" ]] || return 1
+    mkdir -p -- "${VAULT_NOTIFICATION_STATE%/*}" || return 1
+    [[ ! -f "$VAULT_NOTIFICATION_STATE" ]] || jq -e '
+      .schema==1 and (.activeFailure==null or
+        ((.activeFailure.signature|test("^[a-f0-9]{64}$")) and
+         (.activeFailure.description|type)=="string" and
+         (.activeFailure.firstReportedAt|type)=="number" and
+         (.activeFailure.lastSentAt|type)=="number" and
+         .activeFailure.firstReportedAt>=0 and .activeFailure.lastSentAt>=0))
+      ' "$VAULT_NOTIFICATION_STATE" >/dev/null 2>&1
+}
+
 notify_unraid() {
     BACKUP_NOTIFIED=true
     local importance="$1" description="$2" message="$3"
+    local state_ready=false incident=false signature="" identity="${ISS_REQUEST_ID:-}" old="" now first=0 last=0 tmp reason=""
+    now=$(date +%s)
+    vault_notification_state_ready && state_ready=true
+    case "$description" in 'ISS handoff unavailable'|'Backup failed') incident=true;; esac
+    if [[ "$incident" == true ]]; then
+        if [[ -z "$identity" && -f "$ISS_REQUEST_FILE" ]]; then identity=$(sha256sum -- "$ISS_REQUEST_FILE" | cut -d ' ' -f1);fi
+        [[ -n "$identity" ]] || identity=no-request
+        reason="${VAULT_NOTIFICATION_REASON:-$BACKUP_PHASE|$BACKUP_RESULT|$VERIFICATION_RESULT|$RETENTION_RESULT}"
+        signature=$(printf '%s\0' "$identity" "$importance" "$description" "$reason" | sha256sum | cut -d ' ' -f1)
+        if [[ "$state_ready" == true && -f "$VAULT_NOTIFICATION_STATE" ]]; then
+            IFS=$'\t' read -r old first last < <(jq -r '[.activeFailure.signature//"",.activeFailure.firstReportedAt//0,.activeFailure.lastSentAt//0]|@tsv' "$VAULT_NOTIFICATION_STATE")
+            if [[ "$old" == "$signature" ]] && (( now>=last && now-last<VAULT_FAILURE_REMINDER_SECONDS )); then
+                NOTIFICATION_RESULT=suppressed
+                log INFO "Repeated ISS failure notification suppressed; same request/reason, reminder interval=${VAULT_FAILURE_REMINDER_SECONDS}s. $description: $reason"
+                return 0
+            fi
+        fi
+        [[ "$old" == "$signature" ]] || first="$now"
+    elif [[ "$state_ready" == true && -f "$VAULT_NOTIFICATION_STATE" && "$description" == 'Backup completed'* ]]; then
+        old=$(jq -r '.activeFailure.description // ""' "$VAULT_NOTIFICATION_STATE")
+        [[ -z "$old" ]] || message+=$'\n'"Recovery: previously reported $old is cleared; this generation passed transfer and SHA-256 verification."
+    fi
     [[ -x "$NOTIFY_BIN" ]] || { NOTIFICATION_RESULT=unavailable; return 0; }
-    if timeout 30 "$NOTIFY_BIN" -i "$importance" -s "$NOTIFY_SUBJECT" -d "$description" -m "$message" >/dev/null 2>&1; then
+    if timeout --kill-after=5 30 "$NOTIFY_BIN" -i "$importance" -s "$NOTIFY_SUBJECT" -d "$description" -m "$message" >/dev/null 2>&1; then
         NOTIFICATION_RESULT=sent
+        if [[ "$state_ready" == true && ( "$incident" == true || "$description" == 'Backup completed'* ) ]]; then
+            tmp=$(mktemp "${VAULT_NOTIFICATION_STATE}.XXXXXX") || { NOTIFICATION_RESULT=failed;log WARN 'Notification accepted but receipt could not be saved; retry deduplication unavailable';return 0; }
+            if jq -n --arg signature "$signature" --arg request "$identity" --arg description "$description" --arg reason "$reason" \
+                --argjson incident "$incident" --argjson first "$first" --argjson now "$now" \
+                '{schema:1,lastAcceptedAt:$now,activeFailure:(if $incident then
+                  {signature:$signature,requestId:$request,description:$description,reason:$reason,firstReportedAt:$first,lastSentAt:$now}
+                  else null end)}' >"$tmp" && sync -- "$tmp" && mv -f -- "$tmp" "$VAULT_NOTIFICATION_STATE"; then :
+            else rm -f -- "$tmp";NOTIFICATION_RESULT=failed;log WARN 'Notification accepted but durable receipt failed; retry deduplication unavailable';fi
+        fi
     else
         NOTIFICATION_RESULT=failed
-        log WARN 'Notification delivery failed; backup outcome remains in the status receipt'
+        log WARN 'Notification delivery failed; cooldown was not advanced and the next retry can notify'
     fi
 }
 
@@ -666,6 +724,7 @@ vault_select_sources() {
 # Return 10 for a harmless no-op. Malformed/stale requests fail visibly.
 vault_pending_request() {
     local digest completed now delivered="" root="" job label source
+    VAULT_NOTIFICATION_REASON="request-schema"
     [[ -f "$ISS_REQUEST_FILE" ]] || return 10
     jq -e '.schema==1 and (.generation|type=="string") and
       (.manifestSha256|test("^[a-f0-9]{64}$")) and
@@ -678,17 +737,22 @@ vault_pending_request() {
         IFS='|' read -r label source <<<"$job"
         [[ "$label" != appdata ]] || root="$source"
     done
+    VAULT_NOTIFICATION_REASON="generation-path-unavailable"
     [[ -n "$root" && "$ISS_REQUEST_GENERATION" == "$root"/backup_* &&
        "${ISS_REQUEST_GENERATION##*/}" =~ ^backup_[0-9]{8}_[0-9]{6}$ &&
        -d "$ISS_REQUEST_GENERATION" && ! -L "$ISS_REQUEST_GENERATION" &&
        $(realpath -e -- "$ISS_REQUEST_GENERATION") == "$ISS_REQUEST_GENERATION" ]] || return 1
     ISS_REQUEST_ID="${ISS_REQUEST_GENERATION##*/}:$digest"
+    VAULT_NOTIFICATION_REASON="delivery-receipt-invalid"
     if [[ -f "$ISS_DELIVERED_FILE" ]]; then delivered=$(jq -r '.requestId // ""' "$ISS_DELIVERED_FILE") || return 1; fi
     [[ "$ISS_REQUEST_ID" != "$delivered" || "${1:-}" == --force ]] || return 10
+    VAULT_NOTIFICATION_REASON="request-stale-or-future-dated"
     (( completed <= now && now-completed <= MAX_PRODUCER_AGE_SECONDS )) || {
         printf 'Pending ISS request is stale/future-dated; source backup must succeed again\n' >&2; return 1;
     }
+    VAULT_NOTIFICATION_REASON="producer-manifest-changed"
     [[ $(sha256sum "$ISS_REQUEST_GENERATION/backup_manifest.tsv" | awk '{print $1}') == "$digest" ]] || return 1
+    VAULT_NOTIFICATION_REASON=""
 }
 vault_acknowledge_request() {
     [[ -n "$ISS_REQUEST_ID" ]] || return 0
@@ -909,6 +973,7 @@ vault_export_operations_state() {
     local fd spec name source file base size total=0 temp previous current_hash copied_hash optional_media_bytes=0
     local scripts="$OPERATIONS_SCRIPT_ROOT"
     local -a sources=(
+        "vault_backup|$scripts/vault_backup"
         "arr_health_activity|$scripts/arr_health_activity"
         "media_cleanup|$scripts/media_cleanup"
         "media_cleanup/arr|$scripts/media_cleanup/arr"
@@ -1337,7 +1402,10 @@ GitHub, photos and operational state) to be copied into a new ISS generation.
 Verify SHA-256, promote atomically, acknowledge delivery, retain three successful
 remote generations, run the weekly drill when due, then request guarded shutdown.
 
-Undelivered requests retry on later checks. Requests older than 72 hours, changed
+Undelivered requests retry on later checks. Identical request/failure notifications
+are limited to one per 24 hours; new reasons notify immediately. Verified success
+reports recovery, and failed notification sends remain eligible for retry.
+Requests older than 72 hours, changed
 sources or invalid manifests fail safely. Retention/drill/shutdown warnings after
 delivery acknowledgement do not automatically trigger another full copy.
 Photos/GitHub/flash changes alone do not trigger delivery in completion-driven mode.
@@ -1362,7 +1430,7 @@ main() {
         vault_pending_request "${1:-}" || pending_rc=$?
         if (( pending_rc == 10 )); then printf 'No new completed appdata generation; ISS remains undisturbed\n'; return 0; fi
         if (( pending_rc != 0 )); then
-            notify_unraid warning "ISS handoff unavailable" "Pending appdata request is malformed, stale, or its source changed. No ISS wake or transfer was attempted. A fresh successful appdata backup is required."
+            notify_unraid warning "ISS handoff unavailable" "Reason: $VAULT_NOTIFICATION_REASON. Pending appdata request is malformed, stale, or its source changed. No ISS wake or transfer was attempted. A fresh successful appdata backup is required."
             return 1
         fi
     fi

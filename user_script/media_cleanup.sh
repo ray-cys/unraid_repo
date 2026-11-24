@@ -1,6 +1,6 @@
 #!/bin/bash
 arrayStarted=true
-# Media Cleanup v1.1.0 -- personal Hubble operations
+# Media Cleanup v1.2.0 -- personal Hubble operations
 #
 # PURPOSE: One daily job coordinates Arr deletion/unmonitoring/90-day retirement,
 # proven SAB completed-payload cleanup, and metadata-bin retention. Modules run
@@ -23,11 +23,16 @@ arrayStarted=true
 # LOG: media-cleanup.log, capped at 2 MiB, two backups, 30-day backup retention.
 # Logs identify module, application, run and outcome. Working Arr snapshots and
 # sidecar assembly use RAM; final state/checkpoints/receipts remain persistent.
+# Sidecar tools use bounded 64-file/32-KiB argument batches; fresh SHA-256 and
+# before/after identity checks remain mandatory. Sonarr merges each series map
+# once instead of copying the library map for each episode. Timing is logged.
 # File hashing before quarantine is retained. No Docker configuration is changed.
 #
 # NOTIFICATIONS: Modules hand complete operational reports to a durable shared
 # outbox. Acceptance by that outbox is not email delivery. One grouped email/day
 # covers actions, recovered work and attention; failed delivery retains the data.
+# Routine NZB/database-backup expiry is log-only unless another action or
+# exception justifies a report; its counts/bytes are included in that report.
 # Quiet healthy runs send nothing. Oversize reports span future daily messages;
 # undelivered details are retained, never silently dropped. Abnormal exits and
 # deferrals are reported with outcomes. RUNNING receipts are written at startup
@@ -58,7 +63,7 @@ arrayStarted=true
 
 set -uo pipefail
 umask 077
-MC_VERSION="1.1.0"
+MC_VERSION="1.2.0"
 # One execution switch across every module. Conflicting/unused flags fail before work.
 # In preview, quarantine purge becomes audit; restore requires an explicit execute flag.
 MC_DRY_RUN=false
@@ -1954,16 +1959,69 @@ file_size_bytes() {
     stat -c '%s' -- "$1" 2>/dev/null || stat -f '%z' -- "$1" 2>/dev/null
 }
 
+# Hash bounded groups in RAM: three tools per group instead of per sidecar.
+# Every eligible file is freshly hashed. Device/inode/size/nanosecond mtime and
+# ctime plus file type must remain identical across the hash pass. Quarantine
+# still independently validates the saved SHA-256 immediately before moving.
+mc_sidecar_path_bytes() { local LC_ALL=C; MC_PATH_BYTES=${#1}; }
+
+mc_sidecar_batch() (
+    local batch="$1";shift
+    (( $#>0 )) || return 0
+    local temp file size identity type hash row i=0
+    local -a files=() sizes=() identities=()
+    temp=$(mktemp -d "${VERIFY_RUNTIME_DIR:-${TMPDIR:-/tmp}}/sidecar-batch.XXXXXX") || return 1
+    trap 'rm -rf -- "$temp"' EXIT
+    # A failed stat or hash rejects the entire capture, preserving the previous
+    # manifest. NUL framing includes all filename bytes, including newlines.
+    LC_ALL=C stat --printf='%s\0%d:%i:%s:%y:%z\0%F\0' -- "$@" >"$temp/before" || return 1
+    exec 7<"$temp/before"
+    for file in "$@"; do
+        IFS= read -r -d '' size <&7 && IFS= read -r -d '' identity <&7 && IFS= read -r -d '' type <&7 || return 1
+        [[ "$type" == 'regular file' || "$type" == 'regular empty file' ]] || return 1
+        [[ "$size" =~ ^[0-9]+$ ]] || return 1
+        if ((size>MAX_SIDECAR_SIZE_MB*1024*1024)); then
+            log WARNING "Skipping oversized $app_name sidecar (${size} bytes): $file"
+            continue
+        fi
+        files+=("$file");sizes+=("$size");identities+=("$identity")
+    done
+    exec 7<&-
+    (( ${#files[@]}>0 )) || return 0
+    sha256sum --zero -- "${files[@]}" >"$temp/hashes" || return 1
+    LC_ALL=C stat --printf='%s\0%d:%i:%s:%y:%z\0%F\0' -- "${files[@]}" >"$temp/after" || return 1
+    exec 7<"$temp/after" 6<"$temp/hashes"
+    for file in "${files[@]}"; do
+        IFS= read -r -d '' size <&7 && IFS= read -r -d '' identity <&7 && IFS= read -r -d '' type <&7 || return 1
+        IFS= read -r -d '' row <&6 || return 1
+        hash="${row:0:64}"
+        if [[ ! "$hash" =~ ^[a-f0-9]{64}$ || "$row" != "$hash  $file" ||
+              "$size" != "${sizes[$i]}" || "$identity" != "${identities[$i]}" ||
+              ( "$type" != 'regular file' && "$type" != 'regular empty file' ) ]]; then
+            log WARNING "Sidecar changed or could not be hashed while capturing it: $file"
+            return 1
+        fi
+        printf '%s\0%s\0%s\0' "${file#"$media_real"/}" "$size" "$hash" >>"$batch" || return 1
+        i=$((i+1))
+    done
+    # Reject unexpected/truncated tool output rather than pairing the wrong hash.
+    if IFS= read -r -d '' row <&6 || [[ -n "$row" ]]; then return 1;fi
+    exec 7<&- 6<&-
+)
+
 capture_kodi_sidecars_core() (
     local app_name="$1"
     local media_path="$2"
     local media_root="$3"
     local media_relative_paths="$4"
     local media_real relative lower name rel_dir file_name stem candidate
-    local file size size_after hash eligible capture_failed=0 allow_auxiliary="${5:-false}"
+    local file eligible capture_failed=0 allow_auxiliary="${5:-false}"
+    local list_file batch_bytes=0
+    local -a pending_files=()
     local batch_file
     batch_file="$(mktemp "${VERIFY_RUNTIME_DIR:-${TMPDIR:-/tmp}}/sidecar-capture.XXXXXX")" || return 1
-    trap 'rm -f -- "$batch_file"' EXIT
+    list_file="${batch_file}.inventory"
+    trap 'rm -f -- "$batch_file" "$list_file"' EXIT
     local type extension
     local -A exact_paths=()
 
@@ -2023,6 +2081,8 @@ capture_kodi_sidecars_core() (
         fi
     done < <(jq -r '.[]' <<< "$media_relative_paths")
 
+    # A traversal error must not silently publish an incomplete inventory.
+    find "$media_real" -type f -print0 >"$list_file" || return 1
     while IFS= read -r -d '' file; do
         relative="${file#"$media_real"/}"
         valid_relative_path "$relative" || continue
@@ -2051,31 +2111,17 @@ capture_kodi_sidecars_core() (
         fi
         [[ "$eligible" == true ]] || continue
 
-        size="$(file_size_bytes "$file")" || {
-            log WARNING "Could not stat $app_name sidecar while capturing it: $file"
-            capture_failed=1
-            continue
-        }
-        [[ "$size" =~ ^[0-9]+$ ]] || {
-            capture_failed=1
-            continue
-        }
-        if (( size > MAX_SIDECAR_SIZE_MB * 1024 * 1024 )); then
-            log WARNING "Skipping oversized $app_name sidecar (${size} bytes): $file"
-            continue
+        mc_sidecar_path_bytes "$file"
+        pending_files+=("$file");batch_bytes=$((batch_bytes+MC_PATH_BYTES+1))
+        # Bound both count and argument bytes; never build an unbounded argv.
+        if (( ${#pending_files[@]}>=64 || batch_bytes>=32768 )); then
+            mc_sidecar_batch "$batch_file" "${pending_files[@]}" || capture_failed=1
+            pending_files=();batch_bytes=0
         fi
-        hash="$(sha256sum -- "$file" 2>/dev/null | cut -d ' ' -f 1)"
-        size_after="$(file_size_bytes "$file")" || size_after=-1
-        if [[ ! "$hash" =~ ^[a-fA-F0-9]{64}$ || "$size_after" != "$size" ]]; then
-            log WARNING "Sidecar changed or could not be hashed while capturing it: $file"
-            capture_failed=1
-            continue
-        fi
-
-        # NUL framing preserves quotes, tabs, backslashes and Unicode without
-        # one JSON process and a growing array copy for every sidecar.
-        printf '%s\0%s\0%s\0' "$relative" "$size" "${hash,,}" >>"$batch_file" || return 1
-    done < <(find "$media_real" -type f -print0)
+    done < "$list_file"
+    if (( ${#pending_files[@]}>0 )); then
+        mc_sidecar_batch "$batch_file" "${pending_files[@]}" || capture_failed=1
+    fi
 
     (( capture_failed == 0 )) || return 1
     # Assemble the complete RAM-backed batch once, preserving all path bytes.
@@ -3223,9 +3269,12 @@ sonarr_apply_snapshot() {
           else
             .
           end
-        | reduce $episodes[] as $episode (.;
+        # Build only the current series update map, then merge once. Replacing an
+        # episode must not copy the whole library map for every episode.
+        | .episodes as $previous
+        | (reduce $episodes[] as $episode ({};
             ($episode.id | tostring) as $key
-            | (.episodes[$key] // {}) as $old
+            | (.[$key] // $previous[$key] // {}) as $old
             | {
                 episodeId: $episode.id,
                 seriesId: $series_id,
@@ -3236,7 +3285,7 @@ sonarr_apply_snapshot() {
                 lastObservedAt: $now
               } as $identity
             | if $episode.hasFile == true then
-                .episodes[$key] = (
+                .[$key] = (
                     $old + $identity + {
                         everHadFile: true,
                         lastKnownFileId: ($episode.episodeFileId // 0),
@@ -3246,7 +3295,7 @@ sonarr_apply_snapshot() {
                     }
                 )
               elif $old.everHadFile == true then
-                .episodes[$key] = (
+                .[$key] = (
                     $old + $identity + {
                         missingSince: ($old.missingSince // $now),
                         missingRuns: (($old.missingRuns // 0) + 1)
@@ -3255,7 +3304,8 @@ sonarr_apply_snapshot() {
               else
                 .
               end
-        )
+        )) as $updates
+        | .episodes += $updates
     ' "$WORK_STATE" > "$next"; then
         rm -f -- "$next"
         return 1
@@ -4160,8 +4210,8 @@ while IFS= read -r SERIES_ID; do
     }
 
     ((SERIES_SCANNED += 1))
-    COUNT="$(jq length "$CURRENT_SNAPSHOT_FILE")"
-    PRESENT="$(jq '[.[] | select(.hasFile == true)] | length' "$CURRENT_SNAPSHOT_FILE")"
+    IFS=$'\t' read -r COUNT PRESENT < <(jq -r '[length,([.[] | select(.hasFile == true)]|length)]|@tsv' "$CURRENT_SNAPSHOT_FILE")
+    [[ "$COUNT" =~ ^[0-9]+$ && "$PRESENT" =~ ^[0-9]+$ ]] || die "Could not count Sonarr episode snapshot."
     ((EPISODES_SCANNED += COUNT))
     ((FILES_PRESENT += PRESENT))
 
@@ -8476,7 +8526,11 @@ notify_summary() {
   NOTIFICATION_FINALIZED=true
   is_true "$SEND_NOTIFICATIONS" || return 0
   if is_true "$DRY_RUN" && ! is_true "$NOTIFY_DRY_RUN"; then return 0; fi
-  local changed=$((NZB_BACKUPS_REMOVED+APP_BACKUPS_REMOVED+QUARANTINED+PURGED+RECOVERED))
+  # Routine NZB/database backup expiry remains fully logged. It must not
+  # create an email by itself; include those details when payload actions,
+  # recovery or an exception already justify the daily grouped report. Keep
+  # routine backup filenames in the log so they cannot create days of overflow.
+  local changed=$((QUARANTINED+PURGED+RECOVERED))
   local warnings="$OPS_ATTENTION_DETAILS" signature previous="" mode="EXECUTE" importance=normal message detail shown=0
   if [[ -s "${OPS_ATTENTION_FILE:-}" ]]; then warnings=$(cat "$OPS_ATTENTION_FILE"); fi
   signature=$(printf '%s' "$BACKUP_CLEANUP_STATUS|$STRANDED_CLEANUP_STATUS|$QUARANTINE_PURGE_STATUS|$warnings" | sha256sum | cut -d ' ' -f1)
@@ -8497,7 +8551,7 @@ notify_summary() {
   message+="Working folders: inspected=$ORPHANS_SCANNED; protected=$ORPHANS_PROTECTED; awaiting stable observations=$ORPHANS_WAITING; unverified=$ORPHANS_UNVERIFIED; quarantined=$ORPHANS_QUARANTINED."$'\n'
   message+="Quarantine purge: $QUARANTINE_PURGE_STATUS; purged $PURGED payload(s), $(bytes_human "$BYTES_PURGED"). Recovered interrupted actions: $RECOVERED."$'\n'
   message+="Protected/skipped: active queue=$QUEUE_PROTECTED; recently changed=$PATH_UNSTABLE; import history unproven=$HISTORY_UNPROVEN; destination unverified=$DESTINATION_UNVERIFIED; source media unaccounted=$SOURCE_UNACCOUNTED; Mover stops=$MOVER_PROTECTED. Errors: $ERRORS."$'\n'
-  for detail in "${RECOVERY_DETAILS[@]}" "${QUARANTINE_DETAILS[@]}" "${PURGE_DETAILS[@]}" "${BACKUP_DETAILS[@]}"; do
+  for detail in "${RECOVERY_DETAILS[@]}" "${QUARANTINE_DETAILS[@]}" "${PURGE_DETAILS[@]}"; do
     message+=$'\n'"- $detail"; shown=$((shown+1))
   done
   if [[ -n "$warnings" ]]; then message+=$'\n\n'"Exceptions and preserved items:"$'\n'"$warnings"; fi

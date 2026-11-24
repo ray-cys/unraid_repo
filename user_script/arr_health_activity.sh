@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.20.0
+# ARR Health / Download / Import Monitor v3.20.1
 #
 # PURPOSE
 # -------
@@ -719,14 +719,16 @@ GROUP_NOTIFICATION_ITEM_MAX_CHARS=4000
 # Notification lifecycle - v3.7
 # ---------------------------------------------------------------------------
 
-# Repeat unchanged active errors and warnings until they resolve or are
-# acknowledged. Informational issues do not receive reminders.
+# New or materially changed issues still notify immediately. Unchanged active
+# errors/warnings receive at most three daily reminders, then remain visible in
+# state/logs without further reminder email. Resolution reporting is unchanged.
 REMINDERS_ENABLED=true
-ERROR_REMINDER_INTERVAL_HOURS=6
+ERROR_REMINDER_INTERVAL_HOURS=24
 WARNING_REMINDER_INTERVAL_HOURS=24
 
-# 0 means unlimited reminders while the issue remains active.
-REMINDER_MAX_COUNT=0
+# Maximum reminder emails after the initial report, per unchanged signature.
+# A new signature/severity resets the budget; 0 would mean unlimited.
+REMINDER_MAX_COUNT=3
 
 # Historical events are notification-once. Known heuristic conditions use a
 # slower, bounded reminder policy so that a persistent observation cannot
@@ -6706,7 +6708,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.20.0 lifecycle commands' \
+        'ARR Health Monitor v3.20.1 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -16530,7 +16532,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.20.0"
+    "START | ARR Health Monitor v3.20.1"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -16543,7 +16545,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.20.0"
+debug_log "Starting ARR Health Monitor v3.20.1"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -17164,7 +17166,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.20.0 completed"
+log "ARR Health Monitor v3.20.1 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""
