@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# REFERENCE COPY: Hubble now runs media_cleanup.sh (arr module).
+# Standalone behavior and original runtime paths are retained for reference.
 
 ###############################################################################
 # Sonarr + Radarr - Plex Delete Sync and Tagger v2.10.0

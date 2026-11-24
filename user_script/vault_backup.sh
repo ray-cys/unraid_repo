@@ -57,7 +57,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.14"
+readonly SCRIPT_VERSION="1.15"
 
 ###############################################################################
 # CONFIGURATION
@@ -125,8 +125,12 @@ OPERATIONS_EXPORT_TEMP=""
 # become a silently empty "successful" export after an OS/path change.
 OPERATIONS_REQUIRED_STATE_FILES=(
     arr_health_activity/state.json
-    arr_delete_sync_tag/sonarr-state.json
-    arr_delete_sync_tag/radarr-state.json
+    media_cleanup/arr/sonarr-state.json
+    media_cleanup/arr/radarr-state.json
+    media_cleanup/arr/pending-actions.json
+    media_cleanup/sab/pending-operations.json
+    media_cleanup/quarantine/pending-operations.json
+    media_cleanup/notification-outbox.json
     docker_service_watchdog/state.json
     dns_redundancy_watchdog/state.json
 )
@@ -906,12 +910,15 @@ vault_export_operations_state() {
     local scripts="$OPERATIONS_SCRIPT_ROOT"
     local -a sources=(
         "arr_health_activity|$scripts/arr_health_activity"
-        "arr_delete_sync_tag|$scripts/arr_delete_sync_tag"
-        "arr_sabnzbd_cleanup|$scripts/arr_sabnzbd_cleanup"
+        "media_cleanup|$scripts/media_cleanup"
+        "media_cleanup/arr|$scripts/media_cleanup/arr"
+        "media_cleanup/sab|$scripts/media_cleanup/sab"
+        "media_cleanup/quarantine|$scripts/media_cleanup/quarantine"
+        "media_cleanup/sab/purge-receipts|$scripts/media_cleanup/sab/purge-receipts"
+        "media_cleanup/quarantine/purge-receipts|$scripts/media_cleanup/quarantine/purge-receipts"
         "docker_service_watchdog|$scripts/docker_service_watchdog"
         "dns_redundancy_watchdog|$scripts/dns_redundancy_watchdog"
         "plex_dbrepair|$scripts/plex_dbrepair"
-        "quarantine_lifecycle|$scripts/quarantine_lifecycle"
         "media_metadata_audit|$scripts/media_metadata_audit"
         "imagemaid_restore_archive|$scripts/imagemaid_restore_archive"
         "backup_health_audit|$scripts/backup_health_audit"
@@ -934,7 +941,7 @@ vault_export_operations_state() {
     for spec in "${sources[@]}"; do
         IFS='|' read -r name source <<<"$spec"
         [[ -d "$source" && ! -L "$source" ]] || continue
-        mkdir "$temp/$name" || { exec {fd}>&-; return 1; }
+        mkdir -p "$temp/$name" || { exec {fd}>&-; return 1; }
         while IFS= read -r -d '' file; do
             base=${file##*/}
             # Explicit current files, never dated backup snapshots or generic logs.
@@ -951,6 +958,10 @@ vault_export_operations_state() {
                     if [[ "$base" == *.gz ]]; then
                         if ! gzip -t "$file" 2>/dev/null; then log WARNING 'Optional media integrity queue invalid; excluded from state export';continue;fi
                     elif ! jq -e . "$file" >/dev/null 2>&1; then log WARNING 'Optional media integrity delivery state invalid; excluded from export';continue;fi;;
+                *.jsonl|*.tsv)
+                    [[ "$name" == media_cleanup/*/purge-receipts || "$base" == action-receipts.jsonl || "$base" == pending-notifications.jsonl || "$base" == operation-recovery.jsonl || "$base" == quarantine-index.tsv || "$base" == transfer-manifest.tsv ]] || continue;;
+                notification-outbox.json|latest-run.json)
+                    [[ "$name" == media_cleanup || "$name" == media_cleanup/quarantine ]] || continue;;
                 state.json|notification-state.json|import-receipts.json|automation-actions.json|policy-actions.json|sonarr-state.json|radarr-state.json|pending-actions.json|pending-operations.json|action-receipts.jsonl|pending-notifications.jsonl|operation-recovery.jsonl|quarantine-index.tsv|transfer-manifest.tsv) ;;
                 *) continue;;
             esac

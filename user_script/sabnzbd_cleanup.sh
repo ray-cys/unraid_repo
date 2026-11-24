@@ -1,4 +1,6 @@
 #!/bin/bash
+# REFERENCE COPY: Hubble now runs media_cleanup.sh (sab module).
+# Standalone behavior and original runtime paths are retained for reference.
 
 ###############################################################################
 # SABnzbd Cleanup v2.8.0

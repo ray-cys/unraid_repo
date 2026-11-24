@@ -31,8 +31,8 @@
 #                |                      |
 #                +---- THIS SCRIPT -----+ -> issues, receipts, bounded recovery
 #
-#   arr_delete_sync_tag.sh  -> library deletion/unmonitor/tag/sidecar handling
-#   quarantine_lifecycle.sh -> metadata bin retention (/mnt/user/media/bin)
+#   media_cleanup.sh arr    -> library deletion/unmonitor/tag/sidecar handling
+#   media_cleanup.sh quarantine -> metadata bin retention (/mnt/user/media/bin)
 #   sabnzbd_cleanup.sh      -> SAB backup/full-payload retention (net/quarantine)
 #
 # THIS SCRIPT neither purges those bins nor performs their filesystem moves.
@@ -10778,7 +10778,7 @@ process_sab_orphans() {
                 record_normalized_issue "SABnzbd:policy-cleanup:${nzo_id,,}" SABnzbd "$name" \
                   SAB_STRANDED_POLICY_CLEANUP WARNING waiting \
                   'Verified rejected payload still awaits quarantine beyond expected cleanup window' "$age" \
-                  "Download ID: $nzo_id. Arr policy disposition verified; no import is expected for this rejected release. Payload remains at $completed_path after ${age}h. Check arr_sabnzbd_cleanup for queue/path/Mover/receipt blockers. No repeated download rejection or search was submitted."
+                  "Download ID: $nzo_id. Arr policy disposition verified; no import is expected for this rejected release. Payload remains at $completed_path after ${age}h. Check media_cleanup sab for queue/path/Mover/receipt blockers. No repeated download rejection or search was submitted."
             else
                 debug_log "Verified policy rejection awaiting guarded scheduled quarantine: $nzo_id"
             fi
@@ -16180,7 +16180,7 @@ policy_report_actions() {
         severity=WARNING; [ "$status" != done ] || severity=INFO
         detail="Download ID: $id"$'\n'"Original warning: $(jq -r '.warning|join("; ")' <<<"$action")"$'\n'
         if [ "$status" = done ]; then
-            detail+="Queue removal and native disposition verified. Payload preserved for guarded quarantine by arr_sabnzbd_cleanup; library unchanged."$'\n'
+            detail+="Queue removal and native disposition verified. Payload preserved for guarded quarantine by media_cleanup sab; library unchanged."$'\n'
             if [ "$(jq -r '.mode' <<<"$action")" = replace ]; then
                 if [ "$(jq -r '.replacementState // "waiting"' <<<"$action")" = import_verified ]; then
                     detail+="Exact release blocklisted; targeted replacement search accepted. A subsequent exact-target Arr file import was verified (file ID $(jq -r '.replacementFileId' <<<"$action"))."

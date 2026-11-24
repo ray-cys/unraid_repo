@@ -30,7 +30,7 @@ RECEIPT_RULES=(
     "mover_audit|/mnt/vault/cloud/logs/user_scripts_status/mover_audit.json|30|1"
     "docker_service_watchdog|/mnt/vault/cloud/logs/user_scripts_status/docker_service_watchdog.json|1|1"
     "dns_redundancy_watchdog|/mnt/vault/cloud/logs/script/user_scripts_status/dns_redundancy_watchdog.json|1|1"
-    "quarantine_lifecycle|/mnt/vault/cloud/logs/script/user_scripts_status/quarantine_lifecycle.json|30|1"
+    "media_cleanup|/mnt/vault/cloud/logs/script/user_scripts_status/media_cleanup.json|30|1"
     "plex_dbrepair|/mnt/vault/cloud/logs/script/user_scripts_status/plex_dbrepair.json|192|1"
     "pre_post_reboot_audit|/mnt/vault/cloud/logs/user_scripts_status/pre_post_reboot_audit.json|0|0"
 )

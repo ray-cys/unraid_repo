@@ -1,7 +1,9 @@
 #!/bin/bash
+# REFERENCE COPY: Hubble now runs media_cleanup.sh (quarantine module).
+# Standalone behavior and original runtime paths are retained for reference.
 
 ###############################################################################
-# Metadata Quarantine Lifecycle Manager v1.5.0
+# Metadata Quarantine Lifecycle Manager v1.6.0
 #
 # PURPOSE / PERSONAL USE CASE
 # ---------------------------
