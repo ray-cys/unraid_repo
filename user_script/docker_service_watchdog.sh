@@ -1,6 +1,6 @@
 #!/bin/bash
 clearLog=true
-# Docker Service Watchdog v3.10 -- Unraid service availability and bounded recovery.
+# Docker Service Watchdog v3.11 -- Unraid service availability and bounded recovery.
 # Optional schedule: every five minutes. Pi-hole and application-specific health
 # remain owned by the DNS and Arr monitors. Recovery follows Hubble's existing
 # per-service permissions; VPN/configuration findings never request restarts.
@@ -54,13 +54,14 @@ usr_ops_append_log() {
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.10"
+readonly SCRIPT_VERSION="3.11"
 
 ###############################################################################
 # CONFIGURATION
 ###############################################################################
 # name|HTTP endpoint (optional)|always/on-demand|restart permission (0/1)
-# on-demand containers may stop normally, but must remain installed.
+# Profiles apply only while installed; confirmed removal retires old monitoring.
+# on-demand containers may stop normally without an availability failure.
 SERVICE_SPECS=(
     "plex-media-server||always|1"
     "plex-media||always|1"
@@ -373,6 +374,15 @@ finish_observations() {
 ###############################################################################
 maintenance_active() {
     local name="$1" lease expires pid boot active=1 wall_now process_start actual_start owner_alive=false
+    local update_journal="${UPDATE_COORDINATOR_STATE_FILE:-/mnt/vault/cloud/logs/script/system_update_coordinator/state.json}"
+    if [[ -e "$update_journal" ]];then
+      if [[ -L "$update_journal" ]] || ! jq -e '.schema==1 and (.jobs|type)=="object"' "$update_journal" >/dev/null 2>&1;then
+        RECOVERY_BLOCKED["$name"]=1
+        observe monitor:update-journal WARNING 'Update coordinator journal invalid; automatic restart prohibited until its state is verified' 1 || return 2
+      elif jq -e --arg name "$name" 'any(.jobs[];.kind=="docker" and .name==$name and (.status|IN("INTENT","VERIFYING","ATTENTION")))' "$update_journal" >/dev/null;then
+        return 0
+      fi
+    fi
     wall_now="$(date +%s)"
     for lease in "$DOCKER_MAINTENANCE_DIR/$name."*.json; do
         [[ -f "$lease" && ! -L "$lease" ]] || continue
@@ -1056,9 +1066,59 @@ check_job() {
     done
 }
 
+# SERVICE_SPECS are reusable installed-app profiles, not a required container list.
+# A complete Docker inventory is required before retiring an absent app. Daemon
+# errors freeze existing observations and never imply uninstall/recovery.
+retire_inventory_service() {
+    local name="$1" scans
+    mutate --arg name "$name" --argjson now "$NOW" '.inventory //= {} | .inventory[$name]=((.inventory[$name] // {})+{missing:((.inventory[$name].missing // 0)+1),checkedAt:$now})' || return 1
+    scans=$(jq -r --arg name "$name" '.inventory[$name].missing' "$STATE_WORK")
+    FROZEN["$name"]=1
+    ((scans>=2)) || return 0
+    mutate --arg name "$name" --argjson now "$NOW" '
+      if (.inventory[$name].retiredAt // 0)==0 then
+        .inventory[$name].retiredAt=$now |
+        .inventoryOutbox //= {} | .inventoryOutbox[$name]={at:$now,message:("Removed from complete Docker inventory on two observations; monitoring retired. No container recreated; prior alerts closed as retired, not recovered.")} |
+        .observations |= with_entries(if (.key|startswith($name+":")) then .value.active=false|.value.retired=true else . end) |
+        del(.services[$name],.recovery[$name],.jobs[$name],.flapping[$name])
+      else . end' || return 1
+}
+
+readiness_json() {
+    local name="$1" info url='' spec health ready=false source=unverified detail='Application readiness unverified' result=unconfigured
+    valid_service_name "$name" || return 2
+    TMP_DIR=$(mktemp -d /tmp/watchdog-readiness.XXXXXX) || return 1
+    trap cleanup EXIT
+    info=$(docker_cmd inspect "$name" 2>/dev/null) && inspect_valid "$info" || { jq -n --arg name "$name" '{schema:1,name:$name,ready:false,source:"inspection",detail:"Container inspection unavailable"}';return 0; }
+    health=$(jq -r '.[0].State.Health.Status // "none"' <<<"$info")
+    if jq -e '.[0].State.Running==true and .[0].State.OOMKilled==false and .[0].State.Paused==false' <<<"$info" >/dev/null;then
+      if [[ "$health" == healthy ]];then ready=true;source=docker-health;detail='Docker application health is healthy';result=ready
+      elif [[ "$health" == none ]];then
+        for spec in "${SERVICE_SPECS[@]}";do [[ "${spec%%|*}" != "$name" ]] || { IFS='|' read -r _ url _ <<<"$spec";break; };done
+        readiness_probe "$name" "$url" || true
+        result="$PROBE_RESULT";detail="$PROBE_MESSAGE";source=application-probe
+        [[ "$result" != ready ]] || ready=true
+        if [[ "$name" == bazarr && "$ready" == false ]];then
+          if docker_cmd exec bazarr sh -c 'for py in /lsiopy/bin/python3 /app/bazarr/bin/python3 python3;do if "$py" -c "import sys;sys.path[:0]=[\"/app/bazarr/bin/libs\",\"/app/bazarr/libs\"];import yaml" >/dev/null 2>&1;then exec "$py" -c "$1";fi;done;exit 1' _ 'import json, pathlib, urllib.request, sys
+sys.path[:0]=["/app/bazarr/bin/libs","/app/bazarr/libs"]
+import yaml
+p=pathlib.Path("/config/config/config.yaml"); c=yaml.safe_load(p.read_text()); g=c.get("general",{}); key=c.get("auth",{}).get("apikey","")
+assert isinstance(key,str) and key
+base=(g.get("base_url") or "").rstrip("/")
+u="http://127.0.0.1:"+str(g.get("port",6767))+base+"/api/system/status"
+r=urllib.request.urlopen(urllib.request.Request(u,headers={"X-API-KEY":key}),timeout=5)
+d=json.load(r);d=d.get("data",d);assert isinstance(d,dict) and d.get("bazarr_version")
+' >/dev/null 2>&1;then ready=true;source=native-bazarr-api;detail='Bazarr authenticated native system status validated';result=ready;fi
+        fi
+      else detail="Docker health: $health";result="$health";fi
+    else detail='Container stopped, paused or OOM-killed';result=unavailable;fi
+    jq -n --arg name "$name" --arg source "$source" --arg detail "$detail" --arg result "$result" --argjson ready "$ready" '{schema:1,name:$name,ready:$ready,source:$source,classification:$result,detail:$detail}'
+}
+valid_service_name(){ [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; }
+
 resolve_inventory() {
     local names name spec profile url expected allowed alias primary actual info owned
-    local -A present=() classified=()
+    local -A present=() classified=() absence_handled=()
     names="$(docker_cmd container ls -a --format '{{.Names}}')" || return 1
     while IFS= read -r name; do
         [[ -z "$name" ]] && continue
@@ -1075,11 +1135,23 @@ resolve_inventory() {
                 [[ "$primary" != "$profile" || -z "${present[$name]+yes}" ]] || { actual="$name"; break; }
             done
         fi
+        if [[ -z "${present[$actual]+yes}" ]];then
+            # Never-installed defaults are optional profiles. Previously observed
+            # apps retire after confirmation; no permanent missing-app alarm.
+            if jq -e --arg name "$actual" '.services[$name]!=null or .jobs[$name]!=null or .inventory[$name]!=null or any(.observations|keys[];startswith($name+":"))' "$STATE_WORK" >/dev/null;then retire_inventory_service "$actual" || return 1;fi
+            absence_handled["$actual"]=1
+            continue
+        fi
+        mutate --arg name "$actual" --argjson now "$NOW" '.inventory //= {} | .inventory[$name]={missing:0,checkedAt:$now}' || return 1
         classified["$actual"]=1
         PROFILE_BY_NAME["$actual"]="$profile"
         EFFECTIVE_SPECS+=("$actual|$url|$expected|$allowed")
     done
     for name in "${EXTERNAL_SERVICES[@]}" "${DISABLED_SERVICES[@]}"; do classified["$name"]=1; done
+    while read -r name;do
+      [[ -z "${present[$name]+yes}" && -z "${absence_handled[$name]+yes}" ]] || continue
+      retire_inventory_service "$name" || return 1
+    done < <(jq -r '(.inventory // {})|keys[]' "$STATE_WORK")
     [[ "$DISCOVER_UNCLASSIFIED" == true ]] || return 0
     for name in "${!present[@]}"; do
         [[ -z "${classified[$name]+yes}" ]] || continue
@@ -1088,7 +1160,8 @@ resolve_inventory() {
         info="$(docker_cmd inspect "$name")" || return 1
         owned="$(jq -r '.[0].Config.Labels["com.ray-cys.watchdog.owner"] // ""' <<<"$info")" || return 1
         [[ "$owned" != external && "$owned" != disabled ]] || continue
-        observe "$name:unclassified" WARNING "Discovered container has no policy; add SERVICE_SPECS or explicitly delegate/disable monitoring" || return 1
+        mutate --arg name "$name" --argjson now "$NOW" '.inventory //= {} | .inventory[$name]={missing:0,checkedAt:$now}' || return 1
+        observe "$name:unclassified" WARNING "Discovered container has no application-specific policy; availability remains visible; no restart permission granted" || return 1
     done
 }
 
@@ -1628,21 +1701,26 @@ notify_changes() {
             (($state.flapping[(.key | split(":")[0])].unstable // false | not) and
              ($state.observations["monitor:shared-dependency"].active // false | not)))) | map_values(.severity)' "$STATE_WORK")" || return 1
     previous="$(jq -cS --argjson delegate "$delegate" '.notification.issues | with_entries(select(($delegate and (.key|test("^(kometa|lometa):job-(errors|warnings)$")))|not))' "$STATE_WORK")" || return 1
-    if [[ "$current" == "$previous" ]]; then mutate --argjson current "$current" '.notification.issues=$current'; return $?; fi
+    local retired_pending
+    retired_pending=$(jq -r '(.inventoryOutbox // {})|length' "$STATE_WORK")
+    if [[ "$current" == "$previous" && "$retired_pending" == 0 ]]; then mutate --argjson current "$current" '.notification.issues=$current'; return $?; fi
     description="Docker watchdog UPDATED"
-    [[ "$current" != '{}' ]] || description="Docker watchdog RESOLVED"
+    [[ "$current" != '{}' ]] || description="Docker watchdog findings cleared"
+    ((retired_pending==0)) || description='Docker monitoring inventory updated'
     if jq -e 'any(.[]; . == "CRITICAL")' <<<"$current" >/dev/null; then importance=alert
     elif [[ "$current" != '{}' ]]; then importance=warning; fi
     body="$(jq -r --argjson now "$NOW" --argjson current "$current" '.observations | to_entries[] | .key as $key | select($current|has($key)) |
         "[\(.value.severity)] \(.key)\n  Condition: \(.value.message)\n  Observed duration: \(($now - .value.first) / 60 | floor)m; consecutive failures: \(.value.bad)"' "$STATE_WORK")"
-    body+=$'\n'"$(jq -nr --argjson current "$current" --argjson previous "$previous" \
-        '($previous | keys) - ($current | keys) | .[] | "Resolved: " + .')"
+    body+=$'\n'"$(jq -r --argjson current "$current" --argjson previous "$previous" '
+        (.inventory // {}) as $inventory | ($previous|keys)-($current|keys)|.[]|. as $key|
+        if ($inventory[($key|split(":")[0])].retiredAt // 0)>0 then "Retired alert: "+$key else "Resolved: "+$key end' "$STATE_WORK")"
+    body+=$'\n'"$(jq -r '(.inventoryOutbox // {})|to_entries[]|"Retired monitoring: "+.key+"; "+.value.message' "$STATE_WORK")"
     body+=$'\n'"State: $STATE_FILE; log: $LOG_FILE"
     if [[ ! -x "$NOTIFY_BIN" ]] || ! usr_ops_notify timeout 30 "$NOTIFY_BIN" -i "$importance" -s "Docker Service Watchdog" -d "$description" -m "$body"; then
         log ERROR "Notification failed; delivery checkpoint unchanged"
         return 1
     fi
-    mutate --argjson current "$current" '.notification.issues=$current'
+    mutate --argjson current "$current" '.notification.issues=$current | .inventoryOutbox={}'
 }
 
 write_receipt() {
@@ -1655,13 +1733,13 @@ write_receipt() {
 }
 
 main() {
-    case "${1:-}" in --diagnose|--diagnose-vpn|--version|--help|-h|--maintenance) ;;
+    case "${1:-}" in --readiness|--diagnose|--diagnose-vpn|--version|--help|-h|--maintenance) ;;
         *) exec {STATE_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
            if ! flock -s -n "$STATE_EXPORT_FD"; then printf 'State export active; watchdog invocation deferred.\n'; return 0; fi;;
     esac
     local spec name url expected allowed uptime status=OK failed=false command
     case "${1:-}" in
-        --help|-h) printf '%s\n' 'Usage: bash docker_service_watchdog.sh [--version|--diagnose-vpn|--diagnose CONTAINER [URL]|--maintenance CONTAINER MINUTES REASON|--record-job PROFILE EXIT_CODE [START_EPOCH]]'
+        --help|-h) printf '%s\n' 'Usage: bash docker_service_watchdog.sh [--readiness CONTAINER|--version|--diagnose-vpn|--diagnose CONTAINER [URL]|--maintenance CONTAINER MINUTES REASON|--record-job PROFILE EXIT_CODE [START_EPOCH]]'
             printf '%s\n' 'Schedule every five minutes. Recovery requires global AND per-service permission.' \
                 'Maintenance suppresses availability checks/restarts, freezes active findings, and expires within 24h.' \
                 'Remove /run/docker-service-maintenance/CONTAINER.manual.json to end a manual lease early.' \
@@ -1669,6 +1747,7 @@ main() {
                 'Internal schedulers need native status, timestamped whole-run evidence, or producer receipts.' \
                 'Run docker_watchdog_liveness.sh independently every five minutes to monitor this script.' \
                 '--diagnose-vpn prints read-only binding, exit-node, DNS and egress evidence; no state or notifications.'; return 0 ;;
+        --readiness) [[ $# == 2 ]] || return 2;readiness_json "$2";return $?;;
         --version) printf 'docker_service_watchdog.sh %s\n' "$SCRIPT_VERSION"; return 0 ;;
         --diagnose-vpn) [[ $# == 1 ]] || return 2; diagnose_vpn; return $? ;;
         --diagnose) [[ $# == 2 || $# == 3 ]] || return 2; diagnose_service "$2" "${3:-}"; return $? ;;

@@ -2,7 +2,7 @@
 clearLog=true
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.22.0
+# ARR Health / Download / Import Monitor v3.22.1
 #
 # PURPOSE
 # -------
@@ -6992,7 +6992,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'Media Health Monitor v3.22.0 lifecycle commands' \
+        'Media Health Monitor v3.22.1 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -16873,7 +16873,7 @@ if [[ $# == 0 ]]; then
     fi
     if [[ "$arr_backup_deferred" == true ]]; then
         printf '%s\n' "$START_TIME" >"$ARR_BACKUP_DEFERRED_AT"
-        log "MAINTENANCE: Arr scan deferred for appdata backup/startup grace; existing issues preserved; no API calls or recovery actions"
+        log "MAINTENANCE: Arr scan deferred for scheduled application maintenance/startup grace; existing issues preserved; no API calls or recovery actions"
         exit 0
     fi
 fi
@@ -17012,7 +17012,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | Media Health Monitor v3.22.0"
+    "START | Media Health Monitor v3.22.1"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -17025,7 +17025,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting Media Health Monitor v3.22.0"
+debug_log "Starting Media Health Monitor v3.22.1"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -17657,7 +17657,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "Media Health Monitor v3.22.0 completed"
+log "Media Health Monitor v3.22.1 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""

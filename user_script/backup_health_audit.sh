@@ -2,7 +2,7 @@
 # shellcheck disable=SC2034
 clearLog=true
 arrayStarted=true
-# Backup freshness, delivery and runtime-compatibility audit v1.7.
+# Backup freshness, delivery and runtime-compatibility audit v1.8.
 # Schedule: 20 * * * *. Reads local receipts/manifests only: no WOL, remote
 # connection, media hashing, container actions or cleanup. One lifecycle email
 # for changed findings, recovery, or a 24-hour reminder. Failed delivery retries.
@@ -56,7 +56,7 @@ usr_ops_append_log() {
 }
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
-readonly SCRIPT_VERSION="1.7"
+readonly SCRIPT_VERSION="1.8"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/backup_health_audit}"
 APPDATA_ROOT="${APPDATA_ROOT:-/mnt/vault/backup/cache}"
@@ -121,6 +121,22 @@ audit_media_coordination() {
     if jq -e '(.stalledCompletedRuns // 0)>=3' "$receipt" >/dev/null 2>&1;then finding 'Media integrity audit: three completed scans made no measurable coverage progress; review resource holds and scan budget';fi
 }
 
+audit_update_coordinator() {
+    local state="${UPDATE_COORDINATOR_STATE_FILE:-/mnt/vault/cloud/logs/script/system_update_coordinator/state.json}" epoch installed
+    if ! jq -e '.schema==1 and (.jobs|type)=="object" and (.installedAt|type)=="number"' "$state" >/dev/null 2>&1;then
+      finding 'System update coordinator: valid journal missing; automatic-update supervision unavailable';return
+    fi
+    epoch=$(jq -r '.lastAutomaticRunAt // 0' "$state");installed=$(jq -r .installedAt "$state")
+    if ((epoch>0));then check_age 'System update coordinator scheduled run' "$epoch" 10800
+    elif ((NOW>installed+10800));then finding 'System update coordinator: first automatic run overdue; CLI inspection does not count as scheduled execution';fi
+    if jq -e 'any(.jobs[];.status=="INTENT" or .status=="ATTENTION")' "$state" >/dev/null;then
+      finding 'System update coordinator: unresolved installation outcome; further updates and affected watchdog recovery held for review'
+    fi
+    if jq -e '(.outbox|length)>0' "$state" >/dev/null;then
+      finding 'System update coordinator: action report pending delivery; exact evidence remains queued'
+    fi
+}
+
 audit_runtime() {
     local command version major missing=false
     for command in bash curl jq flock timeout rsync tar unzip sha256sum find sort stat df realpath docker smartctl findmnt mountpoint; do
@@ -146,7 +162,7 @@ audit_runtime() {
         mountpoint -q "$path" || { finding "Compatibility: required filesystem is not mounted: $path"; missing=true; }
     done
     cron=$(timeout 8 crontab -c /etc/cron.d -l 2>/dev/null) || { cron=""; finding 'Compatibility: active Unraid cron inventory unavailable'; missing=true; }
-    for path in backup_cache_appdata backup_boot_disk backup_media_remote backup_vault_remote media_health_monitor media_cleanup docker_service_watchdog dns_redundancy_watchdog ram_logs_watchdog media_torrent_management backup_health_audit media_metadata_audit media_integrity_audit; do
+    for path in backup_cache_appdata backup_boot_disk backup_media_remote backup_vault_remote media_health_monitor media_cleanup docker_service_watchdog dns_redundancy_watchdog ram_logs_watchdog media_torrent_management backup_health_audit media_metadata_audit media_integrity_audit system_update_coordinator; do
         if [[ ! -f "/boot/config/plugins/user.scripts/scripts/$path/script" ]] ||
            ! grep -Fq "/scripts/$path/script" <<<"$cron"; then
             finding "Scheduling: required User Script missing or not scheduled: $path"; missing=true
@@ -236,7 +252,7 @@ main() {
     exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
     flock -s -n "$export_fd" || return 0
     local previous='' last=0 fingerprint temp status=OK importance=normal body
-    audit_runtime; audit_backups; audit_recovery_inventory; audit_disk_health_monitor; audit_media_integrity_monitor; audit_media_coordination
+    audit_runtime; audit_backups; audit_recovery_inventory; audit_disk_health_monitor; audit_media_integrity_monitor; audit_media_coordination; audit_update_coordinator
     fingerprint=$(printf '%s\n' "${FINDINGS[@]}" | sort | sha256sum | awk '{print $1}')
     if [[ -f "$STATE_DIR/state.json" ]]; then
         jq -e '.fingerprint|type=="string"' "$STATE_DIR/state.json" >/dev/null || { printf 'Invalid audit state preserved.\n' >&2; return 1; }

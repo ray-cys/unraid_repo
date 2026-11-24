@@ -106,7 +106,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.18"
+readonly SCRIPT_VERSION="1.19"
 
 ###############################################################################
 # CONFIGURATION
@@ -181,6 +181,8 @@ OPERATIONS_REQUIRED_STATE_FILES=(
     media_cleanup/quarantine/pending-operations.json
     media_cleanup/notification-outbox.json
     docker_service_watchdog/state.json
+    system_update_coordinator/state.json
+    system_update_coordinator/policy.json
     dns_redundancy_watchdog/state.json
 )
 RESTORE_DRILL_RESULT="not_due"
@@ -1033,6 +1035,7 @@ vault_export_operations_state() {
         "media_cleanup/sab/purge-receipts|$scripts/media_cleanup/sab/purge-receipts"
         "media_cleanup/quarantine/purge-receipts|$scripts/media_cleanup/quarantine/purge-receipts"
         "docker_service_watchdog|$scripts/docker_service_watchdog"
+        "system_update_coordinator|$scripts/system_update_coordinator"
         "dns_redundancy_watchdog|$scripts/dns_redundancy_watchdog"
         "media_plex_dbrepair|$scripts/media_plex_dbrepair"
         "media_metadata_audit|$scripts/media_metadata_audit"
@@ -1078,6 +1081,7 @@ vault_export_operations_state() {
                     [[ "$name" == media_cleanup/*/purge-receipts || "$base" == action-receipts.jsonl || "$base" == pending-notifications.jsonl || "$base" == operation-recovery.jsonl || "$base" == quarantine-index.tsv || "$base" == transfer-manifest.tsv ]] || continue;;
                 notification-outbox.json|latest-run.json)
                     [[ "$name" == media_cleanup || "$name" == media_cleanup/quarantine ]] || continue;;
+                policy.json) [[ "$name" == system_update_coordinator ]] || continue;;
                 state.json|notification-state.json|import-receipts.json|automation-actions.json|policy-actions.json|sonarr-state.json|radarr-state.json|pending-actions.json|pending-operations.json|action-receipts.jsonl|pending-notifications.jsonl|operation-recovery.jsonl|quarantine-index.tsv|transfer-manifest.tsv) ;;
                 *) continue;;
             esac
