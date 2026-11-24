@@ -64,7 +64,7 @@ historical action label. Paused parity with zero activity is not active parity I
 The audit never holds backup coordination for its entire scan. Checkpoint commits
 briefly share the operational-state export lock. Appdata backup may stop Bazarr;
 then the last confirmed checkpoint remains and the unfinished range is retried.
-No backup, Docker restart or media replacement is triggered by this script.
+No backup or Docker restart is triggered. Optional Arr recovery is installed but disabled. Its short executor uses the existing backup/metadata gates and audit lock; the long decoder scan never holds the appdata gate.
 
 Backup Health Audit checks the new schedule, overdue weekly completions and failed
 notification delivery, without repeating individual media errors. The ISS vault
@@ -82,23 +82,27 @@ schedules instead of being repeatedly decoded in the same run.
 Two clean unchanged-file rechecks can close a previous failing probe/range. A file
 version change preserves its old finding until the replacement completes its
 planned ranges. Confirmed absence from a complete inventory closes the finding
-as removed, not repaired. No state-driven operation deletes, moves, renames,
-changes permissions on, repairs, quarantines or re-downloads any media.
+as removed, not repaired. With `AUTO_RECOVERY_ENABLED=false`, no operation deletes, moves, renames, changes permissions on, quarantines or re-downloads media. No environment variable or CLI flag overrides that switch.
 
 ## Reports and maintenance
 
-One grouped weekly scan summary contains actual actions/counts, file names,
-positions, diagnostic excerpts, recoveries, partial coverage and deferred work.
-A healthy scheduled run also reports progress; no per-file emails are sent.
-Delivery failure retains a single outbox. Active findings and 30-day recoveries
-feed the next summary. Unchanged reruns within 24 hours are suppressed after a
-successful notification. Email is bounded to 24 KB and representative entries;
-all exact findings remain in compressed state.
+Every invocation updates the local report and receipt. Healthy checks, normal
+resumable backlog/maintenance deferrals and successful recoveries are silent.
+Active media findings, unexpected worker/storage failures, checkpoint fallback and
+incomplete/uncertain/overdue recovery produce one grouped attention email with
+file names, IDs, actions, preserved paths and evidence. Progress alone never
+changes an incident signature. The same unresolved evidence reminds at most once
+per week; new/changed issues can notify sooner. No per-file emails are sent.
+Delivery failure retains one pending outbox and retries while still relevant; a
+stale report is cleared locally if the condition is now healthy. Email is bounded
+to 24 KB and representative entries; exact findings remain in state. No success
+email is sent simply because an old issue was resolved.
 
 `/mnt/vault/cloud/logs/script/media_integrity_audit` owns:
 
 - `state.json.gz`: current queue, identities, progress, findings and 12 run summaries.
 - `state.previous.json.gz`: previous validated checkpoint, retained once per run.
+- `recovery.json`: durable Arr intents, exact target IDs, preserved-original ownership and deletion-sync holds. Required backup material, unlike the optional rolling decode queue. Never delete it to clear an unresolved hold.
 - `latest-report.txt`: overwritten readable summary, bounded like the email.
 - `pending-notification.json` and `notified.json`: delivery retry/deduplication.
 - `media-integrity-audit.log`: 1 MiB with two backups; backups expire after 30 days.
@@ -128,3 +132,94 @@ gzip -dc /mnt/vault/cloud/logs/script/media_integrity_audit/state.json.gz |
 ```
 
 Do not delete state to hide findings or claim previously unchecked media healthy.
+
+## Disabled automatic recovery and later activation
+
+The installed version keeps `AUTO_RECOVERY_ENABLED=false`. Leave it off for
+several weekly cycles. Review whether errors repeat on the same unchanged file,
+which codecs are involved, how quickly coverage progresses, and whether any tool,
+resource or permission errors are being confused with media damage. There is no
+need to increase scan scope or install another package during observation.
+
+After a separate decision to enable it, change that one switch in the User Script
+(and GitHub together). Credentials and API roots are configured in the existing
+script; the Arr monitor also passes its discovered roots/keys to the bounded
+executor without placing keys in its command arguments or recovery journal.
+Current supported contracts are Sonarr v5 (or compatible v3) and Radarr v3. The live read-only API schemas, Bazarr UID and preservation/no-overwrite behavior were verified with temporary files outside library folders; no live recovery was enabled or existing media changed.
+Application/API incompatibility stops recovery rather than selecting a speculative
+endpoint or replaying a mutation.
+
+An eligible file must have a repeatable `decode_error` on **two separate audit
+runs**, unchanged five-part identity, current-version findings at most 48 hours
+old, and the same decoder runtime. Permission/read/resource/timeout failures and
+unsupported codecs do not qualify. Upgrading the decoder resets confirmation
+counts. Movies and series require exact Arr path/file ownership and monitored
+native IDs. A multi-episode Sonarr file must map all its monitored episode IDs;
+Formula1/unmanaged/ambiguous/unmonitored media remains review-only.
+
+The existing Arr monitor invokes `--recover-only` within the first ten minutes
+of 00:00, 04:00, 08:00, 12:00, 16:00 and 20:00 Singapore time. This preserves the
+weekly scan schedule and four-hour action windows. While the switch is off the
+executor returns before any API, Docker, media or state mutation. Normal read-only
+follow-up can also run during the next weekly scan when enabled.
+
+For each recovery, the script:
+
+1. Checks mounts, current backups/Mover/parity/Plex workload, native health,
+   commands and queues. Unknown ownership or incomplete queue pagination blocks
+   action. Takes the existing backup and metadata mutation locks briefly.
+2. Records a durable plan and preserves the exact original using Linux
+   `renameat2(RENAME_NOREPLACE)`, with a same-filesystem no-overwrite hard-link/unlink fallback for Unraid shfs, under
+   `/mnt/user/media/integrity_quarantine/ACTION_ID/ORIGINAL_FILENAME`.
+   Cross-filesystem/unsupported/failed preservation stops; interruption with both names preserves both for review; a completed move can be resumed using exact identity without moving again; there is no bulk-copy fallback,
+   overwriting or automatic purge. A changed identity prevents further mutation.
+3. Records deletion intent, removes only the exact obsolete Arr **file record**
+   and requires a 404 read-back. The original is already preserved. Title, profile, blocklist and global monitoring settings remain unchanged.
+   Both live Arr applications have native unmonitor-on-delete enabled. Only
+   targets proven monitored before this recovery may have that prior state
+   restored, within 120 seconds of this script's own deletion, after confirming
+   the native setting and exact missing IDs. Sonarr's series must remain monitored.
+   Monitoring PUT intent/read-back is journaled; an uncertain/user-later change
+   stops for review and is never blindly overwritten.
+4. Confirms the exact target is still monitored and missing, persists search
+   intent, sends one `EpisodeSearch`/`MoviesSearch`, and reads back its exact
+   command identity/target IDs. A lost response is never blindly retried.
+5. Holds deletion-sync until new exact Arr file IDs, import dates and paths match
+   a later **complete planned-range decode cycle**. Replacement paths receive
+   priority within the audit's new-work lane. Search completion or a new filename
+   alone does not count as recovered. The damaged original remains retained.
+
+The executor has a three-minute budget, examines at most four candidates per pass, and reserves the final three minutes of each action window for in-flight work. New preservation also requires free media space for the current file size plus 10 GiB. Capacity is a conservative share-level estimate, not a guarantee about every disk/download client.
+
+Limits: one new recovery per pass, three per rolling seven days, and one attempt
+per exact parent/target set per 30 days. An unsuccessful command, uncertain
+request, changed monitoring or a 28-day verification deadline requires review.
+Unresolved holds never expire silently. Review actions can close automatically through read-only follow-up once the exact current/restored file passes a later complete audit; no mutation is retried to obtain that result. Sonarr holds only its affected series;
+Radarr delete-sync and generic missing searches conservatively defer the affected
+application while a hold exists. Existing Arr queue/import monitoring continues.
+No automatic blocklisting is inferred from a local decoder error: the release
+might be sound and the local file might have suffered storage damage.
+
+```bash
+script=/boot/config/plugins/user.scripts/scripts/media_integrity_audit/script
+/bin/bash "$script" --recovery-status
+/bin/bash "$script" --recover-only  # harmless disabled result while switch is false
+```
+
+Review/uncertain actions list the original/quarantine paths, Arr IDs and reason in
+`--recovery-status`, the local report and attention notifications. For manual
+recovery, inspect source and preserved copies first; never overwrite a returned
+file. A restored original needs an Arr rescan/import and audit verification. Do
+not remove the journal/hold to claim success. There is deliberately no automatic
+rollback that might overwrite a newly imported replacement.
+
+Further tuning should follow several real runs: choose the runtime/segment size
+from observed coverage and timeout rates, review codec-specific false positives,
+and only then consider retention for **verified** recovery originals. Current
+preserved originals are pinned, so inspect their total space before enabling
+recovery at scale.
+
+Implementation references: [Sonarr file-delete controller](https://github.com/Sonarr/Sonarr/blob/develop/src/Sonarr.Api.V5/EpisodeFiles/EpisodeFileController.cs),
+[Sonarr monitoring lifecycle](https://github.com/Sonarr/Sonarr/blob/develop/src/NzbDrone.Core/Tv/EpisodeService.cs),
+[Radarr file-delete controller](https://github.com/Radarr/Radarr/blob/develop/src/Radarr.Api.V3/MovieFiles/MovieFileController.cs), and
+[Radarr monitoring lifecycle](https://github.com/Radarr/Radarr/blob/develop/src/NzbDrone.Core/Movies/MovieService.cs).

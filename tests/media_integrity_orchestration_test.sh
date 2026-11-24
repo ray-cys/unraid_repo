@@ -42,7 +42,7 @@ if [[ "${MEDIA_TEST_MAINTENANCE:-0}" == 1 ]]; then
  jq -e '.status=="DEFERRED" and .lastCompletedScanAt==0 and (.body|contains("maintenance"))' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
  printf 'Container interruption during planned maintenance is deferred, not a corruption/script-failure alert\n'
 else
- jq -e '.status=="OK" and .lastCompletedScanAt>0 and .notification=="sent"' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
+ jq -e '.status=="OK" and .lastCompletedScanAt>0 and .notification=="suppressed"' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
  [[ -f "$STATE_FILE" && ! -e "$STATE_DIR/pending-notification.json" ]]
- printf 'Whole host launch, streaming checkpoint, worker exit, final receipt and fake notification passed\n'
+ printf 'Whole host launch, streaming checkpoint, worker exit, final receipt and quiet healthy completion passed\n'
 fi

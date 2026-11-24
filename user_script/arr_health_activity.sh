@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.16.0
+# ARR Health / Download / Import Monitor v3.17.0
 #
 # PURPOSE
 # -------
@@ -6706,7 +6706,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.16.0 lifecycle commands' \
+        'ARR Health Monitor v3.17.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -15644,12 +15644,42 @@ automation_fetch_missing() {
     jq -e '.records|type=="array"' "$output" >/dev/null
 }
 
+# Media integrity recovery owns this hold until a replacement passes full
+# planned-range verification. Review/uncertain states never expire silently.
+media_recovery_app_held() {
+    local app="$1" parent="${2:-0}" file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}" rc=0
+    [[ -e "$file" || -L "$file" ]] || return 1
+    [[ ! -L "$file" ]] || return 0
+    jq -e --arg app "$app" --argjson parent "$parent" '
+      if .schema!=1 or (.actions|type)!="object" then true
+      elif any(.actions[]; (.app!="Sonarr" and .app!="Radarr") or (.parentId|type)!="number" or .parentId<=0 or
+        (.status as $s | ["prepared","moved","delete_intent","deleted","monitor_intent","search_intent","search_submitted","replacement_detected","verified","review"]|index($s))==null) then true
+      else any(.actions[]; .app==$app and ($parent==0 or .parentId==$parent) and .status!="verified") end' "$file" >/dev/null 2>&1 || rc=$?
+    # jq false is 1; parse/I/O failure protects rather than permitting deletion.
+    ((rc!=1))
+}
+
+process_media_integrity_recovery() {
+    local script="${MEDIA_INTEGRITY_SCRIPT:-/boot/config/plugins/user.scripts/scripts/media_integrity_audit/script}" rc=0
+    [[ "$ARR_AUTOMATION_ENABLED" == true && "$AUTOMATION_CONTROLS_OK" == true ]] && automation_window_open && automation_api_ready || return 0
+    [[ -f "$script" && ! -L "$script" ]] || return 0
+    (
+        export SONARR_API_ROOT SONARR_API_KEY RADARR_API_ROOT RADARR_API_KEY
+        timeout --signal=TERM --kill-after=15 240 /bin/bash "$script" --recover-only
+    ) >"$TMP_DIR/media-integrity-recovery.log" 2>&1 || rc=$?
+    if ((rc==124 || rc==137)); then
+        record_normalized_issue 'Monitor:media-integrity-recovery-timeout' Monitor 'Media recovery executor interrupted' MEDIA_RECOVERY_EXECUTOR_FAILED ERROR executor \
+          'Bounded media recovery executor exceeded its runtime' 0 'Inspect media_integrity_audit --recovery-status. Durable intents/originals remain protected; no automatic replay or success is inferred.'
+    elif ((rc!=0)); then log "WARNING: Media integrity recovery stopped safely (exit $rc); its own grouped report/journal owns the details";fi
+}
+
 automation_missing_searches() {
     automation_window_open || return 0
     local app root key wanted="$TMP_DIR/automation-wanted.json" baseline window surveyed cursor count selected="$TMP_DIR/automation-selected.json"
     local item target parent kind candidate="$TMP_DIR/automation-missing-candidate.json" hash previous survey_error
     window=$(TZ="$AUTOMATION_TIMEZONE" date -d "@$START_TIME" +%Y%m%d%H)
     for app in Sonarr Radarr; do
+        if media_recovery_app_held "$app"; then debug_log "Missing search deferred for $app: media integrity recovery owns an unresolved hold";continue;fi
         surveyed=$(jq -r --arg app "$app" '.missing[$app].surveyedAt // 0' "$AUTOMATION_STATE_FILE")
         previous=$(jq -r --arg app "$app" '.missing[$app].window // ""' "$AUTOMATION_STATE_FILE")
         survey_error=$(jq -r --arg app "$app" '.missing[$app].surveyError // ""' "$AUTOMATION_STATE_FILE")
@@ -16481,7 +16511,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.16.0"
+    "START | ARR Health Monitor v3.17.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -16494,7 +16524,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.16.0"
+debug_log "Starting ARR Health Monitor v3.17.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -16834,6 +16864,7 @@ fi
 
 if runtime_budget_allows_optional_phase "arr-automation"; then
     start_monitor_phase "arr-automation"
+    process_media_integrity_recovery || log 'WARNING: Media integrity recovery executor unavailable'
     process_arr_automation || log 'WARNING: Arr automation deferred or awaits verification'
     end_monitor_phase "arr-automation"
 fi
@@ -17114,7 +17145,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.16.0 completed"
+log "ARR Health Monitor v3.17.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""

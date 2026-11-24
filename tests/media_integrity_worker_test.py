@@ -51,6 +51,19 @@ with tempfile.TemporaryDirectory() as folder:
     broken=execute(state);issue=broken.state['files']['movies/Example.mkv']['issue']
     assert issue['confirmed'] and issue['kind']=='decode_error' and calls==2
     assert broken.state['files']['movies/Example.mkv']['offset']==0
+    assert issue['confirmedRuns']==1
+    # Same-invocation decoder repeats are not independent weekly observations.
+    again=m.Audit(cfg,copy.deepcopy(broken.state));again.runEpoch=issue['lastConfirmedRunAt']
+    e=again.state['files']['movies/Example.mkv']
+    again.issue('movies/Example.mkv',e,'decode_error','fixture',confirmed=True)
+    assert e['issue']['confirmedRuns']==1
+    again.runEpoch+=60
+    again.issue('movies/Example.mkv',e,'decode_error','fixture',confirmed=True)
+    assert e['issue']['confirmedRuns']==2
+    upgraded=dict(cfg,toolset='different decoder runtime')
+    reset=m.Audit(upgraded,copy.deepcopy(broken.state))
+    assert not reset.state['files']['movies/Example.mkv']['issue']['confirmed']
+    assert reset.state['files']['movies/Example.mkv']['issue']['confirmedRuns']==0
     fail=False;timeout=True;slow=execute(state);entry=slow.state['files']['movies/Example.mkv']
     assert not entry['issue']['confirmed'] and entry['issue']['kind']=='unverified_timeout' and entry['offset']==0
     timeout=False

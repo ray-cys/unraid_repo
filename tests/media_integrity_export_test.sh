@@ -32,3 +32,15 @@ OPERATIONS_STATE_MAX_BYTES=$((2+queue_bytes+notify_bytes+1))
 vault_export_operations_state
 [[ ! -d "$OPERATIONS_STATE_ROOT/media_integrity_audit" && -f "$OPERATIONS_STATE_ROOT/arr_health_activity/state.json" ]]
 printf 'Optional compressed queue exports safely; previous snapshots/logs excluded; invalid queue does not block data-backup state export\n'
+
+# Recovery intents/holds are required; evict optional queue bytes first.
+printf '{"schema":1,"actions":{}}' >"$OPERATIONS_SCRIPT_ROOT/media_integrity_audit/recovery.json"
+recovery_bytes=$(stat -c %s "$OPERATIONS_SCRIPT_ROOT/media_integrity_audit/recovery.json")
+OPERATIONS_STATE_MAX_BYTES=$((2+recovery_bytes+2+1))
+vault_export_operations_state
+[[ -f "$OPERATIONS_STATE_ROOT/media_integrity_audit/recovery.json" && ! -e "$OPERATIONS_STATE_ROOT/media_integrity_audit/state.json.gz" ]]
+jq -e '.schema==1' "$OPERATIONS_STATE_ROOT/media_integrity_audit/recovery.json" >/dev/null
+printf invalid >"$OPERATIONS_SCRIPT_ROOT/media_integrity_audit/recovery.json"
+if vault_export_operations_state; then echo 'Invalid recovery journal exported' >&2;exit 1;fi
+jq -e '.schema==1' "$OPERATIONS_STATE_ROOT/media_integrity_audit/recovery.json" >/dev/null
+printf 'Required recovery journal survives optional-queue budget eviction; invalid journal preserves previous export\n'

@@ -57,7 +57,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.12"
+readonly SCRIPT_VERSION="1.13"
 
 ###############################################################################
 # CONFIGURATION
@@ -907,6 +907,11 @@ vault_export_operations_state() {
             base=${file##*/}
             # Explicit current files, never dated backup snapshots or generic logs.
             case "$base" in
+                recovery.json)
+                    [[ "$name" == media_integrity_audit ]] || continue
+                    # Recovery intents/holds are required control-plane material,
+                    # unlike the optional bulk read-only verification queue.
+                    jq -e '.schema==1 and (.actions|type)=="object"' "$file" >/dev/null || { log ERROR 'Media recovery journal invalid; control-plane export stopped';exec {fd}>&-;return 1; };;
                 state.json.gz|notified.json|pending-notification.json)
                     [[ "$name" == media_integrity_audit ]] || continue
                     # Read-only audit progress is optional recovery material.
@@ -918,11 +923,16 @@ vault_export_operations_state() {
                 *) continue;;
             esac
             size=$(stat -c %s "$file") || { exec {fd}>&-; return 1; }
-            if [[ "$name" == media_integrity_audit ]] && (( total+size>OPERATIONS_STATE_MAX_BYTES )); then
+            if [[ "$name" == media_integrity_audit && "$base" != recovery.json ]] && (( total+size>OPERATIONS_STATE_MAX_BYTES )); then
                 log WARNING 'Optional media integrity queue exceeds export budget; omitted without blocking data backup';continue
             fi
             total=$((total+size))
-            [[ "$name" != media_integrity_audit ]] || optional_media_bytes=$((optional_media_bytes+size))
+            [[ "$name" != media_integrity_audit || "$base" == recovery.json ]] || optional_media_bytes=$((optional_media_bytes+size))
+            if [[ "$name" == media_integrity_audit && "$base" == recovery.json ]] && ((total>OPERATIONS_STATE_MAX_BYTES && optional_media_bytes>0)); then
+                rm -f -- "$temp/media_integrity_audit/state.json.gz" "$temp/media_integrity_audit/notified.json" "$temp/media_integrity_audit/pending-notification.json"
+                total=$((total-optional_media_bytes));optional_media_bytes=0
+                log WARNING 'Optional integrity progress omitted to retain required media recovery journal'
+            fi
             (( total<=OPERATIONS_STATE_MAX_BYTES )) || { exec {fd}>&-; log ERROR 'Operational state exceeds export budget; previous snapshot retained'; return 1; }
             [[ "$base" != *.json ]] || jq -e . "$file" >/dev/null || { exec {fd}>&-; return 1; }
             cp -p -- "$file" "$temp/$name/$base" || { exec {fd}>&-; return 1; }
@@ -967,7 +977,8 @@ RESTORE
         recovery_bytes=$((recovery_bytes+size))
     done < <(find "$temp/recovery" -type f -print0)
     if (( total+recovery_bytes>OPERATIONS_STATE_MAX_BYTES && optional_media_bytes>0 )); then
-        rm -rf -- "$temp/media_integrity_audit"
+        rm -f -- "$temp/media_integrity_audit/state.json.gz" "$temp/media_integrity_audit/notified.json" "$temp/media_integrity_audit/pending-notification.json"
+        rmdir -- "$temp/media_integrity_audit" 2>/dev/null || true
         total=$((total-optional_media_bytes))
         log WARNING 'Optional media integrity queue omitted to preserve recovery-bundle export capacity'
     fi

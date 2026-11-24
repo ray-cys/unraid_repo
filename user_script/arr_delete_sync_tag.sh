@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 ###############################################################################
-# Sonarr + Radarr - Plex Delete Sync and Tagger v2.6.0
+# Sonarr + Radarr - Plex Delete Sync and Tagger v2.7.0
 #
 # PURPOSE / PERSONAL USE CASE
 # ---------------------------
@@ -115,7 +115,7 @@ umask 077
 # Release version for logs, notifications, and the HTTP User-Agent. State-file
 # version fields below are independent schema versions and must not be changed
 # merely when this release version changes.
-readonly SCRIPT_VERSION="2.6.0"
+readonly SCRIPT_VERSION="2.7.0"
 
 ###############################################################################
 # CONFIGURATION
@@ -691,6 +691,21 @@ mark_notification_batch_delivered() {
 
 # Select only this run's failures; API helpers run in subshells, so read the
 # durable log rather than relying on an in-memory last-error variable.
+# Media integrity recovery owns this hold until a replacement passes full
+# planned-range verification. Review/uncertain states never expire silently.
+media_recovery_app_held() {
+    local app="$1" parent="${2:-0}" file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}" rc=0
+    [[ -e "$file" || -L "$file" ]] || return 1
+    [[ ! -L "$file" ]] || return 0
+    jq -e --arg app "$app" --argjson parent "$parent" '
+      if .schema!=1 or (.actions|type)!="object" then true
+      elif any(.actions[]; (.app!="Sonarr" and .app!="Radarr") or (.parentId|type)!="number" or .parentId<=0 or
+        (.status as $s | ["prepared","moved","delete_intent","deleted","monitor_intent","search_intent","search_submitted","replacement_detected","verified","review"]|index($s))==null) then true
+      else any(.actions[]; .app==$app and ($parent==0 or .parentId==$parent) and .status!="verified") end' "$file" >/dev/null 2>&1 || rc=$?
+    # jq false is 1; parse/I/O failure protects rather than permitting deletion.
+    ((rc!=1))
+}
+
 current_workflow_error_details() {
     awk -F ' \| ' -v run="run=$RUN_ID" '
       index($0,run) && $2=="ERROR" {reasons[++n]=$5 ": " $6}
@@ -3353,6 +3368,7 @@ fi
 # candidate. No episode-file lookups, refresh commands, or same-run waits occur.
 while IFS= read -r SERIES_ID; do
     [[ -n "$SERIES_ID" ]] || continue
+    if media_recovery_app_held Sonarr "$SERIES_ID"; then log INFO "Series $SERIES_ID deletion/retirement deferred: integrity recovery holds its exact media; state preserved";continue;fi
     SERIES_ITEM="$(jq -c --argjson id "$SERIES_ID" '.[] | select(.id == $id)' <<< "$SERIES")"
     SERIES_TITLE="$(jq -r '.title // empty' <<< "$SERIES_ITEM")"
     SERIES_API_PATH="$(jq -r '.path // empty' <<< "$SERIES_ITEM")"
@@ -4777,6 +4793,10 @@ cp -- "$STATE_FILE" "$WORK_STATE" || die "Cannot copy state to working file."
 ###############################################################################
 
 log DEBUG "Starting delete tagger (dry-run=$DRY_RUN, confirmations=$CONFIRMATION_RUNS)."
+if media_recovery_app_held Radarr; then
+    log INFO 'Radarr delete/tag/retirement workflow deferred: integrity recovery owns unresolved movie holds; existing state preserved.'
+    return 0
+fi
 if [[ "$TRIGGER_LIBRARY_RESCAN" == true ]]; then
     log INFO "Requesting one Radarr all-library rescan before checking movies."
 else
