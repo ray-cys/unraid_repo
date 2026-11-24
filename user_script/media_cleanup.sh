@@ -1,6 +1,6 @@
 #!/bin/bash
 arrayStarted=true
-# Media Cleanup v1.0.0 -- personal Hubble operations
+# Media Cleanup v1.1.0 -- personal Hubble operations
 #
 # PURPOSE: One daily job coordinates Arr deletion/unmonitoring/90-day retirement,
 # proven SAB completed-payload cleanup, and metadata-bin retention. Modules run
@@ -30,7 +30,9 @@ arrayStarted=true
 # covers actions, recovered work and attention; failed delivery retains the data.
 # Quiet healthy runs send nothing. Oversize reports span future daily messages;
 # undelivered details are retained, never silently dropped. Abnormal exits and
-# deferrals are reported with outcomes. The latest run receipt records all modules.
+# deferrals are reported with outcomes. RUNNING receipts are written at startup
+# and phase changes; an abandoned RUNNING record is reported on the next run.
+# Console output streams live; only job-owned processes are stopped on cancellation.
 #
 # CLI (use /bin/bash on Unraid flash):
 #   cleanup=/boot/config/plugins/user.scripts/scripts/media_cleanup/script
@@ -56,8 +58,9 @@ arrayStarted=true
 
 set -uo pipefail
 umask 077
-MC_VERSION="1.0.0"
-# One execution switch; explicit --dry-run / --execute overrides it.
+MC_VERSION="1.1.0"
+# One execution switch across every module. Conflicting/unused flags fail before work.
+# In preview, quarantine purge becomes audit; restore requires an explicit execute flag.
 MC_DRY_RUN=false
 # COMMON CONFIGURATION: credentials below are private on Hubble only.
 MC_ROOT="/mnt/vault/cloud/logs/script/media_cleanup"
@@ -76,6 +79,10 @@ MC_LOCK="/run/media_cleanup.lock"
 MC_NOTIFY_LOCK="/run/media_cleanup-notification.lock"
 MC_LOG_LOCK="/run/media_cleanup-log.lock"
 MC_STATUS_DIR="/mnt/vault/cloud/logs/script/user_scripts_status"
+# Bounded external operations; failed/unverified delivery stays queued.
+MC_NOTIFY_TIMEOUT_SECONDS=30
+MC_LOCK_WAIT_SECONDS=20
+MC_BRIDGE_ACTIVE=false
 
 mc_state_ready() {
     [[ "$MC_ROOT" == /mnt/vault/cloud/logs/script/media_cleanup && ! -L "$MC_ROOT" &&
@@ -117,7 +124,7 @@ mc_write_line() {
     local line="$1" fd rc=0 LC_ALL=C
     [[ -d "$MC_ROOT" && ! -L "$MC_ROOT" && ! -L "$MC_ROOT/media-cleanup.log" ]] || return 1
     exec {fd}>"$MC_LOG_LOCK" || return 1
-    flock -x "$fd" || { exec {fd}>&-; return 1; }
+    flock -x -w "$MC_LOCK_WAIT_SECONDS" "$fd" || { exec {fd}>&-; return 1; }
     (( ${#line}<=4096 )) || line="${line:0:4050} ... [line truncated]"
     # Rotate before append, including a line that would cross the cap.
     if [[ -f "$MC_ROOT/media-cleanup.log" ]] && (( $(stat -c %s "$MC_ROOT/media-cleanup.log")+${#line}+1>MC_LOG_MAX_BYTES )); then
@@ -164,43 +171,41 @@ mc_outbox_ready() {
         done
         jq -cn --arg sent "$sent" '{schema:1,events:[],lastSentDate:$sent}' >"$tmp" && mc_publish "$tmp" "$state" || return 1
     fi
-    jq -e '.schema==1 and (.events|type)=="array" and all(.events[]; (.id|type)=="string" and (.message|type)=="string")' "$state" >/dev/null
+    jq -e '.schema==1 and (.events|type)=="array" and all(.events[]; (.id|type)=="string" and (.message|type)=="string")' "$state" >/dev/null || return 1
+    jq -e '((.topics // {})|type)=="object" and ((.delivered // {})|type)=="object"' "$state" >/dev/null || return 1
+    if jq -e '.topics==null or .delivered==null' "$state" >/dev/null; then
+      tmp=$(mktemp "$MC_ROOT/.outbox.XXXXXX") || return 1
+      jq -c '.topics //= {} | .delivered //= {}' "$state" >"$tmp" && mc_publish "$tmp" "$state" || return 1
+    fi
 }
 
 # Native notify-compatible collector. Each accepted body is durable before the
 # module clears its local delivery queue. The central outbox then owns delivery.
 mc_collect() (
-    local module="$1"; shift
-    local importance=normal subject="Media Cleanup" description="" message="" fd tmp body id
-    case "$module" in arr|sab|quarantine|main) ;; *) return 2;; esac
+    local module="$1";shift
+    local importance=normal subject="Media Cleanup" description="" message="" work
+    case "$module" in arr|sab|quarantine|main) ;; *) return 2;;esac
     while (( $# )); do
-        (( $#>=2 )) || return 2
-        case "$1" in -i) importance=$2;; -s) subject=$2;; -d) description=$2;; -m) message=$2;; *) return 2;; esac
-        shift 2
+      (( $#>=2 )) || return 2
+      case "$1" in -i) importance=$2;;-s) subject=$2;;-d) description=$2;;-m) message=$2;;*) return 2;;esac;shift 2
     done
-    case "$importance" in normal|warning|alert) ;; *) importance=warning;; esac
-    [[ -n "$message" ]] || message="$description"
-    [[ -n "$message" ]] || return 2
-    mc_state_ready || return 1
-    mc_export_guard || return 1
-    exec {fd}>"$MC_NOTIFY_LOCK"; flock -x "$fd" || return 1
-    mc_outbox_ready || return 1
-    body=$(mktemp "$MC_ROOT/.message.XXXXXX") || return 1
-    printf '%s' "$message" >"$body" || return 1
-    id=$(printf '%s\0%s\0%s\0%s\0%s' "$module" "$importance" "$subject" "$description" "$message" | sha256sum | cut -d ' ' -f1)
-    tmp=$(mktemp "$MC_ROOT/.outbox.XXXXXX") || return 1
-    jq -c --arg id "$id" --arg module "$module" --arg importance "$importance" --arg subject "$subject" \
-       --arg description "$description" --rawfile message "$body" --argjson epoch "$(date +%s)" \
-       'if any(.events[];.id==$id) then . else .events += [{id:$id,module:$module,importance:$importance,subject:$subject,description:$description,message:$message,epoch:$epoch}] end' \
-       "$MC_ROOT/notification-outbox.json" >"$tmp" && mc_publish "$tmp" "$MC_ROOT/notification-outbox.json"
-    local rc=$?; rm -f -- "$body" "$tmp"
-    return "$rc"
+    case "$importance" in normal|warning|alert) ;; *) importance=warning;;esac
+    [[ -n "$message" ]] || message=$description
+    work=$(mktemp /tmp/media-cleanup-legacy.XXXXXX) || return 1
+    trap 'rm -f -- "$work" "$work.message"' EXIT
+    printf '%s' "$message" >"$work.message"
+    jq -n --arg module "$module" --arg importance "$importance" --arg subject "$subject" --arg description "$description" \
+      --arg date "$(date +%F)" --rawfile message "$work.message" --argjson now "$(date +%s)" \
+      '{events:[{nativeId:([$module,$importance,$subject,$description,$message,$date]|tojson),module:$module,importance:$importance,subject:$subject,
+        description:$description,message:$message,epoch:$now,
+        kind:(if $importance!="normal" and $subject!="Interrupted run detected" then "attention" else "action" end),
+        topic:(if $importance!="normal" and $subject!="Interrupted run detected" then $module+":preflight" else "" end),eventGroup:""}]}
+        | .topics=(if .events[0].topic!="" then {(.events[0].topic):{status:"attention",summary:$description}} else {} end)' >"$work" && mc_accept_records "$work"
 )
-
 mc_flush() (
     local fd selected tmp body today importance count rc
     mc_export_guard || return 1
-    exec {fd}>"$MC_NOTIFY_LOCK"; flock -x "$fd" || return 1
+    exec {fd}>"$MC_NOTIFY_LOCK"; flock -x -w "$MC_LOCK_WAIT_SECONDS" "$fd" || return 1
     mc_outbox_ready || return 1
     today=$(date +%F)
     if [[ "$(jq -r .lastSentDate "$MC_ROOT/notification-outbox.json")" == "$today" ]]; then
@@ -217,6 +222,8 @@ mc_flush() (
       def prefix($s;$b): reduce ($s|explode[]) as $c ({s:"",n:0,full:false};
         ($c|[.]|implode) as $v | ($v|utf8bytelength) as $n |
         if .full or .n+$n>$b then .full=true else .s+=$v | .n+=$n end) | .s;
+      . as $state | .events |= map(. as $e | if ($e.topic // "")!="" and $state.topics[$e.topic].status=="healthy" then
+        .importance="normal" | .description+="; current condition resolved" else . end) |
       reduce (.events|sort_by([if .importance=="alert" then 0 elif .importance=="warning" then 1 else 2 end,.epoch])[]) as $e
         ({items:[],bytes:0}; ("["+$e.module+"] "+$e.subject+"\nReported: "+($e.epoch|strflocaltime("%Y-%m-%d %H:%M:%S %Z"))+"\n"+$e.description+"\n") as $h |
          ($budget-.bytes-($h|utf8bytelength)-4) as $remaining |
@@ -224,18 +231,23 @@ mc_flush() (
            .items += [$e+{message:$p,consumed:($p|length)}] | .bytes += (($h+$p)|utf8bytelength)+4 end)
       | .items' "$MC_ROOT/notification-outbox.json" >"$selected" || return 1
     count=$(jq length "$selected"); (( count>0 )) || return 1
-    jq -r '.[] | "["+.module+"] "+.subject+"\nReported: "+(.epoch|strflocaltime("%Y-%m-%d %H:%M:%S %Z"))+"\n"+.description+"\n"+.message+"\n"' "$selected" >"$body" || return 1
+    jq -r '.[] | ("["+.module+"] "+.subject+"\nReported: "+(.epoch|strflocaltime("%Y-%m-%d %H:%M:%S %Z"))+"\n"+.description+"\n"+.message+"\n")
+      | explode | map(select(.!=8205 and .!=8419 and .!=65039 and (. < 9728 or . > 10175) and (. < 126976 or . > 129791))) | implode' "$selected" >"$body" || return 1
     printf '\nCurrent run outcomes: %s\nReports retain their original observation time. Pending detail is retained for subsequent daily delivery.\n' "${MC_OUTCOMES:-notification retry only}" >>"$body"
     importance=$(jq -r 'if any(.[];.importance=="alert") then "alert" elif any(.[];.importance=="warning") then "warning" else "normal" end' "$selected")
-    "$MC_NOTIFY_BIN" -i "$importance" -s "Media Cleanup" -d "Daily cleanup actions and attention" -m "$(cat "$body")"
+    exec {MC_EXPORT_FD}>&-
+    timeout --signal=TERM --kill-after=5 "$MC_NOTIFY_TIMEOUT_SECONDS" "$MC_NOTIFY_BIN" -i "$importance" -s "Media Cleanup" -d "Daily cleanup actions and attention" -m "$(cat "$body")"
     rc=$?
     if (( rc==0 )); then
+        mc_export_guard || return 1
         tmp=$(mktemp "$MC_ROOT/.outbox.XXXXXX") || return 1
-        jq -c --arg day "$today" --slurpfile sent "$selected" '
+        jq -c --arg day "$today" --argjson sentAt "$(date +%s)" --slurpfile sent "$selected" '
            . as $state | .lastSentDate=$day | .events = [ $state.events[] | . as $e |
              ([$sent[0][] | select(.id==$e.id)][0] // null) as $s |
              if $s==null then . elif $s.consumed<(.message|length) then
-               .message=.message[$s.consumed:] else empty end ]' \
+               .message=.message[$s.consumed:] else empty end ]
+           | reduce $sent[0][] as $s (.; if any(.events[];.id==$s.id) then . else
+               .delivered[$s.id]={epoch:$sentAt,topic:($s.topic // ""),kind:($s.kind // "action")} end)' \
            "$MC_ROOT/notification-outbox.json" >"$tmp" && mc_publish "$tmp" "$MC_ROOT/notification-outbox.json" || return 1
         mc_log INFO "Unraid accepted one grouped email with $count report section(s); queued remainder=$(jq '.events|length' "$MC_ROOT/notification-outbox.json")" || true
     fi
@@ -245,121 +257,157 @@ mc_flush() (
 
 mc_help() {
     printf '%s\n' "media_cleanup.sh $MC_VERSION" \
-      'Usage: /bin/bash SCRIPT [--dry-run|--execute|--flush-notifications|--version|--help]' \
+      'Usage: /bin/bash SCRIPT [all [--dry-run|--execute]|--dry-run|--execute|--flush-notifications|--version|--help]' \
       '       /bin/bash SCRIPT arr [all|sonarr|radarr|--list-pending|--resolve-pending ID NOTE] [--dry-run|--execute]' \
       '       /bin/bash SCRIPT sab [--dry-run|--execute|--no-purge|--inspect|--restore WRAPPER|--pending-operations|--resolve-operation ID NOTE|--recover-orphan NAME --execute]' \
-      '       /bin/bash SCRIPT quarantine [audit|purge|restore RUN_ID movies|series RELATIVE_PATH|--pending-operations|--resolve-operation ID NOTE]' \
+      '       /bin/bash SCRIPT quarantine [--dry-run|--execute] [audit|purge|restore RUN_ID movies|series RELATIVE_PATH|--pending-operations|--resolve-operation ID NOTE]' \
       'No arguments: Arr, SAB cleanup, metadata retention sequentially; one daily grouped notification.' \
       'Preview: records observations/logs without payload or Arr mutations. Module --help provides further details.' \
       "State/logs: $MC_ROOT; original quarantine payload roots and retention are preserved."
 }
 
-mc_record_status() {
-    local tmp now=$(date +%s) exportfd
-    exec {exportfd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
-    flock -s -w 30 "$exportfd" || { exec {exportfd}>&-; return 1; }
+mc_record_status() (
+    local tmp now=$(date +%s)
+    mc_export_guard || return 1
     tmp=$(mktemp "$MC_ROOT/.status.XXXXXX") || return 1
     jq -n --arg name media_cleanup --arg version "$MC_VERSION" --arg status "$MC_RESULT" --arg summary "$MC_OUTCOMES" \
-      --arg mode "${MC_MODE:-manual}" --argjson epoch "$now" --argjson duration "$((now-MC_STARTED))" --slurpfile modules "$MC_TMP/outcomes.json" \
-      '{schema:1,name:$name,scriptVersion:$version,status:$status,mode:$mode,summary:$summary,epoch:$epoch,duration_seconds:$duration,modules:$modules[0]}' >"$tmp" && \
-      mc_publish "$tmp" "$MC_ROOT/latest-run.json" || return 1
-    # Diagnostics and module-only runs must not refresh the daily-batch receipt.
-    case "${MC_MODE:-manual}" in all|--execute) ;; *) exec {exportfd}>&-; return 0;; esac
+      --arg phase "${MC_ACTIVE_MODULE:-none}" --arg run "$MC_RUN_ID" --arg boot "${MC_BOOT_ID:-unknown}" \
+      --arg mode "${MC_MODE:-manual}" --argjson epoch "$now" --argjson started "$MC_STARTED" --argjson pid "$$" \
+      --slurpfile modules "$MC_TMP/outcomes.json" \
+      '{schema:1,name:$name,scriptVersion:$version,status:$status,mode:$mode,summary:$summary,phase:$phase,runId:$run,bootId:$boot,pid:$pid,
+        startedAt:$started,epoch:$epoch,duration_seconds:($epoch-$started),modules:$modules[0]}' >"$tmp" && mc_publish "$tmp" "$MC_ROOT/latest-run.json" || return 1
+    case "${MC_MODE:-manual}" in all|--execute) ;; *) return 0;; esac
     [[ ! -L "$MC_STATUS_DIR" ]] || return 1
     mkdir -p -- "$MC_STATUS_DIR" || return 1
-    cp -- "$MC_ROOT/latest-run.json" "$MC_STATUS_DIR/.media_cleanup.$MC_RUN_ID" &&
-      mv -f -- "$MC_STATUS_DIR/.media_cleanup.$MC_RUN_ID" "$MC_STATUS_DIR/media_cleanup.json"
-    local rc=$?; exec {exportfd}>&-; return "$rc"
-}
+    tmp=$(mktemp "$MC_STATUS_DIR/.media_cleanup.XXXXXX") || return 1
+    cp -- "$MC_ROOT/latest-run.json" "$tmp" && mc_publish "$tmp" "$MC_STATUS_DIR/media_cleanup.json"
+)
 
 mc_finalizer() {
     local rc=$?
     trap - EXIT INT TERM
+    mc_stop_child || true
     if [[ "${MC_DONE:-false}" != true && -n "${MC_TMP:-}" ]]; then
         MC_RESULT=FAILED
-        MC_OUTCOMES="${MC_OUTCOMES:-}; interrupted during ${MC_ACTIVE_MODULE:-startup} (exit=$rc); pending journals retained"
-        mc_collect main -i alert -s "Cleanup interrupted" -d "Incomplete workflow retained" -m "$MC_OUTCOMES" || true
-        mc_record_status || true
+        MC_OUTCOMES="${MC_OUTCOMES:-}; interrupted during ${MC_ACTIVE_MODULE:-startup}; reason=${MC_CANCEL_REASON:-abnormal exit}; exit=$rc; pending journals retained"
+        mc_note orchestration failed 'Cleanup interrupted' "$MC_OUTCOMES" || mc_emergency_notice "$MC_OUTCOMES"
+        mc_record_status || mc_emergency_notice "Could not save interrupted-run status: $MC_OUTCOMES"
         mc_flush || true
     fi
-    [[ "${MC_TMP:-}" != /tmp/media-cleanup.* ]] || rm -rf -- "$MC_TMP"
+    if [[ "${MC_CHILDREN_UNREAPED:-false}" != true && "${MC_TMP:-}" == /tmp/media-cleanup.* ]]; then rm -rf -- "$MC_TMP";fi
     exit "$rc"
 }
 
 mc_run_module() {
-    local module="$1"; shift
-    local rc=0 start=$(date +%s) status=COMPLETED preview="$MC_TMP/$module.output" next
+    local module="$1";shift
+    local rc=0 start=$(date +%s) status=COMPLETED reason='Native workflow completed' preview="$MC_TMP/$module.output" next
     MC_ACTIVE_MODULE=$module
-    mc_log INFO "Starting module=$module"
-    # Original modules use explicit error checks (set -uo pipefail). Capture
-    # their exit status without aborting the independent remaining modules.
-    case "$module" in
-      arr) mc_arr "$@" >"$preview" 2>&1 || rc=$?;;
-      sab) mc_sab "$@" >"$preview" 2>&1 || rc=$?;;
-      quarantine) mc_quarantine "$@" >"$preview" 2>&1 || rc=$?;;
+    mc_record_status || { mc_self_failure "Cannot persist start of $module; module was not started";return 1; }
+    mc_log INFO "Starting module=$module" || { mc_self_failure "Cannot write operational log; $module not started";return 1; }
+    # Give only this job a process group. The supervisor waits for tee so output
+    # is complete before result inspection. No Docker processes are signalled.
+    set -m
+    (
+      trap - EXIT INT TERM
+      set +m
+      local -a codes
+      case "$module" in
+        arr) mc_arr "$@" 2>&1 | tee "$preview";codes=("${PIPESTATUS[@]}");;
+        sab) mc_sab "$@" 2>&1 | tee "$preview";codes=("${PIPESTATUS[@]}");;
+        quarantine) mc_quarantine "$@" 2>&1 | tee "$preview";codes=("${PIPESTATUS[@]}");;
+      esac
+      (( codes[1]==0 )) || exit 74
+      exit "${codes[0]}"
+    ) &
+    MC_CHILD_PID=$!
+    set +m
+    wait "$MC_CHILD_PID" || rc=$?
+    MC_CHILD_PID=""
+    if (( rc!=0 )); then status=FAILED;reason="Native process exit=$rc";fi
+    if [[ -f "$MC_TMP/$module.result.json" ]]; then
+      jq -e --arg module "$module" '.module==$module and (.status|IN("COMPLETED","WARNING","DEFERRED","FAILED"))' "$MC_TMP/$module.result.json" >/dev/null || { mc_self_failure "Invalid $module result receipt";return 1; }
+      if (( rc==0 )); then status=$(jq -r .status "$MC_TMP/$module.result.json");reason=$(jq -r .reason "$MC_TMP/$module.result.json");fi
+    elif (( rc==0 )) && grep -Eiq 'deferred|Another .*run is active' "$preview"; then status=DEFERRED;reason='Startup coordination prevented work';fi
+    case "$status" in
+      FAILED) MC_RESULT=ATTENTION;mc_note "$module" failed "$module workflow failed" "Exit=$rc; $reason. Completed work and pending journals retained."$'\n'"$(tail -c 6000 "$preview")" || return 1;;
+      DEFERRED) [[ "$MC_RESULT" != RUNNING && "$MC_RESULT" != OK ]] || MC_RESULT=DEFERRED
+        mc_note "$module" deferred "$module deferred" "$reason. No protected operation was forced; next scheduled pass retries." || return 1;;
+      WARNING) [[ "$MC_RESULT" == ATTENTION ]] || MC_RESULT=WARNING;mc_note "$module" healthy 'Workflow completed' "$reason" || return 1;;
+      *) mc_note "$module" healthy 'Workflow completed' "$reason" || return 1;;
     esac
-    cat -- "$preview"
-    if (( rc!=0 )); then
-        status=FAILED; MC_RESULT=ATTENTION
-        mc_collect main -i alert -s "$module workflow failed" -d "Module exit=$rc; safe completed work retained" \
-          -m "Module: $module; exit=$rc. Other modules retain their independent safeguards. Recent evidence:"$'\n'"$(tail -c 6000 -- "$preview")" || return 1
-    elif [[ -f "$MC_TMP/$module.result.json" ]] && [[ "$(jq -r .status "$MC_TMP/$module.result.json")" == WARNING ]]; then
-        status=WARNING; [[ "$MC_RESULT" == ATTENTION ]] || MC_RESULT=WARNING
-    elif { [[ -f "$MC_TMP/$module.result.json" ]] && [[ "$(jq -r .status "$MC_TMP/$module.result.json")" == DEFERRED ]]; } || grep -Eiq 'deferred without changes|scheduled run deferred|Operational-state export active|Quarantine producer is active|Another lifecycle run holds|[Ss]cript already running|[Aa]nother.*run.*active|[Bb]ackup.*(active|in progress).*defer|[Mm]over.*(active.*defer|stopped.*mutat)' "$preview"; then
-        status=DEFERRED; [[ "$MC_RESULT" != OK ]] || MC_RESULT=DEFERRED
-        mc_collect main -i warning -s "$module deferred" -d "Protected work retained for a later run" \
-          -m "Module: $module. Relevant safeguards:"$'\n'"$(grep -Ei 'defer|lock|[Mm]over|coordination' "$preview" | tail -n 10)" || return 1
-    fi
     next="$MC_TMP/outcomes.next"
-    jq --arg module "$module" --arg status "$status" --argjson rc "$rc" --argjson duration "$(( $(date +%s)-start ))" \
-       '.+[{module:$module,status:$status,exit:$rc,duration_seconds:$duration}]' "$MC_TMP/outcomes.json" >"$next" && mv "$next" "$MC_TMP/outcomes.json" || return 1
-    MC_OUTCOMES+="${MC_OUTCOMES:+; }$module=$status ($(( $(date +%s)-start ))s)"
-    mc_log INFO "Completed module=$module status=$status exit=$rc runtime=$(( $(date +%s)-start ))s"
+    jq --arg module "$module" --arg status "$status" --arg reason "$reason" --argjson rc "$rc" --argjson duration "$(( $(date +%s)-start ))" \
+      '.+[{module:$module,status:$status,reason:$reason,exit:$rc,duration_seconds:$duration}]' "$MC_TMP/outcomes.json" >"$next" && mv "$next" "$MC_TMP/outcomes.json" || { mc_self_failure "Cannot record $module outcome";return 1; }
+    MC_OUTCOMES+="${MC_OUTCOMES:+; }$module=$status ($(( $(date +%s)-start ))s): $reason"
+    mc_log INFO "Completed module=$module status=$status exit=$rc runtime=$(( $(date +%s)-start ))s; $reason" || { mc_self_failure 'Cannot write completion log';return 1; }
     return 0
 }
 
 mc_main() {
-    local mode="${1:-all}" fd self rc=0
-    case "$mode" in
-      --version) printf 'media_cleanup.sh %s\n' "$MC_VERSION"; return 0;;
-      --help|-h) mc_help; return 0;;
-      --collect-notification) shift; mc_collect "$@"; return $?;;
-      all|--dry-run|--execute|--flush-notifications|arr|sab|quarantine) ;;
-      *) mc_help >&2; return 2;;
+    local fd self rc=0 module previous="" oldrun="" oldphase="" oldboot="" oldstatus=""
+    if [[ "${1:-}" == --collect-notification ]]; then shift;mc_collect "$@";return $?;fi
+    mc_parse_cli "$@" || { mc_help >&2;return 2; }
+    case "$MC_ROUTE" in
+      --version) printf 'media_cleanup.sh %s\n' "$MC_VERSION";return 0;;
+      --help|-h) mc_help;return 0;;
     esac
-    if [[ "$mode" == arr || "$mode" == sab || "$mode" == quarantine ]] && [[ "${2:-}" == --help || "${2:-}" == --version ]]; then
-        case "$mode" in arr) mc_arr "${@:2}";; sab) mc_sab "${@:2}";; quarantine) mc_quarantine "${@:2}";; esac
-        return $?
+    if [[ "${MC_ARGS[0]:-}" == --help || "${MC_ARGS[0]:-}" == --version ]]; then
+      case "$MC_ROUTE" in arr) mc_arr "${MC_ARGS[@]}";;sab) mc_sab "${MC_ARGS[@]}";;quarantine) mc_quarantine "${MC_ARGS[@]}";;esac;return $?;
     fi
-    [[ "$MC_DRY_RUN" == true || "$MC_DRY_RUN" == false ]] || { printf 'MC_DRY_RUN must be true or false.\n' >&2; return 2; }
-    [[ "$mode" != all || "$MC_DRY_RUN" != true ]] || mode=--dry-run
-    mc_state_ready || { mc_preflight_failure; return 1; }
-    exec {fd}>"$MC_LOCK"; flock -n "$fd" || { printf 'Another media cleanup invocation is active; no duplicate actions started.\n'; return 0; }
-    MC_STARTED=$(date +%s); MC_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
+    [[ "$MC_EFFECTIVE_DRY" == true || "$MC_EFFECTIVE_DRY" == false ]] || return 2
+    MC_DRY_RUN="$MC_EFFECTIVE_DRY"
+    mc_state_ready || { mc_preflight_failure;return 1; }
+    exec {fd}>"$MC_LOCK";flock -n "$fd" || { printf 'Media cleanup already active; no duplicate actions.\n';return 0; }
+    MC_STARTED=$(date +%s);MC_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
+    MC_BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf unknown)
+    if [[ -f "$MC_ROOT/latest-run.json" ]]; then
+      if ! jq -e '.schema==1 and (.status|type)=="string"' "$MC_ROOT/latest-run.json" >/dev/null; then
+        mc_note orchestration failed 'Invalid run receipt' 'Existing run receipt was preserved; no modules started. Review its JSON and storage health.' || true
+        mc_emergency_notice 'Existing cleanup run receipt is invalid; no modules started; state was preserved.' || true
+        return 1
+      fi
+      previous=$(jq -r '.status // ""' "$MC_ROOT/latest-run.json") || return 1
+      oldrun=$(jq -r '.runId // "unknown"' "$MC_ROOT/latest-run.json")
+      oldphase=$(jq -r '.phase // "unknown"' "$MC_ROOT/latest-run.json")
+    fi
     MC_TMP=$(mktemp -d /tmp/media-cleanup.XXXXXX) || return 1
-    MC_MODE="$mode"; MC_DONE=false; MC_RESULT=OK; MC_OUTCOMES=""; MC_ACTIVE_MODULE=startup
+    MC_MODE="$MC_ROUTE"; [[ "$MC_ROUTE" != all || "$MC_DRY_RUN" != true ]] || MC_MODE=--dry-run
+    MC_DONE=false;MC_RESULT=RUNNING;MC_OUTCOMES="";MC_ACTIVE_MODULE=startup;MC_CHILD_PID="";MC_BRIDGE_ACTIVE=true
     printf '[]\n' >"$MC_TMP/outcomes.json"
     trap mc_finalizer EXIT
-    trap 'exit 130' INT TERM
+    trap 'mc_cancel 130 INT' INT
+    trap 'mc_cancel 143 TERM' TERM
     self=$(realpath -- "${BASH_SOURCE[0]}") || return 1
     MC_PROXY="$MC_TMP/notify"
     printf '#!/bin/bash\nexec /bin/bash %q --collect-notification "$MC_MODULE" "$@"\n' "$self" >"$MC_PROXY" || return 1
-    chmod 700 "$MC_PROXY"
-    export MC_MODULE
-    mc_log INFO "Started media cleanup mode=$mode"
-    case "$mode" in
-      all) MC_MODULE=arr; mc_run_module arr || rc=1; MC_MODULE=sab; mc_run_module sab || rc=1; MC_MODULE=quarantine; mc_run_module quarantine || rc=1;;
-      --dry-run) MC_MODULE=arr; mc_run_module arr all --dry-run || rc=1; MC_MODULE=sab; mc_run_module sab --dry-run || rc=1; MC_MODULE=quarantine; mc_run_module quarantine audit || rc=1;;
-      --execute) MC_MODULE=arr; mc_run_module arr all --execute || rc=1; MC_MODULE=sab; mc_run_module sab --execute || rc=1; MC_MODULE=quarantine; mc_run_module quarantine purge || rc=1;;
-      --flush-notifications) MC_OUTCOMES="Notification retry only; no cleanup performed";;
-      *) MC_MODULE=$mode; mc_run_module "$mode" "${@:2}" || rc=1;;
-    esac
-    if ! mc_flush; then
-        MC_RESULT=ATTENTION; rc=1
-        mc_log ERROR 'Grouped email failed; undelivered reports remain in the persistent shared outbox'
+    chmod 700 "$MC_PROXY";export MC_MODULE
+    if [[ "$previous" == RUNNING ]]; then
+      mc_collect main -i warning -s 'Interrupted run detected' -d 'Recovering after interruption' \
+        -m "Prior run=$oldrun; last phase=$oldphase. Its lease is no longer active. Existing action journals are retained; each module verifies outcomes before retrying." || return 1
     fi
-    mc_record_status || rc=1
-    mc_log INFO "Finished status=$MC_RESULT; $MC_OUTCOMES; runtime=$(( $(date +%s)-MC_STARTED ))s"
+    mc_record_status || { mc_self_failure 'Cannot persist initial RUNNING receipt; no modules started';return 1; }
+    mc_log INFO "Started mode=$MC_MODE preview=$MC_DRY_RUN"
+    case "$MC_ROUTE" in
+      all)
+        for module in arr sab quarantine; do
+          MC_MODULE=$module
+          case "$module" in
+            arr) mc_run_module arr all "${MC_ARGS[@]}" || { mc_self_failure 'Arr orchestration failed';rc=1; };;
+            sab) mc_run_module sab "${MC_ARGS[@]}" || { mc_self_failure 'SAB orchestration failed';rc=1; };;
+            quarantine) if [[ "$MC_DRY_RUN" == true ]]; then mc_run_module quarantine audit;else mc_run_module quarantine purge;fi || { mc_self_failure 'Quarantine orchestration failed';rc=1; };;
+          esac
+        done;;
+      --flush-notifications) MC_OUTCOMES='Notification retry only; no cleanup performed';;
+      *) MC_MODULE=$MC_ROUTE;mc_run_module "$MC_ROUTE" "${MC_ARGS[@]}" || { mc_self_failure 'Module orchestration failed';rc=1; };;
+    esac
+    [[ "$MC_RESULT" != RUNNING ]] || MC_RESULT=OK
+    if (( rc==0 )) && [[ "$MC_RESULT" != ATTENTION ]]; then
+      mc_note orchestration healthy 'Orchestration recovered' 'Current control-plane operations completed' || { MC_RESULT=ATTENTION;rc=1; }
+    fi
+    mc_record_status || { mc_self_failure 'Could not save final status; successful module actions remain recorded';rc=1; }
+    if ! mc_flush; then mc_self_failure 'Notification delivery or persistence failed; unsent reports retained';rc=1;fi
+    mc_record_status || { mc_emergency_notice 'Could not persist final cleanup status; inspect storage and permissions';rc=1;MC_RESULT=ATTENTION; }
+    mc_log INFO "Finished status=$MC_RESULT; $MC_OUTCOMES; runtime=$(( $(date +%s)-MC_STARTED ))s" || { MC_RESULT=ATTENTION;rc=1; }
     MC_DONE=true
     [[ "$MC_RESULT" != ATTENTION ]] || rc=1
     return "$rc"
@@ -375,21 +423,33 @@ mc_finish_module() {
     else
         case "$module" in
           arr)
-            if [[ "${LOG_READY:-false}" != true && "${1:-}" != --list-pending ]]; then
+            if [[ "${MC_MODULE_STATUS:-}" == DEFERRED ]]; then
+                status=DEFERRED;reason="$MC_MODULE_REASON"
+            elif [[ "${LOG_READY:-false}" != true && "${1:-}" != --list-pending ]]; then
                 status=DEFERRED;reason="Coordination or active-run guard prevented startup"
             fi;;
           sab)
             if [[ "${RUN_INITIALIZED:-false}" != true && "${1:-}" != --inspect && "${1:-}" != --pending-operations ]]; then
                 status=DEFERRED;reason="Coordination or active-run guard prevented startup"
-            elif [[ "${STRANDED_CLEANUP_STATUS:-}" == MOVER_STOPPED || "${QUARANTINE_PURGE_STATUS:-}" == MOVER_STOPPED ]]; then
+            elif [[ "${MOVER_GUARD_TRIGGERED:-false}" == true || "${BACKUP_CLEANUP_STATUS:-}" == MOVER_* || "${STRANDED_CLEANUP_STATUS:-}" == MOVER_* || "${QUARANTINE_PURGE_STATUS:-}" == MOVER_* ]]; then
                 status=DEFERRED;reason="Mover stopped protected mutations; completed work retained"
-            fi;;
+            elif [[ "${BACKUP_CLEANUP_STATUS:-}" == SKIPPED_* || "${STRANDED_CLEANUP_STATUS:-}" == SKIPPED_* || "${QUARANTINE_PURGE_STATUS:-}" == SKIPPED_* ]]; then
+                status=WARNING;reason="Configured phase skipped: backups=$BACKUP_CLEANUP_STATUS; stranded=$STRANDED_CLEANUP_STATUS; purge=$QUARANTINE_PURGE_STATUS"
+            elif (( ${ERRORS:-0}>0 )); then status=FAILED;reason="SAB cleanup reported $ERRORS error(s)";fi;;
           quarantine)
+            if [[ "${1:-}" == --pending-operations ]]; then
+                status=COMPLETED;reason="Pending operations listed without payload changes"
+            else
             case "${RESULT_STATUS:-}" in
               WARNING) status=WARNING;reason="${RESULT_SUMMARY:-Protected or expired entries remain}";;
               DEFERRED) status=DEFERRED;reason="${RESULT_SUMMARY:-Producer or export coordination active}";;
-            esac;;
+              FAILED) status=FAILED;reason="$RESULT_SUMMARY";;
+            esac
+            fi;;
         esac
+    fi
+    if [[ "$module" == arr && "$status" == COMPLETED && -f "$MC_TMP/arr.result.json" ]]; then
+      status=$(jq -r .status "$MC_TMP/arr.result.json");reason=$(jq -r .reason "$MC_TMP/arr.result.json")
     fi
     temp=$(mktemp "$MC_TMP/.module-result.XXXXXX") || return 1
     jq -n --arg module "$module" --arg status "$status" --arg reason "$reason" --argjson rc "$rc" \
@@ -399,16 +459,232 @@ mc_finish_module() {
 
 # Storage is unavailable precisely when the vault outbox cannot be used. Keep
 # only a RAM daily acceptance marker; never create a shadow vault directory.
-mc_preflight_failure() (
-    local fd today=$(date +%F) marker=/run/media_cleanup-preflight-notified
-    local detail="Required mounted or canonical storage is unavailable. Arr deletion-sync, SAB cleanup and metadata retention were not started; no application or payload changes were attempted. Required mounts: /mnt/vault and /mnt/user. State root: $MC_ROOT. Work is deferred to the next scheduled run."
+mc_preflight_failure() {
+    mc_emergency_notice "Required mounted/canonical storage is unavailable. Arr sync, SAB cleanup and metadata retention were not started; no application or payload changes attempted. Required: /mnt/vault and /mnt/user. State: $MC_ROOT."
+}
+
+mc_parse_cli() {
+    MC_ROUTE="${1:-all}"; MC_ARGS=(); MC_EFFECTIVE_DRY="$MC_DRY_RUN"
+    local choice="" flag arg command
+    (( $#==0 )) || shift
+    mc_execution_flag() {
+        local value="$1"
+        [[ -z "$choice" || "$choice" == "$value" ]] || { printf 'Conflicting --dry-run and --execute flags; nothing started.\n' >&2; return 2; }
+        choice="$value"; MC_EFFECTIVE_DRY=$value
+    }
+    case "$MC_ROUTE" in
+      --help|-h|--version|--flush-notifications)
+        (( $#==0 )) || return 2; return 0;;
+      --dry-run|--execute)
+        (( $#==0 )) || { printf 'Use all --dry-run or a module command; extra global-mode arguments are rejected.\n' >&2;return 2; }
+        [[ "$MC_ROUTE" != --dry-run ]] || MC_EFFECTIVE_DRY=true
+        [[ "$MC_ROUTE" != --execute ]] || MC_EFFECTIVE_DRY=false
+        MC_ROUTE=all;;
+      all)
+        for flag in "$@"; do case "$flag" in --dry-run) mc_execution_flag true || return 2;; --execute) mc_execution_flag false || return 2;; *) return 2;; esac; done;;
+      arr)
+        command="${1:-all}"; (( $#==0 )) || shift
+        case "$command" in
+          --help|--version|--list-pending) (( $#==0 )) || return 2; MC_ARGS=("$command");;
+          --resolve-pending) (( $#>=2 )) || return 2; MC_ARGS=("$command" "$@");;
+          all|sonarr|radarr)
+            for flag in "$@"; do case "$flag" in --dry-run) mc_execution_flag true || return 2;; --execute) mc_execution_flag false || return 2;; *) return 2;; esac; done
+            MC_ARGS=("$command");;
+          *) return 2;;
+        esac;;
+      sab)
+        while (( $# )); do
+          arg="$1";shift
+          case "$arg" in
+            --dry-run) mc_execution_flag true || return 2;;
+            --execute) mc_execution_flag false || return 2;;
+            --restore|--recover-orphan) (( $#>=1 )) || return 2; MC_ARGS+=("$arg" "$1");shift;;
+            --resolve-operation) (( $#>=2 )) || return 2; MC_ARGS+=("$arg" "$1" "$2");shift 2;;
+            --no-purge|--purge|--inspect|--pending-operations|--help|--version) MC_ARGS+=("$arg");;
+            *) return 2;;
+          esac
+        done;;
+      quarantine)
+        while [[ "${1:-}" == --dry-run || "${1:-}" == --execute ]]; do
+          [[ "$1" != --dry-run ]] || mc_execution_flag true || return 2
+          [[ "$1" != --execute ]] || mc_execution_flag false || return 2
+          shift
+        done
+        command="${1:-purge}"; (( $#==0 )) || shift
+        case "$command" in
+          audit|purge)
+            for flag in "$@"; do case "$flag" in --dry-run) mc_execution_flag true || return 2;; --execute) mc_execution_flag false || return 2;; *) return 2;; esac; done
+            [[ "$command" != purge || "$MC_EFFECTIVE_DRY" != true ]] || command=audit
+            MC_ARGS=("$command");;
+          restore)
+            (( $#==3 )) || return 2
+            [[ "$MC_EFFECTIVE_DRY" != true ]] || { printf 'Restore moves payloads; use quarantine --execute restore after review.\n' >&2;return 2; }
+            MC_ARGS=(restore "$@");;
+          --resolve-operation) (( $#>=2 )) || return 2;MC_ARGS=("$command" "$@");;
+          --help|--version|--pending-operations) (( $#==0 )) || return 2; MC_ARGS=("$command");;
+          *) return 2;;
+        esac;;
+      *) return 2;;
+    esac
+    # Native orphan reconstruction is a special manual operation: a default
+    # executing schedule never substitutes for its explicit --execute consent.
+    if [[ "$MC_ROUTE" == sab && "$choice" != false && " ${MC_ARGS[*]} " == *" --recover-orphan "* ]]; then MC_EFFECTIVE_DRY=true;fi
+    flag=--execute; [[ "$MC_EFFECTIVE_DRY" != true ]] || flag=--dry-run
+    case "$MC_ROUTE:${MC_ARGS[0]:-}" in arr:all|arr:sonarr|arr:radarr|sab:*) MC_ARGS+=("$flag");; esac
+}
+
+
+mc_accept_records() (
+    local input="$1" fd tmp work raw id key record now=$(date +%s)
+    mc_state_ready && mc_export_guard || return 1
+    exec {fd}>"$MC_NOTIFY_LOCK";flock -x -w "$MC_LOCK_WAIT_SECONDS" "$fd" || return 1
+    mc_outbox_ready || return 1
+    work=$(mktemp -d /tmp/media-cleanup-records.XXXXXX) || return 1
+    trap 'rm -rf -- "$work"' EXIT
+    jq -e '(.events|type)=="array" and (.topics|type)=="object" and all(.events[]; (.nativeId|type)=="string" and (.message|type)=="string" and (.module|type)=="string")' "$input" >/dev/null || return 1
+    jq -r '.events[] | ((.module+"|"+.nativeId)|@base64)+"\t"+tojson' "$input" >"$work/records" || return 1
+    : >"$work/framed"
+    while IFS=$'\t' read -r key record; do
+      id=$(printf '%s' "$key" | sha256sum | cut -d' ' -f1) || return 1
+      printf '%s\0%s\0' "$id" "$record" >>"$work/framed" || return 1
+    done <"$work/records"
+    jq -Rsc 'split("\u0000")|.[:-1]|. as $v|[range(0;length;2) as $i|($v[$i+1]|fromjson)+{id:$v[$i]}|del(.nativeId)]' "$work/framed" >"$work/events" || return 1
+    tmp=$(mktemp "$MC_ROOT/.outbox.XXXXXX") || return 1
+    jq -c --slurpfile incoming "$work/events" --slurpfile envelope "$input" --argjson now "$now" '
+      .delivered //= {} | .topics //= {}
+      | .delivered |= with_entries(select((.value.epoch // 0)>($now-31536000)))
+      | . as $state | .topics |= with_entries(select(.value.status!="healthy" or (.value.updatedAt // $now)>($now-31536000) or (.key as $key | any($state.events[];.topic==$key))))
+      | reduce ($envelope[0].topics|to_entries[]) as $t (.;
+          (.topics[$t.key] // {}) as $old
+          | (any(.events[];.topic==$t.key and .kind=="attention") or any(.delivered[];.topic==$t.key and .kind=="attention")) as $known
+          | .topics[$t.key]=($t.value+{updatedAt:$now})
+          | if $t.value.status=="healthy" then
+              .events |= map(select(.topic!=$t.key or (.kind // "action")!="attention"))
+              | if $old.status!="healthy" and $known and (any($incoming[0][];.topic==$t.key and .kind=="resolved")|not) then
+                  .events += [{id:($t.key+"|resolved|"+($old.updatedAt|tostring)),module:($t.key|split(":")[0]),topic:$t.key,
+                    eventGroup:$t.key,kind:"resolved",importance:"normal",subject:"Condition recovered",description:$t.value.summary,
+                    message:("Earlier attention for "+$t.key+" is no longer active. "+$t.value.summary+". Completed-action records are retained."),epoch:$now}]
+                else . end
+            else . end)
+      | reduce $incoming[0][] as $e (.;
+          if .delivered[$e.id]!=null or any(.events[];.id==$e.id) then . else
+            if ($e.topic // "")!="" and ($e.kind=="attention" or $e.kind=="resolved") then
+              .events |= map(select(.topic!=$e.topic or ((.kind // "action")!="attention" and .kind!="resolved") or .eventGroup==$e.eventGroup))
+            else . end
+            | .events += [$e]
+          end)
+
+    ' "$MC_ROOT/notification-outbox.json" >"$tmp" && mc_publish "$tmp" "$MC_ROOT/notification-outbox.json"
+)
+
+
+mc_handoff_arr() (
+    local batch="$1" work
+    work=$(mktemp /tmp/media-cleanup-arr-events.XXXXXX) || return 1
+    trap 'rm -f -- "$work"' EXIT
+    jq -sc --argjson now "$(date +%s)" '
+      {events:[.[] | . as $e | {nativeId:($e|to_entries|sort_by(.key)|from_entries|tojson),module:"arr",kind:.event,
+        topic:(if .key!="" then "arr:"+.key else "" end),eventGroup:(.app+"|"+.runId+"|"+.key+"|"+.event+"|"+(.title|sub(" \\(detail part [0-9]+\\)$";""))+"|"+.signature),
+        importance:(if .severity=="ERROR" then "alert" elif .event=="attention" then "warning" else "normal" end),
+        subject:("["+.app+"] "+.title),description:(.event+"; observed "+.queuedAt),message:.detail,epoch:$now}],
+       topics:(reduce (.[]|select(.key!="" and (.event=="resolved" or .event=="attention"))) as $e ({};
+         .["arr:"+$e.key]={status:(if $e.event=="resolved" then "healthy" else "attention" end),summary:$e.title}))}' "$batch" >"$work" && mc_accept_records "$work"
+)
+
+
+mc_handoff_ops() (
+    local module="$1" work
+    work=$(mktemp /tmp/media-cleanup-ops-events.XXXXXX) || return 1
+    trap 'rm -f -- "$work"' EXIT
+    jq --arg module "$module" --argjson now "$(date +%s)" '
+      {events:[.outbox[]|{nativeId:(.id+"|"+.queuedAt),module:$module,kind:.kind,
+        topic:(if .topic!="" then $module+":"+.topic else "" end),eventGroup:(.eventId+"|"+.queuedAt),
+        importance:.importance,subject:.subject,description:(.description+"; observed "+.queuedAt),message:.message,epoch:$now}],
+       topics:(.topics|with_entries(.key=($module+":"+.key)))}' "$OPS_NOTIFICATION_STATE" >"$work" && mc_accept_records "$work"
+)
+
+
+mc_note() (
+    local module="$1" status="$2" description="$3" message="$4" work
+    work=$(mktemp /tmp/media-cleanup-note.XXXXXX) || return 1
+    trap 'rm -f -- "$work"' EXIT
+    jq -n --arg module "$module" --arg status "$status" --arg description "$description" --arg message "$message" \
+      --arg date "$(date +%F)" --argjson now "$(date +%s)" '
+      ("main:"+$module) as $topic | {topics:({($topic):{status:$status,summary:$description}} +
+        (if $status=="healthy" then {((if $module=="orchestration" then "main" else $module end)+":preflight"):{status:"healthy",summary:$description}} else {} end)),
+       events:(if $status=="healthy" then [] else [{nativeId:($topic+"|"+$status+"|"+$date),module:"main",topic:$topic,
+       eventGroup:($topic+"|"+$date),kind:"attention",importance:(if $status=="failed" then "alert" else "warning" end),
+       subject:$description,description:$status,message:$message,epoch:$now}] end)}' >"$work" && mc_accept_records "$work"
+)
+
+
+mc_stop_child() {
+    local n pgid="${MC_CHILD_PID:-}"
+    [[ "$pgid" =~ ^[1-9][0-9]*$ ]] || return 0
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    for ((n=0;n<50;n++)); do kill -0 -- "-$pgid" 2>/dev/null || break;sleep .1;done
+    if kill -0 -- "-$pgid" 2>/dev/null; then kill -KILL -- "-$pgid" 2>/dev/null || true;fi
+    wait "$pgid" 2>/dev/null || true
+    for ((n=0;n<50;n++)); do kill -0 -- "-$pgid" 2>/dev/null || { MC_CHILD_PID="";return 0; };sleep .1;done
+    MC_CHILDREN_UNREAPED=true
+    return 1
+}
+
+
+mc_cancel() {
+    trap '' INT TERM
+    MC_CANCELLED=true;MC_CANCEL_REASON="${2:-termination requested}"
+    mc_stop_child || true
+    exit "${1:-130}"
+}
+
+
+mc_self_failure() {
+    MC_RESULT=ATTENTION
+    mc_log ERROR "$*" || true
+    mc_note orchestration failed 'Cleanup control-plane failure' "$*" || mc_emergency_notice "$*"
+}
+
+
+mc_emergency_notice() (
+    local detail="$1" marker="${MC_EMERGENCY_MARKER:-/run/media_cleanup-preflight-notified}" fd today=$(date +%F)
     printf '%s\n' "$detail" >&2
-    exec {fd}>"$MC_NOTIFY_LOCK"; flock -x "$fd" || return 1
+    exec {fd}>"$MC_NOTIFY_LOCK";flock -x -w "$MC_LOCK_WAIT_SECONDS" "$fd" || return 1
     [[ ! -L "$marker" ]] || return 1
     [[ ! -r "$marker" || "$(cat "$marker")" != "$today" ]] || return 0
-    "$MC_NOTIFY_BIN" -i alert -s 'Media Cleanup' -d 'Required storage unavailable; workflows not started' -m "$detail" || return 1
+    # Respect the accepted-email cap even if only the status destination failed.
+    if [[ -r "$MC_ROOT/notification-outbox.json" ]] && jq -e --arg day "$today" '.lastSentDate==$day' "$MC_ROOT/notification-outbox.json" >/dev/null 2>&1; then return 0;fi
+    timeout --signal=TERM --kill-after=5 "$MC_NOTIFY_TIMEOUT_SECONDS" "$MC_NOTIFY_BIN" -i alert -s 'Media Cleanup' -d 'Cleanup control-plane attention' -m "$detail" || return 1
     printf '%s' "$today" >"$marker"
 )
+
+
+mc_timed_call() {
+    local kind="$1" function="$2" start rc=0 end;shift 2
+    if [[ -z "${MC_TMP:-}" || ! -d "$MC_TMP" ]]; then "$function" "$@";return $?;fi
+    start=$(date +%s%N)
+    "$function" "$@" || rc=$?
+    end=$(date +%s%N)
+    printf '%s %s\n' "$kind" "$(((end-start)/1000000))" >>"$MC_TMP/arr-${APP_CONTEXT:-unknown}.timings"
+    return "$rc"
+}
+
+mc_arr_metrics() {
+    [[ -d "${MC_TMP:-}" ]] || return 0
+    local api=0 hashing=0 total=$(( $(date +%s)-MC_COMPONENT_STARTED )) other
+    if [[ -f "$MC_TMP/arr-$APP_CONTEXT.timings" ]]; then
+      IFS=' ' read -r api hashing < <(awk '$1=="api"{a+=$2}$1=="hash"{h+=$2}END{printf "%.0f %.0f\n",a,h}' "$MC_TMP/arr-$APP_CONTEXT.timings")
+    fi
+    other=$((total*1000-api-hashing)); ((other>=0)) || other=0
+    log INFO "TIMING | total=${total}s api=${api}ms sidecar-capture=${hashing}ms planning-state-other=${other}ms"
+    if (( ${MOVER_DEFERRALS:-0}>0 || ${FOLDER_CLEANUP_PENDING:-0}>0 )); then
+      jq -n --arg reason "Mover deferrals=${MOVER_DEFERRALS:-0}; pending folders=${FOLDER_CLEANUP_PENDING:-0}; completed actions retained" \
+        '{module:"arr",status:"WARNING",reason:$reason,exit:0}' >"$MC_TMP/arr.result.json" || return 1
+    fi
+}
+
+api_request() { mc_timed_call api arr_api_request_core "$@"; }
+capture_kodi_sidecars() { mc_timed_call hash capture_kodi_sidecars_core "$@"; }
 
 # Shared durable operations and notification helpers (one implementation).
 unraid_mover_running() {
@@ -475,7 +751,8 @@ ops_set_topic() {
             | .id += ":resolved" | .description="Queued condition resolved before delivery"
             | .message=("Earlier queued condition: "+$previousDescription+"\nEarlier detail: "+$previousMessage[0:600]+"\nCurrent result: "+$summary+"\nThe earlier warning is no longer reported as active.")
           else . end)
-    ' "$OPS_NOTIFICATION_STATE" >"$tmp" && mv -f -- "$tmp" "$OPS_NOTIFICATION_STATE"
+    ' "$OPS_NOTIFICATION_STATE" >"$tmp" && mv -f -- "$tmp" "$OPS_NOTIFICATION_STATE" || return 1
+    if [[ "${MC_BRIDGE_ACTIVE:-false}" == true ]]; then ops_flush_notifications || return 1;fi
 }
 
 
@@ -533,6 +810,12 @@ ops_notify() {
 ops_flush_notifications() {
     local tmp selected body importance subject count sent today="$(date +%F)" notify_bin="${NOTIFY_BIN:-${NOTIFY:-}}"
     ops_notification_state || return 1
+    if [[ "${MC_BRIDGE_ACTIVE:-false}" == true ]]; then
+      mc_handoff_ops "$MC_MODULE" || return 1
+      tmp=$(mktemp "$LOG_DIR/.notify-handed-off.XXXXXX") || return 1
+      jq '.outbox=[]' "$OPS_NOTIFICATION_STATE" >"$tmp" && ops_publish_checkpoint "$tmp" "$OPS_NOTIFICATION_STATE" || return 1
+      return 0
+    fi
     jq -e '(.outbox // []|length)>0' "$OPS_NOTIFICATION_STATE" >/dev/null || return 0
     [[ "$(jq -r '.lastSentAt // ""' "$OPS_NOTIFICATION_STATE")" != "$today"* ]] || return 0
     selected=$(mktemp "${LOG_DIR}/.notify-selected.XXXXXX") || return 1
@@ -667,6 +950,7 @@ ops_log() {
 
 # MODULE: ARR -- isolated policy, state and traps.
 mc_arr() (
+MC_MODULE_STATUS="";MC_MODULE_REASON=""
 set -uo pipefail
 IFS=$'\n\t'
 umask 077
@@ -1301,6 +1585,12 @@ send_grouped_notification() {
     NOTIFICATION_FINALIZED=true
     [[ "$SEND_GROUPED_NOTIFICATIONS" == true ]] || return 0
     [[ -n "$NOTIFICATION_BATCH" && -s "$NOTIFICATION_BATCH" ]] || return 0
+    if [[ "${MC_BRIDGE_ACTIVE:-false}" == true ]]; then
+      mc_handoff_arr "$NOTIFICATION_BATCH" || return 1
+      mark_notification_batch_delivered "$NOTIFICATION_BATCH" || return 1
+      : >"$NOTIFICATION_BATCH"
+      return 0
+    fi
     if [[ "$(jq -r '.lastSentAt // ""' "$NOTIFICATION_STATE_FILE")" == "$(date +%Y-%m-%d)"* ]]; then
         log INFO "Daily grouped notification already sent; pending events retained for the next day."
         return 0
@@ -1449,7 +1739,7 @@ cleanup_main() {
 append_persistent_log() { mc_write_line "$1"; }
 
 
-initialize_logging() { mc_write_line "$(date) | INFO | media_cleanup/arr | log initialized" || return 1; LOG_READY=true; }
+initialize_logging() { mc_write_line "$(date '+%Y-%m-%d %H:%M:%S') | INFO | media_cleanup/arr v$MC_VERSION | run=$RUN_ID | MAIN | Logger initialized" || return 1; LOG_READY=true; }
 # Temporary files live beside the state files so replacement stays atomic.
 # This runs only after the unified exclusive lock is held.
 remove_stale_temp_files() {
@@ -1664,7 +1954,7 @@ file_size_bytes() {
     stat -c '%s' -- "$1" 2>/dev/null || stat -f '%z' -- "$1" 2>/dev/null
 }
 
-capture_kodi_sidecars() (
+capture_kodi_sidecars_core() (
     local app_name="$1"
     local media_path="$2"
     local media_root="$3"
@@ -2608,7 +2898,7 @@ verify_arr_checkpoint_with_grace() {
     return 1
 }
 
-api_request() {
+arr_api_request_core() {
     local method="$1"
     local endpoint="$2"
     local payload="$3"
@@ -3674,6 +3964,7 @@ sonarr_commit_state() {
 
 run_sonarr() (
 APP_CONTEXT="SONARR"
+MC_COMPONENT_STARTED=$(date +%s)
 ARR_NAME="Sonarr"
 ARR_URL="$SONARR_URL"
 ARR_API_KEY="$SONARR_API_KEY"
@@ -4227,6 +4518,7 @@ sonarr_prune_state "$SERIES" || die "Could not prune stale Sonarr state safely."
 sonarr_commit_state || die "Could not atomically save state."
 WORK_STATE=""
 
+mc_arr_metrics || die "Cannot record Arr timing/protection outcome."
 ACTION_LABEL=applied
 [[ "$DRY_RUN" == true ]] && ACTION_LABEL=would-apply
 log INFO "Summary: series-listed=$SERIES_LISTED, series-scanned=$SERIES_SCANNED, episodes=$EPISODES_SCANNED, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$EPISODES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, episode-actions-$ACTION_LABEL=$EPISODE_ACTIONS, season-actions-$ACTION_LABEL=$SEASON_ACTIONS, series-actions-$ACTION_LABEL=$SERIES_ACTIONS, tagged-series-$ACTION_LABEL=$TAGGED_SERIES_ACTIONS, retirements-started=$RETIREMENTS_STARTED, retirements-cancelled=$RETIREMENTS_CANCELLED, arr-removals=$ARR_REMOVALS, state-pruned=$STATE_PRUNED, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, late-sidecar-candidates=$SIDECARS_LATE_CANDIDATES, late-sidecars-confirmed-$ACTION_LABEL=$SIDECARS_LATE_CONFIRMED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, folder-cleanup-pending=$FOLDER_CLEANUP_PENDING, mover-deferrals=$MOVER_DEFERRALS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
@@ -4459,7 +4751,7 @@ main() {
     else
         lock_rc=$?
         case "$lock_rc" in
-            2) return 0 ;;
+            2) MC_MODULE_STATUS=DEFERRED;MC_MODULE_REASON="Another Arr run holds its runtime lock";return 0 ;;
             *) die "Cannot acquire unified runtime lock." ;;
         esac
     fi
@@ -4469,7 +4761,7 @@ main() {
     }
 
     exec 8>"$QUARANTINE_COORDINATION_LOCK"
-    flock -n 8 || { log WARNING "Metadata quarantine is in use; scheduled run deferred without changes."; return 0; }
+    flock -n 8 || { MC_MODULE_STATUS=DEFERRED;MC_MODULE_REASON="Metadata quarantine producer lock is active"; log WARNING "Metadata quarantine is in use; scheduled run deferred without changes."; return 0; }
     VERIFY_RUNTIME_DIR=$(mktemp -d /tmp/arr-delete-verify.XXXXXX) || return 1
     remove_stale_temp_files
     initialize_grouped_notifications || die "${INITIALIZATION_FAILURE_REASON:-Could not initialize the action journal or grouped notification state; existing records were preserved.}"
@@ -5176,6 +5468,7 @@ radarr_movie_name() {
 
 run_radarr() (
 APP_CONTEXT="RADARR"
+MC_COMPONENT_STARTED=$(date +%s)
 ARR_NAME="Radarr"
 ARR_URL="$RADARR_URL"
 ARR_API_KEY="$RADARR_API_KEY"
@@ -5581,6 +5874,7 @@ radarr_prune_state "$CURRENT_SNAPSHOT_FILE" || die "Could not prune stale Radarr
 radarr_commit_state || die "Could not atomically save state."
 WORK_STATE=""
 
+mc_arr_metrics || die "Cannot record Arr timing/protection outcome."
 ACTION_LABEL=applied
 [[ "$DRY_RUN" == true ]] && ACTION_LABEL=would-apply
 log INFO "Summary: movies-listed=$MOVIES_LISTED, movies-scanned=$MOVIES_SCANNED, recovery-held=$RECOVERY_HELD_COUNT, files-present=$FILES_PRESENT, first-missing=$FIRST_MISSING, confirmed=$MOVIES_CONFIRMED, history-inspected=$HISTORY_INSPECTIONS, history-delete-events=$HISTORY_DELETE_EVENTS, history-cap-skips=$HISTORY_LIMIT_SKIPS, tag-actions-$ACTION_LABEL=$TAG_ACTIONS, retirements-started=$RETIREMENTS_STARTED, retirements-cancelled=$RETIREMENTS_CANCELLED, arr-removals=$ARR_REMOVALS, state-pruned=$STATE_PRUNED, sidecars-captured=$SIDECARS_CAPTURED, sidecars-$ACTION_LABEL=$SIDECARS_QUARANTINED, late-sidecar-candidates=$SIDECARS_LATE_CANDIDATES, late-sidecars-confirmed-$ACTION_LABEL=$SIDECARS_LATE_CONFIRMED, sidecars-native-missing=$SIDECARS_NATIVE_MISSING, sidecars-changed=$SIDECARS_CHANGED, folders-removed-$ACTION_LABEL=$FOLDERS_REMOVED, folder-cleanup-pending=$FOLDER_CLEANUP_PENDING, mover-deferrals=$MOVER_DEFERRALS, api-failures=$API_FAILURES, history-failures=$HISTORY_FAILURES, sidecar-failures=$SIDECAR_FAILURES."
@@ -9578,6 +9872,10 @@ update_lifecycle_notifications() {
 
 main() {
     local mode="${1:-$DEFAULT_MODE}" failure_detail=""
+    if [[ "$MC_DRY_RUN" == true ]]; then
+      [[ "$mode" != purge ]] || mode=audit
+      [[ "$mode" != restore ]] || { printf 'Restore refused in preview mode.\n' >&2;return 2; }
+    fi
     trap cleanup EXIT
     case "$mode" in
       --help|-h) printf '%s\n' 'Usage: /bin/bash SCRIPT quarantine [audit|purge|restore RUN_ID movies|series RELATIVE_PATH|--version]' 'audit changes no quarantine payload. purge defaults to scheduled retention with per-run limits.' 'restore never overwrites an existing path. All modes coordinate with the Arr producer.' '--pending-operations lists unfinished checkpoints; --resolve-operation ID "verified outcome" records an operator decision without moving/deleting payloads.'; RESULT_STATUS=OK; RESULT_SUMMARY="Help displayed"; trap - EXIT; return 0 ;;

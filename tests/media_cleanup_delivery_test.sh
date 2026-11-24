@@ -52,7 +52,7 @@ for file in "$MC_ROOT/media-cleanup.log"*; do (( $(stat -c %s "$file")<=MC_LOG_M
 [[ ! -e "$MC_ROOT/media-cleanup.log.3" ]]
 # Module failures retain their exit and do not prevent independent safe modules.
 MC_TMP="$fixture/work";mkdir "$MC_TMP";printf '[]' >"$MC_TMP/outcomes.json"
-MC_RESULT=OK;MC_OUTCOMES=''
+MC_RESULT=OK;MC_OUTCOMES='';MC_STARTED=$(date +%s);MC_MODE=arr
 mc_arr() { printf 'API unreachable; no payload mutated\n'; return 2; }
 mc_sab() { printf 'Completed independent SAB inspection\n'; }
 mc_quarantine() { printf 'Operational-state export active; lifecycle deferred without changes.\n'; }
