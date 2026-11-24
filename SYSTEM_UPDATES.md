@@ -33,7 +33,9 @@ four due checks per run and bounded failure backoff. Inventory is published in
 bulk to reduce repeated state-file writes.
 
 Normal installation/verification receipts are grouped into **one 15:45 daily
-summary**. Failures and attention reports bypass the cutoff. The report lists
+summary**. Failures and attention reports bypass the cutoff. Routine events recorded after
+the daily summary wait for the next summary; failed pages of an already sealed
+report remain eligible for prompt retries, including across midnight. The report lists
 verified updates with previous/new version or digest, pending outcomes, and every
 remaining installed item with its last-check time and reason for staying unchanged.
 Unverified checks are not described as up to date. No-update days still receive

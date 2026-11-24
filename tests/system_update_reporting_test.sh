@@ -18,9 +18,10 @@ grep -q 'OS update is manual' "$fixture/report"
 daily_update_report;first=$(jq '.outbox|length' "$STATE_FILE");daily_update_report
 [[ $(jq '.outbox|length' "$STATE_FILE") == "$first" && "$first" -gt 0 ]]
 # Verify no record is lost/truncated across multi-email UTF-8 pagination.
-mutate '.outbox=[] | .delivered={}'
+mutate '.outbox=[] | .delivered={} | .normalDeliveryIds=[]'
 long=$(for ((i=1;i<=400;i++));do printf 'record-%04d 日本語 metadata and verified action details retained in report\n' "$i";done)
 event normal 'Large report' "$long" pagination
+mutate '.normalDeliveryIds=[.outbox[].id]'
 jq -e '[.outbox[].detail|utf8bytelength]|all(.<=11000)' "$STATE_FILE" >/dev/null
 jq -r '.outbox[].detail' "$STATE_FILE" >"$fixture/combined"
 for n in 0001 0100 0200 0300 0400;do grep -q "record-$n" "$fixture/combined";done
@@ -34,7 +35,7 @@ for ((i=0;i<20;i++));do [[ $(jq '.outbox|length' "$STATE_FILE") -gt 0 ]] || brea
 for n in 0001 0100 0200 0300 0400;do grep -q "record-$n" "$fixture/mail";done
 # Future daily cutoff suppresses normal events, while urgent attention bypasses.
 policy_update '.reportTime="23:59"'
-mutate '.outbox=[] | .delivered={}'
+mutate '.outbox=[] | .delivered={} | .normalDeliveryIds=[]'
 event normal 'Routine action' 'Retain until daily cutoff' routine
 # A local clock before the cutoff makes this assertion deterministic on Hubble
 # and elsewhere without modifying the execution host clock.
@@ -45,4 +46,15 @@ event alert 'Failed native result' 'Outcome unverified; further updates held' ur
 flush_notifications
 [[ $(jq '.outbox|length' "$STATE_FILE") == 0 ]]
 grep -q 'Failed native result' "$fixture/mail"
+# A normal receipt after today's already sealed/sent summary must not make
+# another routine email; tomorrow's daily batch will include it.
+mutate '.outbox=[] | .delivered={} | .normalDeliveryIds=[]'
+policy_update '.reportTime="00:00"'
+event normal 'Late verification completed' 'Include in the next daily summary' late
+count=$(wc -l <"$fixture/mail");daily_update_report;flush_notifications
+[[ $(jq '.outbox|length' "$STATE_FILE") == 1 && $(wc -l <"$fixture/mail") == "$count" ]]
+mutate 'del(.lastDailyReportDay)'
+daily_update_report;flush_notifications
+[[ $(jq '.outbox|length' "$STATE_FILE") == 0 ]]
+grep -q 'Late verification completed' "$fixture/mail"
 printf 'Daily updated/deferred/current/unknown classification, single report, UTF-8 pagination, failure retry and urgent bypass passed\n'

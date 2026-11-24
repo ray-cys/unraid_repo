@@ -1,7 +1,7 @@
 #!/bin/bash
 clearLog=true
 arrayStarted=true
-# System Update Coordinator v1.1.0 -- personal Hubble maintenance.
+# System Update Coordinator v1.1.1 -- personal Hubble maintenance.
 # PURPOSE: Detect Docker/plugin/Unraid OS updates; automatically install only
 # explicitly approved, still-installed items during a bounded maintenance window.
 # Native DockerMan/plugin installers retain their normal configuration semantics.
@@ -75,7 +75,7 @@ usr_ops_append_log() {
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.1.1"
 # Keep configured per-item holds when approving the same installed identity.
 # Daily rolling tags need a shorter hold to avoid perpetually chasing rebuilds.
 readonly APPROVAL_JQ='def approval($old;$identity;$allow;$kind;$epoch):
@@ -119,7 +119,7 @@ adapter(){ bounded 100 php "$TMP_DIR/native.php" "$@"; }
 export_lock(){ exec {EXPORT_FD}>"$STATE_EXPORT_LOCK" && flock -s -w 20 "$EXPORT_FD"; }
 export_unlock(){ [[ -z "${EXPORT_FD:-}" ]] || exec {EXPORT_FD}>&-; }
 publish(){ local from="$1" to="$2" rc=0;export_lock || return 1;sync -f "$from" && mv "$from" "$to" && sync -f "${to%/*}" || rc=$?;export_unlock;return "$rc"; }
-state_valid(){ jq -e '.schema==1 and (.items|type)=="object" and (.jobs|type)=="object" and (.outbox|type)=="array"' "$1" >/dev/null 2>&1; }
+state_valid(){ jq -e '.schema==1 and (.items|type)=="object" and (.jobs|type)=="object" and (.outbox|type)=="array" and (.normalDeliveryIds==null or ((.normalDeliveryIds|type)=="array" and all(.normalDeliveryIds[];type=="string")))' "$1" >/dev/null 2>&1; }
 mutate(){ jq "$@" "$STATE_FILE" >"$TMP_DIR/state.next" && state_valid "$TMP_DIR/state.next" && publish "$TMP_DIR/state.next" "$STATE_FILE"; }
 policy_valid(){ jq -e '
  .schema==1 and (.enabled|type)=="boolean" and (.docker|type)=="object" and (.plugins|type)=="object" and
@@ -239,6 +239,10 @@ initialize() {
       policy_valid "$TMP_DIR/policy.initial" && publish "$TMP_DIR/policy.initial" "$POLICY_FILE" || return 1
     fi
     policy_valid "$POLICY_FILE" || { log ERROR 'Policy invalid; preserved; updates prohibited';return 1; }
+    # Preserve retry eligibility when upgrading an already queued daily report.
+    if jq -e '.normalDeliveryIds==null and any(.outbox[];.importance=="normal" and (.subject|startswith("Daily update summary")))' "$STATE_FILE" >/dev/null;then
+      mutate '.normalDeliveryIds=[.outbox[]|select(.importance=="normal")|.id]' || return 1
+    fi
 }
 
 collect_inventory() {
@@ -703,18 +707,17 @@ daily_update_report() {
     [[ "$clock" > "$(jq -r '.reportTime // "15:45"' "$POLICY_FILE")" || "$clock" == "$(jq -r '.reportTime // "15:45"' "$POLICY_FILE")" ]] || return 0
     [[ $(jq -r '.lastDailyReportDay // ""' "$STATE_FILE") != "$day" ]] || return 0
     report=$(render_update_report) || return 1
-    event normal 'Daily update summary' "$report" "daily-update-report:$day" && mutate --arg day "$day" '.lastDailyReportDay=$day'
+    event normal 'Daily update summary' "$report" "daily-update-report:$day" && mutate --arg day "$day" '.lastDailyReportDay=$day | .normalDeliveryIds=[.outbox[]|select(.importance=="normal")|.id]'
 }
 
 flush_notifications() {
-    local body count importance rc=0 now day_start clock after=false urgent=false total
-    now=$(date +%s);clock=$(TZ=Asia/Singapore date +%H:%M);day_start=$(TZ=Asia/Singapore date -d "$(TZ=Asia/Singapore date +%F) 00:00:00" +%s)
-    [[ "$clock" < "$(jq -r '.reportTime // "15:45"' "$POLICY_FILE")" ]] || after=true
+    local body count importance rc=0 urgent=false total
     jq -e 'any(.outbox[];.importance!="normal")' "$STATE_FILE" >/dev/null && urgent=true
     jq -e '.outbox|length>0' "$STATE_FILE" >/dev/null || return 0
     # Whole bounded events only. Any remainder is retained for a later run.
-    jq --argjson after "$after" --argjson urgent "$urgent" --argjson start "$day_start" '
-      reduce ((.outbox|sort_by(if .importance=="alert" then 0 elif .importance=="warning" then 1 else 2 end))[]|select($after or $urgent or .at<$start)) as $e ({bytes:0,items:[]};
+    jq --argjson urgent "$urgent" '
+      (.normalDeliveryIds // []) as $batch |
+      reduce ((.outbox|sort_by(if .importance=="alert" then 0 elif .importance=="warning" then 1 else 2 end))[]|. as $event|select($urgent or ($batch|index($event.id))!=null)) as $e ({bytes:0,items:[]};
         (($e.subject+"\nObserved: "+($e.at|tostring)+"\n"+$e.detail+"\n")|utf8bytelength) as $n |
         if .bytes+$n+300<19000 then .bytes+=($n+300)|.items+=[$e] else . end)|.items' "$STATE_FILE" >"$TMP_DIR/notify-selected.json" || return 1
     count=$(jq length "$TMP_DIR/notify-selected.json");((count>0)) || { log INFO "Routine update events retained for the daily report cutoff; urgent attention bypasses batching";return 0; }
@@ -726,6 +729,7 @@ flush_notifications() {
     if ((rc==0));then mutate --slurpfile sent "$TMP_DIR/notify-selected.json" --argjson now "$(date +%s)" '
       reduce $sent[0][] as $e (.;.delivered[$e.id]=$now) |
       .outbox=([.outbox[]|. as $e|select(all($sent[0][];.id!=$e.id))]) |
+      .normalDeliveryIds=([(.normalDeliveryIds // [])[] | . as $id | select(all($sent[0][];.id!=$id))]) |
       .delivered |= with_entries(select(.value>=$now-30*86400))' || return 1;fi
     if ((rc==0));then log INFO "Notification accepted; acknowledged $count event(s); $((total-count)) retained";else log ERROR "Notification delivery failed; $total queued event(s) retained for retry";fi
     return "$rc"
