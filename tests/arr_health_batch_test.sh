@@ -2,7 +2,7 @@
 set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 root=$(mktemp -d /tmp/arr-health-batch.XXXXXX)
-source <(awk '/^# LOCK$/{exit} {print}' "$repo/user_script/arr_health_activity.sh")
+source <(awk '/^# LOCK$/{exit} {print}' "$repo/user_script/media_health_monitor.sh")
 trap - INT TERM HUP
 trap 'rm -rf -- "$root"' EXIT
 TMP_DIR="$root" STATE_FILE="$root/state.json"

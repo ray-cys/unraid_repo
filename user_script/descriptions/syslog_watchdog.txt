@@ -1,0 +1,1 @@
+Monitor new Unraid syslog entries for configured error keywords and notify only when new, non-ignored matching entries are detected<br>

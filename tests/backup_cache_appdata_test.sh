@@ -3,15 +3,15 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SCRIPT="${REPO_ROOT}/user_script/appdata_backup.sh"
-TEST_ROOT="$(mktemp -d /tmp/appdata_backup_test.XXXXXX)"
+SCRIPT="${REPO_ROOT}/user_script/backup_cache_appdata.sh"
+TEST_ROOT="$(mktemp -d /tmp/backup_cache_appdata_test.XXXXXX)"
 export DOCKER_MAINTENANCE_DIR="$TEST_ROOT/maintenance"
 TEST_PLEX_HUBBLE_DATABASE_BACKUP_PATH=""
 TEST_PLEX_NODE_DATABASE_BACKUP_PATH=""
 
 cleanup() {
     case "$TEST_ROOT" in
-        /tmp/appdata_backup_test.*)
+        /tmp/backup_cache_appdata_test.*)
             rm -rf -- "$TEST_ROOT"
             ;;
     esac
@@ -631,4 +631,4 @@ then
     fail "failed pipeline left a partial backup"
 fi
 
-printf 'appdata_backup fixture tests passed\n'
+printf 'backup_cache_appdata fixture tests passed\n'

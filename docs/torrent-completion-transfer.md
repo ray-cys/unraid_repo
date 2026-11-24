@@ -1,7 +1,7 @@
 # Completed torrent transfer policy (v3.1)
 
-`completed_torrent_download.sh` is installed as Unraid User Script
-`torrent_download_complete`. It retains its existing two-hour schedule,
+`media_torrent_management.sh` is installed as Unraid User Script
+`media_torrent_management`. It retains its existing two-hour schedule,
 console-only output, filename cleanup, unwanted-file rules, duplicate handling,
 Mover/maintenance guards, and recovery checkpoint. No Docker configuration or
 qBittorrent seeding/removal setting is changed.
@@ -37,7 +37,7 @@ are deduplicated by size and hash; different destination collisions survive as
 no ambiguous automatic mutation replay was added. VueTorrent retains its existing
 weekly refresh logic; validation does not invoke it.
 
-Run `bash /boot/config/plugins/user.scripts/scripts/torrent_download_complete/script --help`
+Run `bash /boot/config/plugins/user.scripts/scripts/media_torrent_management/script --help`
 for usage, or `--version` for the installed version. A normal manual invocation is
 a real transfer run, not a preview.
 

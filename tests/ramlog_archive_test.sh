@@ -3,7 +3,7 @@ set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 fixture=$(mktemp -d /tmp/ramlog-archive.XXXXXX); fixture=$(realpath "$fixture")
 trap 'rm -rf -- "$fixture"' EXIT
-source "$repo/user_script/ramlog_monitor.sh"
+source "$repo/user_script/ram_logs_watchdog.sh"
 RAMLOG_PATH="$fixture/ramlogs"; VAULT_MOUNT="$fixture/vault"; ARCHIVE_ROOT="$VAULT_MOUNT/archives"
 STATE_DIR="$fixture/state"; BOOT_ID_FILE="$fixture/boot-id"
 mkdir -p "$RAMLOG_PATH/app" "$VAULT_MOUNT" "$STATE_DIR"
@@ -63,7 +63,7 @@ archive_ramlogs checkpoint
 [[ ! -e "$partial" ]]
 printf 'Missing vault, failed capture and interrupted staging preserve completed archives\n'
 # Event adapter is idempotent, bounded, and preserves unrecognized hooks.
-ARCHIVE_HOOK_ROOT="$fixture/hook"; EMHTTP_EVENT="$fixture/emhttp_event"; INSTALLED_SCRIPT="$repo/user_script/ramlog_monitor.sh"
+ARCHIVE_HOOK_ROOT="$fixture/hook"; EMHTTP_EVENT="$fixture/emhttp_event"; INSTALLED_SCRIPT="$repo/user_script/ram_logs_watchdog.sh"
 printf '# unmounting_disks\n' >"$EMHTTP_EVENT"
 # Fixture hook root meets the production /tmp namespace rule on Linux/macOS.
 ARCHIVE_HOOK_ROOT="/tmp/$(basename "$fixture")/hook"

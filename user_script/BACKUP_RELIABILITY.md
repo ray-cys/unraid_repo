@@ -1,7 +1,7 @@
 # Hubble to ISS backup operations
 
-`remote_backup.sh` v2.3 mirrors Media/Secure to the existing ISS shares.
-`vault_backup.sh` v1.5 creates independently verified full generations under
+`backup_media_remote.sh` v2.3 mirrors Media/Secure to the existing ISS shares.
+`backup_vault_remote.sh` v1.5 creates independently verified full generations under
 `/mnt/user/backup/vault_versions`. Each remains a standalone Unraid User Script;
 no helper library or service needs installing. Deploy **both** updated scripts
 so they honor the same ISS lock. Repository changes do not install them on Unraid.
@@ -146,9 +146,9 @@ References: [rsync options](https://download.samba.org/pub/rsync/rsync.1),
 ## Completion-driven vault copies (appdata v3.7 / vault v1.6)
 
 On Hubble, keep the appdata schedule and replace the weekly
-`vault_remote_backup` schedule with `10 * * * *`. The hourly job checks local
+`backup_vault_remote` schedule with `10 * * * *`. The hourly job checks local
 metadata first; without a new request it exits without WOL, SSH, rsync, a new
-backup log, or notification. `remote_backup` keeps its existing Sunday mirror
+backup log, or notification. `backup_media_remote` keeps its existing Sunday mirror
 schedule and shared ISS lease.
 
 A fully successful appdata run (including staged-generation recovery and
@@ -222,7 +222,7 @@ untrusted backups.
 
 ## Arr monitoring during appdata maintenance
 
-`arr_health_activity.sh` v3.13.2 and appdata v3.7 coordinate through
+`media_health_monitor.sh` v3.13.2 and appdata v3.7 coordinate through
 `/run/arr-appdata-coordination.lock`. A normal Arr scan holds it shared through
 its observation, automation and notification phases. Appdata waits up to fifteen
 minutes for an existing scan before it can stop containers, then holds it

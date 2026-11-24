@@ -7,7 +7,7 @@ trap 'rm -rf -- "$fixture"' EXIT
 export fixture repo
 bash <<'VAULT'
 set -euo pipefail
-source "$repo/user_script/vault_backup.sh"
+source "$repo/user_script/backup_vault_remote.sh"
 LOG_DIR="$fixture/vault";mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/log";ISS_REQUEST_FILE="$fixture/request.json"
 NOTIFY_BIN="$fixture/notifier"
@@ -18,7 +18,7 @@ notify_unraid alert 'Backup failed' failed
 notify_unraid alert 'Backup failed' failed
 [[ "$NOTIFICATION_RESULT" == suppressed && $(wc -l <"$fixture/mail") == 1 ]]
 # Repeated invocations share the same state, not shell globals.
-(bash -c 'source "$repo/user_script/vault_backup.sh";LOG_DIR="$fixture/vault";LOG_FILE="$LOG_DIR/log";NOTIFY_BIN="$fixture/notifier";ISS_REQUEST_ID=gen-A;VAULT_NOTIFICATION_REASON=capacity;notify_unraid alert "Backup failed" failed;[[ "$NOTIFICATION_RESULT" == suppressed ]]')
+(bash -c 'source "$repo/user_script/backup_vault_remote.sh";LOG_DIR="$fixture/vault";LOG_FILE="$LOG_DIR/log";NOTIFY_BIN="$fixture/notifier";ISS_REQUEST_ID=gen-A;VAULT_NOTIFICATION_REASON=capacity;notify_unraid alert "Backup failed" failed;[[ "$NOTIFICATION_RESULT" == suppressed ]]')
 # The daily reminder is allowed without changing its incident identity.
 jq '.activeFailure.lastSentAt-=86401' "$VAULT_NOTIFICATION_STATE" >"$fixture/old";mv "$fixture/old" "$VAULT_NOTIFICATION_STATE"
 notify_unraid alert 'Backup failed' failed
@@ -44,7 +44,7 @@ jq -e '.activeFailure.requestId=="gen-C"' "$VAULT_NOTIFICATION_STATE" >/dev/null
 VAULT
 bash <<'ARR'
 set -euo pipefail
-source <(awk '/^# LOCK$/{exit}{print}' "$repo/user_script/arr_health_activity.sh")
+source <(awk '/^# LOCK$/{exit}{print}' "$repo/user_script/media_health_monitor.sh")
 trap - EXIT INT TERM HUP
 [[ "$ERROR_REMINDER_INTERVAL_HOURS" == 24 && "$REMINDER_MAX_COUNT" == 3 ]]
 STATE_FILE="$fixture/arr-state";TMP_DIR="$fixture";NOTIFICATIONS_SUPPRESSED=0

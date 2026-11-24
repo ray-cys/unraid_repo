@@ -1,0 +1,1 @@
+Monitor dedicated RAM-log storage and preserve recent application logs before a clean stop or after an unexpected loss of RAM<br>

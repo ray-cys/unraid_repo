@@ -2,7 +2,7 @@
 # Merged control-plane state and receipts survive restore export; no live calls.
 set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-source "$repo/user_script/vault_backup.sh"
+source "$repo/user_script/backup_vault_remote.sh"
 fixture=$(mktemp -d /tmp/media-cleanup-export.XXXXXX); fixture=$(realpath "$fixture")
 trap 'rm -rf -- "$fixture"' EXIT
 OPERATIONS_STATE_MOUNT_ROOT="$fixture/vault"
@@ -16,8 +16,8 @@ for file in arr/sonarr-state.json arr/radarr-state.json arr/pending-actions.json
 done
 printf '{"proof":"exact payload"}\n' >"$OPERATIONS_SCRIPT_ROOT/media_cleanup/sab/purge-receipts/run.jsonl"
 printf 'path\tbytes\nExample/poster.jpg\t1024\n' >"$OPERATIONS_SCRIPT_ROOT/media_cleanup/quarantine/purge-receipts/run.tsv"
-mkdir -p "$OPERATIONS_SCRIPT_ROOT/vault_backup"
-printf '{"schema":1,"activeFailure":{"signature":"preserved"}}' >"$OPERATIONS_SCRIPT_ROOT/vault_backup/notification-state.json"
+mkdir -p "$OPERATIONS_SCRIPT_ROOT/backup_vault_remote"
+printf '{"schema":1,"activeFailure":{"signature":"preserved"}}' >"$OPERATIONS_SCRIPT_ROOT/backup_vault_remote/notification-state.json"
 printf 'not exported' >"$OPERATIONS_SCRIPT_ROOT/media_cleanup/media-cleanup.log"
 vault_capture_recovery() { mkdir "$1";printf '{}' >"$1/inventory.json"; }
 log() { :; }
@@ -27,5 +27,5 @@ for file in arr/sonarr-state.json arr/radarr-state.json arr/pending-actions.json
 done
 [[ ! -e "$OPERATIONS_STATE_ROOT/media_cleanup/media-cleanup.log" ]]
 [[ ! -e "$OPERATIONS_STATE_ROOT/arr_delete_sync_tag" ]]
-cmp "$OPERATIONS_SCRIPT_ROOT/vault_backup/notification-state.json" "$OPERATIONS_STATE_ROOT/vault_backup/notification-state.json"
+cmp "$OPERATIONS_SCRIPT_ROOT/backup_vault_remote/notification-state.json" "$OPERATIONS_STATE_ROOT/backup_vault_remote/notification-state.json"
 printf 'Merged nested state, pending operations, unsent notification and purge receipts exported; logs excluded\n'

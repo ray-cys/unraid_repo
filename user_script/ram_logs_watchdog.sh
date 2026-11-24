@@ -1,5 +1,5 @@
 #!/bin/bash
-# RAM-log readiness and lifecycle monitor v3.0 (Unraid User Scripts).
+# RAM-log readiness and lifecycle monitor v3.1 (Unraid User Scripts).
 # Schedule: */10 * * * * (unchanged). Normal runs check RAM-log health and save
 # changed logs to vault at most once per interval. Application logs are never
 # deleted/truncated/rotated. --prepare is the existing PRE-DOCKER boot hook;
@@ -20,7 +20,7 @@
 # All archive diagnostics go to console and existing monitor health reporting,
 # never a new syslog stream or additional scheduled User Script.
 set -uo pipefail
-readonly SCRIPT_VERSION="3.0"
+readonly SCRIPT_VERSION="3.1"
 RAMLOG_PATH="${RAMLOG_PATH:-/mnt/ramlogs}"
 RAMLOG_SIZE="${RAMLOG_SIZE:-2G}"
 RAMLOG_APPS=(sonarr radarr prowlarr bazarr tautulli recyclarr sabnzbd qbittorrent imagemaid seerr lumunarr)
@@ -29,19 +29,19 @@ CRITICAL_PERCENT=90
 RECOVER_PERCENT=65
 REMINDER_SECONDS=86400
 APP_WARNING_BYTES=$((512 * 1024 * 1024))
-STATE_DIR="${STATE_DIR:-/run/ramlog-monitor}"
+STATE_DIR="${STATE_DIR:-/run/ram_logs_watchdog}"
 NOTIFY="${NOTIFY:-/usr/local/emhttp/webGui/scripts/notify}"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 
-ARCHIVE_ROOT="${ARCHIVE_ROOT:-/mnt/vault/cloud/logs/ramlog_archives}"
+ARCHIVE_ROOT="${ARCHIVE_ROOT:-/mnt/vault/cloud/logs/ram_logs_watchdog_archives}"
 VAULT_MOUNT="${VAULT_MOUNT:-/mnt/vault}"
 ARCHIVE_INTERVAL_SECONDS="${ARCHIVE_INTERVAL_SECONDS:-600}"
 ARCHIVE_MAX_BYTES=$((256 * 1024 * 1024))
 ARCHIVE_RESERVE_BYTES=$((64 * 1024 * 1024))
 ARCHIVE_TIMEOUT_SECONDS=25
-ARCHIVE_HOOK_ROOT="${ARCHIVE_HOOK_ROOT:-/usr/local/emhttp/plugins/ramlog.monitor}"
+ARCHIVE_HOOK_ROOT="${ARCHIVE_HOOK_ROOT:-/usr/local/emhttp/plugins/ram_logs_watchdog}"
 EMHTTP_EVENT="${EMHTTP_EVENT:-/usr/local/sbin/emhttp_event}"
-INSTALLED_SCRIPT="${INSTALLED_SCRIPT:-/boot/config/plugins/user.scripts/scripts/ramlog_monitor/script}"
+INSTALLED_SCRIPT="${INSTALLED_SCRIPT:-/boot/config/plugins/user.scripts/scripts/ram_logs_watchdog/script}"
 BOOT_ID_FILE="${BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
 readonly SELF_PATH="$(realpath -- "${BASH_SOURCE[0]}")"
 ARCHIVE_LAST_ERROR=""
@@ -57,7 +57,7 @@ install_archive_hook() {
     [[ ! -L "$ARCHIVE_HOOK_ROOT" && $(realpath -m "$ARCHIVE_HOOK_ROOT") == "$ARCHIVE_HOOK_ROOT" &&
        "$INSTALLED_SCRIPT" == /* && "$INSTALLED_SCRIPT" != *$'\n'* ]] || return 1
     if [[ -e "$hook" ]]; then
-        [[ -f "$hook" && ! -L "$hook" ]] && grep -Fqx '# Managed by ramlog_monitor.sh archive hook v1' "$hook" || {
+        [[ -f "$hook" && ! -L "$hook" ]] && grep -Fqx '# Managed by ram_logs_watchdog.sh archive hook v1' "$hook" || {
             printf 'Unrecognized archive event hook preserved.\n' >&2; return 1;
         }
     fi
@@ -65,7 +65,7 @@ install_archive_hook() {
     mkdir -p -- "${hook%/*}" || return 1
     temp=$(mktemp "${hook%/*}/.ramlog-hook.XXXXXX") || return 1
     {
-        printf '#!/bin/bash\n# Managed by ramlog_monitor.sh archive hook v1\n'
+        printf '#!/bin/bash\n# Managed by ram_logs_watchdog.sh archive hook v1\n'
         printf 'cd /\n'
         printf 'if ! /usr/bin/timeout --kill-after=2 %s /bin/bash %q --archive shutdown; then\n' "$ARCHIVE_TIMEOUT_SECONDS" "$INSTALLED_SCRIPT"
         printf '  printf "%%s\\n" "RAM-log shutdown archive incomplete; previous completed checkpoints retained." >/dev/console\nfi\nexit 0\n'
@@ -97,7 +97,7 @@ archive_generation_valid() {
     jq -e '.schema==1 and (.bootId|test("^[a-f0-9-]{36}$")) and (.createdAt|type=="number")' "$dir/manifest.json" >/dev/null
 }
 
-prune_ramlog_archives() {
+prune_ram_logs_watchdog_archives() {
     local list="$STATE_DIR/archive-retention.list" dir boot kept=1 promoted="$1" promoted_boot
     local -A retained_boots=()
     archive_generation_valid "$promoted" || return 1
@@ -151,12 +151,12 @@ archive_ramlogs() (
     [[ -s "$files" ]] || { printf 'Archive skipped: RAM log tree has no regular files.\n'; return 0; }
     fingerprint=$(sha256sum "$inventory" | awk '{print $1}') || return 1
     if [[ -d "$ARCHIVE_ROOT" ]]; then
-        if [[ ! -f "$ARCHIVE_ROOT/.owner" || -L "$ARCHIVE_ROOT/.owner" || $(cat "$ARCHIVE_ROOT/.owner") != ramlog_monitor ]]; then
+        if [[ ! -f "$ARCHIVE_ROOT/.owner" || -L "$ARCHIVE_ROOT/.owner" || $(cat "$ARCHIVE_ROOT/.owner") != ram_logs_watchdog ]]; then
             printf 'Archive failed: existing destination is unowned; preserved.\n' >&2; return 1
         fi
     else
         mkdir -m 700 -- "$ARCHIVE_ROOT" || return 1
-        printf 'ramlog_monitor\n' >"$ARCHIVE_ROOT/.owner" || return 1
+        printf 'ram_logs_watchdog\n' >"$ARCHIVE_ROOT/.owner" || return 1
     fi
     # Only this worker owns the archive lock. Remove recognizable interrupted
     # staging directories; completed generations are never treated as scratch.
@@ -170,7 +170,7 @@ archive_ramlogs() (
         [[ -n "$dir" ]] || continue
         if archive_generation_valid "$ARCHIVE_ROOT/$dir" && [[ $(jq -r .bootId "$ARCHIVE_ROOT/$dir/manifest.json") == "$boot" ]]; then newest="$ARCHIVE_ROOT/$dir"; break; fi
     done < <(find "$ARCHIVE_ROOT" -mindepth 1 -maxdepth 1 -type d -name 'ramlogs_*' -printf '%f\n' | sort -r)
-    [[ -z "$newest" ]] || prune_ramlog_archives "$newest" || return 1
+    [[ -z "$newest" ]] || prune_ram_logs_watchdog_archives "$newest" || return 1
     if [[ "$reason" == checkpoint && -n "$newest" ]]; then
         local epoch
         epoch=$(jq -r .createdAt "$newest/manifest.json")
@@ -218,7 +218,7 @@ archive_ramlogs() (
     mv -- "$stage" "$target" || return 1
     stage=''
     sync -- "$ARCHIVE_ROOT" || return 1
-    prune_ramlog_archives "$target" || { printf 'Archive completed but retention needs review; existing generations preserved.\n' >&2; return 1; }
+    prune_ram_logs_watchdog_archives "$target" || { printf 'Archive completed but retention needs review; existing generations preserved.\n' >&2; return 1; }
     printf 'RAM logs archived: reason=%s; selected files=%s; compressed=%s bytes; destination=%s; retained=at most two boot snapshots.\n' "$reason" "$count" "$size" "$target"
 )
 
@@ -315,7 +315,7 @@ monitor_ramlogs() {
     if mountpoint -q /mnt/vault; then
         mkdir -p -- "$STATUS_DIR" || return 1
         temp=$(mktemp "$STATUS_DIR/.ramlog.XXXXXX") || return 1
-        jq --arg name ramlog_monitor '{name:$name,status:.condition,summary:.reason,epoch:.epoch}' "$STATE_DIR/state.json" >"$temp" && mv "$temp" "$STATUS_DIR/ramlog_monitor.json" || return 1
+        jq --arg name ram_logs_watchdog '{name:$name,status:.condition,summary:.reason,epoch:.epoch}' "$STATE_DIR/state.json" >"$temp" && mv "$temp" "$STATUS_DIR/ram_logs_watchdog.json" || return 1
     fi
     [[ "$condition" != CRITICAL ]]
 }
@@ -324,7 +324,7 @@ main() {
         --prepare) prepare_ramlogs && install_archive_hook;;
         --install-hook) install_archive_hook;;
         --archive) archive_ramlogs "${2:-manual}";;
-        --version) printf 'ramlog_monitor.sh %s\n' "$SCRIPT_VERSION";;
+        --version) printf 'ram_logs_watchdog.sh %s\n' "$SCRIPT_VERSION";;
         --help) printf 'Usage: bash script [--prepare|--install-hook|--archive [manual|checkpoint|shutdown]|--version]\nNormal schedule stays */10 * * * *: health checks plus changed-log checkpoints. Two boot snapshots maximum, 256 MiB compressed each. --prepare mounts RAM logs before Docker and installs the shutdown event hook. --install-hook changes only the owned RAM-resident event adapter. --archive writes a vault snapshot; never restores old logs. Sudden power loss loses changes since the last successful checkpoint.\n';;
         '')
             if ! install_archive_hook; then ARCHIVE_LAST_ERROR='Archive shutdown hook unavailable; checkpoint protection remains best effort.'; fi

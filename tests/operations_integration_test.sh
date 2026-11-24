@@ -32,43 +32,31 @@ printf 'DNS planned primary downtime preserves counters and fallback failure rep
 DNS
 bash <<'EXPORT'
 set -euo pipefail
-source "$ROOT/user_script/vault_backup.sh"
+source "$ROOT/user_script/backup_vault_remote.sh"
 OPERATIONS_STATE_MOUNT_ROOT="$TEST_ROOT/vault"; OPERATIONS_STATE_ROOT="$TEST_ROOT/vault/backup/operations_state"
-OPERATIONS_REQUIRED_STATE_FILES=(arr_health_activity/state.json media_cleanup/arr/pending-operations.json)
+OPERATIONS_REQUIRED_STATE_FILES=(media_health_monitor/state.json media_cleanup/arr/pending-operations.json)
 OPERATIONS_SCRIPT_ROOT="$TEST_ROOT/live"; LOG_FILE="$TEST_ROOT/export.log"
 RECOVERY_BOOT_ROOT="$TEST_ROOT/no-host-boot"
 recovery_docker() { return 1; }
-mkdir -p "$OPERATIONS_STATE_MOUNT_ROOT/backup" "$OPERATIONS_SCRIPT_ROOT/arr_health_activity" "$OPERATIONS_SCRIPT_ROOT/media_cleanup/arr"
-printf '{"issues":{"ack":"preserved"}}' >"$OPERATIONS_SCRIPT_ROOT/arr_health_activity/state.json"
+mkdir -p "$OPERATIONS_STATE_MOUNT_ROOT/backup" "$OPERATIONS_SCRIPT_ROOT/media_health_monitor" "$OPERATIONS_SCRIPT_ROOT/media_cleanup/arr"
+printf '{"issues":{"ack":"preserved"}}' >"$OPERATIONS_SCRIPT_ROOT/media_health_monitor/state.json"
 printf '{"operations":{}}' >"$OPERATIONS_SCRIPT_ROOT/media_cleanup/arr/pending-operations.json"
-printf 'bulk log data' >"$OPERATIONS_SCRIPT_ROOT/arr_health_activity/huge.log"
-printf '{"stale":true}' >"$OPERATIONS_SCRIPT_ROOT/arr_health_activity/state.before-bulk-ack.json"
+printf 'bulk log data' >"$OPERATIONS_SCRIPT_ROOT/media_health_monitor/huge.log"
+printf '{"stale":true}' >"$OPERATIONS_SCRIPT_ROOT/media_health_monitor/state.before-bulk-ack.json"
 vault_export_operations_state
-[[ -f "$OPERATIONS_STATE_ROOT/arr_health_activity/state.json" && -f "$OPERATIONS_STATE_ROOT/media_cleanup/arr/pending-operations.json" ]]
-[[ ! -e "$OPERATIONS_STATE_ROOT/arr_health_activity/huge.log" && ! -e "$OPERATIONS_STATE_ROOT/arr_health_activity/state.before-bulk-ack.json" ]]
-printf 'invalid' >"$OPERATIONS_SCRIPT_ROOT/arr_health_activity/state.json"
+[[ -f "$OPERATIONS_STATE_ROOT/media_health_monitor/state.json" && -f "$OPERATIONS_STATE_ROOT/media_cleanup/arr/pending-operations.json" ]]
+[[ ! -e "$OPERATIONS_STATE_ROOT/media_health_monitor/huge.log" && ! -e "$OPERATIONS_STATE_ROOT/media_health_monitor/state.before-bulk-ack.json" ]]
+printf 'invalid' >"$OPERATIONS_SCRIPT_ROOT/media_health_monitor/state.json"
 if vault_export_operations_state; then exit 1; fi
-jq -e '.issues.ack=="preserved"' "$OPERATIONS_STATE_ROOT/arr_health_activity/state.json" >/dev/null
+jq -e '.issues.ack=="preserved"' "$OPERATIONS_STATE_ROOT/media_health_monitor/state.json" >/dev/null
 printf 'Operational export keeps current journals, excludes logs/history and preserves prior snapshot on invalid source\n'
 EXPORT
-bash <<'TORRENT'
-set -euo pipefail
-source "$ROOT/user_script/completed_torrent_download.sh"
-QBIT_RUNTIME="$TEST_ROOT/qbit"; mkdir "$QBIT_RUNTIME"; source_dir="$TEST_ROOT/complete/category"; mkdir -p "$source_dir"
-printf 'payload' >"$source_dir/file.mkv"
-QBIT_HOST_ROOT="$TEST_ROOT"; QBIT_CONTAINER_ROOT=/data
-qbit_request() { jq -n --arg state "${JOB_STATE:-stoppedUP}" '[{hash:"abc",content_path:"/data/complete/category/file.mkv",progress:1,amount_left:0,state:$state}]' >"$2"; }
-category_completion_proven "$source_dir"
-JOB_STATE=downloading
-if category_completion_proven "$source_dir"; then exit 1; fi
-JOB_STATE=stoppedUP; printf 'unknown' >"$source_dir/unowned.mkv"
-if category_completion_proven "$source_dir"; then exit 1; fi
-printf 'Exact completed/stopped torrent ownership required; active and unowned files retained\n'
-TORRENT
+# Exercise the current immediate per-payload policy, including active-job vetoes.
+bash "$ROOT/tests/media_torrent_management_test.sh"
 printf 'Operations integration fixtures passed\n'
 bash <<'RAM'
 set -euo pipefail
-source "$ROOT/user_script/ramlog_monitor.sh"
+source "$ROOT/user_script/ram_logs_watchdog.sh"
 STATE_DIR="$TEST_ROOT/ram-state"; STATUS_DIR="$TEST_ROOT/ram-status"; RAMLOG_PATH="$TEST_ROOT/ramlogs"; mkdir "$RAMLOG_PATH"
 NOTIFY="$TEST_ROOT/notify"; printf '#!/bin/sh\nprintf "sent\\n" >>"%s/notified"\n' "$TEST_ROOT" >"$NOTIFY"; chmod 755 "$NOTIFY"
 mountpoint() { return 0; }
@@ -132,7 +120,7 @@ printf 'ImageMaid atomic archival preserves images and active runs; idle schedul
 IMAGE
 bash <<'COMPAT'
 set -euo pipefail
-source "$ROOT/user_script/completed_torrent_download.sh"
+source "$ROOT/user_script/media_torrent_management.sh"
 UNRAID_VERSION_FILE="$TEST_ROOT/unraid-next"
 printf 'version="8.0.0"\n' >"$UNRAID_VERSION_FILE"
 rc=0; acquire_operation_coordination || rc=$?

@@ -12,7 +12,7 @@ STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/backup_health_audit}"
 APPDATA_ROOT="${APPDATA_ROOT:-/mnt/vault/backup/cache}"
 FLASH_ROOT="${FLASH_ROOT:-/mnt/vault/backup/flash}"
-REMOTE_LOG_ROOT="${REMOTE_LOG_ROOT:-/mnt/vault/cloud/logs/script/remote_backup}"
+REMOTE_LOG_ROOT="${REMOTE_LOG_ROOT:-/mnt/vault/cloud/logs/script/backup_media_remote}"
 UNRAID_VERSION_FILE="${UNRAID_VERSION_FILE:-/etc/unraid-version}"
 DISK_HEALTH_RECEIPT="${DISK_HEALTH_RECEIPT:-/mnt/vault/cloud/logs/script/health_monitoring/state/monitor_receipt.json}"
 DISK_HEALTH_MAX_AGE_SECONDS=$((30*3600))
@@ -87,7 +87,7 @@ audit_runtime() {
         mountpoint -q "$path" || { finding "Compatibility: required filesystem is not mounted: $path"; missing=true; }
     done
     cron=$(timeout 8 crontab -c /etc/cron.d -l 2>/dev/null) || { cron=""; finding 'Compatibility: active Unraid cron inventory unavailable'; missing=true; }
-    for path in appdata_backup flash_disk_backup remote_backup vault_remote_backup arr_health_activity media_cleanup docker_service_watchdog dns_redundancy_watchdog ramlog_monitor torrent_download_complete backup_health_audit media_metadata_audit media_integrity_audit; do
+    for path in backup_cache_appdata backup_boot_disk backup_media_remote backup_vault_remote media_health_monitor media_cleanup docker_service_watchdog dns_redundancy_watchdog ram_logs_watchdog media_torrent_management backup_health_audit media_metadata_audit media_integrity_audit; do
         if [[ ! -f "/boot/config/plugins/user.scripts/scripts/$path/script" ]] ||
            ! grep -Fq "/scripts/$path/script" <<<"$cron"; then
             finding "Scheduling: required User Script missing or not scheduled: $path"; missing=true
@@ -127,12 +127,12 @@ audit_backups() {
     epoch=0
     if [[ -n "$latest" && -f "$FLASH_ROOT/$latest.sha256" ]]; then epoch=$(stat -c %Y "$FLASH_ROOT/$latest"); ACTIONS+=("Flash generation: $latest; checksum sidecar present (ZIP payload not rehashed)."); fi
     check_age Flash "$epoch" "$FLASH_MAX_AGE_SECONDS"
-    if [[ -f "$STATUS_DIR/remote_backup.json" ]] && jq -e '.copy=="OK" and .verification=="rsync_transfer_verified"' "$STATUS_DIR/remote_backup.json" >/dev/null; then
-        copy_epoch=$(jq -r .epoch "$STATUS_DIR/remote_backup.json")
+    if [[ -f "$STATUS_DIR/backup_media_remote.json" ]] && jq -e '.copy=="OK" and .verification=="rsync_transfer_verified"' "$STATUS_DIR/backup_media_remote.json" >/dev/null; then
+        copy_epoch=$(jq -r .epoch "$STATUS_DIR/backup_media_remote.json")
     else
         # Cutover compatibility: the previous successful mirror predates atomic
         # receipts. A bounded, anchored success line is legacy log evidence only.
-        log=$(latest_path "$REMOTE_LOG_ROOT" f 'remote_backup_*.log')
+        log=$(latest_path "$REMOTE_LOG_ROOT" f 'backup_media_remote_*.log')
         if [[ -n "$log" ]]; then
             created=$(tail -n 80 "$REMOTE_LOG_ROOT/$log" | sed -n '/\[BACKUP\]\[INFO\] Remote backup completed successfully/s/^\(.\{19\}\).*/\1/p' | tail -n 1)
             [[ -z "$created" ]] || copy_epoch=$(date -d "$created" +%s 2>/dev/null || printf 0)
@@ -156,9 +156,9 @@ audit_backups() {
     else
         ACTIONS+=('ISS handoff: awaiting the first successful appdata producer request after cutover.')
     fi
-    if [[ -f "$STATUS_DIR/vault_backup.json" ]]; then
-        [[ $(jq -r '.restoreDrill // "not_observed"' "$STATUS_DIR/vault_backup.json") != FAILED ]] || finding 'ISS restore drill failed after a verified copy; backup retained; inspect the vault drill summary'
-        epoch=$(jq -r '.restoreDrillEpoch // 0' "$STATUS_DIR/vault_backup.json")
+    if [[ -f "$STATUS_DIR/backup_vault_remote.json" ]]; then
+        [[ $(jq -r '.restoreDrill // "not_observed"' "$STATUS_DIR/backup_vault_remote.json") != FAILED ]] || finding 'ISS restore drill failed after a verified copy; backup retained; inspect the vault drill summary'
+        epoch=$(jq -r '.restoreDrillEpoch // 0' "$STATUS_DIR/backup_vault_remote.json")
     else epoch=0; fi
     if [[ "$epoch" =~ ^[0-9]+$ ]] && (( epoch>0 )); then check_age 'ISS rotating restore drill' "$epoch" "$DRILL_MAX_AGE_SECONDS"
     elif [[ -f "$STATUS_DIR/backup_restore_drill.json" ]]; then

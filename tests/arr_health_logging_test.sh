@@ -2,10 +2,10 @@
 set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 fixture=$(mktemp -d /tmp/arr-health-log.XXXXXX)
-source <(awk '/^# LOCK$/{exit} {print}' "$repo/user_script/arr_health_activity.sh")
+source <(awk '/^# LOCK$/{exit} {print}' "$repo/user_script/media_health_monitor.sh")
 trap - INT TERM HUP
 trap 'rm -rf -- "$fixture"' EXIT
-STATE_DIR="$fixture" LOG_FILE="$fixture/arr_health_activity.log"
+STATE_DIR="$fixture" LOG_FILE="$fixture/media_health_monitor.log"
 LOG_MAX_SIZE_MB=1 LOG_BACKUPS=2 LOG_LINE_MAX_BYTES=256 LOG_RETENTION_DAYS=30
 head -c $((1024*1024-100)) /dev/zero >"$LOG_FILE"
 printf -v long '%*s' 3000 ''

@@ -3,8 +3,8 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-script="$repo_root/user_script/arr_health_activity.sh"
-test_root=$(mktemp -d "${TMPDIR:-/tmp}/arr_health_activity_test.XXXXXX")
+script="$repo_root/user_script/media_health_monitor.sh"
+test_root=$(mktemp -d "${TMPDIR:-/tmp}/media_health_monitor_test.XXXXXX")
 
 cleanup_test() {
     rm -rf -- "${test_root:?}"
@@ -196,4 +196,4 @@ assess_pipeline_health
 [[ "$PIPELINE_STATUS" = "DEGRADED" ]]
 [[ "$PIPELINE_LIVE_ERROR_COUNT" -eq 1 ]]
 
-printf 'arr_health_activity fixture tests passed\n'
+printf 'media_health_monitor fixture tests passed\n'

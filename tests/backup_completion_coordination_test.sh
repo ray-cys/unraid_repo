@@ -10,7 +10,7 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 for cmd in jq flock sha256sum tar timeout setsid; do command -v "$cmd" >/dev/null || fail "missing $cmd"; done
 bash <<'PENDING'
 set -euo pipefail
-source "$ROOT/user_script/vault_backup.sh"
+source "$ROOT/user_script/backup_vault_remote.sh"
 LOCK_FILE="$TEST_ROOT/vault.lock"
 ISS_REQUEST_FILE="$TEST_ROOT/request.json"; ISS_DELIVERED_FILE="$TEST_ROOT/delivered.json"
 wait_for_remote() { touch "$TEST_ROOT/unexpected-wake"; return 1; }
@@ -42,7 +42,7 @@ printf 'completion request, deduplication and changed-source fixtures passed\n'
 PENDING
 # Exercise the actual gate block before any state/API initialization.
 awk '/^ARR_BACKUP_GATE="/{copy=1} copy && /^# TEMP DIRECTORY/{exit} copy{print}' \
- "$ROOT/user_script/arr_health_activity.sh" >"$TEST_ROOT/gate.sh"
+ "$ROOT/user_script/media_health_monitor.sh" >"$TEST_ROOT/gate.sh"
 cat >>"$TEST_ROOT/gate.sh" <<'GUARD'
 touch "$TEST_ROOT/api-called"
 GUARD
@@ -134,7 +134,7 @@ FULL
 # Execute the real SSH command construction against a local simulated receiver.
 bash <<'REMOTE_DRILL'
 set -euo pipefail
-source "$ROOT/user_script/vault_backup.sh"
+source "$ROOT/user_script/backup_vault_remote.sh"
 REMOTE=fixture
 REMOTE_VERSION_ROOT="$TEST_ROOT/remote"
 REMOTE_FINAL="$REMOTE_VERSION_ROOT/hubble-fixture"

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Appdata + Optional Shares Backup v3.8
+# Appdata + Optional Shares Backup v3.9
 #
 # PURPOSE
 # -------
@@ -59,7 +59,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="3.8"
+readonly SCRIPT_VERSION="3.9"
 
 
 ###############################################################################
@@ -74,7 +74,7 @@ SRC_DIR="${SRC_DIR:-/mnt/cache/appdata}"
 DEST_DIR="${DEST_DIR:-/mnt/vault/backup/cache}"
 DEST_MOUNT_ROOT="${DEST_MOUNT_ROOT:-/mnt/vault}"
 
-LOG_DIR="${LOG_DIR:-/mnt/vault/cloud/logs/script/appdata_backup}"
+LOG_DIR="${LOG_DIR:-/mnt/vault/cloud/logs/script/backup_cache_appdata}"
 
 # When the vault cannot safely hold the old and new generations together, the
 # replacement is built and verified here first. The staged generation remains
@@ -407,7 +407,7 @@ NOTIFY_SUBJECT="${NOTIFY_SUBJECT:-Scheduled Backup}"
 # Lock
 # ---------------------------------------------------------------------------
 
-LOCK_FILE="${LOCK_FILE:-/tmp/appdata_backup.lock}"
+LOCK_FILE="${LOCK_FILE:-/tmp/backup_cache_appdata.lock}"
 # Shared expiring leases prevent watchdog alerts/recovery during owned downtime.
 DOCKER_MAINTENANCE_DIR="${DOCKER_MAINTENANCE_DIR:-/run/docker-service-maintenance}"
 # Arr scans hold this shared; backup takes it exclusively before any Docker stop.
@@ -426,7 +426,7 @@ ISS_HANDOFF_RESULT="not_requested"
 SRC_NAME="$(basename "${SRC_DIR%/}")"
 RUN_STAMP="$(date '+%Y%m%d_%H%M%S')"
 
-LOG_FILE="${LOG_DIR}/${SRC_NAME}-${RUN_STAMP}.log"
+LOG_FILE="${LOG_DIR}/backup_cache_appdata-${RUN_STAMP}.log"
 
 WORK_ROOT=""
 WORK_DIR=""
@@ -952,7 +952,7 @@ acquire_lock() {
 
     printf '%s %s\n' \
         "$(date '+%Y-%m-%d %H:%M:%S')" \
-        "Another appdata_backup.sh run is active, exiting (lock: $LOCK_FILE)"
+        "Another backup_cache_appdata.sh run is active, exiting (lock: $LOCK_FILE)"
     return 1
 }
 
@@ -1716,7 +1716,7 @@ prune_logs() {
         list_paths_by_mtime \
             "$LOG_DIR" \
             f \
-            "${SRC_NAME}-*.log"
+            "backup_cache_appdata-*.log"
     )
 
     while [ "${#logs[@]}" -gt "$MAX_LOGS" ]; do
@@ -2840,7 +2840,7 @@ recover_pending_staged_backup() {
 # APPDATA BACKUP
 ###############################################################################
 
-run_appdata_backup() {
+run_backup_cache_appdata() {
     local directory=""
     local name=""
     local archive=""
@@ -3214,7 +3214,7 @@ run_shares_backup() {
             fi
         fi
 
-        tmp_log="$(mktemp /tmp/appdata_backup_rsync.XXXXXX)"
+        tmp_log="$(mktemp /tmp/backup_cache_appdata_rsync.XXXXXX)"
 
         rsync_command=(
             "${PRIORITY_PREFIX[@]}"
@@ -3520,7 +3520,7 @@ main() {
         return 1
     fi
 
-    TEMP_DIR="$(mktemp -d "/tmp/appdata_backup.${RUN_STAMP}.XXXXXX")" || {
+    TEMP_DIR="$(mktemp -d "/tmp/backup_cache_appdata.${RUN_STAMP}.XXXXXX")" || {
         printf '%s ERROR: Unable to create runtime diagnostic directory\n' \
             "$(date '+%Y-%m-%d %H:%M:%S')"
         return 1
@@ -3731,7 +3731,7 @@ ${LOG_FILE}"
     # Appdata backup
     # -----------------------------------------------------------------------
 
-    run_appdata_backup || final_exit=1
+    run_backup_cache_appdata || final_exit=1
     log_largest_archives_report
 
 

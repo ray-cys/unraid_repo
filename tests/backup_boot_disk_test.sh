@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# Fixture tests for user_script/flash_backup.sh. These tests do not require an
+# Fixture tests for user_script/backup_boot_disk.sh. These tests do not require an
 # Unraid host; platform-specific commands are replaced with deterministic mocks.
 
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-script="$repo_root/user_script/flash_backup.sh"
-test_root=$(mktemp -d "${TMPDIR:-/tmp}/flash_backup_test.XXXXXX")
+script="$repo_root/user_script/backup_boot_disk.sh"
+test_root=$(mktemp -d "${TMPDIR:-/tmp}/backup_boot_disk_test.XXXXXX")
 
 cleanup_test() {
     rm -rf -- "${test_root:?}"
@@ -100,7 +100,7 @@ cat >"$mock_bin/notify" <<'EOF'
 printf '%s\n' "$*" >>"$TEST_NOTIFICATION_LOG"
 EOF
 
-mock_helper="$test_root/mock_flash_backup"
+mock_helper="$test_root/mock_backup_boot_disk"
 cat >"$mock_helper" <<'EOF'
 #!/bin/bash
 
@@ -163,9 +163,9 @@ run_backup() {
     HELPER="$helper" \
     NOTIFY="$mock_bin/notify" \
     TIMEOUT_BIN="timeout" \
-    LOCKFILE="$test_root/flash_backup.lock" \
+    LOCKFILE="$test_root/backup_boot_disk.lock" \
     LOG_DIR="$log_dir" \
-    STATE_FILE="$backup_dir/.flash_backup_state.json" \
+    STATE_FILE="$backup_dir/.backup_boot_disk_state.json" \
     MIN_ARCHIVE_FILES=5 \
     MOCK_FLASH_MODE="$mode" \
     MOCK_AVAILABLE_BYTES="$available" \
@@ -225,7 +225,7 @@ run_backup native "$mock_helper" valid
 verify_generations
 jq -e '.backend == "native" and .fallbackUsed == false and
        (.archiveSha256 | length) == 64' \
-    "$backup_dir/.flash_backup_state.json" >/dev/null
+    "$backup_dir/.backup_boot_disk_state.json" >/dev/null
 
 ###############################################################################
 # Helper fingerprint change is detected and reported once
@@ -253,7 +253,7 @@ fi
 sleep 1
 run_backup auto "$mock_helper" invalid
 jq -e '.backend == "direct" and .fallbackUsed == true' \
-    "$backup_dir/.flash_backup_state.json" >/dev/null
+    "$backup_dir/.backup_boot_disk_state.json" >/dev/null
 grep -q 'OK WITH FALLBACK' "$notification_log"
 latest_zip=$(
     "$test_real_find" "$backup_dir" -maxdepth 1 -type f \
@@ -268,7 +268,7 @@ unzip -Z1 "$latest_zip" | grep -q 'folder with spaces/payload.txt'
 sleep 1
 run_backup auto "$test_root/missing_helper" valid
 jq -e '.backend == "direct" and .helperSha256 == "missing"' \
-    "$backup_dir/.flash_backup_state.json" >/dev/null
+    "$backup_dir/.backup_boot_disk_state.json" >/dev/null
 
 ###############################################################################
 # Forced native failures preserve successful generations and remove partials
@@ -315,25 +315,25 @@ export MOCK_DIAGNOSTIC_BYTES=1048576
 expect_failure 6 native "$mock_helper" diagnostic_flood
 
 diagnostic_notice_count=$(
-    grep -h 'captured output is binary' "$log_dir"/flash_backup.log* 2>/dev/null |
+    grep -h 'captured output is binary' "$log_dir"/backup_boot_disk.log* 2>/dev/null |
         awk 'END {print NR+0}'
 )
 [[ "$diagnostic_notice_count" -eq 1 ]]
 
-for bounded_log in "$log_dir"/flash_backup.log*; do
+for bounded_log in "$log_dir"/backup_boot_disk.log*; do
     [[ -f "$bounded_log" ]] || continue
     [[ "$("$test_real_stat" -c '%s' "$bounded_log")" -le "$LOG_MAX_BYTES" ]]
 done
 
-head -c 200000 /dev/zero >"$log_dir/flash_backup.log"
-cp "$log_dir/flash_backup.log" "$log_dir/flash_backup.log.1"
-cp "$log_dir/flash_backup.log" "$log_dir/flash_backup.log.2"
+head -c 200000 /dev/zero >"$log_dir/backup_boot_disk.log"
+cp "$log_dir/backup_boot_disk.log" "$log_dir/backup_boot_disk.log.1"
+cp "$log_dir/backup_boot_disk.log" "$log_dir/backup_boot_disk.log.2"
 
 run_backup native "$mock_helper" valid
 
-[[ ! -e "$log_dir/flash_backup.log.2" ]]
-[[ "$("$test_real_stat" -c '%s' "$log_dir/flash_backup.log")" -le "$LOG_MAX_BYTES" ]]
+[[ ! -e "$log_dir/backup_boot_disk.log.2" ]]
+[[ "$("$test_real_stat" -c '%s' "$log_dir/backup_boot_disk.log")" -le "$LOG_MAX_BYTES" ]]
 grep -q 'oversized, expired, or obsolete log file' \
-    "$log_dir/flash_backup.log"
+    "$log_dir/backup_boot_disk.log"
 
-printf 'flash_backup fixture tests passed\n'
+printf 'backup_boot_disk fixture tests passed\n'

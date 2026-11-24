@@ -75,7 +75,7 @@ reset_findings; check_appdata; assert_issue appdata:metadata
 # A fresh ZIP alone is insufficient. Require the producer's successful state,
 # original size, matching sidecar, and a recent successfulAt timestamp.
 FLASH_BACKUP_ROOT="$TEST_ROOT/flash"
-FLASH_STATE_FILE="$FLASH_BACKUP_ROOT/.flash_backup_state.json"
+FLASH_STATE_FILE="$FLASH_BACKUP_ROOT/.backup_boot_disk_state.json"
 mkdir -p "$FLASH_BACKUP_ROOT"
 archive="$FLASH_BACKUP_ROOT/backup.zip"
 printf 'fixture archive\n' >"$archive"

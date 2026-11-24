@@ -8,7 +8,7 @@ TEST_ROOT=$(realpath "$TEST_ROOT")
 export ROOT TEST_ROOT
 bash <<'CAPTURE'
 set -euo pipefail
-source "$ROOT/user_script/vault_backup.sh"
+source "$ROOT/user_script/backup_vault_remote.sh"
 RECOVERY_BOOT_ROOT="$TEST_ROOT/boot"; LOG_FILE="$TEST_ROOT/capture.log"
 BACKUP_JOBS=("photos|/mnt/vault/cloud/photos")
 mkdir -p "$RECOVERY_BOOT_ROOT/config/plugins/user.scripts/scripts/example"

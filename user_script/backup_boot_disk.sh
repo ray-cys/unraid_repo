@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Unraid Boot Device Backup v3.1
+# Unraid Boot Device Backup v3.2
 #
 # Designed for Unraid 7.4+ while remaining resilient to future changes in the
 # private WebGUI backup helper.
@@ -22,7 +22,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="3.1"
+readonly SCRIPT_VERSION="3.2"
 
 ###############################################################################
 # CONFIGURATION
@@ -46,10 +46,10 @@ HELPER="${HELPER:-/usr/local/emhttp/webGui/scripts/flash_backup}"
 NOTIFY="${NOTIFY:-/usr/local/emhttp/webGui/scripts/notify}"
 TIMEOUT_BIN="${TIMEOUT_BIN:-timeout}"
 
-LOCKFILE="${LOCKFILE:-/tmp/flash_backup.lock}"
+LOCKFILE="${LOCKFILE:-/tmp/backup_boot_disk.lock}"
 
-LOG_DIR="${LOG_DIR:-/mnt/user/cloud/logs/script/flash_backup}"
-LOG_FILE="${LOG_FILE:-${LOG_DIR}/flash_backup.log}"
+LOG_DIR="${LOG_DIR:-/mnt/user/cloud/logs/script/backup_boot_disk}"
+LOG_FILE="${LOG_FILE:-${LOG_DIR}/backup_boot_disk.log}"
 LOG_MAX_BYTES="${LOG_MAX_BYTES:-$((256 * 1024))}"
 LOG_KEEP="${LOG_KEEP:-1}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"
@@ -63,7 +63,7 @@ LOG_RUNAWAY_MULTIPLIER="${LOG_RUNAWAY_MULTIPLIER:-4}"
 BACKEND_DIAGNOSTIC_MAX_BYTES="${BACKEND_DIAGNOSTIC_MAX_BYTES:-$((64 * 1024))}"
 BACKEND_DIAGNOSTIC_MAX_LINES="${BACKEND_DIAGNOSTIC_MAX_LINES:-100}"
 
-STATE_FILE="${STATE_FILE:-${BACKUP_DIR}/.flash_backup_state.json}"
+STATE_FILE="${STATE_FILE:-${BACKUP_DIR}/.backup_boot_disk_state.json}"
 
 RECOMMENDED_ARCHIVE_PATHS=(
     "config/super.dat"
@@ -1113,7 +1113,7 @@ prepare_destination() {
     [ -d "$BACKUP_DIR" ] || mkdir -p -- "$BACKUP_DIR" || return 1
     chmod 0775 "$BACKUP_DIR" 2>/dev/null || true
 
-    WRITE_TEST="$BACKUP_DIR/.flash_backup_write_test.$$"
+    WRITE_TEST="$BACKUP_DIR/.backup_boot_disk_write_test.$$"
     touch "$WRITE_TEST" 2>/dev/null || return 1
     rm -f -- "$WRITE_TEST"
     WRITE_TEST=""
@@ -1157,10 +1157,10 @@ main() {
         return 3
     fi
 
-    HELPER_LOG=$(mktemp /tmp/flash_backup_backend.XXXXXX) || return 4
+    HELPER_LOG=$(mktemp /tmp/backup_boot_disk_backend.XXXXXX) || return 4
     HELPER_LOG_META="${HELPER_LOG}.meta"
     HELPER_LOGGED_MARKER="${HELPER_LOG}.logged"
-    ARCHIVE_LIST_FILE=$(mktemp /tmp/flash_backup_archive.XXXXXX) || return 4
+    ARCHIVE_LIST_FILE=$(mktemp /tmp/backup_boot_disk_archive.XXXXXX) || return 4
 
     initialize_identity
     detect_platform_changes

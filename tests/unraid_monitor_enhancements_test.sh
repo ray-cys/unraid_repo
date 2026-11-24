@@ -30,7 +30,7 @@ trap 'rm -rf -- "$tmp"' EXIT
  : >"$findings"; mock_dns=0.0.0.0; check_vpn_egress qbittorrent; grep -q vpn-canary-dns "$findings"
 )
 (
- source "$repo/user_script/syslog_notification.sh"
+ source "$repo/user_script/syslog_watchdog.sh"
  STATE_DIR="$tmp/syslog"; mkdir -p "$STATE_DIR"
  cat >"$tmp/syslog.input" <<'LINES'
 Nov 23 10:00:01 Hubble kernel: Out of memory: Killed process 1234 (kometa)
@@ -55,7 +55,7 @@ LINES
 )
 (
  # shellcheck disable=SC1090
- source <(awk '/^# LOCK$/{exit} {print}' "$repo/user_script/arr_health_activity.sh")
+ source <(awk '/^# LOCK$/{exit} {print}' "$repo/user_script/media_health_monitor.sh")
  trap - EXIT INT TERM HUP
  TMP_DIR="$tmp"; mkdir -p "$tmp/payload"
  printf 'media' >"$tmp/payload/episode.mkv"

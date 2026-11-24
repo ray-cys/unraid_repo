@@ -126,7 +126,7 @@ RECOVERY_CONFIRM_SCANS=2
 CHECK_LOG_SIZE=true
 LOG_SIZE_WARNING_BYTES=$((1024 * 1024 * 1024))
 # A maintenance lease suppresses availability observations AND restart actions.
-# appdata_backup.sh and plex_dbrepair.sh write independent leases here. A shared
+# backup_cache_appdata.sh and media_plex_dbrepair.sh write independent leases here. A shared
 # per-container lock serializes lease creation against watchdog recovery.
 DOCKER_MAINTENANCE_DIR="${DOCKER_MAINTENANCE_DIR:-/run/docker-service-maintenance}"
 MAX_MAINTENANCE_SECONDS=86400

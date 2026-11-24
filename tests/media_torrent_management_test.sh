@@ -2,7 +2,7 @@
 # Real temporary-file moves with mocked read-only qBittorrent API responses.
 set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-source "$repo/user_script/completed_torrent_download.sh"
+source "$repo/user_script/media_torrent_management.sh"
 tmp=$(mktemp -d /tmp/torrent-transfer-test.XXXXXX)
 trap 'rm -rf -- "$tmp"' EXIT
 QBIT_RUNTIME="$tmp/runtime"; mkdir -p "$QBIT_RUNTIME"

@@ -41,7 +41,7 @@
 ###############################################################################
 
 set -uo pipefail
-readonly SCRIPT_VERSION="1.1"
+readonly SCRIPT_VERSION="1.3"
 
 
 ###############################################################################
@@ -63,6 +63,9 @@ SYSLOG_FILE="/var/log/syslog"
 #   failure
 #
 ERROR_REGEX="corrupt|error|fail|tainted|out of memory|oom-kill|invoked oom-killer|killed process|blocked for more than|soft lockup|hard lockup|NETDEV WATCHDOG|transmit queue.*timed out|reset adapter|resetting (chip|adapter)"
+STORAGE_MATCH_REGEX='XFS.*(shutdown|shut down|shutting down)'
+# Use the deployed User Scripts directory, not the generated execution copy.
+XFS_INCIDENT_FILE="/boot/config/plugins/user.scripts/scripts/syslog_watchdog/xfs_faults.tsv"
 # Event deduplication; repeats after this interval are reminders, not new faults.
 # Silence is not proof of recovery from an OOM or hardware fault.
 INCIDENT_REMINDER_SECONDS=86400
@@ -173,7 +176,7 @@ SYSLOG_USAGE_TOP_ENTRIES=10
 # Runtime state
 # ---------------------------------------------------------------------------
 
-STATE_DIR="/tmp/syslog_notify_state"
+STATE_DIR="/tmp/syslog_watchdog_state"
 
 CURSOR_FILE="${STATE_DIR}/cursor"
 USAGE_ALERT_FILE="${STATE_DIR}/usage_alerted"
@@ -183,7 +186,7 @@ USAGE_ALERT_FILE="${STATE_DIR}/usage_alerted"
 # Lock
 # ---------------------------------------------------------------------------
 
-LOCK_FILE="/tmp/syslog_notification.lock"
+LOCK_FILE="/tmp/syslog_watchdog.lock"
 
 
 ###############################################################################
@@ -570,7 +573,10 @@ build_new_syslog_chunk() {
     # -----------------------------------------------------------------------
 
     if [ "$SAVED_FILE_ID" = "$CURRENT_FILE_ID" ]; then
-        if [ "$SAVED_LINE_COUNT" -le "$CURRENT_LINE_COUNT" ]; then
+        if [ "$SAVED_LINE_COUNT" -le "$CURRENT_LINE_COUNT" ] &&
+           { (( SAVED_LINE_COUNT == 0 )) ||
+             [[ -n "$SAVED_LAST_LINE_HASH" &&
+                "$(hash_log_line "$SYSLOG_FILE" "$SAVED_LINE_COUNT")" == "$SAVED_LAST_LINE_HASH" ]]; }; then
             start_line=$((SAVED_LINE_COUNT + 1))
 
             if [ "$start_line" -le "$CURRENT_LINE_COUNT" ]; then
@@ -586,6 +592,7 @@ build_new_syslog_chunk() {
         # Same inode but file became shorter: likely truncation.
         log "STATE" "WARN" \
             "Syslog appears to have been truncated; scanning current file from beginning"
+        printf '%s\n' 'Syslog coverage error: active log was rewritten; unread older lines may be lost.' >>"$output_file"
 
         read_log_all \
             "$SYSLOG_FILE" \
@@ -630,7 +637,10 @@ build_new_syslog_chunk() {
                 true
             )"
 
-            [ -n "$rotated_file" ] || continue
+            if [ -z "$rotated_file" ]; then
+                printf '%s\n' "Syslog coverage error: missing rotated generation $generation." >>"$output_file"
+                continue
+            fi
 
             read_log_all \
                 "$rotated_file" \
@@ -652,6 +662,7 @@ build_new_syslog_chunk() {
 
     log "STATE" "WARN" \
         "Previous cursor could not be located in rotated logs; using startup lookback"
+    printf '%s\n' "Syslog coverage error: previous cursor log is unavailable; using bounded lookback." >>"$output_file"
 
     if [ "$CURRENT_LINE_COUNT" -gt "$STARTUP_LOOKBACK_LINES" ]; then
         start_line=$(( CURRENT_LINE_COUNT - STARTUP_LOOKBACK_LINES + 1 ))
@@ -688,11 +699,56 @@ is_ignored_line() {
 }
 
 
+xfs_fault_source() {
+    local prefix='^[^ ]+ +([0-9]+ [0-9:]+ +)?[^ ]+ +kernel: +XFS +\(([[:alnum:]_.-]+)\):'
+    [[ "$1" =~ $prefix ]] || return 1
+    local source="${BASH_REMATCH[2]}"
+    case "${1,,}" in
+        *corrupt*|*shutdown*|*"shut down"*|*"shutting down"*) printf '%s\n' "$source" ;;
+        *) return 1 ;;
+    esac
+}
+
+xfs_incident_state() {
+    local operation="$1" source="${2:-}" now="${3:-}" temp
+    local parent="${XFS_INCIDENT_FILE%/*}"
+    [[ -d "$parent" && ! -L "$parent" && -O "$parent" ]] || return 1
+    # Unraid boot storage is usually FAT and cannot enforce POSIX write bits.
+    # Do not read or replace symlinks (including the ledger itself).
+    [[ ! -L "$XFS_INCIDENT_FILE" ]] || return 1
+    if [[ -e "$XFS_INCIDENT_FILE" ]]; then
+        [[ -f "$XFS_INCIDENT_FILE" && -O "$XFS_INCIDENT_FILE" ]] || return 1
+    fi
+    if [[ "$operation" == list ]]; then
+        if [[ -f "$XFS_INCIDENT_FILE" ]]; then cat -- "$XFS_INCIDENT_FILE"; fi
+        return
+    fi
+    [[ "$source" =~ ^[[:alnum:]_.-]+$ ]] || return 2
+    case "$operation" in
+        open)
+            if [[ -f "$XFS_INCIDENT_FILE" ]] &&
+               awk -F '\t' -v source="$source" '$1==source { found=1 } END { exit !found }' "$XFS_INCIDENT_FILE"; then
+                return 0
+            fi ;;
+        ack) [[ -f "$XFS_INCIDENT_FILE" ]] || return 0 ;;
+        *) return 2 ;;
+    esac
+    temp=$(mktemp "$parent/.xfs_faults.XXXXXX") || return 1
+    TEMP_FILES+=("$temp")
+    if [[ -f "$XFS_INCIDENT_FILE" ]]; then
+        awk -F '\t' -v source="$source" '$1!=source' "$XFS_INCIDENT_FILE" >"$temp" || return 1
+    fi
+    if [[ "$operation" == open ]]; then
+        printf '%s\t%s\n' "$source" "$now" >>"$temp" || return 1
+    fi
+    mv -f -- "$temp" "$XFS_INCIDENT_FILE"
+}
+
 filter_matching_errors() {
     local chunk_file="$1"
     local match_file="$2"
 
-    local line="" scrubbed key now previous
+    local line="" scrubbed key now previous xfs_source xfs_opened
     now=$(date +%s)
     INCIDENT_NEXT="${STATE_DIR}/incidents.pending"
     local history="${STATE_DIR}/incidents.tsv"
@@ -708,8 +764,24 @@ filter_matching_errors() {
         # Remove only explicit zero-valued counters, then re-evaluate. An OOM
         # on a line also containing failures=0 must still alert.
         scrubbed=$(printf '%s\n' "$line" | sed -E 's/(errors?|failures?|failed)[=:][[:space:]]*0([^0-9]|$)/ /gI')
-        printf '%s\n' "$scrubbed" | grep -Eiq "$ERROR_REGEX" || continue
-        if is_ignored_line "$line"; then
+        xfs_source=$(xfs_fault_source "$line") || xfs_source=""
+        if [[ -n "$xfs_source" ]]; then
+            xfs_incident_state open "$xfs_source" "$now" || return 1
+            # Group corruption/shutdown lines for the same XFS source.
+            xfs_opened=$(awk -F '\t' -v source="$xfs_source" '$1==source {print $2; exit}' "$XFS_INCIDENT_FILE") || return 1
+            [[ "$xfs_opened" =~ ^[1-9][0-9]{0,11}$ ]] || return 1
+            key="xfs:$xfs_source:$xfs_opened"
+        else
+            printf '%s\n' "$scrubbed" | grep -Eiq "$ERROR_REGEX" || continue
+            # Daily health owns link-instability trends, but not actual I/O failures.
+            if [[ "$line" =~ kernel:[[:space:]]+ata[0-9]+ ]] &&
+               [[ "${line,,}" =~ hard\ resetting\ link|link\ is\ slow\ to\ respond|exception\ emask ]] &&
+               [[ ! "${line,,}" =~ i/o\ error|read\ error|write\ error|failed\ command ]]; then
+                continue
+            fi
+            key=""
+        fi
+        if [[ -z "$xfs_source" ]] && is_ignored_line "$line"; then
             if [ "$LOG_IGNORED_LINES" = "true" ]; then
                 log "SYSLOG" "INFO" \
                     "Ignored matching line: $line"
@@ -718,7 +790,7 @@ filter_matching_errors() {
             continue
         fi
 
-        key=$(printf '%s\n' "$line" | sed -E \
+        [[ -n "$key" ]] || key=$(printf '%s\n' "$line" | sed -E \
           's/^[A-Z][a-z]{2} +[0-9]+ [0-9:]+ [^ ]+ //; s/^[0-9]{4}-[0-9T:.+-]+ [^ ]+ //; s/\[[0-9]+\]/[PID]/g; s/Killed process [0-9]+/Killed process PID/g; s/task [^ ]+:[0-9]+/task PROCESS:PID/g' | sha256sum | awk '{print $1}')
         previous=$(awk -F '\t' -v key="$key" '$1==key {v=$2} END {print v+0}' "$INCIDENT_NEXT")
         if (( previous>0 && now-previous<INCIDENT_REMINDER_SECONDS )); then continue; fi
@@ -728,7 +800,7 @@ filter_matching_errors() {
     done < <(
         grep \
             -Ei \
-            "(${ERROR_REGEX})" \
+            "(${ERROR_REGEX}|${STORAGE_MATCH_REGEX})" \
             "$chunk_file" \
             2>/dev/null ||
             true
@@ -751,11 +823,11 @@ check_syslog_errors() {
     local body="" importance=warning critical=0
 
     chunk_file="$(
-        mktemp /tmp/syslog_notification_chunk.XXXXXX
+        mktemp /tmp/syslog_watchdog_chunk.XXXXXX
     )"
 
     match_file="$(
-        mktemp /tmp/syslog_notification_matches.XXXXXX
+        mktemp /tmp/syslog_watchdog_matches.XXXXXX
     )"
 
     TEMP_FILES+=(
@@ -772,7 +844,7 @@ check_syslog_errors() {
 
     filter_matching_errors \
         "$chunk_file" \
-        "$match_file"
+        "$match_file" || return 1
 
     match_count="$(
         wc -l <"$match_file" |
@@ -798,7 +870,7 @@ check_syslog_errors() {
     keyword_summary="$(
         grep \
             -Eio \
-            "(${ERROR_REGEX})" \
+            "(${ERROR_REGEX}|${STORAGE_MATCH_REGEX})" \
             "$match_file" \
             2>/dev/null |
             tr '[:upper:]' '[:lower:]' |
@@ -817,7 +889,7 @@ check_syslog_errors() {
 
     done <"$match_file"
 
-    critical=$(grep -Eic 'out of memory|oom-kill|killed process|blocked for more than|soft lockup|hard lockup|corrupt' "$match_file" || true)
+    critical=$(grep -Eic "out of memory|oom-kill|killed process|blocked for more than|soft lockup|hard lockup|corrupt|${STORAGE_MATCH_REGEX}" "$match_file" || true)
     (( critical==0 )) || importance=alert
     body+="Host events: ${match_count}; critical matches: ${critical}"$'\n'
     body+="Action: new syslog events detected and grouped; no process, container or network settings were changed."$'\n'
@@ -993,8 +1065,8 @@ check_log_usage() {
 main() {
     local final_exit=0
     case "${1:-}" in
-      --version) printf 'syslog_notification.sh %s\n' "$SCRIPT_VERSION"; return 0 ;;
-      '') ;;
+      --version) printf 'syslog_watchdog.sh %s\n' "$SCRIPT_VERSION"; return 0 ;;
+      ''|--open-xfs|--ack-xfs) ;;
       *) return 2 ;;
     esac
     exec 9>"$LOCK_FILE" || return 1
@@ -1013,6 +1085,10 @@ main() {
     fi
 
     trap cleanup_temp_files EXIT
+    case "${1:-}" in
+        --open-xfs) xfs_incident_state list; return ;;
+        --ack-xfs) [[ $# == 2 ]] || return 2; xfs_incident_state ack "$2"; return ;;
+    esac
 
 
     # -----------------------------------------------------------------------
@@ -1045,7 +1121,14 @@ main() {
     # New syslog errors
     # -----------------------------------------------------------------------
 
-    if ! check_syslog_errors; then
+    if check_syslog_errors; then
+        local heartbeat
+        heartbeat=$(mktemp "$STATE_DIR/.storage-watch.XXXXXX") || return 1
+        TEMP_FILES+=("$heartbeat")
+        if ! date +%s >"$heartbeat" || ! mv -f -- "$heartbeat" "$STATE_DIR/storage-watch.epoch"; then
+            final_exit=1
+        fi
+    else
         final_exit=1
     fi
 

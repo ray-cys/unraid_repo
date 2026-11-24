@@ -179,7 +179,7 @@ latest_entry() {
         cut -d'|' -f2-
 }
 
-latest_flash_backup() {
+latest_backup_boot_disk() {
     find "$FLASH_BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type f \
         \( -name '*-boot-backup-*.zip' -o -name '*-flash-backup-*.zip' \) \
         ! -name '*.partial' ! -name '*.failed' \
@@ -339,7 +339,7 @@ validate_environment() {
     else
         APPDATA_BACKUP="$(latest_entry "$APPDATA_BACKUP_ROOT" d 'backup_[0-9]*_[0-9]*')"
     fi
-    FLASH_BACKUP="$(latest_flash_backup)"
+    FLASH_BACKUP="$(latest_backup_boot_disk)"
     [[ -n "$APPDATA_BACKUP" ]] || {
         log ERROR "No successful appdata backup generation found"
         return 1
@@ -676,8 +676,8 @@ promote_drill() {
     {
         printf 'script_version=%s\n' "$SCRIPT_VERSION"
         printf 'completed=%s\n' "$(date -Iseconds)"
-        printf 'appdata_backup=%s\n' "$APPDATA_BACKUP"
-        printf 'flash_backup=%s\n' "$FLASH_BACKUP"
+        printf 'backup_cache_appdata=%s\n' "$APPDATA_BACKUP"
+        printf 'backup_boot_disk=%s\n' "$FLASH_BACKUP"
         printf 'flash_checksum_status=%s\n' "$FLASH_CHECKSUM_STATUS"
         printf 'flash_archive_files=%s\n' "$FLASH_ARCHIVE_FILES"
         printf 'archives_extracted=%s\n' "$ARCHIVES_EXTRACTED"
@@ -727,9 +727,9 @@ main() {
 
     log INFO "Starting isolated backup restore drill"
     # Shared locks match producers; select only while retention is excluded.
-    exec {APPDATA_LOCK_FD}>"${APPDATA_LOCK_FILE:-/tmp/appdata_backup.lock}" || return 1
+    exec {APPDATA_LOCK_FD}>"${APPDATA_LOCK_FILE:-/tmp/backup_cache_appdata.lock}" || return 1
     flock -s -n "$APPDATA_LOCK_FD" || { RESULT_SUMMARY="Appdata producer active; retry the drill later"; return 1; }
-    exec {FLASH_LOCK_FD}>"${FLASH_LOCK_FILE:-/tmp/flash_backup.lock}" || return 1
+    exec {FLASH_LOCK_FD}>"${FLASH_LOCK_FILE:-/tmp/backup_boot_disk.lock}" || return 1
     flock -s -n "$FLASH_LOCK_FD" || { RESULT_SUMMARY="Flash producer active; retry the drill later"; return 1; }
     # Export replacement takes this lock exclusively. Keep the local bundle
     # stable while hashing; immutable ISS generations need no Hubble lock.

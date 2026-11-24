@@ -19,7 +19,7 @@ if media_recovery_app_held Radarr; then exit 1;fi
 printf invalid >"$MEDIA_INTEGRITY_RECOVERY_FILE"
 media_recovery_app_held Radarr
 media_recovery_app_held Sonarr 20
-source <(awk '/^# LOCK$/{exit} {print}' "$repo/user_script/arr_health_activity.sh")
+source <(awk '/^# LOCK$/{exit} {print}' "$repo/user_script/media_health_monitor.sh")
 trap - INT TERM HUP
 trap 'rm -rf -- "$fixture"' EXIT
 TMP_DIR="$fixture";ARR_AUTOMATION_ENABLED=true;AUTOMATION_CONTROLS_OK=true

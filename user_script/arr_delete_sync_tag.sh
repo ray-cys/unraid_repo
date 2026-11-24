@@ -15,7 +15,7 @@
 #
 # ROLE IN THE FOUR-SCRIPT WORKFLOW
 # -------------------------------
-#   arr_health_activity.sh  -> monitors the download/import pipeline and recovery
+#   media_health_monitor.sh  -> monitors the download/import pipeline and recovery
 #   THIS SCRIPT            -> confirms library deletions and quarantines sidecars
 #   quarantine_lifecycle.sh -> expires metadata runs under /mnt/user/media/bin
 #   sabnzbd_cleanup.sh     -> separately manages full SAB payloads and backups

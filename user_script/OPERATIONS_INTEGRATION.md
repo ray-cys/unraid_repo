@@ -6,7 +6,7 @@ current API evidence are checked, not assumed from a future roadmap.
 
 ## Maintenance and crash recovery
 
-`appdata_backup` remains the exclusive owner of `/tmp/appdata_backup.lock`.
+`backup_cache_appdata` remains the exclusive owner of `/tmp/backup_cache_appdata.lock`.
 DBRepair takes that lock shared before database maintenance, so backup and
 DBRepair cannot run on the same live databases concurrently. A conflicting
 maintenance run defers rather than stopping/restarting the other producer.
@@ -31,7 +31,7 @@ existing opt-ins. Docker restart policies are not changed to bypass these limits
 
 ## Operational-state backup
 
-The installed `vault_remote_backup` entry uses GitHub's `vault_backup.sh`.
+The installed `backup_vault_remote` entry uses GitHub's `backup_vault_remote.sh`.
 Schedule `10 * * * *`: each hourly invocation checks the appdata completion
 request; it is not a resident daemon or an hourly full copy. No request or an
 already delivered identity exits before SSH/WOL, new backup logs or notifications.
@@ -65,14 +65,14 @@ never means a mutation may be replayed unconditionally. Keep snapshots private.
 
 ## RAM logs and boot readiness
 
-`ramlog_monitor.sh` v2.0 runs every ten minutes, using lifecycle state in `/run`:
+`ram_logs_watchdog.sh` v2.0 runs every ten minutes, using lifecycle state in `/run`:
 70% warning, 90% critical, recovery at/below 65%, at most daily reminders for an
 unchanged problem, and delivery retry. It reports large applications without
 deleting/truncating active logs. Native application rotation remains authoritative.
 Current mapped application logs already demonstrate rotation; no generic log
 truncation job is introduced.
 
-`bash .../ramlog_monitor/script --prepare` is the pre-emhttp/Docker boot hook.
+`bash .../ram_logs_watchdog/script --prepare` is the pre-emhttp/Docker boot hook.
 It creates a missing empty 2 GiB tmpfs only before Docker is running, validates
 existing tmpfs and creates declared application log directories. It refuses
 nonempty unmounted directories, wrong filesystems and symlinked paths. It never
@@ -83,7 +83,7 @@ hook is patched on the server, preserving unrelated content and secrets.
 
 Torrent processing keeps console output only, with no grouped email or persistent
 run log. Small state checkpoints live under
-`/mnt/vault/cloud/logs/script/torrent_download_complete/state`. Required mounts,
+`/mnt/vault/cloud/logs/script/media_torrent_management/state`. Required mounts,
 Mover and maintenance are checked before changes. Exact qBittorrent content paths
 must account for the category's files, and matching jobs must be complete and
 already stopped (`stoppedUP`/legacy `pausedUP`). Active seeding, checking,

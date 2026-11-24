@@ -54,7 +54,7 @@ main() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
     exec {gate}>"${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}"; flock -s -n "$gate" || { printf 'Appdata maintenance active; ImageMaid archive deferred.\n'; return 0; }
-    exec {producer}>"${APPDATA_LOCK_FILE:-/tmp/appdata_backup.lock}"; flock -s -n "$producer" || return 0
+    exec {producer}>"${APPDATA_LOCK_FILE:-/tmp/backup_cache_appdata.lock}"; flock -s -n "$producer" || return 0
     exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}"; flock -s -n "$export_fd" || return 0
     local source="$PLEX_ROOT/ImageMaid Restore" root="$PLEX_ROOT/ImageMaid Restore Archives" temp identity bytes archive boot process_start
     [[ -d "$source" && ! -L "$source" ]] || { printf 'No active ImageMaid restore tree; preparation not needed.\n'; return 0; }

@@ -21,7 +21,7 @@ exec bash -c "$*"
 SSH
 chmod 755 "$TEST_ROOT/bin/fake-ssh"
 # Each source is loaded in a separate shell, exactly as standalone User Scripts.
-for SCRIPT_ID_TEST in remote_backup vault_backup; do
+for SCRIPT_ID_TEST in backup_media_remote backup_vault_remote; do
 export SCRIPT_ID_TEST
 bash <<'FIXTURE'
 set -euo pipefail
@@ -65,7 +65,7 @@ backup_acquire_lease || fail 'lease not reusable after disconnect'
 printf '%010000d' 1 >"$TEST_ROOT/large-$SCRIPT_ID_TEST.log"
 backup_bound_log "$TEST_ROOT/large-$SCRIPT_ID_TEST.log" 512
 [[ $(stat -c %s "$TEST_ROOT/large-$SCRIPT_ID_TEST.log") == 512 ]] || fail 'log cap not enforced'
-if [[ "$SCRIPT_ID_TEST" == remote_backup ]]; then
+if [[ "$SCRIPT_ID_TEST" == backup_media_remote ]]; then
     RSYNC_RSH="$TEST_ROOT/bin/fake-ssh"
     MAX_DELETIONS=1
     build_rsync_args opts '' 0 actual
@@ -93,7 +93,7 @@ if [[ "$SCRIPT_ID_TEST" == remote_backup ]]; then
     exec {LEASE_INPUT}>&-; wait "$LEASE_PID"; LEASE_INPUT=""; LEASE_PID=""
     if (main) >"$TEST_ROOT/mirror-main.log" 2>&1; then :; else cat "$TEST_ROOT/mirror-main.log"; fail 'complete mirror workflow failed'; fi
     cmp "$src/media.mkv" "$dst/media.mkv" || fail 'main mirror data mismatch'
-    jq -e '.copy == "OK" and .verification == "rsync_transfer_verified"' "$STATUS_DIR/remote_backup.json" >/dev/null || fail 'main mirror receipt wrong'
+    jq -e '.copy == "OK" and .verification == "rsync_transfer_verified"' "$STATUS_DIR/backup_media_remote.json" >/dev/null || fail 'main mirror receipt wrong'
     backup_acquire_lease || fail 'main mirror leaked remote lease'
     # Exercise the existing aggregate-capacity arithmetic with controlled data.
     BACKUP_JOBS=('Media|/mnt/user/media|/mnt/user/media||0')
@@ -192,7 +192,7 @@ else
     rm -rf -- "$REMOTE_PARTIAL"
     exec {LEASE_INPUT}>&-; wait "$LEASE_PID"; LEASE_INPUT=""; LEASE_PID=""
     if (main) >"$TEST_ROOT/vault-main.log" 2>&1; then :; else cat "$TEST_ROOT/vault-main.log"; fail 'complete vault workflow failed'; fi
-    jq -e '.copy == "OK" and .verification == "sha256_verified"' "$STATUS_DIR/vault_backup.json" >/dev/null || fail 'main vault receipt wrong'
+    jq -e '.copy == "OK" and .verification == "sha256_verified"' "$STATUS_DIR/backup_vault_remote.json" >/dev/null || fail 'main vault receipt wrong'
     [[ -f "$REMOTE_VERSION_ROOT/$GENERATION_NAME/manifests/restore-sources.tsv" ]] || fail 'restore source map missing'
     backup_acquire_lease || fail 'main vault leaked remote lease'
 fi

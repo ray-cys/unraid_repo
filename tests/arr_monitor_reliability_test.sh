@@ -7,7 +7,7 @@ trap 'rm -rf -- "$fixture"' EXIT
 export repo fixture
 bash <<'OUTBOX'
 set -euo pipefail
-source <(awk '/^# LOCK$/{exit}{print}' "$repo/user_script/arr_health_activity.sh")
+source <(awk '/^# LOCK$/{exit}{print}' "$repo/user_script/media_health_monitor.sh")
 trap - EXIT INT TERM HUP
 log(){ :; };persistent_log(){ :; }
 TMP_DIR="$fixture/outbox";mkdir "$TMP_DIR"
@@ -46,7 +46,7 @@ printf 'Durable inactive-resolution replay, export lease release/reacquire, acce
 OUTBOX
 bash <<'GATES'
 set -euo pipefail
-source <(awk '/^# LOCK$/{exit}{print}' "$repo/user_script/arr_health_activity.sh")
+source <(awk '/^# LOCK$/{exit}{print}' "$repo/user_script/media_health_monitor.sh")
 trap - EXIT INT TERM HUP
 TMP_DIR="$fixture/gates";mkdir "$TMP_DIR";ARR_MUTATION_LOCK_DIR="$TMP_DIR"
 MONITOR_COORDINATION_ACTIVE=true
@@ -69,7 +69,7 @@ printf 'Per-app mutation exclusion, independent other-app progress and HTTP dead
 GATES
 bash <<'SCHEMA'
 set -euo pipefail
-source <(awk '/^# LOCK$/{exit}{print}' "$repo/user_script/arr_health_activity.sh")
+source <(awk '/^# LOCK$/{exit}{print}' "$repo/user_script/media_health_monitor.sh")
 trap - EXIT INT TERM HUP
 file="$fixture/receipts.json"
 printf '{"version":1,"receipts":{"Radarr:download":{"app":"Radarr","downloadId":"download","targets":{"movie:1:2":{"kind":"movie","targetId":1,"parentId":1,"fileId":2,"pathAtImport":"/media/movie.mkv"}}}}}' >"$file"
@@ -90,7 +90,7 @@ printf 'Typed receipt/version rejection and unique exact command rediscovery wit
 SCHEMA
 bash <<'INACTIVE'
 set -euo pipefail
-source <(awk '/^# LOCK$/{exit}{print}' "$repo/user_script/arr_health_activity.sh")
+source <(awk '/^# LOCK$/{exit}{print}' "$repo/user_script/media_health_monitor.sh")
 trap - EXIT INT TERM HUP
 log(){ :; };debug_log(){ :; }
 TMP_DIR="$fixture/inactive";mkdir "$TMP_DIR";STATE_FILE="$TMP_DIR/state";DOWNLOAD_LEDGER_RECONCILIATION_RESULTS_FILE="$TMP_DIR/results"
@@ -122,7 +122,7 @@ printf 'Exact inactive-target closure, active-job/monitoring veto and Sonarr par
 INACTIVE
 bash <<'COVERAGE'
 set -euo pipefail
-source <(awk '/^# LOCK$/{exit}{print}' "$repo/user_script/arr_health_activity.sh")
+source <(awk '/^# LOCK$/{exit}{print}' "$repo/user_script/media_health_monitor.sh")
 trap - EXIT INT TERM HUP
 TMP_DIR="$fixture/coverage";mkdir "$TMP_DIR";STATE_FILE="$TMP_DIR/state"
 printf '{"issues":{},"monitor":{}}' >"$STATE_FILE"
@@ -139,7 +139,7 @@ printf 'Enabled collector coverage, stale-success preservation and partial statu
 COVERAGE
 bash <<'AUTOMATION'
 set -euo pipefail
-source <(awk '/^# LOCK$/{exit}{print}' "$repo/user_script/arr_health_activity.sh")
+source <(awk '/^# LOCK$/{exit}{print}' "$repo/user_script/media_health_monitor.sh")
 trap - EXIT INT TERM HUP
 log(){ :; };debug_log(){ :; }
 TMP_DIR="$fixture/actions";mkdir "$TMP_DIR";AUTOMATION_STATE_FILE="$TMP_DIR/actions.json";START_TIME=10000
@@ -163,7 +163,7 @@ printf 'Known non-dispatch clears only its unapplied intent; uncertain POST adop
 AUTOMATION
 bash <<'REPLACEMENT'
 set -euo pipefail
-source <(awk '/^# LOCK$/{exit}{print}' "$repo/user_script/arr_health_activity.sh")
+source <(awk '/^# LOCK$/{exit}{print}' "$repo/user_script/media_health_monitor.sh")
 trap - EXIT INT TERM HUP
 log(){ :; };debug_log(){ :; }
 TMP_DIR="$fixture/replacement";mkdir "$TMP_DIR";POLICY_STATE_FILE="$TMP_DIR/policy.json";START_TIME=10000

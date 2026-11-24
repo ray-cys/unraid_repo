@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Remote NAS Backup v2.4
+# Media Remote Backup v2.6
 #
 # PURPOSE
 # -------
@@ -79,7 +79,7 @@ ENABLE_WOL=true
 # Logging
 # ---------------------------------------------------------------------------
 
-LOG_DIR="/mnt/user/cloud/logs/script/remote_backup"
+LOG_DIR="/mnt/user/cloud/logs/script/backup_media_remote"
 RAW_LOG_DIR="${LOG_DIR}/rsync_raw"
 
 MAX_LOGS=2
@@ -297,11 +297,11 @@ NOTIFY_EXCERPT_LINES=8
 # Lock
 # ---------------------------------------------------------------------------
 
-LOCK_FILE="/tmp/remote_backup.lock"
+LOCK_FILE="/tmp/backup_media_remote.lock"
 
 
-readonly SCRIPT_ID="remote_backup"
-readonly SCRIPT_VERSION="2.5"
+readonly SCRIPT_ID="backup_media_remote"
+readonly SCRIPT_VERSION="2.6"
 
 ###############################################################################
 # SHARED ISS COORDINATION AND TRANSPORT (embedded; standalone User Script)
@@ -561,7 +561,7 @@ backup_destination() {
 ###############################################################################
 
 RUN_STAMP="$(date '+%Y%m%d_%H%M%S')"
-LOG_FILE="${LOG_DIR}/remote_backup_${RUN_STAMP}.log"
+LOG_FILE="${LOG_DIR}/backup_media_remote_${RUN_STAMP}.log"
 
 START_TIME=0
 
@@ -1361,7 +1361,7 @@ estimate_job_change() {
     local -a rsync_args=()
     local -a command=()
 
-    tmp_log="$(mktemp /tmp/remote_backup_estimate.XXXXXX)"
+    tmp_log="$(mktemp /tmp/backup_media_remote_estimate.XXXXXX)"
 
     build_rsync_args \
         rsync_args \
@@ -1706,7 +1706,7 @@ rsync_label() {
     RESULT_REASON["$label"]="Not run"
 
     while [ "$attempt" -le "$MAX_RETRIES" ]; do
-        tmp_log="$(mktemp /tmp/remote_backup_rsync.XXXXXX)"
+        tmp_log="$(mktemp /tmp/backup_media_remote_rsync.XXXXXX)"
 
         build_rsync_args \
             rsync_args \
@@ -2083,7 +2083,7 @@ prune_main_logs() {
         find "$LOG_DIR" \
             -maxdepth 1 \
             -type f \
-            -name 'remote_backup_*.log' \
+            -name 'backup_media_remote_*.log' \
             -printf '%T@\t%p\n' \
             2>/dev/null |
             sort -nr |
@@ -2159,7 +2159,7 @@ prune_raw_logs() {
 prune_old_artifacts() {
     local file
     prune_main_logs && prune_raw_logs || { RETENTION_RESULT=FAILED; return 1; }
-    while IFS= read -r -d '' file; do backup_bound_log "$file" "$MAX_MAIN_LOG_BYTES" || return 1; done < <(find "$LOG_DIR" -maxdepth 1 -type f -name 'remote_backup_*.log' -print0)
+    while IFS= read -r -d '' file; do backup_bound_log "$file" "$MAX_MAIN_LOG_BYTES" || return 1; done < <(find "$LOG_DIR" -maxdepth 1 -type f -name 'backup_media_remote_*.log' -print0)
     while IFS= read -r -d '' file; do backup_bound_log "$file" "$MAX_RAW_LOG_BYTES" || return 1; done < <(find "$RAW_LOG_DIR" -maxdepth 1 -type f -name 'rsync_*.log' -print0)
     RETENTION_RESULT=OK
 }
@@ -2334,7 +2334,7 @@ main() {
     if ! flock -n 9; then
         printf '%s %s\n' \
             "$(date '+%Y-%m-%d %H:%M:%S')" \
-            "Another remote_backup.sh run is active, exiting (lock: $LOCK_FILE)"
+            "Another backup_media_remote.sh run is active, exiting (lock: $LOCK_FILE)"
 
         exit 1
     fi

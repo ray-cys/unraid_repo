@@ -2,7 +2,7 @@
 set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/arr-reconciliation.XXXXXX")
-source <(awk '/^# LOCK$/{exit} {print}' "$repo_root/user_script/arr_health_activity.sh")
+source <(awk '/^# LOCK$/{exit} {print}' "$repo_root/user_script/media_health_monitor.sh")
 trap - INT TERM HUP
 trap 'rm -rf -- "$test_root"' EXIT
 TMP_DIR="$test_root"

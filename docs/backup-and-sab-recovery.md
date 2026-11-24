@@ -1,7 +1,7 @@
 # Backup and SAB recovery behavior
 
-`vault_backup.sh` is installed as `vault_remote_backup` in Unraid User Scripts.
-The stable status receipt remains `vault_backup.json`; all notifications use
+`backup_vault_remote.sh` is installed as `backup_vault_remote` in Unraid User Scripts.
+The stable status receipt remains `backup_vault_remote.json`; all notifications use
 **Vault to ISS Backup**. Version checks on both backup endpoints consume all
 rsync output before deciding compatibility. This avoids a SIGPIPE false failure
 under `pipefail`, including with newer rsync versions.
@@ -11,7 +11,7 @@ existing guarded shutdown follows successful delivery/retention and the schedule
 restore-drill decision. A failed preflight leaves ISS available for investigation;
 it does not force a shutdown or claim a successful backup.
 
-`appdata_backup.sh` now includes Plex's `Media` directory for both configured
+`backup_cache_appdata.sh` now includes Plex's `Media` directory for both configured
 instances. Generated previews/analysis can be rebuilt, but keeping them improves
 restoration completeness. Cache, logs and the other documented temporary paths
 remain excluded. Media can be large and compress poorly. The default retains one
@@ -50,7 +50,7 @@ warning active. Other download/import problems continue to be monitored.
 
 ## ISS rsync compatibility
 
-`remote_backup.sh` and `vault_backup.sh` (Unraid entry `vault_remote_backup`)
+`backup_media_remote.sh` and `backup_vault_remote.sh` (Unraid entry `backup_vault_remote`)
 accept the native rsync on the older ISS Unraid installation based on its actual
 features. Version banners are diagnostic only; no exact-match or minimum-number
 gate and no host package/OS upgrade is imposed. Each end copies and checksums a

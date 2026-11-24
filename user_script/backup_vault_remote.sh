@@ -3,19 +3,19 @@
 ###############################################################################
 # Hubble -> ISS: completion-driven vault backup consumer
 #
-# GitHub source: user_script/vault_backup.sh
-# Installed Unraid User Scripts entry: vault_remote_backup (its file is "script").
+# GitHub source: user_script/backup_vault_remote.sh
+# Installed Unraid User Scripts entry: backup_vault_remote (its file is "script").
 #
 # PURPOSE
 # Keep a separately restorable copy on ISS if Hubble or its local vault fails.
 # Back up the newest completed appdata generation, flash backup, User Scripts,
 # GitHub working directories, photos and compact operational state. This script
-# transfers existing backups; appdata_backup.sh remains the appdata producer.
+# transfers existing backups; backup_cache_appdata.sh remains the appdata producer.
 #
 # WHY IT IS SCHEDULED HOURLY
 # Use 10 * * * * (hourly at minute 10, Singapore time). Each invocation is a short
 # queue check, not a resident daemon or an unconditional hourly full backup.
-# appdata_backup.sh publishes iss-backup-request.json only after completing and
+# backup_cache_appdata.sh publishes iss-backup-request.json only after completing and
 # verifying a local generation and checking container restart requirements.
 # With no request, or an already acknowledged generation, exit before transport,
 # WOL, backup log creation, payload enumeration, pruning or notifications.
@@ -24,7 +24,7 @@
 # 1. Validate the exact producer generation/manifest; acquire producer/state
 #    locks and prepare the compact operational-state export.
 # 2. Wake ISS if needed; wait for SSH/array readiness and acquire the shared ISS
-#    backup lease, also used by the separate remote_backup.sh media mirror.
+#    backup lease, also used by the separate backup_media_remote.sh media mirror.
 # 3. Transfer every configured BACKUP_JOBS source into a hidden .partial remote
 #    generation; verify regular files against the expected SHA-256 manifest.
 # 4. Atomically promote the verified generation and acknowledge its request.
@@ -57,7 +57,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.16"
+readonly SCRIPT_VERSION="1.17"
 
 ###############################################################################
 # CONFIGURATION
@@ -124,7 +124,7 @@ OPERATIONS_EXPORT_TEMP=""
 # Required state for this personal installation; missing/renamed state must not
 # become a silently empty "successful" export after an OS/path change.
 OPERATIONS_REQUIRED_STATE_FILES=(
-    arr_health_activity/state.json
+    media_health_monitor/state.json
     media_cleanup/arr/sonarr-state.json
     media_cleanup/arr/radarr-state.json
     media_cleanup/arr/pending-actions.json
@@ -143,7 +143,7 @@ IONICE_CLASS=2
 IONICE_PRIORITY=7
 NICE_LEVEL=10
 
-LOG_DIR="/mnt/vault/cloud/logs/script/vault_backup"
+LOG_DIR="/mnt/vault/cloud/logs/script/backup_vault_remote"
 MAX_LOGS=5
 STATUS_DIR="/mnt/vault/cloud/logs/script/user_scripts_status"
 NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
@@ -153,9 +153,11 @@ NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
 VAULT_FAILURE_REMINDER_SECONDS=86400
 VAULT_NOTIFICATION_STATE=""
 VAULT_NOTIFICATION_REASON=""
-LOCK_FILE="/run/vault_backup.lock"
+LOCK_FILE="/run/backup_vault_remote.lock"
 
-readonly SCRIPT_ID="vault_backup"
+# Existing ISS generation .owner values are the stable vault_backup v1 format.
+# Script/state names changed; verified remote archive ownership is preserved.
+readonly SCRIPT_ID="backup_vault_remote"
 readonly NOTIFY_SUBJECT="Vault to ISS Backup"
 
 ###############################################################################
@@ -409,7 +411,7 @@ RUN_STAMP="$(date '+%Y%m%d_%H%M%S')"
 GENERATION_NAME="hubble-${RUN_STAMP}"
 REMOTE_PARTIAL="${REMOTE_VERSION_ROOT}/.${GENERATION_NAME}.partial"
 REMOTE_FINAL="${REMOTE_VERSION_ROOT}/${GENERATION_NAME}"
-LOG_FILE="${LOG_DIR}/vault-to-iss-${RUN_STAMP}.log"
+LOG_FILE="${LOG_DIR}/backup_vault_remote-${RUN_STAMP}.log"
 
 TMP_DIR=""
 
@@ -533,7 +535,7 @@ prune_local_logs() {
     local -a logs=()
     local file
     mapfile -t logs < <(
-        find "$LOG_DIR" -maxdepth 1 -type f -name 'vault-to-iss-*.log' \
+        find "$LOG_DIR" -maxdepth 1 -type f -name 'backup_vault_remote-*.log' \
             -printf '%T@|%p\n' 2>/dev/null | sort -rn | cut -d'|' -f2-
     )
     for ((i=MAX_LOGS; i<${#logs[@]}; i++)); do
@@ -695,7 +697,7 @@ PRODUCER_LOCK_FDS=()
 declare -A MANIFEST_FILES=() MANIFEST_BYTES=() SOURCE_FINGERPRINT=()
 vault_producer_locks() {
     local file fd
-    for file in /tmp/appdata_backup.lock /tmp/flash_backup.lock; do
+    for file in /tmp/backup_cache_appdata.lock /tmp/backup_boot_disk.lock; do
         exec {fd}>"$file" || return 1
         flock -s -n "$fd" || { log ERROR "Backup producer is active: $file; retry this vault run later"; return 1; }
         PRODUCER_LOCK_FDS+=("$fd")
@@ -973,8 +975,8 @@ vault_export_operations_state() {
     local fd spec name source file base size total=0 temp previous current_hash copied_hash optional_media_bytes=0
     local scripts="$OPERATIONS_SCRIPT_ROOT"
     local -a sources=(
-        "vault_backup|$scripts/vault_backup"
-        "arr_health_activity|$scripts/arr_health_activity"
+        "backup_vault_remote|$scripts/backup_vault_remote"
+        "media_health_monitor|$scripts/media_health_monitor"
         "media_cleanup|$scripts/media_cleanup"
         "media_cleanup/arr|$scripts/media_cleanup/arr"
         "media_cleanup/sab|$scripts/media_cleanup/sab"
@@ -983,11 +985,11 @@ vault_export_operations_state() {
         "media_cleanup/quarantine/purge-receipts|$scripts/media_cleanup/quarantine/purge-receipts"
         "docker_service_watchdog|$scripts/docker_service_watchdog"
         "dns_redundancy_watchdog|$scripts/dns_redundancy_watchdog"
-        "plex_dbrepair|$scripts/plex_dbrepair"
+        "media_plex_dbrepair|$scripts/media_plex_dbrepair"
         "media_metadata_audit|$scripts/media_metadata_audit"
         "imagemaid_restore_archive|$scripts/imagemaid_restore_archive"
         "backup_health_audit|$scripts/backup_health_audit"
-        "torrent_download_complete|$scripts/torrent_download_complete/state"
+        "media_torrent_management|$scripts/media_torrent_management/state"
         "media_integrity_audit|$scripts/media_integrity_audit"
     )
     [[ "$OPERATIONS_STATE_ROOT" == "$OPERATIONS_STATE_MOUNT_ROOT"/backup/* && ! -L "$OPERATIONS_STATE_ROOT" &&
@@ -1390,13 +1392,13 @@ shutdown_remote() {
 vault_usage() {
     cat <<'HELP'
 Usage: bash script [--help|--version|--force]
-Installed Unraid entry: vault_remote_backup; GitHub source: vault_backup.sh.
+Installed Unraid entry: backup_vault_remote; GitHub source: backup_vault_remote.sh.
 
 Schedule: 10 * * * * (hourly at minute 10, Singapore time).
 This is a scheduled completion-request check, not a continuously running daemon.
 No request/already delivered: local no-op; no ISS SSH/WOL, new backup log or email.
 
-A successful appdata_backup publishes a request for its verified local generation.
+A successful backup_cache_appdata publishes a request for its verified local generation.
 A new valid request causes all configured jobs (appdata, flash, User Scripts,
 GitHub, photos and operational state) to be copied into a new ISS generation.
 Verify SHA-256, promote atomically, acknowledge delivery, retain three successful
@@ -1419,7 +1421,7 @@ main() {
     local job label source manifest notification_message
     case "${1:-}" in
         --help|-h) vault_usage; return 0;;
-        --version) printf 'vault_backup.sh %s (Unraid entry: vault_remote_backup)\n' "$SCRIPT_VERSION"; return 0;;
+        --version) printf 'backup_vault_remote.sh %s (Unraid entry: backup_vault_remote)\n' "$SCRIPT_VERSION"; return 0;;
         ""|--force) ;;
         *) vault_usage >&2; return 2;;
     esac
@@ -1452,7 +1454,7 @@ main() {
     log INFO "Starting $SRC_NAS -> $DEST_NAS versioned backup (dry_run=$DRY_RUN)"
     validate_configuration || return 1
     build_priority_prefix
-    TMP_DIR="$(mktemp -d /tmp/vault-to-iss.XXXXXX)" || return 1
+    TMP_DIR="$(mktemp -d /tmp/backup_vault_remote.XXXXXX)" || return 1
     vault_producer_locks || return 1
     for job in "${BACKUP_JOBS[@]}"; do
         if [[ "$job" == "operations_state|$OPERATIONS_STATE_ROOT" ]]; then

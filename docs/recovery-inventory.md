@@ -1,6 +1,6 @@
 # Private recovery inventory and restore checks
 
-`vault_backup.sh` v1.9 captures `operations_state/recovery` on a new valid appdata
+`backup_vault_remote.sh` v1.9 captures `operations_state/recovery` on a new valid appdata
 completion request, before ISS wakes. Hourly no-op checks still perform no capture
 or transfer. The existing state-export lock and atomic promotion protect the old
 snapshot if copying fails. State and recovery files share the 128 MiB export

@@ -5,7 +5,7 @@ log/state directories. No shared runtime script, extra cron job, API-key file or
 watchdog is required. Keep the current schedules. New notifications use the
 existing grouped delivery, deduplication, size limits and emoji filtering.
 
-## arr_health_activity.sh 3.13.1
+## media_health_monitor.sh 3.13.1
 
 The five-minute monitor now captures native import evidence, audits quality
 configuration, retries allowlisted transient imports, and performs bounded
@@ -123,8 +123,8 @@ command ID, native error where supplied, actual outcome and preserved data.
 Read-only CLI:
 
 ```bash
-/bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script --automation-status
-/bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script --policy-actions
+/bin/bash /boot/config/plugins/user.scripts/scripts/media_health_monitor/script --automation-status
+/bin/bash /boot/config/plugins/user.scripts/scripts/media_health_monitor/script --policy-actions
 ```
 
 `--automation-status` summarizes baseline counts, profile holds, and the most

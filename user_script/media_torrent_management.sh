@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Data Management v3.1
+# Data Management v3.2
 #
 # PURPOSE
 # -------
@@ -56,7 +56,7 @@
 ###############################################################################
 
 set -uo pipefail
-readonly SCRIPT_VERSION="3.1"
+readonly SCRIPT_VERSION="3.2"
 
 umask 0002
 
@@ -212,7 +212,7 @@ VUETORRENT_REPO="https://github.com/VueTorrent/VueTorrent.git"
 VUETORRENT_BRANCH="latest-release"
 VUETORRENT_CLONE_TIMEOUT=300
 # Console output only. Small durable recovery checkpoints are state, not logs.
-TRANSFER_STATE_DIR="${TRANSFER_STATE_DIR:-/mnt/vault/cloud/logs/script/torrent_download_complete/state}"
+TRANSFER_STATE_DIR="${TRANSFER_STATE_DIR:-/mnt/vault/cloud/logs/script/media_torrent_management/state}"
 QBIT_API_URL="${QBIT_API_URL:-https://qbittorrent.taila4be9.ts.net}"
 QBIT_RESOLVE="${QBIT_RESOLVE:-qbittorrent.taila4be9.ts.net:443:100.64.251.79}"
 QBIT_CONTAINER_ROOT="${QBIT_CONTAINER_ROOT:-/data}"
@@ -226,7 +226,7 @@ QBIT_API_UNAVAILABLE=false
 # Runtime / locking
 # ---------------------------------------------------------------------------
 
-LOCK_FILE="/tmp/data_management.lock"
+LOCK_FILE="/tmp/media_torrent_management.lock"
 
 LOG_MIN_LEVEL="info"
 
@@ -1518,7 +1518,7 @@ torrent_storage_ready() {
             return 1
         fi
     fi
-    QBIT_RUNTIME=$(mktemp -d /tmp/torrent-completion.XXXXXX) || return 1
+    QBIT_RUNTIME=$(mktemp -d /tmp/media_torrent_management.XXXXXX) || return 1
     trap 'rm -rf -- "$QBIT_RUNTIME"' EXIT
 }
 
@@ -1549,7 +1549,7 @@ acquire_operation_coordination() {
 
 main() {
     case "${1:-}" in
-        --version) printf 'completed_torrent_download.sh %s\n' "$SCRIPT_VERSION"; return 0;;
+        --version) printf 'media_torrent_management.sh %s\n' "$SCRIPT_VERSION"; return 0;;
         --help|-h) printf '%s\n' 'Usage: bash script [--help|--version]' 'Normal run: console-only processing of configured categories, one top-level download/file at a time.' 'Unregistered completed-folder payloads move immediately at the schedule; no age or repeat-scan delay in either phase.' 'Active/incomplete/checking/seeding torrents, symlinks and partial markers are preserved. API failure defers transfers.' 'Unfinished checkpoints require review before retry. VueTorrent refresh is weekly and independent of transfers.'; return 0;;
         "") ;;
         *) printf 'Unknown option: %s; use --help.\n' "$1" >&2; return 2;;

@@ -6274,11 +6274,11 @@ SAB_URL="$MC_SAB_URL"
 SAB_API_KEY="$MC_SAB_API_KEY"
 
 # Host-visible completed download layout. These defaults match the repository's
-# arr_health_activity.sh configuration.
+# media_health_monitor.sh configuration.
 # Only the monitor-generated verified dispositions can authorize rejected-payload quarantine.
 # Exact native import receipts survive history pruning and destination renames.
-IMPORT_RECEIPT_FILE="${IMPORT_RECEIPT_FILE:-/mnt/vault/cloud/logs/script/arr_health_activity/import-receipts.json}"
-POLICY_DISPOSITION_FILE="${POLICY_DISPOSITION_FILE:-/mnt/vault/cloud/logs/script/arr_health_activity/policy-actions.json}"
+IMPORT_RECEIPT_FILE="${IMPORT_RECEIPT_FILE:-/mnt/vault/cloud/logs/script/media_health_monitor/import-receipts.json}"
+POLICY_DISPOSITION_FILE="${POLICY_DISPOSITION_FILE:-/mnt/vault/cloud/logs/script/media_health_monitor/policy-actions.json}"
 
 SAB_COMPLETE_ROOT="${SAB_COMPLETE_ROOT:-/mnt/user/media/net/complete}"
 

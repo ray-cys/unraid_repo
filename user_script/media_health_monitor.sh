@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.21.0
+# ARR Health / Download / Import Monitor v3.21.1
 #
 # PURPOSE
 # -------
@@ -239,7 +239,7 @@
 #
 # STATE / RECEIPTS / OPERATOR USE
 # --------------------------------
-# STATE_DIR defaults to /mnt/vault/cloud/logs/script/arr_health_activity.
+# STATE_DIR defaults to /mnt/vault/cloud/logs/script/media_health_monitor.
 # state.json/backups hold issue lifecycles, collector cursors and exact-flow state.
 # policy-actions.json and automation-actions.json hold request intent/outcomes;
 # import-receipts.json preserves exact native import/file IDs and stable external
@@ -253,7 +253,7 @@
 #
 # Use /bin/bash for the User Scripts copy because Unraid flash may reject direct
 # execution. Read-only inventory and notification-management examples:
-#   monitor_script="/boot/config/plugins/user.scripts/scripts/arr_health_activity/script"
+#   monitor_script="/boot/config/plugins/user.scripts/scripts/media_health_monitor/script"
 #   /bin/bash "$monitor_script" --help
 #   /bin/bash "$monitor_script" --automation-status
 #   /bin/bash "$monitor_script" --policy-actions
@@ -762,7 +762,7 @@ FLAP_SUPPRESSION_MINUTES=120
 # State
 # ---------------------------------------------------------------------------
 
-STATE_DIR="/mnt/vault/cloud/logs/script/arr_health_activity"
+STATE_DIR="/mnt/vault/cloud/logs/script/media_health_monitor"
 
 # Never create the state tree beneath an absent backing mount. The SAB guard
 # affects only filesystem orphan/residue analysis; API monitoring continues.
@@ -829,7 +829,7 @@ BATCH_DISMISS_AUDIT_RETENTION_DAYS=30
 # Persistent operational log - v2.5
 # ---------------------------------------------------------------------------
 
-LOG_FILE="${STATE_DIR}/arr_health_activity.log"
+LOG_FILE="${STATE_DIR}/media_health_monitor.log"
 
 # Routine runs stay compact. DEBUG temporarily restores phase, checkpoint,
 # pagination/cache, suppression, and other troubleshooting messages.
@@ -843,9 +843,9 @@ LOG_MAX_SIZE_MB=5
 LOG_LINE_MAX_BYTES=4096
 
 # Keep:
-#   arr_health_activity.log
-#   arr_health_activity.log.1
-#   arr_health_activity.log.2
+#   media_health_monitor.log
+#   media_health_monitor.log.1
+#   media_health_monitor.log.2
 # Keep the active log plus two numbered backups (approximately 15 MiB total).
 LOG_BACKUPS=2
 
@@ -958,7 +958,7 @@ ARR_HISTORY_CURSOR_OVERLAP_MINUTES=10
 # Runtime
 # ---------------------------------------------------------------------------
 
-LOCKFILE="/tmp/arr_health_activity.lock"
+LOCKFILE="/tmp/media_health_monitor.lock"
 
 # Keep a five-minute scheduled run below four minutes. Once the remaining
 # reserve is reached, optional audit/reconciliation/filesystem phases are
@@ -1508,7 +1508,7 @@ ensure_state_storage_ready() {
     LOG_FILE=""
 
     if command -v logger >/dev/null 2>&1; then
-        logger -t "arr_health_activity" -- "$reason" 2>/dev/null || true
+        logger -t "media_health_monitor" -- "$reason" 2>/dev/null || true
     fi
 
     if [ "$SEND_NOTIFICATIONS" = true ] && [ -x "$NOTIFY" ]; then
@@ -1633,7 +1633,7 @@ monitor_outbox_ack() {
 monitor_outbox_prepare() {
     monitor_outbox_valid || {
         log 'ERROR: Durable notification outbox invalid; state preserved; automation was not started'
-        local marker="${MONITOR_OUTBOX_EMERGENCY_MARKER:-/run/arr-monitor-outbox-alert}" identity
+        local marker="${MONITOR_OUTBOX_EMERGENCY_MARKER:-/run/media-health-monitor-outbox-alert}" identity
         identity="$(date +%F)|$(sha256sum "$STATE_FILE"|cut -d ' ' -f1)"
         if [[ ! -f "$marker" || "$(cat "$marker")" != "$identity" ]];then
             if notify alert 'Notification state requires attention' 'Durable pending notification state is invalid. State was preserved; no automation was started. Restore or inspect state.json before resuming.';then printf '%s' "$identity" >"$marker";fi
@@ -6620,10 +6620,10 @@ batch_dismiss_downloads() {
 
         if (( count > 0 )); then
             printf '\nPreview this exact saved selection again:\n'
-            printf '  /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script \\\n'
+            printf '  /bin/bash /boot/config/plugins/user.scripts/scripts/media_health_monitor/script \\\n'
             printf '    --batch-dismiss-downloads --ack-file "%s"\n' "$BATCH_PREVIEW_ACK_FILE"
             printf '\nDismiss this exact saved selection after review:\n'
-            printf '  /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script \\\n'
+            printf '  /bin/bash /boot/config/plugins/user.scripts/scripts/media_health_monitor/script \\\n'
             printf '    --batch-dismiss-downloads --ack-file "%s" \\\n' "$BATCH_PREVIEW_ACK_FILE"
             printf '    --execute --confirm-count %s --reason "YOUR REVIEWED REASON"\n' "$count"
         else
@@ -6900,7 +6900,7 @@ print_lifecycle_command_help() {
         'Notification details include the last reconciliation decision and evidence.' \
         '' \
         'Always invoke the Unraid User Scripts copy through /bin/bash:' \
-        '  /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script COMMAND' \
+        '  /bin/bash /boot/config/plugins/user.scripts/scripts/media_health_monitor/script COMMAND' \
         '' \
         'Inspect and manage one issue:' \
         '  --automation-status  Show action/hold/baseline summaries; no changes.' \
@@ -6950,7 +6950,7 @@ print_lifecycle_command_help() {
         '' \
         '  Use the generated ACK-only file as an exact saved selection:' \
         "    --batch-dismiss-downloads \\" \
-        "      --ack-file \"/mnt/vault/cloud/logs/script/arr_health_activity/batch-dismissals/previews/FILE-ack-ids.txt\" \\" \
+        "      --ack-file \"/mnt/vault/cloud/logs/script/media_health_monitor/batch-dismissals/previews/FILE-ack-ids.txt\" \\" \
         "      --execute --confirm-count PREVIEW_COUNT \\" \
         '      --reason "Reviewed intentional removals"' \
         '' \
@@ -8006,7 +8006,7 @@ record_monitor_schedule_issue() {
     allowed_gap=$(( MONITOR_EXPECTED_INTERVAL_MINUTES + MONITOR_MISSED_RUN_GRACE_MINUTES ))
 
     local maintenance_seen
-    maintenance_seen=$(cat "${ARR_BACKUP_DEFERRED_AT:-/run/arr-appdata-monitor-deferred-at}" 2>/dev/null || true)
+    maintenance_seen=$(cat "${ARR_BACKUP_DEFERRED_AT:-/run/media-health-monitor-backup-deferred-at}" 2>/dev/null || true)
     if [[ "$maintenance_seen" =~ ^[0-9]+$ ]] &&
        (( maintenance_seen > PREVIOUS_RUN_STARTED_AT && maintenance_seen <= START_TIME &&
           START_TIME - maintenance_seen <= allowed_gap * 60 )); then
@@ -16676,7 +16676,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --automation-status ]]; then
 fi
 
 # Policy action inventory:
-# /bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script --policy-actions
+# /bin/bash /boot/config/plugins/user.scripts/scripts/media_health_monitor/script --policy-actions
 # Columns: app, download ID, action, checkpoint, target ID, replacement state.
 # "intent" or "search_uncertain" means a request may have succeeded before a
 # timeout; do not delete the journal or retry it manually without reviewing Arr.
@@ -16736,7 +16736,7 @@ require_command pgrep
 ###############################################################################
 ARR_BACKUP_GATE="${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}"
 ARR_BACKUP_GRACE="${ARR_BACKUP_GRACE:-/run/arr-appdata-recovery-until}"
-ARR_BACKUP_DEFERRED_AT="${ARR_BACKUP_DEFERRED_AT:-/run/arr-appdata-monitor-deferred-at}"
+ARR_BACKUP_DEFERRED_AT="${ARR_BACKUP_DEFERRED_AT:-/run/media-health-monitor-backup-deferred-at}"
 if [[ $# == 0 ]]; then
     exec {ARR_BACKUP_GATE_FD}>"$ARR_BACKUP_GATE" || exit 3
     arr_backup_deferred=false
@@ -16758,7 +16758,7 @@ fi
 # TEMP DIRECTORY
 ###############################################################################
 
-TMP_DIR=$(mktemp -d /tmp/arr_health_activity.XXXXXX) || {
+TMP_DIR=$(mktemp -d /tmp/media_health_monitor.XXXXXX) || {
     log "ERROR: Unable to create temporary directory"
     exit 3
 }

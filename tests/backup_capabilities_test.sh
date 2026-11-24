@@ -4,7 +4,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 fixture=$(mktemp -d /tmp/backup-capabilities.XXXXXX)
 trap 'rm -rf -- "$fixture"' EXIT
 export root fixture
-for script in vault_backup remote_backup; do
+for script in backup_vault_remote backup_media_remote; do
 SCRIPT_UNDER_TEST=$script bash <<'FIXTURE'
 set -euo pipefail
 source "$root/user_script/$SCRIPT_UNDER_TEST.sh"

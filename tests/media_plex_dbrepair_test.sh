@@ -5,16 +5,16 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SCRIPT="${REPO_ROOT}/user_script/plex_dbrepair.sh"
-TEST_ROOT="$(mktemp -d /tmp/plex_dbrepair_test.XXXXXX)"
+SCRIPT="${REPO_ROOT}/user_script/media_plex_dbrepair.sh"
+TEST_ROOT="$(mktemp -d /tmp/media_plex_dbrepair_test.XXXXXX)"
 export DOCKER_MAINTENANCE_DIR="$TEST_ROOT/maintenance"
 
 test_cleanup() {
     case "${RUNTIME_DIR:-}" in
-        /tmp/plex_dbrepair.fixture.*) rm -rf -- "$RUNTIME_DIR" ;;
+        /tmp/media_plex_dbrepair.fixture.*) rm -rf -- "$RUNTIME_DIR" ;;
     esac
     case "$TEST_ROOT" in
-        /tmp/plex_dbrepair_test.*) rm -rf -- "$TEST_ROOT" ;;
+        /tmp/media_plex_dbrepair_test.*) rm -rf -- "$TEST_ROOT" ;;
     esac
 }
 trap test_cleanup EXIT
@@ -34,7 +34,7 @@ assert_contains() {
 source "$SCRIPT"
 
 LOG_DIR="${TEST_ROOT}/logs"
-LOG_FILE="${LOG_DIR}/dbrepair.log"
+LOG_FILE="${LOG_DIR}/media_plex_dbrepair.log"
 REPORT_DIR="${LOG_DIR}/reports"
 NOTIFICATION_STATE_FILE="${LOG_DIR}/notification-state.json"
 STATUS_DIR="${TEST_ROOT}/status"
@@ -42,7 +42,7 @@ NOTIFY_BIN="${TEST_ROOT}/notify"
 MOCK_NOTIFY_LOG="${TEST_ROOT}/notify.log"
 MOCK_NOTIFY_COUNT="${TEST_ROOT}/notify.count"
 export MOCK_NOTIFY_LOG MOCK_NOTIFY_COUNT
-RUNTIME_DIR="$(mktemp -d /tmp/plex_dbrepair.fixture.XXXXXX)"
+RUNTIME_DIR="$(mktemp -d /tmp/media_plex_dbrepair.fixture.XXXXXX)"
 
 mkdir -p "$LOG_DIR" "$REPORT_DIR"
 : >"$LOG_FILE"
@@ -415,4 +415,4 @@ process_container_impl() {
 if process_container plex-media-server; then fail "processing failure was hidden"; fi
 [[ ! -e "$DOCKER_MAINTENANCE_DIR/plex-media-server.dbrepair.json" ]] || fail "Plex lease leaked after processing"
 
-printf 'plex_dbrepair fixture tests passed\n'
+printf 'media_plex_dbrepair fixture tests passed\n'

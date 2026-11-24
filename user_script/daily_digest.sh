@@ -25,28 +25,28 @@ STATUS_DIR="/mnt/vault/cloud/logs/script/user_scripts_status"
 # An age of 0 disables age checking for event-driven jobs such as reboot audits.
 # Remove rules for jobs you do not run. 192h allows an 8-day weekly backup window.
 RECEIPT_RULES=(
-    "vault_backup|/mnt/vault/cloud/logs/script/user_scripts_status/vault_backup.json|192|1"
+    "backup_vault_remote|/mnt/vault/cloud/logs/script/user_scripts_status/backup_vault_remote.json|192|1"
     "backup_restore_drill|/mnt/vault/cloud/logs/user_scripts_status/backup_restore_drill.json|192|1"
     "mover_audit|/mnt/vault/cloud/logs/user_scripts_status/mover_audit.json|30|1"
     "docker_service_watchdog|/mnt/vault/cloud/logs/user_scripts_status/docker_service_watchdog.json|1|1"
     "dns_redundancy_watchdog|/mnt/vault/cloud/logs/script/user_scripts_status/dns_redundancy_watchdog.json|1|1"
     "media_cleanup|/mnt/vault/cloud/logs/script/user_scripts_status/media_cleanup.json|30|1"
-    "plex_dbrepair|/mnt/vault/cloud/logs/script/user_scripts_status/plex_dbrepair.json|192|1"
+    "media_plex_dbrepair|/mnt/vault/cloud/logs/script/user_scripts_status/media_plex_dbrepair.json|192|1"
     "pre_post_reboot_audit|/mnt/vault/cloud/logs/user_scripts_status/pre_post_reboot_audit.json|0|0"
 )
 
 APPDATA_BACKUP_ROOT="/mnt/vault/backup/cache"
 FLASH_BACKUP_ROOT="/mnt/vault/backup/flash"
-FLASH_STATE_FILE="${FLASH_BACKUP_ROOT}/.flash_backup_state.json"
+FLASH_STATE_FILE="${FLASH_BACKUP_ROOT}/.backup_boot_disk_state.json"
 BACKUP_MAX_AGE_HOURS=192
 
 # Check monitor execution, not the active Sonarr/Radarr/SAB issue inventory.
-# Those applications' health findings remain owned by arr_health_activity.sh.
+# Those applications' health findings remain owned by media_health_monitor.sh.
 # A recent start alone is insufficient: successful completion must be recent.
-ARR_STATE_FILE="/mnt/vault/cloud/logs/script/arr_health_activity/state.json"
+ARR_STATE_FILE="/mnt/vault/cloud/logs/script/media_health_monitor/state.json"
 ARR_MAX_AGE_MINUTES=15
 
-# Disk-health logs and remote_backup.sh have no compatible completion receipt;
+# Disk-health logs and backup_media_remote.sh have no compatible completion receipt;
 # log freshness is deliberately not treated as proof of successful execution.
 SEND_NOTIFICATION=true
 MAX_DETAIL_ITEMS=30

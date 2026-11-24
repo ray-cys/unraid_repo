@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Plex DBRepair Scheduler Wrapper v3.4
+# Plex DBRepair Scheduler Wrapper v3.5
 #
 # Unraid 7.4-focused scheduler for the current standalone DBRepair executable.
 # It verifies the official GitHub release, stages updates safely inside each
@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-readonly VERSION="3.4"
+readonly VERSION="3.5"
 
 ###############################################################################
 # CONFIGURATION
@@ -34,8 +34,8 @@ DBREPAIR_TIMEOUT_SECONDS=14400
 GITHUB_RELEASE_API="https://api.github.com/repos/ChuckPa/DBRepair/releases/latest"
 GITHUB_API_ACCEPT="application/vnd.github+json"
 
-LOG_DIR="/mnt/vault/cloud/logs/script/plex_dbrepair"
-LOG_FILE="${LOG_DIR}/dbrepair.log"
+LOG_DIR="/mnt/vault/cloud/logs/script/media_plex_dbrepair"
+LOG_FILE="${LOG_DIR}/media_plex_dbrepair.log"
 LOG_MAX_BYTES=$((2 * 1024 * 1024))
 LOG_KEEP=2
 
@@ -46,7 +46,7 @@ NOTIFICATION_REMINDER_DAYS=7
 NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
 
 STATUS_DIR="/mnt/vault/cloud/logs/script/user_scripts_status"
-LOCK_FILE="/run/plex_dbrepair.lock"
+LOCK_FILE="/run/media_plex_dbrepair.lock"
 DOCKER_MAINTENANCE_DIR="${DOCKER_MAINTENANCE_DIR:-/run/docker-service-maintenance}"
 ACTIVE_MAINTENANCE_CONTAINER=""
 
@@ -175,7 +175,7 @@ cleanup() {
     if [[ -n "$ACTIVE_MAINTENANCE_CONTAINER" ]]; then
         rm -f -- "$DOCKER_MAINTENANCE_DIR/$ACTIVE_MAINTENANCE_CONTAINER.dbrepair.json"
     fi
-    if [[ -n "$RUNTIME_DIR" && "$RUNTIME_DIR" == /tmp/plex_dbrepair.* ]]; then
+    if [[ -n "$RUNTIME_DIR" && "$RUNTIME_DIR" == /tmp/media_plex_dbrepair.* ]]; then
         rm -rf -- "$RUNTIME_DIR"
     fi
     trap - EXIT
@@ -229,7 +229,7 @@ cleanup_legacy_logs() {
         removed=$((removed + 1))
     done < <(
         find "$LOG_DIR" -mindepth 1 -maxdepth 1 -type f \
-            -name 'dbrepair-[0-9]*_[0-9]*.log' -print0 2>/dev/null
+            -name 'media_plex_dbrepair-[0-9]*_[0-9]*.log' -print0 2>/dev/null
     )
     (( removed == 0 )) || log INFO "Removed $removed legacy timestamp log file(s)"
 }
@@ -238,12 +238,12 @@ prune_reports() {
     local report removed=0
     mkdir -p -- "$REPORT_DIR" || return 1
     while IFS= read -r -d '' report; do
-        [[ "$report" == "$REPORT_DIR"/dbrepair-*.txt ]] || continue
+        [[ "$report" == "$REPORT_DIR"/media_plex_dbrepair-*.txt ]] || continue
         rm -f -- "$report" || return 1
         removed=$((removed + 1))
     done < <(
         find "$REPORT_DIR" -mindepth 1 -maxdepth 1 -type f \
-            -name 'dbrepair-*.txt' \
+            -name 'media_plex_dbrepair-*.txt' \
             -mtime "+${REPORT_RETENTION_DAYS}" -print0 2>/dev/null
     )
     (( removed == 0 )) || log INFO "Removed $removed DBRepair report(s) older than $REPORT_RETENTION_DAYS days"
@@ -253,9 +253,9 @@ write_status_receipt() {
     local status="$1" summary="$2" now tmp
     now="$(date +%s)"
     mkdir -p -- "$STATUS_DIR" 2>/dev/null || return 0
-    tmp="$(mktemp "${STATUS_DIR}/.plex_dbrepair.XXXXXX")" || return 0
+    tmp="$(mktemp "${STATUS_DIR}/.media_plex_dbrepair.XXXXXX")" || return 0
     if jq -n \
-        --arg name "plex_dbrepair" \
+        --arg name "media_plex_dbrepair" \
         --arg status "$status" \
         --arg summary "$summary" \
         --arg log "$LOG_FILE" \
@@ -264,7 +264,7 @@ write_status_receipt() {
         --argjson duration "$((now - START_EPOCH))" \
         '{name:$name,status:$status,summary:$summary,log:$log,report:$report,epoch:$epoch,duration_seconds:$duration}' \
         >"$tmp"; then
-        mv -f -- "$tmp" "${STATUS_DIR}/plex_dbrepair.json"
+        mv -f -- "$tmp" "${STATUS_DIR}/media_plex_dbrepair.json"
     else
         rm -f -- "$tmp"
     fi
@@ -927,8 +927,8 @@ build_summary_text() {
 write_run_report() {
     local tmp
     mkdir -p -- "$REPORT_DIR" || return 1
-    RUN_REPORT_FILE="${REPORT_DIR}/dbrepair-${RUN_STAMP}.txt"
-    tmp="$(mktemp "${REPORT_DIR}/.dbrepair-report.XXXXXX")" || return 1
+    RUN_REPORT_FILE="${REPORT_DIR}/media_plex_dbrepair-${RUN_STAMP}.txt"
+    tmp="$(mktemp "${REPORT_DIR}/.media_plex_dbrepair-report.XXXXXX")" || return 1
     {
         printf 'Plex DBRepair run report\n'
         printf 'Started epoch: %s\n' "$START_EPOCH"
@@ -1101,14 +1101,14 @@ main() {
     fi
     acquire_lock || return 0
 
-    exec {APPDATA_EXCLUSION_FD}>"${APPDATA_LOCK_FILE:-/tmp/appdata_backup.lock}" || return 1
+    exec {APPDATA_EXCLUSION_FD}>"${APPDATA_LOCK_FILE:-/tmp/backup_cache_appdata.lock}" || return 1
     if ! flock -s -n "$APPDATA_EXCLUSION_FD"; then
         printf 'MAINTENANCE: appdata backup owns the producer lock; DBRepair deferred without database changes.\n'
         return 0
     fi
     exec {STATE_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
     flock -s -n "$STATE_EXPORT_FD" || return 0
-    RUNTIME_DIR="$(mktemp -d /tmp/plex_dbrepair.XXXXXX)" || return 1
+    RUNTIME_DIR="$(mktemp -d /tmp/media_plex_dbrepair.XXXXXX)" || return 1
     cleanup_legacy_logs
     prune_reports || warn "Old DBRepair reports could not be pruned"
     initialize_notification_state || {

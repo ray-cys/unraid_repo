@@ -3,7 +3,7 @@
 See [ARR_AUTOMATION.md](ARR_AUTOMATION.md) for the shared action windows,
 combined budgets, profile-change holds and the four-script integration.
 
-`arr_health_activity.sh` 3.13.1 monitors Sonarr, Radarr and SABnzbd and can
+`media_health_monitor.sh` 3.13.1 monitors Sonarr, Radarr and SABnzbd and can
 resolve narrowly proven import-policy rejections. No additional schedule is
 needed: keep its five-minute schedule and the existing four-hour import batches.
 The monitor makes no direct library filesystem checks for these decisions.
@@ -71,7 +71,7 @@ expire. Recent observation records expire after a day.
 Read-only inventory (does not send notifications or create state):
 
 ```bash
-/bin/bash /boot/config/plugins/user.scripts/scripts/arr_health_activity/script --policy-actions
+/bin/bash /boot/config/plugins/user.scripts/scripts/media_health_monitor/script --policy-actions
 ```
 
 Columns: application, download ID, decision, checkpoint, target ID, replacement

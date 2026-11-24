@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-source <(awk '/^# LOCK$/{exit} {print}' "$root/user_script/arr_health_activity.sh")
+source <(awk '/^# LOCK$/{exit} {print}' "$root/user_script/media_health_monitor.sh")
 trap - INT TERM HUP
 fixture=$(mktemp -d /tmp/sab-loader-recovery.XXXXXX)
 trap 'rm -rf -- "$fixture"' EXIT

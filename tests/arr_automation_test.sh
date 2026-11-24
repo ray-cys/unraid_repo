@@ -2,7 +2,7 @@
 set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 fixture=$(mktemp -d /tmp/arr-automation-test.XXXXXX)
-source <(awk '/^# LOCK$/{exit} {print}' "$repo/user_script/arr_health_activity.sh")
+source <(awk '/^# LOCK$/{exit} {print}' "$repo/user_script/media_health_monitor.sh")
 trap - EXIT INT TERM HUP
 export MEDIA_INTEGRITY_RECOVERY_FILE="$fixture/recovery.json"
 printf '{"schema":1,"workflow":"arr-native","actions":{}}' >"$MEDIA_INTEGRITY_RECOVERY_FILE"
