@@ -48,6 +48,13 @@ with tempfile.TemporaryDirectory() as folder:
     with contextlib.redirect_stdout(io.StringIO()):narrow.execute()
     assert narrow.stats['targeted'] and narrow.found=={'movies/Example.mkv'}
     assert 'series/untouched.mkv' in narrow.state['files'] and narrow.stats['cyclesCompleted']==1
+    # Clearing a known warning starts a fresh full cycle even when an older
+    # successful verification timestamp exists; later passes retain progress.
+    recheck_cfg=copy.deepcopy(targeted);recheck_cfg['recheckAfter']={'movies/Example.mkv':int(time.time())}
+    prior=copy.deepcopy(good.state);prior['files']['movies/Example.mkv']['verifiedAt']=int(time.time())-100
+    recheck=m.Audit(recheck_cfg,prior)
+    with contextlib.redirect_stdout(io.StringIO()):recheck.execute()
+    assert recheck.stats['cyclesCompleted']==1 and recheck.state['files']['movies/Example.mkv']['verifiedAt']>=recheck_cfg['recheckAfter']['movies/Example.mkv']
     # A long file resumes from a confirmed offset, not its beginning.
     duration=1300;stop_after=1;calls=0
     partial=execute(state);e=partial.state['files']['movies/Example.mkv']

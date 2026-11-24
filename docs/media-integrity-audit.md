@@ -133,7 +133,7 @@ gzip -dc /mnt/vault/cloud/logs/script/media_integrity_audit/state.json.gz |
 
 Do not delete state to hide findings or claim previously unchecked media healthy.
 
-## Arr-native replacement (v2.1.0, disabled by default)
+## Arr-native replacement (v2.1.1, disabled by default)
 
 `AUTO_RECOVERY_ENABLED=false` remains installed on Hubble. Observe several weekly
 runs before enabling it in the script. No CLI/environment argument overrides
@@ -244,7 +244,7 @@ original, stay protected and report why automation stopped. They never trigger a
 fallback deletion or forced import. Release metadata and SAB completion cannot
 prove an uncorrupted source; post-import decoding supplies the integrity evidence.
 
-## Recovery reliability enhancements (v2.1.0)
+## Recovery reliability enhancements (v2.1.1)
 
 - External recovery: match stable external IDs, exact targets and physical files.
   A current external replacement receives priority verification and closes only
@@ -289,3 +289,7 @@ prove an uncorrupted source; post-import decoding supplies the integrity evidenc
   require review. Failed GUID/title is excluded, no automatic blocklist/profile
   change, and lost responses are not replayed. Retry-wait/failure/completion
   updates remain grouped and delivery-tracked.
+
+A cleared original-file warning is not itself a complete recovery: priority
+verification finishes a fresh full decode cycle before releasing the job as
+resolved, without claiming that a replacement was downloaded.

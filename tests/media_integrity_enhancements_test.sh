@@ -29,6 +29,17 @@ jq --arg path "$relative" --slurpfile i "$fixture/current-identity" --argjson no
 recovery_observe_external "$id" "$fixture/job"
 jq -e 'all(.actions[];.status=="recovered" and .resolutionSource=="external")' "$RECOVERY_FILE" >/dev/null
 ! rg -q '^POST|^DELETE|^PUT' "$requests"
+# A cleared original warning receives full priority verification, then resolves
+# without incorrectly claiming a replacement or remaining indefinitely blocked.
+make_job
+jq --arg path "$relative" '.files[$path].issue=null | .files[$path].verifiedAt=1' "$TMP_DIR/state.json" >"$fixture/new";mv "$fixture/new" "$TMP_DIR/state.json"
+recovery_observe_external "$id" "$fixture/job"
+jq -e 'all(.actions[];.status=="verifying" and .resolutionSource=="recheck")' "$RECOVERY_FILE" >/dev/null
+recovery_schedule
+jq -e --arg path "$relative" '.recheckAfter[$path]>1 and (.paths|index($path))!=null' "$TMP_DIR/recovery-schedule.json" >/dev/null
+jq --arg path "$relative" --argjson now "$(date +%s)" '.files[$path].verifiedAt=$now | .files[$path].coverage="all_planned_segments_decoded"' "$TMP_DIR/state.json" >"$fixture/new";mv "$fixture/new" "$TMP_DIR/state.json"
+recovery_observe_external "$id" "$fixture/job"
+jq -e 'all(.actions[];.status=="resolved")' "$RECOVERY_FILE" >/dev/null
 # Native unmonitoring cancels only with the exact original still present.
 make_job
 eval "$(declare -f recovery_api|sed '1s/recovery_api/base_fixture_api/')"

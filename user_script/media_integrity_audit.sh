@@ -2,7 +2,7 @@
 # shellcheck disable=SC2034
 arrayStarted=true
 ###############################################################################
-# Media Integrity Audit v2.1.0 -- personal Unraid User Script
+# Media Integrity Audit v2.1.1 -- personal Unraid User Script
 #
 # PURPOSE / USE CASE
 # ------------------
@@ -87,7 +87,7 @@ arrayStarted=true
 ###############################################################################
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.1.1"
 BAZARR_CONTAINER="bazarr"
 MEDIA_HOST_ROOT="/mnt/user/media"
 MEDIA_CONTAINER_ROOT="/data"
@@ -654,7 +654,7 @@ recovery_followup() {
     if jq -e --slurpfile rows "$rows" --slurpfile j "$job" 'all($rows[];. as $r|$r.path as $p| .identity as $i|
        $state[0].files[$p] as $f|$f!=null and $f.identity==$i and $f.issue==null and ($f.verifiedAt // 0)>=$j[0].startedAt)' \
        --slurpfile state "$TMP_DIR/state.json" -n >/dev/null;then
-        recovery_update '.actions[$id].replacementVerifiedAt=$now | .actions[$id].lastError=null' --arg id "$id" --argjson now "$(date +%s)" || return 1
+        recovery_update '.actions[$id].replacementVerifiedAt=$now | .actions[$id].resolutionSource="native" | .actions[$id].lastError=null' --arg id "$id" --argjson now "$(date +%s)" || return 1
         recovery_set "$id" recovered 'Replacement completed: exact native download/import/file IDs and current filesystem version passed all planned decode ranges. Arr performed replacement and owns original recycling; script performed no media move/delete.'
     else
         recovery_update '.actions[$id].importedAt=(.actions[$id].importedAt // $now)' --arg id "$id" --argjson now "$(date +%s)" || return 1
@@ -736,7 +736,13 @@ recovery_observe_external() {
         else recovery_set "$id" recovered 'External recovery verified: exact current Arr/external IDs and physical replacement completed all planned decode ranges. Recovery guards released; replacement was not attributed to this script.';fi
         return $?
     fi
-    [[ "$old_same" != true ]] || return 1
+    if [[ "$old_same" == true ]];then
+        if jq -e --slurpfile rows "$rows" 'all($rows[];.path as $p|$state[0].files[$p].issue==null)' --slurpfile state "$TMP_DIR/state.json" -n >/dev/null;then
+            recovery_update '.actions[$id].replacementFiles=$rows | .actions[$id].replacementPaths=[$rows[].path] | .actions[$id].resolutionSource="recheck"' --arg id "$id" --slurpfile rows "$rows" || return 1
+            recovery_set "$id" verifying 'Original warning cleared on focused rechecks; a complete current-file decode cycle is still required. No replacement attributed or media changed.';return $?
+        fi
+        return 1
+    fi
     recovery_update '.actions[$id].replacementFiles=$rows | .actions[$id].replacementPaths=[$rows[].path] | .actions[$id].resolutionSource="external" | .actions[$id].importedAt=([$rows[].importedAt|select(.>0)]|min // $now)' --arg id "$id" --slurpfile rows "$rows" --argjson now "$(date +%s)" || return 1
     recovery_retention "$id" "$job" || return 1
     recovery_set "$id" verifying 'External/current replacement detected by exact Arr and physical identities. Attribution is unproven; priority full verification pending. No download replay or monitoring override.'
@@ -772,7 +778,7 @@ recovery_schedule() {
        $state[0].files[.path] as $f|select($f.identity==$job.identity and $f.issue.kind=="decode_error" and $f.issue.confirmed==true and
        ($f.issue.lastSeen // 0)<$now-48*3600 and ($f.lastAttemptAt // 0)<$now-86400)|{path:.path,attempt:($f.lastAttemptAt // 0)}]|
       unique_by(.path)|sort_by(.attempt) as $evidence|
-      {evidencePaths:[$evidence[:1][].path],paths:([$replacements[:(if ($evidence|length)>0 then 3 else 4 end)][].path]+[$evidence[:1][].path])}' >"$TMP_DIR/recovery-schedule.json"
+      {recheckAfter:([$j[0].actions[]|select(.status=="verifying" and .resolutionSource=="recheck")|. as $job|.replacementPaths[]?|{key:.,value:$job.startedAt}]|from_entries),evidencePaths:[$evidence[:1][].path],paths:([$replacements[:(if ($evidence|length)>0 then 3 else 4 end)][].path]+[$evidence[:1][].path])}' >"$TMP_DIR/recovery-schedule.json"
 }
 
 recovery_resume() {
@@ -784,6 +790,7 @@ recovery_resume() {
         recovery_correlate "$id" "$job" || { if recovery_observe_external "$id" "$job";then return 0;fi;recovery_set "$id" review 'Grab outcome uncertain: exact native download identity not established. Request not replayed; original remains in place.';return 0; }
         jq --arg id "$id" '.actions[$id]' "$RECOVERY_FILE" >"$job";status=downloading
     fi
+    if [[ $(jq -r '.resolutionSource // ""' "$job") == recheck ]] && recovery_observe_external "$id" "$job";then return 0;fi
     if jq -e '(.downloadId // "")!=""' "$job" >/dev/null;then
         if recovery_followup "$id" "$job";then return 0;fi
         recovery_api_diagnostic "$id" 'Native download/import correlation unavailable; checking exact current media without attributing the replacement' || return 1
@@ -1005,6 +1012,10 @@ class Audit:
                     if not old or old['identity']!=current:
                         self.state['files'][rel]={'identity':current,'probeAt':0,'verifiedAt':0,'offset':0,'chunkSeconds':self.cfg['segmentSeconds'],'notBefore':0,'cycleLane':'new'}
                 except OSError:self.stats['inventoryErrors']+=1
+            for rel,after in self.cfg.get('recheckAfter',{}).items():
+                e=self.state['files'].get(rel)
+                if rel in self.found and e and 0<e.get('verifiedAt',0)<after:
+                    e.update(verifiedAt=0,offset=0,notBefore=0)
             for rel in self.cfg.get('evidencePaths',[]):
                 e=self.state['files'].get(rel)
                 if rel in self.found and e and e.get('issue') and e['issue'].get('identity')==e['identity']:
@@ -1336,7 +1347,7 @@ main() {
       --argjson recheck "$RECHECK_DAYS" --argjson settle "$SETTLE_SECONDS" --argjson max "$MAX_STATE_BYTES" \
       '{state:$state[0],config:{root:$root,hostRoot:$hostRoot,libraries:$libraries,toolset:$toolset,mode:$mode,
        targeted:$targeted,budgetSeconds:$budget,quickBudgetSeconds:$quick,threads:$threads,memoryMiB:$memory,segmentSeconds:$segment,segmentWallSeconds:$wall,
-       fileSliceSeconds:$slice,recheckDays:$recheck,settleSeconds:$settle,maxStateBytes:$max,recoveryPriority:$schedule[0].paths,evidencePaths:$schedule[0].evidencePaths}}' >"$input" || return 1
+       fileSliceSeconds:$slice,recheckDays:$recheck,settleSeconds:$settle,maxStateBytes:$max,recoveryPriority:$schedule[0].paths,evidencePaths:$schedule[0].evidencePaths,recheckAfter:($schedule[0].recheckAfter // {})}}' >"$input" || return 1
     program=$(worker_program) || return 1
     WORKER_TOKEN=$(cat /proc/sys/kernel/random/uuid)
     mkfifo "$TMP_DIR/events" || return 1
