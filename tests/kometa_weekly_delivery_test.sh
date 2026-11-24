@@ -21,13 +21,18 @@ printf '#!/bin/sh\nexit 1\n' >"$NOTIFY_BIN"; chmod 755 "$NOTIFY_BIN"
 before=$(sha256sum "$STATE_DIR/weekly-report-state.json")
 if weekly_media_report false; then echo 'Failed notification accepted' >&2; exit 1; fi
 [[ "$before" == "$(sha256sum "$STATE_DIR/weekly-report-state.json")" ]]
+[[ -f "$STATE_DIR/weekly-pending-notification.json" ]]
+# A newer snapshot cannot replace an undelivered historical resolution/report.
+jq '.jobs.kometa.runLog.maintenance.issues.one.message="NEW evidence after failed send"' "$WATCHDOG_STATE_FILE" >"$fixture/new-evidence";mv "$fixture/new-evidence" "$WATCHDOG_STATE_FILE"
 weekly_media_report true >"$fixture/preview.txt"
 [[ "$before" == "$(sha256sum "$STATE_DIR/weekly-report-state.json")" ]]
 grep -q 'Recommended action:' "$fixture/preview.txt"
-printf '#!/bin/sh\nprintf "sent\\n" >>"%s/calls"\n' "$fixture" >"$NOTIFY_BIN"
+printf '#!/bin/sh\nprintf "sent\\n" >>"%s/calls"\nprintf "%%s\\n" "$*" >>"%s/delivered-body"\n' "$fixture" "$fixture" >"$NOTIFY_BIN"
 weekly_media_report false
 weekly_media_report false
-[[ $(wc -l <"$fixture/calls") == 1 ]]
+[[ $(wc -l <"$fixture/calls") == 1 && ! -e "$STATE_DIR/weekly-pending-notification.json" ]]
+grep -q 'duplicate key' "$fixture/delivered-body"
+if grep -q 'NEW evidence after failed send' "$fixture/delivered-body";then exit 1;fi
 jq -e --argjson now "$now" '.nextDue>$now and .lastCheckedAt>=$now' "$STATE_DIR/weekly-report-state.json" >/dev/null
 printf 'Failed delivery retries without deadline advancement; preview is read-only; successful delivery occurs once\n'
 )

@@ -1,8 +1,9 @@
 #!/bin/bash
 # shellcheck disable=SC2034
+clearLog=true
 arrayStarted=true
 ###############################################################################
-# Media Integrity Audit v2.1.2 -- personal Unraid User Script
+# Media Integrity Audit v2.2.0 -- personal Unraid User Script
 #
 # PURPOSE / USE CASE
 # ------------------
@@ -85,9 +86,107 @@ arrayStarted=true
 # only the recovery journal. --recover-only cannot override the disabled switch.
 # No scan, timeout or error changes media permissions.
 ###############################################################################
+# BEGIN EMBEDDED OPERATIONS CONTRACT
+OPS_SCRIPT_ID="media_integrity_audit"
+# Embedded operations contract v1; generated into standalone User Scripts.
+usr_ops_log_line() {
+    local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
+    case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
+    message=${message//$'\r'/};message=${message//$'\n'/ | }
+    printf -v line '%s | %s | %s | run=%s | phase=%s | %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$OPS_SCRIPT_ID" "${OPS_RUN_ID:-$$}" "$phase" "$message"
+    if ((${#line}>4096));then line="${line:0:4050} ... [truncated]";fi
+    printf '%s\n' "$line"
+}
+
+# Accept the original command, including its timeout, so producer-specific
+# delivery/cooldown/acknowledgement semantics stay with the owning script.
+usr_ops_notify() {
+    local -a args=("$@")
+    local i importance=normal summary='' message='' index=-1 status=UPDATE
+    for ((i=0;i<${#args[@]};i++));do
+        case "${args[$i]}" in
+          -i) importance="${args[$((i+1))]:-normal}";;
+          -d) summary="${args[$((i+1))]:-}";;
+          -m) index=$((i+1));message="${args[$index]:-}";;
+        esac
+    done
+    case "$importance" in alert|warning) status=ATTENTION;;esac
+    if [[ "$message" != 'Status: '* ]];then
+        message="Status: $status"$'\n'"Summary: $summary"$'\n\n'"Actions and findings:"$'\n'"${message:-$summary}"
+        if ((index>=0));then args[$index]="$message";else args+=(-m "$message");fi
+    fi
+    # Every notifier has a termination escalation, including legacy callers.
+    if [[ "${args[0]##*/}" == timeout ]];then
+        if [[ " ${args[*]} " != *' --kill-after'* ]];then args=("${args[0]}" --kill-after=5 "${args[@]:1}");fi
+    else args=(timeout --signal=TERM --kill-after=5 30 "${args[@]}");fi
+    "${args[@]}"
+}
+
+# Bounded local history for scripts previously dependent on the plugin console.
+usr_ops_append_log() {
+    local file="$1" line="$2" max="${3:-2097152}" i
+    [[ -d "${file%/*}" && ! -L "$file" ]] || return 1
+    for i in 1 2;do [[ ! -L "$file.$i" ]] || return 1;done
+    find "${file%/*}" -maxdepth 1 -type f \( -name "${file##*/}.1" -o -name "${file##*/}.2" \) -mtime +29 -delete || return 1
+    if [[ -f "$file" ]] && (( $(stat -c %s "$file")+${#line}+1>max ));then
+        rm -f "$file.2";[[ ! -f "$file.1" ]] || mv "$file.1" "$file.2";mv "$file" "$file.1" || return 1
+    fi
+    printf '%s\n' "$line" >>"$file"
+}
+# END EMBEDDED OPERATIONS CONTRACT
+# Shared new-action budget. Native outcomes remain in the producer's journal.
+usr_ops_arr_reserve() (
+    [[ "${USR_OPS_SHARED_BUDGET_ACTIVE:-false}" == true ]] || return 0
+    local action="$1" app="$2" target="$3" root="${MEDIA_ACTION_BUDGET_ROOT:-/mnt/vault/cloud/logs/script/media_health_monitor}" now run fd export_fd temp file
+    [[ "$app" == Sonarr || "$app" == Radarr ]] || return 1
+    [[ "$target" =~ ^[1-9][0-9]*$ && -d "$root" && ! -L "$root" ]] || return 1
+    [[ "$root" != /mnt/vault/* ]] || mountpoint -q /mnt/vault || return 75
+    file="$root/action-budget.json";[[ ! -L "$file" ]] || return 1
+    exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
+    flock -s -n "$export_fd" || return 75
+    exec {fd}>"${MEDIA_ACTION_BUDGET_LOCK:-/run/media-automation-budget.lock}" || return 1
+    flock -x -w 5 "$fd" || return 75
+    now=$(date +%s);run="${MEDIA_AUTOMATION_RUN_ID:-$OPS_SCRIPT_ID:${START_TIME:-${START_EPOCH:-$$}}:$$}"
+    temp=$(mktemp "$root/.action-budget.XXXXXX") || return 1
+    trap 'rm -f -- "$temp"' EXIT
+    if [[ -f "$file" ]];then
+      jq -e '.schema==1 and (.actions|type)=="object" and all(.actions[];(.at|type)=="number" and (.run|type)=="string")' "$file" >/dev/null || return 1
+      cp "$file" "$temp" || return 1
+    else
+      # Seed from existing issued/uncertain journals instead of resetting limits
+      # when the shared contract is first installed. Known local non-dispatch is excluded.
+      printf '{"schema":1,"actions":{}}\n' >"$temp"
+      local source prefix seed
+      for source in "$root/automation-actions.json" "$root/policy-actions.json" "${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}";do
+        [[ -f "$source" && ! -L "$source" ]] || continue
+        prefix="${source##*/}";seed="$temp.seed"
+        jq --slurpfile old "$source" --arg prefix "$prefix" --argjson since "$((now-86400))" '
+          reduce (($old[0].actions // {})|to_entries[]|select((.value.startedAt // .value.grabSentAt // 0)>=$since and .value.outcome!="not_dispatched" and
+           (if $prefix=="recovery.json" then (.value.grabSentAt // 0)>0 else true end))) as $r
+           (.;.actions[($prefix+":"+$r.key)]={at:($r.value.grabSentAt // $r.value.startedAt),run:"pre-contract",owner:$prefix,app:$r.value.app,target:($r.value.targetId // $r.value.parentId)})' "$temp" >"$seed" && mv "$seed" "$temp" || return 1
+      done
+    fi
+    if jq -e --arg key "$action" '.actions[$key]!=null' "$temp" >/dev/null;then return 75;fi
+    jq -e --argjson since "$((now-86400))" --arg run "$run" '[.actions[]|select(.at>=$since)] as $today | ($today|length)<4 and ([$today[]|select(.run==$run)]|length)<2' "$temp" >/dev/null || return 75
+    jq --arg key "$action" --arg app "$app" --argjson target "$target" --arg run "$run" --arg owner "$OPS_SCRIPT_ID" --argjson now "$now" \
+      '.actions |= with_entries(select(.value.at>=$now-30*86400)) | .actions[$key]={at:$now,run:$run,owner:$owner,app:$app,target:$target,outcome:"reserved; native journal owns dispatch/outcome"}' "$temp" >"$temp.next" && mv "$temp.next" "$temp" || return 1
+    sync -f "$temp" && mv "$temp" "$file" && sync -f "$root"
+)
+
+usr_ops_arr_release_undispatched() (
+    [[ "${USR_OPS_SHARED_BUDGET_ACTIVE:-false}" == true ]] || return 0
+    local key="$1" root="${MEDIA_ACTION_BUDGET_ROOT:-/mnt/vault/cloud/logs/script/media_health_monitor}" fd export_fd temp run
+    run="${MEDIA_AUTOMATION_RUN_ID:-$OPS_SCRIPT_ID:${START_TIME:-${START_EPOCH:-$$}}:$$}"
+    [[ -f "$root/action-budget.json" && ! -L "$root/action-budget.json" ]] || return 1
+    exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}";flock -s -n "$export_fd" || return 75
+    exec {fd}>"${MEDIA_ACTION_BUDGET_LOCK:-/run/media-automation-budget.lock}";flock -x -w 5 "$fd" || return 75
+    temp=$(mktemp "$root/.budget-release.XXXXXX") || return 1
+    trap 'rm -f -- "$temp"' EXIT
+    jq --arg key "$key" --arg run "$run" 'if .actions[$key].run==$run then del(.actions[$key]) else . end' "$root/action-budget.json" >"$temp" && sync -f "$temp" && mv "$temp" "$root/action-budget.json" && sync -f "$root"
+)
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="2.1.2"
+readonly SCRIPT_VERSION="2.2.0"
 BAZARR_CONTAINER="bazarr"
 MEDIA_HOST_ROOT="/mnt/user/media"
 MEDIA_CONTAINER_ROOT="/data"
@@ -165,7 +264,7 @@ log() {
         [[ ! -f "$LOG_FILE.1" ]] || mv -f "$LOG_FILE.1" "$LOG_FILE.2"
         mv -f "$LOG_FILE" "$LOG_FILE.1"
     fi
-    printf '%s [%s] %s\n' "$(date '+%F %T')" "$level" "$*" | tee -a "$LOG_FILE"
+    usr_ops_log_line "$level" MAIN "$*" | tee -a "$LOG_FILE"
 }
 
 probe_lock() {
@@ -239,7 +338,7 @@ finish() {
         marker="/tmp/media-integrity-preflight-$(date +%F).notified"
         printf 'Media integrity audit failed before normal reporting: %s (exit %s)\n' "${FAILURE_REASON:-${GUARD_REASON:-Startup or report persistence failed}}" "$rc" >&2
         if [[ ! -e "$marker" && -x "$NOTIFY_BIN" ]] && command -v timeout >/dev/null; then
-            if timeout 30 "$NOTIFY_BIN" -i alert -s 'Media Integrity Audit' -d 'Audit could not complete normal reporting' \
+            if usr_ops_notify timeout 30 "$NOTIFY_BIN" -i alert -s 'Media Integrity Audit' -d 'Audit could not complete normal reporting' \
               -m "Failure: ${FAILURE_REASON:-${GUARD_REASON:-Startup or persistent reporting failed}} (exit $rc).
 No unverified scan/recovery was marked healthy. Existing recovery originals, intent records and deletion-sync holds remain protected. Correct the missing command/storage/configuration or reporting failure before the next run; review the User Scripts console for the failing operation."; then : >"$marker";fi
         fi
@@ -294,12 +393,23 @@ commit_checkpoint() {
     return "$rc"
 }
 
+integrity_notify() {
+    local released=false rc=0
+    if [[ -n "${INTEGRITY_REPORT_EXPORT_FD:-}" ]];then exec {INTEGRITY_REPORT_EXPORT_FD}>&-;released=true;fi
+    usr_ops_notify "$@" || rc=$?
+    if [[ "$released" == true ]];then
+      exec {INTEGRITY_REPORT_EXPORT_FD}>"$STATE_EXPORT_LOCK" || { INTEGRITY_REPORT_EXPORT_LOST=true;return 75; }
+      flock -s -w 20 "$INTEGRITY_REPORT_EXPORT_FD" || { exec {INTEGRITY_REPORT_EXPORT_FD}>&-;INTEGRITY_REPORT_EXPORT_LOST=true;return 75; }
+    fi
+    return "$rc"
+}
+
 write_report() {
-    local fd rc=0
-    exec {fd}>"$STATE_EXPORT_LOCK" || return 1
-    if ! flock -s -w 30 "$fd"; then exec {fd}>&-;return 1;fi
+    local rc=0
+    exec {INTEGRITY_REPORT_EXPORT_FD}>"$STATE_EXPORT_LOCK" || return 1
+    if ! flock -s -w 30 "$INTEGRITY_REPORT_EXPORT_FD";then exec {INTEGRITY_REPORT_EXPORT_FD}>&-;return 1;fi
     render_report "$@" || rc=$?
-    exec {fd}>&-
+    [[ -z "${INTEGRITY_REPORT_EXPORT_FD:-}" ]] || exec {INTEGRITY_REPORT_EXPORT_FD}>&-
     return "$rc"
 }
 
@@ -322,16 +432,21 @@ render_report() {
       [$jobs[]|select(.value.status=="required" or .value.status=="blocked" or .value.status=="review" or .value.status=="retry_wait" or (.value.status=="verifying" and $now>=(.value.verificationAttentionAt // ((.value.importedAt // .value.startedAt)+86400))))] as $attention |
       (if $status=="FAILED" then "FAILED" elif ($issues|length)>0 or ($attention|length)>0 or $note!="" then "WARNING" else $status end) as $effective |
       {schema:1,name:"media_integrity_audit",status:$effective,epoch:$now,mode:$mode,recoveryEnabled:$enabled,stats:$stats[0],
+       coverage:{knownFiles:($state[0].files|length),fullyVerified:([$state[0].files[]|select((.verifiedAt // 0)>0 and .coverage=="all_planned_segments_decoded")]|length),
+        pendingVerification:([$state[0].files[]|select((.verifiedAt // 0)==0)]|length),
+        oldestPendingObservedAt:([$state[0].files[]|select((.verifiedAt // 0)==0)|.observedAt // empty]|min),
+        pendingAgeUnknown:([$state[0].files[]|select((.verifiedAt // 0)==0 and (.observedAt // 0)==0)]|length)},
        recoveryActions:($jobs|length),recoveryAttention:($attention|length),activeFindings:($issues|length),recoveries:([$jobs[]|select(.value.status=="recovered")]|length),
        findingKeys:[$issues[]|.value.issue.id+":"+.value.issue.kind+":"+(.value.issue.confirmed|tostring)+":"+((.value.issue.confirmedRuns // 0)>=2|tostring)],
        recoveryAttentionKeys:[$attention[].notice],noticeKeys:[$notices[:$max][].notice],
        summary:("Media integrity: "+$effective+"; findings="+($issues|length|tostring)+"; replacement updates="+($notices|length|tostring)),
        body:(["Media integrity audit: "+$effective,"Automatic replacement: "+(if $enabled then "ENABLED" else "DISABLED; original files remain unchanged" end),
         "Run: "+$mode+"; "+$reason,"Checks passed: quick="+(($stats[0].quickPassed // 0)|tostring)+"; ranges="+(($stats[0].segmentsPassed // 0)|tostring)+"; full planned-range cycles="+(($stats[0].cyclesCompleted // 0)|tostring),
+        "Coverage: known files="+($state[0].files|length|tostring)+"; fully decoded current versions="+([$state[0].files[]|select((.verifiedAt // 0)>0 and .coverage=="all_planned_segments_decoded")]|length|tostring)+"; pending initial/replacement verification="+([$state[0].files[]|select((.verifiedAt // 0)==0)]|length|tostring),
         "Original files and monitoring are retained until native Arr replacement. Arr owns imports and recycling; this script never moves/deletes library media or forces import.",
         "State note: "+$note,"", "Replacement actions and results:"]+
        [$notices[:$max][]|"- "+.value.app+" | "+.value.path+" | "+.value.status+
-        "\n  Action/evidence: "+.value.reason+"\n  Target IDs: "+(.value.targets|tostring)+"; original file ID: "+(.value.fileId|tostring)+
+        "\n  Incident: integrity:"+.key+"\n  Action/evidence: "+.value.reason+"\n  Target IDs: "+(.value.targets|tostring)+"; original file ID: "+(.value.fileId|tostring)+
         "\n  Selected release: "+(.value.selected.title // "none; original retained")+"; download ID: "+(.value.downloadId // "none")+
         "\n  Replacement files: "+((.value.replacementFiles // []|map({path,fileId}))|tostring)+
         "\n  Attempts: "+((.value.attempts // []|length)|tostring)+"; retry no earlier than epoch: "+((.value.retryAt // 0)|tostring)+
@@ -351,16 +466,23 @@ render_report() {
     if [[ "$MODE" != inventory ]] && { jq -e '.noticeKeys|length>0' "$temp" >/dev/null || [[ "$attention" == true && ( "$signature" != "$previous" || $((now-last)) -ge NOTIFICATION_REMINDER_SECONDS ) ]]; };then
         [[ "$attention" != true ]] || importance=warning;[[ "$status" != FAILED ]] || importance=alert
         jq -n --arg body "$body" --arg signature "$signature" --argjson epoch "$now" '{schema:1,body:$body,signature:$signature,epoch:$epoch}' >"$STATE_DIR/pending-notification.json.new" && mv "$STATE_DIR/pending-notification.json.new" "$STATE_DIR/pending-notification.json" || return 1
-        if [[ -x "$NOTIFY_BIN" ]] && timeout 30 "$NOTIFY_BIN" -i "$importance" -s 'Media Integrity Audit' -d "$(jq -r .summary "$temp")" -m "$body";then
+        if [[ -x "$NOTIFY_BIN" ]] && integrity_notify timeout 30 "$NOTIFY_BIN" -i "$importance" -s 'Media Integrity Audit' -d "$(jq -r .summary "$temp")" -m "$body";then
             jq --arg signature "$signature" --argjson sentAt "$now" --slurpfile report "$temp" '.signature=$signature | .sentAt=$sentAt | .recoveryEvents=((.recoveryEvents // [])+$report[0].noticeKeys|unique|.[-512:])' "$TMP_DIR/delivery.json" >"$STATE_DIR/notified.json.new" && mv "$STATE_DIR/notified.json.new" "$STATE_DIR/notified.json" || return 1
             rm -f "$STATE_DIR/pending-notification.json";sent=1
         else log WARNING 'Grouped replacement notification failed; delivery remains pending';fi
     elif [[ "$attention" == false ]];then rm -f "$STATE_DIR/pending-notification.json";fi
+    [[ "${INTEGRITY_REPORT_EXPORT_LOST:-false}" != true ]] || return 75
     local completed=0 installed="$now" first="$now"
     if [[ -f "$STATUS_DIR/media_integrity_audit.json" ]];then
         completed=$(jq -r '.lastCompletedScanAt // 0' "$STATUS_DIR/media_integrity_audit.json");installed=$(jq -r '.installedAt // .epoch' "$STATUS_DIR/media_integrity_audit.json");first=$(jq -r '.firstScheduledAt // .epoch' "$STATUS_DIR/media_integrity_audit.json")
     fi
     if [[ "$MODE" == scan && "$WORKER_FINISHED" == true && "$status" != FAILED && "$status" != DEFERRED ]] && jq -e '.inventoryComplete==true' "$TMP_DIR/stats.json" >/dev/null;then completed="$now";fi
+    local stalled=0
+    [[ ! -f "$STATUS_DIR/media_integrity_audit.json" ]] || stalled=$(jq -r '.stalledCompletedRuns // 0' "$STATUS_DIR/media_integrity_audit.json")
+    if [[ "$MODE" == scan && "$WORKER_FINISHED" == true && "$status" != DEFERRED && "$status" != FAILED ]];then
+      if jq -e '.coverage.pendingVerification>0 and (.stats.segmentsPassed // 0)==0 and (.stats.cyclesCompleted // 0)==0 and (.stats.quickPassed // 0)==0' "$temp" >/dev/null;then stalled=$((stalled+1));else stalled=0;fi
+    fi
+    jq --argjson stalled "$stalled" '.stalledCompletedRuns=$stalled' "$temp" >"$temp.next" && mv "$temp.next" "$temp" || return 1
     local delivery=suppressed;((sent==0)) || delivery=sent;[[ ! -f "$STATE_DIR/pending-notification.json" ]] || delivery=failed
     jq --arg notification "$delivery" --arg version "$SCRIPT_VERSION" --argjson completed "$completed" --argjson installed "$installed" --argjson first "$first" '.+{notification:$notification,scriptVersion:$version,lastCompletedScanAt:$completed,installedAt:$installed,firstScheduledAt:$first}' "$temp" >"$STATUS_DIR/.media-integrity-audit.new" && mv "$STATUS_DIR/.media-integrity-audit.new" "$STATUS_DIR/media_integrity_audit.json" || return 1
     RUN_REPORT_WRITTEN=true;log INFO "$(jq -r .summary "$temp")";rm -f "$temp"
@@ -832,6 +954,7 @@ recovery_resume_core() {
     ((RECOVERY_NEW_GRABS<RECOVERY_MAX_NEW_PER_RUN)) || return 0
     jq -e --argjson cutoff "$(( $(date +%s)-7*86400 ))" --argjson limit "$RECOVERY_MAX_NEW_PER_WEEK" '[.actions[]|if (.attempts // []|length)>0 then .attempts[]|select(.at>=$cutoff) else select((.grabSentAt // 0)>=$cutoff) end]|length<$limit' "$RECOVERY_FILE" >/dev/null || return 0
     recovery_history "$job" "$history" || return 1
+    usr_ops_arr_reserve "integrity:$id:$(jq -r '.attempts // []|length' "$job")" "$(jq -r '.app' "$job")" "$(jq -r '.targets[0]' "$job")" || { RECOVERY_NOTE='Shared media action budget reached or unavailable; replacement deferred; original retained';return 0; }
     recovery_update '.actions[$id].baselineGrabs=[$h[0].records[]|select(.eventType=="grabbed")|.id] | .actions[$id].grabSentAt=$now | .actions[$id].attempts=((.actions[$id].attempts // [])+[{at:$now,guid:.actions[$id].selected.guid,title:.actions[$id].selected.title,indexerId:.actions[$id].selected.indexerId,outcome:"intent"}])' --arg id "$id" --argjson now "$(date +%s)" --slurpfile h "$history" || return 1
     RECOVERY_NEW_GRABS=$((RECOVERY_NEW_GRABS+1))
     recovery_set "$id" grab_intent 'Release grab intent saved before one POST /release. Original remains in library; uncertain outcomes will not be replayed.' || return 1
@@ -1020,7 +1143,7 @@ class Audit:
                     if not stat.S_ISREG(st.st_mode):raise ValueError('not regular replacement')
                     self.found.add(rel);self.seen.add(rel);current=identity(st);old=self.state['files'].get(rel)
                     if not old or old['identity']!=current:
-                        self.state['files'][rel]={'identity':current,'probeAt':0,'verifiedAt':0,'offset':0,'chunkSeconds':self.cfg['segmentSeconds'],'notBefore':0,'cycleLane':'new'}
+                        self.state['files'][rel]={'identity':current,'observedAt':int(time.time()),'probeAt':0,'verifiedAt':0,'offset':0,'chunkSeconds':self.cfg['segmentSeconds'],'notBefore':0,'cycleLane':'new'}
                 except OSError:self.stats['inventoryErrors']+=1
             for rel,after in self.cfg.get('recheckAfter',{}).items():
                 e=self.state['files'].get(rel)
@@ -1057,7 +1180,7 @@ class Audit:
                             current=identity(item.stat(follow_symlinks=False));self.found.add(rel)
                             old=self.state['files'].get(rel)
                             if old is None or old['identity']!=current:
-                                entry={'identity':current,'probeAt':0,'verifiedAt':0,'offset':0,'chunkSeconds':self.cfg['segmentSeconds'],
+                                entry={'identity':current,'observedAt':int(time.time()),'probeAt':0,'verifiedAt':0,'offset':0,'chunkSeconds':self.cfg['segmentSeconds'],
                                        'lastAttemptAt':0,'notBefore':0,'cycleLane':'new'}
                                 if old and old.get('issue'):entry['issue']=old['issue'];entry['replacementPending']=True
                                 self.state['files'][rel]=entry;self.stats['newChanged']+=1;self.dirty=True
@@ -1275,6 +1398,7 @@ PYWORKER
 }
 
 main() {
+    USR_OPS_SHARED_BUDGET_ACTIVE=true
     ARR_MUTATION_COORDINATION_ACTIVE=true
     case "${1:-}" in
       --version) printf 'media_integrity_audit.sh %s\n' "$SCRIPT_VERSION";return 0;;
@@ -1314,7 +1438,7 @@ main() {
         printf 'Vault unavailable; no shadow state, scan or recovery started.\n' >&2
         local marker
         marker="/tmp/media-integrity-storage-failure-$(date +%F)"
-        if [[ ! -e "$marker" && -x "$NOTIFY_BIN" ]] && timeout 30 "$NOTIFY_BIN" -i alert -s 'Media Integrity Audit' -d 'Required vault storage unavailable' -m 'No audit or recovery was started. Persistent state was preserved; no media or Arr action was performed. Check the vault mount and next scheduled audit.'; then : >"$marker";fi
+        if [[ ! -e "$marker" && -x "$NOTIFY_BIN" ]] && usr_ops_notify timeout 30 "$NOTIFY_BIN" -i alert -s 'Media Integrity Audit' -d 'Required vault storage unavailable' -m 'No audit or recovery was started. Persistent state was preserved; no media or Arr action was performed. Check the vault mount and next scheduled audit.'; then : >"$marker";fi
         return 1
     }
     [[ "$STATE_DIR" == "$VAULT_MOUNT"/cloud/logs/script/media_integrity_audit && ! -L "$STATE_DIR" && ! -L "$STATUS_DIR" ]] || return 1

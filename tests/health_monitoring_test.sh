@@ -100,7 +100,7 @@ run_regression_tests() (
         mkdir "$RUN_DIR"
         local IO_ERROR_HISTORY_FILE="$RUN_DIR/history" SYSLOG_CURSOR_STATE_FILE="$RUN_DIR/cursor"
         local SYSLOG_CHUNK_FILE="$RUN_DIR/input" COLLECTOR_EVENT_FILE="$RUN_DIR/events"
-        local IO_ERROR_WARN_THRESHOLD=2 IO_ERROR_CRIT_THRESHOLD=4
+        local IO_ERROR_WARN_THRESHOLD=2 IO_ERROR_CRIT_THRESHOLD=4 SYSLOG_FAST_STORAGE_OWNER=0
         local timestamp
         timestamp=$(LC_ALL=C date -d '12 hours ago' '+%b %e %T')
         printf '%s\n' "$timestamp host kernel: I/O error on dev sda, sector 1" \
@@ -1348,7 +1348,7 @@ run_regression_tests() (
 
     STORAGE_TOP_LINES=$'Array: 50.0% used (5.00 TB of 10.00 TB)\nPools: 25.0% used (250.00 GB of 1.00 TB)'
     NOTIFICATION_RECOVERY_SECTION=$'Resolved Since Last Successful Notification:\n - [WARNING] Earlier finding'
-    SUBJECT="Disks Health - WARNING (1)"
+    SUBJECT="Disk Health Monitor - WARNING (1)"
     NOTIFY_MAX_BODY_CHARS=12000
     NOTIFY_MAX_BODY_LINES=180
     compose_notification
@@ -1376,11 +1376,11 @@ run_regression_tests() (
         collect_storage_usage "$storage_fixture" &&
             [[ "$ARRAY_TOTAL_BYTES" == 1000 && "$POOLS_TOTAL_BYTES" == 1000 &&
                "${POOL_MEMBER_MAP[/dev/nvme0n1]:-}" == cache &&
-               "${FRESH_STORAGE[$storage_fixture/disk1]:-}" == 1 && "$alerts" == 3 ]]
+               "${FRESH_STORAGE[$storage_fixture/disk1]:-}" == 1 && "$alerts" == 2 && -z "${FRESH_STORAGE[$storage_fixture/ramlogs]:-}" ]]
     ); then
-        self_test_result 1 "One capacity sample drives per-mount alerts, totals, and recovery"
+        self_test_result 1 "One capacity sample drives disk/pool alerts and excludes RAM-log capacity owned by its watchdog"
     else
-        self_test_result 0 "One capacity sample drives per-mount alerts, totals, and recovery"
+        self_test_result 0 "One capacity sample drives disk/pool alerts and excludes RAM-log capacity owned by its watchdog"
     fi
 
     # shellcheck disable=SC2030
@@ -1577,7 +1577,7 @@ run_regression_tests() (
     if [[ "$NOTIFICATION_DECISION" == "SEND" &&
           "$NOTIFICATION_RESOLVED_COUNT" == "1" &&
           "$NOTIFICATION_RECOVERY_SECTION" == *"Fixture notification"* &&
-          "$SUBJECT" == "Disks Health - RECOVERED (1)" ]]
+          "$SUBJECT" == "Disk Health Monitor - RECOVERED (1)" ]]
     then
         self_test_result 1 "Resolved finding notification rendering"
     else

@@ -1,13 +1,62 @@
 #!/bin/bash
 # shellcheck disable=SC2034
+clearLog=true
 arrayStarted=true
-# MetaFusion/Kometa weekly findings audit and guarded configuration reconciliation v3.0. Schedule 55 3,7,11,15,19,23 * * *.
+# MetaFusion/Kometa weekly findings audit and guarded configuration reconciliation v3.1. Schedule 55 3,7,11,15,19,23 * * *.
 # Run after MetaFusion and before the four-hour Kometa boundaries. MetaFusion
 # owns generated metadata; this wrapper only maintains personal overlay and
 # collection templates, under the MetaFusion/wrapper write lock.
 # Incomplete Plex identity inventories/active producers prohibit edits.
+# BEGIN EMBEDDED OPERATIONS CONTRACT
+OPS_SCRIPT_ID="media_metadata_audit"
+# Embedded operations contract v1; generated into standalone User Scripts.
+usr_ops_log_line() {
+    local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
+    case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
+    message=${message//$'\r'/};message=${message//$'\n'/ | }
+    printf -v line '%s | %s | %s | run=%s | phase=%s | %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$OPS_SCRIPT_ID" "${OPS_RUN_ID:-$$}" "$phase" "$message"
+    if ((${#line}>4096));then line="${line:0:4050} ... [truncated]";fi
+    printf '%s\n' "$line"
+}
+
+# Accept the original command, including its timeout, so producer-specific
+# delivery/cooldown/acknowledgement semantics stay with the owning script.
+usr_ops_notify() {
+    local -a args=("$@")
+    local i importance=normal summary='' message='' index=-1 status=UPDATE
+    for ((i=0;i<${#args[@]};i++));do
+        case "${args[$i]}" in
+          -i) importance="${args[$((i+1))]:-normal}";;
+          -d) summary="${args[$((i+1))]:-}";;
+          -m) index=$((i+1));message="${args[$index]:-}";;
+        esac
+    done
+    case "$importance" in alert|warning) status=ATTENTION;;esac
+    if [[ "$message" != 'Status: '* ]];then
+        message="Status: $status"$'\n'"Summary: $summary"$'\n\n'"Actions and findings:"$'\n'"${message:-$summary}"
+        if ((index>=0));then args[$index]="$message";else args+=(-m "$message");fi
+    fi
+    # Every notifier has a termination escalation, including legacy callers.
+    if [[ "${args[0]##*/}" == timeout ]];then
+        if [[ " ${args[*]} " != *' --kill-after'* ]];then args=("${args[0]}" --kill-after=5 "${args[@]:1}");fi
+    else args=(timeout --signal=TERM --kill-after=5 30 "${args[@]}");fi
+    "${args[@]}"
+}
+
+# Bounded local history for scripts previously dependent on the plugin console.
+usr_ops_append_log() {
+    local file="$1" line="$2" max="${3:-2097152}" i
+    [[ -d "${file%/*}" && ! -L "$file" ]] || return 1
+    for i in 1 2;do [[ ! -L "$file.$i" ]] || return 1;done
+    find "${file%/*}" -maxdepth 1 -type f \( -name "${file##*/}.1" -o -name "${file##*/}.2" \) -mtime +29 -delete || return 1
+    if [[ -f "$file" ]] && (( $(stat -c %s "$file")+${#line}+1>max ));then
+        rm -f "$file.2";[[ ! -f "$file.1" ]] || mv "$file.1" "$file.2";mv "$file" "$file.1" || return 1
+    fi
+    printf '%s\n' "$line" >>"$file"
+}
+# END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
-readonly SCRIPT_VERSION="3.0"
+readonly SCRIPT_VERSION="3.1"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/media_metadata_audit}"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 NOTIFY_BIN="${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}"
@@ -24,6 +73,39 @@ WEEKLY_REPORT_MINUTE="${WEEKLY_REPORT_MINUTE:-55}"
 WEEKLY_REPORT_MAX_ITEMS=20
 METAFUSION_FINDINGS_FILE="${METAFUSION_FINDINGS_FILE:-/mnt/cache/appdata/metafusion/reports/findings-latest.json}"
 METAFUSION_FINDINGS_MAX_BYTES=$((32*1024*1024))
+
+log() {
+    local level="$1";shift;local line
+    line=$(usr_ops_log_line "$level" "${METADATA_PHASE:-MAIN}" "$*")
+    printf '%s\n' "$line"
+    [[ ! -d "$STATE_DIR" ]] || usr_ops_append_log "$STATE_DIR/media-metadata-audit.log" "$line"
+}
+
+metadata_notify() {
+    local released=false rc=0
+    if [[ -n "${METADATA_EXPORT_FD:-}" ]];then exec {METADATA_EXPORT_FD}>&-;released=true;fi
+    usr_ops_notify "$@" || rc=$?
+    if [[ "$released" == true ]];then
+        exec {METADATA_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || { METADATA_EXPORT_LOST=true;return 75; }
+        flock -s -w 20 "$METADATA_EXPORT_FD" || { exec {METADATA_EXPORT_FD}>&-;METADATA_EXPORT_LOST=true;return 75; }
+    fi
+    return "$rc"
+}
+
+metadata_finish() {
+    local rc="$1" temp outcome="${METADATA_STATUS:-FAILED}" summary="${METADATA_SUMMARY:-Audit did not complete}"
+    trap - EXIT
+    [[ "$outcome" != RUNNING ]] || { outcome=FAILED;summary='Audit ended before recording its final outcome'; }
+    ((rc==0)) || { [[ "$outcome" == DEFERRED ]] || outcome=FAILED; }
+    if [[ "${METADATA_WEEKLY_STATUS:-}" == FAILED && "$outcome" == OK ]];then outcome=WARNING;summary+='; weekly report delivery or evidence collection failed and remains pending';fi
+    log "$(case "$outcome" in FAILED) printf ERROR;;WARNING|ATTENTION) printf WARNING;;*) printf INFO;;esac)" "$outcome: $summary" || true
+    [[ "${METADATA_EXPORT_LOST:-false}" != true ]] || return 0
+    temp=$(mktemp "$STATUS_DIR/.media-metadata-receipt.XXXXXX") || return 0
+    jq -n --arg status "$outcome" --arg summary "$summary" --arg weekly "${METADATA_WEEKLY_STATUS:-NOT_CHECKED}" \
+      --arg phase "${METADATA_PHASE:-startup}" --arg run "${METADATA_RUN_ID:-$$}" --arg version "$SCRIPT_VERSION" \
+      --argjson started "${METADATA_STARTED:-0}" --argjson epoch "$(date +%s)" \
+      '{schema:1,name:"media_metadata_audit",status:$status,summary:$summary,epoch:$epoch,startedAt:$started,runId:$run,phase:$phase,scriptVersion:$version,weeklyReportStatus:$weekly}' >"$temp" && mv "$temp" "$STATUS_DIR/media_metadata_audit.json" || rm -f "$temp"
+}
 
 weekly_media_report() {
     local preview="${1:-false}" epoch input result saved mf watchdog report_state="$STATE_DIR/weekly-report-state.json" rc=0
@@ -401,20 +483,26 @@ PYWEEKLY
 )" || { rm -f "$input" "$result" "$saved"; return 1; }
     timeout --kill-after=3 25 docker exec -i "$KOMETA_CONTAINER" python3 -c "$program" "$epoch" "$WEEKLY_REPORT_TIMEZONE" "$WEEKLY_REPORT_WEEKDAY" "$WEEKLY_REPORT_HOUR" "$WEEKLY_REPORT_MINUTE" "$WEEKLY_REPORT_MAX_ITEMS" "$preview" <"$input" >"$result" || rc=$?
     if ((rc!=0)) || ! jq -e '.state.schema==1 and (.body|type=="string")' "$result" >/dev/null 2>&1; then
-        rm -f "$input" "$result" "$saved"; printf 'Weekly media metadata report unavailable; delivery deadline unchanged and watchdog immediate reporting retained.\n' >&2; return 1
+        rm -f "$input" "$result" "$saved"; usr_ops_log_line ERROR reporting 'Weekly evidence collection failed; delivery deadline retained for retry; watchdog availability reporting remains active' >&2; return 1
     fi
     if [[ "$preview" == true ]]; then jq -r .fullBody "$result"; rm -f "$input" "$result" "$saved"; return 0; fi
+    local pending="$STATE_DIR/weekly-pending-notification.json"
+    if [[ -e "$pending" ]];then
+      [[ ! -L "$pending" ]] && jq -e '.state.schema==1 and .send==true and (.body|type)=="string"' "$pending" >/dev/null || { rm -f "$input" "$result" "$saved";return 1; }
+      cp "$pending" "$result" || return 1
+    fi
     jq -r .fullBody "$result" >"$input" && mv -f "$input" "$STATE_DIR/weekly-report.txt" || { rm -f "$input" "$result" "$saved"; return 1; }
     if [[ $(jq -r .send "$result") == true ]]; then
+        cp "$result" "$pending.new" && sync -f "$pending.new" && mv "$pending.new" "$pending" || return 1
         local importance=warning
         if jq -e '.actionable==0 and .coverageWarnings==0' "$result" >/dev/null; then importance=normal; fi
-        if [[ ! -x "$NOTIFY_BIN" ]] || ! timeout 30 "$NOTIFY_BIN" -i "$importance" -s 'Media Metadata Weekly Review' -d "Weekly findings: $(jq -r .actionable "$result"); verified resolved: $(jq -r .resolved "$result"); coverage warnings: $(jq -r .coverageWarnings "$result")" -m "$(jq -r .body "$result")"; then
-            rm -f "$result" "$saved"; printf 'Weekly media metadata notification failed; deadline unchanged for retry.\n' >&2; return 1
+        if [[ ! -x "$NOTIFY_BIN" ]] || ! metadata_notify timeout 30 "$NOTIFY_BIN" -i "$importance" -s 'Media Metadata Weekly Review' -d "Weekly findings: $(jq -r .actionable "$result"); verified resolved: $(jq -r .resolved "$result"); coverage warnings: $(jq -r .coverageWarnings "$result")" -m "$(jq -r .body "$result")"; then
+            rm -f "$result" "$saved"; usr_ops_log_line ERROR notification 'Notification delivery failed; exact report retained for retry; delivery deadline unchanged' >&2; return 1
         fi
-        printf 'Weekly media metadata maintenance notification delivered.\n'
+        usr_ops_log_line INFO notification 'Completed weekly notification delivery'
     fi
     jq .state "$result" >"$saved" && mv -f "$saved" "$report_state" || { rm -f "$result" "$saved"; return 1; }
-    rm -f "$result"
+    rm -f "$result" "$pending"
 }
 
 main() {
@@ -432,19 +520,25 @@ main() {
     mountpoint -q /mnt/vault || return 1
     mkdir -p "$STATE_DIR" "$STATUS_DIR" || return 1
     exec 9>"$STATE_DIR/audit.lock"; flock -n 9 || return 0
-    exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}"; flock -s -n "$export_fd" || return 0
+    exec {METADATA_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}"; flock -s -n "$METADATA_EXPORT_FD" || return 0
     if [[ ${1:-} == --report-preview ]]; then weekly_media_report true; return $?; fi
+    METADATA_STARTED=$(date +%s);METADATA_RUN_ID="${METADATA_STARTED}_$$";METADATA_STATUS=RUNNING;METADATA_PHASE=weekly-report;METADATA_SUMMARY='Audit started';METADATA_WEEKLY_STATUS=RUNNING
+    trap 'metadata_finish "$?"' EXIT
+    # Planned container downtime is a maintenance deferral, not failed reporting.
+    exec {gate}>"${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}";flock -s -n "$gate" || { METADATA_STATUS=DEFERRED;METADATA_WEEKLY_STATUS=DEFERRED;METADATA_SUMMARY='Appdata maintenance active; reporting and configuration changes deferred';return 0; }
     local weekly_rc=0
     weekly_media_report false || weekly_rc=$?
-    if [[ ${1:-} == --weekly-report ]]; then return "$weekly_rc"; fi
-    if [[ -n "${platform_version:-}" && "$platform_version" != 7.* ]]; then printf 'Unvalidated Unraid %s; configuration mutations deferred.\n' "$platform_version"; return 0; fi
-    exec {gate}>"${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}"; flock -s -n "$gate" || { printf 'Appdata maintenance active; Kometa preflight deferred.\n'; return 0; }
+    METADATA_WEEKLY_STATUS=OK;((weekly_rc==0)) || METADATA_WEEKLY_STATUS=FAILED
+    [[ "${METADATA_EXPORT_LOST:-false}" != true ]] || return 75
+    METADATA_PHASE=reconciliation
+    if [[ ${1:-} == --weekly-report ]]; then METADATA_PHASE=weekly-report;METADATA_STATUS=OK;METADATA_SUMMARY='Weekly findings reporting checked; no configuration reconciliation requested';return "$weekly_rc"; fi
+    if [[ -n "${platform_version:-}" && "$platform_version" != 7.* ]]; then METADATA_STATUS=DEFERRED;METADATA_SUMMARY="Unvalidated Unraid $platform_version; configuration changes deferred";return 0;fi
     # Reporting failure never authorizes or blocks existing guarded edits.
     # Watchdog falls back to its immediate routine alerts if handoff is stale.
     # Never compete with an active or unobservable MetaFusion producer.
-    if ! timeout 8 docker exec metafusion cat /tmp/metafusion-status.json | jq -e '.state=="idle"' >/dev/null; then printf 'MetaFusion is active/unverified; configuration edits deferred.\n'; return 0; fi
+    if ! timeout 8 docker exec metafusion cat /tmp/metafusion-status.json | jq -e '.state=="idle"' >/dev/null; then METADATA_STATUS=DEFERRED;METADATA_SUMMARY='MetaFusion active or status unverified; configuration changes deferred';return 0;fi
     if ! timeout 8 docker exec metafusion cat /tmp/metafusion-status.json | jq -e '.capabilities.kometa_metadata_reconciliation==1 and .capabilities.kometa_output_lock==1' >/dev/null; then
-        printf 'Native MetaFusion reconciliation capability unavailable; upgrade develop image before enabling preflight v2. No YAML files changed.\n'; return 0
+        METADATA_STATUS=DEFERRED;METADATA_SUMMARY='Required native reconciliation capability unavailable; no configuration changes';return 0
     fi
     native_report=$(timeout 8 docker exec metafusion cat /tmp/metafusion-status.json | jq -c '{finished:.last_run_finished,status:.last_run_status,result:(.metrics.kometa_reconciliation // {})} | .result.actions=((.result.actions // [])[:10])') || return 1
     temp=$(mktemp "$STATE_DIR/.result.XXXXXX") || return 1
@@ -453,12 +547,15 @@ import json, os, re, stat, sys, time
 from pathlib import Path
 import yaml
 import fcntl
+from zoneinfo import ZoneInfo
+import datetime
 root=Path(os.environ.get('KOMETA_CONFIG_ROOT','/config')); state=root/'.preflight'; state.mkdir(mode=0o700,exist_ok=True)
 class SafetyError(Exception): pass
 changes=[]
 try:
     log=root/'logs/meta.log'
     active=None
+    log_before=log.stat()
     with log.open(errors='replace') as handle:
         for line in handle:
             body=line.split('|',1)[-1].strip().strip('=| ').strip()
@@ -475,6 +572,15 @@ try:
     try:fcntl.flock(output_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError:
         print(json.dumps({'status':'DEFERRED','summary':'MetaFusion owns write lock; no edits','changed':False}));sys.exit(0)
+    def publication_allowed():
+        current=log.stat()
+        if (current.st_ino,current.st_size,current.st_mtime_ns)!=(log_before.st_ino,log_before.st_size,log_before.st_mtime_ns):
+            return False
+        now=datetime.datetime.now(ZoneInfo('Asia/Singapore'))
+        seconds=(now.hour%4)*3600+now.minute*60+now.second
+        return 4*3600-seconds>180
+    if not publication_allowed():
+        print(json.dumps({'status':'DEFERRED','summary':'Kometa activity changed or next scheduled boundary is within three minutes; no configuration changes','changed':False}));sys.exit(0)
     staged=[]
     # Native per-item regex filters allow a legitimate empty resolution class.
     # Keep builder validation elsewhere and preserve all configured overlays.
@@ -562,6 +668,7 @@ try:
             try:os.fsync(directory)
             finally:os.close(directory)
         for path,old,new in staged:
+            if not publication_allowed():raise SafetyError('Kometa activity changed; further publication stopped; original-file backups retained')
             if (path.read_bytes() if path.exists() else b'')!=old:raise SafetyError('Concurrent write detected; prepared originals retained')
             publish_file(path.with_name('.'+path.name+'.preflight-new'),path)
         # Keep five original-file sets; the deferred catalogue is never pruned.
@@ -590,11 +697,12 @@ PY
     status=$(jq -r .status "$temp"); summary=$(jq -r .summary "$temp"); changed=$(jq -r .changed "$temp")
     signature=$(jq -c '{status,summary,actions}' "$temp" | sha256sum | awk '{print $1}')
     [[ ! -f "$STATE_DIR/state.json" ]] || previous=$(jq -r '.signature // ""' "$STATE_DIR/state.json")
-    printf '%s: %s\n' "$status" "$summary"
+    METADATA_STATUS="$status";METADATA_SUMMARY="$summary"
+    log INFO "$status: $summary"
     if [[ "$status" != DEFERRED && "$signature" != "$previous" && ( "$changed" == true || "$status" == FAILED ) ]]; then
         local importance=normal
         [[ "$status" != FAILED ]] || importance=warning
-        timeout 30 "$NOTIFY_BIN" -i "$importance" -s 'Media Metadata Audit' -d "Configuration reconciliation: $status" -m "$summary"$'\n'"$(jq -r '.actions[]?' "$temp")" >/dev/null 2>&1 || { rm -f "$temp"; return 1; }
+        metadata_notify timeout 30 "$NOTIFY_BIN" -i "$importance" -s 'Media Metadata Audit' -d "Configuration reconciliation: $status" -m "$summary"$'\n'"$(jq -r '.actions[]?' "$temp")" >/dev/null 2>&1 || { rm -f "$temp"; return 1; }
     fi
     jq --arg signature "$signature" --argjson epoch "$(date +%s)" '.+{signature:$signature,epoch:$epoch}' "$temp" >"$STATE_DIR/.state.new" && mv "$STATE_DIR/.state.new" "$STATE_DIR/state.json" || return 1
     jq --arg name media_metadata_audit --argjson epoch "$(date +%s)" '.+{name:$name,epoch:$epoch}' "$temp" >"$STATUS_DIR/.media-metadata-audit.new" && mv "$STATUS_DIR/.media-metadata-audit.new" "$STATUS_DIR/media_metadata_audit.json"

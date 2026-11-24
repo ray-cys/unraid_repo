@@ -11,24 +11,24 @@ source "$repo/user_script/backup_vault_remote.sh"
 LOG_DIR="$fixture/vault";mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/log";ISS_REQUEST_FILE="$fixture/request.json"
 NOTIFY_BIN="$fixture/notifier"
-printf '#!/bin/bash\nprintf "%%s\\n" "$*" >>"$fixture/mail"\n' >"$NOTIFY_BIN";chmod +x "$NOTIFY_BIN"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >>"$fixture/mail"\nprintf "accepted\\n" >>"$fixture/mail-count"\n' >"$NOTIFY_BIN";chmod +x "$NOTIFY_BIN"
 export fixture
 ISS_REQUEST_ID=gen-A;VAULT_NOTIFICATION_REASON=capacity
 notify_unraid alert 'Backup failed' failed
 notify_unraid alert 'Backup failed' failed
-[[ "$NOTIFICATION_RESULT" == suppressed && $(wc -l <"$fixture/mail") == 1 ]]
+[[ "$NOTIFICATION_RESULT" == suppressed && $(wc -l <"$fixture/mail-count") == 1 ]]
 # Repeated invocations share the same state, not shell globals.
 (bash -c 'source "$repo/user_script/backup_vault_remote.sh";LOG_DIR="$fixture/vault";LOG_FILE="$LOG_DIR/log";NOTIFY_BIN="$fixture/notifier";ISS_REQUEST_ID=gen-A;VAULT_NOTIFICATION_REASON=capacity;notify_unraid alert "Backup failed" failed;[[ "$NOTIFICATION_RESULT" == suppressed ]]')
 # The daily reminder is allowed without changing its incident identity.
 jq '.activeFailure.lastSentAt-=86401' "$VAULT_NOTIFICATION_STATE" >"$fixture/old";mv "$fixture/old" "$VAULT_NOTIFICATION_STATE"
 notify_unraid alert 'Backup failed' failed
-[[ $(wc -l <"$fixture/mail") == 2 ]]
+[[ $(wc -l <"$fixture/mail-count") == 2 ]]
 VAULT_NOTIFICATION_REASON=ssh-auth
 notify_unraid alert 'Backup failed' failed
-[[ $(wc -l <"$fixture/mail") == 3 ]]
+[[ $(wc -l <"$fixture/mail-count") == 3 ]]
 ISS_REQUEST_ID=gen-B
 notify_unraid alert 'Backup failed' failed
-[[ $(wc -l <"$fixture/mail") == 4 ]]
+[[ $(wc -l <"$fixture/mail-count") == 4 ]]
 notify_unraid normal 'Backup completed' verified
 jq -e '.activeFailure==null' "$VAULT_NOTIFICATION_STATE" >/dev/null
 grep -q 'Recovery: previously reported Backup failed is cleared' "$fixture/mail"
@@ -38,7 +38,7 @@ printf '#!/bin/bash\nexit 1\n' >"$NOTIFY_BIN"
 notify_unraid alert 'Backup failed' failed
 [[ "$NOTIFICATION_RESULT" == failed ]]
 jq -e '.activeFailure==null' "$VAULT_NOTIFICATION_STATE" >/dev/null
-printf '#!/bin/bash\nprintf "%%s\\n" "$*" >>"$fixture/mail"\n' >"$NOTIFY_BIN"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >>"$fixture/mail"\nprintf "accepted\\n" >>"$fixture/mail-count"\n' >"$NOTIFY_BIN"
 notify_unraid alert 'Backup failed' failed
 jq -e '.activeFailure.requestId=="gen-C"' "$VAULT_NOTIFICATION_STATE" >/dev/null
 VAULT

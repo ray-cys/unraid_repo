@@ -1,13 +1,62 @@
 #!/bin/bash
 # shellcheck disable=SC2034
+clearLog=true
 arrayStarted=true
-# Backup freshness, delivery and runtime-compatibility audit v1.6.
+# Backup freshness, delivery and runtime-compatibility audit v1.7.
 # Schedule: 20 * * * *. Reads local receipts/manifests only: no WOL, remote
 # connection, media hashing, container actions or cleanup. One lifecycle email
 # for changed findings, recovery, or a 24-hour reminder. Failed delivery retries.
 # CLI: bash script [--help|--version]. No CLI modifies backup or application data.
+# BEGIN EMBEDDED OPERATIONS CONTRACT
+OPS_SCRIPT_ID="backup_health_audit"
+# Embedded operations contract v1; generated into standalone User Scripts.
+usr_ops_log_line() {
+    local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
+    case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
+    message=${message//$'\r'/};message=${message//$'\n'/ | }
+    printf -v line '%s | %s | %s | run=%s | phase=%s | %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$OPS_SCRIPT_ID" "${OPS_RUN_ID:-$$}" "$phase" "$message"
+    if ((${#line}>4096));then line="${line:0:4050} ... [truncated]";fi
+    printf '%s\n' "$line"
+}
+
+# Accept the original command, including its timeout, so producer-specific
+# delivery/cooldown/acknowledgement semantics stay with the owning script.
+usr_ops_notify() {
+    local -a args=("$@")
+    local i importance=normal summary='' message='' index=-1 status=UPDATE
+    for ((i=0;i<${#args[@]};i++));do
+        case "${args[$i]}" in
+          -i) importance="${args[$((i+1))]:-normal}";;
+          -d) summary="${args[$((i+1))]:-}";;
+          -m) index=$((i+1));message="${args[$index]:-}";;
+        esac
+    done
+    case "$importance" in alert|warning) status=ATTENTION;;esac
+    if [[ "$message" != 'Status: '* ]];then
+        message="Status: $status"$'\n'"Summary: $summary"$'\n\n'"Actions and findings:"$'\n'"${message:-$summary}"
+        if ((index>=0));then args[$index]="$message";else args+=(-m "$message");fi
+    fi
+    # Every notifier has a termination escalation, including legacy callers.
+    if [[ "${args[0]##*/}" == timeout ]];then
+        if [[ " ${args[*]} " != *' --kill-after'* ]];then args=("${args[0]}" --kill-after=5 "${args[@]:1}");fi
+    else args=(timeout --signal=TERM --kill-after=5 30 "${args[@]}");fi
+    "${args[@]}"
+}
+
+# Bounded local history for scripts previously dependent on the plugin console.
+usr_ops_append_log() {
+    local file="$1" line="$2" max="${3:-2097152}" i
+    [[ -d "${file%/*}" && ! -L "$file" ]] || return 1
+    for i in 1 2;do [[ ! -L "$file.$i" ]] || return 1;done
+    find "${file%/*}" -maxdepth 1 -type f \( -name "${file##*/}.1" -o -name "${file##*/}.2" \) -mtime +29 -delete || return 1
+    if [[ -f "$file" ]] && (( $(stat -c %s "$file")+${#line}+1>max ));then
+        rm -f "$file.2";[[ ! -f "$file.1" ]] || mv "$file.1" "$file.2";mv "$file" "$file.1" || return 1
+    fi
+    printf '%s\n' "$line" >>"$file"
+}
+# END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
-readonly SCRIPT_VERSION="1.6"
+readonly SCRIPT_VERSION="1.7"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/backup_health_audit}"
 APPDATA_ROOT="${APPDATA_ROOT:-/mnt/vault/backup/cache}"
@@ -31,7 +80,7 @@ RUNTIME_SAFE=true
 PLATFORM_VERSION=unknown
 
 finding() { FINDINGS+=("$*"); }
-audit_log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$STATE_DIR/audit.log"; }
+audit_log() { local line;line=$(usr_ops_log_line INFO audit "$*");printf '%s\n' "$line";usr_ops_append_log "$STATE_DIR/audit.log" "$line" "$LOG_MAX_BYTES"; }
 latest_path() {
     find "$1" -mindepth 1 -maxdepth 1 -type "$2" -name "$3" ! -name '*.partial' ! -name '*.failed' -printf '%f\n' 2>/dev/null | sort | tail -n 1
 }
@@ -60,6 +109,16 @@ audit_media_integrity_monitor() {
     if jq -e '.notification=="failed"' "$receipt" >/dev/null; then finding 'Media integrity audit: grouped notification delivery failed; pending report retained';fi
     # Individual media findings remain owned by the weekly audit, not repeated
     # in this hourly backup/runtime notification stream.
+}
+
+audit_media_coordination() {
+    local receipt="$STATUS_DIR/media_metadata_audit.json" epoch
+    if jq -e '(.epoch|type)=="number"' "$receipt" >/dev/null 2>&1;then
+      epoch=$(jq -r .epoch "$receipt");check_age 'Media metadata audit invocation' "$epoch" "$((8*3600))"
+      [[ $(jq -r '.weeklyReportStatus // "OK"' "$receipt") != FAILED ]] || finding 'Media metadata weekly reporting failed; exact pending report retained for retry'
+    else finding 'Media metadata audit: valid run receipt missing';fi
+    receipt="$STATUS_DIR/media_integrity_audit.json"
+    if jq -e '(.stalledCompletedRuns // 0)>=3' "$receipt" >/dev/null 2>&1;then finding 'Media integrity audit: three completed scans made no measurable coverage progress; review resource holds and scan budget';fi
 }
 
 audit_runtime() {
@@ -134,7 +193,7 @@ audit_backups() {
         # receipts. A bounded, anchored success line is legacy log evidence only.
         log=$(latest_path "$REMOTE_LOG_ROOT" f 'backup_media_remote_*.log')
         if [[ -n "$log" ]]; then
-            created=$(tail -n 80 "$REMOTE_LOG_ROOT/$log" | sed -n '/\[BACKUP\]\[INFO\] Remote backup completed successfully/s/^\(.\{19\}\).*/\1/p' | tail -n 1)
+            created=$(tail -n 80 "$REMOTE_LOG_ROOT/$log" | sed -n '/Remote backup completed successfully/s/^\(.\{19\}\).*/\1/p' | tail -n 1)
             [[ -z "$created" ]] || copy_epoch=$(date -d "$created" +%s 2>/dev/null || printf 0)
             (( copy_epoch==0 )) || ACTIONS+=('Mirror freshness obtained from legacy completion log; next successful mirror should publish its verification receipt.')
         fi
@@ -177,7 +236,7 @@ main() {
     exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
     flock -s -n "$export_fd" || return 0
     local previous='' last=0 fingerprint temp status=OK importance=normal body
-    audit_runtime; audit_backups; audit_recovery_inventory; audit_disk_health_monitor; audit_media_integrity_monitor
+    audit_runtime; audit_backups; audit_recovery_inventory; audit_disk_health_monitor; audit_media_integrity_monitor; audit_media_coordination
     fingerprint=$(printf '%s\n' "${FINDINGS[@]}" | sort | sha256sum | awk '{print $1}')
     if [[ -f "$STATE_DIR/state.json" ]]; then
         jq -e '.fingerprint|type=="string"' "$STATE_DIR/state.json" >/dev/null || { printf 'Invalid audit state preserved.\n' >&2; return 1; }
@@ -187,7 +246,7 @@ main() {
     if (( ${#FINDINGS[@]}>0 )); then status=WARNING; importance=warning; fi
     body="Backup audit: $status; Unraid $PLATFORM_VERSION; findings=${#FINDINGS[@]}."$'\n'"$(printf '%s\n' "${FINDINGS[@]}" "${ACTIONS[@]}")"$'\n''Actions: local backup evidence and host capabilities checked. No backup, remote wake, media scan, restart or cleanup was performed.'
     if [[ "$fingerprint" != "$previous" && ( -n "$previous" || "$status" != OK ) ]] || { [[ "$status" != OK ]] && (( NOW-last>=REMINDER_SECONDS )); }; then
-        if [[ ! -x "$NOTIFY_BIN" ]] || ! timeout 30 "$NOTIFY_BIN" -i "$importance" -s 'Backup Health Audit' -d "Backup audit: $status" -m "$body"; then
+        if [[ ! -x "$NOTIFY_BIN" ]] || ! usr_ops_notify timeout 30 "$NOTIFY_BIN" -i "$importance" -s 'Backup Health Audit' -d "Backup audit: $status" -m "$body"; then
             printf 'Audit notification failed; transition remains pending.\n' >&2; return 1
         fi
         last=$NOW

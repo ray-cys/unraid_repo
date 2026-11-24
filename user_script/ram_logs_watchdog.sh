@@ -1,5 +1,6 @@
 #!/bin/bash
-# RAM-log readiness and lifecycle monitor v3.1 (Unraid User Scripts).
+clearLog=true
+# RAM-log readiness and lifecycle monitor v3.2 (Unraid User Scripts).
 # Schedule: */10 * * * * (unchanged). Normal runs check RAM-log health and save
 # changed logs to vault at most once per interval. Application logs are never
 # deleted/truncated/rotated. --prepare is the existing PRE-DOCKER boot hook;
@@ -19,8 +20,56 @@
 # at 256 MiB; metadata is small. Unknown/unmanaged paths are never purged.
 # All archive diagnostics go to console and existing monitor health reporting,
 # never a new syslog stream or additional scheduled User Script.
+# BEGIN EMBEDDED OPERATIONS CONTRACT
+OPS_SCRIPT_ID="ram_logs_watchdog"
+# Embedded operations contract v1; generated into standalone User Scripts.
+usr_ops_log_line() {
+    local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
+    case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
+    message=${message//$'\r'/};message=${message//$'\n'/ | }
+    printf -v line '%s | %s | %s | run=%s | phase=%s | %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$OPS_SCRIPT_ID" "${OPS_RUN_ID:-$$}" "$phase" "$message"
+    if ((${#line}>4096));then line="${line:0:4050} ... [truncated]";fi
+    printf '%s\n' "$line"
+}
+
+# Accept the original command, including its timeout, so producer-specific
+# delivery/cooldown/acknowledgement semantics stay with the owning script.
+usr_ops_notify() {
+    local -a args=("$@")
+    local i importance=normal summary='' message='' index=-1 status=UPDATE
+    for ((i=0;i<${#args[@]};i++));do
+        case "${args[$i]}" in
+          -i) importance="${args[$((i+1))]:-normal}";;
+          -d) summary="${args[$((i+1))]:-}";;
+          -m) index=$((i+1));message="${args[$index]:-}";;
+        esac
+    done
+    case "$importance" in alert|warning) status=ATTENTION;;esac
+    if [[ "$message" != 'Status: '* ]];then
+        message="Status: $status"$'\n'"Summary: $summary"$'\n\n'"Actions and findings:"$'\n'"${message:-$summary}"
+        if ((index>=0));then args[$index]="$message";else args+=(-m "$message");fi
+    fi
+    # Every notifier has a termination escalation, including legacy callers.
+    if [[ "${args[0]##*/}" == timeout ]];then
+        if [[ " ${args[*]} " != *' --kill-after'* ]];then args=("${args[0]}" --kill-after=5 "${args[@]:1}");fi
+    else args=(timeout --signal=TERM --kill-after=5 30 "${args[@]}");fi
+    "${args[@]}"
+}
+
+# Bounded local history for scripts previously dependent on the plugin console.
+usr_ops_append_log() {
+    local file="$1" line="$2" max="${3:-2097152}" i
+    [[ -d "${file%/*}" && ! -L "$file" ]] || return 1
+    for i in 1 2;do [[ ! -L "$file.$i" ]] || return 1;done
+    find "${file%/*}" -maxdepth 1 -type f \( -name "${file##*/}.1" -o -name "${file##*/}.2" \) -mtime +29 -delete || return 1
+    if [[ -f "$file" ]] && (( $(stat -c %s "$file")+${#line}+1>max ));then
+        rm -f "$file.2";[[ ! -f "$file.1" ]] || mv "$file.1" "$file.2";mv "$file" "$file.1" || return 1
+    fi
+    printf '%s\n' "$line" >>"$file"
+}
+# END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
-readonly SCRIPT_VERSION="3.1"
+readonly SCRIPT_VERSION="3.2"
 RAMLOG_PATH="${RAMLOG_PATH:-/mnt/ramlogs}"
 RAMLOG_SIZE="${RAMLOG_SIZE:-2G}"
 RAMLOG_APPS=(sonarr radarr prowlarr bazarr tautulli recyclarr sabnzbd qbittorrent imagemaid seerr lumunarr)
@@ -51,14 +100,14 @@ ARCHIVE_LAST_ERROR=""
 install_archive_hook() {
     local hook="$ARCHIVE_HOOK_ROOT/event/unmounting_disks" temp
     [[ -f "$EMHTTP_EVENT" ]] && grep -q '^# unmounting_disks' "$EMHTTP_EVENT" || {
-        printf 'Archive hook unavailable: Unraid event interface not recognized.\n' >&2; return 1;
+        usr_ops_log_line INFO archive "$(printf 'Archive hook unavailable: Unraid event interface not recognized.\n')" >&2; return 1;
     }
     [[ "$ARCHIVE_HOOK_ROOT" == /usr/local/emhttp/plugins/* || "$ARCHIVE_HOOK_ROOT" == /tmp/* ]] || return 1
     [[ ! -L "$ARCHIVE_HOOK_ROOT" && $(realpath -m "$ARCHIVE_HOOK_ROOT") == "$ARCHIVE_HOOK_ROOT" &&
        "$INSTALLED_SCRIPT" == /* && "$INSTALLED_SCRIPT" != *$'\n'* ]] || return 1
     if [[ -e "$hook" ]]; then
         [[ -f "$hook" && ! -L "$hook" ]] && grep -Fqx '# Managed by ram_logs_watchdog.sh archive hook v1' "$hook" || {
-            printf 'Unrecognized archive event hook preserved.\n' >&2; return 1;
+            usr_ops_log_line WARNING archive "$(printf 'Unrecognized archive event hook preserved.\n')" >&2; return 1;
         }
     fi
     [[ $(realpath -m "${hook%/*}") == "${hook%/*}" ]] || return 1
@@ -107,7 +156,7 @@ prune_ram_logs_watchdog_archives() {
     while IFS= read -r dir; do
         [[ -n "$dir" ]] || continue
         dir="$ARCHIVE_ROOT/$dir"
-        archive_generation_valid "$dir" || { printf 'Unrecognized archive generation preserved: %s\n' "$dir" >&2; return 1; }
+        archive_generation_valid "$dir" || { usr_ops_log_line WARNING archive "$(printf 'Unrecognized archive generation preserved: %s\n' "$dir")" >&2; return 1; }
         [[ "$dir" != "$promoted" ]] || continue
         boot=$(jq -r .bootId "$dir/manifest.json") || return 1
         if [[ -z "${retained_boots[$boot]:-}" ]] && ((kept<2)); then
@@ -135,24 +184,24 @@ archive_ramlogs() (
     trap 'exit 130' INT
     case "$reason" in checkpoint|shutdown|manual) ;; *) return 2;; esac
     for dependency in jq flock timeout tar gzip sha256sum stat find sort df sync realpath; do command -v "$dependency" >/dev/null || return 1; done
-    tar --version 2>/dev/null | grep -q 'GNU tar' || { printf 'Archive failed: GNU tar is required.\n' >&2; return 1; }
+    tar --version 2>/dev/null | grep -q 'GNU tar' || { usr_ops_log_line ERROR archive "$(printf 'Archive failed: GNU tar is required.\n')" >&2; return 1; }
     [[ "$ARCHIVE_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || return 1
-    mountpoint -q "$VAULT_MOUNT" || { printf 'Archive failed: vault is not mounted; no shadow directory created.\n' >&2; return 1; }
+    mountpoint -q "$VAULT_MOUNT" || { usr_ops_log_line ERROR archive "$(printf 'Archive failed: vault is not mounted; no shadow directory created.\n')" >&2; return 1; }
     [[ "$ARCHIVE_ROOT" == "$VAULT_MOUNT"/* && ! -L "$ARCHIVE_ROOT" && $(realpath -m "$ARCHIVE_ROOT") == "$ARCHIVE_ROOT" ]] || return 1
     mkdir -p -- "$STATE_DIR" || return 1
     exec {archive_fd}>"$STATE_DIR/archive.lock" || return 1
-    if ! flock -w 5 "$archive_fd"; then printf 'Archive deferred: another capture is active.\n'; return 1; fi
+    if ! flock -w 5 "$archive_fd"; then usr_ops_log_line INFO archive "$(printf 'Archive deferred: another capture is active.\n')"; return 1; fi
     boot=$(cat "$BOOT_ID_FILE") || return 1
     [[ "$boot" =~ ^[a-f0-9-]{36}$ ]] || return 1
     now=$(date +%s)
     work=$(mktemp -d "$STATE_DIR/.archive-work.XXXXXX") || return 1
     files="$work/files"; inventory="$work/inventory"
-    archive_source_inventory "$files" "$inventory" || { printf 'Archive failed: RAM-log source is unavailable or is not tmpfs.\n' >&2; return 1; }
-    [[ -s "$files" ]] || { printf 'Archive skipped: RAM log tree has no regular files.\n'; return 0; }
+    archive_source_inventory "$files" "$inventory" || { usr_ops_log_line ERROR archive "$(printf 'Archive failed: RAM-log source is unavailable or is not tmpfs.\n')" >&2; return 1; }
+    [[ -s "$files" ]] || { usr_ops_log_line INFO archive "$(printf 'Archive skipped: RAM log tree has no regular files.\n')"; return 0; }
     fingerprint=$(sha256sum "$inventory" | awk '{print $1}') || return 1
     if [[ -d "$ARCHIVE_ROOT" ]]; then
         if [[ ! -f "$ARCHIVE_ROOT/.owner" || -L "$ARCHIVE_ROOT/.owner" || $(cat "$ARCHIVE_ROOT/.owner") != ram_logs_watchdog ]]; then
-            printf 'Archive failed: existing destination is unowned; preserved.\n' >&2; return 1
+            usr_ops_log_line ERROR archive "$(printf 'Archive failed: existing destination is unowned; preserved.\n')" >&2; return 1
         fi
     else
         mkdir -m 700 -- "$ARCHIVE_ROOT" || return 1
@@ -174,14 +223,14 @@ archive_ramlogs() (
     if [[ "$reason" == checkpoint && -n "$newest" ]]; then
         local epoch
         epoch=$(jq -r .createdAt "$newest/manifest.json")
-        if ((now>=epoch && now-epoch<ARCHIVE_INTERVAL_SECONDS)); then printf 'Archive checkpoint not due; last success %ss ago.\n' "$((now-epoch))"; return 0; fi
+        if ((now>=epoch && now-epoch<ARCHIVE_INTERVAL_SECONDS)); then usr_ops_log_line INFO archive "$(printf 'Archive checkpoint not due; last success %ss ago.\n' "$((now-epoch))")"; return 0; fi
         if [[ $(jq -r .sourceFingerprint "$newest/manifest.json") == "$fingerprint" ]]; then
-            printf 'Archive checkpoint unchanged; previous completed snapshot retained.\n'; return 0
+            usr_ops_log_line INFO archive "$(printf 'Archive checkpoint unchanged; previous completed snapshot retained.\n')"; return 0
         fi
     fi
     available=$(df -PB1 "$ARCHIVE_ROOT" | awk 'NR==2{print $4}') || return 1
     [[ "$available" =~ ^[0-9]+$ ]] && ((available>=ARCHIVE_MAX_BYTES+ARCHIVE_RESERVE_BYTES)) || {
-        printf 'Archive failed: insufficient vault space for the bounded archive plus reserve; previous archives retained.\n' >&2; return 1;
+        usr_ops_log_line ERROR archive "$(printf 'Archive failed: insufficient vault space for the bounded archive plus reserve; previous archives retained.\n')" >&2; return 1;
     }
     stage=$(mktemp -d "$ARCHIVE_ROOT/.ramlog-$boot.XXXXXX.partial") || return 1
     printf 'ramlog_archive\n' >"$stage/.owner" || return 1
@@ -194,12 +243,12 @@ archive_ramlogs() (
         tar --create --use-compress-program='gzip -1' --file="$stage/payload.tar.gz" \
             --directory="$RAMLOG_PATH" --no-recursion --hard-dereference --null --verbatim-files-from --files-from="$files"
     ) 2>"$work/tar.err" || rc=$?
-    if ((rc>1)); then printf 'Archive failed: tar exit=%s; incomplete staging discarded.\n' "$rc" >&2; return 1; fi
+    if ((rc>1)); then usr_ops_log_line ERROR archive "$(printf 'Archive failed: tar exit=%s; incomplete staging discarded.\n' "$rc")" >&2; return 1; fi
     size=$(stat -c %s "$stage/payload.tar.gz") || return 1
     ((size>0 && size<=ARCHIVE_MAX_BYTES)) || return 1
-    gzip -t "$stage/payload.tar.gz" || { printf 'Archive failed: gzip CRC verification failed.\n' >&2; return 1; }
+    gzip -t "$stage/payload.tar.gz" || { usr_ops_log_line ERROR archive "$(printf 'Archive failed: gzip CRC verification failed.\n')" >&2; return 1; }
     tar -tzf "$stage/payload.tar.gz" >"$work/archive-list" 2>"$work/verify.err" || {
-        printf 'Archive failed: compressed archive verification failed.\n' >&2; return 1;
+        usr_ops_log_line ERROR archive "$(printf 'Archive failed: compressed archive verification failed.\n')" >&2; return 1;
     }
     archive_source_inventory "$work/after-files" "$work/after-inventory" || return 1
     after=$(sha256sum "$work/after-inventory" | awk '{print $1}') || return 1
@@ -218,8 +267,8 @@ archive_ramlogs() (
     mv -- "$stage" "$target" || return 1
     stage=''
     sync -- "$ARCHIVE_ROOT" || return 1
-    prune_ram_logs_watchdog_archives "$target" || { printf 'Archive completed but retention needs review; existing generations preserved.\n' >&2; return 1; }
-    printf 'RAM logs archived: reason=%s; selected files=%s; compressed=%s bytes; destination=%s; retained=at most two boot snapshots.\n' "$reason" "$count" "$size" "$target"
+    prune_ram_logs_watchdog_archives "$target" || { usr_ops_log_line INFO archive "$(printf 'Archive completed but retention needs review; existing generations preserved.\n')" >&2; return 1; }
+    usr_ops_log_line INFO archive "Completed RAM-log archive: reason=$reason; files=$count; compressed=$size bytes; destination=$target; retained=at most two boot snapshots"
 )
 
 run_ramlog_archive() {
@@ -238,14 +287,14 @@ prepare_ramlogs() {
        $(realpath -m "$RAMLOG_PATH") == "$RAMLOG_PATH" && "$RAMLOG_SIZE" =~ ^[1-9][0-9]*[MG]$ ]] || return 1
     if mountpoint -q "$RAMLOG_PATH"; then
         [[ $(findmnt -rn -T "$RAMLOG_PATH" -o FSTYPE) == tmpfs ]] || return 1
-        printf 'RAM logs: existing tmpfs retained; mount size and files unchanged.\n'
+        usr_ops_log_line INFO archive "$(printf 'RAM logs: existing tmpfs retained; mount size and files unchanged.\n')"
     else
         if pgrep -x dockerd >/dev/null || [[ -d "$RAMLOG_PATH" && -n $(find "$RAMLOG_PATH" -mindepth 1 -print -quit) ]]; then
-            printf 'RAM-log preparation refused: Docker is active or unmounted path is nonempty; no files changed.\n' >&2; return 1
+            usr_ops_log_line ERROR archive "$(printf 'RAM-log preparation refused: Docker is active or unmounted path is nonempty; no files changed.\n')" >&2; return 1
         fi
         mkdir -p -- "$RAMLOG_PATH" || return 1
         mount -t tmpfs -o "size=$RAMLOG_SIZE,noatime,nosuid,nodev" tmpfs "$RAMLOG_PATH" || return 1
-        printf 'RAM logs: mounted %s tmpfs before Docker startup.\n' "$RAMLOG_SIZE"
+        usr_ops_log_line INFO archive "$(printf 'RAM logs: mounted %s tmpfs before Docker startup.\n' "$RAMLOG_SIZE")"
     fi
     local app
     for app in "${RAMLOG_APPS[@]}"; do
@@ -262,13 +311,13 @@ prepare_ramlogs() {
 monitor_ramlogs() {
     local condition=OK reason='' usage=0 previous=OK last=0 now temp details='' largest='' bytes path severity=normal
     local -a findings=()
-    for dependency in jq flock timeout findmnt mountpoint df stat du date; do command -v "$dependency" >/dev/null || { printf 'Missing dependency: %s\n' "$dependency" >&2; return 1; }; done
+    for dependency in jq flock timeout findmnt mountpoint df stat du date; do command -v "$dependency" >/dev/null || { usr_ops_log_line INFO archive "$(printf 'Missing dependency: %s\n' "$dependency")" >&2; return 1; }; done
     mkdir -p -- "$STATE_DIR" || return 1
     exec 9>"$STATE_DIR/monitor.lock" || return 1
     flock -n 9 || return 0
     now=$(date +%s)
     if [[ -f "$STATE_DIR/state.json" ]]; then
-        jq -e '.condition|type=="string"' "$STATE_DIR/state.json" >/dev/null || { printf 'Invalid RAM-log state preserved; no notification baseline overwritten.\n' >&2; return 1; }
+        jq -e '.condition|type=="string"' "$STATE_DIR/state.json" >/dev/null || { usr_ops_log_line INFO archive "$(printf 'Invalid RAM-log state preserved; no notification baseline overwritten.\n')" >&2; return 1; }
         previous=$(jq -r .condition "$STATE_DIR/state.json")
         last=$(jq -r '.notifiedAt // 0' "$STATE_DIR/state.json")
         [[ "$last" =~ ^[0-9]+$ ]] || return 1
@@ -301,11 +350,11 @@ monitor_ramlogs() {
         details+=$'\n'"$ARCHIVE_LAST_ERROR"
         reason+=" Archive protection needs attention."
     fi
-    printf 'RAM logs: %s. %s\n%s\n'  "$condition" "$reason" "$details"
+    usr_ops_log_line "$( [[ "$condition" == CRITICAL ]] && printf CRITICAL || printf INFO )" monitoring "$condition: $reason | $details"
     if [[ "$condition" != "$previous" ]] || { [[ "$condition" != OK ]] && (( now-last>=REMINDER_SECONDS )); }; then
         [[ "$condition" != CRITICAL ]] || severity=alert
         [[ "$condition" != WARNING ]] || severity=warning
-        if [[ ! -x "$NOTIFY" ]] || ! timeout 30 "$NOTIFY" -i "$severity" -s 'RAM Logs Monitor' -d "RAM logs: $previous -> $condition" -m "$reason"$'\n'"$details"$'\n''Action: readiness/usage checked; existing application logs preserved.'; then
+        if [[ ! -x "$NOTIFY" ]] || ! usr_ops_notify timeout 30 "$NOTIFY" -i "$severity" -s 'RAM Logs Watchdog' -d "RAM logs: $previous -> $condition" -m "$reason"$'\n'"$details"$'\n''Action: readiness/usage checked; existing application logs preserved.'; then
             printf 'Notification delivery failed; transition remains pending.\n' >&2; return 1
         fi
         last=$now

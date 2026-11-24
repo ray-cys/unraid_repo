@@ -1,10 +1,59 @@
 #!/bin/bash
+clearLog=true
 # shellcheck disable=SC2034,SC2155
+# BEGIN EMBEDDED OPERATIONS CONTRACT
+OPS_SCRIPT_ID="health_monitoring"
+# Embedded operations contract v1; generated into standalone User Scripts.
+usr_ops_log_line() {
+    local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
+    case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
+    message=${message//$'\r'/};message=${message//$'\n'/ | }
+    printf -v line '%s | %s | %s | run=%s | phase=%s | %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$OPS_SCRIPT_ID" "${OPS_RUN_ID:-$$}" "$phase" "$message"
+    if ((${#line}>4096));then line="${line:0:4050} ... [truncated]";fi
+    printf '%s\n' "$line"
+}
+
+# Accept the original command, including its timeout, so producer-specific
+# delivery/cooldown/acknowledgement semantics stay with the owning script.
+usr_ops_notify() {
+    local -a args=("$@")
+    local i importance=normal summary='' message='' index=-1 status=UPDATE
+    for ((i=0;i<${#args[@]};i++));do
+        case "${args[$i]}" in
+          -i) importance="${args[$((i+1))]:-normal}";;
+          -d) summary="${args[$((i+1))]:-}";;
+          -m) index=$((i+1));message="${args[$index]:-}";;
+        esac
+    done
+    case "$importance" in alert|warning) status=ATTENTION;;esac
+    if [[ "$message" != 'Status: '* ]];then
+        message="Status: $status"$'\n'"Summary: $summary"$'\n\n'"Actions and findings:"$'\n'"${message:-$summary}"
+        if ((index>=0));then args[$index]="$message";else args+=(-m "$message");fi
+    fi
+    # Every notifier has a termination escalation, including legacy callers.
+    if [[ "${args[0]##*/}" == timeout ]];then
+        if [[ " ${args[*]} " != *' --kill-after'* ]];then args=("${args[0]}" --kill-after=5 "${args[@]:1}");fi
+    else args=(timeout --signal=TERM --kill-after=5 30 "${args[@]}");fi
+    "${args[@]}"
+}
+
+# Bounded local history for scripts previously dependent on the plugin console.
+usr_ops_append_log() {
+    local file="$1" line="$2" max="${3:-2097152}" i
+    [[ -d "${file%/*}" && ! -L "$file" ]] || return 1
+    for i in 1 2;do [[ ! -L "$file.$i" ]] || return 1;done
+    find "${file%/*}" -maxdepth 1 -type f \( -name "${file##*/}.1" -o -name "${file##*/}.2" \) -mtime +29 -delete || return 1
+    if [[ -f "$file" ]] && (( $(stat -c %s "$file")+${#line}+1>max ));then
+        rm -f "$file.2";[[ ! -f "$file.1" ]] || mv "$file.1" "$file.2";mv "$file" "$file.1" || return 1
+    fi
+    printf '%s\n' "$line" >>"$file"
+}
+# END EMBEDDED OPERATIONS CONTRACT
 noParity=true
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.20.0"
+readonly SCRIPT_VERSION="2.22.0"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -15,7 +64,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.20.0
+# Disk Health Monitor for Unraid v2.22.0
 # Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
 # check capacity thresholds, detect firmware/regression events, surface I/O error frequency, and emit concise
 # notifications.
@@ -108,6 +157,8 @@ IO_ERROR_WARN_THRESHOLD=5                       # Unique error events >= warning
 IO_ERROR_CRIT_THRESHOLD=20                      # Unique error events >= critical
 SYSLOG_CURSOR_STARTUP_LOOKBACK_LINES=100         # First cursor run: inspect only the most recent N lines
 SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES=2000       # Recovery scan when the previous rotated file cannot be found
+SYSLOG_FAST_STORAGE_OWNER=1                      # Hubble's five-minute syslog watcher owns individual urgent events
+SYSLOG_FAST_HEARTBEAT="/tmp/syslog_watchdog_state/storage-watch.epoch"
 
 # === Trends & Alerts: Toggles ===
 NVME_WEAR_REGRESSION_WARN=1                     # Flag any NVMe Percentage Used regression (0=disable)
@@ -633,11 +684,7 @@ log() {
     local line
 
     message="$(printf '%s' "$message" | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} - //')"
-    printf -v line '%s [%s][%s] %s' \
-        "$(date '+%Y-%m-%d %H:%M:%S')" \
-        "$category" \
-        "$level" \
-        "$message"
+    line=$(usr_ops_log_line "$level" "$category" "$message")
 
     if (( LOG_MIRROR_STDOUT == 1 )); then
         # Use stderr so logging never contaminates data returned by command substitution.
@@ -699,13 +746,12 @@ XFS_PROC_HISTORY_FILE="$STATE_DIR/xfs_proc_stats_history.log"       # XFS stat c
 TBW_HISTORY_FILE="$STATE_DIR/tbw_history.log"                       # Total bytes written progression (wear modeling)
 SMART_ATTR_HISTORY_FILE="$STATE_DIR/smart_attr_history.log"         # Attribute growth time-series (trend alerts)
 TEMP_HISTORY_FILE="$STATE_DIR/temp_history.log"                     # Temperature samples (rate & exposure)
-SELFTEST_HISTORY_FILE="$STATE_DIR/selftest_events.log"              # SMART self-test lifecycle history (frequency/volatility)
 STATE_FILES_ALERT_RUNTIME=(
     "$MONITOR_RECEIPT_FILE" "$SMART_COVERAGE_FILE"
     "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$ALERT_NEW_SEEN_FILE" "$RISK_PREV_FILE" "$XFS_PROC_PREV_FILE" "$BTRFS_DEV_PREV_FILE" "$SYSLOG_CURSOR_STATE_FILE" "$RISK_SPIKE_FILE" "$REPLACEMENT_EVENTS_FILE" "$SATA_LINK_HISTORY_FILE" "$NOTIFICATION_JOURNAL_FILE" "$NOTIFICATION_RECOVERY_STATE_FILE" "$SOAK_RUN_HISTORY_FILE"
 )
 STATE_FILES_TREND_HISTORY=(
-    "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE" "$XFS_PROC_HISTORY_FILE" "$TBW_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$TEMP_HISTORY_FILE" "$SELFTEST_HISTORY_FILE"
+    "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE" "$XFS_PROC_HISTORY_FILE" "$TBW_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$TEMP_HISTORY_FILE"
 )
 # === Notification Settings ===
 NOTIFY_TITLE_SMART="SMART Test Alert"                       # SMART test notifications
@@ -2310,7 +2356,6 @@ initialize_runtime() {
 
     ensure_dir "$LOG_DIR" || return 1
     ensure_private_dir "$STATE_DIR" || return 1
-    ensure_private_dir "$STATE_BACKUP_DIR" || return 1
     validate_managed_state_paths || return 1
     # Inspect/adopt the manifest before changing existing state permissions or
     # creating state subdirectories. Future or malformed schemas therefore
@@ -2857,11 +2902,23 @@ prune_history_files() {
         cutoff_epoch=$(date -d "$cutoff 00:00:00" +%s 2>/dev/null || echo 0)
     fi
     local files=(
-        "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE" "$XFS_PROC_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$TEMP_HISTORY_FILE" "$TBW_HISTORY_FILE" "$SELFTEST_HISTORY_FILE" "$SATA_LINK_HISTORY_FILE" "$REPLACEMENT_EVENTS_FILE"
+        "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE" "$XFS_PROC_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$TEMP_HISTORY_FILE" "$TBW_HISTORY_FILE" "$SATA_LINK_HISTORY_FILE" "$REPLACEMENT_EVENTS_FILE"
     )
-    local f
+    local f retain_days file_cutoff file_epoch
     for f in "${files[@]}"; do
         [[ -f "$f" ]] || continue
+        retain_days=0
+        case "$f" in
+            "$TEMP_HISTORY_FILE") retain_days=$(( ${TEMP_TREND_WINDOW_DAYS:-14} + 7 )) ;;
+            "$TBW_HISTORY_FILE") retain_days=$(( HISTORY_WINDOW_DAYS + 7 )) ;;
+            "$SMART_ATTR_HISTORY_FILE") retain_days=$(( WEAR_TREND_WINDOW_DAYS + 14 )) ;;
+            "$SATA_LINK_HISTORY_FILE") retain_days=$(( SATA_LINK_INSTABILITY_WINDOW_DAYS + 7 )) ;;
+        esac
+        file_cutoff="$cutoff"; file_epoch="$cutoff_epoch"
+        if (( retain_days > 0 && max_days > 0 )); then
+            file_cutoff=$(date -d "-$retain_days days" '+%Y-%m-%d') || continue
+            file_epoch=$(date -d "$file_cutoff 00:00:00" +%s) || continue
+        fi
         local filtered final_file line_count
         filtered="$(state_temp_file "$f")" || continue
         final_file="$(state_temp_file "$f")" || {
@@ -2871,7 +2928,7 @@ prune_history_files() {
 
         # Date-led analytics rows and epoch-led I/O-event rows are both valid.
         # Anything else is malformed history and is removed during staging.
-        if ! awk -v c="$cutoff" -v ce="$cutoff_epoch" -v prune_age="$max_days" '
+        if ! awk -v c="$file_cutoff" -v ce="$file_epoch" -v prune_age="$max_days" '
             /^#/ { print; next }
             $1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ {
                 if (!prune_age || $1 >= c) print
@@ -3177,9 +3234,10 @@ notify_unraid() {
     fi
 
     log_info "Sending notification with $icon title '$title' (critical=$crit_count, warning=$warn_count)"
+    body_norm="Status: $( [[ "$icon" == normal ]] && printf UPDATE || printf ATTENTION )"$'\n'"Summary: $description"$'\n\n'"Actions and findings:"$'\n'"$body_norm"
     run_bounded_checked "$NOTIFICATION_TIMEOUT_SECONDS" \
         "Unraid notification helper" \
-        "$NOTIFY_BIN" -s "${title:-Disks Health Monitoring}" \
+        "$NOTIFY_BIN" -s "${title:-Disk Health Monitor}" \
         -d "$description" -m "$body_norm" -i "$icon"
 }
 
@@ -3193,10 +3251,10 @@ log_notification_fallback() {
         return 1
     fi
     run_bounded_checked "$NOTIFICATION_TIMEOUT_SECONDS" \
-        "Syslog notification summary" logger -t "Disks Health Monitoring" \
-        "${title:-Disks Health Monitoring}: delivery failed" || rc=$?
+        "Syslog notification summary" logger -t "Disk Health Monitor" \
+        "${title:-Disk Health Monitor}: delivery failed" || rc=$?
     run_bounded_checked "$NOTIFICATION_TIMEOUT_SECONDS" \
-        "Syslog notification body" logger -t "Disks Health Monitoring" \
+        "Syslog notification body" logger -t "Disk Health Monitor" \
         "$body" || rc=$?
     (( rc == 0 )) || log_warn \
         "Notification syslog fallback failed with exit $rc"
@@ -3828,17 +3886,25 @@ syslog_line_is_disk_io_error() {
 
     [[ "$line" == *"Script aborted"* || "$line" == *"Disk I/O Alert"* ]] && return 1
     grep -qiE \
-        'I/O error|blk_update_request|end_request|failed command: (READ|WRITE)|hard resetting link|link is slow to respond|exception Emask' \
+        'I/O error|blk_update_request|end_request|failed command: (READ|WRITE)|hard resetting link|link is slow to respond|exception Emask|md:.*disk[0-9]+.*(read|write) error' \
         <<< "$line"
 }
 
 extract_syslog_device_paths() {
-    local line="$1"
-
-    printf '%s\n' "$line" |
-        grep -oE 'sd[a-z]+|nvme[0-9]+n[0-9]+' 2>/dev/null |
-        sort -u |
-        sed 's#^#/dev/#' || true
+    local line="$1" token slot path
+    while IFS= read -r token; do
+        case "$token" in
+            sd*|nvme*) base_device "/dev/$token" ;;
+            md*|disk*)
+                slot="disk${token#md}"; slot="${slot%%p[0-9]*}"
+                [[ "$token" == disk* ]] && slot="$token"
+                [[ "$slot" != disk0 ]] || continue
+                path="${MOUNT_TO_DEV[/mnt/$slot]:-slot:$slot}"
+                printf '%s\n' "$path" ;;
+        esac
+    done < <(printf '%s\n' "$line" | tr -cs '[:alnum:]_' '\n' |
+        grep -Ex 'sd[a-z]+[0-9]*|nvme[0-9]+n[0-9]+(p[0-9]+)?|md[0-9]+(p[0-9]+)?|disk[0-9]+' || true) |
+        sed '/^$/d' | sort -u
 }
 
 parse_unraid_disk_devices_file() {
@@ -4372,7 +4438,6 @@ migrate_device_identity_histories() {
         "$TEMP_HISTORY_FILE"
         "$SATA_LINK_HISTORY_FILE"
         "$REPLACEMENT_EVENTS_FILE"
-        "$SELFTEST_HISTORY_FILE"
         "$SMART_ATTR_HISTORY_FILE"
         "$TBW_HISTORY_FILE"
         "$BTRFS_DEV_HIST_FILE"
@@ -6249,7 +6314,6 @@ run_smart_test() {
     fi
     if [[ $existing_in_progress -eq 1 ]]; then
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Self-test already in progress on $disk; skipping new start (status: ${exec_status})"
-        printf '%s %s in_progress status=%s captured_epoch=%s schema=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(persistent_device_key "$disk")" "$exec_status" "$RUN_EPOCH" "$HISTORY_SCHEMA_VERSION" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
     elif (( test_due == 1 )); then
         local test_start_output="" test_start_rc=0
         if [[ $disk == /dev/nvme* ]]; then
@@ -6268,7 +6332,6 @@ run_smart_test() {
         then
             test_started=1
             mark_test_started "$disk" "$test_kind"
-            printf '%s %s start type=%s captured_epoch=%s schema=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(persistent_device_key "$disk")" "${test_kind}" "$RUN_EPOCH" "$HISTORY_SCHEMA_VERSION" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
             if [[ $test_kind == long || $test_kind == extended ]]; then
                 LONG_TEST_RUNNING_LONG["$disk"]=1
             fi
@@ -6287,13 +6350,11 @@ run_smart_test() {
         msg=$(echo "$result" | awk -F'|' '{print $2}')
         if [[ $sev != INPROGRESS ]]; then
             log_smart "$(date '+%Y-%m-%d %H:%M:%S') - $disk short self-test status: $msg"
-            printf '%s %s complete type=short sev=%s msg="%s" captured_epoch=%s schema=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(persistent_device_key "$disk")" "$sev" "$msg" "$RUN_EPOCH" "$HISTORY_SCHEMA_VERSION" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
             if [[ $sev == WARNING ]]; then
                 record_alert warning "$NOTIFY_TITLE_SMART" "Disk $disk short self-test warning: $msg"
             fi
         else
             log_smart "$(date '+%Y-%m-%d %H:%M:%S') - $disk short self-test still in progress after wait window"
-            printf '%s %s incomplete type=short status=in_progress captured_epoch=%s schema=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(persistent_device_key "$disk")" "$RUN_EPOCH" "$HISTORY_SCHEMA_VERSION" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
         fi
     else
         if [[ $existing_in_progress -eq 1 ]]; then
@@ -6432,7 +6493,6 @@ check_completed_long_tests() {
         elif [[ $sev == CRITICAL ]]; then
             record_alert critical "$NOTIFY_TITLE_SMART" "Disk $disk long self-test CRITICAL: $msg"
         fi
-        printf '%s %s complete type=long id=%s sev=%s msg="%s" captured_epoch=%s schema=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(persistent_device_key "$disk")" "$id" "$sev" "$msg" "$RUN_EPOCH" "$HISTORY_SCHEMA_VERSION" >> "$SELFTEST_HISTORY_FILE" 2>/dev/null || true
         local poh current_poh
         if [[ -n "${lifetime:-}" && "$lifetime" =~ ^[0-9]+$ ]]; then
             local prev_ll=${LONG_LAST_POH["$disk"]:-}
@@ -6839,7 +6899,7 @@ build_new_syslog_chunk() {
     local schema="" previous_path="" previous_device="" previous_inode=""
     local previous_lines=0 previous_size=0 previous_anchor="-" start_line reason
     local rotated rotated_metadata rotated_device rotated_inode rotated_size rotated_lines
-    local recovered=0 anchor_matches=0 observed_anchor=""
+    local recovered=0 anchor_matches=0 observed_anchor="" generation next
     local verify_metadata verify_device verify_inode verify_size chunk_lines
 
     SYSLOG_CURSOR_READY=0
@@ -6902,7 +6962,9 @@ build_new_syslog_chunk() {
         reason="cursor continuation"
         SYSLOG_CURSOR_MODE="cursor_continuation"
     else
-        for rotated in "${source}.1" "${source}.0"; do
+        for generation in 1 2 3 4 5 6 7 8 9 0; do
+            [[ "$previous_path" == "$source" ]] || break
+            rotated="${source}.$generation"
             [[ -r "$rotated" ]] || continue
             rotated_metadata=$(stat -c '%d %i %s' -- "$rotated" 2>/dev/null) || continue
             read -r rotated_device rotated_inode rotated_size <<< "$rotated_metadata"
@@ -6910,11 +6972,20 @@ build_new_syslog_chunk() {
             rotated_lines=$(wc -l < "$rotated" 2>/dev/null || echo 0)
             rotated_lines=${rotated_lines//[[:space:]]/}
             [[ "$rotated_lines" =~ ^[0-9]+$ ]] || continue
+            (( rotated_lines >= previous_lines && rotated_size >= previous_size )) || continue
             if (( previous_lines > 0 )) && [[ "$previous_anchor" != "-" ]]; then
                 observed_anchor=$(sed -n "${previous_lines}p" "$rotated" 2>/dev/null | sha1sum | awk '{print $1}')
                 [[ "$observed_anchor" == "$previous_anchor" ]] || continue
             fi
             append_syslog_line_range "$rotated" "$(( previous_lines + 1 ))" "$rotated_lines" "$SYSLOG_CHUNK_FILE" || return 1
+            for (( next=generation-1; next>=1; next-- )); do
+                [[ -r "${source}.$next" ]] || break
+                cat -- "${source}.$next" >> "$SYSLOG_CHUNK_FILE" || return 1
+            done
+            if (( next >= 1 )); then
+                : > "$SYSLOG_CHUNK_FILE" || return 1
+                break
+            fi
             append_syslog_line_range "$source" 1 "$current_lines" "$SYSLOG_CHUNK_FILE" || return 1
             recovered=1
             reason="rotation recovery via ${rotated}"
@@ -6941,10 +7012,13 @@ build_new_syslog_chunk() {
     # run will retry from the last committed cursor.
     verify_metadata=$(stat -c '%d %i %s' -- "$source" 2>/dev/null || true)
     read -r verify_device verify_inode verify_size <<< "$verify_metadata"
-    if [[ "$verify_device" != "$current_device" || "$verify_inode" != "$current_inode" ]]; then
+    if [[ "$verify_device" != "$current_device" || "$verify_inode" != "$current_inode" ||
+          ! "$verify_size" =~ ^[0-9]+$ || "$verify_size" -lt "$current_size" ]] ||
+       { (( current_lines > 0 )) &&
+         [[ "$(sed -n "${current_lines}p" "$source" | sha1sum | awk '{print $1}')" != "$current_anchor" ]]; }; then
         SYSLOG_CURSOR_MODE="concurrent_rotation"
         log "SYSLOG" "WARN" "Syslog rotated while its incremental chunk was being built; cursor advancement deferred"
-        return 0
+        return 1
     fi
 
     SYSLOG_CURSOR_PENDING_PATH="$source"
@@ -7005,13 +7079,14 @@ record_xfs_syslog_event() {
     local prefix='kernel:[[:space:]]+XFS[[:space:]]+\(([[:alnum:]_.-]+)\):'
     [[ "$line" =~ $prefix ]] || return 1
     source="${BASH_REMATCH[1]}"
-    mount="${XFS_SYSLOG_MOUNTS[$source]:-}"
-    [[ -n "$mount" ]] || return 1
     case "${line,,}" in
         *corrupt*|*shutdown*|*"shut down"*|*"shutting down"*) severity=critical ;;
         *"i/o error"*|*"log error"*|*"metadata error"*) ;;
         *) return 1 ;;
     esac
+    (( SYSLOG_FAST_STORAGE_OWNER == 0 )) || return 0
+    mount="${XFS_SYSLOG_MOUNTS[$source]:-}"
+    [[ -n "$mount" ]] || return 1
     record_finding "$severity" filesystem filesystem.xfs "" \
         "XFS kernel error" "${line#*kernel: }" \
         "Check Unraid diagnostics and backups for this filesystem before scheduling an offline check." \
@@ -7036,13 +7111,31 @@ peak_syslog_bursts() {
 
 scan_syslog_disk_errors() {
     local window=$(( IO_ERROR_WINDOW_MINUTES * 60 )) now cutoff device key timestamp hash
-    local events="$RUN_DIR/io-events.tsv" line devices rows peak history
+    local events="$RUN_DIR/io-events.tsv" line devices rows peak history heartbeat=0
+    local kernel='^[^ ]+ +([0-9]+ [0-9:]+ +)?[^ ]+ +kernel:[[:space:]]'
     local -A XFS_SYSLOG_MOUNTS=()
     now=$(date +%s) || return 1
     cutoff=$((now - window))
     : > "$events" || return 1
     build_new_syslog_chunk || return 1
-    map_xfs_syslog_sources || return 1
+    if [[ "$SYSLOG_CURSOR_MODE" == rotation_fallback ]]; then
+        record_finding warning io io.kernel "" "Syslog coverage gap" \
+            "A complete rotation chain was unavailable; some disk I/O events may have been missed." \
+            "Check syslog retention and the fast syslog watcher." syslog_coverage_gap
+    fi
+    if (( SYSLOG_FAST_STORAGE_OWNER == 1 )); then
+        if [[ -f "$SYSLOG_FAST_HEARTBEAT" && ! -L "$SYSLOG_FAST_HEARTBEAT" ]] &&
+           [[ "$(stat -c %u -- "$SYSLOG_FAST_HEARTBEAT" 2>/dev/null)" == "$EUID" ]]; then
+            read -r heartbeat < "$SYSLOG_FAST_HEARTBEAT" || heartbeat=0
+        fi
+        if [[ ! "$heartbeat" =~ ^[1-9][0-9]{0,11}$ ]] || (( heartbeat > now || now-heartbeat > 1200 )); then
+            record_finding warning io io.kernel "" "Fast storage watcher not current" \
+                "No successful fast syslog scan in the last 20 minutes." \
+                "Check the syslog_watchdog User Script and its five-minute schedule." syslog_fast_watcher_stale
+        fi
+    else
+        map_xfs_syslog_sources || return 1
+    fi
 
     if [[ -r "$IO_ERROR_HISTORY_FILE" ]]; then
         while read -r timestamp key hash; do
@@ -7051,7 +7144,6 @@ scan_syslog_disk_errors() {
         done < "$IO_ERROR_HISTORY_FILE"
     fi
     while IFS= read -r line; do
-        local kernel='kernel:[[:space:]]'
         [[ "$line" =~ $kernel ]] || continue
         if record_xfs_syslog_event "$line"; then continue; fi
         (( IO_ERROR_MONITOR_ENABLED == 1 )) || continue
@@ -7063,7 +7155,9 @@ scan_syslog_disk_errors() {
         if (( IO_ERROR_DEDUP_ENABLED == 0 )); then hash+="-$RANDOM-$RANDOM"; fi
         while IFS= read -r device; do
             [[ -n "$device" ]] || continue
-            key=$(persistent_device_key "$device") || return 1
+            if [[ "$device" == slot:* ]]; then key="$device"
+            else key=$(persistent_device_key "$device") || return 1
+            fi
             printf '%s %s %s 1\n' "$key" "$timestamp" "$hash" >> "$events" || return 1
         done <<< "$devices"
     done < "$SYSLOG_CHUNK_FILE"
@@ -7071,14 +7165,20 @@ scan_syslog_disk_errors() {
     rows=$(peak_syslog_bursts "$window" "$events") || return 1
     while read -r key peak; do
         [[ -n "$key" ]] || continue
-        device=$(runtime_device_path "$key") || continue
         local severity=""
         if (( peak >= IO_ERROR_CRIT_THRESHOLD )); then severity=critical
         elif (( peak >= IO_ERROR_WARN_THRESHOLD )); then severity=warning
         fi
         if [[ -n "$severity" ]]; then
-            record_alert "$severity" "$NOTIFY_TITLE_DISKIO" \
-                "Disk $device I/O errors unique peak $peak in a ${IO_ERROR_WINDOW_MINUTES}-minute window ending at a newly read event."
+            if [[ "$key" == slot:* ]]; then
+                record_finding "$severity" io io.kernel "" "Sustained disk I/O errors" \
+                    "Unraid ${key#slot:}: $peak distinct errors in a ${IO_ERROR_WINDOW_MINUTES}-minute window." \
+                    "Check Unraid diagnostics and identify the physical disk in this slot." disk_io_burst "$key"
+            else
+                device=$(runtime_device_path "$key") || continue
+                record_alert "$severity" "$NOTIFY_TITLE_DISKIO" \
+                    "Disk $device I/O errors unique peak $peak in a ${IO_ERROR_WINDOW_MINUTES}-minute window ending at a newly read event."
+            fi
         fi
     done <<< "$rows"
     history=$(awk -v cutoff="$cutoff" '$2 >= cutoff && !seen[$1 FS $2 FS $3]++ {print $2, $1, $3}' "$events") || return 1
@@ -7124,6 +7224,11 @@ collect_storage_usage() {
         mountpoint -q "$mount" || continue
         kind=pool
         if [[ "$name" =~ ^disk[0-9]+$ ]]; then kind=array; fi
+        # The dedicated RAM-log monitor owns RAM-backed usage alerts.
+        if [[ "$kind" == pool ]]; then
+            fstype=$(findmnt_bounded -n -o FSTYPE "$mount" 2>/dev/null || true)
+            case "$fstype" in tmpfs|ramfs) continue ;; esac
+        fi
         if ! read -r size used pct < <(df_bounded -B1 --output=size,used,pcent "$mount" 2>/dev/null | tail -n1) ||
            [[ ! "$size" =~ ^[1-9][0-9]*$ || ! "$used" =~ ^[0-9]+$ || ! "$pct" =~ ^[0-9]+%$ ]]; then
             record_collector_event FAILED "Capacity $mount" "df returned no usable sample"
@@ -7142,9 +7247,6 @@ collect_storage_usage() {
             continue
         fi
 
-        fstype=$(findmnt_bounded -n -o FSTYPE "$mount" 2>/dev/null || true)
-        # RAM-backed mounts can still fill up, but are not persistent pool capacity.
-        case "$fstype" in tmpfs|ramfs) continue ;; esac
         pools_used=$((pools_used + used))
         pools_total=$((pools_total + size))
         if [[ "$fstype" == btrfs ]]; then
@@ -7605,15 +7707,27 @@ finding_has_fresh_recovery_evidence() {
         mount:*)
             case "$code" in
                 btrfs_scrub_alert) [[ -n "${FRESH_FILESYSTEM["scrub:${scope#mount:}"]:-}" ]] ;;
-                xfs_alert|xfs_kernel_error) [[ -n "${FRESH_FILESYSTEM["xfs:${scope#mount:}"]:-}" ]] &&
+                # Silence cannot prove that a shutdown/corruption was repaired.
+                xfs_kernel_error) [[ "${NOTIFY_PREV_SEVERITY[$id]:-}" != critical ]] &&
+                    [[ -n "${FRESH_FILESYSTEM["xfs:${scope#mount:}"]:-}" ]] &&
+                    collector_status_is_safe syslog_io ;;
+                xfs_alert) [[ -n "${FRESH_FILESYSTEM["xfs:${scope#mount:}"]:-}" ]] &&
                     collector_status_is_safe syslog_io ;;
                 *) [[ -n "${FRESH_STORAGE["${scope#mount:}"]:-}" ]] ;;
             esac
             ;;
-        slot:*) [[ -n "${FRESH_STORAGE[$scope]:-}" ]] ;;
+        slot:*)
+            if [[ "$code" == disk_io_burst ]]; then
+                [[ "$SYSLOG_CURSOR_MODE" =~ ^(cursor_continuation|rotation_recovery)$ ]] &&
+                    collector_status_is_safe syslog_io
+            else [[ -n "${FRESH_STORAGE[$scope]:-}" ]]
+            fi ;;
         *)
             case "$code" in
                 completed_parity_check) (( PARITY_HISTORY_OBSERVED == 1 )) ;;
+                syslog_coverage_gap) [[ "$SYSLOG_CURSOR_MODE" =~ ^(cursor_continuation|rotation_recovery)$ ]] &&
+                    collector_status_is_safe syslog_io ;;
+                syslog_fast_watcher_stale) collector_status_is_safe syslog_io ;;
                 parity_status|parity_sync_errors) (( PARITY_RESULT_OBSERVED == 1 )) ;;
                 array_capacity|pools_capacity|storage_validation) (( ARRAY_TOPOLOGY_OBSERVED == 1 )) ;;
                 *) return 0 ;;
@@ -8196,13 +8310,13 @@ build_trend_section() {
 build_subject() {
     if (( FINDING_CRITICAL_COUNT == 0 && FINDING_WARNING_COUNT == 0 &&
           NOTIFICATION_RESOLVED_COUNT > 0 )); then
-        SUBJECT="Disks Health - RECOVERED (${NOTIFICATION_RESOLVED_COUNT})"
+        SUBJECT="Disk Health Monitor - RECOVERED (${NOTIFICATION_RESOLVED_COUNT})"
     elif (( FINDING_CRITICAL_COUNT > 0 )); then
-        SUBJECT="Disks Health - CRITICAL (${FINDING_CRITICAL_COUNT})"
+        SUBJECT="Disk Health Monitor - CRITICAL (${FINDING_CRITICAL_COUNT})"
     elif (( FINDING_WARNING_COUNT > 0 )); then
-        SUBJECT="Disks Health - WARNING (${FINDING_WARNING_COUNT})"
+        SUBJECT="Disk Health Monitor - WARNING (${FINDING_WARNING_COUNT})"
     else
-        SUBJECT="Disks Health - OK"
+        SUBJECT="Disk Health Monitor - OK"
     fi
     if (( NOTIFICATION_RESOLVED_COUNT > 0 &&
           (FINDING_CRITICAL_COUNT > 0 || FINDING_WARNING_COUNT > 0) )); then

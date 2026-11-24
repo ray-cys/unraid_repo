@@ -1,4 +1,5 @@
 #!/bin/bash
+clearLog=true
 
 ###############################################################################
 # Hubble -> ISS: completion-driven vault backup consumer
@@ -53,11 +54,59 @@
 # Repository DRY_RUN defaults to true for review; preserve the installed value.
 ###############################################################################
 
+# BEGIN EMBEDDED OPERATIONS CONTRACT
+OPS_SCRIPT_ID="backup_vault_remote"
+# Embedded operations contract v1; generated into standalone User Scripts.
+usr_ops_log_line() {
+    local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
+    case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
+    message=${message//$'\r'/};message=${message//$'\n'/ | }
+    printf -v line '%s | %s | %s | run=%s | phase=%s | %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$OPS_SCRIPT_ID" "${OPS_RUN_ID:-$$}" "$phase" "$message"
+    if ((${#line}>4096));then line="${line:0:4050} ... [truncated]";fi
+    printf '%s\n' "$line"
+}
+
+# Accept the original command, including its timeout, so producer-specific
+# delivery/cooldown/acknowledgement semantics stay with the owning script.
+usr_ops_notify() {
+    local -a args=("$@")
+    local i importance=normal summary='' message='' index=-1 status=UPDATE
+    for ((i=0;i<${#args[@]};i++));do
+        case "${args[$i]}" in
+          -i) importance="${args[$((i+1))]:-normal}";;
+          -d) summary="${args[$((i+1))]:-}";;
+          -m) index=$((i+1));message="${args[$index]:-}";;
+        esac
+    done
+    case "$importance" in alert|warning) status=ATTENTION;;esac
+    if [[ "$message" != 'Status: '* ]];then
+        message="Status: $status"$'\n'"Summary: $summary"$'\n\n'"Actions and findings:"$'\n'"${message:-$summary}"
+        if ((index>=0));then args[$index]="$message";else args+=(-m "$message");fi
+    fi
+    # Every notifier has a termination escalation, including legacy callers.
+    if [[ "${args[0]##*/}" == timeout ]];then
+        if [[ " ${args[*]} " != *' --kill-after'* ]];then args=("${args[0]}" --kill-after=5 "${args[@]:1}");fi
+    else args=(timeout --signal=TERM --kill-after=5 30 "${args[@]}");fi
+    "${args[@]}"
+}
+
+# Bounded local history for scripts previously dependent on the plugin console.
+usr_ops_append_log() {
+    local file="$1" line="$2" max="${3:-2097152}" i
+    [[ -d "${file%/*}" && ! -L "$file" ]] || return 1
+    for i in 1 2;do [[ ! -L "$file.$i" ]] || return 1;done
+    find "${file%/*}" -maxdepth 1 -type f \( -name "${file##*/}.1" -o -name "${file##*/}.2" \) -mtime +29 -delete || return 1
+    if [[ -f "$file" ]] && (( $(stat -c %s "$file")+${#line}+1>max ));then
+        rm -f "$file.2";[[ ! -f "$file.1" ]] || mv "$file.1" "$file.2";mv "$file" "$file.1" || return 1
+    fi
+    printf '%s\n' "$line" >>"$file"
+}
+# END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.17"
+readonly SCRIPT_VERSION="1.18"
 
 ###############################################################################
 # CONFIGURATION
@@ -158,7 +207,7 @@ LOCK_FILE="/run/backup_vault_remote.lock"
 # Existing ISS generation .owner values are the stable vault_backup v1 format.
 # Script/state names changed; verified remote archive ownership is preserved.
 readonly SCRIPT_ID="backup_vault_remote"
-readonly NOTIFY_SUBJECT="Vault to ISS Backup"
+readonly NOTIFY_SUBJECT="Backup Vault Remote"
 
 ###############################################################################
 # SHARED ISS COORDINATION AND TRANSPORT (embedded; standalone User Script)
@@ -447,7 +496,7 @@ log() {
     local level="$1"
     shift
     local line
-    printf -v line '%s [%s] %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*"
+    line=$(usr_ops_log_line "$level" MAIN "$*")
     printf '%s\n' "$line"
     [[ -n "$LOG_FILE" && -d "$LOG_DIR" ]] &&
         { backup_bound_log "$LOG_FILE" "$MAX_MAIN_LOG_BYTES" && printf '%s\n' "$line" >>"$LOG_FILE"; } 2>/dev/null || true
@@ -497,7 +546,7 @@ notify_unraid() {
         [[ -z "$old" ]] || message+=$'\n'"Recovery: previously reported $old is cleared; this generation passed transfer and SHA-256 verification."
     fi
     [[ -x "$NOTIFY_BIN" ]] || { NOTIFICATION_RESULT=unavailable; return 0; }
-    if timeout --kill-after=5 30 "$NOTIFY_BIN" -i "$importance" -s "$NOTIFY_SUBJECT" -d "$description" -m "$message" >/dev/null 2>&1; then
+    if usr_ops_notify timeout --kill-after=5 30 "$NOTIFY_BIN" -i "$importance" -s "$NOTIFY_SUBJECT" -d "$description" -m "$message" >/dev/null 2>&1; then
         NOTIFICATION_RESULT=sent
         if [[ "$state_ready" == true && ( "$incident" == true || "$description" == 'Backup completed'* ) ]]; then
             tmp=$(mktemp "${VAULT_NOTIFICATION_STATE}.XXXXXX") || { NOTIFICATION_RESULT=failed;log WARN 'Notification accepted but receipt could not be saved; retry deduplication unavailable';return 0; }
@@ -1213,7 +1262,7 @@ transfer_job() {
                 log WARN "Source changed during $label transfer; rebuilding manifest and retrying"
             else
                 ssh_exec "find $(shell_quote "$destination") -type d -name .rsync-partial -prune -exec rm -rf -- {} +" || return 1
-                rsync -a --protect-args "--timeout=$RSYNC_IO_TIMEOUT" "$manifest" "$REMOTE:$manifest_remote" || return 1
+                rsync -a --checksum --protect-args "--timeout=$RSYNC_IO_TIMEOUT" "$manifest" "$REMOTE:$manifest_remote" || return 1
                 backup_phase "verify-$label"
                 if ssh_exec "cd $(shell_quote "$destination") && sha256sum -c -- $(shell_quote "$manifest_remote") >/dev/null"; then
                     FILES_VERIFIED=$((FILES_VERIFIED+MANIFEST_FILES[$label]))

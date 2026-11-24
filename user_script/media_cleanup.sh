@@ -1,6 +1,7 @@
 #!/bin/bash
+clearLog=true
 arrayStarted=true
-# Media Cleanup v1.4.0 -- personal Hubble operations
+# Media Cleanup v1.5.0 -- personal Hubble operations
 #
 # PURPOSE: One daily job coordinates Arr deletion/unmonitoring/90-day retirement,
 # proven SAB completed-payload cleanup, and metadata-bin retention. Modules run
@@ -68,9 +69,57 @@ arrayStarted=true
 # Arr monitoring. Restore/resolve/orphan modes require the original exact IDs and
 # proofs; they never gain a force-delete shortcut from this wrapper.
 
+# BEGIN EMBEDDED OPERATIONS CONTRACT
+OPS_SCRIPT_ID="media_cleanup"
+# Embedded operations contract v1; generated into standalone User Scripts.
+usr_ops_log_line() {
+    local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
+    case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
+    message=${message//$'\r'/};message=${message//$'\n'/ | }
+    printf -v line '%s | %s | %s | run=%s | phase=%s | %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$OPS_SCRIPT_ID" "${OPS_RUN_ID:-$$}" "$phase" "$message"
+    if ((${#line}>4096));then line="${line:0:4050} ... [truncated]";fi
+    printf '%s\n' "$line"
+}
+
+# Accept the original command, including its timeout, so producer-specific
+# delivery/cooldown/acknowledgement semantics stay with the owning script.
+usr_ops_notify() {
+    local -a args=("$@")
+    local i importance=normal summary='' message='' index=-1 status=UPDATE
+    for ((i=0;i<${#args[@]};i++));do
+        case "${args[$i]}" in
+          -i) importance="${args[$((i+1))]:-normal}";;
+          -d) summary="${args[$((i+1))]:-}";;
+          -m) index=$((i+1));message="${args[$index]:-}";;
+        esac
+    done
+    case "$importance" in alert|warning) status=ATTENTION;;esac
+    if [[ "$message" != 'Status: '* ]];then
+        message="Status: $status"$'\n'"Summary: $summary"$'\n\n'"Actions and findings:"$'\n'"${message:-$summary}"
+        if ((index>=0));then args[$index]="$message";else args+=(-m "$message");fi
+    fi
+    # Every notifier has a termination escalation, including legacy callers.
+    if [[ "${args[0]##*/}" == timeout ]];then
+        if [[ " ${args[*]} " != *' --kill-after'* ]];then args=("${args[0]}" --kill-after=5 "${args[@]:1}");fi
+    else args=(timeout --signal=TERM --kill-after=5 30 "${args[@]}");fi
+    "${args[@]}"
+}
+
+# Bounded local history for scripts previously dependent on the plugin console.
+usr_ops_append_log() {
+    local file="$1" line="$2" max="${3:-2097152}" i
+    [[ -d "${file%/*}" && ! -L "$file" ]] || return 1
+    for i in 1 2;do [[ ! -L "$file.$i" ]] || return 1;done
+    find "${file%/*}" -maxdepth 1 -type f \( -name "${file##*/}.1" -o -name "${file##*/}.2" \) -mtime +29 -delete || return 1
+    if [[ -f "$file" ]] && (( $(stat -c %s "$file")+${#line}+1>max ));then
+        rm -f "$file.2";[[ ! -f "$file.1" ]] || mv "$file.1" "$file.2";mv "$file" "$file.1" || return 1
+    fi
+    printf '%s\n' "$line" >>"$file"
+}
+# END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
 umask 077
-MC_VERSION="1.4.0"
+MC_VERSION="1.5.0"
 # One execution switch across every module. Conflicting/unused flags fail before work.
 # In preview, quarantine purge becomes audit; restore requires an explicit execute flag.
 MC_DRY_RUN=false
@@ -212,7 +261,7 @@ mc_rotate_locked_force() {
 
 mc_log() {
     local level="$1"; shift
-    local line="$(date '+%Y-%m-%d %H:%M:%S') | $level | media_cleanup v$MC_VERSION | run=${MC_RUN_ID:-none} | MAIN | $*"
+    local line;line=$(OPS_RUN_ID="${MC_RUN_ID:-$$}" usr_ops_log_line "$level" MAIN "$*")
     printf '%s\n' "$line" >&2
     mc_write_line "$line"
 }
@@ -304,7 +353,7 @@ mc_flush() (
     rm -f -- "$selected.backlog"
     importance=$(jq -r 'if any(.[];.importance=="alert") then "alert" elif any(.[];.importance=="warning") then "warning" else "normal" end' "$selected")
     exec {MC_EXPORT_FD}>&-
-    timeout --signal=TERM --kill-after=5 "$MC_NOTIFY_TIMEOUT_SECONDS" "$MC_NOTIFY_BIN" -i "$importance" -s "Media Cleanup" -d "Daily cleanup actions and attention" -m "$(cat "$body")"
+    usr_ops_notify timeout --signal=TERM --kill-after=5 "$MC_NOTIFY_TIMEOUT_SECONDS" "$MC_NOTIFY_BIN" -i "$importance" -s "Media Cleanup" -d "Daily cleanup actions and attention" -m "$(cat "$body")"
     rc=$?
     if (( rc==0 )); then
         mc_export_guard || return 1
@@ -743,7 +792,7 @@ mc_emergency_notice() (
     [[ ! -r "$marker" || "$(cat "$marker")" != "$today" ]] || return 0
     # Respect the accepted-email cap even if only the status destination failed.
     if [[ -r "$MC_ROOT/notification-outbox.json" ]] && jq -e --arg day "$today" '.lastSentDate==$day' "$MC_ROOT/notification-outbox.json" >/dev/null 2>&1; then return 0;fi
-    timeout --signal=TERM --kill-after=5 "$MC_NOTIFY_TIMEOUT_SECONDS" "$MC_NOTIFY_BIN" -i alert -s 'Media Cleanup' -d 'Cleanup control-plane attention' -m "$detail" || return 1
+    usr_ops_notify timeout --signal=TERM --kill-after=5 "$MC_NOTIFY_TIMEOUT_SECONDS" "$MC_NOTIFY_BIN" -i alert -s 'Media Cleanup' -d 'Cleanup control-plane attention' -m "$detail" || return 1
     printf '%s' "$today" >"$marker"
 )
 
@@ -1128,7 +1177,7 @@ ops_log() {
     case "$level" in WARN|WARNING|ERROR|CRITICAL)
         OPS_ATTENTION_DETAILS+="- [$level] $message"$'\n'
         if [[ -n "${OPS_ATTENTION_FILE:-}" ]]; then printf '%s\n' "- [$level] $message" >>"$OPS_ATTENTION_FILE"; fi;; esac
-    line="$(date '+%Y-%m-%d %H:%M:%S') | $level | media_cleanup/$MC_MODULE v$MC_VERSION | run=$OPS_RUN_ID | $message"
+    line=$(usr_ops_log_line "$level" "$MC_MODULE" "$message")
     printf '%s\n' "$line" >&2
     mc_write_line "$line"
 }
@@ -1422,7 +1471,7 @@ log() {
         message="${message:0:LOG_LINE_MAX_BYTES} ... [line truncated]"
     fi
 
-    line="$(date '+%Y-%m-%d %H:%M:%S') | $level | media_cleanup/arr v$MC_VERSION | run=$RUN_ID | $APP_CONTEXT | $message"
+    line=$(OPS_RUN_ID="$RUN_ID" usr_ops_log_line "$level" "arr/$APP_CONTEXT" "$message")
     printf '%s\n' "$line" >&2
 
     if [[ "$LOG_READY" == true ]] && ! append_persistent_log "$line"; then
@@ -1855,7 +1904,7 @@ send_grouped_notification() {
     description="$(strip_notification_emoji "$description")"
     body="$(strip_notification_emoji "$body")"
 
-    if ! "$NOTIFY_BIN" \
+    if ! usr_ops_notify "$NOTIFY_BIN" \
         -i "$importance" \
         -s "Arr Delete Sync" \
         -d "$description" \
@@ -1901,7 +1950,7 @@ notify_preflight_failure() {
     local reason="$1" marker="/tmp/arr-delete-preflight-$(date +%F).notified"
     printf '%s\n' "$reason" >&2
     [[ ! -e "$marker" && -x "$NOTIFY_BIN" ]] || return 0
-    if "$NOTIFY_BIN" -i alert -s "Arr Delete Sync" -d "Preflight failed; cleanup preserved" \
+    if usr_ops_notify "$NOTIFY_BIN" -i alert -s "Arr Delete Sync" -d "Preflight failed; cleanup preserved" \
       -m "$reason"$'\n'"No Arr API changes, sidecar moves, folder removals or retirements were attempted. Existing state and media were preserved." >/dev/null 2>&1; then : >"$marker"; fi
 }
 
@@ -7105,7 +7154,7 @@ initialize() {
     storage_reason="Required log storage $required_log_mount is unavailable. No backup deletions, quarantine moves, purges or restores were attempted."
     printf '%s\n' "$storage_reason" >&2
     if [[ ! -e "$storage_marker" && -x "$NOTIFY" ]] && is_true "$SEND_NOTIFICATIONS"; then
-      if "$NOTIFY" -i alert -s "SABnzbd Cleanup" -d "Storage preflight failed" -m "$storage_reason" >/dev/null 2>&1; then : >"$storage_marker"; fi
+      if usr_ops_notify "$NOTIFY" -i alert -s "SABnzbd Cleanup" -d "Storage preflight failed" -m "$storage_reason" >/dev/null 2>&1; then : >"$storage_marker"; fi
     fi
     return 1
   fi
@@ -10307,7 +10356,7 @@ main() {
     if ! mountpoint -q /mnt/vault || ! mountpoint -q /mnt/user; then
         RESULT_SUMMARY="Required mounts are unavailable: /mnt/vault and/or /mnt/user; no purge or restore was attempted"
         printf '%s\n' "$RESULT_SUMMARY" >&2
-        if [[ -x "$NOTIFY_BIN" ]]; then "$NOTIFY_BIN" -i alert -s "Quarantine Lifecycle" -d "Required storage unavailable" -m "$RESULT_SUMMARY" >/dev/null 2>&1 || true; NOTIFICATION_ATTEMPTED=true; fi
+        if [[ -x "$NOTIFY_BIN" ]]; then usr_ops_notify "$NOTIFY_BIN" -i alert -s "Quarantine Lifecycle" -d "Required storage unavailable" -m "$RESULT_SUMMARY" >/dev/null 2>&1 || true; NOTIFICATION_ATTEMPTED=true; fi
         return 1
     fi
     mkdir -p -- "$LOG_DIR" || return 1

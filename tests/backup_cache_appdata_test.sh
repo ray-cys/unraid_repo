@@ -416,7 +416,7 @@ assert_contains "$DIRECT_ROOT/direct.out" "exclusions "
 
 mapfile -t DIRECT_ARCHIVE_ORDER < <(
     sed -n \
-        's/.*\[DOCKER\]\[INFO\] \[\(.*\)\] Creating archive$/\1/p' \
+        's/.*phase=DOCKER | \[\(.*\)\] Creating archive$/\1/p' \
         "$DIRECT_ROOT/direct.out"
 )
 

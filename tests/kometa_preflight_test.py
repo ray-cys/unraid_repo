@@ -23,10 +23,11 @@ with tempfile.TemporaryDirectory(prefix='media-metadata-audit-fixture-') as fold
     (root/'collections/movie_collection.yml').write_text(yaml.safe_dump({'dynamic_collections':{'TMDb':{'type':'tmdb_collection','sync':True,'exclude':[123]},'Custom':{'type':'tmdb_collection','template':'my_custom'}}}))
     (root/'overlays/media_info.yml').write_text('templates:\n  resolution_info:\n    conditionals:\n      resolution:\n        conditions: []\n    plex_search:\n      all:\n        resolution: <<resolution>>\n\n  next_template:\n    plex_all: true\n')
     os.environ['KOMETA_CONFIG_ROOT']=str(root)
-    def run():
-        out=io.StringIO();scope={'__name__':'__main__'}
+    def run(epoch=1795518000):
+        out=io.StringIO();scope={'__name__':'__main__','FIXTURE_EPOCH':epoch}
+        program=PREFLIGHT_SOURCE.replace("datetime.datetime.now(ZoneInfo('Asia/Singapore'))", "datetime.datetime.fromtimestamp(FIXTURE_EPOCH, ZoneInfo('Asia/Singapore'))")
         with contextlib.redirect_stdout(out):
-            try:exec(compile(PREFLIGHT_SOURCE,'embedded-preflight','exec'),scope)
+            try:exec(compile(program,'embedded-preflight','exec'),scope)
             except SystemExit:pass
             finally:
                 if scope.get('output_lock') is not None:scope['output_lock'].close()
@@ -48,6 +49,10 @@ with tempfile.TemporaryDirectory(prefix='media-metadata-audit-fixture-') as fold
     (root/'logs/meta.log').write_text('[INFO] | Starting 00:00 Run |\n[INFO] | Finished 00:00 Run |\n')
     (root/'.metafusion/kometa-coordinator.json').unlink()
     result=run();assert result['status']=='OK',result  # Stock Kometa needs no installed launcher.
+    import datetime
+    from zoneinfo import ZoneInfo
+    near=int(datetime.datetime(2026,11,24,3,59,tzinfo=ZoneInfo('Asia/Singapore')).timestamp())
+    assert run(near)['status']=='DEFERRED'
     with (root/'.metafusion/output.lock').open('a+') as holder:
         fcntl.flock(holder,fcntl.LOCK_EX|fcntl.LOCK_NB)
         assert run()['status']=='DEFERRED'

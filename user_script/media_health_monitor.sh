@@ -1,7 +1,8 @@
 #!/bin/bash
+clearLog=true
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.21.1
+# ARR Health / Download / Import Monitor v3.22.0
 #
 # PURPOSE
 # -------
@@ -437,6 +438,104 @@
 #
 ###############################################################################
 
+# BEGIN EMBEDDED OPERATIONS CONTRACT
+OPS_SCRIPT_ID="media_health_monitor"
+# Embedded operations contract v1; generated into standalone User Scripts.
+usr_ops_log_line() {
+    local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
+    case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
+    message=${message//$'\r'/};message=${message//$'\n'/ | }
+    printf -v line '%s | %s | %s | run=%s | phase=%s | %s' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$OPS_SCRIPT_ID" "${OPS_RUN_ID:-$$}" "$phase" "$message"
+    if ((${#line}>4096));then line="${line:0:4050} ... [truncated]";fi
+    printf '%s\n' "$line"
+}
+
+# Accept the original command, including its timeout, so producer-specific
+# delivery/cooldown/acknowledgement semantics stay with the owning script.
+usr_ops_notify() {
+    local -a args=("$@")
+    local i importance=normal summary='' message='' index=-1 status=UPDATE
+    for ((i=0;i<${#args[@]};i++));do
+        case "${args[$i]}" in
+          -i) importance="${args[$((i+1))]:-normal}";;
+          -d) summary="${args[$((i+1))]:-}";;
+          -m) index=$((i+1));message="${args[$index]:-}";;
+        esac
+    done
+    case "$importance" in alert|warning) status=ATTENTION;;esac
+    if [[ "$message" != 'Status: '* ]];then
+        message="Status: $status"$'\n'"Summary: $summary"$'\n\n'"Actions and findings:"$'\n'"${message:-$summary}"
+        if ((index>=0));then args[$index]="$message";else args+=(-m "$message");fi
+    fi
+    # Every notifier has a termination escalation, including legacy callers.
+    if [[ "${args[0]##*/}" == timeout ]];then
+        if [[ " ${args[*]} " != *' --kill-after'* ]];then args=("${args[0]}" --kill-after=5 "${args[@]:1}");fi
+    else args=(timeout --signal=TERM --kill-after=5 30 "${args[@]}");fi
+    "${args[@]}"
+}
+
+# Bounded local history for scripts previously dependent on the plugin console.
+usr_ops_append_log() {
+    local file="$1" line="$2" max="${3:-2097152}" i
+    [[ -d "${file%/*}" && ! -L "$file" ]] || return 1
+    for i in 1 2;do [[ ! -L "$file.$i" ]] || return 1;done
+    find "${file%/*}" -maxdepth 1 -type f \( -name "${file##*/}.1" -o -name "${file##*/}.2" \) -mtime +29 -delete || return 1
+    if [[ -f "$file" ]] && (( $(stat -c %s "$file")+${#line}+1>max ));then
+        rm -f "$file.2";[[ ! -f "$file.1" ]] || mv "$file.1" "$file.2";mv "$file" "$file.1" || return 1
+    fi
+    printf '%s\n' "$line" >>"$file"
+}
+# END EMBEDDED OPERATIONS CONTRACT
+# Shared new-action budget. Native outcomes remain in the producer's journal.
+usr_ops_arr_reserve() (
+    [[ "${USR_OPS_SHARED_BUDGET_ACTIVE:-false}" == true ]] || return 0
+    local action="$1" app="$2" target="$3" root="${MEDIA_ACTION_BUDGET_ROOT:-/mnt/vault/cloud/logs/script/media_health_monitor}" now run fd export_fd temp file
+    [[ "$app" == Sonarr || "$app" == Radarr ]] || return 1
+    [[ "$target" =~ ^[1-9][0-9]*$ && -d "$root" && ! -L "$root" ]] || return 1
+    [[ "$root" != /mnt/vault/* ]] || mountpoint -q /mnt/vault || return 75
+    file="$root/action-budget.json";[[ ! -L "$file" ]] || return 1
+    exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
+    flock -s -n "$export_fd" || return 75
+    exec {fd}>"${MEDIA_ACTION_BUDGET_LOCK:-/run/media-automation-budget.lock}" || return 1
+    flock -x -w 5 "$fd" || return 75
+    now=$(date +%s);run="${MEDIA_AUTOMATION_RUN_ID:-$OPS_SCRIPT_ID:${START_TIME:-${START_EPOCH:-$$}}:$$}"
+    temp=$(mktemp "$root/.action-budget.XXXXXX") || return 1
+    trap 'rm -f -- "$temp"' EXIT
+    if [[ -f "$file" ]];then
+      jq -e '.schema==1 and (.actions|type)=="object" and all(.actions[];(.at|type)=="number" and (.run|type)=="string")' "$file" >/dev/null || return 1
+      cp "$file" "$temp" || return 1
+    else
+      # Seed from existing issued/uncertain journals instead of resetting limits
+      # when the shared contract is first installed. Known local non-dispatch is excluded.
+      printf '{"schema":1,"actions":{}}\n' >"$temp"
+      local source prefix seed
+      for source in "$root/automation-actions.json" "$root/policy-actions.json" "${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}";do
+        [[ -f "$source" && ! -L "$source" ]] || continue
+        prefix="${source##*/}";seed="$temp.seed"
+        jq --slurpfile old "$source" --arg prefix "$prefix" --argjson since "$((now-86400))" '
+          reduce (($old[0].actions // {})|to_entries[]|select((.value.startedAt // .value.grabSentAt // 0)>=$since and .value.outcome!="not_dispatched" and
+           (if $prefix=="recovery.json" then (.value.grabSentAt // 0)>0 else true end))) as $r
+           (.;.actions[($prefix+":"+$r.key)]={at:($r.value.grabSentAt // $r.value.startedAt),run:"pre-contract",owner:$prefix,app:$r.value.app,target:($r.value.targetId // $r.value.parentId)})' "$temp" >"$seed" && mv "$seed" "$temp" || return 1
+      done
+    fi
+    if jq -e --arg key "$action" '.actions[$key]!=null' "$temp" >/dev/null;then return 75;fi
+    jq -e --argjson since "$((now-86400))" --arg run "$run" '[.actions[]|select(.at>=$since)] as $today | ($today|length)<4 and ([$today[]|select(.run==$run)]|length)<2' "$temp" >/dev/null || return 75
+    jq --arg key "$action" --arg app "$app" --argjson target "$target" --arg run "$run" --arg owner "$OPS_SCRIPT_ID" --argjson now "$now" \
+      '.actions |= with_entries(select(.value.at>=$now-30*86400)) | .actions[$key]={at:$now,run:$run,owner:$owner,app:$app,target:$target,outcome:"reserved; native journal owns dispatch/outcome"}' "$temp" >"$temp.next" && mv "$temp.next" "$temp" || return 1
+    sync -f "$temp" && mv "$temp" "$file" && sync -f "$root"
+)
+
+usr_ops_arr_release_undispatched() (
+    [[ "${USR_OPS_SHARED_BUDGET_ACTIVE:-false}" == true ]] || return 0
+    local key="$1" root="${MEDIA_ACTION_BUDGET_ROOT:-/mnt/vault/cloud/logs/script/media_health_monitor}" fd export_fd temp run
+    run="${MEDIA_AUTOMATION_RUN_ID:-$OPS_SCRIPT_ID:${START_TIME:-${START_EPOCH:-$$}}:$$}"
+    [[ -f "$root/action-budget.json" && ! -L "$root/action-budget.json" ]] || return 1
+    exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}";flock -s -n "$export_fd" || return 75
+    exec {fd}>"${MEDIA_ACTION_BUDGET_LOCK:-/run/media-automation-budget.lock}";flock -x -w 5 "$fd" || return 75
+    temp=$(mktemp "$root/.budget-release.XXXXXX") || return 1
+    trap 'rm -f -- "$temp"' EXIT
+    jq --arg key "$key" --arg run "$run" 'if .actions[$key].run==$run then del(.actions[$key]) else . end' "$root/action-budget.json" >"$temp" && sync -f "$temp" && mv "$temp" "$root/action-budget.json" && sync -f "$root"
+)
 set -uo pipefail
 
 ###############################################################################
@@ -1301,7 +1400,7 @@ log() {
     esac
 
     log_level_enabled "$level" || return 0
-    printf '%s : %s\n' "$(date '+%Y/%m/%d %T')" "$message"
+    usr_ops_log_line "$level" MAIN "$message"
 }
 
 debug_log() {
@@ -1319,7 +1418,7 @@ persistent_log() {
     [[ "$level" != DEBUG ]] || log_level_enabled DEBUG || return 0
     [[ -n "$LOG_FILE" ]] || return 0
     message="$*"; message=${message//$'\n'/ | }; message=${message//$'\r'/}
-    printf -v line '%s | %s | %s' "$(date '+%Y/%m/%d %T')" "$level" "$message"
+    line=$(usr_ops_log_line "$level" MAIN "$message")
     if (( ${#line}>LOG_LINE_MAX_BYTES )); then line="${line:0:LOG_LINE_MAX_BYTES-24} ... [line truncated]"; fi
     size=$(stat -c '%s' "$LOG_FILE" 2>/dev/null || printf 0)
     [[ "$size" =~ ^[0-9]+$ ]] || size=0
@@ -1514,7 +1613,7 @@ ensure_state_storage_ready() {
     if [ "$SEND_NOTIFICATIONS" = true ] && [ -x "$NOTIFY" ]; then
         notify \
             "alert" \
-            "ARR Health Monitor - State Mount Unavailable" \
+            "Media Health Monitor - State Mount Unavailable" \
             "${reason}. The monitor stopped before creating ${STATE_DIR}."
     fi
 
@@ -1730,9 +1829,9 @@ notify() {
         exec {STATE_EXPORT_FD}>&-
         MONITOR_STATE_LEASE_HELD=false;lease_released=true
     fi
-    timeout --signal=TERM --kill-after=5 "$MONITOR_NOTIFY_TIMEOUT_SECONDS" "$NOTIFY" \
+    usr_ops_notify timeout --signal=TERM --kill-after=5 "$MONITOR_NOTIFY_TIMEOUT_SECONDS" "$NOTIFY" \
         -i "$importance" \
-        -s "ARR Health Monitor" \
+        -s "Media Health Monitor" \
         -d "$description" \
         -m "$message" \
         >/dev/null 2>&1 || rc=$?
@@ -4434,7 +4533,7 @@ save_state() {
 
         notify \
             "alert" \
-            "ARR Health Monitor - State Write Failed" \
+            "Media Health Monitor - State Write Failed" \
             "The monitor could not update ${display_state}. Issue lifecycle and notification deduplication may be stale."
     fi
 
@@ -6893,7 +6992,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.21.0 lifecycle commands' \
+        'Media Health Monitor v3.22.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -7301,6 +7400,14 @@ queue_group_notification() {
     local ack_id
 
     ack_id=$(issue_ack_id "$issue_key")
+    # Link the exact shared download without suppressing native API/import faults.
+    # Integrity owns replacement results; health retains independent service evidence.
+    local recovery_file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}" incident_id='' download_id=''
+    [[ "$issue_key" != FLOW:DOWNLOAD:* ]] || download_id="${issue_key#FLOW:DOWNLOAD:}"
+    if [[ -n "$download_id" && -r "$recovery_file" && ! -L "$recovery_file" ]];then
+      incident_id=$(jq -r --arg id "$download_id" --arg app "$source" '.actions|to_entries[]|select(.value.app==$app and (.value.downloadId // "")!="" and ((.value.downloadId|ascii_downcase)==($id|ascii_downcase)))|.key' "$recovery_file" 2>/dev/null|head -n 1)
+      [[ -z "$incident_id" ]] || detail+=$'\n'"Recovery owner: Media Integrity Audit; incident integrity:$incident_id. This health event reports independent workflow evidence; replacement outcome is recorded by the recovery owner."
+    fi
     printf '%s' "$detail" >"$TMP_DIR/notification-detail.txt" || return 1
 
     jq -nc \
@@ -7499,7 +7606,7 @@ send_notification_page() {
             ;;
     esac
 
-    description="ARR Health Monitor - ${batch_total} Update(s)"
+    description="Media Health Monitor - ${batch_total} Update(s)"
 
     if (( page_total > 1 )); then
         description+=" - Batch ${page_number}/${page_total}"
@@ -15845,6 +15952,7 @@ automation_submit_command() {
     automation_window_open && automation_action_budget && automation_no_active_command "$root" "$key" &&
       automation_last_moment_guard "$candidate" "$root" "$key" || return 1
     action_id=$(jq -r '.key' "$candidate"); action_id="$action_id:$START_TIME"
+    usr_ops_arr_reserve "command:$action_id" "$(jq -r '.app' "$candidate")" "$(jq -r '.targetId' "$candidate")" || { printf '%s\n' 'Shared media action budget deferred command; no HTTP request sent' >>"$TMP_DIR/automation-deferrals.txt";return 0; }
     automation_state_update '.actions[$id]=$candidate[0]+{status:"intent",startedAt:$now,outcome:"pending"}' \
       --arg id "$action_id" --argjson now "$START_TIME" --slurpfile candidate "$candidate" || return 1
     body=$(jq -c '.command' "$candidate")
@@ -15852,6 +15960,7 @@ automation_submit_command() {
     local mutation_rc=0
     policy_mutate POST "$root/command" "$key" "$body" "$TMP_DIR/automation-submit-response.json" || mutation_rc=$?
     if ((mutation_rc==75));then
+      usr_ops_arr_release_undispatched "command:$action_id" || true
       automation_state_update '.deferred //= {} | .deferred[$id]=(.actions[$id]+{outcome:"not_dispatched",reason:"Local lease/runtime gate refused before HTTP"}) | del(.actions[$id]) | .deferred |= with_entries(select(.value.startedAt>=$cutoff))' \
         --arg id "$action_id" --argjson cutoff "$((START_TIME-7*86400))" || return 1
       printf '%s\n' 'Local deadline/lease deferred a command before HTTP; no request dispatched and no uncertain intent left' >>"$TMP_DIR/automation-deferrals.txt"
@@ -15957,14 +16066,27 @@ process_media_integrity_recovery() {
     local allow=false
     if [[ "$ARR_AUTOMATION_ENABLED" == true && "$AUTOMATION_CONTROLS_OK" == true ]] && automation_window_open && automation_api_ready && automation_action_budget;then allow=true;fi
     [[ -f "$script" && ! -L "$script" ]] || return 0
+    # The child may notify. Commit and release the parent's shared lease too;
+    # releasing only the child's descriptor would still block an exclusive export.
+    local child_lease_released=false
+    if [[ "${MONITOR_STATE_LEASE_HELD:-false}" == true && -n "${STATE_EXPORT_FD:-}" ]];then
+      commit_state_transaction before-integrity-child || return 1
+      exec {STATE_EXPORT_FD}>&-;MONITOR_STATE_LEASE_HELD=false;child_lease_released=true
+    fi
     (
         export SONARR_API_ROOT SONARR_API_KEY RADARR_API_ROOT RADARR_API_KEY
-        export RECOVERY_ALLOW_GRAB="$allow"
+        export RECOVERY_ALLOW_GRAB="$allow" USR_OPS_SHARED_BUDGET_ACTIVE
+        export MEDIA_AUTOMATION_RUN_ID="${MEDIA_AUTOMATION_RUN_ID:-media_health_monitor:$START_TIME:$$}"
         local remaining=$((START_TIME+MONITOR_RUNTIME_BUDGET_SECONDS-MONITOR_RUNTIME_RESERVE_SECONDS-$(date +%s)))
         ((remaining>0)) || exit 0
         ((remaining<=210)) || remaining=210
         timeout --signal=TERM --kill-after=5 "$remaining" /bin/bash "$script" --recover-only
     ) >"$TMP_DIR/media-integrity-recovery.log" 2>&1 || rc=$?
+    if [[ "$child_lease_released" == true ]];then
+      exec {STATE_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || { MONITOR_EXPORT_LEASE_LOST=true;return 75; }
+      if ! flock -s -w "$MONITOR_NOTIFY_LEASE_WAIT_SECONDS" "$STATE_EXPORT_FD";then exec {STATE_EXPORT_FD}>&-;MONITOR_EXPORT_LEASE_LOST=true;return 75;fi
+      MONITOR_STATE_LEASE_HELD=true
+    fi
     if ((rc==124 || rc==137)); then
         record_normalized_issue 'Monitor:media-integrity-recovery-timeout' Monitor 'Media recovery executor interrupted' MEDIA_RECOVERY_EXECUTOR_FAILED ERROR executor \
           'Bounded media recovery executor exceeded its runtime' 0 'Inspect media_integrity_audit --recovery-status. Durable intents/originals remain protected; no automatic replay or success is inferred.'
@@ -16641,6 +16763,7 @@ process_policy_remediation() {
             [ -n "$item" ] || continue
             policy_build_candidate "$app" "$item" "$TMP_DIR/policy-fresh-candidate.json" || continue
             [ "$fingerprint" = "$(jq -Sc 'del(.parent.statistics,.parent.nextAiring,.parent.previousAiring,.target.statistics,.queue.estimatedCompletionTime,.queue.timeleft)' "$TMP_DIR/policy-fresh-candidate.json" | sha256sum | awk '{print $1}')" ] || continue
+            usr_ops_arr_reserve "policy:$id" "$app" "$(jq -r '.targetId' "$TMP_DIR/policy-candidate.json")" || { printf '%s\n' "$app: shared media action budget deferred rejection; queue unchanged" >>"$TMP_DIR/automation-deferrals.txt";continue; }
             local tmp="${POLICY_STATE_FILE}.tmp.$$" queue_id blocklist=false
             jq --slurpfile c "$TMP_DIR/policy-candidate.json" --arg id "$id" --argjson now "$START_TIME" '.actions[$id]=$c[0]+{status:"intent",startedAt:$now}' "$POLICY_STATE_FILE" >"$tmp" && policy_publish "$tmp" "$POLICY_STATE_FILE" || return 1
             queue_id=$(jq -r '.queueId' "$TMP_DIR/policy-candidate.json")
@@ -16651,6 +16774,7 @@ process_policy_remediation() {
             local mutation_rc=0
             policy_mutate DELETE "$root/queue/$queue_id?removeFromClient=false&blocklist=$blocklist&skipRedownload=true&changeCategory=false" "$key" '' "$TMP_DIR/policy-delete-response" || mutation_rc=$?
             if ((mutation_rc==75));then
+                usr_ops_arr_release_undispatched "policy:$id" || true
                 jq --arg id "$id" '.deferred //= {} | .deferred[$id]=(.actions[$id]+{outcome:"not_dispatched"}) | del(.actions[$id])' "$POLICY_STATE_FILE" >"$tmp" && policy_publish "$tmp" "$POLICY_STATE_FILE" || return 1
                 printf '%s\n' "$app: policy rejection deferred before HTTP; SAB and Arr queue untouched" >>"$TMP_DIR/automation-deferrals.txt"
                 continue
@@ -16873,6 +16997,7 @@ if ! begin_monitor_run; then
 fi
 
 monitor_outbox_prepare || exit 3
+USR_OPS_SHARED_BUDGET_ACTIVE=true
 MONITOR_COORDINATION_ACTIVE=true
 MONITOR_RUN_ACTIVE=true
 commit_state_transaction "run-start" || exit 3
@@ -16887,7 +17012,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.21.0"
+    "START | Media Health Monitor v3.22.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -16900,7 +17025,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.21.0"
+debug_log "Starting Media Health Monitor v3.22.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -17242,6 +17367,7 @@ monitor_release_mutation_gates
 if runtime_budget_allows_optional_phase "arr-automation"; then
     start_monitor_phase "arr-automation"
     process_media_integrity_recovery || log 'WARNING: Media integrity recovery executor unavailable'
+    [[ "$MONITOR_EXPORT_LEASE_LOST" != true ]] || exit 75
     process_arr_automation || log 'WARNING: Arr automation deferred or awaits verification'
     end_monitor_phase "arr-automation"
 fi
@@ -17439,6 +17565,11 @@ assess_activity_flow
 end_monitor_phase "activity-flow"
 
 start_monitor_phase "monitor-self-health"
+if [[ -e "$STATE_DIR/action-budget.json" ]] && { [[ -L "$STATE_DIR/action-budget.json" ]] || ! jq -e '.schema==1 and (.actions|type)=="object"' "$STATE_DIR/action-budget.json" >/dev/null 2>&1; };then
+    record_normalized_issue 'Monitor:shared-media-budget' Monitor 'Shared media action budget invalid' MONITOR_STATE_INVALID ERROR control-plane \
+      'New automated actions deferred because the shared action ledger is invalid' 0 \
+      'Existing intent journals and media were preserved. Restore a verified action-budget.json or repair its structure; do not clear uncertain native actions.'
+fi
 monitor_persist_coverage || exit 3
 monitor_report_stale_coverage
 # Core service endpoint failures are already represented by the per-service
@@ -17526,7 +17657,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.21.0 completed"
+log "Media Health Monitor v3.22.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""
