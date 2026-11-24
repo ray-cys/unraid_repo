@@ -1,6 +1,6 @@
 #!/bin/bash
 arrayStarted=true
-# Media Cleanup v1.3.0 -- personal Hubble operations
+# Media Cleanup v1.4.0 -- personal Hubble operations
 #
 # PURPOSE: One daily job coordinates Arr deletion/unmonitoring/90-day retirement,
 # proven SAB completed-payload cleanup, and metadata-bin retention. Modules run
@@ -70,7 +70,7 @@ arrayStarted=true
 
 set -uo pipefail
 umask 077
-MC_VERSION="1.3.0"
+MC_VERSION="1.4.0"
 # One execution switch across every module. Conflicting/unused flags fail before work.
 # In preview, quarantine purge becomes audit; restore requires an explicit execute flag.
 MC_DRY_RUN=false
@@ -103,6 +103,51 @@ MC_ARR_MAX_RETIREMENTS=10          # DELETE requests per application.
 MC_RADARR_MAX_TAG_MOVIES=100       # Bound a bulk editor payload; remainder retries.
 MC_GUARDS_ACTIVE=false
 MC_BRIDGE_ACTIVE=false
+
+mc_app_mutation_gate() {
+    local app="$1"
+    [[ "${MC_GUARDS_ACTIVE:-false}" == true && "${MC_DRY_RUN:-false}" != true ]] || return 0
+    exec {ARR_MUTATION_FD}>"${ARR_MUTATION_LOCK_DIR:-/run}/arr-mutations-$app.lock" || return 1
+    flock -n "$ARR_MUTATION_FD" || { mc_defer_work "${app^^}" 'Another coordinated script owns Arr changes; current state preserved';return 75; }
+}
+
+# Shared v1 receipt contract, embedded verbatim in producer and consumer.
+# Older receipts may lack optional enrichment; exact live identity validation
+# remains mandatory before cleanup. History proof is not expired just by age.
+arr_import_receipt_document_valid() {
+    jq -e '
+      def pos: type=="number" and .>0 and .==floor;
+      def nonneg: type=="number" and .>=0 and .==floor;
+      def text: type=="string" and length>0 and (contains("\u0000")|not);
+      def absolute: text and startswith("/");
+      .version==1 and (.receipts|type)=="object" and all(.receipts|to_entries[];
+        .key as $key | .value |
+        (.app=="Sonarr" or .app=="Radarr") and (.downloadId|text) and $key==(.app+":"+.downloadId) and
+        (.targets|type)=="object" and (.targets|length)>0 and
+        all(.targets[];
+          (.fileId|pos) and (.targetId|pos) and (.parentId|pos) and (.pathAtImport|absolute) and
+          (.kind=="episode" or .kind=="movie") and
+          ((.parentExternalId // 0)|nonneg) and
+          (if .kind=="episode" then
+             ((.seasonNumber // 0)|nonneg) and ((.episodeNumber // 0)|nonneg) else .targetId==.parentId end)))' "$1" >/dev/null
+}
+
+arr_policy_receipt_document_valid() {
+    jq -e '
+      type=="object" and .version==1 and (.actions|type)=="object" and (.observations|type)=="object" and
+      all(.actions|to_entries[];
+        .key as $id | .value |
+        .downloadId==$id and ($id|test("^[a-z0-9-]+$")) and
+        ((.sab.nzo_id // ""|ascii_downcase)==$id) and ((.queue.downloadId // ""|ascii_downcase)==$id) and .queue.id==.queueId and
+        ((.app=="Sonarr" and .kind=="episode") or (.app=="Radarr" and .kind=="movie")) and
+        (.mode=="redundant" or .mode=="replace") and
+        (.status=="intent" or .status=="queue_verified" or .status=="search_uncertain" or .status=="done") and
+        ([.targetId,.parentId,.queueId,.startedAt] | all(.[]; type=="number" and .>0 and .==floor)) and
+        (.command == (if .kind=="episode" then {name:"EpisodeSearch",episodeIds:[.targetId]} else {name:"MoviesSearch",movieIds:[.targetId]} end)) and
+        ([.replacementProofRuns // 0,.replacementCheckedAt // 0,.searchStartedAt // 0] | all(.[];type=="number" and .>=0 and .==floor)) and
+        (.profile|type)=="object" and (.target|type)=="object" and (.parent|type)=="object" and (.sab|type)=="object" and (.queue|type)=="object")
+    ' "$1" >/dev/null
+}
 
 mc_state_ready() {
     [[ "$MC_ROOT" == /mnt/vault/cloud/logs/script/media_cleanup && ! -L "$MC_ROOT" &&
@@ -4204,6 +4249,8 @@ PLEX_DELETED_SERIES_TAG_ID=''
 
 trap cleanup_app EXIT
 trap 'exit 130' INT TERM
+mc_app_mutation_gate Sonarr || return $?
+
 
 [[ -n "$SONARR_URL" && "$SONARR_URL" != */ ]] || die "Set SONARR_URL without a trailing slash."
 [[ -n "$SONARR_API_KEY" && "$SONARR_API_KEY" != PUT_YOUR_SONARR_API_KEY_HERE ]] ||
@@ -4246,7 +4293,7 @@ cp -- "$STATE_FILE" "$WORK_STATE" || die "Cannot copy state to working file."
 ###############################################################################
 
 log DEBUG "Starting delete sync (dry-run=$DRY_RUN, confirmations=$CONFIRMATION_RUNS)."
-if [[ "$TRIGGER_LIBRARY_RESCAN" == true ]]; then
+if [[ "$TRIGGER_LIBRARY_RESCAN" == true && "$DRY_RUN" != true ]]; then
     log INFO "API-only mode: requesting one Sonarr all-library rescan before checking episodes."
 else
     log DEBUG "Using Sonarr's current database state; no rescan will be requested."
@@ -4266,7 +4313,7 @@ load_tag_catalog || {
     die "Could not load Sonarr tags; state was not changed."
 }
 
-if [[ "$TRIGGER_LIBRARY_RESCAN" == true ]]; then
+if [[ "$TRIGGER_LIBRARY_RESCAN" == true && "$DRY_RUN" != true ]]; then
     RESCAN_ID="$(start_arr_command '{"name":"RescanSeries"}')" || {
         ((API_FAILURES += 1))
         die "Could not start Sonarr library rescan; state was not changed."
@@ -5710,6 +5757,8 @@ PLEX_DELETED_MOVIE_TAG_ID=''
 
 trap cleanup_app EXIT
 trap 'exit 130' INT TERM
+mc_app_mutation_gate Radarr || return $?
+
 
 [[ -n "$RADARR_URL" && "$RADARR_URL" != */ ]] || die "Set RADARR_URL without a trailing slash."
 [[ -n "$RADARR_API_KEY" && "$RADARR_API_KEY" != PUT_YOUR_RADARR_API_KEY_HERE ]] ||
@@ -5744,7 +5793,7 @@ cp -- "$STATE_FILE" "$WORK_STATE" || die "Cannot copy state to working file."
 
 log DEBUG "Starting delete tagger (dry-run=$DRY_RUN, confirmations=$CONFIRMATION_RUNS)."
 media_recovery_journal_valid || die 'Media recovery hold journal invalid; Radarr state and media preserved.'
-if [[ "$TRIGGER_LIBRARY_RESCAN" == true ]]; then
+if [[ "$TRIGGER_LIBRARY_RESCAN" == true && "$DRY_RUN" != true ]]; then
     log INFO "Requesting one Radarr all-library rescan before checking movies."
 else
     log DEBUG "Using Radarr's current database state; no rescan will be requested."
@@ -5764,7 +5813,7 @@ load_tag_catalog || {
     die "Could not load Radarr tags; state was not changed."
 }
 
-if [[ "$TRIGGER_LIBRARY_RESCAN" == true ]]; then
+if [[ "$TRIGGER_LIBRARY_RESCAN" == true && "$DRY_RUN" != true ]]; then
     RESCAN_ID="$(start_arr_command '{"name":"RescanMovie"}')" || {
         ((API_FAILURES += 1))
         die "Could not start Radarr library rescan; state was not changed."
@@ -7824,6 +7873,7 @@ verify_durable_import_receipt() {
   local root key target target_id parent_id file_id kind object="$TMP_DIR/receipt-object.json" media="$TMP_DIR/receipt-media.json"
   local paths="$TMP_DIR/receipt-paths.jsonl" resolved source_count count
   [[ -f "$IMPORT_RECEIPT_FILE" && ! -L "$IMPORT_RECEIPT_FILE" ]] || return 11
+  arr_import_receipt_document_valid "$IMPORT_RECEIPT_FILE" || { log ERROR 'Import receipt schema invalid; payload preserved';return 11; }
   printf '%s' "$item" >"$input" || return 11
   jq -e --arg app "$owner" --arg id "$download_id" --slurpfile job "$input" '
     select(.version==1) | .receipts[$app+":"+$id] | select(.app==$app and .downloadId==$id and .conflict!=true and
@@ -7878,6 +7928,7 @@ verify_policy_disposition() {
   local receipt="$TMP_DIR/policy-receipt.json" target="$TMP_DIR/policy-current-target.json" parent="$TMP_DIR/policy-current-parent.json"
   local root key kind target_id parent_id mode file_id file endpoint resolved source_count
   [[ -r "$POLICY_DISPOSITION_FILE" ]] || return 11
+  arr_policy_receipt_document_valid "$POLICY_DISPOSITION_FILE" || { log ERROR 'Policy receipt schema invalid; payload preserved';return 11; }
   local item_file="$TMP_DIR/policy-sab-item.json"
   printf '%s' "$item" >"$item_file" || return 11
   jq -e --arg id "$download_id" --arg app "$owner" --slurpfile sab_item "$item_file" '$sab_item[0] as $item |
@@ -7909,8 +7960,21 @@ verify_policy_disposition() {
     resolved=$(resolve_imported_path "$owner" "$(jq -r '.path' "$file")") || return 12
     imported=$(jq -nc --arg path "$resolved" '[$path]') || return 12
   else
-    # Rejection must still be followed by an explicitly accepted targeted search.
-    jq -e '.commandId>0' "$receipt" >/dev/null || return 11
+    # A verified external/current import can make the planned search obsolete.
+    # It authorizes no replay and must still name the exact current native file.
+    if ! jq -e '(.commandId // 0)>0' "$receipt" >/dev/null;then
+      jq -e '.resolutionSource=="verified-current-file" and .replacementState=="import_verified" and
+        (.replacementProofRuns|type)=="number" and .replacementProofRuns>=2 and
+        (.replacementFileId|type)=="number" and .replacementFileId>0' "$receipt" >/dev/null || return 11
+      file_id=$(jq -r '.replacementFileId' "$receipt")
+      jq -e --argjson file "$file_id" '.hasFile==true and (.episodeFileId // .movieFileId)==$file' "$target" >/dev/null || return 12
+      file="$TMP_DIR/policy-replacement-file.json"
+      arr_get "$root/${kind}file/$file_id" "$key" "$file" || return 10
+      jq -e --argjson id "$file_id" --argjson parent "$parent_id" --arg kind "$kind" '.id==$id and .size>0 and
+        (.path|type)=="string" and (if $kind=="episode" then .seriesId==$parent else .movieId==$parent end)' "$file" >/dev/null || return 12
+      resolved=$(resolve_imported_path "$owner" "$(jq -r '.path' "$file")") || return 12
+      imported=$(jq -nc --arg path "$resolved" '[$path]') || return 12
+    fi
   fi
   jq -n --arg owner "$owner" --arg id "$download_id" --argjson paths "$imported" --argjson count "$source_count" --slurpfile receipt "$receipt" \
     '{proofKind:"policy-disposition",owner:$owner,downloadId:$id,policyReceipt:$receipt[0],importEvents:0,
@@ -8522,7 +8586,7 @@ process_orphan_folders() {
       # Include durable exact-ID import receipts when native history was pruned.
       jq -c --arg base "$base" '.[]|select((.status // ""|ascii_downcase)=="completed" and ((.storage // ""|split("/")|last)==$base))' "$SAB_HISTORY_FILE" >"$candidates" || return 1
       if [[ -f "$IMPORT_RECEIPT_FILE" ]]; then
-        jq -e '.version==1 and (.receipts|type=="object")' "$IMPORT_RECEIPT_FILE" >/dev/null || return 1
+        arr_import_receipt_document_valid "$IMPORT_RECEIPT_FILE" || { log ERROR 'Import receipt schema invalid; orphan payloads preserved';return 1; }
         jq -c --arg owner "$owner" --arg base "$base" '.receipts[]|select(.app==$owner and .conflict!=true and ((.sab.storage // ""|split("/")|last)==$base))|.sab+{status:"Completed"}' "$IMPORT_RECEIPT_FILE" >>"$candidates" || return 1
       fi
       : >"$selected"; matches=0

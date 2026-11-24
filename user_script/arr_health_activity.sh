@@ -1,11 +1,18 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.20.1
+# ARR Health / Download / Import Monitor v3.21.0
 #
 # PURPOSE
 # -------
 # Monitoring and guarded policy remediation for Sonarr, Radarr, and Usenet:
+# v3.21: bounded notifier with durable per-page acknowledgement in state.json;
+# per-application change leases shared with media_cleanup/integrity recovery;
+# per-request retry deadlines, persistent collector coverage and strict receipt
+# contracts. Confirmed inactive targets close obsolete workflow alerts after two
+# independent scans; absence of evidence never becomes an import/cancel claim.
+# Health polls continue while automation waits for a lease. Four-hour mutation
+# windows/budgets remain in force. Docker configuration/images are never edited.
 #
 #   SABnzbd
 #      |
@@ -957,12 +964,21 @@ LOCKFILE="/tmp/arr_health_activity.lock"
 # reserve is reached, optional audit/reconciliation/filesystem phases are
 # deferred without resolving any issue that depends on them.
 MONITOR_RUNTIME_BUDGET_SECONDS=240
-MONITOR_RUNTIME_RESERVE_SECONDS=20
+MONITOR_RUNTIME_RESERVE_SECONDS=60
 
 # Stop repeatedly calling one service during the same run after consecutive
 # transport/server failures. Authentication failures open the circuit
 # immediately; ordinary endpoint 404 responses do not.
 SERVICE_CIRCUIT_FAILURE_THRESHOLD=2
+MONITOR_NOTIFY_TIMEOUT_SECONDS=30
+MONITOR_NOTIFY_LEASE_WAIT_SECONDS=20
+MONITOR_OUTBOX_ACTIVE=false
+MONITOR_COORDINATION_ACTIVE=false
+MONITOR_STATE_LEASE_HELD=false
+MONITOR_EXPORT_LEASE_LOST=false
+ARR_MUTATION_LOCK_DIR="${ARR_MUTATION_LOCK_DIR:-/run}"
+MONITOR_SONARR_MUTATION_FD=""
+MONITOR_RADARR_MUTATION_FD=""
 
 QUEUE_PAGE_SIZE=1000
 SAB_HISTORY_LIMIT=500
@@ -1431,8 +1447,9 @@ handle_monitor_exit() {
 
     trap - EXIT
 
+    monitor_release_mutation_gates
     if [ "$MONITOR_RUN_ACTIVE" = true ] &&
-       [ "$MONITOR_RUN_FINALIZED" != true ]; then
+       [ "$MONITOR_RUN_FINALIZED" != true ] && [[ "${MONITOR_EXPORT_LEASE_LOST:-false}" != true ]]; then
 
         if [ -n "$MONITOR_EXIT_SIGNAL" ]; then
             final_status="interrupted"
@@ -1522,19 +1539,158 @@ require_command() {
 # UNRAID NOTIFICATION
 ###############################################################################
 
+# Changes by monitor/cleanup/integrity recovery share one per-application gate.
+# Only automation owns these leases; native health collection remains available.
+monitor_mutation_gate() {
+    local app="$1" variable fd
+    [[ "${MONITOR_COORDINATION_ACTIVE:-false}" == true ]] || return 0
+    case "$app" in Sonarr) variable=MONITOR_SONARR_MUTATION_FD;;Radarr) variable=MONITOR_RADARR_MUTATION_FD;;*) return 1;;esac
+    [[ -z "${!variable:-}" ]] || return 0
+    exec {fd}>"${ARR_MUTATION_LOCK_DIR:-/run}/arr-mutations-$app.lock" || return 1
+    if ! flock -n "$fd";then
+        exec {fd}>&-
+        printf '%s\n' "$app: another coordinated script owns Arr changes; monitoring continues" >>"$TMP_DIR/automation-deferrals.txt"
+        return 1
+    fi
+    printf -v "$variable" '%s' "$fd"
+}
+
+monitor_release_mutation_gates() {
+    local variable fd
+    for variable in MONITOR_SONARR_MUTATION_FD MONITOR_RADARR_MUTATION_FD;do
+        fd="${!variable:-}"
+        [[ -z "$fd" ]] || exec {fd}>&-
+        printf -v "$variable" ''
+    done
+}
+
+monitor_note_budget() {
+    local scope="$1"
+    [[ -d "${TMP_DIR:-}" ]] || return 0
+    printf '%s\n' "$scope" >>"$TMP_DIR/budget-deferrals.txt"
+}
+
+monitor_http_seconds() {
+    local service="$1" remaining limit="${HTTP_REQUEST_TIMEOUT_SECONDS:-30}"
+    [[ "$limit" =~ ^[1-9][0-9]*$ ]] || limit=30
+    if [[ "${MONITOR_RUN_ACTIVE:-false}" != true ]];then printf '%s' "$limit";return 0;fi
+    remaining=$(( START_TIME+MONITOR_RUNTIME_BUDGET_SECONDS-MONITOR_RUNTIME_RESERVE_SECONDS-$(date +%s) ))
+    if ((remaining<=0));then monitor_note_budget "$service";return 1;fi
+    ((remaining<=limit)) || remaining="$limit"
+    printf '%s' "$remaining"
+}
+
+monitor_service_deferred() {
+    [[ -f "${TMP_DIR:-}/budget-deferrals.txt" ]] && grep -Fxq -- "$1" "$TMP_DIR/budget-deferrals.txt"
+}
+
+# An additive field in existing state.json; no separate permanent log/state tree.
+monitor_outbox_valid() {
+    jq -e '(.monitor.notification.outbox // {}) as $q | ($q|type)=="object" and
+      all($q|to_entries[]; .key==.value.outboxId and (.key|test("^[a-f0-9]{64}$")) and
+        (.value.issueKey|type)=="string" and (.value.signature|type)=="string" and
+        (.value.detail|type)=="string" and (.value.queuedAt|type)=="number" and
+        (.value.event|type)=="string" and (.value.severity=="ERROR" or .value.severity=="WARNING" or .value.severity=="INFO"))' "$STATE_FILE" >/dev/null
+}
+
+monitor_outbox_enqueue() {
+    local record="$1" key signature event previous id tmp="$TMP_DIR/outbox-enqueue.json"
+    [[ "${MONITOR_OUTBOX_ACTIVE:-false}" == true ]] || return 0
+    monitor_outbox_valid || return 1
+    IFS=$'\t' read -r key signature event < <(jq -r '[.issueKey,.signature,.event]|@tsv' "$record")
+    previous=$(jq -r --arg key "$key" '.issues[$key].lastNotifiedAt // 0' "$STATE_FILE") || return 1
+    id=$(printf '%s\0' "$key" "$signature" "$event" "$previous" | sha256sum | cut -d ' ' -f1)
+    jq --arg id "$id" --argjson now "$(date +%s)" --slurpfile incoming "$record" '
+      .monitor.notification.outbox //= {} |
+      $incoming[0] as $e |
+      # Coalesce obsolete undelivered attention; action/recovery records retain
+      # their original payload and observation time until accepted and acked.
+      if ($e.event=="new" or $e.event=="reminder") then
+        .monitor.notification.outbox |= with_entries(select(.value.issueKey!=$e.issueKey or
+          (.value.event!="new" and .value.event!="reminder") or .key==$id))
+      else . end |
+      .monitor.notification.outbox[$id] //= ($e+{outboxId:$id,queuedAt:$now})' "$STATE_FILE" >"$tmp" && save_state "$tmp"
+}
+
+monitor_outbox_load() {
+    [[ "${MONITOR_OUTBOX_ACTIVE:-false}" == true ]] || return 0
+    monitor_outbox_valid || return 1
+    local tmp="$TMP_DIR/outbox-current.json"
+    jq '. as $state | .monitor.notification.outbox //= {} |
+      .monitor.notification.outbox |= with_entries(select(
+        (.value.event!="new" and .value.event!="reminder") or
+        ($state.issues[.value.issueKey] == null) or $state.issues[.value.issueKey].active==true))' "$STATE_FILE" >"$tmp" && save_state "$tmp" || return 1
+    jq -c '.monitor.notification.outbox // {} | .[]' "$STATE_FILE" >"$NOTIFICATION_BATCH"
+}
+
+monitor_outbox_ack() {
+    local page="$1" tmp="$TMP_DIR/outbox-acked.json"
+    [[ "${MONITOR_OUTBOX_ACTIVE:-false}" == true ]] || return 0
+    jq --slurpfile accepted "$page" 'reduce $accepted[] as $a (.;del(.monitor.notification.outbox[$a.outboxId]))' "$STATE_FILE" >"$tmp" &&
+      save_state "$tmp" && commit_state_transaction notification-page-accepted
+}
+
+monitor_outbox_prepare() {
+    monitor_outbox_valid || {
+        log 'ERROR: Durable notification outbox invalid; state preserved; automation was not started'
+        local marker="${MONITOR_OUTBOX_EMERGENCY_MARKER:-/run/arr-monitor-outbox-alert}" identity
+        identity="$(date +%F)|$(sha256sum "$STATE_FILE"|cut -d ' ' -f1)"
+        if [[ ! -f "$marker" || "$(cat "$marker")" != "$identity" ]];then
+            if notify alert 'Notification state requires attention' 'Durable pending notification state is invalid. State was preserved; no automation was started. Restore or inspect state.json before resuming.';then printf '%s' "$identity" >"$marker";fi
+        fi
+        return 1
+    }
+    MONITOR_OUTBOX_ACTIVE=true
+}
+
+monitor_persist_coverage() {
+    local tmp="$TMP_DIR/coverage-state.json" data="$TMP_DIR/coverage.json" now elapsed
+    now=$(date +%s);elapsed=$((now-START_TIME))
+    jq -n --argjson se "$SONARR_ENABLED" --argjson re "$RADARR_ENABLED" --argjson be "$SAB_ENABLED" --argjson audit "$ACTIVITY_AUDIT_ENABLED" --argjson sq "$SONARR_QUEUE_OK" --argjson sh "$SONARR_HEALTH_OK" --argjson ss "$SONARR_STATUS_OK" --argjson sa "$SONARR_AUDIT_OK" \
+      --argjson rq "$RADARR_QUEUE_OK" --argjson rh "$RADARR_HEALTH_OK" --argjson rs "$RADARR_STATUS_OK" --argjson ra "$RADARR_AUDIT_OK" \
+      --argjson bq "$SAB_QUEUE_OK" --argjson bh "$SAB_HISTORY_OK" --argjson bw "$SAB_WARNINGS_OK" --argjson bs "$SAB_STATUS_OK" --argjson bp "$SAB_SERVER_STATS_OK" \
+      '{"Sonarr.queue":$sq,"Sonarr.health":$sh,"Sonarr.status":$ss,"Sonarr.history":$sa,
+        "Radarr.queue":$rq,"Radarr.health":$rh,"Radarr.status":$rs,"Radarr.history":$ra,
+        "SABnzbd.queue":$bq,"SABnzbd.history":$bh,"SABnzbd.warnings":$bw,"SABnzbd.status":$bs,"SABnzbd.providers":$bp} |
+        with_entries(.key as $key | .value={complete:.value,enabled:(if ($key|startswith("Sonarr.")) then $se elif ($key|startswith("Radarr.")) then $re else $be end)}) |
+        with_entries(if (.key|endswith(".history")) and (.key|startswith("SABnzbd.")|not) then .value.enabled=(.value.enabled and $audit) else . end)' >"$data" || return 1
+    local deferred="${MONITOR_RUNTIME_DEFERRED_PHASES:-}" gates="" reasons="$TMP_DIR/coverage-reasons.json"
+    jq -n --arg s "${SONARR_API_FAILURES:-}" --arg r "${RADARR_API_FAILURES:-}" --arg b "${SAB_API_FAILURES:-}" '{Sonarr:$s,Radarr:$r,SABnzbd:$b}' >"$reasons" || return 1
+    [[ ! -s "$TMP_DIR/budget-deferrals.txt" ]] || deferred+="; API budget: $(sort -u "$TMP_DIR/budget-deferrals.txt"|tr '\n' ',')"
+    [[ ! -s "$TMP_DIR/automation-deferrals.txt" ]] || gates=$(sort -u "$TMP_DIR/automation-deferrals.txt")
+    jq --slurpfile coverage "$data" --slurpfile reasons "$reasons" --argjson now "$now" --argjson elapsed "$elapsed" --arg deferred "$deferred" --arg gates "$gates" '
+      .monitor.collectionCoverage //= {} |
+      reduce ($coverage[0]|to_entries[]) as $c (.;
+        .monitor.collectionCoverage[$c.key]={complete:$c.value.complete,enabled:$c.value.enabled,checkedAt:$now,
+          reason:(if $c.value.complete then "Fresh successful observation" elif ($c.value.enabled|not) then "Collector disabled by configuration" else ($reasons[0][($c.key|split(".")[0])] | if .!="" then . else "Collector deferred/unavailable; previous evidence retained" end) end),
+          firstObservedAt:(.monitor.collectionCoverage[$c.key].firstObservedAt // $now),
+          lastSuccessfulAt:(if $c.value.complete then $now else (.monitor.collectionCoverage[$c.key].lastSuccessfulAt // 0) end)}) |
+      .monitor.operationalSummary={collectionComplete:all($coverage[0][]|select(.enabled);.complete==true),elapsedSeconds:$elapsed,
+        deferredWork:$deferred,automationDeferrals:$gates,
+        activeWorkflowWarnings:([.issues[]?|select(.active==true and .severity=="WARNING" and .app!="Monitor")]|length),
+        activeWorkflowErrors:([.issues[]?|select(.active==true and .severity=="ERROR" and .app!="Monitor")]|length),
+        monitorErrors:([.issues[]?|select(.active==true and .severity=="ERROR" and .app=="Monitor")]|length),
+        monitorWarnings:([.issues[]?|select(.active==true and .severity=="WARNING" and .app=="Monitor")]|length),
+        pendingNotificationSections:((.monitor.notification.outbox // {})|length)}' "$STATE_FILE" >"$tmp" && save_state "$tmp"
+}
+
+monitor_report_stale_coverage() {
+    local row key last first now=$(date +%s)
+    while IFS= read -r row;do
+      key=$(jq -r '.key' <<<"$row");last=$(jq -r '.value.lastSuccessfulAt // 0' <<<"$row");first=$(jq -r '.value.firstObservedAt' <<<"$row")
+      record_normalized_issue "Monitor:coverage:$key" Monitor "$key coverage stale" MONITOR_COVERAGE_STALE WARNING stale \
+        'Collector has no fresh successful observation for at least 24 hours' 24 \
+        "Collector: $key. Last successful epoch: $last; first tracked epoch: $first. Existing dependent issues were preserved. Automatic collection retries continue; no healthy result or import was inferred."
+    done < <(jq -c --argjson now "$now" '.monitor.collectionCoverage|to_entries[]|select(.value.enabled and (.value.complete|not) and ($now-(if .value.lastSuccessfulAt>0 then .value.lastSuccessfulAt else .value.firstObservedAt end))>=86400)' "$STATE_FILE")
+}
+
 notification_fallback_alert() {
 
     local reason="$1"
 
     persistent_log "ERROR" "Notification command failure | ${reason}"
 
-    if command -v logger >/dev/null 2>&1; then
-        logger \
-            -t "arr_health_activity" \
-            -- \
-            "Unraid notification command failure: ${reason}" \
-            2>/dev/null || true
-    fi
+
 }
 
 notify() {
@@ -1566,14 +1722,30 @@ notify() {
         return 1
     fi
 
-    if "$NOTIFY" \
+    local lease_released=false rc=0
+    if [[ "${MONITOR_NOTIFY_DURABLE_PAGE:-false}" == true ]];then
+        commit_state_transaction notification-before-send || return 1
+    fi
+    if [[ "${MONITOR_STATE_LEASE_HELD:-false}" == true && -n "${STATE_EXPORT_FD:-}" ]];then
+        exec {STATE_EXPORT_FD}>&-
+        MONITOR_STATE_LEASE_HELD=false;lease_released=true
+    fi
+    timeout --signal=TERM --kill-after=5 "$MONITOR_NOTIFY_TIMEOUT_SECONDS" "$NOTIFY" \
         -i "$importance" \
         -s "ARR Health Monitor" \
         -d "$description" \
         -m "$message" \
-        >/dev/null 2>&1
-    then
-
+        >/dev/null 2>&1 || rc=$?
+    if [[ "$lease_released" == true ]];then
+        exec {STATE_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || { MONITOR_EXPORT_LEASE_LOST=true;return 75; }
+        if ! flock -s -w "$MONITOR_NOTIFY_LEASE_WAIT_SECONDS" "$STATE_EXPORT_FD";then
+            exec {STATE_EXPORT_FD}>&-;MONITOR_EXPORT_LEASE_LOST=true
+            log 'MAINTENANCE: export lease could not be reacquired; accepted notification remains pending acknowledgement; next run reconciles'
+            return 75
+        fi
+        MONITOR_STATE_LEASE_HELD=true
+    fi
+    if ((rc==0));then
         ((NOTIFICATIONS_SENT++)) || true
 
         return 0
@@ -1581,7 +1753,11 @@ notify() {
 
     log "WARNING: Failed to send grouped Unraid notification"
 
-    NOTIFICATION_LAST_ERROR="notification command returned a non-zero exit status: ${NOTIFY}"
+    if ((rc==124 || rc==137));then
+        NOTIFICATION_LAST_ERROR="notification command timed out after ${MONITOR_NOTIFY_TIMEOUT_SECONDS}s; pending messages retained"
+    else
+        NOTIFICATION_LAST_ERROR="notification command failed (exit ${rc}): ${NOTIFY}; pending messages retained"
+    fi
     notification_fallback_alert "$NOTIFICATION_LAST_ERROR"
 
     return 1
@@ -1702,7 +1878,7 @@ http_json_get() {
     local invalid_json=false
     local retry_after=""
     local retry_epoch=0
-    local delay=0
+    local delay=0 seconds service
     local safe_url="${url%%\?*}"
     local header_file
     local stderr_file
@@ -1722,14 +1898,19 @@ http_json_get() {
         return 1
     }
 
+    service=$(api_service_for_url "$url")
     while (( attempt <= max_attempts )); do
-
+        if ! seconds=$(monitor_http_seconds "$service");then
+            HTTP_LAST_ERROR="runtime budget deferred request; existing evidence preserved"
+            rm -f -- "$header_file" "$stderr_file"
+            return 1
+        fi
         : >"$header_file"
         : >"$stderr_file"
         invalid_json=false
 
         http_code=$(curl \
-            "${request_args[@]}" \
+            "${request_args[@]}" --max-time "$seconds" --max-filesize 67108864 \
             --dump-header "$header_file" \
             "$url" \
             -o "$output" \
@@ -1790,6 +1971,9 @@ http_json_get() {
             delay="$HTTP_RETRY_MAX_DELAY_SECONDS"
 
         debug_log "Temporary HTTP failure for ${safe_url}: ${HTTP_LAST_ERROR}; retrying in ${delay}s (${attempt}/${HTTP_RETRY_COUNT})"
+        if [[ "${MONITOR_RUN_ACTIVE:-false}" == true ]] && (( $(date +%s)+delay>=START_TIME+MONITOR_RUNTIME_BUDGET_SECONDS-MONITOR_RUNTIME_RESERVE_SECONDS ));then
+            monitor_note_budget "$service";break
+        fi
         sleep "$delay"
 
         ((attempt++)) || true
@@ -2190,7 +2374,7 @@ append_api_failure() {
     local current="$1"
     local endpoint="$2"
     local error="${3:-request failed}"
-
+    if [[ "$error" == 'runtime budget deferred request'* ]];then printf '%s' "$current";return 0;fi
     if [ -n "$current" ]; then
         printf '%s; %s: %s' "$current" "$endpoint" "$error"
     else
@@ -3837,6 +4021,7 @@ commit_state_transaction() {
 
     local checkpoint="${1:-checkpoint}"
 
+    [[ "${MONITOR_EXPORT_LEASE_LOST:-false}" != true ]] || return 1
     [ "$STATE_TRANSACTION_ACTIVE" = true ] || return 0
     [ "$STATE_TRANSACTION_DIRTY" = true ] || return 0
 
@@ -6708,7 +6893,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.20.1 lifecycle commands' \
+        'ARR Health Monitor v3.21.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -6813,6 +6998,7 @@ source_can_resolve() {
                     ;;
 
                 Sonarr:service-api)
+                    monitor_service_deferred Sonarr && return 1
                     [ "$SONARR_API_OK" = true ]
                     ;;
 
@@ -6843,6 +7029,7 @@ source_can_resolve() {
                     ;;
 
                 Radarr:service-api)
+                    monitor_service_deferred Radarr && return 1
                     [ "$RADARR_API_OK" = true ]
                     ;;
 
@@ -6865,6 +7052,7 @@ source_can_resolve() {
             case "$issue_key" in
 
                 SABnzbd:service-api)
+                    monitor_service_deferred SABnzbd && return 1
                     [ "$SAB_API_OK" = true ]
                     ;;
 
@@ -7113,6 +7301,7 @@ queue_group_notification() {
     local ack_id
 
     ack_id=$(issue_ack_id "$issue_key")
+    printf '%s' "$detail" >"$TMP_DIR/notification-detail.txt" || return 1
 
     jq -nc \
         --arg issueKey "$issue_key" \
@@ -7122,7 +7311,7 @@ queue_group_notification() {
         --arg classification "$classification" \
         --arg severity "$severity" \
         --arg age "$age" \
-        --arg detail "$detail" \
+        --rawfile detail "$TMP_DIR/notification-detail.txt" \
         --arg event "$event" \
         --arg ackId "$ack_id" \
         '{
@@ -7137,7 +7326,9 @@ queue_group_notification() {
             event: $event,
             ackId: $ackId
         }' \
-        >>"$NOTIFICATION_BATCH"
+        >"$TMP_DIR/notification-new-record.json" || return 1
+    cat "$TMP_DIR/notification-new-record.json" >>"$NOTIFICATION_BATCH" || return 1
+    monitor_outbox_enqueue "$TMP_DIR/notification-new-record.json" || return 1
 
     ((BATCHED_NOTIFICATION_ITEMS++)) || true
 
@@ -7217,6 +7408,7 @@ notification_record_text() {
                 else ""
             end
           )
+          + (if (.queuedAt // 0)>0 then "\n  Queued: "+(.queuedAt|strflocaltime("%Y-%m-%d %H:%M:%S %Z")) else "" end)
           + (
                 if $detail != ""
                 then "\n  " + ($detail | gsub("\n"; "\n  "))
@@ -7345,10 +7537,15 @@ send_notification_page() {
         fi
     done <"$group_file"
 
+    if [[ "${MONITOR_OUTBOX_ACTIVE:-false}" == true ]];then
+      body+="Collection coverage: $(jq -r '.monitor.operationalSummary.collectionComplete|if . then "complete" else "partial; previous evidence retained" end' "$STATE_FILE")."$'\n'
+      body+="Workflow attention: $(jq -r '.monitor.operationalSummary|"\(.activeWorkflowWarnings) warning(s), \(.activeWorkflowErrors) error(s); monitor errors: \(.monitorErrors)"' "$STATE_FILE")."$'\n'
+    fi
+    body+="Pending messages retain their original observation and action details."$'\n'
     body+="Monitor schedule: every five minutes recommended"$'\n'
     body+="Runtime: $(runtime)"
 
-    notify \
+    MONITOR_NOTIFY_DURABLE_PAGE=true notify \
         "$importance" \
         "$description" \
         "$body"
@@ -7375,18 +7572,20 @@ send_notification_page() {
 
         if ! mark_notified "$issue_key" "$signature" "$event"; then
             log "WARNING: Failed to mark issue notified: $issue_key"
+            return 1
         fi
 
     done <"$page_file"
 
-    log "Grouped notification batch ${page_number}/${page_total} sent successfully"
+    monitor_outbox_ack "$page_file" || return 1
+    log "Grouped notification batch ${page_number}/${page_total} accepted and acknowledged"
     log "Issues included in batch: $page_items"
 
     return 0
 }
 
 send_grouped_notification() {
-
+    monitor_outbox_load || return 1
     [ -f "$NOTIFICATION_BATCH" ] || return 0
     [ -s "$NOTIFICATION_BATCH" ] || return 0
 
@@ -7748,6 +7947,7 @@ record_service_api_issue() {
     local failures="$3"
 
     [ "$api_ok" = true ] && return 0
+    if [[ -z "$failures" ]] && monitor_service_deferred "$app";then return 0;fi
     [ -n "$failures" ] || failures="one or more required API endpoints failed"
 
     local classification="SERVICE_API_UNAVAILABLE"
@@ -7885,9 +8085,6 @@ record_monitor_scan_issue() {
         failures+=("Previous monitor run ${PREVIOUS_RUN_STATUS} during ${PREVIOUS_RUN_PHASE}: ${PREVIOUS_RUN_ERROR:-exit code ${PREVIOUS_RUN_EXIT_CODE}}")
     fi
 
-    if [ "$MONITOR_RUNTIME_DEFERRED" = true ]; then
-        failures+=("Runtime budget deferred optional phase(s): ${MONITOR_RUNTIME_DEFERRED_PHASES}")
-    fi
 
     if [ "$ACTIVITY_AUDIT_ENABLED" = true ] &&
        [[ "$MONITOR_RUNTIME_DEFERRED_PHASES" != *"activity-audit"* ]]; then
@@ -12754,6 +12951,55 @@ record_arr_reconciliation_not_found() {
         "${object_label}: ${object_id}; HTTP 404. The issue remains active for review or intentional batch dismissal."
 }
 
+# Close only exact, obsolete workflow attempts. This is NOT import proof and
+# never authorizes cleanup, a new search, or deletion of SAB/library files.
+record_inactive_target_reconciliation() {
+    local id="$1" app="$2" record="$3" root key rows="$TMP_DIR/inactive-targets.jsonl" row kind target parent season episode
+    local object="$TMP_DIR/inactive-object.json" owner="$TMP_DIR/inactive-parent.json" evidence="$TMP_DIR/inactive-evidence.jsonl" fingerprint count=0
+    jq -e --arg key "FLOW:DOWNLOAD:$id" '.issues[$key].classification=="DOWNLOAD_FLOW_REVIEW_REQUIRED"' "$STATE_FILE" >/dev/null || return 1
+    download_ledger_can_evaluate "$app" || return 1
+    [[ "$SAB_HISTORY_OK" == true && "$SAB_QUEUE_OK" == true ]] || return 1
+    download_ledger_arr_queue_contains "$app" "$id" && return 1
+    jq -e --arg id "${id,,}" 'all(.history.slots[]?;(.nzo_id|ascii_downcase)!=$id)' "$SAB_HISTORY" >/dev/null || return 1
+    jq -e --arg id "${id,,}" 'all(.queue.slots[]?;(.nzo_id|ascii_downcase)!=$id)' "$SAB_QUEUE" >/dev/null || return 1
+    IFS=$'\t' read -r root key < <(arr_reconciliation_connection "$app")
+    jq -c '.targets // {} | .[]' <<<"$record" >"$rows" || return 1
+    [[ -s "$rows" ]] || return 1
+    : >"$evidence"
+    while IFS= read -r row;do
+        runtime_budget_allows_optional_phase inactive-target-reconciliation || return 1
+        if [[ "$app" == Sonarr ]];then
+            kind=episode;target=$(jq -r '.episodeId // 0' <<<"$row");parent=$(jq -r '.seriesId // 0' <<<"$row")
+            season=$(jq -r '.seasonNumber // -1' <<<"$row");episode=$(jq -r '.episodeNumber // -1' <<<"$row")
+        else kind=movie;target=$(jq -r '.movieId // 0' <<<"$row");parent="$target";fi
+        [[ "$target" =~ ^[1-9][0-9]*$ && "$parent" =~ ^[1-9][0-9]*$ ]] || return 1
+        if api_get "$root/$kind/$target" "$key" "$object";then
+            jq -e --argjson id "$target" '.id==$id and .monitored==false' "$object" >/dev/null || return 1
+            if [[ "$app" == Sonarr ]];then
+                [[ "$season" =~ ^[0-9]+$ && "$episode" =~ ^[0-9]+$ ]] || return 1
+                jq -e --argjson p "$parent" --argjson s "$season" --argjson e "$episode" '.seriesId==$p and .seasonNumber==$s and .episodeNumber==$e' "$object" >/dev/null || return 1
+                api_get "$root/series/$parent" "$key" "$owner" || return 1
+                jq -e --argjson p "$parent" '.id==$p' "$owner" >/dev/null || return 1
+            fi
+            printf '%s:%s:%s:unmonitored\n' "$app" "$parent" "$target" >>"$evidence"
+        elif [[ "$API_LAST_HTTP_CODE" == 404 ]];then
+            # Parent deletion is required for a missing episode; a single
+            # episode 404 during metadata refresh is insufficient evidence.
+            if [[ "$app" == Sonarr ]];then
+                if api_get "$root/series/$parent" "$key" "$owner";then return 1;fi
+                [[ "$API_LAST_HTTP_CODE" == 404 ]] || return 1
+            fi
+            printf '%s:%s:%s:removed\n' "$app" "$parent" "$target" >>"$evidence"
+        else return 1;fi
+        count=$((count+1))
+    done <"$rows"
+    ((count>0)) || return 1
+    fingerprint=$(sort "$evidence"|sha256sum|cut -d ' ' -f1)
+    write_download_reconciliation_result "$id" "$app" true true inactive_target DOWNLOAD_FLOW_RECONCILED_INACTIVE INFO "$fingerprint" \
+      'Exact native targets are removed or explicitly unmonitored; no current Arr/SAB job exists' \
+      "Verified $count exact target(s). Closed only this obsolete monitor workflow after the normal two-scan grace. Import/download cancellation was not inferred. Arr, SAB and media were not changed."
+}
+
 record_arr_database_file_reconciliation() {
 
     local download_id="$1"
@@ -13188,6 +13434,7 @@ update_download_reconciliation_state() {
             then .
             else
                 .downloadLedger[$id].reconciliationLastAttemptAt = $now
+                | if $result.scanOk then .downloadLedger[$id].reconciliationPolicyRevision=2 else . end
                 | .downloadLedger[$id].reconciliationLastScanOk = $result.scanOk
                 | .downloadLedger[$id].reconciliationLastReason = ($result.evidence // "API evidence unavailable")
                 | .downloadLedger[$id].reconciliationLastDetail = ($result.detail // "")
@@ -13586,6 +13833,7 @@ perform_download_ledger_reconciliation() {
             | select((.value.manuallyDismissedAt // 0) <= 0)
             | select(
                 (.value.reconciliationCandidateRuns // 0) > 0
+                or ((.value.reconciliationPolicyRevision // 0)<2 and $issues["FLOW:DOWNLOAD:"+.key].classification=="DOWNLOAD_FLOW_REVIEW_REQUIRED")
                 or (.value.reconciliationLastAttemptAt // 0) <= 0
                 or .value.reconciliationLastScanOk == false
                 or (.value.reconciliationLastCheckedAt // 0) <= 0
@@ -13701,6 +13949,7 @@ perform_download_ledger_reconciliation() {
 
         [ -n "$refreshed_record" ] || continue
 
+        if record_inactive_target_reconciliation "$download_id" "$app" "$refreshed_record";then continue;fi
         record_arr_database_file_reconciliation \
             "$download_id" \
             "$app" \
@@ -15159,6 +15408,27 @@ prune_state() {
 # No media filesystem reads are performed by receipt capture/profile polling.
 ###############################################################################
 
+# Shared v1 receipt contract, embedded verbatim in producer and consumer.
+# Older receipts may lack optional enrichment; exact live identity validation
+# remains mandatory before cleanup. History proof is not expired just by age.
+arr_import_receipt_document_valid() {
+    jq -e '
+      def pos: type=="number" and .>0 and .==floor;
+      def nonneg: type=="number" and .>=0 and .==floor;
+      def text: type=="string" and length>0 and (contains("\u0000")|not);
+      def absolute: text and startswith("/");
+      .version==1 and (.receipts|type)=="object" and all(.receipts|to_entries[];
+        .key as $key | .value |
+        (.app=="Sonarr" or .app=="Radarr") and (.downloadId|text) and $key==(.app+":"+.downloadId) and
+        (.targets|type)=="object" and (.targets|length)>0 and
+        all(.targets[];
+          (.fileId|pos) and (.targetId|pos) and (.parentId|pos) and (.pathAtImport|absolute) and
+          (.kind=="episode" or .kind=="movie") and
+          ((.parentExternalId // 0)|nonneg) and
+          (if .kind=="episode" then
+             ((.seasonNumber // 0)|nonneg) and ((.episodeNumber // 0)|nonneg) else .targetId==.parentId end)))' "$1" >/dev/null
+}
+
 automation_document_valid() {
     local file="$1" kind="$2"
     case "$kind" in
@@ -15166,16 +15436,12 @@ automation_document_valid() {
             jq -e '.version==1 and (.actions|type)=="object" and (.observations|type)=="object" and (.profiles|type)=="object" and (.events|type)=="object" and (.missing|type)=="object" and
               all(.actions[]; (.app=="Sonarr" or .app=="Radarr") and (.kind=="missing-search" or .kind=="import-retry") and
                 (.status=="intent" or .status=="accepted" or .status=="completed" or .status=="failed") and
-                (.startedAt|type)=="number" and .startedAt>0 and (.targetId|type)=="number" and .targetId>0 and .parentId>0 and
+                ([.startedAt,.targetId,.parentId]|all(.[];type=="number" and .>0 and .==floor)) and
                 (if .kind=="missing-search" then
                   .command==(if .app=="Sonarr" then {name:"EpisodeSearch",episodeIds:[.targetId]} else {name:"MoviesSearch",movieIds:[.targetId]} end)
                  else .command.name==(if .app=="Sonarr" then "DownloadedEpisodesScan" else "DownloadedMoviesScan" end) and
                    .command.importMode=="Auto" and .command.downloadClientId==.downloadId and (.command.path|startswith("/")) end))' "$file" >/dev/null ;;
-        receipts)
-            jq -e '.version==1 and (.receipts|type)=="object" and all(.receipts|to_entries[];
-              .key as $key | .value | (.app=="Sonarr" or .app=="Radarr") and .downloadId!="" and $key==(.app+":"+.downloadId) and
-              (.targets|type)=="object" and (.targets|length)>0 and
-              all(.targets[]; .fileId>0 and .targetId>0 and .parentId>0 and (.pathAtImport|type)=="string" and (.pathAtImport|length)>0))' "$file" >/dev/null ;;
+        receipts) arr_import_receipt_document_valid "$file" ;;
         *) return 1 ;;
     esac
 }
@@ -15381,6 +15647,7 @@ automation_followup_imports() {
         runtime_budget_allows_optional_phase automation-import-followup || return 0
         id=$(jq -r '.key' <<<"$record"); printf '%s' "$record" | jq '.value' >"$action"
         app=$(jq -r '.app' "$action"); kind=$(jq -r '.mediaKind' "$action"); target=$(jq -r '.targetId' "$action"); parent=$(jq -r '.parentId' "$action")
+        monitor_mutation_gate "$app" || continue
         automation_state_update '.actions[$id].followupAt=$now' --arg id "$id" --argjson now "$START_TIME" || return 1
         IFS=$'\t' read -r root key < <(arr_reconciliation_connection "$app")
         api_get "$root/$kind/$target" "$key" "$current" || continue
@@ -15574,6 +15841,7 @@ automation_command_readback() {
 
 automation_submit_command() {
     local candidate="$1" root="$2" key="$3" action_id body command_id status
+    monitor_mutation_gate "$(jq -r '.app' "$candidate")" || return 1
     automation_window_open && automation_action_budget && automation_no_active_command "$root" "$key" &&
       automation_last_moment_guard "$candidate" "$root" "$key" || return 1
     action_id=$(jq -r '.key' "$candidate"); action_id="$action_id:$START_TIME"
@@ -15581,7 +15849,14 @@ automation_submit_command() {
       --arg id "$action_id" --argjson now "$START_TIME" --slurpfile candidate "$candidate" || return 1
     body=$(jq -c '.command' "$candidate")
     rm -f -- "$TMP_DIR/automation-submit-response.json" || return 1
-    policy_mutate POST "$root/command" "$key" "$body" "$TMP_DIR/automation-submit-response.json" || true
+    local mutation_rc=0
+    policy_mutate POST "$root/command" "$key" "$body" "$TMP_DIR/automation-submit-response.json" || mutation_rc=$?
+    if ((mutation_rc==75));then
+      automation_state_update '.deferred //= {} | .deferred[$id]=(.actions[$id]+{outcome:"not_dispatched",reason:"Local lease/runtime gate refused before HTTP"}) | del(.actions[$id]) | .deferred |= with_entries(select(.value.startedAt>=$cutoff))' \
+        --arg id "$action_id" --argjson cutoff "$((START_TIME-7*86400))" || return 1
+      printf '%s\n' 'Local deadline/lease deferred a command before HTTP; no request dispatched and no uncertain intent left' >>"$TMP_DIR/automation-deferrals.txt"
+      return 0
+    fi
     command_id=$(jq -r '.id // 0' "$TMP_DIR/automation-submit-response.json" 2>/dev/null) || command_id=0
     [[ "$command_id" =~ ^[1-9][0-9]*$ ]] || return 1
     automation_state_update '.actions[$id].commandId=$command' --arg id "$action_id" --argjson command "$command_id" || return 1
@@ -15589,7 +15864,7 @@ automation_submit_command() {
         status=$(jq -r '.status' "$TMP_DIR/automation-command.json")
         case "$status" in failed|completed) ;; *) status=accepted;; esac
         local native_message
-        native_message=$(jq -r '(.exception.message // .message // "")|tostring|.[0:2000]' "$TMP_DIR/automation-command.json")
+        native_message=$(jq -r '(if (.exception|type)=="object" then (.exception.message // .message // "") elif (.exception|type)=="string" and .exception!="" then .exception else (.message // "") end)|tostring|.[0:2000]' "$TMP_DIR/automation-command.json")
         automation_state_update '.actions[$id].status=$status | .actions[$id].nativeMessage=$message' --arg message "$native_message" --arg id "$action_id" --arg status "$status"
     else return 1; fi
 }
@@ -15677,6 +15952,7 @@ media_recovery_app_held() {
 
 
 process_media_integrity_recovery() {
+    monitor_release_mutation_gates
     local script="${MEDIA_INTEGRITY_SCRIPT:-/boot/config/plugins/user.scripts/scripts/media_integrity_audit/script}" rc=0
     local allow=false
     if [[ "$ARR_AUTOMATION_ENABLED" == true && "$AUTOMATION_CONTROLS_OK" == true ]] && automation_window_open && automation_api_ready && automation_action_budget;then allow=true;fi
@@ -15684,7 +15960,10 @@ process_media_integrity_recovery() {
     (
         export SONARR_API_ROOT SONARR_API_KEY RADARR_API_ROOT RADARR_API_KEY
         export RECOVERY_ALLOW_GRAB="$allow"
-        timeout --signal=TERM --kill-after=15 240 /bin/bash "$script" --recover-only
+        local remaining=$((START_TIME+MONITOR_RUNTIME_BUDGET_SECONDS-MONITOR_RUNTIME_RESERVE_SECONDS-$(date +%s)))
+        ((remaining>0)) || exit 0
+        ((remaining<=210)) || remaining=210
+        timeout --signal=TERM --kill-after=5 "$remaining" /bin/bash "$script" --recover-only
     ) >"$TMP_DIR/media-integrity-recovery.log" 2>&1 || rc=$?
     if ((rc==124 || rc==137)); then
         record_normalized_issue 'Monitor:media-integrity-recovery-timeout' Monitor 'Media recovery executor interrupted' MEDIA_RECOVERY_EXECUTOR_FAILED ERROR executor \
@@ -15811,6 +16090,22 @@ automation_import_retries() {
     done
 }
 
+# Lost POST responses are reconciled by a unique exact body/time match. Finding
+# a native operation prevents replay; it does not prove import or attribution.
+automation_find_existing_command() {
+    local action="$1" root="$2" key="$3" output="$4" list="$TMP_DIR/automation-command-list.json"
+    api_get "$root/command" "$key" "$list" || return 1
+    jq -e --slurpfile action "$action" '
+      def epoch: try (sub("\\.[0-9]+Z$";"Z")|fromdateiso8601) catch 0;
+      $action[0] as $a |
+      [ .[] | select((.id|type)=="number" and .id>0 and .name==$a.command.name and (.body|type)=="object") | . as $native |
+        select((.queued // ""|epoch)>=$a.startedAt-5 and (.queued // ""|epoch)<=$a.startedAt+120) |
+        select(all($a.command|to_entries[]; . as $field |
+          if $field.key=="importMode" then ($native.body[$field.key]|ascii_downcase)==($field.value|ascii_downcase)
+          else $native.body[$field.key]==$field.value end)) ] |
+      select(length==1) | .[0]' "$list" >"$output"
+}
+
 automation_reconcile_commands() {
     local action id app root key command status file="$TMP_DIR/automation-recover-action.json"
     while IFS= read -r action; do
@@ -15819,11 +16114,18 @@ automation_reconcile_commands() {
         automation_state_update '.actions[$id].commandCheckedAt=$now' --arg id "$id" --argjson now "$START_TIME" || return 1
         app=$(jq -r '.app' "$file"); command=$(jq -r '.commandId // 0' "$file")
         IFS=$'\t' read -r root key < <(arr_reconciliation_connection "$app")
+        if ! [[ "$command" =~ ^[1-9][0-9]*$ ]];then
+            if automation_find_existing_command "$file" "$root" "$key" "$TMP_DIR/automation-command-match.json";then
+                command=$(jq -r '.id' "$TMP_DIR/automation-command-match.json")
+                automation_state_update '.actions[$id].commandId=$command | .actions[$id].commandMatchedBy="unique exact request body and queued time; initiating client unproven"' \
+                  --arg id "$id" --argjson command "$command" || return 1
+            fi
+        fi
         if automation_command_readback "$file" "$root" "$key" "$command"; then
             status=$(jq -r '.status' "$TMP_DIR/automation-command.json")
             case "$status" in failed|completed) ;; *) status=accepted;; esac
             local native_message
-            native_message=$(jq -r '(.exception.message // .message // "")|tostring|.[0:2000]' "$TMP_DIR/automation-command.json")
+            native_message=$(jq -r '(if (.exception|type)=="object" then (.exception.message // .message // "") elif (.exception|type)=="string" and .exception!="" then .exception else (.message // "") end)|tostring|.[0:2000]' "$TMP_DIR/automation-command.json")
             automation_state_update '.actions[$id].status=$status | .actions[$id].nativeMessage=$message | .actions[$id].lastVerifiedStatus=$status' --arg message "$native_message" --arg id "$id" --arg status "$status" || return 1
         else
             automation_state_update '.actions[$id].lastVerifiedStatus=(.actions[$id].lastVerifiedStatus // .actions[$id].status) | .actions[$id].status="intent"' --arg id "$id" || return 1
@@ -15863,6 +16165,9 @@ automation_report() {
         fi
         if [ -n "$(jq -r '.nativeMessage // ""' "$file")" ]; then
             detail+="Arr result: $(jq -r '.nativeMessage' "$file")."$'\n'
+        fi
+        if [[ "$(jq -r '.commandMatchedBy // ""' "$file")" != "" ]];then
+          detail+="Automatic reconciliation: $(jq -r '.commandMatchedBy' "$file"); existing command ID $(jq -r '.commandId' "$file") adopted; no request replayed."$'\n'
         fi
         detail+="Native request: $(jq -r '.command.name' "$file"), under the existing profile/monitoring policy. Payloads and library files were not deleted; no profile was lowered and no forced import was requested."$'\n'
         detail+="A completed search/scan command does not prove an import; the normal exact-download reconciliation continues independently."
@@ -15910,7 +16215,7 @@ policy_disposition_matches() {
       .sab==($item[0]|{nzo_id,name,storage,completed,category})' "$file" >/dev/null
 }
 
-policy_validate_journal() {
+arr_policy_receipt_document_valid() {
     jq -e '
       type=="object" and .version==1 and (.actions|type)=="object" and (.observations|type)=="object" and
       all(.actions|to_entries[];
@@ -15922,9 +16227,12 @@ policy_validate_journal() {
         (.status=="intent" or .status=="queue_verified" or .status=="search_uncertain" or .status=="done") and
         ([.targetId,.parentId,.queueId,.startedAt] | all(.[]; type=="number" and .>0 and .==floor)) and
         (.command == (if .kind=="episode" then {name:"EpisodeSearch",episodeIds:[.targetId]} else {name:"MoviesSearch",movieIds:[.targetId]} end)) and
+        ([.replacementProofRuns // 0,.replacementCheckedAt // 0,.searchStartedAt // 0] | all(.[];type=="number" and .>=0 and .==floor)) and
         (.profile|type)=="object" and (.target|type)=="object" and (.parent|type)=="object" and (.sab|type)=="object" and (.queue|type)=="object")
     ' "$1" >/dev/null
 }
+
+policy_validate_journal() { arr_policy_receipt_document_valid "$1"; }
 
 policy_publish() {
     local candidate="$1" target="$2"
@@ -15947,6 +16255,8 @@ policy_update_action() {
 
 policy_mutate() {
     local method="$1" url="$2" key="$3" body="$4" output="$5"
+    monitor_mutation_gate "$(api_service_for_url "$url")" || return 75
+    runtime_budget_allows_optional_phase arr-mutation || return 75
     # NO --retry: a timeout may follow a successfully applied mutation.
     local code
     code=$(curl --silent --show-error --connect-timeout "$HTTP_CONNECT_TIMEOUT_SECONDS" \
@@ -16092,6 +16402,7 @@ policy_verify_removed() {
 policy_finish_tracking() {
     local action="$1" id app mode root key tmp status body target_id kind current
     local action_file="$TMP_DIR/policy-active-action.json"
+    monitor_mutation_gate "$(jq -r '.app' <<<"$action")" || return 0
     printf '%s' "$action" >"$action_file" || return 1
     id=$(jq -r '.downloadId' <<<"$action"); app=$(jq -r '.app' <<<"$action"); mode=$(jq -r '.mode' <<<"$action")
     status=$(jq -r '.status' <<<"$action")
@@ -16101,6 +16412,13 @@ policy_finish_tracking() {
         policy_verify_removed "$app" "$id" "$root" "$key" "$mode" || return 1
         policy_update_action "$id" '{"status":"queue_verified","queueVerified":true}' || return 1
         status=queue_verified
+    fi
+    if [[ ( "$status" == queue_verified || "$status" == search_uncertain ) && "$mode" == replace ]];then
+        policy_check_replacement "$action" || true
+        if jq -e --arg id "$id" '.actions[$id].replacementState=="import_verified"' "$POLICY_STATE_FILE" >/dev/null;then
+            policy_update_action "$id" '{"status":"done","queueVerified":true,"resolutionSource":"verified-current-file"}' || return 1
+            return 0
+        fi
     fi
     if [ "$status" = queue_verified ] && [ "$mode" = replace ]; then
         if [ -f "${AUTOMATION_STATE_FILE:-}" ]; then
@@ -16124,9 +16442,16 @@ policy_finish_tracking() {
         jq -e --slurpfile action_record "$action_file" '$action_record[0] as $action | .==$action.profile' "$profile" >/dev/null || return 1
         # Persist before POST. A timeout or interruption leaves an uncertain
         # search, which is not automatically repeated.
-        policy_update_action "$id" '{"status":"search_uncertain"}' || return 1
+        policy_update_action "$id" "{\"status\":\"search_uncertain\",\"searchStartedAt\":$START_TIME}" || return 1
         body=$(jq -c '.command' <<<"$action")
-        policy_mutate POST "$root/command" "$key" "$body" "$TMP_DIR/policy-search-response.json" || return 1
+        local mutation_rc=0
+        policy_mutate POST "$root/command" "$key" "$body" "$TMP_DIR/policy-search-response.json" || mutation_rc=$?
+        if ((mutation_rc==75));then
+            policy_update_action "$id" '{"status":"queue_verified","searchNotDispatched":true}' || return 1
+            printf '%s\n' "$app: replacement search deferred locally before HTTP; verified queue disposition retained" >>"$TMP_DIR/automation-deferrals.txt"
+            return 0
+        fi
+        ((mutation_rc==0)) || return 1
         local command_id; command_id=$(jq -r '.id // 0' "$TMP_DIR/policy-search-response.json")
         [[ "$command_id" =~ ^[1-9][0-9]*$ ]] || return 1
         policy_update_action "$id" "{\"commandId\":$command_id}" || return 1
@@ -16134,7 +16459,12 @@ policy_finish_tracking() {
     fi
     if [ "$status" = search_uncertain ]; then
         local command_id; command_id=$(jq -r --arg id "$id" '.actions[$id].commandId // 0' "$POLICY_STATE_FILE")
-        [[ "$command_id" =~ ^[1-9][0-9]*$ ]] || return 1
+        if ! [[ "$command_id" =~ ^[1-9][0-9]*$ ]];then
+            jq '.startedAt=(.searchStartedAt // .startedAt)' "$action_file" >"$TMP_DIR/policy-command-match-action.json" || return 1
+            automation_find_existing_command "$TMP_DIR/policy-command-match-action.json" "$root" "$key" "$TMP_DIR/policy-command-match.json" || return 1
+            command_id=$(jq -r '.id' "$TMP_DIR/policy-command-match.json")
+            policy_update_action "$id" "{\"commandId\":$command_id,\"commandMatchedBy\":\"unique exact native body and queued time; no replay\"}" || return 1
+        fi
         api_get "$root/command/$command_id" "$key" "$TMP_DIR/policy-command-verify.json" || return 1
         jq -e --argjson id "$command_id" --slurpfile action_record "$action_file" '$action_record[0] as $action | .id==$id and .name==$action.command.name and
           (.status=="queued" or .status=="started" or .status=="completed") and
@@ -16146,13 +16476,17 @@ policy_finish_tracking() {
 policy_check_replacement() {
     local action="$1" id root key target_id parent_id kind target file file_id epoch
     local action_file="$TMP_DIR/policy-active-action.json"
+    monitor_mutation_gate "$(jq -r '.app' <<<"$action")" || return 0
     printf '%s' "$action" >"$action_file" || return 1
     id=$(jq -r '.downloadId' <<<"$action")
-    (( START_TIME >= $(jq -r '.replacementCheckedAt // 0' <<<"$action")+3600 )) || return 0
+    local check_interval=3600
+    (( $(jq -r '.replacementProofRuns // 0' <<<"$action")>0 )) && check_interval=240
+    (( START_TIME >= $(jq -r '.replacementCheckedAt // 0' <<<"$action")+check_interval )) || return 0
     IFS=$'\t' read -r root key < <(arr_reconciliation_connection "$(jq -r '.app' <<<"$action")")
     target_id=$(jq -r '.targetId' <<<"$action"); parent_id=$(jq -r '.parentId' <<<"$action"); kind=$(jq -r '.kind' <<<"$action")
     target="$TMP_DIR/policy-replacement-target.json"; file="$TMP_DIR/policy-replacement-file.json"
-    policy_update_action "$id" "{\"replacementCheckedAt\":$START_TIME}" || return 1
+    # Any interrupted or negative check breaks the consecutive confirmation pair.
+    policy_update_action "$id" "{\"replacementCheckedAt\":$START_TIME,\"replacementProofRuns\":0,\"replacementProofFingerprint\":\"\"}" || return 1
     api_get "$root/$kind/$target_id" "$key" "$target" || return 1
     jq -e --argjson id "$target_id" --argjson parent "$parent_id" --slurpfile action_record "$action_file" '$action_record[0] as $action | .id==$id and
       (if $action.kind=="episode" then .seriesId==$parent and .seasonNumber==$action.target.seasonNumber and .episodeNumber==$action.target.episodeNumber else true end)' "$target" >/dev/null || return 1
@@ -16171,6 +16505,11 @@ policy_check_replacement() {
     api_get "$root/qualityprofile/$profile_id" "$key" "$profile" || return 1
     jq -e --slurpfile p "$profile" '(.customFormatScore|type)=="number" and .customFormatScore >= $p[0].minFormatScore and
       (.quality.quality.id as $quality | [$p[0].items[] | select(.allowed==true) | .quality.id, .items[]?.quality.id] | index($quality)!=null)' "$file" >/dev/null || return 0
+    local fingerprint runs
+    fingerprint=$(printf '%s' "$kind:$target_id:$parent_id:$file_id:$epoch"|sha256sum|cut -d ' ' -f1)
+    policy_update_action "$id" "$(jq -cn --arg fp "$fingerprint" --argjson prior "$(jq -r '.replacementProofRuns // 0' <<<"$action")" --arg old "$(jq -r '.replacementProofFingerprint // ""' <<<"$action")" '{replacementProofFingerprint:$fp,replacementProofRuns:(if $old==$fp then $prior+1 else 1 end)}')" || return 1
+    runs=$(jq -r --arg id "$id" '.actions[$id].replacementProofRuns' "$POLICY_STATE_FILE")
+    ((runs>=2)) || return 0
     # This verifies the database import; do not touch physical media paths.
     policy_update_action "$id" "{\"replacementState\":\"import_verified\",\"replacementFileId\":$file_id,\"replacementImportedAt\":$epoch}"
 }
@@ -16185,7 +16524,11 @@ policy_report_actions() {
             detail+="Queue removal and native disposition verified. Payload preserved for guarded quarantine by media_cleanup sab; library unchanged."$'\n'
             if [ "$(jq -r '.mode' <<<"$action")" = replace ]; then
                 if [ "$(jq -r '.replacementState // "waiting"' <<<"$action")" = import_verified ]; then
-                    detail+="Exact release blocklisted; targeted replacement search accepted. A subsequent exact-target Arr file import was verified (file ID $(jq -r '.replacementFileId' <<<"$action"))."
+                    if [[ "$(jq -r '.resolutionSource // ""' <<<"$action")" == verified-current-file ]];then
+                        detail+="A fresh policy-compliant file was verified on two scans (file ID $(jq -r '.replacementFileId' <<<"$action")). Closed the obsolete pending search; no additional search was sent. Import initiator was not attributed."
+                    else
+                        detail+="Exact release blocklisted; targeted replacement search accepted. A subsequent exact-target Arr file import was verified on two scans (file ID $(jq -r '.replacementFileId' <<<"$action"))."
+                    fi
                 else
                     detail+="Exact release blocklisted; one targeted replacement search accepted (command $(jq -r '.commandId' <<<"$action")). Compliant import still pending; no success inferred."
                 fi
@@ -16268,6 +16611,7 @@ process_policy_remediation() {
         policy_report_actions; return 0
     fi
     for app in Sonarr Radarr; do
+        monitor_mutation_gate "$app" || continue
         case "$app" in Sonarr) queue="$SONARR_QUEUE";; Radarr) queue="$RADARR_QUEUE";; esac
         while IFS= read -r item; do
             runtime_budget_allows_optional_phase policy-remediation || break
@@ -16304,7 +16648,13 @@ process_policy_remediation() {
             ((count++)) || true
             # removeFromClient=false preserves SAB data. skipRedownload=true
             # prevents native redownload competing with our single command.
-            policy_mutate DELETE "$root/queue/$queue_id?removeFromClient=false&blocklist=$blocklist&skipRedownload=true&changeCategory=false" "$key" '' "$TMP_DIR/policy-delete-response" || true
+            local mutation_rc=0
+            policy_mutate DELETE "$root/queue/$queue_id?removeFromClient=false&blocklist=$blocklist&skipRedownload=true&changeCategory=false" "$key" '' "$TMP_DIR/policy-delete-response" || mutation_rc=$?
+            if ((mutation_rc==75));then
+                jq --arg id "$id" '.deferred //= {} | .deferred[$id]=(.actions[$id]+{outcome:"not_dispatched"}) | del(.actions[$id])' "$POLICY_STATE_FILE" >"$tmp" && policy_publish "$tmp" "$POLICY_STATE_FILE" || return 1
+                printf '%s\n' "$app: policy rejection deferred before HTTP; SAB and Arr queue untouched" >>"$TMP_DIR/automation-deferrals.txt"
+                continue
+            fi
             action=$(jq -c --arg id "$id" '.actions[$id]' "$POLICY_STATE_FILE")
             policy_finish_tracking "$action" || { policy_report_actions; return 0; }
         done < <(jq -c '.records[]? | select(any(.statusMessages[]?.messages[]?; test("custom format|not an upgrade|not a quality revision";"i")))' "$queue")
@@ -16359,6 +16709,7 @@ fi
 ###############################################################################
 
 require_command curl
+require_command timeout
 require_command jq
 require_command date
 require_command stat
@@ -16450,6 +16801,8 @@ if ! begin_state_transaction; then
     exit 3
 fi
 
+MONITOR_STATE_LEASE_HELD=true
+
 case "${1:-}" in
     --list-active)
         list_active_issues
@@ -16519,6 +16872,8 @@ if ! begin_monitor_run; then
     exit 3
 fi
 
+monitor_outbox_prepare || exit 3
+MONITOR_COORDINATION_ACTIVE=true
 MONITOR_RUN_ACTIVE=true
 commit_state_transaction "run-start" || exit 3
 end_monitor_phase "startup"
@@ -16532,7 +16887,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.20.1"
+    "START | ARR Health Monitor v3.21.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -16545,7 +16900,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.20.1"
+debug_log "Starting ARR Health Monitor v3.21.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -16882,6 +17237,7 @@ if runtime_budget_allows_optional_phase "policy-remediation"; then
     process_policy_remediation || log "WARNING: Policy automation stopped; review grouped report and journal"
     end_monitor_phase "policy-remediation"
 fi
+monitor_release_mutation_gates
 
 if runtime_budget_allows_optional_phase "arr-automation"; then
     start_monitor_phase "arr-automation"
@@ -17083,6 +17439,8 @@ assess_activity_flow
 end_monitor_phase "activity-flow"
 
 start_monitor_phase "monitor-self-health"
+monitor_persist_coverage || exit 3
+monitor_report_stale_coverage
 # Core service endpoint failures are already represented by the per-service
 # API lifecycle issues. This adds repeated incomplete-run, secondary history,
 # and internal flow-analysis failures without duplicating those API alerts.
@@ -17114,9 +17472,11 @@ commit_state_transaction "pre-notification" || exit 3
 end_monitor_phase "pre-notification-checkpoint"
 
 start_monitor_phase "notifications"
-
+monitor_release_mutation_gates
+monitor_persist_coverage || exit 3
 send_grouped_notification
 NOTIFICATION_SEND_RC=$?
+[[ "$MONITOR_EXPORT_LEASE_LOST" != true ]] || exit 75
 
 if [ "$NOTIFICATION_ATTEMPTED" = true ]; then
 
@@ -17166,7 +17526,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.20.1 completed"
+log "ARR Health Monitor v3.21.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""
@@ -17399,6 +17759,7 @@ fi
 
 end_monitor_phase "finalization"
 
+monitor_persist_coverage || exit 3
 if ! complete_monitor_run "$PIPELINE_STATUS" 0 ""; then
     log "ERROR: Unable to update monitor completion heartbeat"
     persistent_log "ERROR" "Unable to update monitor completion heartbeat"

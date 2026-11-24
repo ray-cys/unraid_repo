@@ -2,7 +2,7 @@
 # shellcheck disable=SC2034
 arrayStarted=true
 ###############################################################################
-# Media Integrity Audit v2.1.1 -- personal Unraid User Script
+# Media Integrity Audit v2.1.2 -- personal Unraid User Script
 #
 # PURPOSE / USE CASE
 # ------------------
@@ -87,7 +87,7 @@ arrayStarted=true
 ###############################################################################
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="2.1.1"
+readonly SCRIPT_VERSION="2.1.2"
 BAZARR_CONTAINER="bazarr"
 MEDIA_HOST_ROOT="/mnt/user/media"
 MEDIA_CONTAINER_ROOT="/data"
@@ -781,7 +781,17 @@ recovery_schedule() {
       {recheckAfter:([$j[0].actions[]|select(.status=="verifying" and .resolutionSource=="recheck")|. as $job|.replacementPaths[]?|{key:.,value:$job.startedAt}]|from_entries),evidencePaths:[$evidence[:1][].path],paths:([$replacements[:(if ($evidence|length)>0 then 3 else 4 end)][].path]+[$evidence[:1][].path])}' >"$TMP_DIR/recovery-schedule.json"
 }
 
-recovery_resume() {
+recovery_resume() (
+    if [[ "${ARR_MUTATION_COORDINATION_ACTIVE:-false}" != true ]];then recovery_resume_core "$@";return $?;fi
+    local coordinated_app fd
+    coordinated_app=$(jq -r --arg id "$1" '.actions[$id].app' "$RECOVERY_FILE") || return 1
+    case "$coordinated_app" in Sonarr|Radarr) ;;*) return 1;;esac
+    exec {fd}>"${ARR_MUTATION_LOCK_DIR:-/run}/arr-mutations-$coordinated_app.lock" || return 1
+    flock -n "$fd" || { printf '%s recovery deferred: another coordinated script owns Arr changes\n' "$coordinated_app" >&2;return 0; }
+    recovery_resume_core "$@"
+)
+
+recovery_resume_core() {
     local id="$1" job="$TMP_DIR/native-job.json" status response="$TMP_DIR/native-response.json" query selected="$TMP_DIR/native-selected.json" fresh="$TMP_DIR/native-fresh.json" candidate="$TMP_DIR/native-candidate.json" history="$TMP_DIR/native-baseline.json" ready
     jq --arg id "$id" '.actions[$id]' "$RECOVERY_FILE" >"$job" || return 1
     status=$(jq -r .status "$job");[[ "$status" != recovered && "$status" != cancelled && "$status" != resolved ]] || return 0
@@ -1265,6 +1275,7 @@ PYWORKER
 }
 
 main() {
+    ARR_MUTATION_COORDINATION_ACTIVE=true
     case "${1:-}" in
       --version) printf 'media_integrity_audit.sh %s\n' "$SCRIPT_VERSION";return 0;;
       --help|-h) printf '%s\n' 'Usage: bash script [--version|--status|--inventory-only|--recovery-status|--recover-only|--help]' \

@@ -57,7 +57,7 @@ printf 'Changes reset hold; fresh post-processing ownership vetoes a late move\n
 fetch_required_state() { return 0; }
 printf '[]' >"$SAB_HISTORY_FILE"; printf '{"records":[]}' >"$SONARR_QUEUE_FILE"
 path="$SAB_TV_DIR_REAL/_UNPACK_proven"; mkdir "$path"; printf movie >"$path/show.mkv"; printf imported >"$fixture/library/show.mkv"
-jq -n --arg p "$path" --argjson epoch "$((fake_now-20*86400))" '{version:1,receipts:{one:{app:"Sonarr",conflict:false,sab:{nzo_id:"proof-id",name:"proven",storage:$p,completed:$epoch,category:"tv"}}}}' >"$IMPORT_RECEIPT_FILE"
+jq -n --arg p "$path" --argjson epoch "$((fake_now-20*86400))" '{version:1,receipts:{"Sonarr:proof-id":{app:"Sonarr",downloadId:"proof-id",conflict:false,targets:{one:{kind:"episode",targetId:11,parentId:1,fileId:21,pathAtImport:"/library/show.mkv"}},sab:{nzo_id:"proof-id",name:"proven",storage:$p,completed:$epoch,category:"tv"}}}}' >"$IMPORT_RECEIPT_FILE"
 verify_download_cleanup_proof() {
   [[ "$2" == proof-id && "$3" == "$path" ]] || return 1
   jq -n --arg p "$fixture/library/show.mkv" '{proofKind:"durable-import-receipt",importedPaths:[$p]}' >"$4"

@@ -147,6 +147,9 @@ jq -e '(.actions["abc-123"].replacementState // "")!="import_verified"' "$POLICY
 START_TIME=208000; fixture_file=$(jq '.customFormatScore=60' <<<"$fixture_file")
 action=$(jq -c '.actions["abc-123"]' "$POLICY_STATE_FILE")
 policy_check_replacement "$action"
+jq -e '.actions["abc-123"].replacementProofRuns==1 and (.actions["abc-123"].replacementState // "")!="import_verified"' "$POLICY_STATE_FILE" >/dev/null
+START_TIME=208300; action=$(jq -c '.actions["abc-123"]' "$POLICY_STATE_FILE")
+policy_check_replacement "$action"
 jq -e '.actions["abc-123"].replacementState=="import_verified" and .actions["abc-123"].replacementFileId==21' "$POLICY_STATE_FILE" >/dev/null
 
 # Full scan orchestration: no first-scan mutations, bounded actions, cooldown,

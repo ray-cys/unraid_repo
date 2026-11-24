@@ -8,7 +8,7 @@ trap 'rm -rf -- "$fixture"' EXIT
 TMP_DIR="$fixture"; POLICY_DISPOSITION_FILE="$fixture/receipts.json"
 SONARR_URL=http://fixture; SONARR_API_KEY=fixture
 fixture_item='{"nzo_id":"abc-123","name":"Show.S01E01","storage":"/download/show","completed":123,"category":"tv"}'
-jq -n --argjson sab "$fixture_item" '{version:1,actions:{"abc-123":{downloadId:"abc-123",app:"Sonarr",status:"done",queueVerified:true,mode:"redundant",kind:"episode",targetId:11,parentId:1,fileId:21,filePath:"/library/show.mkv",target:{seasonNumber:1,episodeNumber:1},sab:$sab}}}' >"$POLICY_DISPOSITION_FILE"
+jq -n --argjson sab "$fixture_item" '{version:1,observations:{},actions:{"abc-123":{queueId:5,startedAt:100,queue:{id:5,downloadId:"abc-123"},command:{name:"EpisodeSearch",episodeIds:[11]},profile:{},parent:{},downloadId:"abc-123",app:"Sonarr",status:"done",queueVerified:true,mode:"redundant",kind:"episode",targetId:11,parentId:1,fileId:21,filePath:"/library/show.mkv",target:{seasonNumber:1,episodeNumber:1},sab:$sab}}}' >"$POLICY_DISPOSITION_FILE"
 fixture_target='{"id":11,"seriesId":1,"seasonNumber":1,"episodeNumber":1,"hasFile":true,"episodeFileId":21,"monitored":true}'
 fixture_parent='{"id":1,"monitored":true,"tags":[]}'
 fixture_file='{"id":21,"seriesId":1,"path":"/library/show.mkv"}'
