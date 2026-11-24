@@ -455,13 +455,13 @@ tar -tzf "$DIRECT_GENERATION/plex-media-server.tar.gz" \
     >"$DIRECT_ROOT/plex.list"
 assert_contains "$DIRECT_ROOT/plex.list" "Metadata/metadata.db"
 assert_not_contains "$DIRECT_ROOT/plex.list" "Cache/cache.bin"
-assert_not_contains "$DIRECT_ROOT/plex.list" "Media/preview.bif"
+assert_contains "$DIRECT_ROOT/plex.list" "Media/preview.bif"
 
 tar -tzf "$DIRECT_GENERATION/plex-media.tar.gz" \
     >"$DIRECT_ROOT/plex-node.list"
 assert_contains "$DIRECT_ROOT/plex-node.list" "Metadata/metadata.db"
 assert_not_contains "$DIRECT_ROOT/plex-node.list" "Cache/cache.bin"
-assert_not_contains "$DIRECT_ROOT/plex-node.list" "Media/preview.bif"
+assert_contains "$DIRECT_ROOT/plex-node.list" "Media/preview.bif"
 
 tar -tzf "$DIRECT_GENERATION/radarr.tar.gz" >"$DIRECT_ROOT/radarr.list"
 assert_contains "$DIRECT_ROOT/radarr.list" "radarr/config.xml"

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.15.0
+# ARR Health / Download / Import Monitor v3.16.0
 #
 # PURPOSE
 # -------
@@ -6706,7 +6706,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.15.0 lifecycle commands' \
+        'ARR Health Monitor v3.16.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -8768,6 +8768,28 @@ sab_category_root() {
 # SAB NATIVE WARNINGS / FAILED JOBS / LIVE PROGRESS - v3.0
 ###############################################################################
 
+# A persisted SAB warning is an event, not proof the job is still broken.
+# Reconcile only this exact loader error against fresh native SAB snapshots.
+# No filesystem reads, title-only episode inference, deletion or queue mutation.
+sab_load_warning_recovered() {
+    local text="$1" epoch="$2" path name
+    [[ "$epoch" =~ ^[1-9][0-9]*$ && "$text" == 'Loading '*'/__ADMIN__/SABnzbd_nzo_data failed' ]] || return 1
+    [[ "$SAB_STATUS_OK" == true && "$SAB_QUEUE_OK" == true && "$SAB_HISTORY_OK" == true ]] || return 1
+    path=${text#Loading }; path=${path%/__ADMIN__/SABnzbd_nzo_data failed}; name=${path##*/}
+    [[ -n "$name" ]] || return 1
+    jq -en --arg name "$name" --argjson epoch "$epoch" --slurpfile s "$SAB_STATUS" --slurpfile q "$SAB_QUEUE" --slurpfile h "$SAB_HISTORY" '
+      ($s[0].status.folders|type)=="array"
+      and all($s[0].status.folders[]; .!=$name)
+      and (any($q[0].queue.slots[]?;
+        (.filename // .name // "")==$name and (.nzo_id // ""|length)>0
+        and ((.time_added // 0 | tonumber?) // 0)>=$epoch
+        and ((.status // ""|ascii_downcase) as $status | ["queued","paused","downloading","fetching","verifying","repairing","unpacking","moving"]|index($status)!=null))
+      or any($h[0].history.slots[]?;
+        (.name // .nzb_name // "")==$name and (.nzo_id // ""|length)>0
+        and .status=="Completed" and ((.completed // 0 | tonumber?) // 0)>=$epoch))
+    ' >/dev/null 2>&1
+}
+
 process_sab_warnings() {
 
     [ "$SAB_WARNINGS_OK" = true ] || return 0
@@ -8830,6 +8852,16 @@ process_sab_warnings() {
         fi
 
         issue_hash=$(stable_issue_hash "${warning_type}|${warning_origin}|${warning_text}")
+
+        if sab_load_warning_recovered "$warning_text" "$warning_epoch"; then
+            local warning_key="SABnzbd:warning:${issue_hash}"
+            if jq -e --arg key "$warning_key" '.issues[$key].active==true' "$STATE_FILE" >/dev/null; then
+                log "SAB loader warning recovered; Ack ID: $(issue_ack_id "$warning_key"); exact job registered after warning and absent from native orphan inventory. Original: $warning_text"
+                queue_group_notification "$warning_key" "recovered:$issue_hash" SABnzbd 'SAB orphan recovery verified' SAB_STATE_RECOVERED INFO 0 \
+                    "SAB reconstructed the exact orphan job after its saved-state load failed. Fresh API checks confirm job registration and removal from the orphan inventory. Payload was preserved; download/import completion is monitored separately. Original warning: $warning_text" reconciled
+            fi
+            continue
+        fi
 
         record_normalized_issue \
             "SABnzbd:warning:${issue_hash}" \
@@ -16449,7 +16481,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.15.0"
+    "START | ARR Health Monitor v3.16.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -16462,7 +16494,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.15.0"
+debug_log "Starting ARR Health Monitor v3.16.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -17082,7 +17114,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.15.0 completed"
+log "ARR Health Monitor v3.16.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""

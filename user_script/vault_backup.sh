@@ -57,7 +57,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.11"
+readonly SCRIPT_VERSION="1.12"
 
 ###############################################################################
 # CONFIGURATION
@@ -146,6 +146,7 @@ NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
 LOCK_FILE="/run/vault_backup.lock"
 
 readonly SCRIPT_ID="vault_backup"
+readonly NOTIFY_SUBJECT="Vault to ISS Backup"
 
 ###############################################################################
 # SHARED ISS COORDINATION AND TRANSPORT (embedded; standalone User Script)
@@ -210,19 +211,19 @@ backup_capabilities() {
     for value in "$RSYNC_IO_TIMEOUT" "$MAX_MAIN_LOG_BYTES" "$MAX_RAW_LOG_BYTES"; do [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1; done
     [[ "$PRESERVE_HARD_LINKS" == true || "$PRESERVE_HARD_LINKS" == false ]] || return 1
     [[ "$SSH_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( SSH_PORT <= 65535 )) || return 1
-    for cmd in ssh rsync jq timeout flock realpath sha256sum stat find sort awk tail head tee date mktemp xargs grep cat du mountpoint; do command -v "$cmd" >/dev/null || return 1; done
+    for cmd in ssh rsync jq timeout flock realpath sha256sum stat find sort awk sed tail head tee date mktemp xargs grep cat du mountpoint; do command -v "$cmd" >/dev/null || return 1; done
     # The options used here are supported by rsync >= 3.1, on BOTH ends.
-    printf 'Local: %s\n' "$(rsync --version | head -n 1)" >>"$LOG_FILE"
-    rsync --version | awk 'NR==1 {split($3,v,"."); exit !(v[1]>3 || (v[1]==3 && v[2]>=1))}' || return 1
+    printf 'Local: %s\n' "$(rsync --version | sed -n '1p')" >>"$LOG_FILE"
+    rsync --version | awk 'NR==1 {split($3,v,"."); supported=(v[1]>3 || (v[1]==3 && v[2]>=1))} END {exit !supported}' || return 1
     local remote_boot
     remote_boot=$(BACKUP_SSH_COMMAND_TIMEOUT=30 backup_ssh 'cat /proc/sys/kernel/random/boot_id') || return 1
     [[ -n "$remote_boot" && "$remote_boot" != "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" ]] || return 1
     BACKUP_SSH_COMMAND_TIMEOUT=30 backup_ssh bash -s <<'CAPABILITIES'
 set -euo pipefail
 export LC_ALL=C
-for cmd in bash rsync flock realpath sha256sum stat find sort awk df mktemp du mv cat; do command -v "$cmd" >/dev/null; done
-rsync --version | awk 'NR==1 {split($3,v,"."); exit !(v[1]>3 || (v[1]==3 && v[2]>=1))}'
-rsync --version | head -n 1
+for cmd in bash rsync flock realpath sha256sum stat find sort awk sed df mktemp du mv cat; do command -v "$cmd" >/dev/null; done
+rsync --version | awk 'NR==1 {split($3,v,"."); supported=(v[1]>3 || (v[1]==3 && v[2]>=1))} END {exit !supported}'
+rsync --version | sed -n '1p'
 CAPABILITIES
 }
 backup_acquire_lease() {
@@ -333,7 +334,9 @@ backup_finish() {
     if (( rc == 0 )); then BACKUP_PHASE=completed; fi
     summary="${SCRIPT_ID} v${SCRIPT_VERSION}; copy=$BACKUP_RESULT; verify=$VERIFICATION_RESULT; retention=$RETENTION_RESULT; phase=$BACKUP_PHASE; duration=$(( $(date +%s)-BACKUP_STARTED ))s; shutdown=$SHUTDOWN_RESULT ${REMOTE_SHUTDOWN_SKIPPED_REASON:-}"
     if (( rc != 0 )) && [[ "$BACKUP_NOTIFIED" != true && -x "${NOTIFY_BIN:-}" ]]; then
-        if timeout 30 "$NOTIFY_BIN" -i alert -s "${SCRIPT_ID}" -d 'Backup failed' -m "$summary
+        if timeout 30 "$NOTIFY_BIN" -i alert -s "$NOTIFY_SUBJECT" -d 'Backup failed' -m "$summary
+Last error: $(awk '/\[ERROR\]/ {last=$0} END {print last}' "$LOG_FILE" 2>/dev/null)
+ISS shutdown was not forced after this failure; any undelivered appdata request remains eligible for retry.
 Log: $LOG_FILE" >/dev/null 2>&1; then NOTIFICATION_RESULT=sent; else NOTIFICATION_RESULT=failed; fi
     fi
     [[ "$NOTIFICATION_RESULT" != failed && "$NOTIFICATION_RESULT" != unavailable || "$status" != OK ]] || status=WARNING
@@ -407,7 +410,7 @@ notify_unraid() {
     BACKUP_NOTIFIED=true
     local importance="$1" description="$2" message="$3"
     [[ -x "$NOTIFY_BIN" ]] || { NOTIFICATION_RESULT=unavailable; return 0; }
-    if timeout 30 "$NOTIFY_BIN" -i "$importance" -s "Vault to ISS Backup" -d "$description" -m "$message" >/dev/null 2>&1; then
+    if timeout 30 "$NOTIFY_BIN" -i "$importance" -s "$NOTIFY_SUBJECT" -d "$description" -m "$message" >/dev/null 2>&1; then
         NOTIFICATION_RESULT=sent
     else
         NOTIFICATION_RESULT=failed
@@ -1345,7 +1348,7 @@ main() {
     fi
     wait_for_remote || return 1
     backup_phase capabilities
-    backup_capabilities || return 1
+    backup_capabilities || { log ERROR "Local/ISS capability validation failed; no backup was published. ISS is left available for retry."; return 1; }
     backup_acquire_lease || { log ERROR "ISS is already in use by another backup, or lease acquisition failed"; return 1; }
     [[ "$PRESERVE_HARD_LINKS" != true ]] || RSYNC_ARGS+=(-H)
     RSYNC_ARGS+=("--timeout=$RSYNC_IO_TIMEOUT")

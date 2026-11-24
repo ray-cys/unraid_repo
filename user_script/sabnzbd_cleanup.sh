@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# SABnzbd Cleanup v2.6.0
+# SABnzbd Cleanup v2.8.0
 #
 # PURPOSE / PERSONAL USE CASE
 # ---------------------------
@@ -115,6 +115,11 @@
 #   /bin/bash "$cleanup_script" --help
 #   /bin/bash "$cleanup_script" --dry-run --no-purge
 #   /bin/bash "$cleanup_script" --execute --no-purge
+#   /bin/bash "$cleanup_script" --dry-run --recover-orphan "EXACT_FOLDER_NAME"
+#   /bin/bash "$cleanup_script" --execute --recover-orphan "EXACT_FOLDER_NAME"
+# Native SAB recovery is separate from cleanup: unreadable __ADMIN__ state does
+# not prove payload is disposable. Scheduled cleanup never deletes incomplete
+# folders. Native recovery reuses the stored NZB/segments; verify subsequent import.
 #   /bin/bash "$cleanup_script" --inspect
 #   /bin/bash "$cleanup_script" --restore /mnt/user/media/net/quarantine/items/Sonarr/WRAPPER
 #   /bin/bash "$cleanup_script" --pending-operations
@@ -130,7 +135,7 @@ set -uo pipefail
 # CONFIGURATION
 ###############################################################################
 
-VERSION="2.7.0"
+VERSION="2.8.0"
 
 # ---------------------------------------------------------------------------
 # Execution behavior
@@ -374,7 +379,7 @@ is_false() {
 }
 
 OPS_SCRIPT_NAME="arr_sabnzbd_cleanup"
-OPS_SCRIPT_VERSION="2.7.0"
+OPS_SCRIPT_VERSION="2.8.0"
 OPS_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
 OPS_ATTENTION_DETAILS=""
 OPS_ATTENTION_FILE=""
@@ -801,6 +806,8 @@ Options:
   --purge       Enable delayed quarantine purge.
   --no-purge    Disable delayed quarantine purge.
   --inspect     List quarantine payloads, original paths, state and retention age; change nothing.
+  --recover-orphan NAME Retry one exact native SAB orphan; requires --execute to submit.
+                        Reuses retained data; never deletes an incomplete folder.
   --restore WRAPPER Restore one manifest-backed payload to its original path; never overwrite.
   --pending-operations List unfinished purge/restore checkpoints.
   --resolve-operation ID "verified outcome" Record an operator resolution; change no payload.
@@ -818,13 +825,14 @@ EOF
 parse_args() {
   while (( $# > 0 )); do
     case "$1" in
-      --dry-run) DRY_RUN=true ;;
-      --execute) DRY_RUN=false ;;
+      --dry-run) DRY_RUN=true; CLI_EXECUTE=false ;;
+      --execute) DRY_RUN=false; CLI_EXECUTE=true ;;
       --purge) PURGE_QUARANTINE=true ;;
       --no-purge) PURGE_QUARANTINE=false ;;
       --pending-operations) CLI_OPERATION=pending ;;
       --resolve-operation) [[ $# -ge 3 ]] || { usage >&2; exit 2; }; CLI_OPERATION=resolve; CLI_OPERATION_ID="$2"; CLI_OPERATION_NOTE="$3"; shift 2 ;;
       --inspect) CLI_OPERATION=inspect ;;
+      --recover-orphan) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; CLI_OPERATION=recover-orphan; CLI_WRAPPER="$2"; shift ;;
       --restore) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; CLI_OPERATION=restore; CLI_WRAPPER="$2"; shift ;;
       --version) printf 'sabnzbd_cleanup.sh %s\n' "$VERSION"; exit 0 ;;
       --help|-h)
@@ -1552,6 +1560,9 @@ sab_get() {
   local parameter
   for parameter in "$@"; do
     query_args+=(--data-urlencode "$parameter")
+    # This GET-shaped native endpoint mutates the queue. Never replay it on
+    # timeout/server error, even though read-only API requests may retry.
+    [[ "$parameter" != name=add_orphan ]] || query_args+=(--retry 0)
   done
 
   if ! run_curl "${query_args[@]}" "${SAB_URL%/}/api" -o "$output"; then
@@ -2988,12 +2999,47 @@ acquire_operation_coordination() {
     flock -s -n "$STATE_EXPORT_FD" || return 75
 }
 
+# Explicit operator recovery only. SAB's success response is not sufficient:
+# verify that the exact native orphan disappears and an exact job is visible.
+recover_sab_orphan() {
+  local started
+  local name="$1" before="$TMP_DIR/orphan-before.json" after="$TMP_DIR/orphan-after.json"
+  local response="$TMP_DIR/orphan-retry.json" queue="$TMP_DIR/orphan-retry-queue.json" history="$TMP_DIR/orphan-retry-history.json"
+  [[ -n "$name" && "$name" != . && "$name" != .. && "$name" != */* && "$name" != *\\* && "$name" != *$'\n'* && "$name" != *$'\r'* ]] || { log ERROR 'Expected an exact orphan folder basename, not a path'; return 2; }
+  validate_api_key SABnzbd "$SAB_API_KEY" || return 1
+  check_mover_guard 'native orphan recovery' || return $?
+  sab_get status "$before" skip_dashboard=1 || return 1
+  jq -e --arg name "$name" '(.status.folders|type)=="array" and ([.status.folders[]|select(.==$name)]|length)==1' "$before" >/dev/null || { log ERROR "Recovery refused: exact folder is not a native SAB orphan: $name"; return 1; }
+  if is_true "$DRY_RUN"; then log INFO "DRY RUN: would request native SAB orphan reconstruction for $name; no files deleted"; return 0; fi
+  started=$(date +%s) || return 1
+  # No curl retries: a timed-out mutation must be inspected before manual retry.
+  sab_get status "$response" name=add_orphan "value=$name" || { log ERROR "Native recovery response unavailable for $name; inspect SAB before retrying"; return 1; }
+  jq -e '.status==true' "$response" >/dev/null || { log ERROR "Native SAB orphan retry rejected for $name"; return 1; }
+  sab_get status "$after" skip_dashboard=1 && sab_get queue "$queue" limit=1000 && sab_get history "$history" limit=1000 || return 1
+  if jq -e --arg name "$name" '(.status.folders|type)=="array" and all(.status.folders[]; .!=$name)' "$after" >/dev/null &&
+     jq -en --arg name "$name" --argjson started "$started" --slurpfile q "$queue" --slurpfile h "$history" '
+       [($q[0].queue.slots[]?, $h[0].history.slots[]?)
+         | select((.filename // .name // "")==$name and (.nzo_id // ""|length)>0)
+         | select(([(.time_added // 0),(.completed // 0)] | map(tonumber? // 0)|max)>=$started)
+         | .nzo_id] | unique | length==1'  >/dev/null; then
+    RECOVERED=$((RECOVERED+1))
+    RECOVERY_DETAILS+=("Native SAB orphan reconstructed: $name. Retained NZB/data reused; job registration verified. Download/repair/import completion is monitored separately; no payload was deleted.")
+    log INFO "${RECOVERY_DETAILS[-1]}"
+    notify_summary
+    return 0
+  fi
+  log ERROR "SAB accepted orphan recovery but exact registration is unverified: $name. No second request or deletion was sent; inspect SAB queue/history."
+  return 1
+}
+
 main() {
   local operation_status
   local quarantine_ready=false
 
+  CLI_EXECUTE=false
   CLI_OPERATION=""; CLI_WRAPPER=""; CLI_OPERATION_ID=""; CLI_OPERATION_NOTE=""
   parse_args "$@"
+  [[ "$CLI_OPERATION" != recover-orphan || "$CLI_EXECUTE" == true ]] || DRY_RUN=true
   if [[ "$CLI_OPERATION" == inspect ]]; then inspect_quarantines; return $?; fi
   if [[ "$CLI_OPERATION" == pending ]]; then ops_list_pending_operations; return $?; fi
     local coordination_rc=0
@@ -3002,6 +3048,7 @@ main() {
     (( coordination_rc==0 )) || return 1
 
   initialize || return 1
+  if [[ "$CLI_OPERATION" == recover-orphan ]]; then recover_sab_orphan "$CLI_WRAPPER"; return $?; fi
   if [[ "$CLI_OPERATION" == resolve ]]; then
     ops_resolve_operation "$CLI_OPERATION_ID" "$CLI_OPERATION_NOTE" || return $?
     RECOVERED=1; RECOVERY_DETAILS+=("$OPS_RECOVERY_DETAILS")

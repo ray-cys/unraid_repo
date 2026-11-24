@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# Appdata + Optional Shares Backup v3.6
+# Appdata + Optional Shares Backup v3.8
 #
 # PURPOSE
 # -------
@@ -59,7 +59,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="3.7"
+readonly SCRIPT_VERSION="3.8"
 
 
 ###############################################################################
@@ -243,7 +243,11 @@ APPDATA_EXCLUDES=(
 #
 # The label becomes part of the verified archive name. Each instance receives
 # the same conservative list of regenerable exclusions, while Metadata,
-# preferences, plug-ins, scanners, and live databases remain protected.
+# preferences, plug-ins, scanners, live databases and Media remain protected.
+# Media includes generated previews/analysis and is intentionally backed up for
+# fuller restoration of both instances. It can be large and compress poorly;
+# capacity preflight/staging still applies. Cache and temporary diagnostics below
+# remain excluded. See https://support.plex.tv/articles/201539237-backing-up-plex-media-server-data/
 PLEX_HUBBLE_APPDATA_DIR="${PLEX_HUBBLE_APPDATA_DIR:-plex-media-server}"
 PLEX_NODE_APPDATA_DIR="${PLEX_NODE_APPDATA_DIR:-plex-media}"
 PLEX_HUBBLE_DATABASE_BACKUP_PATH="${PLEX_HUBBLE_DATABASE_BACKUP_PATH-/mnt/vault/backup/plex_db/hubble}"
@@ -260,7 +264,6 @@ PLEX_REGENERABLE_PATHS=(
     "Library/Application Support/Plex Media Server/Crash Reports"
     "Library/Application Support/Plex Media Server/Diagnostics"
     "Library/Application Support/Plex Media Server/Logs"
-    "Library/Application Support/Plex Media Server/Media"
     "Library/Application Support/Plex Media Server/Updates"
     "Library/Application Support/Plex Media Server/Plug-in Support/Caches"
 )

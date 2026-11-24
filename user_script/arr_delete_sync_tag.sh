@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 ###############################################################################
-# Sonarr + Radarr - Plex Delete Sync and Tagger v2.4.0
+# Sonarr + Radarr - Plex Delete Sync and Tagger v2.6.0
 #
 # PURPOSE / PERSONAL USE CASE
 # ---------------------------
@@ -115,7 +115,7 @@ umask 077
 # Release version for logs, notifications, and the HTTP User-Agent. State-file
 # version fields below are independent schema versions and must not be changed
 # merely when this release version changes.
-readonly SCRIPT_VERSION="2.5.0"
+readonly SCRIPT_VERSION="2.6.0"
 
 ###############################################################################
 # CONFIGURATION
@@ -303,8 +303,8 @@ HTTP_CONNECT_TIMEOUT=10
 HTTP_MAX_TIME=90
 HTTP_RETRIES=2
 # Retry read-back only; a failed or delayed mutation is never blindly replayed.
-API_VERIFY_ATTEMPTS=3
-API_VERIFY_DELAY_SECONDS=1
+API_VERIFY_ATTEMPTS=6
+API_VERIFY_DELAY_SECONDS=2
 USER_AGENT="Arr-Delete-Sync-Tag/$SCRIPT_VERSION"
 
 ###############################################################################
@@ -689,6 +689,16 @@ mark_notification_batch_delivered() {
     mv -f -- "$next" "$NOTIFICATION_STATE_FILE"
 }
 
+# Select only this run's failures; API helpers run in subshells, so read the
+# durable log rather than relying on an in-memory last-error variable.
+current_workflow_error_details() {
+    awk -F ' \| ' -v run="run=$RUN_ID" '
+      index($0,run) && $2=="ERROR" {reasons[++n]=$5 ": " $6}
+      END {start=n>5?n-4:1; for(i=start;i<=n;i++) print "- " reasons[i];
+        if(n==0) print "- See the per-application attention entries for this run."}
+    ' "$LOG_FILE"
+}
+
 send_grouped_notification() {
     local LC_ALL=C
     local total actions attention resolved errors
@@ -719,6 +729,7 @@ send_grouped_notification() {
     description="Daily grouped summary: actions=${actions}, attention=${attention}, resolved=${resolved}"
     body="Arr Delete Sync v${SCRIPT_VERSION} | Run ${RUN_ID}"$'\n'
     body+="Mode: ${mode}; events may include retained earlier-run actions."$'\n'
+    body+="Latest invocation: Sonarr exit=${sonarr_rc:-unknown}; Radarr exit=${radarr_rc:-unknown}. Earlier timestamps describe previous runs, not a new failure in this run."$'\n'
     body+="Actions: ${actions} | Attention: ${attention} | Resolved: ${resolved}"$'\n\n'
 
     sorted="$(mktemp "$RUNTIME_DIR/.notification-render.XXXXXX")" || return 1
@@ -2091,7 +2102,12 @@ verify_arr_checkpoint() {
         arr_verification_get "$endpoint" "$actual" || { ARR_VERIFY_REASON="Arr object read-back unavailable"; return 1; }
         if [[ "$ARR_VERIFY_HTTP" != 200 ]] || ! jq -e --argjson id "$object_id" '.id==$id' "$actual" >/dev/null; then ARR_VERIFY_REASON="Arr object identity missing or mismatched"; return 1; fi
         if arr_expected_fields_match "$expected" "$actual" "$object_id"; then ARR_VERIFY_REASON="Monitoring, seasons and tags verified against exact object ID $object_id"; return 0; fi
-        ARR_VERIFY_REASON="Exact object $object_id does not currently match requested monitoring/seasons/tags"; ARR_VERIFY_DIFFERENT=true; return 1
+        ARR_VERIFY_REASON="Exact object $object_id does not currently match requested monitoring/seasons/tags: $(jq -cr --slurpfile expected "$expected" '
+          $expected[0] as $e | . as $a | {
+            monitored:(if ($e|has("monitored")) then {expected:$e.monitored,actual:$a.monitored} else null end),
+            tags:(if ($e|has("tags")) then {expected:$e.tags,actual:$a.tags} else null end),
+            seasons:[ $e.seasons[]? | . as $s | select(any($a.seasons[]?; .seasonNumber==$s.seasonNumber and .monitored==$s.monitored)|not) | {seasonNumber,expectedMonitored:.monitored} ]
+          }' "$actual")"; ARR_VERIFY_DIFFERENT=true; return 1
     elif [[ "$method" == POST && "$endpoint" == /api/v3/tag ]]; then
         local label
         label=$(jq -r '.label // ""' "$expected") || return 1
@@ -4028,7 +4044,7 @@ main() {
     if (( sonarr_rc != 0 || radarr_rc != 0 )); then
         log WARNING "Unified Arr delete workflow completed with one or more application failures."
         queue_attention_notification ERROR MAIN "Application workflow failure" \
-            "Sonarr exit status: ${sonarr_rc}; Radarr exit status: ${radarr_rc}. See ${LOG_FILE}."
+            "Sonarr exit status: ${sonarr_rc}; Radarr exit status: ${radarr_rc}. Successful actions remain committed; only incomplete work is reconsidered next run. No unverified retirement removal is reported as successful."$'\n'"$(current_workflow_error_details)"
     fi
 
     send_grouped_notification || notification_rc=$?
