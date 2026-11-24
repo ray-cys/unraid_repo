@@ -126,7 +126,7 @@ SKIP_APPDATA_DIRS=(
 # has been promoted. With MAX_BACKUPS=1, the previous generation remains
 # available for the entire backup operation.
 #
-MAX_BACKUPS="${MAX_BACKUPS:-1}"
+MAX_BACKUPS="${MAX_BACKUPS:-2}"
 
 # Number of failed/incomplete ".partial" backup directories to retain.
 #
