@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 ###############################################################################
-# Sonarr + Radarr - Plex Delete Sync and Tagger v2.8.0
+# Sonarr + Radarr - Plex Delete Sync and Tagger v2.9.0
 #
 # PURPOSE / PERSONAL USE CASE
 # ---------------------------
@@ -115,7 +115,7 @@ umask 077
 # Release version for logs, notifications, and the HTTP User-Agent. State-file
 # version fields below are independent schema versions and must not be changed
 # merely when this release version changes.
-readonly SCRIPT_VERSION="2.8.0"
+readonly SCRIPT_VERSION="2.9.0"
 
 ###############################################################################
 # CONFIGURATION
@@ -695,29 +695,27 @@ mark_notification_batch_delivered() {
 # planned-range verification. Review/uncertain states never expire silently.
 # Library protection ends after full replacement verification. Disposal problems
 # concern the retired original only and must not block healthy library media.
+# A persistent empty journal is installed with the audit. Missing/unreadable
+# state is uncertainty, never permission to process a temporarily missing title.
 media_recovery_journal_valid() {
     local file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}"
-    [[ ! -L "$file" ]] || return 1
-    [[ -e "$file" ]] || return 0
-    jq -e '.schema==1 and (.actions|type)=="object" and all(.actions[];
-      ((.replacementVerifiedAt // 0)|type)=="number" and (.app=="Sonarr" or .app=="Radarr") and (.parentId|type)=="number" and .parentId>0 and
-      (.status as $s | ["prepared","moved","delete_intent","deleted","monitor_intent","search_intent","search_submitted","replacement_detected","verified","review","handoff_pending","handoff_intent","handoff_review","handed_off","bin_removed"]|index($s))!=null and
-      (if (.status|startswith("handoff_")) or .status=="handed_off" or .status=="bin_removed" then (.replacementVerifiedAt // 0)>0 else true end))' "$file" >/dev/null 2>&1
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    jq -e '.schema==1 and .workflow=="arr-native" and (.actions|type)=="object" and all(.actions[];
+      (.app=="Sonarr" or .app=="Radarr") and (.parentId|type)=="number" and .parentId>0 and
+      (.status as $s|["required","selected","grab_intent","downloading","imported","verifying","recovered","blocked","review"]|index($s))!=null)' "$file" >/dev/null 2>&1
 }
 media_recovery_ids() {
     local app="$1" output="$2" file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}"
     media_recovery_journal_valid || return 1
-    if [[ ! -f "$file" ]]; then printf '[]\n' >"$output";return 0;fi
-    jq --arg app "$app" '[.actions[]|select(.app==$app and .status!="verified" and (.replacementVerifiedAt // 0)<=0)|.parentId]|unique' "$file" >"$output"
+    jq --arg app "$app" '[.actions[]|select(.app==$app and .status!="recovered")|.parentId]|unique' "$file" >"$output"
 }
 media_recovery_app_held() {
     local app="$1" parent="${2:-0}" file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}" rc=0
     media_recovery_journal_valid || return 0
-    [[ -f "$file" ]] || return 1
-    jq -e --arg app "$app" --argjson parent "$parent" 'any(.actions[];
-      .app==$app and ($parent==0 or .parentId==$parent) and .status!="verified" and (.replacementVerifiedAt // 0)<=0)' "$file" >/dev/null 2>&1 || rc=$?
-    ((rc!=1)) # malformed/unreadable state protects instead of permitting actions
+    jq -e --arg app "$app" --argjson parent "$parent" 'any(.actions[];.app==$app and ($parent==0 or .parentId==$parent) and .status!="recovered")' "$file" >/dev/null 2>&1 || rc=$?
+    ((rc!=1))
 }
+
 
 # Preserve the complete catalog for pruning/existence checks. Only this RAM
 # action view excludes exact protected IDs; held movie state is never falsified.

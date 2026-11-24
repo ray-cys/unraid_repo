@@ -4,6 +4,8 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 fixture=$(mktemp -d /tmp/arr-policy-test.XXXXXX)
 source <(awk '/^# LOCK$/{exit} {print}' "$repo/user_script/arr_health_activity.sh")
 trap - INT TERM HUP
+export MEDIA_INTEGRITY_RECOVERY_FILE="$fixture/recovery.json"
+printf '{"schema":1,"workflow":"arr-native","actions":{}}' >"$MEDIA_INTEGRITY_RECOVERY_FILE"
 trap 'rm -rf -- "$fixture"' EXIT
 TMP_DIR="$fixture"; STATE_DIR="$fixture"; POLICY_STATE_FILE="$fixture/policy-actions.json"; START_TIME=100000
 sync() { :; }

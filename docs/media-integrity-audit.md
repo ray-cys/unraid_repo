@@ -87,10 +87,10 @@ as removed, not repaired. With `AUTO_RECOVERY_ENABLED=false`, no operation delet
 ## Reports and maintenance
 
 Every invocation updates the local report and receipt. Healthy checks, normal
-resumable backlog/maintenance deferrals and successful recoveries are silent.
+resumable backlog/maintenance deferrals are silent. Verified replacements send a grouped completion notification.
 Active media findings, unexpected worker/storage failures, checkpoint fallback and
 incomplete/uncertain/overdue recovery produce one grouped attention email with
-file names, IDs, actions, preserved paths and evidence. Progress alone never
+file names, IDs, actions, original/replacement paths and evidence. Progress alone never
 changes an incident signature. The same unresolved evidence reminds at most once
 per week; new/changed issues can notify sooner. No per-file emails are sent.
 Delivery failure retains one pending outbox and retries while still relevant; a
@@ -102,7 +102,7 @@ email is sent simply because an old issue was resolved.
 
 - `state.json.gz`: current queue, identities, progress, findings and 12 run summaries.
 - `state.previous.json.gz`: previous validated checkpoint, retained once per run.
-- `recovery.json`: durable Arr intents, exact target IDs, preserved-original ownership and deletion-sync holds. Required backup material, unlike the optional rolling decode queue. Never delete it to clear an unresolved hold.
+- `recovery.json`: durable Arr intents, exact target IDs, original/replacement identities, bounded events and exact-target holds. Required backup material, unlike the optional rolling decode queue. Never delete it to clear an unresolved hold.
 - `latest-report.txt`: overwritten readable summary, bounded like the email.
 - `pending-notification.json` and `notified.json`: delivery retry/deduplication.
 - `media-integrity-audit.log`: 1 MiB with two backups; backups expire after 30 days.
@@ -133,144 +133,113 @@ gzip -dc /mnt/vault/cloud/logs/script/media_integrity_audit/state.json.gz |
 
 Do not delete state to hide findings or claim previously unchecked media healthy.
 
-## Disabled automatic recovery and later activation
+## Arr-native replacement (v2.0.0, disabled by default)
 
-The installed version keeps `AUTO_RECOVERY_ENABLED=false`. Leave it off for
-several weekly cycles. Review whether errors repeat on the same unchanged file,
-which codecs are involved, how quickly coverage progresses, and whether any tool,
-resource or permission errors are being confused with media damage. There is no
-need to increase scan scope or install another package during observation.
+`AUTO_RECOVERY_ENABLED=false` remains installed on Hubble. Observe several weekly
+runs before enabling it in the script. No CLI/environment argument overrides
+this switch. The persistent `recovery.json` is installed as an empty
+`{"schema":1,"workflow":"arr-native","actions":{}}` document; missing, invalid,
+symlinked or legacy workflow state stops mutations. Never delete the journal to
+clear an unresolved job. Deployment confirms no legacy recovery exists before
+installing this contract; it performs no legacy media moves or migration.
 
-After a separate decision to enable it, change that one switch in the User Script
-(and GitHub together). Credentials and API roots are configured in the existing
-script; the Arr monitor also passes its discovered roots/keys to the bounded
-executor without placing keys in its command arguments or recovery journal.
-Current supported contracts are Sonarr v5 (or compatible v3) and Radarr v3. The live read-only API schemas, Bazarr UID and preservation/no-overwrite behavior were verified with temporary files outside library folders; no live recovery was enabled or existing media changed.
-Application/API incompatibility stops recovery rather than selecting a speculative
-endpoint or replaying a mutation.
+The script retains the original at its existing library path and leaves Arr's
+file record and monitoring unchanged. Arr owns normal download/import/recycling.
+The only permitted mutation in the recovery API helper is **POST /release**.
+File DELETE, monitoring PUT, profile changes, blocklisting, forced/manual import,
+filesystem moves and custom bin handoff have been removed.
 
-An eligible file must have a repeatable `decode_error` on **two separate audit
-runs**, unchanged five-part identity, current-version findings at most 48 hours
-old, and the same decoder runtime. Permission/read/resource/timeout failures and
-unsupported codecs do not qualify. Upgrading the decoder resets confirmation
-counts. Movies and series require exact Arr path/file ownership and monitored
-native IDs. A multi-episode Sonarr file must map all its monitored episode IDs;
-Formula1/unmanaged/ambiguous/unmonitored media remains review-only.
+Process:
 
-The existing Arr monitor invokes `--recover-only` within the first ten minutes
-of 00:00, 04:00, 08:00, 12:00, 16:00 and 20:00 Singapore time. This preserves the
-weekly scan schedule and four-hour action windows. While the switch is off the
-executor returns before any API, Docker, media or state mutation. Normal read-only
-follow-up can also run during the next weekly scan when enabled.
+1. Require a repeatable decoder error on the same filesystem version in two
+   distinct runs, evidence at most 48 hours old, and the same decoder runtime.
+   Read/resource/permission/timeout failures do not authorize replacement.
+2. Prove exact monitored Arr parent/file/episode ownership, native external ID,
+   active season monitoring, no tags, current quality profile, quiet native
+   health/queue/commands, free capacity and the unchanged physical original.
+3. Query native interactive releases. Initial automation supports Sonarr v5 and
+   Radarr v3 API resources and **Usenet** only. Sonarr v3 search resources are
+   rejected rather than guessed. Unknown response fields or rejection formats,
+   whole-season packs, partial/mismatched episode sets and ambiguous identities
+   do not qualify. Exact multi-episode files can qualify when every mapped ID,
+   season and episode matches the original file's complete target set.
+4. Preserve profile-allowed quality ordering, revision, language metadata when
+   present, minimum format score and non-decreasing score at equal quality.
+   Preserve explicit Radarr edition. Reject previously grabbed candidates and
+   the original scene release when known. Only allowlisted **existing-file**
+   cutoff/preference/revision/score rejections may be bypassed. Unknown, minimum
+   score, wrong identity, language, availability, blocklist or disabled-upgrade
+   rejections remain vetoes. No profile or quality override is submitted.
+5. Re-read current rules/identity/queue immediately before saving grab intent and
+   sending one native release grab. Correlate exact GUID, source title, target
+   IDs and new history IDs to one actual download ID. A lost response is never
+   blindly repeated. Discovery retries at most daily; one attempted grab per
+   pass, three per rolling week and one job per parent per 30 days bound work.
+6. Track native queue completion/warnings and exact download history. A matching
+   import event must identify the new file ID and path for each exact target;
+   also re-read current parent external identity, import date and physical file
+   version. Download completion/import alone is not integrity proof.
+7. Give imported replacements bounded priority verification through the existing
+   five-minute Arr monitor. These passes stat/decode only up to four exact
+   replacement paths, without walking/pruning the full library queue. Reuse
+   checkpoints and low-priority decoder limits, with at most 75 seconds worker
+   time per pass. Normal weekly auditing remains Wednesday 09:30 SGT, two hours.
+8. Mark `recovered` only after every exact current replacement passes all planned
+   decode ranges. Arr recycles/removes the original using its normal policy;
+   this script performs no second delete/move. Native import is not promised
+   atomic, and native recycling retention does not wait for our verification.
 
-For each recovery, the script:
+The Arr monitor permits new grabs only in the first ten minutes of 00:00,
+04:00, 08:00, 12:00, 16:00 and 20:00 Asia/Singapore, with new work starting before
+minute seven. Follow-up and priority verification continue outside these windows.
+`ARR_AUTOMATION_ENABLED`/profile controls can pause new grabs while observation
+continues. Appdata/state-export/metadata locks and workload guards remain in use.
 
-1. Checks mounts, current backups/Mover/parity/Plex workload, native health,
-   commands and queues. Unknown ownership or incomplete queue pagination blocks
-   action. Takes the existing backup and metadata mutation locks briefly.
-2. Records a durable plan and preserves the exact original using Linux
-   `renameat2(RENAME_NOREPLACE)`, with a same-filesystem no-overwrite hard-link/unlink fallback for Unraid shfs, under
-   `/mnt/user/media/repair_hold/ACTION_ID/ORIGINAL_FILENAME`.
-   Cross-filesystem/unsupported/failed preservation stops; interruption with both names preserves both for review; a completed move can be resumed using exact identity without moving again; there is no bulk-copy fallback,
-   overwriting or automatic purge. A changed identity prevents further mutation.
-3. Records deletion intent, removes only the exact obsolete Arr **file record**
-   and requires a 404 read-back. The original is already preserved. Title, profile, blocklist and global monitoring settings remain unchanged.
-   Both live Arr applications have native unmonitor-on-delete enabled. Only
-   targets proven monitored before this recovery may have that prior state
-   restored, within 120 seconds of this script's own deletion, after confirming
-   the native setting and exact missing IDs. Sonarr's series must remain monitored.
-   Monitoring PUT intent/read-back is journaled; an uncertain/user-later change
-   stops for review and is never blindly overwritten.
-4. Confirms the exact target is still monitored and missing, persists search
-   intent, sends one `EpisodeSearch`/`MoviesSearch`, and reads back its exact
-   command identity/target IDs. A lost response is never blindly retried.
-5. Holds deletion-sync until new exact Arr file IDs, import dates and paths match
-   a later **complete planned-range decode cycle**. Replacement paths receive
-   priority within the audit's new-work lane. Search completion or a new filename
-   alone does not count as recovered. The damaged original remains in `repair_hold`
-   until verification completes.
-6. Re-read exact current Arr IDs and match each current file identity to completed
-   audit coverage. Read the configured native recycling bin and cleanup policy;
-   no application setting is changed. Refresh only the retired original's
-   retention timestamp **before** publishing it under
-   `arr_bin/media_audit/sonarr/ACTION_ID/ORIGINAL_FILENAME` or the equivalent
-   `radarr` subfolder. The actual configured bin path is used, not hardcoded.
-7. Record the handoff and let native Arr cleanup remove the retired original.
-   The script sends no second file-delete, search, or monitoring request during
-   handoff. The current healthy library file is never moved into the bin.
+Sonarr series and individual Radarr movies with unresolved jobs are excluded
+from delete-sync/retirement, generic missing searches, import retries and policy
+rejection/replacement. This prevents the policy cleaner treating a needed
+replacement as redundant simply because the damaged original is still present.
+Unrelated series/movies continue. Native Arr RSS/import tasks do not obey script
+locks: fresh pre-grab checks reduce races, not provide a global Arr transaction.
 
-The executor has a three-minute budget, examines at most four candidates per pass, and reserves the final three minutes of each action window for in-flight work. New preservation also requires free media space for the current file size plus 10 GiB. Capacity is a conservative share-level estimate, not a guarantee about every disk/download client.
+## Grouped replacement notifications and state
 
-Limits: one new recovery per pass, three per rolling seven days, and one attempt
-per exact parent/target set per 30 days. An unsuccessful command, uncertain
-request, changed monitoring or a 28-day verification deadline requires review.
-Unresolved holds never expire silently. Review actions can close automatically through read-only follow-up once the exact current/restored file passes a later complete audit; no mutation is retried to obtain that result. Sonarr holds only its affected series;
-Radarr delete-sync excludes only protected movie IDs from observation updates,
-sidecar/tag plans, watchdog rescans and retirements. Other movies continue. The
-full unfiltered catalog is retained for state pruning, so a held movie is never
-mistaken for an absent movie. Radarr generic missing searches also skip only the
-held target. Existing Arr queue/import monitoring continues. Once replacement
-verification passes, any remaining bin-disposal problem does not keep the library
-hold active.
-No automatic blocklisting is inferred from a local decoder error: the release
-might be sound and the local file might have suffered storage damage.
+Healthy ordinary scans are quiet. Findings requiring replacement, newly tracked
+downloads, blocked/uncertain actions, overdue verification and **verified
+replacement completions** are grouped in a single notification per reporting
+pass, with filenames, selected release, target/file/download IDs, actual action,
+reason and recent transitions. Completion says a replacement was performed by
+Arr and fully verified, without claiming our script moved the original.
+Delivered event keys suppress repeat completion emails. Failed delivery remains
+pending and is retried; unchanged incidents remind at most weekly. No emojis.
+
+`recovery.json` keeps each original identity, finding, current profile snapshot,
+selection decision, grab intent, baseline/native history/download IDs, native
+queue/completion status, replacement file identities, decode outcome and at most
+32 significant transition events. Poll timestamps do not append events. Completed
+jobs expire after one year; unresolved jobs do not silently expire. Raw download
+URLs, full API responses and API keys are not logged in events/notifications.
+The existing ISS operational-state export includes the required recovery journal.
+
+Native bin retention on Hubble is currently two days. Verification older than
+24 hours produces attention so it can be investigated before that period ends.
+Workload deferrals, long/slow files and errors may exceed retention; **there is no
+guaranteed original rollback**. A 28-day missing-import deadline requires review.
+The script never changes bin retention or Plex configuration. Leaving originals
+in place removes the prolonged Plex-missing and media-mirror deletion gap, but
+normal Arr import can still expose a short file transition.
+
+Commands (no new User Scripts schedule required):
 
 ```bash
 script=/boot/config/plugins/user.scripts/scripts/media_integrity_audit/script
+/bin/bash "$script" --version
 /bin/bash "$script" --recovery-status
-/bin/bash "$script" --recover-only  # harmless disabled result while switch is false
+/bin/bash "$script" --recover-only  # exits immediately while recovery is disabled
 ```
 
-Review/uncertain actions list the original/quarantine paths, Arr IDs and reason in
-`--recovery-status`, the local report and attention notifications. For manual
-recovery, inspect source and preserved copies first; never overwrite a returned
-file. A restored original needs an Arr rescan/import and audit verification. Do
-not remove the journal/hold to claim success. There is deliberately no automatic
-rollback that might overwrite a newly imported replacement.
-
-Further tuning should follow several real runs: choose the runtime/segment size
-from observed coverage and timeout rates, review codec-specific false positives,
-and verify that any new retention/cleanup policy is appropriate before enabling
-recovery at scale. Pending or unverified originals are pinned; verified originals
-use the native Arr bin policy described below.
-
-Implementation references: [Sonarr file-delete controller](https://github.com/Sonarr/Sonarr/blob/develop/src/Sonarr.Api.V5/EpisodeFiles/EpisodeFileController.cs),
-[Sonarr monitoring lifecycle](https://github.com/Sonarr/Sonarr/blob/develop/src/NzbDrone.Core/Tv/EpisodeService.cs),
-[Radarr file-delete controller](https://github.com/Radarr/Radarr/blob/develop/src/Radarr.Api.V3/MovieFiles/MovieFileController.cs), and
-[Radarr monitoring lifecycle](https://github.com/Radarr/Radarr/blob/develop/src/NzbDrone.Core/Movies/MovieService.cs).
-
-## Retired-original handoff and normal Arr upgrades
-
-`repair_hold` is outside all audited library folders and outside the native Arr
-bin. Nothing is purged there while a replacement is pending. Recovery remains
-**disabled by default**; this deployment does not start any replacement or handoff.
-
-Normal Arr processing can recycle a file that it replaces during an ordinary
-upgrade. Recovery first removes its damaged original from the library and then
-removes that old file record from Arr. That detached original is therefore a
-separate object from the new imported replacement. The later handoff operates
-only on the owned `repair_hold/ACTION_ID` original, using exact filesystem
-identity and the durable journal. It does not ask Arr to delete the replacement
-or process the same original twice.
-
-Both live applications currently share `/data/arr_bin/` with two-day cleanup.
-Both native cleanup tasks scan recursively, so either can remove an expired
-handed-off original. The application subfolder documents origin; it does not
-create separate cleanup policies. Fresh file modification time is set while the
-original is still outside the bin, preventing an old media timestamp from making
-it immediately eligible for cleanup. Native settings are never changed.
-
-If the preserved original has other hard links, handoff waits without modifying
-its timestamps. This protects downloader files and other quarantine manifests
-that may reference the same inode. It uses no payload-copy fallback. After other
-links are released, handoff can proceed; a wait beyond 35 days produces a grouped
-review warning. A bin collision, changed original/replacement, unavailable native
-bin or uncertain move retains the journal and reports the named action/reason.
-An interrupted completed move can be verified without moving again. If both
-source and destination exist, neither is overwritten or unlinked automatically.
-
-Successful handoff and observed bin removal remain quiet and visible locally in
-`--recovery-status`/the report. `bin_removed` means the handed-off path is now
-absent; it does not claim the script itself deleted it. `quarantine_lifecycle.sh`
-continues to manage metadata under its existing `bin` root and does not purge
-`repair_hold` or take over native `arr_bin` cleanup.
+`--recovery-status` includes the exact job state, selected release, download,
+replacement IDs and bounded event history. Unknown/blocked cases retain the
+original, stay protected and report why automation stopped. They never trigger a
+fallback deletion or forced import. Release metadata and SAB completion cannot
+prove an uncorrupted source; post-import decoding supplies the integrity evidence.

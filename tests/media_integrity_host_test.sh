@@ -57,18 +57,31 @@ write_report OK 'Recovered worker'
 RECOVERY_FILE="$STATE_DIR/recovery.json"
 jq '.files["series/Example/episode.mkv"]={identity:["1","2","3","4","5"],issue:{id:"finding",kind:"decode_error",confirmed:true,confirmedRuns:2,evidence:"Invalid NAL unit",offset:600}}' "$TMP_DIR/state.json" >"$fixture/new-state"
 gzip -c "$fixture/new-state" >"$STATE_FILE"
-jq -n --argjson now "$(date +%s)" '{schema:1,actions:{("a"*64):{app:"Sonarr",parentId:20,fileId:31,targets:[32],path:"series/Example/episode.mkv",identity:["1","2","3","4","5"],status:"review",startedAt:$now,updatedAt:$now,reason:"Search response unavailable; no retry"}}}' >"$RECOVERY_FILE"
+jq -n --argjson now "$(date +%s)" '{schema:1,workflow:"arr-native",actions:{("a"*64):{app:"Sonarr",parentId:20,fileId:31,targets:[32],path:"series/Example/episode.mkv",identity:["1","2","3","4","5"],events:[],status:"review",startedAt:$now,updatedAt:$now,reason:"Search response unavailable; no retry"}}}' >"$RECOVERY_FILE"
 write_report WARNING 'Recovery needs review'
 jq -e '.status=="WARNING" and .recoveryAttention==1 and (.body|contains("Search response unavailable; no retry")) and (.body|contains("Invalid NAL unit")) and (.body|contains("Next action:"))' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
 [[ $(wc -l <"$fixture/calls") == 3 ]]
 printf '{"inventoryComplete":true,"quickPassed":100,"segmentsPassed":99}' >"$TMP_DIR/stats.json"
 write_report WARNING 'More progress with unchanged finding'
 [[ $(wc -l <"$fixture/calls") == 3 ]]
-# Verified recovery generates a local record, not another email.
-jq '.actions[].status="verified"' "$RECOVERY_FILE" >"$fixture/new-recovery";mv "$fixture/new-recovery" "$RECOVERY_FILE"
+# Verified replacements generate one grouped completion email, then deduplicate.
+jq '.actions[].status="recovered"' "$RECOVERY_FILE" >"$fixture/new-recovery";mv "$fixture/new-recovery" "$RECOVERY_FILE"
 jq '.files[].issue=null' "$fixture/new-state" | gzip -c >"$STATE_FILE"
 write_report OK 'Recovery verified'
-[[ $(wc -l <"$fixture/calls") == 3 ]]
+[[ $(wc -l <"$fixture/calls") == 4 ]]
+write_report OK 'Repeated verified observation'
+[[ $(wc -l <"$fixture/calls") == 4 ]]
+# Completion delivery failure remains pending until acknowledged by notify;
+# successful retry produces one completion message, then remains quiet.
+jq '.actions[("b"*64)]=(.actions[("a"*64)]+{reason:"Another verified native replacement"})' "$RECOVERY_FILE" >"$fixture/new-recovery";mv "$fixture/new-recovery" "$RECOVERY_FILE"
+printf '#!/bin/sh\nexit 1\n' >"$NOTIFY_BIN"
+write_report OK 'Completion delivery failure'
+[[ -f "$STATE_DIR/pending-notification.json" ]]
+printf '#!/bin/sh\nprintf "sent\\n" >>"%s/calls"\n' "$fixture" >"$NOTIFY_BIN"
+write_report OK 'Completion delivery retry'
+[[ $(wc -l <"$fixture/calls") == 5 && ! -e "$STATE_DIR/pending-notification.json" ]]
+write_report OK 'Duplicate completion poll'
+[[ $(wc -l <"$fixture/calls") == 5 ]]
 # A guard probe must release its shared lock immediately, never for the scan.
 lock="$fixture/backup.lock";touch "$lock"
 probe_lock "$lock"

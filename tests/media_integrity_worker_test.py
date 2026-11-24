@@ -40,6 +40,14 @@ with tempfile.TemporaryDirectory() as folder:
     check=m.Audit(inventory_cfg,bridged)
     with contextlib.redirect_stdout(io.StringIO()):check.execute()
     assert check.stats['newChanged']==0 and check.state['files']['movies/Example.mkv']['verifiedAt']>0
+    # Priority recovery passes stat/decode exact replacements only and never
+    # prune ordinary cached entries outside that narrow scope.
+    targeted=copy.deepcopy(cfg);targeted.update(targeted=True,recoveryPriority=['movies/Example.mkv'])
+    cached=copy.deepcopy(state);cached['files']['series/untouched.mkv']={'identity':['1','2','3','4','5'],'offset':0,'verifiedAt':123}
+    narrow=m.Audit(targeted,cached)
+    with contextlib.redirect_stdout(io.StringIO()):narrow.execute()
+    assert narrow.stats['targeted'] and narrow.found=={'movies/Example.mkv'}
+    assert 'series/untouched.mkv' in narrow.state['files'] and narrow.stats['cyclesCompleted']==1
     # A long file resumes from a confirmed offset, not its beginning.
     duration=1300;stop_after=1;calls=0
     partial=execute(state);e=partial.state['files']['movies/Example.mkv']

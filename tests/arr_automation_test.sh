@@ -4,6 +4,8 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 fixture=$(mktemp -d /tmp/arr-automation-test.XXXXXX)
 source <(awk '/^# LOCK$/{exit} {print}' "$repo/user_script/arr_health_activity.sh")
 trap - EXIT INT TERM HUP
+export MEDIA_INTEGRITY_RECOVERY_FILE="$fixture/recovery.json"
+printf '{"schema":1,"workflow":"arr-native","actions":{}}' >"$MEDIA_INTEGRITY_RECOVERY_FILE"
 trap 'rm -rf -- "$fixture"' EXIT
 TMP_DIR="$fixture"; STATE_DIR="$fixture"; STATE_FILE="$fixture/monitor.json"; AUTOMATION_STATE_FILE="$fixture/actions.json"
 SONARR_API_ROOT=http://sonarr/api/v3; RADARR_API_ROOT=http://radarr/api/v3

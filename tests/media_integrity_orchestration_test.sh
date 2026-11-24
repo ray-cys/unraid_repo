@@ -7,8 +7,10 @@ fixture=$(mktemp -d /tmp/media-integrity-entry-test.XXXXXX)
 VAULT_MOUNT="$fixture/vault"
 STATE_DIR="$VAULT_MOUNT/cloud/logs/script/media_integrity_audit"
 STATUS_DIR="$fixture/status";STATE_FILE="$STATE_DIR/state.json.gz";PREVIOUS_STATE_FILE="$STATE_DIR/state.previous.json.gz"
+RECOVERY_FILE="$STATE_DIR/recovery.json"
 LOG_FILE="$STATE_DIR/audit.log";LOCK_FILE="$fixture/audit.lock";STATE_EXPORT_LOCK="$fixture/export.lock"
-NOTIFY_BIN="$fixture/notify";mkdir -p "$fixture/bin"
+NOTIFY_BIN="$fixture/notify";mkdir -p "$fixture/bin" "$STATE_DIR"
+printf '{"schema":1,"workflow":"arr-native","actions":{}}' >"$RECOVERY_FILE"
 printf '#!/bin/sh\nexit 0\n' >"$NOTIFY_BIN";chmod 755 "$NOTIFY_BIN"
 printf '{"schema":1,"files":{},"runs":[]}' | gzip -c | base64 | tr -d '\n' >"$fixture/payload"
 jq -nc --rawfile payload "$fixture/payload" '

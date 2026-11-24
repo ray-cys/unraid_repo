@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.18.0
+# ARR Health / Download / Import Monitor v3.19.0
 #
 # PURPOSE
 # -------
@@ -6706,7 +6706,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'ARR Health Monitor v3.18.0 lifecycle commands' \
+        'ARR Health Monitor v3.19.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -15337,6 +15337,7 @@ automation_last_moment_guard() {
     local candidate="$1" root="$2" key="$3" app kind target parent parent_kind object="$TMP_DIR/automation-final-object.json" owner="$TMP_DIR/automation-final-parent.json"
     app=$(jq -r '.app' "$candidate"); kind=$(jq -r '.mediaKind' "$candidate"); target=$(jq -r '.targetId' "$candidate"); parent=$(jq -r '.parentId' "$candidate")
     [[ "$target" =~ ^[1-9][0-9]*$ && "$parent" =~ ^[1-9][0-9]*$ ]] || return 1
+    media_recovery_app_held "$app" "$parent" && return 1
     parent_kind=movie; [ "$kind" != episode ] || parent_kind=series
     api_get "$root/$kind/$target" "$key" "$object" && api_get "$root/$parent_kind/$parent" "$key" "$owner" || return 1
     jq -e --slurpfile c "$candidate" '.id==$c[0].targetId and .monitored==true and
@@ -15544,7 +15545,10 @@ automation_action_budget() {
         # Do not race any unresolved policy mutation or replacement request.
         jq -e 'all(.actions[]; .status=="done")' "$policy" >/dev/null || return 1
     fi
-    IFS=$'\t' read -r today run < <(jq -sr --argjson now "$START_TIME" '[([.[]|select(.startedAt>=$now-86400)]|length),([.[]|select(.startedAt==$now)]|length)]|@tsv' "$counter")
+    local recovery_file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}"
+    media_recovery_journal_valid || return 1
+    jq -c '.actions[]|select((.grabSentAt // 0)>0)|{startedAt:.grabSentAt}' "$recovery_file" >>"$counter" || return 1
+    IFS=$'\t' read -r today run < <(jq -sr --argjson now "$START_TIME" '[([.[]|select(.startedAt>=$now-86400)]|length),([.[]|select(.startedAt>=$now)]|length)]|@tsv' "$counter")
     (( today<POLICY_MAX_ACTIONS_PER_DAY && run<POLICY_MAX_ACTIONS_PER_RUN ))
 }
 
@@ -15648,36 +15652,36 @@ automation_fetch_missing() {
 # planned-range verification. Review/uncertain states never expire silently.
 # Library protection ends after full replacement verification. Disposal problems
 # concern the retired original only and must not block healthy library media.
+# A persistent empty journal is installed with the audit. Missing/unreadable
+# state is uncertainty, never permission to process a temporarily missing title.
 media_recovery_journal_valid() {
     local file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}"
-    [[ ! -L "$file" ]] || return 1
-    [[ -e "$file" ]] || return 0
-    jq -e '.schema==1 and (.actions|type)=="object" and all(.actions[];
-      ((.replacementVerifiedAt // 0)|type)=="number" and (.app=="Sonarr" or .app=="Radarr") and (.parentId|type)=="number" and .parentId>0 and
-      (.status as $s | ["prepared","moved","delete_intent","deleted","monitor_intent","search_intent","search_submitted","replacement_detected","verified","review","handoff_pending","handoff_intent","handoff_review","handed_off","bin_removed"]|index($s))!=null and
-      (if (.status|startswith("handoff_")) or .status=="handed_off" or .status=="bin_removed" then (.replacementVerifiedAt // 0)>0 else true end))' "$file" >/dev/null 2>&1
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    jq -e '.schema==1 and .workflow=="arr-native" and (.actions|type)=="object" and all(.actions[];
+      (.app=="Sonarr" or .app=="Radarr") and (.parentId|type)=="number" and .parentId>0 and
+      (.status as $s|["required","selected","grab_intent","downloading","imported","verifying","recovered","blocked","review"]|index($s))!=null)' "$file" >/dev/null 2>&1
 }
 media_recovery_ids() {
     local app="$1" output="$2" file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}"
     media_recovery_journal_valid || return 1
-    if [[ ! -f "$file" ]]; then printf '[]\n' >"$output";return 0;fi
-    jq --arg app "$app" '[.actions[]|select(.app==$app and .status!="verified" and (.replacementVerifiedAt // 0)<=0)|.parentId]|unique' "$file" >"$output"
+    jq --arg app "$app" '[.actions[]|select(.app==$app and .status!="recovered")|.parentId]|unique' "$file" >"$output"
 }
 media_recovery_app_held() {
     local app="$1" parent="${2:-0}" file="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}" rc=0
     media_recovery_journal_valid || return 0
-    [[ -f "$file" ]] || return 1
-    jq -e --arg app "$app" --argjson parent "$parent" 'any(.actions[];
-      .app==$app and ($parent==0 or .parentId==$parent) and .status!="verified" and (.replacementVerifiedAt // 0)<=0)' "$file" >/dev/null 2>&1 || rc=$?
-    ((rc!=1)) # malformed/unreadable state protects instead of permitting actions
+    jq -e --arg app "$app" --argjson parent "$parent" 'any(.actions[];.app==$app and ($parent==0 or .parentId==$parent) and .status!="recovered")' "$file" >/dev/null 2>&1 || rc=$?
+    ((rc!=1))
 }
+
 
 process_media_integrity_recovery() {
     local script="${MEDIA_INTEGRITY_SCRIPT:-/boot/config/plugins/user.scripts/scripts/media_integrity_audit/script}" rc=0
-    [[ "$ARR_AUTOMATION_ENABLED" == true && "$AUTOMATION_CONTROLS_OK" == true ]] && automation_window_open && automation_api_ready || return 0
+    local allow=false
+    if [[ "$ARR_AUTOMATION_ENABLED" == true && "$AUTOMATION_CONTROLS_OK" == true ]] && automation_window_open && automation_api_ready && automation_action_budget;then allow=true;fi
     [[ -f "$script" && ! -L "$script" ]] || return 0
     (
         export SONARR_API_ROOT SONARR_API_KEY RADARR_API_ROOT RADARR_API_KEY
+        export RECOVERY_ALLOW_GRAB="$allow"
         timeout --signal=TERM --kill-after=15 240 /bin/bash "$script" --recover-only
     ) >"$TMP_DIR/media-integrity-recovery.log" 2>&1 || rc=$?
     if ((rc==124 || rc==137)); then
@@ -15692,7 +15696,6 @@ automation_missing_searches() {
     local item target parent kind candidate="$TMP_DIR/automation-missing-candidate.json" hash previous survey_error
     window=$(TZ="$AUTOMATION_TIMEZONE" date -d "@$START_TIME" +%Y%m%d%H)
     for app in Sonarr Radarr; do
-        if [[ "$app" == Sonarr ]] && media_recovery_app_held "$app"; then debug_log "Missing search deferred for $app: media integrity recovery owns an unresolved hold";continue;fi
         surveyed=$(jq -r --arg app "$app" '.missing[$app].surveyedAt // 0' "$AUTOMATION_STATE_FILE")
         previous=$(jq -r --arg app "$app" '.missing[$app].window // ""' "$AUTOMATION_STATE_FILE")
         survey_error=$(jq -r --arg app "$app" '.missing[$app].surveyError // ""' "$AUTOMATION_STATE_FILE")
@@ -16013,6 +16016,7 @@ policy_build_candidate() {
         jq -e --argjson id "$target_id" '.id==$id and .monitored==true and (.tags|length)==0' "$target" >/dev/null || return 1
         file_id=$(jq -r '.movieFileId // 0' "$target"); endpoint=moviefile; kind=movie; command=MoviesSearch; ids_field=movieIds
     fi
+    media_recovery_app_held "$app" "$parent_id" && return 1
     local profile_id; profile_id=$(jq -r '.qualityProfileId // 0' "$parent")
     [[ "$profile_id" =~ ^[1-9][0-9]*$ ]] || return 1
     api_get "$root/qualityprofile/$profile_id" "$key" "$profile" || return 1
@@ -16107,7 +16111,8 @@ policy_finish_tracking() {
         api_get "$root/$kind/$target_id" "$key" "$current" || return 1
         jq -e --argjson id "$target_id" '.id==$id and .monitored==true and .hasFile==false' "$current" >/dev/null || return 1
         local parent="$TMP_DIR/policy-presearch-parent.json" parent_kind=movie parent_id
-        parent_id=$(jq -r '.parentId' <<<"$action"); [ "$app" != Sonarr ] || parent_kind=series
+        parent_id=$(jq -r '.parentId' <<<"$action"); media_recovery_app_held "$app" "$parent_id" && return 1
+        [ "$app" != Sonarr ] || parent_kind=series
         api_get "$root/$parent_kind/$parent_id" "$key" "$parent" || return 1
         jq -e --argjson id "$parent_id" --slurpfile action_record "$action_file" '$action_record[0] as $action | .id==$id and .monitored==true and (.tags|length)==0 and .qualityProfileId==$action.parent.qualityProfileId and
           (if $action.kind=="episode" then any(.seasons[]?; .seasonNumber==$action.target.seasonNumber and .monitored==true) else true end)' "$parent" >/dev/null || return 1
@@ -16525,7 +16530,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | ARR Health Monitor v3.18.0"
+    "START | ARR Health Monitor v3.19.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -16538,7 +16543,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting ARR Health Monitor v3.18.0"
+debug_log "Starting ARR Health Monitor v3.19.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -17159,7 +17164,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "ARR Health Monitor v3.18.0 completed"
+log "ARR Health Monitor v3.19.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""
