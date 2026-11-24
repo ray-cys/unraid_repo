@@ -1,11 +1,18 @@
 #!/bin/bash
 arrayStarted=true
-# Media Cleanup v1.2.0 -- personal Hubble operations
+# Media Cleanup v1.3.0 -- personal Hubble operations
 #
 # PURPOSE: One daily job coordinates Arr deletion/unmonitoring/90-day retirement,
 # proven SAB completed-payload cleanup, and metadata-bin retention. Modules run
 # sequentially: arr -> sab -> quarantine. Each retains its own proof, retry,
 # mount/Mover, recovery-hold, confirmation, retention and action-budget checks.
+# Runtime is cooperatively bounded to 45 minutes. Before new work, transport
+# circuits and per-app write/retirement budgets are checked. Issued changes still
+# complete their read-back/checkpoint; leftovers retry on the next scheduled run.
+# SAB oversized wrappers drain by identity-checked file intents within the same
+# daily byte limit and a 250-file cap. A single file above the byte limit remains
+# protected/reported. Existing correct quarantine permissions are not rewritten.
+# Run receipts include counts, protection reasons, timing and notification backlog.
 # One module failure does not authorize another module to bypass its safeguards.
 # Existing originals remain in GitHub as reference; this file is standalone.
 #
@@ -63,7 +70,7 @@ arrayStarted=true
 
 set -uo pipefail
 umask 077
-MC_VERSION="1.2.0"
+MC_VERSION="1.3.0"
 # One execution switch across every module. Conflicting/unused flags fail before work.
 # In preview, quarantine purge becomes audit; restore requires an explicit execute flag.
 MC_DRY_RUN=false
@@ -87,6 +94,14 @@ MC_STATUS_DIR="/mnt/vault/cloud/logs/script/user_scripts_status"
 # Bounded external operations; failed/unverified delivery stays queued.
 MC_NOTIFY_TIMEOUT_SECONDS=30
 MC_LOCK_WAIT_SECONDS=20
+# Soft deadline: stop at safe boundaries; never interrupt a committed move or
+# its read-back. Limits reset each invocation; no manual reset is required.
+MC_MAX_RUNTIME_SECONDS=2700
+MC_ARR_CONSECUTIVE_FAILURES=3
+MC_ARR_MAX_MUTATIONS=50            # Attempted mutation requests per application.
+MC_ARR_MAX_RETIREMENTS=10          # DELETE requests per application.
+MC_RADARR_MAX_TAG_MOVIES=100       # Bound a bulk editor payload; remainder retries.
+MC_GUARDS_ACTIVE=false
 MC_BRIDGE_ACTIVE=false
 
 mc_state_ready() {
@@ -239,6 +254,9 @@ mc_flush() (
     jq -r '.[] | ("["+.module+"] "+.subject+"\nReported: "+(.epoch|strflocaltime("%Y-%m-%d %H:%M:%S %Z"))+"\n"+.description+"\n"+.message+"\n")
       | explode | map(select(.!=8205 and .!=8419 and .!=65039 and (. < 9728 or . > 10175) and (. < 126976 or . > 129791))) | implode' "$selected" >"$body" || return 1
     printf '\nCurrent run outcomes: %s\nReports retain their original observation time. Pending detail is retained for subsequent daily delivery.\n' "${MC_OUTCOMES:-notification retry only}" >>"$body"
+    mc_backlog_metrics >"$selected.backlog" || return 1
+    jq -r '"Queue before delivery: \(.pendingSections) section(s), \(.pendingBytes) bytes; oldest pending age: \((.oldestAgeSeconds/86400)|floor) day(s)."' "$selected.backlog" >>"$body" || return 1
+    rm -f -- "$selected.backlog"
     importance=$(jq -r 'if any(.[];.importance=="alert") then "alert" elif any(.[];.importance=="warning") then "warning" else "normal" end' "$selected")
     exec {MC_EXPORT_FD}>&-
     timeout --signal=TERM --kill-after=5 "$MC_NOTIFY_TIMEOUT_SECONDS" "$MC_NOTIFY_BIN" -i "$importance" -s "Media Cleanup" -d "Daily cleanup actions and attention" -m "$(cat "$body")"
@@ -274,13 +292,14 @@ mc_help() {
 mc_record_status() (
     local tmp now=$(date +%s)
     mc_export_guard || return 1
+    mc_backlog_metrics >"$MC_TMP/backlog.json" || return 1
     tmp=$(mktemp "$MC_ROOT/.status.XXXXXX") || return 1
     jq -n --arg name media_cleanup --arg version "$MC_VERSION" --arg status "$MC_RESULT" --arg summary "$MC_OUTCOMES" \
       --arg phase "${MC_ACTIVE_MODULE:-none}" --arg run "$MC_RUN_ID" --arg boot "${MC_BOOT_ID:-unknown}" \
       --arg mode "${MC_MODE:-manual}" --argjson epoch "$now" --argjson started "$MC_STARTED" --argjson pid "$$" \
-      --slurpfile modules "$MC_TMP/outcomes.json" \
+      --slurpfile modules "$MC_TMP/outcomes.json" --slurpfile backlog "$MC_TMP/backlog.json" \
       '{schema:1,name:$name,scriptVersion:$version,status:$status,mode:$mode,summary:$summary,phase:$phase,runId:$run,bootId:$boot,pid:$pid,
-        startedAt:$started,epoch:$epoch,duration_seconds:($epoch-$started),modules:$modules[0]}' >"$tmp" && mc_publish "$tmp" "$MC_ROOT/latest-run.json" || return 1
+        startedAt:$started,epoch:$epoch,duration_seconds:($epoch-$started),modules:$modules[0],notificationBacklog:$backlog[0]}' >"$tmp" && mc_publish "$tmp" "$MC_ROOT/latest-run.json" || return 1
     case "${MC_MODE:-manual}" in all|--execute) ;; *) return 0;; esac
     [[ ! -L "$MC_STATUS_DIR" ]] || return 1
     mkdir -p -- "$MC_STATUS_DIR" || return 1
@@ -311,11 +330,15 @@ mc_run_module() {
     mc_log INFO "Starting module=$module" || { mc_self_failure "Cannot write operational log; $module not started";return 1; }
     # Give only this job a process group. The supervisor waits for tee so output
     # is complete before result inspection. No Docker processes are signalled.
+    if ! mc_work_allowed "$module";then
+      jq -n --arg reason "$(cat "$MC_TMP/deferred-$module")" --arg module "$module" '{module:$module,status:"DEFERRED",reason:$reason,exit:75,metrics:{notStarted:true}}' >"$MC_TMP/$module.result.json" || return 1
+    fi
     set -m
     (
       trap - EXIT INT TERM
       set +m
       local -a codes
+      if [[ -f "$MC_TMP/deferred-$module" ]];then exit 0;fi
       case "$module" in
         arr) mc_arr "$@" 2>&1 | tee "$preview";codes=("${PIPESTATUS[@]}");;
         sab) mc_sab "$@" 2>&1 | tee "$preview";codes=("${PIPESTATUS[@]}");;
@@ -340,9 +363,10 @@ mc_run_module() {
       WARNING) [[ "$MC_RESULT" == ATTENTION ]] || MC_RESULT=WARNING;mc_note "$module" healthy 'Workflow completed' "$reason" || return 1;;
       *) mc_note "$module" healthy 'Workflow completed' "$reason" || return 1;;
     esac
+    [[ -f "$MC_TMP/$module.result.json" ]] || printf '{}' >"$MC_TMP/$module.result.json"
     next="$MC_TMP/outcomes.next"
-    jq --arg module "$module" --arg status "$status" --arg reason "$reason" --argjson rc "$rc" --argjson duration "$(( $(date +%s)-start ))" \
-      '.+[{module:$module,status:$status,reason:$reason,exit:$rc,duration_seconds:$duration}]' "$MC_TMP/outcomes.json" >"$next" && mv "$next" "$MC_TMP/outcomes.json" || { mc_self_failure "Cannot record $module outcome";return 1; }
+    jq --arg module "$module" --arg status "$status" --arg reason "$reason" --argjson rc "$rc" --argjson duration "$(( $(date +%s)-start ))" --slurpfile result "$MC_TMP/$module.result.json" \
+      '.+[{module:$module,status:$status,reason:$reason,exit:(if $rc!=0 then $rc else ($result[0].exit//$rc) end),duration_seconds:$duration,metrics:($result[0].metrics//{})}]' "$MC_TMP/outcomes.json" >"$next" && mv "$next" "$MC_TMP/outcomes.json" || { mc_self_failure "Cannot record $module outcome";return 1; }
     MC_OUTCOMES+="${MC_OUTCOMES:+; }$module=$status ($(( $(date +%s)-start ))s): $reason"
     mc_log INFO "Completed module=$module status=$status exit=$rc runtime=$(( $(date +%s)-start ))s; $reason" || { mc_self_failure 'Cannot write completion log';return 1; }
     return 0
@@ -363,7 +387,10 @@ mc_main() {
     MC_DRY_RUN="$MC_EFFECTIVE_DRY"
     mc_state_ready || { mc_preflight_failure;return 1; }
     exec {fd}>"$MC_LOCK";flock -n "$fd" || { printf 'Media cleanup already active; no duplicate actions.\n';return 0; }
-    MC_STARTED=$(date +%s);MC_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
+    for self in MC_MAX_RUNTIME_SECONDS MC_ARR_CONSECUTIVE_FAILURES MC_ARR_MAX_MUTATIONS MC_ARR_MAX_RETIREMENTS MC_RADARR_MAX_TAG_MOVIES;do
+      [[ "${!self}" =~ ^[1-9][0-9]*$ ]] || { printf 'Invalid positive limit: %s\n' "$self" >&2;return 2; }
+    done
+    MC_STARTED=$(date +%s);MC_DEADLINE=$((MC_STARTED+MC_MAX_RUNTIME_SECONDS));MC_GUARDS_ACTIVE=true;MC_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
     MC_BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf unknown)
     if [[ -f "$MC_ROOT/latest-run.json" ]]; then
       if ! jq -e '.schema==1 and (.status|type)=="string"' "$MC_ROOT/latest-run.json" >/dev/null; then
@@ -424,7 +451,17 @@ mc_finish_module() {
     local module="$1" rc="$2";shift 2
     local status=COMPLETED reason="Native workflow completed" temp
     [[ -d "${MC_TMP:-}" ]] || return "$rc"
-    if (( rc!=0 )); then status=FAILED; reason="Native workflow returned $rc"
+    local scope deferred=""
+    if [[ "${MC_GUARDS_ACTIVE:-false}" == true ]];then
+      [[ ! -f "$MC_TMP/deferred-$module" ]] || deferred+="$(cat "$MC_TMP/deferred-$module"); "
+      if [[ "$module" == arr ]];then
+        for scope in SONARR RADARR RADARR_TAG_REMAINDER;do [[ ! -f "$MC_TMP/deferred-$scope" ]] || deferred+="$scope: $(cat "$MC_TMP/deferred-$scope"); ";done
+      fi
+    fi
+    if [[ -f "$MC_TMP/failed-$module" ]];then status=FAILED;reason="$(cat "$MC_TMP/failed-$module"); $deferred"
+    elif [[ "$module" == sab && "${ERRORS:-0}" != 0 ]];then status=FAILED;reason="SAB cleanup recorded $ERRORS error(s); $deferred"
+    elif [[ -n "$deferred" ]];then status=DEFERRED;reason="$deferred"
+    elif (( rc!=0 )); then status=FAILED; reason="Native workflow returned $rc"
     else
         case "$module" in
           arr)
@@ -456,9 +493,11 @@ mc_finish_module() {
     if [[ "$module" == arr && "$status" == COMPLETED && -f "$MC_TMP/arr.result.json" ]]; then
       status=$(jq -r .status "$MC_TMP/arr.result.json");reason=$(jq -r .reason "$MC_TMP/arr.result.json")
     fi
+    mc_module_metrics "$module" >"$MC_TMP/$module.metrics.json" || return 1
     temp=$(mktemp "$MC_TMP/.module-result.XXXXXX") || return 1
-    jq -n --arg module "$module" --arg status "$status" --arg reason "$reason" --argjson rc "$rc" \
-      '{module:$module,status:$status,reason:$reason,exit:$rc}' >"$temp" && mv "$temp" "$MC_TMP/$module.result.json" || return 1
+    jq -n --arg module "$module" --arg status "$status" --arg reason "$reason" --argjson rc "$rc" --slurpfile metrics "$MC_TMP/$module.metrics.json" \
+      '{module:$module,status:$status,reason:$reason,exit:$rc,metrics:$metrics[0]}' >"$temp" && mv "$temp" "$MC_TMP/$module.result.json" || return 1
+    [[ "$status" != DEFERRED ]] || return 0
     return "$rc"
 }
 
@@ -664,6 +703,90 @@ mc_emergency_notice() (
 )
 
 
+# Cooperative limits apply only to this supervised invocation. Finish any
+# already-issued mutation/read-back and its durable checkpoint before stopping.
+mc_defer_work() {
+    local scope="$1" reason="$2"
+    [[ "${MC_GUARDS_ACTIVE:-false}" == true && -d "${MC_TMP:-}" ]] || return 0
+    [[ -f "$MC_TMP/deferred-$scope" ]] || printf '%s\n' "$reason" >"$MC_TMP/deferred-$scope"
+}
+
+mc_work_allowed() {
+    local scope="$1" now
+    [[ "${MC_GUARDS_ACTIVE:-false}" == true && -d "${MC_TMP:-}" ]] || return 0
+    [[ ! -f "$MC_TMP/deferred-$scope" ]] || return 1
+    now=$(date +%s)
+    if ((now>=MC_DEADLINE)); then
+        mc_defer_work "$scope" "Overall ${MC_MAX_RUNTIME_SECONDS}s budget reached; completed work retained; remaining candidates retry next scheduled run"
+        return 1
+    fi
+}
+
+mc_arr_write_reserve() {
+    local method="$1" endpoint="$2" file count=0 retired=0
+    [[ "${MC_GUARDS_ACTIVE:-false}" == true && "$method" != GET ]] || return 0
+    file="$MC_TMP/arr-${APP_CONTEXT}.writes"
+    [[ ! -f "$file" ]] || read -r count retired <"$file"
+    if ((count>=MC_ARR_MAX_MUTATIONS)) || { [[ "$method" == DELETE ]] && ((retired>=MC_ARR_MAX_RETIREMENTS)); };then
+        mc_defer_work "$APP_CONTEXT" "Arr write budget reached ($count requests, $retired retirements); unapplied candidates remain eligible next run"
+        return 1
+    fi
+    [[ "$method" != DELETE ]] || retired=$((retired+1))
+    printf '%s %s\n' "$((count+1))" "$retired" >"$file"
+}
+
+mc_arr_request() {
+    local rc=0 transport=0 http=200 failures=0 file scope="${APP_CONTEXT:-UNKNOWN}"
+    mc_work_allowed "$scope" || return 75
+    mc_arr_write_reserve "$@" || return 75
+    file="${MC_TMP:-}/arr-$scope.transport"
+    [[ "${MC_GUARDS_ACTIVE:-false}" != true ]] || rm -f -- "$file"
+    mc_timed_call api arr_api_request_core "$@" || rc=$?
+    if [[ "${MC_GUARDS_ACTIVE:-false}" == true && -f "$file" ]];then
+        read -r transport http <"$file"
+        [[ ! -f "$MC_TMP/arr-$scope.failures" ]] || read -r failures <"$MC_TMP/arr-$scope.failures"
+        if [[ "$http" == 401 || "$http" == 403 ]];then failures="$MC_ARR_CONSECUTIVE_FAILURES"
+        elif ((transport!=0)) || [[ "$http" == 408 || "$http" == 425 || "$http" == 429 || "$http" == 5?? ]];then failures=$((failures+1));else failures=0;fi
+        printf '%s\n' "$failures" >"$MC_TMP/arr-$scope.failures"
+        if ((failures>=MC_ARR_CONSECUTIVE_FAILURES));then
+            mc_defer_work "$scope" "Arr circuit breaker opened after $failures consecutive authentication/transport/rate-limit/server failures; no further requests sent to this application"
+        fi
+    fi
+    return "$rc"
+}
+
+mc_backlog_metrics() {
+    local state="$MC_ROOT/notification-outbox.json" now=$(date +%s)
+    if [[ -f "$state" ]];then
+        jq --argjson now "$now" '{pendingSections:(.events|length),pendingBytes:([.events[].message|utf8bytelength]|add//0),
+          oldestAgeSeconds:(if (.events|length)>0 then ($now-([.events[].epoch]|min)|[.,0]|max) else 0 end)}' "$state"
+    else printf '{"pendingSections":0,"pendingBytes":0,"oldestAgeSeconds":0}\n';fi
+}
+
+mc_module_metrics() {
+  local module="$1" file scope
+  case "$module" in
+    arr)
+      local -a files=()
+      for scope in SONARR RADARR;do file="$MC_TMP/arr-$scope.metrics.json";[[ ! -f "$file" ]] || files+=("$file");done
+      if ((${#files[@]}>0));then jq -s '{applications:.}' "${files[@]}";else printf '{"applications":[],"inventoryComplete":false}\n';fi;;
+    sab)
+      jq -n --argjson scanned "${SCANNED:-0}" --argjson quarantined "${QUARANTINED:-0}" --argjson purged "${PURGED:-0}" \
+       --argjson bytes "${BYTES_PURGED:-0}" --argjson files "${SAB_PURGED_FILES:-0}" --argjson partial "${SAB_PARTIAL_PURGES:-0}" \
+       --argjson remaining "${SAB_PURGE_REMAINING:-0}" --argjson protected "${QUEUE_PROTECTED:-0}" --argjson unproven "${HISTORY_UNPROVEN:-0}" \
+       --argjson unverified "${DESTINATION_UNVERIFIED:-0}" --argjson backups "$((${NZB_BACKUPS_REMOVED:-0}+${APP_BACKUPS_REMOVED:-0}))" \
+       --argjson errors "${ERRORS:-0}" --argjson remainingWrappers "$((${SAB_EXPIRED_WRAPPERS:-0}-${PURGED:-0}))" \
+       --argjson oldest "${SAB_OLDEST_EXPIRED_EPOCH:-0}" '{oldestEligibleQuarantineEpoch:$oldest,remainingExpiredWrappers:$remainingWrappers,scanned:$scanned,quarantined:$quarantined,purgedWrappers:$purged,purgedBytes:$bytes,
+         incrementallyPurgedFiles:$files,partialWrappers:$partial,remainingPurgeDeferrals:$remaining,
+         protectedByQueue:$protected,importProofUnproven:$unproven,destinationUnverified:$unverified,routineBackupsExpired:$backups,errors:$errors}' ;;
+    quarantine)
+      jq -n --argjson runs "${RUNS_SCANNED:-0}" --argjson expired "${EXPIRED_RUNS:-0}" --argjson purged "${PURGED_RUNS:-0}" \
+       --argjson files "${PURGED_FILES:-0}" --argjson bytes "${PURGED_BYTES:-0}" --argjson remaining "${REMAINING_EXPIRED_RUNS:-0}" \
+       --argjson unmanaged "${UNMANAGED_ENTRIES:-0}" --argjson errors "${SCAN_ERRORS:-0}" \
+       '{runsScanned:$runs,expiredRuns:$expired,purgedRuns:$purged,purgedFiles:$files,purgedBytes:$bytes,remainingExpiredRuns:$remaining,unmanagedEntries:$unmanaged,scanErrors:$errors}' ;;
+  esac
+}
+
 mc_timed_call() {
     local kind="$1" function="$2" start rc=0 end;shift 2
     if [[ -z "${MC_TMP:-}" || ! -d "$MC_TMP" ]]; then "$function" "$@";return $?;fi
@@ -676,19 +799,31 @@ mc_timed_call() {
 
 mc_arr_metrics() {
     [[ -d "${MC_TMP:-}" ]] || return 0
-    local api=0 hashing=0 total=$(( $(date +%s)-MC_COMPONENT_STARTED )) other
+    local inventory_complete=false
+    [[ "${MC_COMPONENT_COMPLETED:-false}" != true || -f "$MC_TMP/deferred-$APP_CONTEXT" ]] || inventory_complete=true
+    (($((${API_FAILURES:-0}+${HISTORY_FAILURES:-0}+${SIDECAR_FAILURES:-0}))==0)) || inventory_complete=false
+    local api=0 hashing=0 total=$(( $(date +%s)-${MC_COMPONENT_STARTED:-$(date +%s)} )) other
     if [[ -f "$MC_TMP/arr-$APP_CONTEXT.timings" ]]; then
       IFS=' ' read -r api hashing < <(awk '$1=="api"{a+=$2}$1=="hash"{h+=$2}END{printf "%.0f %.0f\n",a,h}' "$MC_TMP/arr-$APP_CONTEXT.timings")
     fi
     other=$((total*1000-api-hashing)); ((other>=0)) || other=0
     log INFO "TIMING | total=${total}s api=${api}ms sidecar-capture=${hashing}ms planning-state-other=${other}ms"
+    jq -n --arg app "$APP_CONTEXT" --argjson inventoryComplete "$inventory_complete" --argjson api "$api" --argjson hashing "$hashing" --argjson other "$other" \
+      --argjson scanned "$((${SERIES_SCANNED:-0}+${MOVIES_SCANNED:-0}))" --argjson present "${FILES_PRESENT:-0}" \
+      --argjson sidecars "${SIDECARS_CAPTURED:-0}" --argjson moved "${SIDECARS_QUARANTINED:-0}" --argjson folders "${FOLDERS_REMOVED:-0}" \
+      --argjson retired "${ARR_REMOVALS:-0}" --argjson episodeActions "${EPISODE_ACTIONS:-0}" --argjson seasonActions "${SEASON_ACTIONS:-0}" \
+      --argjson seriesActions "${SERIES_ACTIONS:-0}" --argjson tagActions "${TAG_ACTIONS:-0}" \
+      --argjson confirmed "$((${EPISODES_CONFIRMED:-0}+${MOVIES_CONFIRMED:-0}))" --argjson pending "${FOLDER_CLEANUP_PENDING:-0}" --argjson mover "${MOVER_DEFERRALS:-0}" \
+      --argjson errors "$((${API_FAILURES:-0}+${HISTORY_FAILURES:-0}+${SIDECAR_FAILURES:-0}))" \
+      '{application:$app,inventoryComplete:$inventoryComplete,confirmedCandidates:$confirmed,episodeActions:$episodeActions,seasonActions:$seasonActions,seriesActions:$seriesActions,tagActions:$tagActions,scanned:$scanned,filesPresent:$present,sidecarsCaptured:$sidecars,sidecarsQuarantined:$moved,foldersRemoved:$folders,
+        retired:$retired,pendingFolderCleanup:$pending,moverDeferrals:$mover,errors:$errors,timingMs:{api:$api,sidecarCapture:$hashing,planningStateOther:$other}}' >"$MC_TMP/arr-$APP_CONTEXT.metrics.json" || return 1
     if (( ${MOVER_DEFERRALS:-0}>0 || ${FOLDER_CLEANUP_PENDING:-0}>0 )); then
       jq -n --arg reason "Mover deferrals=${MOVER_DEFERRALS:-0}; pending folders=${FOLDER_CLEANUP_PENDING:-0}; completed actions retained" \
         '{module:"arr",status:"WARNING",reason:$reason,exit:0}' >"$MC_TMP/arr.result.json" || return 1
     fi
 }
 
-api_request() { mc_timed_call api arr_api_request_core "$@"; }
+api_request() { mc_arr_request "$@"; }
 capture_kodi_sidecars() { mc_timed_call hash capture_kodi_sidecars_core "$@"; }
 
 # Shared durable operations and notification helpers (one implementation).
@@ -1705,6 +1840,7 @@ die() {
 
 cleanup_app() {
     local status=$?
+    [[ ! -d "${MC_TMP:-}" || -f "$MC_TMP/arr-${APP_CONTEXT:-UNKNOWN}.metrics.json" ]] || mc_arr_metrics || true
     [[ -n "$WORK_STATE" && -f "$WORK_STATE" ]] && rm -f -- "$WORK_STATE"
     [[ -n "$CURRENT_SNAPSHOT_FILE" && -f "$CURRENT_SNAPSHOT_FILE" ]] &&
         rm -f -- "$CURRENT_SNAPSHOT_FILE"
@@ -1967,6 +2103,7 @@ mc_sidecar_path_bytes() { local LC_ALL=C; MC_PATH_BYTES=${#1}; }
 
 mc_sidecar_batch() (
     local batch="$1";shift
+    mc_work_allowed "${APP_CONTEXT:-arr}" || return 75
     (( $#>0 )) || return 0
     local temp file size identity type hash row i=0
     local -a files=() sizes=() identities=()
@@ -3012,6 +3149,7 @@ arr_api_request_core() {
         )"
     fi
     curl_status=$?
+    if [[ "${MC_GUARDS_ACTIVE:-false}" == true ]];then printf '%s %s\n' "$curl_status" "${http_status:-000}" >"$MC_TMP/arr-$APP_CONTEXT.transport";fi
 
     if (( curl_status != 0 )) || ! [[ "$http_status" =~ ^2[0-9][0-9]$ ]]; then
         message="$({ tr '\r\n' ' ' < "$err"; tr '\r\n' ' ' < "$body"; } | cut -c1-500)"
@@ -4014,7 +4152,7 @@ sonarr_commit_state() {
 
 run_sonarr() (
 APP_CONTEXT="SONARR"
-MC_COMPONENT_STARTED=$(date +%s)
+MC_COMPONENT_STARTED=$(date +%s);MC_COMPONENT_COMPLETED=false
 ARR_NAME="Sonarr"
 ARR_URL="$SONARR_URL"
 ARR_API_KEY="$SONARR_API_KEY"
@@ -4173,6 +4311,7 @@ fi
 # candidate. No episode-file lookups, refresh commands, or same-run waits occur.
 while IFS= read -r SERIES_ID; do
     [[ -n "$SERIES_ID" ]] || continue
+    mc_work_allowed SONARR || break
     [[ "$SERIES_ID" =~ ^[1-9][0-9]*$ ]] || die "Invalid stored Sonarr series ID; state preserved."
     if media_recovery_app_held Sonarr "$SERIES_ID"; then log INFO "Series $SERIES_ID deletion/retirement deferred: integrity recovery holds its exact media; state preserved";continue;fi
     SERIES_ITEM="${SONARR_CATALOG_INDEX[$SERIES_ID]:-}"
@@ -4565,9 +4704,10 @@ done < <(
 )
 
 sonarr_prune_state "$SERIES" || die "Could not prune stale Sonarr state safely."
-sonarr_commit_state || die "Could not atomically save state."
+sonarr_commit_state || { [[ ! -d "${MC_TMP:-}" ]] || printf 'Sonarr state commit failed\n' >>"$MC_TMP/failed-arr";die "Could not atomically save state."; }
 WORK_STATE=""
 
+MC_COMPONENT_COMPLETED=true
 mc_arr_metrics || die "Cannot record Arr timing/protection outcome."
 ACTION_LABEL=applied
 [[ "$DRY_RUN" == true ]] && ACTION_LABEL=would-apply
@@ -4843,9 +4983,11 @@ main() {
 
     if [[ "$mode" == all || "$mode" == sonarr ]]; then
         run_sonarr || sonarr_rc=$?
+        if ((sonarr_rc!=0)) && [[ -d "${MC_TMP:-}" && ! -f "$MC_TMP/deferred-SONARR" ]];then printf 'Sonarr workflow failed with exit=%s\n' "$sonarr_rc" >>"$MC_TMP/failed-arr";fi
     fi
     if [[ "$mode" == all || "$mode" == radarr ]]; then
         run_radarr || radarr_rc=$?
+        if ((radarr_rc!=0)) && [[ -d "${MC_TMP:-}" && ! -f "$MC_TMP/deferred-RADARR" ]];then printf 'Radarr workflow failed with exit=%s\n' "$radarr_rc" >>"$MC_TMP/failed-arr";fi
     fi
 
     APP_CONTEXT="MAIN"
@@ -4856,7 +4998,10 @@ main() {
             "Sonarr exit status: ${sonarr_rc}; Radarr exit status: ${radarr_rc}. Successful actions remain committed; only incomplete work is reconsidered next run. No unverified retirement removal is reported as successful."$'\n'"$(current_workflow_error_details)"
     fi
 
-    send_grouped_notification || notification_rc=$?
+    send_grouped_notification || {
+        notification_rc=$?
+        [[ ! -d "${MC_TMP:-}" ]] || printf 'Arr report handoff failed; producer outbox retained\n' >>"$MC_TMP/failed-arr"
+    }
 
     if (( sonarr_rc != 0 || radarr_rc != 0 )); then
         return 2
@@ -5518,7 +5663,7 @@ radarr_movie_name() {
 
 run_radarr() (
 APP_CONTEXT="RADARR"
-MC_COMPONENT_STARTED=$(date +%s)
+MC_COMPONENT_STARTED=$(date +%s);MC_COMPONENT_COMPLETED=false
 ARR_NAME="Radarr"
 ARR_URL="$RADARR_URL"
 ARR_API_KEY="$RADARR_API_KEY"
@@ -5660,6 +5805,7 @@ if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( FILES_PRESENT > 0 )); then
     RADARR_CAPTURE_SCANNED=0
     while IFS= read -r MOVIE_WITH_FILE; do
         [[ -n "$MOVIE_WITH_FILE" ]] || continue
+        mc_work_allowed RADARR || break
         MOVIE_ID="$(jq -r '.id' <<< "$MOVIE_WITH_FILE")"
         (( RADARR_CAPTURE_SCANNED+=1 ))
         if (( RADARR_CAPTURE_SCANNED==1 || RADARR_CAPTURE_SCANNED%PROGRESS_LOG_EVERY==0 )); then
@@ -5746,6 +5892,11 @@ if (( MOVIES_CONFIRMED > 0 )); then
         ACTION_CANDIDATES="$(radarr_movies_missing_tag "$CONFIRMED" "$PLEX_DELETED_MOVIE_TAG_ID")" ||
             die "Could not calculate movies that need the '$PLEX_DELETED_MOVIE_TAG' tag."
         ACTION_CANDIDATE_COUNT="$(jq length <<< "$ACTION_CANDIDATES")"
+        if [[ "${MC_GUARDS_ACTIVE:-false}" == true ]] && ((ACTION_CANDIDATE_COUNT>MC_RADARR_MAX_TAG_MOVIES));then
+            mc_defer_work RADARR_TAG_REMAINDER "$((ACTION_CANDIDATE_COUNT-MC_RADARR_MAX_TAG_MOVIES)) movie tag candidates remain beyond the bulk limit; retry next run"
+            ACTION_CANDIDATES=$(jq -c --argjson limit "$MC_RADARR_MAX_TAG_MOVIES" 'sort_by(.id)|.[:$limit]' <<<"$ACTION_CANDIDATES") || return 1
+            ACTION_CANDIDATE_COUNT=$(jq length <<<"$ACTION_CANDIDATES")
+        fi
 
         if (( ACTION_CANDIDATE_COUNT == 0 )); then
             log DEBUG "All $MOVIES_CONFIRMED confirmed movie(s) already have the '$PLEX_DELETED_MOVIE_TAG' tag."
@@ -5921,9 +6072,10 @@ radarr_process_retirements "$RADARR_ACTION_SNAPSHOT_FILE" || {
         "No unsafe removal was attempted; unfinished retirement work will be retried next run."
 }
 radarr_prune_state "$CURRENT_SNAPSHOT_FILE" || die "Could not prune stale Radarr state safely."
-radarr_commit_state || die "Could not atomically save state."
+radarr_commit_state || { [[ ! -d "${MC_TMP:-}" ]] || printf 'Radarr state commit failed\n' >>"$MC_TMP/failed-arr";die "Could not atomically save state."; }
 WORK_STATE=""
 
+MC_COMPONENT_COMPLETED=true
 mc_arr_metrics || die "Cannot record Arr timing/protection outcome."
 ACTION_LABEL=applied
 [[ "$DRY_RUN" == true ]] && ACTION_LABEL=would-apply
@@ -6023,6 +6175,7 @@ QUARANTINE_RETENTION_DAYS="${QUARANTINE_RETENTION_DAYS:-14}"
 # Limit real quarantine moves per run. Zero means unlimited.
 MAX_QUARANTINES_PER_RUN="${MAX_QUARANTINES_PER_RUN:-10}"
 MAX_PURGES_PER_RUN="${MAX_PURGES_PER_RUN:-25}"
+MAX_PURGE_FILES_PER_RUN="${MAX_PURGE_FILES_PER_RUN:-250}"
 MAX_PURGE_BYTES_PER_RUN="${MAX_PURGE_BYTES_PER_RUN:-107374182400}"
 PURGE_RECEIPT_RETENTION_DAYS=365
 PURGE_RECEIPT_DIR="$MC_ROOT/sab/purge-receipts"
@@ -6178,6 +6331,7 @@ SAFETY_SKIPPED=0
 MOVER_PROTECTED=0
 ELIGIBLE=0
 QUARANTINED=0
+SAB_PURGED_FILES=0;SAB_PARTIAL_PURGES=0;SAB_PURGE_REMAINING=0;SAB_EXPIRED_WRAPPERS=0;SAB_OLDEST_EXPIRED_EPOCH=0
 PURGED=0
 ERRORS=0
 BYTES_ELIGIBLE=0
@@ -6252,18 +6406,20 @@ OPS_LOG_BYTES=""
 
 ops_operation_begin() {
     local kind="$1" source="$2" destination="$3" proof="$4" identity="" id tmp
+    mc_work_allowed sab || return 75
     ops_operation_state || return 1
     ops_operation_paths_valid "$source" "$destination" || { ops_log ERROR "Unsafe operation paths; checkpoint and mutation refused: $source -> $destination"; return 1; }
     id=$(printf '%s' "$kind|$source|$destination" | sha256sum | cut -d ' ' -f1)
     if jq -e --arg id "$id" '.operations[$id]!=null' "$OPS_PENDING_OPERATIONS_FILE" >/dev/null; then
         # A partial purge resumes only after the caller's normal retention,
         # inventory, Mover and byte-limit checks. Its original evidence stays.
-        [[ "$kind" == purge ]] || { ops_log ERROR "Restore already pending; reconciliation required ($id)."; return 1; }
+        [[ "$kind" == purge || "$kind" == purge-file ]] || { ops_log ERROR "Restore already pending; reconciliation required ($id)."; return 1; }
         printf '%s' "$id"; return 0
     fi
     [[ -f "$proof" ]] || return 1
     ops_flush_file "$proof" || return 1
     ops_flush_directory "$(dirname -- "$proof")" || return 1
+    if [[ "$kind" == purge-file ]];then identity=$(stat -c '%d:%i:%f:%s:%y:%z' -- "$source") || return 1;fi
     if [[ "$kind" == restore ]]; then identity=$(stat -c '%d:%i:%F:%s' -- "$source") || return 1; fi
     tmp=$(mktemp "$LOG_DIR/.operation-intent.XXXXXX") || return 1
     jq --arg id "$id" --arg kind "$kind" --arg source "$source" --arg destination "$destination" \
@@ -6285,12 +6441,27 @@ ops_recover_operations() {
         id=$(jq -r '.key' <<<"$entry"); kind=$(jq -r '.value.kind' <<<"$entry")
         source=$(jq -r '.value.source' <<<"$entry"); destination=$(jq -r '.value.destination' <<<"$entry")
         ops_operation_paths_valid "$source" "$destination" || { ops_log ERROR "Unsafe pending operation preserved: $id"; failed=$((failed+1)); continue; }
-        if [[ "$kind" == purge && -z "$destination" ]]; then
+        if [[ "$kind" == purge-file && -z "$destination" ]];then
+            identity=$(jq -r '.value.identity // ""' <<<"$entry")
+            if [[ ! -e "$source" && ! -L "$source" ]];then
+                ops_operation_finish "$id" 'Reconciled interrupted file purge: absence verified; no new deletion' || return 1
+                OPS_RECOVERED_COUNT=$((OPS_RECOVERED_COUNT+1));OPS_RECOVERY_DETAILS+="- Reconciled interrupted file purge: $source is absent; no repeat unlink."$'\n'
+            elif [[ -f "$source" && ! -L "$source" && -n "$identity" && "$(stat -c '%d:%i:%f:%s:%y:%z' -- "$source")" == "$identity" ]];then
+                ops_log WARNING "Interrupted file purge retained for fresh retention, Mover and budget checks: $source"
+            else ops_log ERROR "Interrupted file identity changed; preserved: $source";failed=$((failed+1));fi
+        elif [[ "$kind" == purge && -z "$destination" ]]; then
             if [[ ! -e "$source" && ! -L "$source" ]]; then
                 ops_operation_finish "$id" "Reconciled interrupted purge: directory absence confirmed; no new deletion performed" || return 1
                 OPS_RECOVERY_DETAILS+="- Reconciled interrupted purge: $source is absent. No new deletion was needed. Operation $id."$'\n'
                 OPS_RECOVERED_COUNT=$((OPS_RECOVERED_COUNT+1))
             elif [[ -d "$source" && ! -L "$source" ]]; then
+                check_mover_guard 'before reconciling an empty purged wrapper' || { failed=$((failed+1));continue; }
+                if rmdir -- "$source" 2>/dev/null;then
+                    ops_flush_directory "${source%/*}" || return 1
+                    ops_operation_finish "$id" 'Interrupted purge reconciled: remaining empty wrapper removed; no files deleted' || return 1
+                    OPS_RECOVERED_COUNT=$((OPS_RECOVERED_COUNT+1));OPS_RECOVERY_DETAILS+="- Removed interrupted empty purge wrapper: $source; no payload files deleted."$'\n'
+                    continue
+                fi
                 ops_log WARNING "Incomplete purge preserved: $source; remaining files will be retried only after normal retention, idle, Mover and execution-limit checks. Operation $id."
             else
                 ops_log ERROR "Interrupted purge source changed type; preserved for review: $source (operation $id)"; failed=$((failed+1))
@@ -6613,12 +6784,12 @@ normalize_quarantine_permissions() {
     failed=true
   fi
 
-  if ! find "$target_real" -xdev -type d -exec chmod -- "$QUARANTINE_DIRECTORY_MODE" {} +; then
+  if ! find "$target_real" -xdev -type d ! -perm "$QUARANTINE_DIRECTORY_MODE" -exec chmod -- "$QUARANTINE_DIRECTORY_MODE" {} +; then
     log "ERROR" "Unable to set quarantine directory mode $QUARANTINE_DIRECTORY_MODE: $target_real"
     failed=true
   fi
 
-  if ! find "$target_real" -xdev -type f -exec chmod -- "$QUARANTINE_FILE_MODE" {} +; then
+  if ! find "$target_real" -xdev -type f ! -perm "$QUARANTINE_FILE_MODE" -exec chmod -- "$QUARANTINE_FILE_MODE" {} +; then
     log "ERROR" "Unable to set quarantine file mode $QUARANTINE_FILE_MODE: $target_real"
     failed=true
   fi
@@ -6653,6 +6824,8 @@ validate_common_environment() {
   validate_integer "LOG_KEEP" "$LOG_KEEP" || valid=false
   validate_integer "MAX_PURGES_PER_RUN" "$MAX_PURGES_PER_RUN" || valid=false
   validate_integer "MAX_PURGE_BYTES_PER_RUN" "$MAX_PURGE_BYTES_PER_RUN" || valid=false
+  validate_integer "MAX_PURGE_FILES_PER_RUN" "$MAX_PURGE_FILES_PER_RUN" || valid=false
+  [[ "$MAX_PURGE_FILES_PER_RUN" =~ ^[1-9][0-9]*$ ]] || { log ERROR "MAX_PURGE_FILES_PER_RUN must be positive";valid=false; }
   validate_integer "CURL_CONNECT_TIMEOUT" "$CURL_CONNECT_TIMEOUT" || valid=false
   validate_integer "CURL_MAX_TIME" "$CURL_MAX_TIME" || valid=false
 
@@ -6934,6 +7107,7 @@ notify_mover_skip() {
 }
 
 check_mover_guard() {
+  mc_work_allowed sab || return 21
   local context="$1"
 
   mover_is_running || return 0
@@ -7065,6 +7239,7 @@ cleanup_backup_class() {
     return 1
   fi
   while IFS= read -r -d '' file; do
+    mc_work_allowed sab || return 21
     process_backup_candidate "$backup_kind" "$file"
     candidate_status=$?
 
@@ -7107,18 +7282,18 @@ cleanup_backups() {
   if [[ -n "$NZB_BACKUP_DIR_REAL" ]]; then
     cleanup_backup_class nzb
     operation_status=$?
-    (( operation_status == 20 )) && return 20
+    (( operation_status == 20 || operation_status == 21 )) && return "$operation_status"
     (( operation_status == 0 )) || cleanup_failed=true
   fi
 
   cleanup_backup_class application
   operation_status=$?
-  (( operation_status == 20 )) && return 20
+  (( operation_status == 20 || operation_status == 21 )) && return "$operation_status"
   (( operation_status == 0 )) || cleanup_failed=true
 
   remove_empty_nzb_backup_directories
   operation_status=$?
-  (( operation_status == 20 )) && return 20
+  (( operation_status == 20 || operation_status == 21 )) && return "$operation_status"
 
   ! is_true "$cleanup_failed"
 }
@@ -7208,6 +7383,7 @@ fetch_sab_history() {
   local output
 
   while (( page < SAB_HISTORY_MAX_PAGES )); do
+    mc_work_allowed sab || return 21
     output="$TMP_DIR/sab_history_page_${page}.json"
 
     if ! sab_get history "$output" "start=$start" "limit=$SAB_HISTORY_PAGE_SIZE"; then
@@ -7973,7 +8149,7 @@ inspect_quarantines() {
   find "$root/items" -mindepth 3 -maxdepth 3 -name '.sabnzbd-cleanup-manifest.json' -type f -print0 >"$list" || return 1
   while IFS= read -r -d '' manifest; do
     jq -c --arg wrapper "${manifest%/*}" --argjson now "$(date +%s)" \
-      '{wrapper:$wrapper,job:.jobName,originalPath,state:(.state // "committed"),quarantinedAt,quarantinedEpoch,bytes,
+      '{wrapper:$wrapper,job:.jobName,originalPath,state:(.state // "committed"),quarantinedAt,quarantinedEpoch,bytes,incrementalPurgeStarted:(.incrementalPurgeStarted // false),
         ageDays:(if (.quarantinedEpoch // 0)>0 then (($now-.quarantinedEpoch)/86400|floor) else null end)}' "$manifest" || return 1
   done <"$list"
 }
@@ -7981,10 +8157,14 @@ inspect_quarantines() {
 restore_quarantine_payload() {
   OPS_QUARANTINE_ROOT="$QUARANTINE_DIR_REAL"
   OPS_RESTORE_ROOTS=("$SAB_MOVIE_DIR_REAL" "$SAB_TV_DIR_REAL")
-  local operation_id
+  local operation_id partial_notice=""
   local wrapper="$1" manifest="$1/.sabnzbd-cleanup-manifest.json" destination resolved
   check_mover_guard "before manual quarantine restore" || return $?
   validate_quarantine_manifest "$wrapper" || { log ERROR "Invalid restore manifest or unsafe wrapper: $wrapper"; return 1; }
+  if jq -e '.incrementalPurgeStarted==true' "$manifest" >/dev/null;then
+    partial_notice='Incremental purge previously started; this restore returns only the remaining quarantined payload. Previously purged files cannot be restored from this wrapper.'
+    log WARNING "$partial_notice"
+  fi
   destination=$(jq -r '.originalPath' "$manifest")
   resolved=$(realpath -m -- "$destination") || return 1
   if ! { path_is_below "$resolved" "$SAB_MOVIE_DIR_REAL" || path_is_below "$resolved" "$SAB_TV_DIR_REAL"; }; then log ERROR "Restore path escapes completed-download roots: $destination"; return 1; fi
@@ -8002,7 +8182,7 @@ restore_quarantine_payload() {
   ops_flush_file "$PURGE_RECEIPT_DIR/$RUN_ID.jsonl" || return 1
   ops_operation_finish "$operation_id" "Restore verified by successful move, source absence and destination presence" || return 1
   rm -f -- "$manifest"; rmdir -- "$wrapper" 2>/dev/null || true
-  RECOVERY_DETAILS+=("Restored $destination from $wrapper/payload; existing destinations were not overwritten. Permissions outside quarantine were not changed.")
+  RECOVERY_DETAILS+=("Restored $destination from $wrapper/payload; existing destinations were not overwritten. Permissions outside quarantine were not changed. $partial_notice")
   ((RECOVERED++)) || true
   log INFO "Restored quarantined download: $destination"
 }
@@ -8047,6 +8227,92 @@ recover_quarantine_preparations() {
   done <"$manifests"
 }
 
+# Drain only the payload, keeping its ownership/retention manifest until all
+# payload entries are gone. Every file has a flushed identity intent and result.
+# A single file larger than the configured byte cap remains protected/reported.
+sab_purge_incremental() {
+  local wrapper="$1" epoch="$2" receipt="$3" list="$TMP_DIR/incremental-files.list"
+  local source canonical identity recorded op size completed=0 bytes=0 remaining manifest_identity manifest="$wrapper/.sabnzbd-cleanup-manifest.json"
+  manifest_identity=$(stat -c '%d:%i:%f:%s:%y:%z' -- "$manifest") || return 1
+  : >"$list"
+  if [[ -e "$wrapper/payload" || -L "$wrapper/payload" ]];then
+    find "$wrapper/payload" -xdev -type f -print0 >"$list" || return 1
+  fi
+  sort -z "$list" -o "$list" || return 1
+  while IFS= read -r -d '' source;do
+    mc_work_allowed sab || return 21
+    check_mover_guard 'before incremental quarantine purge' || return $?
+    validate_quarantine_manifest "$wrapper" || return 1
+    [[ "$(stat -c '%d:%i:%f:%s:%y:%z' -- "$manifest")" == "$manifest_identity" ]] || return 1
+    jq -e '(.state // "committed")=="committed"' "$manifest" >/dev/null || return 1
+    [[ "$source" == "$wrapper/payload" || "$source" == "$wrapper/payload/"* ]] || return 1
+    canonical=$(realpath -e -- "$source") || return 1
+    [[ "$canonical" == "$source" && -f "$source" && ! -L "$source" ]] || return 1
+    identity=$(stat -c '%d:%i:%f:%s:%y:%z' -- "$source") || return 1
+    size=$(stat -c %s -- "$source") || return 1
+    if ((size>MAX_PURGE_BYTES_PER_RUN));then
+      log WARNING "Single quarantined file exceeds the daily byte cap; preserved: $source; bytes=$size; cap=$MAX_PURGE_BYTES_PER_RUN"
+    fi
+    if ((BYTES_PURGED+size>MAX_PURGE_BYTES_PER_RUN || SAB_PURGED_FILES>=MAX_PURGE_FILES_PER_RUN));then
+      SAB_PURGE_REMAINING=$((SAB_PURGE_REMAINING+1));continue
+    fi
+    if is_true "$DRY_RUN";then
+      log INFO "[DRY RUN] Would incrementally purge $source ($size bytes)"
+    else
+      # Persist before the first file unlink so manual restore/inspection never
+      # promises a complete payload after an interrupted partial purge.
+      if ! jq -e '.incrementalPurgeStarted==true' "$manifest" >/dev/null;then
+        jq '.incrementalPurgeStarted=true' "$manifest" >"$TMP_DIR/partial-manifest.json" || return 1
+        ops_publish_checkpoint "$TMP_DIR/partial-manifest.json" "$manifest" || return 1
+        manifest_identity=$(stat -c '%d:%i:%f:%s:%y:%z' -- "$manifest") || return 1
+      fi
+      jq -nc --arg source "$source" --arg identity "$identity" --arg wrapper "$wrapper" --argjson bytes "$size" --argjson epoch "$epoch" \
+        '{event:"file_purge_intent",source:$source,identity:$identity,wrapper:$wrapper,quarantinedEpoch:$epoch,bytes:$bytes}' >>"$receipt" || return 1
+      op=$(ops_operation_begin purge-file "$source" '' "$receipt") || return 1
+      recorded=$(jq -r --arg id "$op" '.operations[$id].identity' "$OPS_PENDING_OPERATIONS_FILE") || return 1
+      [[ "$identity" == "$recorded" && "$(stat -c '%d:%i:%f:%s:%y:%z' -- "$source")" == "$identity" && ! -L "$source" ]] || { log ERROR "Incremental purge identity changed; file preserved: $source";return 1; }
+      check_mover_guard 'immediately before incremental unlink' || return $?
+      [[ "$(realpath -e -- "$source")" == "$source" && "$(stat -c '%d:%i:%f:%s:%y:%z' -- "$source")" == "$identity" && "$(stat -c '%d:%i:%f:%s:%y:%z' -- "$manifest")" == "$manifest_identity" ]] || return 1
+      rm -f -- "$source" || return 1
+      [[ ! -e "$source" && ! -L "$source" ]] || return 1
+      ops_flush_directory "${source%/*}" || return 1
+      jq -nc --arg source "$source" --argjson bytes "$size" '{event:"file_purge_verified",source:$source,bytes:$bytes}' >>"$receipt" || return 1
+      ops_flush_file "$receipt" || return 1
+      ops_operation_finish "$op" "Incremental purge verified; original file absent; bytes=$size" || return 1
+    fi
+    SAB_PURGED_FILES=$((SAB_PURGED_FILES+1));BYTES_PURGED=$((BYTES_PURGED+size))
+    completed=$((completed+1));bytes=$((bytes+size))
+  done <"$list"
+  if ! is_true "$DRY_RUN";then
+    check_mover_guard 'before incremental empty-directory removal' || return $?
+    : >"$list"
+    if [[ -d "$wrapper/payload" && ! -L "$wrapper/payload" ]];then
+      find "$wrapper/payload" -xdev -depth -type d -print0 >"$list" || return 1
+    fi
+    while IFS= read -r -d '' source;do rmdir -- "$source" 2>/dev/null || true;done <"$list"
+    if [[ ! -e "$wrapper/payload" && ! -L "$wrapper/payload" ]];then
+      # Never remove a wrapper containing unexpected or newly created entries.
+      find "$wrapper" -mindepth 1 -maxdepth 1 ! -name '.sabnzbd-cleanup-manifest.json' -print0 >"$list" || return 1
+      if [[ ! -s "$list" ]] && ((SAB_PURGED_FILES<MAX_PURGE_FILES_PER_RUN && BYTES_PURGED+$(stat -c %s -- "$manifest")<=MAX_PURGE_BYTES_PER_RUN));then
+        op=$(ops_operation_begin purge "$wrapper" '' "$receipt") || return 1
+        check_mover_guard 'before final incremental wrapper cleanup' || return $?
+        size=$(stat -c %s -- "$manifest") || return 1
+        rm -f -- "$manifest" && rmdir -- "$wrapper" || return 1
+        SAB_PURGED_FILES=$((SAB_PURGED_FILES+1));BYTES_PURGED=$((BYTES_PURGED+size))
+        ops_flush_directory "${wrapper%/*}" || return 1
+        ops_operation_finish "$op" 'Incremental wrapper purge complete; absence verified' || return 1
+        PURGED=$((PURGED+1))
+      fi
+    fi
+  fi
+  if [[ -d "$wrapper" ]];then
+    SAB_PURGE_REMAINING=$((SAB_PURGE_REMAINING+1))
+    ((completed==0)) || SAB_PARTIAL_PURGES=$((SAB_PARTIAL_PURGES+1))
+    log WARNING "Incremental quarantine retained remainder: $wrapper; removed=$completed files/$bytes bytes; byte/file caps or protected entries require a later eligible pass"
+  fi
+  ((completed==0)) || PURGE_DETAILS+=("Incremental purge $wrapper: $completed file(s), $(bytes_human "$bytes"); manifest/retention verified; remaining payload is preserved for a later eligible pass.")
+}
+
 purge_quarantine() {
   OPS_QUARANTINE_ROOT="$QUARANTINE_DIR_REAL"
   OPS_RESTORE_ROOTS=("$SAB_MOVIE_DIR_REAL" "$SAB_TV_DIR_REAL")
@@ -8084,6 +8350,9 @@ purge_quarantine() {
     printf '%s\t%s\n' "$epoch" "$wrapper" >>"$candidates"
   done <"$wrappers"
   sort -n "$candidates" -o "$candidates" || return 1
+  SAB_OLDEST_EXPIRED_EPOCH=0
+  SAB_EXPIRED_WRAPPERS=$(wc -l <"$candidates")
+  if [[ -s "$candidates" ]];then IFS=$'\t' read -r SAB_OLDEST_EXPIRED_EPOCH wrapper <"$candidates";fi
   receipt="$PURGE_RECEIPT_DIR/$RUN_ID.jsonl"
   while IFS=$'\t' read -r epoch wrapper; do
     [[ -n "$wrapper" ]] || continue
@@ -8094,17 +8363,18 @@ purge_quarantine() {
     tmp="$TMP_DIR/purge-inventory.json"
     jq -Rs '[split("\u0000")[]|select(length>0)|capture("^(?<path>.*)\t(?<bytes>[0-9]+)$";"s")|.bytes|=tonumber]' "$inventory" >"$tmp" || return 1
     size=$(jq '[.[].bytes]|add // 0' "$tmp"); count=$(jq 'length' "$tmp")
-    if ((size>MAX_PURGE_BYTES_PER_RUN)); then
-      log WARNING "Oversized expired payload preserved: $wrapper; size=$(bytes_human "$size") exceeds MAX_PURGE_BYTES_PER_RUN=$(bytes_human "$MAX_PURGE_BYTES_PER_RUN"). Other eligible payloads will still be evaluated."
+    if ((size>MAX_PURGE_BYTES_PER_RUN || count>MAX_PURGE_FILES_PER_RUN || BYTES_PURGED+size>MAX_PURGE_BYTES_PER_RUN || SAB_PURGED_FILES+count>MAX_PURGE_FILES_PER_RUN));then
+      if ((PURGED+SAB_PARTIAL_PURGES>=MAX_PURGES_PER_RUN));then SAB_PURGE_REMAINING=$((SAB_PURGE_REMAINING+1));continue;fi
+      sab_purge_incremental "$wrapper" "$epoch" "$receipt" || return $?
       continue
     fi
-    if ((PURGED>=MAX_PURGES_PER_RUN || BYTES_PURGED+size>MAX_PURGE_BYTES_PER_RUN)); then
+    if ((PURGED+SAB_PARTIAL_PURGES>=MAX_PURGES_PER_RUN || BYTES_PURGED+size>MAX_PURGE_BYTES_PER_RUN)); then
       log WARNING "Purge limit reached; retained additional expired payloads for the next run (count limit=$MAX_PURGES_PER_RUN, byte limit=$MAX_PURGE_BYTES_PER_RUN)."; break
     fi
     manifest="$wrapper/.sabnzbd-cleanup-manifest.json"
     if is_true "$DRY_RUN"; then
       PURGE_DETAILS+=("[DRY RUN] Would purge $(jq -r '.jobName // .downloadId' "$manifest"): $wrapper ($count files, $(bytes_human "$size")); manifest retention satisfied.")
-      ((PURGED++)) || true; ((BYTES_PURGED+=size)) || true; continue
+      ((PURGED++)) || true; ((BYTES_PURGED+=size)) || true; SAB_PURGED_FILES=$((SAB_PURGED_FILES+count)); continue
     fi
     jq -nc --slurpfile manifest "$manifest" --slurpfile files "$tmp" --arg wrapper "$wrapper" --argjson now "$now" \
       '{event:"purge_intent",at:$now,wrapper:$wrapper,manifest:$manifest[0],files:$files[0]}' >>"$receipt" || return 1
@@ -8116,7 +8386,7 @@ purge_quarantine() {
       ops_flush_file "$receipt" || return 1
       ops_operation_finish "$operation_id" "Purge verified: wrapper absent; files=$count bytes=$size" || return 1
       PURGE_DETAILS+=("Purged $wrapper: $count files, $(bytes_human "$size"); quarantine age=$(((now-epoch)/86400)) days; deletion verified.")
-      ((PURGED++)) || true; ((BYTES_PURGED+=size)) || true
+      ((PURGED++)) || true; ((BYTES_PURGED+=size)) || true; SAB_PURGED_FILES=$((SAB_PURGED_FILES+count))
       log INFO "Purged quarantine: $wrapper; files=$count; bytes=$size; absence verified."
     else ((ERRORS++)) || true; log ERROR "Quarantine deletion incomplete; remaining entries preserved: $wrapper"; return 1; fi
   done <"$candidates"
@@ -8226,6 +8496,7 @@ process_orphan_folders() {
     find "$root" -mindepth 1 -maxdepth 1 -type d \( -name '_UNPACK_*' -o -name '_FAILED_*' -o -name '__ADMIN__' -o -name '_ADMIN_' \) -print0 >"$list" || return 1
     sort -z -o "$list" "$list" || return 1
     while IFS= read -r -d '' path; do
+      mc_work_allowed sab || return 21
       ((ORPHANS_SCANNED++)) || true
       base=${path##*/}; id=$(printf '%s' "$path" | sha256sum | awk '{print $1}')
       # A bare admin directory has no payload-job boundary. Never remove it.
@@ -8341,6 +8612,7 @@ process_completed_jobs() {
   log "INFO" "Evaluating completed SABnzbd jobs."
 
   while IFS= read -r item; do
+    mc_work_allowed sab || return 21
     ((SCANNED++)) || true
 
     status="$(jq -r '.status // ""' <<<"$item")"
@@ -8509,8 +8781,8 @@ process_completed_jobs() {
       else
         log "INFO" "Action: moved to quarantine"
       fi
-    elif (( quarantine_status == 20 )); then
-      return 20
+    elif (( quarantine_status == 20 || quarantine_status == 21 )); then
+      return "$quarantine_status"
     else
       ((ERRORS++)) || true
       log "ERROR" "Failed to quarantine: $source_path"
@@ -8550,6 +8822,7 @@ notify_summary() {
   message+="Completed downloads: $STRANDED_CLEANUP_STATUS; quarantined $QUARANTINED payload(s), $(bytes_human "$BYTES_QUARANTINED")."$'\n'
   message+="Working folders: inspected=$ORPHANS_SCANNED; protected=$ORPHANS_PROTECTED; awaiting stable observations=$ORPHANS_WAITING; unverified=$ORPHANS_UNVERIFIED; quarantined=$ORPHANS_QUARANTINED."$'\n'
   message+="Quarantine purge: $QUARANTINE_PURGE_STATUS; purged $PURGED payload(s), $(bytes_human "$BYTES_PURGED"). Recovered interrupted actions: $RECOVERED."$'\n'
+  message+="Purge backlog: expired wrappers remaining=$((SAB_EXPIRED_WRAPPERS-PURGED)); partial wrappers=$SAB_PARTIAL_PURGES; file/budget deferrals=$SAB_PURGE_REMAINING; oldest eligible quarantine epoch=$SAB_OLDEST_EXPIRED_EPOCH."$'\n'
   message+="Protected/skipped: active queue=$QUEUE_PROTECTED; recently changed=$PATH_UNSTABLE; import history unproven=$HISTORY_UNPROVEN; destination unverified=$DESTINATION_UNVERIFIED; source media unaccounted=$SOURCE_UNACCOUNTED; Mover stops=$MOVER_PROTECTED. Errors: $ERRORS."$'\n'
   for detail in "${RECOVERY_DETAILS[@]}" "${QUARANTINE_DETAILS[@]}" "${PURGE_DETAILS[@]}"; do
     message+=$'\n'"- $detail"; shown=$((shown+1))
@@ -8672,10 +8945,12 @@ main() {
 
   check_mover_guard "startup"
   operation_status=$?
-  if (( operation_status == 20 )); then
-    is_true "$CLEAN_BACKUPS" && BACKUP_CLEANUP_STATUS="MOVER_SKIPPED"
-    is_true "$CLEAN_STRANDED_DOWNLOADS" && STRANDED_CLEANUP_STATUS="MOVER_SKIPPED"
-    is_true "$PURGE_QUARANTINE" && QUARANTINE_PURGE_STATUS="MOVER_SKIPPED"
+  if (( operation_status == 20 || operation_status == 21 )); then
+      local stop_prefix=MOVER
+      if ((operation_status==21));then stop_prefix=BUDGET;fi
+    is_true "$CLEAN_BACKUPS" && BACKUP_CLEANUP_STATUS="${stop_prefix}_SKIPPED"
+    is_true "$CLEAN_STRANDED_DOWNLOADS" && STRANDED_CLEANUP_STATUS="${stop_prefix}_SKIPPED"
+    is_true "$PURGE_QUARANTINE" && QUARANTINE_PURGE_STATUS="${stop_prefix}_SKIPPED"
     print_summary
     return 0
   fi
@@ -8686,10 +8961,12 @@ main() {
       cleanup_backups
       operation_status=$?
 
-      if (( operation_status == 20 )); then
-        BACKUP_CLEANUP_STATUS="MOVER_STOPPED"
-        is_true "$CLEAN_STRANDED_DOWNLOADS" && STRANDED_CLEANUP_STATUS="MOVER_SKIPPED"
-        is_true "$PURGE_QUARANTINE" && QUARANTINE_PURGE_STATUS="MOVER_SKIPPED"
+      if (( operation_status == 20 || operation_status == 21 )); then
+      local stop_prefix=MOVER
+      if ((operation_status==21));then stop_prefix=BUDGET;fi
+        BACKUP_CLEANUP_STATUS="${stop_prefix}_STOPPED"
+        is_true "$CLEAN_STRANDED_DOWNLOADS" && STRANDED_CLEANUP_STATUS="${stop_prefix}_SKIPPED"
+        is_true "$PURGE_QUARANTINE" && QUARANTINE_PURGE_STATUS="${stop_prefix}_SKIPPED"
         print_summary
         return 0
       elif (( operation_status == 0 )); then
@@ -8730,18 +9007,25 @@ main() {
     if ! validate_stranded_environment; then
       STRANDED_CLEANUP_STATUS="SKIPPED_CONFIGURATION"
     elif ! fetch_required_state; then
-      STRANDED_CLEANUP_STATUS="SKIPPED_API_FAILURE"
-      ((ERRORS++)) || true
-      log ERROR "Sonarr/Radarr/SAB API collection failed; completed-download payloads were preserved."
+      if [[ -f "${MC_TMP:-}/deferred-sab" ]];then
+        STRANDED_CLEANUP_STATUS=BUDGET_SKIPPED
+        log INFO 'Runtime budget deferred SAB collection; completed-download payloads preserved'
+      else
+        STRANDED_CLEANUP_STATUS="SKIPPED_API_FAILURE"
+        ((ERRORS++)) || true
+        log ERROR "Sonarr/Radarr/SAB API collection failed; completed-download payloads were preserved."
+      fi
     else
       STRANDED_CLEANUP_STATUS="RUNNING"
       process_completed_jobs
       operation_status=$?
       if ((operation_status==0)); then process_orphan_folders; operation_status=$?; fi
 
-      if (( operation_status == 20 )); then
-        STRANDED_CLEANUP_STATUS="MOVER_STOPPED"
-        is_true "$PURGE_QUARANTINE" && QUARANTINE_PURGE_STATUS="MOVER_SKIPPED"
+      if (( operation_status == 20 || operation_status == 21 )); then
+      local stop_prefix=MOVER
+      if ((operation_status==21));then stop_prefix=BUDGET;fi
+        STRANDED_CLEANUP_STATUS="${stop_prefix}_STOPPED"
+        is_true "$PURGE_QUARANTINE" && QUARANTINE_PURGE_STATUS="${stop_prefix}_SKIPPED"
         print_summary
         return 0
       elif (( operation_status == 0 )); then
@@ -8760,8 +9044,10 @@ main() {
     purge_quarantine
     operation_status=$?
 
-    if (( operation_status == 20 )); then
-      QUARANTINE_PURGE_STATUS="MOVER_STOPPED"
+    if (( operation_status == 20 || operation_status == 21 )); then
+      local stop_prefix=MOVER
+      if ((operation_status==21));then stop_prefix=BUDGET;fi
+      QUARANTINE_PURGE_STATUS="${stop_prefix}_STOPPED"
       print_summary
       return 0
     elif (( operation_status == 0 )); then
@@ -8923,6 +9209,7 @@ OPS_LOG_BYTES=""
 
 
 ops_operation_begin() {
+    mc_work_allowed quarantine || return 75
     local kind="$1" source="$2" destination="$3" proof="$4" identity="" id tmp
     ops_operation_state || return 1
     ops_operation_paths_valid "$source" "$destination" || { ops_log ERROR "Unsafe operation paths; checkpoint and mutation refused: $source -> $destination"; return 1; }
@@ -9696,6 +9983,7 @@ purge_run_incrementally() {
     fi
     initialize_purge_receipt && append_purge_receipt_block "$manifest" || return 1
     while IFS= read -r -d '' relative && IFS= read -r -d '' identity; do
+        mc_work_allowed quarantine || { PURGE_DEFERRED_REASON='Overall cleanup runtime budget reached';break; }
         if [[ "$DEFER_PURGE_WHILE_MOVER" == true ]] && unraid_mover_running; then
             PURGE_DEFERRED_REASON="Unraid Mover became active during incremental purge"; break
         fi
@@ -9763,6 +10051,7 @@ purge_expired() {
     fi
 
     while IFS= read -r -d '' run; do
+        mc_work_allowed quarantine || { PURGE_DEFERRED_REASON='Overall cleanup runtime budget reached';break; }
         run_id="$(basename "$run")"
         valid_run_id "$run_id" || continue
         validate_managed_run_path "$run" "$run_id" || {
