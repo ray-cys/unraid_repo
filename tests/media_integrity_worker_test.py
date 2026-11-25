@@ -78,11 +78,15 @@ with tempfile.TemporaryDirectory() as folder:
     # Same-invocation decoder repeats are not independent weekly observations.
     again=m.Audit(cfg,copy.deepcopy(broken.state));again.runEpoch=issue['lastConfirmedRunAt']
     e=again.state['files']['movies/Example.mkv']
-    again.issue('movies/Example.mkv',e,'decode_error','fixture',confirmed=True)
+    again.issue('movies/Example.mkv',e,'decode_error','fixture',offset=0,confirmed=True,confirmation_key=issue['confirmationKey'])
     assert e['issue']['confirmedRuns']==1
     again.runEpoch+=60
-    again.issue('movies/Example.mkv',e,'decode_error','fixture',confirmed=True)
+    again.issue('movies/Example.mkv',e,'decode_error','fixture',offset=0,confirmed=True,confirmation_key=issue['confirmationKey'])
     assert e['issue']['confirmedRuns']==2
+    # A different failing range/signature starts a fresh independent count.
+    again.runEpoch+=60
+    again.issue('movies/Example.mkv',e,'decode_error','different',offset=600,confirmed=True,confirmation_key='different')
+    assert e['issue']['confirmedRuns']==1
     upgraded=dict(cfg,toolset='different decoder runtime')
     reset=m.Audit(upgraded,copy.deepcopy(broken.state))
     assert not reset.state['files']['movies/Example.mkv']['issue']['confirmed']
@@ -114,6 +118,37 @@ with tempfile.TemporaryDirectory() as folder:
     assert m.classify(dict(code=1,stop='',err='Unknown decoder hevc'))=='unverified_tool_or_resource'
     print('Read-only scope, probe/decode separation, range resume, repeatable errors, timeout classification, recovery and changing-file fixtures passed')
 
+    # Re-evaluate old probe-only evidence without inheriting replacement proof.
+    duration=1300;fail=False
+    legacy=copy.deepcopy(broken.state);le=legacy['files']['movies/Example.mkv']
+    le['issue'].pop('proofVersion',None);le['issue'].update(confirmedRuns=9,confirmed=True)
+    review=m.Audit(cfg,legacy)
+    assert review.state['files']['movies/Example.mkv']['issue']['kind']=='unverified_legacy_evidence'
+    with contextlib.redirect_stdout(io.StringIO()):review.inventory()
+    le=review.state['files']['movies/Example.mkv'];fd=review.open_file('movies/Example.mkv',le)
+    warning='[h264 @ 0x1234] SEI type 5 size 595 truncated at 593'
+    def warning_tool(args,fd,seconds):
+        result=runner(args,fd,seconds,lambda:None,2048)
+        result['err']=warning
+        return result
+    review.run_tool=warning_tool
+    assert review.probe('movies/Example.mkv',le,fd)
+    assert not le.get('issue') and le['advisory'] and not le['verifiedAt']
+    assert review.state['resolved'][-1]['resolution'].startswith('Legacy probe-only')
+    assert review.segment('movies/Example.mkv',le,fd)=='next'
+    assert le['offset']==600 and not le['verifiedAt']
+    # A seek failure that disappears with wider context remains unconfirmed.
+    le['offset']=600;seen=[]
+    def seek_tool(args,fd,seconds):
+        seen.append(float(args[args.index('-ss')+1]))
+        if len(seen)==1:return dict(code=1,out='',err='Invalid NAL unit',stop='',wall=.01)
+        return runner(args,fd,seconds,lambda:None,2048)
+    review.run_tool=seek_tool
+    assert review.segment('movies/Example.mkv',le,fd)=='next'
+    assert seen==[598,570] and not le.get('issue') and le['advisory']['kind']=='seek_context_recovered'
+    assert le['offset']==1200 and le['seekWarmupSeconds']==30
+    os.close(fd)
+
     large=copy.deepcopy(state);large['padding']=os.urandom(180000).hex()
     audit=m.Audit(cfg,large);capture=io.StringIO()
     with contextlib.redirect_stdout(capture):audit.checkpoint(True)
@@ -123,3 +158,14 @@ with tempfile.TemporaryDirectory() as folder:
     payload=''.join(e['data'] for e in events if e['type']=='checkpoint-chunk')
     assert json.loads(gzip.decompress(base64.b64decode(payload)))['padding']==large['padding']
     print('Large state transport uses bounded lines and lossless file-backed chunks')
+
+# All four reported warning patterns succeeded in live probe/decode checks.
+for warning in ('[h264 @ 0x1234] SEI type 5 size 595 truncated at 593',
+                '[h264 @ 0x1234] SEI type 5 size 40 truncated at 39',
+                '[h264 @ 0x1234] number of reference frames (0+5) exceeds max (4; probably corrupt input), discarding one'):
+    assert m.classify(dict(code=0,stop='',err=warning))=='passed'
+    assert m.classify(dict(code=1,stop='',err=warning))!='decode_error'
+assert m.classify(dict(code=0,stop='',err='Invalid NAL unit'))=='unverified_decoder_warning'
+assert m.classify(dict(code=1,stop='',err='Invalid NAL unit'),stage='probe')=='unverified_container'
+assert m.classify(dict(code=1,stop='',err='Invalid NAL unit'))=='decode_error'
+print('Nonfatal diagnostics, unknown warnings and probe-only failure classification passed')

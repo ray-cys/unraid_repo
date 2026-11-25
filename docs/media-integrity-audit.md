@@ -72,8 +72,9 @@ workflow includes the compressed queue in its existing operational-state export.
 
 ## Findings and recovery
 
-A known decoder/container error is repeated on the same unchanged file when
-budget permits. "Repeatable decoder error" is evidence requiring review, not
+A nonzero decoder failure is repeated on the same unchanged file and planned
+range with wider seek context when budget permits. Probe-only failures remain
+unverified container findings; they never authorize replacement. "Repeatable decoder error" is evidence requiring review, not
 proof of physical disk damage or irreparability. Permission/tool/resource/time
 limits remain unverified. The first failing range stops that file; this is not an
 exhaustive enumeration of every bad location. Failed files back off to future
@@ -293,3 +294,33 @@ prove an uncorrupted source; post-import decoding supplies the integrity evidenc
 A cleared original-file warning is not itself a complete recovery: priority
 verification finishes a fresh full decode cycle before releasing the job as
 resolved, without claiming that a replacement was downloaded.
+
+## Decoder evidence policy (v2.3.0)
+
+A successful FFprobe run with valid stream/duration metadata does not become a
+corruption finding merely because stderr contains “truncated” or “corrupt”. The
+narrowly recognized H.264 SEI type-5 user-data and reference-startup diagnostics
+are retained as nonfatal advisories. Unknown diagnostics remain unverified and
+visible; they are not silently ignored. This does not guarantee invisible
+playback artifacts are absent.
+
+Deep checks use `-xerror -max_error_rate 0`, positive video-frame progress and
+planned output duration. A failed seek is retried with up to 30 seconds of
+preceding context. A successful context retry must pass the same frame/duration
+checks before receiving range credit. A repeated nonzero decoder failure must
+have matching normalized diagnostics, file identity, planned range and toolchain.
+Two separate audit invocations must confirm that same evidence before any Arr
+replacement is eligible; repeating a tool in one invocation counts only once.
+Tool/resource/access failures and metadata-only findings never qualify.
+
+Legacy corruption findings without this decoder proof lose replacement
+eligibility and are re-evaluated. Valid metadata with a recognized nonfatal
+probe diagnostic withdraws the old classification, preserves its evidence in
+resolution history, and sends one grouped correction. The original media stays
+unchanged and full-range verification remains pending. Routine advisory logs and
+healthy progress do not generate repeated email.
+
+Worker messages are newline-framed and bounded. The host retains partial input
+across read timeouts; malformed, oversized or incomplete messages fail the scan
+without creating a media-corruption finding. The last committed checkpoint is
+retained, and complete-library coverage is never inferred from a short check.

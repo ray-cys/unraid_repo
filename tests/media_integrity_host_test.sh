@@ -55,7 +55,7 @@ write_report OK 'Recovered worker'
 # Findings and recovery failures must contain useful actions/evidence, while
 # changed progress alone must not resend the same incident.
 RECOVERY_FILE="$STATE_DIR/recovery.json"
-jq '.files["series/Example/episode.mkv"]={identity:["1","2","3","4","5"],issue:{id:"finding",kind:"decode_error",confirmed:true,confirmedRuns:2,evidence:"Invalid NAL unit",offset:600}}' "$TMP_DIR/state.json" >"$fixture/new-state"
+jq '.files["series/Example/episode.mkv"]={identity:["1","2","3","4","5"],issue:{id:"finding",kind:"decode_error",proofVersion:2,origin:"decode",confirmationKey:"fixture",confirmed:true,confirmedRuns:2,evidence:"Invalid NAL unit",offset:600}}' "$TMP_DIR/state.json" >"$fixture/new-state"
 gzip -c "$fixture/new-state" >"$STATE_FILE"
 jq -n --argjson now "$(date +%s)" '{schema:1,workflow:"arr-native",actions:{("a"*64):{app:"Sonarr",parentId:20,fileId:31,targets:[32],path:"series/Example/episode.mkv",identity:["1","2","3","4","5"],events:[],status:"review",startedAt:$now,updatedAt:$now,reason:"Search response unavailable; no retry"}}}' >"$RECOVERY_FILE"
 write_report WARNING 'Recovery needs review'
@@ -87,3 +87,13 @@ lock="$fixture/backup.lock";touch "$lock"
 probe_lock "$lock"
 flock -n "$lock" true
 printf 'Previous-state recovery, file-backed large checkpoints, notification retry/dedup, inventory silence and short backup-lock checks passed\n'
+# Legacy probe warnings produce one explanatory grouped correction, never a
+# claim that a media file was repaired or fully verified.
+jq '.resolved=[{id:"old-probe",path:"movies/Example.mkv",resolvedAt:123,resolution:"Legacy probe-only corruption classification withdrawn; media unchanged"}]' "$TMP_DIR/state.json" | gzip -c >"$STATE_FILE"
+old_calls=$(wc -l <"$fixture/calls")
+write_report OK 'Evidence review completed'
+[[ $(wc -l <"$fixture/calls") == $((old_calls+1)) ]]
+jq -e '(.body|contains("media unchanged")) and .notification=="sent"' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
+write_report OK 'Repeated evidence review'
+[[ $(wc -l <"$fixture/calls") == $((old_calls+1)) ]]
+printf 'Evidence reclassification is explained and notified once\n'

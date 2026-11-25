@@ -49,10 +49,17 @@ setup() {
  if [[ "$app" == Radarr ]];then relative=movies/Example/film.mkv;else relative=series/Example/film.mkv;fi
  api_path="/data/$relative";printf original-damaged >"$MEDIA_HOST_ROOT/$relative"
  recovery_file_tool identity "$relative" >"$fixture/identity"
- jq -n --arg path "$relative" --argjson now "$(date +%s)" --slurpfile i "$fixture/identity" '{schema:1,toolset:"fixture",files:{($path):{identity:$i[0],issue:{id:"finding",kind:"decode_error",confirmed:true,confirmedRuns:2,lastSeen:$now,identity:$i[0]}}}}' >"$TMP_DIR/state.json"
+ jq -n --arg path "$relative" --argjson now "$(date +%s)" --slurpfile i "$fixture/identity" '{schema:1,toolset:"fixture",files:{($path):{identity:$i[0],issue:{id:"finding",kind:"decode_error",proofVersion:2,origin:"decode",confirmationKey:"fixture",confirmed:true,confirmedRuns:2,lastSeen:$now,identity:$i[0]}}}}' >"$TMP_DIR/state.json"
 }
 setup Radarr;AUTO_RECOVERY_ENABLED=false;recovery_process;[[ ! -s "$requests" ]]
 AUTO_RECOVERY_ENABLED=true
+# Old metadata-only evidence must never dispatch a native release grab.
+setup Radarr
+jq 'del(.files[].issue.proofVersion)' "$TMP_DIR/state.json" >"$fixture/old-state"
+mv "$fixture/old-state" "$TMP_DIR/state.json"
+recovery_process
+[[ ! -s "$requests" ]]
+jq -e '.actions|length==0' "$RECOVERY_FILE" >/dev/null
 for app in Radarr Sonarr;do
  setup "$app";recovery_process;recovery_valid
  jq -e '.actions|length==1 and all(.[];.status=="downloading" and .downloadId=="sab-new")' "$RECOVERY_FILE" >/dev/null
