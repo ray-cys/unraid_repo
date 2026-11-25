@@ -376,3 +376,40 @@ stall and missed-run monitoring remain independent.
 Grouped reports distinguish replacement-candidate counts from audit/review
 findings and include per-stream results. Existing deduplication and weekly
 unchanged-incident reminders remain in effect; healthy progress is quiet.
+
+## Coverage and last-checked reporting (v2.5.0)
+
+Every local report, and any notification already warranted by findings or recovery
+updates, includes these details calculated from saved state:
+
+- Per-run **unique** files attempted, opened, metadata-probed successfully, given
+  passed decode ranges, left partially decoded, and fully verified. Repeated
+  probes/range retries do not count as additional media files. Existing tool/range
+  operation counts remain separate.
+- Overall and per-library coverage: fully verified current versions, partial
+  decode coverage, metadata-only coverage, attempted but unverified, and untouched.
+  These five coverage buckets are disjoint. Deferred, blocked and periodic-due
+  counts overlap those buckets. Work remaining counts each file once, including
+  a previously verified version due for its periodic recheck.
+- Per-library inventory status: complete, partial, unavailable, not started, or
+  limited to a targeted recovery scope. Finishing inventory means discovering
+  paths; it does not mean those files were fully decoded.
+- The last attempted file and outcome, last successful check and its type, and
+  last passed decode, with timestamps and saved resume positions. Metadata success
+  is explicitly different from full-file verification. These are historical
+  activity records, not an alphabetical continuation promise.
+- Counts of media-containing parent folders with complete, in-progress and
+  untouched coverage, plus overlapping pending/blocked/deferred totals. Up to three
+  recent, pending and blocked folder examples are included. Empty directories,
+  excluded files and ancestor-only folders are not counted.
+
+The structured status receipt exposes these details under `progress`, with the
+same bounded folder examples used in `latest-report.txt` and email. No directory
+walk, media read or extra API call is performed to render this coverage summary.
+Progress updates do not alter notification incident signatures or cause healthy
+emails. The existing schedule and notification reminders remain unchanged.
+
+Counters and explicit last-success tracking begin with v2.5.0. Older runs show
+“not recorded” where the evidence did not exist, rather than inventing historical
+counts or declaring an arbitrary file the last success. Existing saved file
+coverage and offsets remain usable immediately and are not reset.

@@ -33,6 +33,11 @@ with tempfile.TemporaryDirectory() as folder:
     good=execute(state)
     assert good.stats['cyclesCompleted']==1 and good.state['files']['movies/Example.mkv']['verifiedAt']>0
     assert video.read_bytes()==b'fixture media'
+    assert all(good.stats[k]==1 for k in ('uniqueFilesAttempted','uniqueFilesOpened','uniqueMetadataPassed','uniqueFilesDecoded','uniqueFilesCompleted'))
+    assert good.stats['uniqueFilesPartiallyDecoded']==0
+    assert good.stats['inventoryByLibrary']['movies']=={'status':'complete','files':1}
+    assert good.state['lastActivity']['attempt']['kind']=='full_cycle_passed'
+    assert good.state['lastActivity']['success']['kind']=='full_cycle_passed'
     # Host jq input construction must not round ns timestamps/large inodes and
     # accidentally invalidate every saved offset at the next weekly run.
     bridged=json.loads(subprocess.check_output(['jq','.'],input=json.dumps(good.state).encode()))
@@ -59,6 +64,8 @@ with tempfile.TemporaryDirectory() as folder:
     duration=1300;stop_after=1;calls=0
     partial=execute(state);e=partial.state['files']['movies/Example.mkv']
     assert e['offset']==600 and not e['verifiedAt']
+    assert partial.stats['uniqueFilesDecoded']==1 and partial.stats['uniqueFilesPartiallyDecoded']==1 and partial.stats['uniqueFilesCompleted']==0
+    assert partial.state['lastActivity']['decoded']['nextOffset']==600
     stop_after=0;calls=0;continued=execute(partial.state)
     assert continued.stats['cyclesCompleted']==1 and calls==2
     # Missing metadata/probe success alone is not proof of decode health.
@@ -152,6 +159,12 @@ with tempfile.TemporaryDirectory() as folder:
     assert le['offset']==1200 and le['seekWarmupSeconds']==30
     os.close(fd)
 
+    interrupted=m.Audit(cfg,copy.deepcopy(state));m.STOP='fixture interruption'
+    with contextlib.redirect_stdout(io.StringIO()):interrupted.inventory()
+    assert interrupted.stats['inventoryByLibrary']['movies']['status']=='partial'
+    assert interrupted.stats['inventoryByLibrary']['series']['status']=='not_started'
+    assert interrupted.stats['inventoryByLibrary']['formula1']['status']=='not_started'
+    m.STOP=''
     large=copy.deepcopy(state);large['padding']=os.urandom(180000).hex()
     audit=m.Audit(cfg,large);capture=io.StringIO()
     with contextlib.redirect_stdout(capture):audit.checkpoint(True)

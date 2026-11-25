@@ -115,3 +115,10 @@ jq -e '.replacementCandidates==1 and (.body|contains("Primary-stream decode fail
 gzip -dc "$STATE_FILE" | jq '.files[].issue.streamEvidence[].primary=false' | gzip -c >"$fixture/aux.gz";mv "$fixture/aux.gz" "$STATE_FILE"
 write_report WARNING 'Primary evidence absent fixture'
 jq -e '.replacementCandidates==0 and (.body|contains("Suspected decode failure"))' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
+# Progress and last-path changes never bypass grouped incident deduplication.
+old_calls=$(wc -l <"$fixture/calls")
+jq '.uniqueFilesAttempted=42 | .uniqueFilesOpened=40 | .uniqueFilesPartiallyDecoded=12' "$TMP_DIR/stats.json" >"$fixture/stats-new";mv "$fixture/stats-new" "$TMP_DIR/stats.json"
+gzip -dc "$STATE_FILE" | jq '.lastActivity.attempt={path:"movies/Example.mkv",epoch:100,kind:"decode_range_passed",nextOffset:600,duration:7200}' | gzip -c >"$fixture/progress.gz";mv "$fixture/progress.gz" "$STATE_FILE"
+write_report WARNING 'Same finding; more progress'
+[[ $(wc -l <"$fixture/calls") == "$old_calls" ]]
+jq -e '.progress.run.uniqueFilesAttempted==42 and (.body|contains("Last attempted file: movies/Example.mkv")) and .notification=="suppressed"' "$STATUS_DIR/media_integrity_audit.json" >/dev/null

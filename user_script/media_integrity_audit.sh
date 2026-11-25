@@ -3,7 +3,7 @@
 clearLog=true
 arrayStarted=true
 ###############################################################################
-# Media Integrity Audit v2.4.0 -- personal Unraid User Script
+# Media Integrity Audit v2.5.0 -- personal Unraid User Script
 #
 # PURPOSE / USE CASE
 # ------------------
@@ -196,7 +196,7 @@ umask 077
 # stay unverified. Completed ranges prove decoder acceptance, not perfect visual
 # playback. Legacy probe-only incidents are re-evaluated without replacing media.
 # Worker transport failures preserve the last checkpoint and never accuse media.
-readonly SCRIPT_VERSION="2.4.0"
+readonly SCRIPT_VERSION="2.5.0"
 BAZARR_CONTAINER="bazarr"
 MEDIA_HOST_ROOT="/mnt/user/media"
 MEDIA_CONTAINER_ROOT="/data"
@@ -423,6 +423,64 @@ write_report() {
     return "$rc"
 }
 
+# Summarise saved identities/progress only. No find/stat/read of library media.
+# Folder counts describe parents containing tracked media, not empty directories.
+coverage_summary() {
+    local libraries
+    libraries=$(printf '%s\n' "${LIBRARY_SUBDIRS[@]}" | jq -Rsc 'split("\n")|map(select(length>0))') || return 1
+    jq -n --slurpfile state "$TMP_DIR/state.json" --slurpfile stats "$TMP_DIR/stats.json" \
+      --arg root "$MEDIA_HOST_ROOT" --argjson libraries "$libraries" --argjson now "$(date +%s)" --argjson days "$RECHECK_DAYS" '
+      def tally:
+        reduce .[] as $r ({total:0,verified:0,partial:0,metadataOnly:0,attemptedUnverified:0,untouched:0,deferred:0,blocked:0,periodicDue:0,workRemaining:0};
+          .total+=1 | .[$r.bucket]+=1 | .deferred+=(if $r.deferred then 1 else 0 end) |
+          .blocked+=(if $r.blocked then 1 else 0 end) | .periodicDue+=(if $r.periodicDue then 1 else 0 end) |
+          .workRemaining+=(if $r.bucket!="verified" or $r.periodicDue then 1 else 0 end)) |
+        .awaitingVerification=(.total-.verified);
+      [$state[0].files|to_entries[]|.key as $path|.value as $f|
+        (($f.verifiedAt // 0)>0 and $f.coverage=="all_planned_segments_decoded" and $f.issue==null and ($f.replacementPending // false)==false) as $verified |
+        {path:$path,library:($path|split("/")[0]),directory:($path|split("/")|.[0:-1]|join("/")),
+         bucket:(if $verified then "verified" elif ($f.offset // 0)>0 then "partial" elif ($f.probeAt // 0)>0 then "metadataOnly" elif ($f.lastAttemptAt // 0)>0 or ($f.verifiedAt // 0)>0 or ($f.previousVerifiedAt // 0)>0 then "attemptedUnverified" else "untouched" end),
+         deferred:(($f.notBefore // 0)>$now),blocked:($f.issue!=null),lastAttemptAt:($f.lastAttemptAt // 0),
+         periodicDue:($f.cycleLane=="old" or (($f.verifiedAt // 0)>0 and $now-$f.verifiedAt>=$days*86400))}] as $rows |
+      ($rows|tally) as $overall |
+      [$libraries[] as $library | {name:$library,counts:([$rows[]|select(.library==$library)]|tally),
+        inventory:($stats[0].inventoryByLibrary[$library] // {status:(if $stats[0].inventoryComplete==true then "complete" else "not_recorded" end),files:null})}] as $byLibrary |
+      [$rows|group_by(.directory)[]|{path:.[0].directory,counts:(tally),lastAttemptAt:(map(.lastAttemptAt)|max)}|
+        .status=(if .counts.verified==.counts.total and .counts.periodicDue==0 then "complete" elif .counts.untouched==.counts.total then "untouched" else "in_progress" end)] as $folders |
+      {schema:1,mediaRoot:($state[0].hostRoot // $root),overall:$overall,libraries:$byLibrary,lastActivity:($state[0].lastActivity // {}),
+       run:{startedAt:($stats[0].startedAt // null),finishedAt:($stats[0].finishedAt // null),mode:($stats[0].mode // "not_recorded"),
+        uniqueFilesAttempted:($stats[0].uniqueFilesAttempted // null),uniqueFilesOpened:($stats[0].uniqueFilesOpened // null),uniqueMetadataPassed:($stats[0].uniqueMetadataPassed // null),
+        uniqueFilesDecoded:($stats[0].uniqueFilesDecoded // null),uniqueFilesPartiallyDecoded:($stats[0].uniqueFilesPartiallyDecoded // null),uniqueFilesCompleted:($stats[0].uniqueFilesCompleted // null)},
+       directories:{total:($folders|length),complete:([$folders[]|select(.status=="complete")]|length),inProgress:([$folders[]|select(.status=="in_progress")]|length),
+        untouched:([$folders[]|select(.status=="untouched")]|length),blocked:([$folders[]|select(.counts.blocked>0)]|length),deferred:([$folders[]|select(.counts.deferred>0)]|length),
+        pending:([$folders[]|select(.counts.workRemaining>0)]|length),
+        recent:([$folders[]|select(.lastAttemptAt>0)]|sort_by(-.lastAttemptAt,.path)|.[0:3]),
+        pendingExamples:([$folders[]|select(.counts.workRemaining>0)]|sort_by(.lastAttemptAt,.path)|.[0:3]),
+        blockedExamples:([$folders[]|select(.counts.blocked>0)]|sort_by(.path)|.[0:3])}} |
+      def shown:if .==null then "not recorded" else tostring end;
+      def counts_line:
+        "total="+(.total|tostring)+"; fully verified="+(.verified|tostring)+"; partial decode="+(.partial|tostring)+"; metadata only="+(.metadataOnly|tostring)+
+        "; attempted/unverified="+(.attemptedUnverified|tostring)+"; untouched="+(.untouched|tostring)+"; work remaining="+(.workRemaining|tostring)+
+        "; deferred="+(.deferred|tostring)+"; blocked="+(.blocked|tostring)+"; periodic due="+(.periodicDue|tostring);
+      def activity_line($label;$record):
+        $label+": "+(if $record==null then "not yet recorded" else ($record.path|.[0:350])+" | "+($record.kind|gsub("_";" "))+" | "+($record.epoch|strftime("%Y-%m-%d %H:%M UTC"))+
+          (if $record.kind=="full_cycle_passed" or $record.kind=="complete" then " | full current cycle completed" else " | next saved offset="+(($record.nextOffset // 0)|tostring)+" s"+(if $record.duration!=null then " of "+($record.duration|tostring)+" s" else "" end) end) end);
+      def folder_line($label):$label+": "+.path[0:240]+" | "+.status+" | verified="+(.counts.verified|tostring)+"/"+(.counts.total|tostring)+"; partial="+(.counts.partial|tostring)+"; untouched="+(.counts.untouched|tostring)+"; blocked="+(.counts.blocked|tostring)+"; periodic due="+(.counts.periodicDue|tostring)+"; remaining="+(.counts.workRemaining|tostring);
+      .body=(["", "Progress and coverage (saved state; no additional media reads):",
+        "Media root: "+.mediaRoot+"; libraries="+([.libraries[].name]|join(", ")),"Last reported run: "+(if .run.startedAt!=null then (.run.startedAt|strftime("%Y-%m-%d %H:%M UTC")) else "not recorded" end)+"; mode="+.run.mode,
+        "Unique files this run: attempted="+(.run.uniqueFilesAttempted|shown)+"; opened="+(.run.uniqueFilesOpened|shown)+"; metadata passed="+(.run.uniqueMetadataPassed|shown)+
+        "; with passed decode ranges="+(.run.uniqueFilesDecoded|shown)+"; partially decoded="+(.run.uniqueFilesPartiallyDecoded|shown)+"; fully verified="+(.run.uniqueFilesCompleted|shown),
+        "Overall files: "+(.overall|counts_line),
+        "Deferred, blocked and periodic-due counts overlap coverage categories. Work remaining counts each file once.",
+        "Per-library saved coverage:"]+
+        [.libraries[]|"- "+.name+": inventory="+(.inventory.status|gsub("_";" "))+"; "+(.counts|counts_line)]+
+        [activity_line("Last attempted file";.lastActivity.attempt),activity_line("Last successful check";.lastActivity.success),activity_line("Last passed decode";.lastActivity.decoded),
+        "Media-containing folders: total="+(.directories.total|tostring)+"; complete="+(.directories.complete|tostring)+"; in progress="+(.directories.inProgress|tostring)+"; untouched="+(.directories.untouched|tostring)+
+        "; pending="+(.directories.pending|tostring)+"; blocked="+(.directories.blocked|tostring)+"; deferred="+(.directories.deferred|tostring)+". Inventory completion does not mean decoding completion; empty/excluded folders are not counted."]+
+        [.directories.recent[]|folder_line("Recent folder")]+[.directories.pendingExamples[]|folder_line("Pending folder example")]+[.directories.blockedExamples[]|folder_line("Blocked folder example")]+[""]|join("\n"))
+      ' >"$TMP_DIR/coverage-summary.json"
+}
+
 render_report() {
     local status="$1" reason="$2" now temp body importance=normal previous="" last=0 signature attention=false sent=0
     now=$(date +%s)
@@ -431,8 +489,9 @@ render_report() {
     [[ -f "$TMP_DIR/stats.json" ]] || printf '{}' >"$TMP_DIR/stats.json"
     if recovery_valid;then cp "$RECOVERY_FILE" "$TMP_DIR/recovery-report.json";else printf '{"schema":1,"workflow":"arr-native","actions":{}}' >"$TMP_DIR/recovery-report.json";fi
     if [[ -f "$STATE_DIR/notified.json" ]];then cp "$STATE_DIR/notified.json" "$TMP_DIR/delivery.json";else printf '{}' >"$TMP_DIR/delivery.json";fi
+    coverage_summary || return 1
     temp=$(mktemp "$STATE_DIR/.report.XXXXXX") || return 1
-    jq -n --slurpfile state "$TMP_DIR/state.json" --slurpfile stats "$TMP_DIR/stats.json" --slurpfile journal "$TMP_DIR/recovery-report.json" --slurpfile receipt "$TMP_DIR/delivery.json" \
+    jq -n --slurpfile state "$TMP_DIR/state.json" --slurpfile stats "$TMP_DIR/stats.json" --slurpfile journal "$TMP_DIR/recovery-report.json" --slurpfile receipt "$TMP_DIR/delivery.json" --slurpfile progress "$TMP_DIR/coverage-summary.json" \
       --argjson enabled "$AUTO_RECOVERY_ENABLED" --argjson now "$now" --argjson max "$NOTIFY_MAX_ITEMS" --arg status "$status" --arg reason "$reason" --arg mode "$MODE" --arg note "$RECOVERY_NOTE" '
       def replacement_candidate:
         .value as $f | $f.issue as $i |
@@ -452,9 +511,9 @@ render_report() {
         select(.notice as $k|($receipt[0].recoveryEvents // []|index($k))==null)] as $notices |
       [$jobs[]|select(.value.status=="required" or .value.status=="blocked" or .value.status=="review" or .value.status=="retry_wait" or (.value.status=="verifying" and $now>=(.value.verificationAttentionAt // ((.value.importedAt // .value.startedAt)+86400))))] as $attention |
       (if $status=="FAILED" then "FAILED" elif ($issues|length)>0 or ($attention|length)>0 or $note!="" then "WARNING" else $status end) as $effective |
-      {schema:1,name:"media_integrity_audit",status:$effective,epoch:$now,mode:$mode,recoveryEnabled:$enabled,stats:$stats[0],
-       coverage:{knownFiles:($state[0].files|length),fullyVerified:([$state[0].files[]|select((.verifiedAt // 0)>0 and .coverage=="all_planned_segments_decoded")]|length),
-        pendingVerification:([$state[0].files[]|select((.verifiedAt // 0)==0)]|length),
+      {schema:1,name:"media_integrity_audit",progress:($progress[0]|del(.body)),status:$effective,epoch:$now,mode:$mode,recoveryEnabled:$enabled,stats:$stats[0],
+       coverage:{knownFiles:$progress[0].overall.total,fullyVerified:$progress[0].overall.verified,
+        pendingVerification:$progress[0].overall.awaitingVerification,
         oldestPendingObservedAt:([$state[0].files[]|select((.verifiedAt // 0)==0)|.observedAt // empty]|min),
         pendingAgeUnknown:([$state[0].files[]|select((.verifiedAt // 0)==0 and (.observedAt // 0)==0)]|length)},
        auditAttention:($note!="" or ($stats[0].inventoryErrors // 0)>0 or ($stats[0].inventoryComplete==false and ($stats[0].targeted // false)!=true)),recoveryActions:($jobs|length),recoveryAttention:($attention|length),replacementCandidates:($candidates|length),activeFindings:($issues|length),actionableFindings:($actionable|length),recoveries:([$jobs[]|select(.value.status=="recovered")]|length),
@@ -463,8 +522,8 @@ render_report() {
        summary:("Media integrity: "+$effective+"; findings="+($issues|length|tostring)+"; replacement candidates="+($candidates|length|tostring)+"; replacement updates="+($notices|length|tostring)),
        body:(["Media integrity audit: "+$effective,"Automatic replacement: "+(if $enabled then "ENABLED" else "DISABLED; original files remain unchanged" end),
         "Run: "+$mode+"; "+$reason,"Finding categories: replacement candidates="+($candidates|length|tostring)+"; audit/review findings="+(($issues|length)-($candidates|length)|tostring),"Checks passed: quick="+(($stats[0].quickPassed // 0)|tostring)+"; ranges="+(($stats[0].segmentsPassed // 0)|tostring)+"; full planned-range cycles="+(($stats[0].cyclesCompleted // 0)|tostring),
-        "Coverage: known files="+($state[0].files|length|tostring)+"; fully decoded current versions="+([$state[0].files[]|select((.verifiedAt // 0)>0 and .coverage=="all_planned_segments_decoded")]|length|tostring)+"; pending initial/replacement verification="+([$state[0].files[]|select((.verifiedAt // 0)==0)]|length|tostring),
-        "Original files and monitoring are retained until native Arr replacement. Arr owns imports and recycling; this script never moves/deletes library media or forces import.",
+        "Coverage: known files="+($progress[0].overall.total|tostring)+"; fully decoded current versions="+($progress[0].overall.verified|tostring)+"; pending current-cycle verification="+($progress[0].overall.awaitingVerification|tostring),
+        $progress[0].body,"Original files and monitoring are retained until native Arr replacement. Arr owns imports and recycling; this script never moves/deletes library media or forces import.",
         "State note: "+$note,"", "Replacement actions and results:"]+
        [$notices[:$max][]|"- "+.value.app+" | "+.value.path+" | "+.value.status+
         "\n  Incident: integrity:"+.key+"\n  Action/evidence: "+.value.reason+"\n  Target IDs: "+(.value.targets|tostring)+"; original file ID: "+(.value.fileId|tostring)+
@@ -1146,6 +1205,21 @@ class Audit:
                     'unsupportedImages':0,'newChanged':0,'quickPassed':0,'segmentsPassed':0,'cyclesCompleted':0,
                     'decodeWallSeconds':0.0,'mediaSecondsDecoded':0.0,'reason':'','mode':cfg['mode']}
         self.found=set();self.seen=set()
+        self.run_paths={name:set() for name in ('attempted','opened','probed','ranges','completed')}
+        self.stats['inventoryByLibrary']={name:{'status':'not_started','files':0} for name in cfg['libraries']}
+    def progress_counts(self):
+        for key,name in (('uniqueFilesAttempted','attempted'),('uniqueFilesOpened','opened'),('uniqueMetadataPassed','probed'),('uniqueFilesDecoded','ranges'),('uniqueFilesCompleted','completed')):
+            self.stats[key]=len(self.run_paths[name])
+        self.stats['uniqueFilesPartiallyDecoded']=len(self.run_paths['ranges']-self.run_paths['completed'])
+    def attempt(self,path,entry,outcome):
+        kind={'next':'decode_range_passed','complete':'full_cycle_passed','recheck':'repeat_check_pending','retry':'transient_retry_pending','changed':'deferred_source_changed','issue':(entry.get('issue') or {}).get('kind','finding_recorded')}.get(outcome,outcome)
+        self.state.setdefault('lastActivity',{})['attempt']={'path':path,'epoch':int(time.time()),'kind':kind,'nextOffset':entry.get('offset',0),'duration':entry.get('duration')}
+        self.dirty=True
+    def activity(self,path,entry,kind):
+        record={'path':path,'epoch':int(time.time()),'kind':kind,'nextOffset':entry.get('offset',0),'duration':entry.get('duration')}
+        self.state.setdefault('lastActivity',{})['success']=record
+        if kind!='metadata_probe_passed':self.state['lastActivity']['decoded']=record
+        self.dirty=True
     def beat(self):
         if time.monotonic()-self.last_heartbeat>=10:
             emit({'type':'heartbeat','elapsed':int(time.monotonic()-self.start)})
@@ -1154,6 +1228,7 @@ class Audit:
     def stopped(self):return bool(STOP) or self.remaining()<3
     def checkpoint(self,force=False):
         if not force and (not self.dirty or time.monotonic()-self.last_checkpoint<60):return
+        self.progress_counts()
         self.state['lastRun']=dict(self.stats,elapsedSeconds=int(time.monotonic()-self.start))
         raw=json.dumps(self.state,separators=(',',':')).encode()
         if len(raw)>self.cfg['maxStateBytes']:raise ValueError('state exceeds configured byte limit; previous checkpoint retained')
@@ -1213,12 +1288,18 @@ class Audit:
                 if rel in self.found and e and e.get('issue') and e['issue'].get('identity')==e['identity']:
                     e['notBefore']=0
                     if e['issue'].get('offset') is not None:e['offset']=e['issue']['offset']
+            for library in self.cfg['libraries']:
+                count=sum(p.split('/')[0]==library for p in self.found)
+                self.stats['inventoryByLibrary'][library]={'status':'targeted' if count else 'not_in_targeted_scope','files':count}
             self.stats.update(inventoryFiles=len(self.found),inventoryComplete=False,targeted=True)
             self.checkpoint(True);return
         for library in self.cfg['libraries']:
+            before_files=len(self.found);before_errors=self.stats['inventoryErrors']
             library_path=os.path.join(root,library)
             if not os.path.isdir(library_path) or os.path.islink(library_path):
-                self.stats['inventoryErrors']+=1;complete=False;continue
+                self.stats['inventoryErrors']+=1;complete=False
+                self.stats['inventoryByLibrary'][library]={'status':'unavailable','files':0}
+                continue
             stack=[library_path]
             while stack:
                 self.beat()
@@ -1246,6 +1327,7 @@ class Audit:
                             if len(self.state['files'])>200000:raise ValueError('inventory exceeds 200000 files; explicit scope review required')
                 except OSError:
                     self.stats['inventoryErrors']+=1;complete=False
+            self.stats['inventoryByLibrary'][library]={'status':'complete' if not self.stopped() and self.stats['inventoryErrors']==before_errors else 'partial','files':len(self.found)-before_files}
             if self.stopped():break
         self.stats['inventoryFiles']=len(self.found);self.stats['inventoryComplete']=complete
         if complete:
@@ -1293,6 +1375,7 @@ class Audit:
                 self.resolve(path,entry,'Legacy probe-only corruption classification withdrawn: valid metadata with nonfatal diagnostic; media unchanged, full decode verification still pending')
         entry.update(probeAt=int(time.time()),duration=duration,video=videos,audio=audio,
                      streamDetails=[{'index':v['index'],'type':v.get('codec_type'),'codec':v.get('codec_name'),'default':bool(v.get('disposition',{}).get('default'))} for v in streams if v['index'] in videos+audio])
+        self.run_paths['probed'].add(path);self.activity(path,entry,'metadata_probe_passed')
         self.stats['quickPassed']+=1;self.dirty=True
         return True
     def retry_transient(self,entry):
@@ -1420,38 +1503,49 @@ class Audit:
             if old['cleanRechecks']<2:return 'recheck'
             self.resolve(path,entry,'Two successful unchanged-file rechecks of the previously failing probe/range; remaining ranges are tracked separately')
         entry['offset']=expected_end;entry['notBefore']=0
+        self.run_paths['ranges'].add(path);self.activity(path,entry,'decode_range_passed')
         self.stats['segmentsPassed']+=1;self.stats['mediaSecondsDecoded']+=span;self.dirty=True
         if expected_end>=duration-0.05:
             entry.update(verifiedAt=int(time.time()),offset=0,probeAt=int(time.time()),coverage='all_planned_segments_decoded')
             if entry.pop('replacementPending',False):self.resolve(path,entry,'Replacement file completed all planned decode ranges; source version changed')
             entry.pop('cycleLane',None)
+            self.run_paths['completed'].add(path);self.activity(path,entry,'full_cycle_passed')
             self.stats['cyclesCompleted']+=1;return 'complete'
         return 'next'
     def work(self,path,probe_only=False):
+        self.run_paths['attempted'].add(path)
         entry=self.state['files'][path];entry['lastAttemptAt']=int(time.time());entry.pop('deferredReason',None);self.dirty=True
+        self.attempt(path,entry,'metadata_probe_in_progress' if not entry.get('probeAt') else 'decode_in_progress')
         if time.time()-max(map(int,entry['identity'][3:]))/1000000000<self.cfg['settleSeconds']:
-            entry['notBefore']=int(time.time())+self.cfg['settleSeconds'];entry['deferredReason']='Recently changed file; ten-minute settle guard';return
-        fd=None;start=time.monotonic()
+            entry['notBefore']=int(time.time())+self.cfg['settleSeconds'];entry['deferredReason']='Recently changed file; ten-minute settle guard'
+            self.attempt(path,entry,'deferred_recent_change')
+            return
+        fd=None;start=time.monotonic();outcome='interrupted_or_unverified'
         try:
-            fd=self.open_file(path,entry)
+            fd=self.open_file(path,entry);self.run_paths['opened'].add(path)
             if not entry.get('probeAt') and not self.probe(path,entry,fd):
                 if not self.retry_transient(entry) or not self.probe(path,entry,fd):return
-            if probe_only:return
+            if probe_only:outcome='metadata_probe_passed';return
             while not self.stopped() and time.monotonic()-start<self.cfg['fileSliceSeconds']:
                 outcome=self.segment(path,entry,fd)
+                self.attempt(path,entry,outcome)
                 self.checkpoint()
                 if outcome=='changed':entry['notBefore']=int(time.time())+300;entry['deferredReason']='File identity changed during decoding; no range credit'
                 if path in self.cfg.get('evidencePaths',[]) and outcome!='recheck':break
                 if outcome not in ('next','recheck','retry'):break
         except FileNotFoundError:
+            outcome='deferred_source_changed'
             entry['notBefore']=int(time.time())+300;entry['deferredReason']='File removed/changed before opening; no range credit'
         except OSError as error:
             kind='read_error' if error.errno==errno.EIO else 'unverified_permissions_or_storage'
-            self.issue(path,entry,kind,type(error).__name__+': '+str(error.errno))
+            outcome=kind;self.issue(path,entry,kind,type(error).__name__+': '+str(error.errno))
         finally:
+            if outcome=='interrupted_or_unverified' and entry.get('issue'):outcome=entry['issue']['kind']
+            self.attempt(path,entry,outcome)
             if fd is not None:os.close(fd)
             self.checkpoint()
     def finish(self):
+        self.progress_counts()
         now=int(time.time());files=self.state['files'];stats=self.stats
         stats.update(elapsedSeconds=int(time.monotonic()-self.start),finishedAt=now,
                      pendingInitial=sum(not f.get('verifiedAt') and f.get('cycleLane')!='old' for f in files.values()),
