@@ -16,7 +16,7 @@ adapter(){ case "$1" in inventory) cat "$fixture/inventory";;*) return 1;;esac; 
 docker_cmd(){ case "$1 ${2:-}" in 'info ') return 0;;'container ls') jq -r '.docker|keys[]' "$fixture/inventory";;*) return 1;;esac; }
 initialize
 trap 'rm -rf -- "$TMP_DIR"' EXIT
-jq -e '.enabled==true and .docker.prowlarr.allow==true and .docker.seerr.allow==true and .docker.sabnzbd.allow==true and .docker.sabnzbd.candidateHoldHours==12 and .plugins["community.applications.plg"].allow==true and .plugins["tailscale.plg"].allow==true' "$POLICY_FILE" >/dev/null
+jq -e '.enabled==true and .docker.prowlarr.allow==true and .docker.seerr.allow==true and .docker.sabnzbd.allow==true and .docker.sabnzbd.candidateHoldHours==1 and .docker.prowlarr.candidateHoldHours==6 and .plugins["community.applications.plg"].allow==true and .plugins["tailscale.plg"].allow==true' "$POLICY_FILE" >/dev/null
 policy_update '.reportTime="00:00"'
 collect_inventory
 # Installed-but-stopped does not mean retired and never grants an autostart.

@@ -54,7 +54,7 @@ usr_ops_append_log() {
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.13"
+readonly SCRIPT_VERSION="3.14"
 
 ###############################################################################
 # CONFIGURATION
@@ -1175,9 +1175,13 @@ plex_update_readiness() {
 arr_activity_summary() {
     jq -e '
       if (.commands|type)!="array" or (.queue.records|type)!="array" or (.queue.totalRecords|type)!="number" or .queue.totalRecords>(.queue.records|length) then error("Incomplete Arr activity evidence") else . end |
-      [.commands[]|select((.status|ascii_downcase)=="started" or (.status|ascii_downcase)=="queued" or (.status|ascii_downcase)=="running")] as $commands |
-      [.queue.records[]|select((.trackedDownloadState // ""|ascii_downcase)=="importing" or (.trackedDownloadState // ""|ascii_downcase)=="processing")] as $imports |
-      {ready:($commands|length)==0 and ($imports|length)==0,classification:(if ($commands|length)+($imports|length)>0 then "busy" else "ready" end),source:"native-arr-activity",activeCommands:($commands|length),activeImports:($imports|length),detail:(if ($commands|length)+($imports|length)>0 then "Native Arr command/import operation active; update deferred until completion" else "Native Arr command/import activity idle; queued downloads and import warnings alone do not block updates" end)}'
+      # Queued native commands survive restart. Only active file-changing or
+      # unknown operations block; routine checks/searches may be interrupted.
+      def routine: (.name // .body.name // ""|ascii_downcase) as $n |
+        ["checkhealth","rsssync","refreshmonitoreddownloads","applicationupdatecheck","messagingcleanup","trimlog","housekeeping","episodesearch","moviessearch","moviesearch","seasonsearch","seriessearch","missingepisodesearch","cutoffunmetepisodesearch","missingmoviessearch","cutoffunmetmoviessearch"] | index($n)!=null;
+      [.commands[]|select((.status|ascii_downcase)=="started" or (.status|ascii_downcase)=="running")|select((.body.requiresDiskAccess // false)==true or (routine|not))] as $commands |
+      [.queue.records[]|select((.trackedDownloadState // ""|ascii_downcase)=="importing")] as $imports |
+      {ready:($commands|length)==0 and ($imports|length)==0,classification:(if ($commands|length)+($imports|length)>0 then "busy" else "ready" end),source:"native-arr-activity",activeCommands:($commands|length),activeImports:($imports|length),detail:(if ($commands|length)+($imports|length)>0 then "Active Arr file-changing/unknown command or import; update deferred until completion" else "No protected Arr file operation; queued commands, downloading, pending four-hour post-processing and import warnings allow updates" end)}'
 }
 arr_update_readiness() {
     local name="$1"
@@ -1203,23 +1207,36 @@ arr_update_readiness() {
 
 
 sab_readiness() {
-    local purpose="$1"
-    docker_cmd exec -i sabnzbd /lsiopy/bin/python3 - "$purpose" <<'PY'
+    local purpose="$1" tools processes
+    processes=$(docker_cmd top sabnzbd -eo pid,comm) || return 1
+    tools=$(awk 'NR>1 && $2 ~ /^(unrar|rar|7z|7za|7zz|7zzs|unzip|par2|par2repair|par2cmdline.*)$/ {n++} END {print n+0}' <<<"$processes")
+    docker_cmd exec -i sabnzbd /lsiopy/bin/python3 - "$purpose" "$tools" <<'PY'
 import configobj,json,sys,urllib.parse,urllib.request
 c=configobj.ConfigObj('/config/sabnzbd.ini',interpolation=False)['misc']
 q=urllib.parse.urlencode({'mode':'queue','output':'json','apikey':c['api_key'],'limit':1000})
 url='http://127.0.0.1:'+str(c.get('port',8080))+'/api?'+q
 with urllib.request.urlopen(url,timeout=5) as r:d=json.load(r)['queue']
 assert isinstance(d,dict) and isinstance(d.get('status'),str) and isinstance(d.get('slots'),list)
-busy=d['status'].lower()=='downloading' or any(str(s.get('status','')).lower() not in ('queued','paused','completed') for s in d['slots'])
-# SAB can post-process while downloads are paused; the native history endpoint
-# includes these jobs even when there is no currently downloading queue item.
+# Waiting for the four-hour batch and resumable downloading are not active
+# post-processing. Failed history entries are terminal, handled by the monitor.
+active={'checking','quickcheck','verifying','repairing','extracting','unpacking','moving','running','postprocessing'}
+waiting={'idle','queued','paused','completed','failed','deleted','downloading','fetching','grabbing','propagating','stopped'}
+def classify(slots):
+    states=[str(s.get('status','')).replace(' ','').lower() for s in slots]
+    return sum(v in active for v in states),sum(v not in active|waiting for v in states)
+busy,unknown=classify(d['slots'])
+b,u=classify([{'status':d['status']}]);busy+=b;unknown+=u
 q=urllib.parse.urlencode({'mode':'history','output':'json','apikey':c['api_key'],'limit':1000})
 with urllib.request.urlopen('http://127.0.0.1:'+str(c.get('port',8080))+'/api?'+q,timeout=5) as r:h=json.load(r)['history']
 assert isinstance(h.get('slots'),list)
-busy=busy or any(str(s.get('status','')).lower() not in ('completed','failed','deleted','queued') for s in h['slots'])
-ready=not busy if sys.argv[1]=='update' else True
-print(json.dumps({'ready':ready,'classification':'ready' if ready else 'busy','source':'native-sab-api','detail':'Authenticated SAB queue/history verified; active download or post-processing defers installation' if ready else 'SAB download/post-processing active; update deferred'}))
+assert int(h.get('ppslots',0))<=len(h['slots']),'Post-processing history slice incomplete'
+b,u=classify(h['slots']);busy+=b;unknown+=u
+# Direct unpack may be active while the queue still says Downloading.
+tools=int(sys.argv[2]) if len(sys.argv)>2 else 0
+busy+=tools
+ready=not busy and not unknown if sys.argv[1]=='update' else True
+print(json.dumps({'ready':ready,'classification':'ready' if ready else ('unverified' if unknown else 'busy'),'source':'native-sab-api',
+ 'detail':('SAB queue/history verified; downloading, queued and pending four-hour post-processing jobs allow updates; downloads resume after restart' if ready else 'SAB active post-processing/tool processes='+str(busy)+', unknown job statuses='+str(unknown)+'; existing work retained and update retries after completion')}))
 PY
 }
 

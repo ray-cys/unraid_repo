@@ -45,14 +45,14 @@ class Readiness(unittest.TestCase):
         self.assertTrue(self.scheduler(self.line('Validating Options'),'imagemaid','health')['ready'])
     def test_malformed_native_log_fails_closed(self):
         with self.assertRaises(AssertionError):self.scheduler('unrecognized content\n')
-    def sab(self,queue,history,purpose='update'):
+    def sab(self,queue,history,purpose='update',tools=0):
         native=types.ModuleType('configobj')
         native.ConfigObj=lambda *a,**k:{'misc':{'port':8080,'api_key':'fixture-secret'}}
         import urllib.request
         def open_(url,timeout):
             return io.StringIO(json.dumps({'queue':queue} if 'mode=queue' in url else {'history':history}))
         out=io.StringIO()
-        with patch.dict(sys.modules,{'configobj':native}),patch.object(sys,'argv',['-',purpose]),patch.object(urllib.request,'urlopen',open_),contextlib.redirect_stdout(out):
+        with patch.dict(sys.modules,{'configobj':native}),patch.object(sys,'argv',['-',purpose,str(tools)]),patch.object(urllib.request,'urlopen',open_),contextlib.redirect_stdout(out):
             exec(program('sab_readiness'),{})
         self.assertNotIn('fixture-secret',out.getvalue())
         return json.loads(out.getvalue())
@@ -60,8 +60,16 @@ class Readiness(unittest.TestCase):
         q={'status':'Paused','slots':[{'status':'Queued'}]}
         self.assertTrue(self.sab(q,{'slots':[{'status':'Completed'}]})['ready'])
         self.assertFalse(self.sab(q,{'slots':[{'status':'Extracting'}]})['ready'])
-        self.assertFalse(self.sab({'status':'Downloading','slots':[]},{'slots':[]})['ready'])
+        self.assertTrue(self.sab({'status':'Downloading','slots':[{'status':'Downloading'}]},{'slots':[{'status':'Queued'}]})['ready'])
         self.assertTrue(self.sab(q,{'slots':[{'status':'Extracting'}]},'health')['ready'])
+    def test_sab_postprocessing_and_unknown_states(self):
+        q={'status':'Paused','slots':[{'status':'Queued'}]}
+        for state in ('Repairing','QuickCheck','Verifying','Extracting','Moving','Running'):
+            self.assertFalse(self.sab(q,{'slots':[{'status':state}]})['ready'],state)
+        self.assertTrue(self.sab(q,{'slots':[{'status':'Failed'},{'status':'Queued'}]})['ready'])
+        self.assertFalse(self.sab(q,{'slots':[{'status':'NewUnknownState'}]})['ready'])
+        self.assertFalse(self.sab({'status':'Downloading','slots':[{'status':'Downloading'}]},{'slots':[]},tools=1)['ready'])
+        with self.assertRaises(AssertionError):self.sab(q,{'ppslots':5,'slots':[]})
     def test_sab_malformed_api_fails_closed(self):
         with self.assertRaises(AssertionError):self.sab({'status':'Paused'},{'slots':[]})
 

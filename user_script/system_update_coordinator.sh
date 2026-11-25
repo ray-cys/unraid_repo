@@ -1,7 +1,7 @@
 #!/bin/bash
 clearLog=true
 arrayStarted=true
-# System Update Coordinator v1.3.0 -- personal Hubble maintenance.
+# System Update Coordinator v1.4.0 -- personal Hubble maintenance.
 # PURPOSE: Detect Docker/plugin/Unraid OS updates; automatically install only
 # explicitly approved, still-installed items during a bounded maintenance window.
 # Existing producers finish; expiring requests make new conflicting work yield.
@@ -11,6 +11,14 @@ arrayStarted=true
 # No OS installation/reboot, image-channel change, forced import or DB rollback.
 # SCHEDULE: */15 * * * *; registry polling has its own six-hour per-item cache.
 # New installs: 13:15-15:30 Singapore; at most one/run, six Docker + two plugins/rolling 24h.
+# Default Docker holds: stable 6h; nightly/develop/unstable 1h. Plugins 24h.
+# Backup freshness follows its User Scripts cron: tolerate one missed run plus
+# 12-hour completion grace. Active appdata/boot backup still blocks installs.
+# Ordinary non-correcting parity checks, Mover, remote copies and read-only
+# restore drills are advisory; rebuilds/correcting or unknown array work defer.
+# SAB/qBittorrent downloading and queued four-hour batches do not block updates.
+# Arr protects active file-changing/unknown work and imports, not queued checks.
+# All observed holds and next reassessment are saved for the grouped report.
 # Default allowlist seeds once, bound to exact installed repository/source URL.
 # Retired items leave policy automatically after two complete inventory scans;
 # stopped items stay stopped. Reinstalling a retired/changed identity needs review.
@@ -22,7 +30,7 @@ arrayStarted=true
 # Undelivered pages stay in a durable outbox.
 # Recovery: journal before native recreation. Uncertain installs are inspected,
 # never blindly repeated. Previous image/config archived before update; latest
-# two finished recovery sets retained, plus any unresolved set (new work stops).
+# two finished recovery sets retained, plus unresolved sets (affected dependency groups remain held).
 # An image archive does not reverse DB migrations. Compatible appdata restoration
 # is a critical/manual recovery step; existing backup retention is independent.
 # Native mutable tags can move during the installer pull; read-back detects any
@@ -79,13 +87,13 @@ usr_ops_append_log() {
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="1.3.0"
+readonly SCRIPT_VERSION="1.4.0"
 # Keep configured per-item holds when approving the same installed identity.
 # Daily rolling tags need a shorter hold to avoid perpetually chasing rebuilds.
 readonly APPROVAL_JQ='def approval($old;$identity;$allow;$kind;$epoch):
  (if ($old.identity // "")==$identity then $old else {} end) |
  .+{identity:$identity,allow:$allow,approvedAt:$epoch} |
- if $kind=="docker" and .candidateHoldHours==null and ($identity|test(":(nightly|develop|unstable)$")) then .candidateHoldHours=12 else . end;'
+ if $kind=="docker" and .candidateHoldHours==null and ($identity|test(":(nightly|develop|unstable)$")) then .candidateHoldHours=1 elif $kind=="docker" and .candidateHoldHours==null then .candidateHoldHours=6 else . end;'
 
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/system_update_coordinator}"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
@@ -105,7 +113,10 @@ LOG_FILE="$STATE_DIR/system-update-coordinator.log"
 MAX_RUNTIME_SECONDS=840
 MAX_CHECKS_PER_RUN=4
 CHECK_INTERVAL_SECONDS=21600
-BACKUP_MAX_AGE_SECONDS=$((80*3600))
+BACKUP_MAX_AGE_SECONDS=$((80*3600)) # Fallback only when no User Scripts schedule exists.
+BACKUP_SCHEDULE_FILE="${BACKUP_SCHEDULE_FILE:-/boot/config/plugins/user.scripts/schedule.json}"
+BACKUP_FINISH_GRACE_SECONDS=43200
+BACKUP_REASON=''
 DOCKER_MAINTENANCE_DIR="${DOCKER_MAINTENANCE_DIR:-/run/docker-service-maintenance}"
 APP_UPDATE_REQUEST_DIR="${APP_UPDATE_REQUEST_DIR:-/run/docker-update-requests}"
 COORDINATION_WAIT_SECONDS="${COORDINATION_WAIT_SECONDS:-90}"
@@ -340,12 +351,55 @@ check_updates() {
       [.key,.value.kind,.value.name,.value.identity]|@tsv' "$STATE_FILE")
 }
 
+backup_schedule_window() {
+    # Two due occurrences means one missed run is tolerated. A 12-hour finish
+    # grace is applied before a scheduled start becomes due. No cron changes.
+    local kind="$1" now="$2" name=backup_cache_appdata
+    [[ "$kind" != plugin ]] || name=backup_boot_disk
+    php -r '
+      [$file,$name,$now,$grace]=array_slice($argv,1);$now=(int)$now;$grace=(int)$grace;
+      if(!is_file($file)){echo json_encode(["cutoff"=>$now-80*3600,"source"=>"80-hour fallback; schedule unavailable"]);exit;}
+      $s=json_decode(file_get_contents($file),true,512,JSON_THROW_ON_ERROR);
+      $key="/boot/config/plugins/user.scripts/scripts/$name/script";
+      $entry=$s[$key]??null;
+      if(!is_array($entry)||($entry["frequency"]??null)!=="custom")exit(1);
+      $fields=preg_split("/\s+/",trim($entry["custom"]??""));if(count($fields)!==5)exit(1);
+      function vals($expr,$lo,$hi){
+        $out=[];foreach(explode(",",$expr) as $piece){
+          if(!preg_match("~^(\\*|[0-9]+(?:-[0-9]+)?)(?:/([0-9]+))?$~D",$piece,$m))exit(1);
+          $step=isset($m[2])?(int)$m[2]:1;if($step<1)exit(1);
+          if($m[1]==="*"){ $a=$lo;$b=$hi; }
+          elseif(str_contains($m[1],"-")){[$a,$b]=array_map("intval",explode("-",$m[1]));}
+          else{$a=(int)$m[1];$b=isset($m[2])?$hi:$a;}
+          if($a<$lo||$b>$hi||$b<$a)exit(1);
+          for($i=$a;$i<=$b;$i+=$step)$out[$i]=true;
+        }return array_keys($out);
+      }
+      $mins=vals($fields[0],0,59);$hours=vals($fields[1],0,23);$dom=vals($fields[2],1,31);$months=vals($fields[3],1,12);$dow=vals($fields[4],0,7);
+      if(in_array(7,$dow,true))$dow[]=0;
+      rsort($mins);rsort($hours);$zone=new DateTimeZone("Asia/Singapore");
+      $day=(new DateTimeImmutable("@".$now))->setTimezone($zone)->setTime(0,0);$due=[];
+      for($d=0;$d<400 && count($due)<2;$d++,$day=$day->modify("-1 day")){
+        if(!in_array((int)$day->format("n"),$months,true))continue;
+        $dm=in_array((int)$day->format("j"),$dom,true);$dw=in_array((int)$day->format("w"),$dow,true);
+        $match=!str_starts_with($fields[2],"*") && !str_starts_with($fields[4],"*")?($dm||$dw):($dm&&$dw);
+        if(!$match)continue;
+        foreach($hours as $h)foreach($mins as $m){$t=$day->setTime($h,$m)->getTimestamp();if($t<=$now-$grace){$due[]=$t;if(count($due)===2)break 2;}}
+      }
+      if(count($due)!==2)exit(1);
+      echo json_encode(["cutoff"=>$due[1],"lastDue"=>$due[0],"source"=>"User Scripts cron ".$entry["custom"]."; one delayed run and 12-hour finish grace allowed"]);
+    ' "$BACKUP_SCHEDULE_FILE" "$name" "$now" "$BACKUP_FINISH_GRACE_SECONDS"
+}
+
 backup_evidence() {
-    local kind="$1" source manifest hash now
-    now=$(date +%s)
+    local kind="$1" source manifest hash now window cutoff
+    now=$(date +%s);BACKUP_REASON='Verified backup evidence unavailable'
+    window=$(backup_schedule_window "$kind" "$now") || { BACKUP_REASON="Backup schedule could not be validated; no automatic update";return 1; }
+    cutoff=$(jq -r .cutoff <<<"$window")
+    BACKUP_REASON="Verified backup required since $(TZ=Asia/Singapore date -d "@$cutoff" '+%Y-%m-%d %H:%M SGT'); $(jq -r .source <<<"$window")"
     if [[ "$kind" == docker ]];then
       source="$STATUS_DIR/iss-backup-request.json"
-      jq -e --argjson cutoff "$((now-BACKUP_MAX_AGE_SECONDS))" '.schema==1 and .completedAt>=$cutoff and (.generation|startswith("/mnt/vault/backup/cache/backup_")) and (.manifestSha256|test("^[a-f0-9]{64}$"))' "$source" >/dev/null || return 1
+      jq -e --argjson cutoff "$cutoff" '.schema==1 and .completedAt>=$cutoff and (.generation|startswith("/mnt/vault/backup/cache/backup_")) and (.manifestSha256|test("^[a-f0-9]{64}$"))' "$source" >/dev/null || return 1
       manifest=$(jq -r .generation "$source")/backup_manifest.tsv
       [[ -f "$manifest" && ! -L "$manifest" ]] || return 1
       hash=$(sha256sum "$manifest"|cut -d' ' -f1)
@@ -353,7 +407,7 @@ backup_evidence() {
       cp "$source" "$TMP_DIR/backup-evidence.json"
     else
       source=/mnt/vault/backup/flash/.backup_boot_disk_state.json
-      jq -e --argjson cutoff "$((now-BACKUP_MAX_AGE_SECONDS))" '.successfulAt>=$cutoff and (.archiveSha256|test("^[a-f0-9]{64}$"))' "$source" >/dev/null || return 1
+      jq -e --argjson cutoff "$cutoff" '.successfulAt>=$cutoff and (.archiveSha256|test("^[a-f0-9]{64}$"))' "$source" >/dev/null || return 1
       [[ -f "$(jq -r .backupFile "$source")" ]] || return 1
       cp "$source" "$TMP_DIR/backup-evidence.json"
     fi
@@ -397,6 +451,59 @@ prune_update_requests() {
       if jq -e --arg boot "$boot" --argjson now "$now" '.owner=="system_update_coordinator" and (.boot!=$boot or ((.expires|type)=="number" and .expires<=$now))' "$file" >/dev/null 2>&1;then rm -f -- "$file";fi
     done
 }
+native_installer_idle() {
+    ! pgrep -f '(^|/)(update_container|installpkg|upgradepkg|removepkg)([[:space:]]|$)|/scripts/plugin (install|update|remove)([[:space:]]|$)' >/dev/null
+}
+application_group() {
+    local family="${1,,} ${2,,}"
+    case "$family" in
+      *sonarr*|*radarr*|*sabnzbd*|*prowlarr*|*qbittorrent*|*recyclarr*|*bazarr*) printf media_pipeline;;
+      *plex*|*kometa*|*metafusion*|*imagemaid*) printf plex_metadata;;
+      *) printf '%s' "$1";;
+    esac
+}
+pending_update_guard() {
+    local kind="$1" name="$2" identity="${3:-}" row group other
+    group=$(application_group "$name" "$identity")
+    while IFS= read -r row;do
+      if [[ $(jq -r '.kind' <<<"$row") == plugin || $(jq -r '.installerFinishedVerified // false' <<<"$row") != true ]];then
+        SUMMARY="All updates wait: $(jq -r .name <<<"$row") installer completion/host outcome unverified";return 1
+      fi
+      other=$(application_group "$(jq -r .name <<<"$row")" "$(jq -r '.identity // ""' <<<"$row")")
+      if [[ "$kind" == plugin || "$other" == "$group" ]];then
+        SUMMARY="$name waits: $(jq -r .name <<<"$row") outcome pending in $other; independent Docker groups remain eligible";return 1
+      fi
+    done < <(jq -c '.jobs[]|select(.status=="INTENT" or .status=="VERIFYING" or .status=="ATTENTION")' "$STATE_FILE")
+}
+array_update_guard() {
+    local values active action correct
+    values=$(bounded 5 /usr/local/sbin/mdcmd status) || { SUMMARY='Array activity could not be verified';return 1; }
+    grep -q '^mdState=STARTED$' <<<"$values" || { SUMMARY='Array is not started';return 1; }
+    active=$(awk -F= '$1=="mdResync"{print $2}' <<<"$values")
+    [[ "$active" =~ ^[0-9]+$ ]] || { SUMMARY='Array operation flag unavailable';return 1; }
+    [[ "$active" != 0 ]] || return 0
+    action=$(awk -F= '$1=="mdResyncAction"{print $2}' <<<"$values")
+    correct=$(awk -F= '$1=="mdResyncCorr"{print $2}' <<<"$values")
+    if [[ "$action" =~ ^check([[:space:]]|$) && "$correct" == 0 ]];then return 0;fi
+    SUMMARY="Array rebuild, parity sync/correction or unverified operation active: $action; updates wait";return 1
+}
+
+target_coordination() {
+    local kind="$1" family="${2,,} ${3,,}"
+    COORD_SCOPES='[]';COORD_EXCLUSIVE=false;COORD_LOCKS=()
+    if [[ "$kind" == plugin || "$family" =~ sonarr|radarr|sabnzbd|prowlarr ]];then
+      COORD_EXCLUSIVE=true;COORD_SCOPES='["arr","torrent","metadata","integrity"]'
+      [[ "$kind" != plugin ]] || COORD_LOCKS+=(/run/media_plex_dbrepair.lock)
+    elif [[ "$family" == *qbittorrent* ]];then
+      COORD_SCOPES='["torrent"]';COORD_LOCKS+=(/tmp/media_torrent_management.lock)
+    elif [[ "$family" =~ plex|kometa|metafusion|imagemaid ]];then
+      COORD_SCOPES='["metadata"]';COORD_LOCKS+=("${METADATA_AUDIT_LOCK:-/mnt/vault/cloud/logs/script/media_metadata_audit/audit.lock}")
+      [[ "$family" != *plex* ]] || COORD_LOCKS+=(/run/media_plex_dbrepair.lock)
+    elif [[ "$family" == *bazarr* ]];then
+      COORD_SCOPES='["integrity"]';COORD_LOCKS+=(/run/media_integrity_audit.lock)
+    fi
+}
+
 maintenance_guard() {
     local kind="${1:-plugin}" name="${2:-plugin}" identity="${3:-}" lock values fd scopes='[]' exclusive=false family="${2:-plugin} ${3:-}"
     [[ "$COORDINATION_WAIT_SECONDS" =~ ^[0-9]+$ ]] && ((COORDINATION_WAIT_SECONDS<=120)) || { SUMMARY="Invalid coordination wait limit";return 1; }
@@ -405,27 +512,17 @@ maintenance_guard() {
     release_operation_locks
     [[ "${REQUEST_KEEP:-false}" == true ]] || clear_update_request || return 1
     CURRENT_REQUEST='';REQUEST_KEEP=false;GUARD_GLOBAL=true
-    for lock in /tmp/backup_cache_appdata.lock /tmp/backup_boot_disk.lock /tmp/backup_media_remote.lock /run/backup_vault_remote.lock /run/backup_restore_drill.lock;do
+    for lock in /tmp/backup_cache_appdata.lock /tmp/backup_boot_disk.lock;do
       if [[ -e "$lock" ]];then flock -s -n "$lock" -c true || { SUMMARY="Maintenance deferred: ${lock##*/} active";return 1; };fi
     done
-    pgrep -f '(^|/)(update_container|installpkg|upgradepkg|removepkg)([[:space:]]|$)|/scripts/plugin (install|update|remove)([[:space:]]|$)' >/dev/null && { SUMMARY='Maintenance deferred: native installer/package operation active';return 1; }
-    pgrep -f '(^|/)(mover|mover\.old)([[:space:]]|$)|mover\.php' >/dev/null && { SUMMARY='Maintenance deferred: Mover active';return 1; }
-    values=$(bounded 5 /usr/local/sbin/mdcmd status) || { SUMMARY='Array activity could not be verified';return 1; }
-    grep -q '^mdState=STARTED$' <<<"$values" || { SUMMARY='Array is not started';return 1; }
-    [[ $(awk -F= '$1=="mdResync"{print $2}' <<<"$values") == 0 ]] || { SUMMARY='Maintenance deferred: active array operation';return 1; }
+    native_installer_idle || { SUMMARY='Maintenance deferred: native installer/package operation active';return 1; }
+    # Mover and unrelated remote copies/read-only drills are I/O advisories.
+    # Shared/exclusive application gates still protect actual data mutation.
+    array_update_guard || return 1
     GUARD_GLOBAL=false
-    local -a producer_locks=()
-    if [[ "$kind" == plugin || "$family" =~ sonarr|radarr|sabnzbd|prowlarr ]];then
-      exclusive=true;scopes='["arr","torrent","metadata","integrity"]'
-      [[ "$kind" != plugin ]] || producer_locks+=(/run/media_plex_dbrepair.lock)
-    elif [[ "$family" == *qbittorrent* ]];then
-      scopes='["torrent"]';producer_locks+=(/tmp/media_torrent_management.lock)
-    elif [[ "$family" =~ plex|kometa|metafusion|imagemaid ]];then
-      scopes='["metadata"]';producer_locks+=("${METADATA_AUDIT_LOCK:-/mnt/vault/cloud/logs/script/media_metadata_audit/audit.lock}")
-      [[ "$family" != *plex* ]] || producer_locks+=(/run/media_plex_dbrepair.lock)
-    elif [[ "$family" == *bazarr* ]];then
-      scopes='["integrity"]';producer_locks+=(/run/media_integrity_audit.lock)
-    fi
+    target_coordination "$kind" "$name" "$identity"
+    exclusive=$COORD_EXCLUSIVE;scopes=$COORD_SCOPES
+    local -a producer_locks=("${COORD_LOCKS[@]}")
     request_update_handoff "$name" "$scopes" || return 1
     # Wait only for existing consumers, never remove their lock. The expiring
     # request survives a busy attempt so the next scheduled run can resume.
@@ -547,7 +644,7 @@ recover_preparation() {
     local id
     while read -r id;do
       cleanup_unissued_set "$id" || true
-      job_update "$id" '.jobs[$id].status="DEFERRED" | .jobs[$id].reason="Interrupted preparation reconciled; no native installer was dispatched"' || return 1
+      job_update "$id" '.jobs[$id].status="DEFERRED" | .jobs[$id].reason="Interrupted preparation reconciled; no native installer was dispatched" | .jobs[$id].retryAt=($now+300)' --argjson now "$(date +%s)" || return 1
       event normal 'Interrupted preparation reconciled' "$id: preparation reconciled; known owned partial files cleaned where safe and unexpected entries preserved; no native installer had been dispatched and the application was not changed. Normal backoff and safety checks remain in force." "preparation-recovered:$id" || return 1
     done < <(jq -r '.jobs|to_entries[]|select(.value.status=="PREPARING" and (.value.dispatchedAt // 0)==0)|.key' "$STATE_FILE")
 }
@@ -555,6 +652,20 @@ recover_preparation() {
 defer_prepared() {
     job_update "$1" '.jobs[$id].status="DEFERRED" | .jobs[$id].reason=$reason | .jobs[$id].retryAt=$retry' --argjson retry "$(( $(date +%s)+300 ))" --arg reason "$2" || return 1
     cleanup_unissued_set "$1" || true
+}
+
+release_pre_dispatch() {
+    # Called only while the durable journal proves the installer was not called.
+    # Never remove another producer lease or any uncertain installation guard.
+    if [[ -n "$LEASE_FILE" && -f "$LEASE_FILE" && ! -L "$LEASE_FILE" ]];then
+      if jq -e --arg run "$RUN_ID" '.owner=="system_update_coordinator" and .runId==$run' "$LEASE_FILE" >/dev/null 2>&1;then rm -f -- "$LEASE_FILE";fi
+    fi
+    LEASE_FILE=''
+    [[ -z "${MAINT_FD:-}" ]] || exec {MAINT_FD}>&-
+    MAINT_FD=''
+    [[ "$REQUEST_KEEP" == true ]] || clear_update_request || true
+    CURRENT_REQUEST='';REQUEST_KEEP=false
+    release_operation_locks
 }
 
 reconcile_jobs() {
@@ -569,6 +680,7 @@ reconcile_jobs() {
       fi
       if job_verified "$id";then
         clear_update_request "$APP_UPDATE_REQUEST_DIR/$name.json" || return 1
+        if native_installer_idle;then job_update "$id" '.jobs[$id].installerFinishedVerified=true' || return 1;fi
         count=$(jq -r --arg id "$id" '.jobs[$id].verifiedScans // 0' "$STATE_FILE");count=$((count+1))
         job_update "$id" '.jobs[$id].verifiedScans=$count' --argjson count "$count" || return 1
         if ((count>=2));then
@@ -584,7 +696,7 @@ reconcile_jobs() {
           continue
         fi
         job_update "$id" '.jobs[$id].verifiedScans=0 | .jobs[$id].status="ATTENTION"' || return 1
-        event warning 'Update requires review' "$name: native update outcome or application readiness remains unverified. Further automatic installs are held. Existing recovery evidence retained; no blind installer replay or database rollback was attempted. Recovery set: $(jq -r --arg id "$id" '.jobs[$id].recoveryPath' "$STATE_FILE")" "attention:$id" || return 1
+        event warning 'Update requires review' "$name: native update outcome or application readiness remains unverified. Affected application/dependency updates remain held; independent Docker apps may continue only after installer completion is verified. Existing recovery evidence retained; no blind installer replay or database rollback was attempted. Recovery set: $(jq -r --arg id "$id" '.jobs[$id].recoveryPath' "$STATE_FILE")" "attention:$id" || return 1
       fi
     done < <(jq -r '.jobs|to_entries[]|select(.value.status=="INTENT" or .value.status=="VERIFYING" or .value.status=="ATTENTION")|.key' "$STATE_FILE")
 }
@@ -628,8 +740,8 @@ quota_available() {
 install_one() {
     local key kind name identity candidate approved now count job_id old_id='' old_image='' recovery_path native_rc=0 post_guard_failed=false fresh
     [[ $(jq -r .enabled "$POLICY_FILE") == true ]] && window_open && within_budget 630 || return 0
-    # Never continue a batch after an unverified or interrupted native mutation.
-    jq -e 'all(.jobs[];.status!="INTENT" and .status!="VERIFYING" and .status!="ATTENTION")' "$STATE_FILE" >/dev/null || { RESULT=DEFERRED;jq -e 'any(.jobs[];.status=="INTENT" or .status=="ATTENTION")' "$STATE_FILE" >/dev/null && RESULT=ATTENTION;SUMMARY='Automatic installs held for pending verification; reconciliation continues';return 0; }
+    # Uncertain/running installers remain global; completed Docker installers
+    # hold only the affected dependency group while reconciliation continues.
     now=$(date +%s)
     count=$(jq --argjson cutoff "$((now-86400))" '[.jobs[]|select((.dispatchedAt // 0)>=$cutoff)]|length' "$STATE_FILE")
     ((count<$(jq -r '.limits.dailyTotal // 8' "$POLICY_FILE"))) || return 0
@@ -638,11 +750,12 @@ install_one() {
       [[ "$name" != unRAIDServer.plg ]] || continue
       approved=$(jq -r --arg kind "$kind" --arg name "$name" --arg identity "$identity" '(if $kind=="docker" then .docker[$name] else .plugins[$name] end) as $p | ($p.allow==true and $p.identity==$identity)' "$POLICY_FILE")
       [[ "$approved" == true ]] || continue
+      pending_update_guard "$kind" "$name" "$identity" || { decision "$key" "$SUMMARY";continue; }
       # Failed/rejected digest/version stays quarantined until it changes or an
       # operator explicitly resolves the job; no reinstall loops.
       jq -e --arg key "$key" --arg candidate "$candidate" --argjson cutoff "$((now-6*3600))" --argjson now "$now" 'all(.jobs[];.item!=$key or .candidate!=$candidate or (.status=="DEFERRED" and (.retryAt // (.startedAt+21600))<=$now))' "$STATE_FILE" >/dev/null || continue
       quota_available "$kind" || { decision "$key" "Rolling 24-hour $kind update limit reached";continue; }
-      backup_evidence "$kind" || { decision "$key" "Recent verified backup evidence unavailable";log INFO "$name: DEFERRED; recent verified backup evidence unavailable";continue; }
+      backup_evidence "$kind" || { decision "$key" "${BACKUP_REASON:-Recent verified backup evidence unavailable}";log INFO "$name: DEFERRED; ${BACKUP_REASON:-recent verified backup evidence unavailable}";continue; }
       if [[ "$kind" == docker ]];then
         jq -e --arg name "$name" '.docker[$name].running==true and .docker[$name].managed=="dockerman"' "$TMP_DIR/inventory.json" >/dev/null || { decision "$key" "Container stopped or not managed by DockerMan";continue; }
         # Require readiness before taking down an already unhealthy application.
@@ -678,25 +791,27 @@ install_one() {
         --arg previous "$(jq -r '.local // .installed.version // "unknown"' "$TMP_DIR/fresh.json")" --arg oldId "$old_id" --arg oldImage "$old_image" --arg path "$recovery_path" --argjson now "$now" \
         '.jobs[$id]={previous:$previous,item:$item,kind:$kind,name:$name,identity:$identity,candidate:$candidate,status:"PREPARING",startedAt:$now,oldId:$oldId,oldImage:$oldImage,recoveryPath:$path,verifiedScans:0}' || return 1
       if ! prepare_recovery_set "$kind" "$name" "$job_id" "$old_image";then
-        job_update "$job_id" '.jobs[$id].status="DEFERRED" | .jobs[$id].reason="Recovery evidence preparation failed; native installer not called"' || return 1
-        cleanup_unissued_set "$job_id" || true
+        defer_prepared "$job_id" "Recovery evidence preparation failed; native installer not called: ${RECOVERY_REASON:-archive preparation unavailable}" || return 1
         event warning 'Update deferred before installation' "$name: recovery evidence could not be prepared; native installer was not called and the current application was retained. Reason: ${RECOVERY_REASON:-Recovery preparation did not complete}." "prepare:$key:$candidate" || return 1
-        return 0
+        release_pre_dispatch;continue
       fi
-      if [[ "$kind" == docker ]];then start_container_lease "$name" "$old_id" || { defer_prepared "$job_id" 'Existing maintenance lease; native installer not called';return 0; };fi
+      if [[ "$kind" == docker ]];then start_container_lease "$name" "$old_id" || { defer_prepared "$job_id" 'Existing maintenance lease; native installer not called' || return 1;release_pre_dispatch;continue; };fi
       # Recheck backup/interface/window and unchanged installed identity at the
       # final boundary. A late hold is known non-dispatch, not an uncertain POST.
       if ! window_open || ! within_budget 480 || ! adapter_compatible;then defer_prepared "$job_id" 'Final window/runtime/interface guard deferred before native installer';return 0;fi
       if [[ "$kind" == docker ]];then
         fresh=$(docker_cmd inspect "$name" --format '{{.Id}}') || return 1
-        readiness "$name" || { decision "$key" "$(jq -r '.detail // "Application busy or readiness unverified"' "$TMP_DIR/readiness.json" 2>/dev/null)";defer_prepared "$job_id" 'Final application readiness/busy guard deferred before dispatch';return 0; }
-        [[ "$fresh" == "$old_id" ]] || { defer_prepared "$job_id" 'Installed identity changed; native installer not called';return 0; }
+        readiness "$name" || { decision "$key" "$(jq -r '.detail // "Application busy or readiness unverified"' "$TMP_DIR/readiness.json" 2>/dev/null)";defer_prepared "$job_id" 'Final application readiness/busy guard deferred before dispatch' || return 1;release_pre_dispatch;continue; }
+        [[ "$fresh" == "$old_id" ]] || { defer_prepared "$job_id" 'Installed identity changed; native installer not called' || return 1;release_pre_dispatch;continue; }
       fi
       job_update "$job_id" '.jobs[$id].status="INTENT" | .jobs[$id].dispatchedAt=$now | .jobs[$id].candidateHash=$hash' --arg hash "$( [[ "$kind" != plugin ]] || jq -r .candidate.sha256 "$TMP_DIR/fresh.json" )" --argjson now "$(date +%s)" || return 1
       INSTALL_ACTIVE=true
       if [[ "$kind" == docker ]];then bounded 420 "$NATIVE_DOCKER_UPDATE" "$name" >"$TMP_DIR/native-install.log" 2>&1 || native_rc=$?
       else bounded 300 "$NATIVE_PLUGIN" update "$name" >"$TMP_DIR/native-install.log" 2>&1 || native_rc=$?;fi
       INSTALL_ACTIVE=false
+      local finished_verified=false
+      if ((native_rc!=124 && native_rc!=137 && native_rc!=143)) && native_installer_idle;then finished_verified=true;fi
+      job_update "$job_id" '.jobs[$id].nativeFinishedAt=$now | .jobs[$id].installerFinishedVerified=$finished' --argjson now "$(date +%s)" --argjson finished "$finished_verified" || return 1
       if [[ "$kind" == plugin ]];then
         enforce_single_installer || post_guard_failed=true
       fi
@@ -714,11 +829,11 @@ install_one() {
         if [[ -n "$CURRENT_REQUEST" && -f "$CURRENT_REQUEST" ]];then
           jq --argjson expires "$(( $(date +%s)+1200 ))" '.expires=$expires | .phase="startup_grace"' "$CURRENT_REQUEST" >"$TMP_DIR/request-startup" && mv "$TMP_DIR/request-startup" "$CURRENT_REQUEST" || return 1
         fi
-        event normal 'Update installed; startup verification pending' "$name: expected image digest and retained configuration verified; application readiness is still pending within the 20-minute startup grace. Further installations and watchdog restarts remain held while scheduled reconciliation checks actual readiness. Recovery set: $recovery_path." "startup:$job_id" || return 1
+        event normal 'Update installed; startup verification pending' "$name: expected image digest and retained configuration verified; application readiness is still pending within the 20-minute startup grace. Affected dependency installations and watchdog restarts remain held while scheduled reconciliation checks readiness; independent Docker apps may continue only after installer completion is verified. Recovery set: $recovery_path." "startup:$job_id" || return 1
       else
         RESULT=ATTENTION
         job_update "$job_id" '.jobs[$id].status="ATTENTION"' || return 1
-        event alert 'Update outcome requires attention' "$name: native installer exit=$native_rc; expected version/digest, configuration or readiness could not be confirmed. Further updates are held. Previous-image/configuration or plugin-definition recovery evidence and the backup reference are retained at $recovery_path. No blind replay or database rollback was attempted." "attention:$job_id" || return 1
+        event alert 'Update outcome requires attention' "$name: native installer exit=$native_rc; expected version/digest, configuration or readiness could not be confirmed. Affected application/dependency updates are held; uncertain installer completion or plugin outcomes still hold all updates. Previous-image/configuration or plugin-definition recovery evidence and the backup reference are retained at $recovery_path. No blind replay or database rollback was attempted." "attention:$job_id" || return 1
       fi
       return 0
     done < <(jq -r --slurpfile policy "$POLICY_FILE" --argjson now "$now" '
@@ -766,6 +881,104 @@ enforce_single_installer() {
     ! grep -Eq 'ca.update.applications/.+(updateDocker|updatePlugins)' <<<"$cron"
 }
 
+next_update_attempt() {
+    local now="${1:-$(date +%s)}" stamp day start end
+    stamp=$(( (now+899)/900*900 ));day=$(TZ=Asia/Singapore date -d "@$stamp" +%F)
+    start=$(TZ=Asia/Singapore date -d "$day $(jq -r .window.start "$POLICY_FILE")" +%s)
+    end=$(TZ=Asia/Singapore date -d "$day $(jq -r .window.end "$POLICY_FILE")" +%s)
+    if ((stamp<start));then stamp=$start
+    elif ((stamp>=end));then stamp=$(TZ=Asia/Singapore date -d "$day +1 day $(jq -r .window.start "$POLICY_FILE")" +%s);fi
+    printf '%s\n' "$stamp"
+}
+add_hold() {
+    jq -nc --arg code "$1" --arg reason "$2" '{code:$code,reason:$reason}' >>"$TMP_DIR/holds.ndjson"
+}
+collect_update_holds() {
+    # Read-only assessment after installation work, so reporting cannot consume
+    # its preparation budget. Cache expensive readiness for at most 30 minutes.
+    local key kind name identity row now age hours retry candidate family lock mode cached checks=0 array_reason='' backup_docker='' backup_plugin=''
+    local interface_bad=false saved_summary="$SUMMARY"
+    now=$(date +%s)
+    adapter_compatible || interface_bad=true
+    array_update_guard || array_reason="$SUMMARY"
+    backup_evidence docker || backup_docker="${BACKUP_REASON:-Verified appdata backup unavailable}"
+    backup_evidence plugin || backup_plugin="${BACKUP_REASON:-Verified boot backup unavailable}"
+    while IFS=$'\t' read -r key kind name identity candidate;do
+      within_budget 30 || break
+      : >"$TMP_DIR/holds.ndjson"
+      row=$(jq -c --arg key "$key" '.items[$key]' "$STATE_FILE")
+      hours=$(jq -r --arg kind "$kind" --arg name "$name" '(if $kind=="docker" then .docker[$name] else .plugins[$name] end).candidateHoldHours // .limits.candidateHoldHours // 24' "$POLICY_FILE")
+      age=$(( $(jq -r '.candidateSeenAt // 0' <<<"$row")+hours*3600 ));retry=$((now+1));((age<=retry)) || retry=$age
+      [[ "$name" != unRAIDServer.plg ]] || add_hold manual-os 'Unraid OS updates remain manual'
+      [[ $(jq -r .enabled "$POLICY_FILE") == true ]] || add_hold paused 'Automatic updates paused'
+      window_open || add_hold window 'Outside the approved installation window'
+      ((age<=now)) || add_hold candidate-age "Candidate observation hold: $hours hour(s); new digests restart this timer"
+      jq -e --arg kind "$kind" --arg name "$name" --arg identity "$identity" '(if $kind=="docker" then .docker[$name] else .plugins[$name] end)|.allow==true and .identity==$identity' "$POLICY_FILE" >/dev/null || add_hold approval 'Installed repository/source identity is not approved'
+      [[ $(jq -r .checkStatus <<<"$row") == VERIFIED ]] || add_hold registry 'Fresh registry/native evidence unavailable'
+      [[ $(jq -r '.missingScans // 0' <<<"$row") == 0 ]] || add_hold presence 'Presence needs complete inventory confirmation'
+      [[ "$interface_bad" != true ]] || add_hold native-interface 'Native Unraid updater interface/OS compatibility could not be verified'
+      [[ -z "$array_reason" ]] || add_hold array "$array_reason"
+      native_installer_idle || add_hold installer 'Native installer/package operation still active; all updates wait'
+      pending_update_guard "$kind" "$name" "$identity" || add_hold pending "$SUMMARY"
+      # Previous image archive limits are independent of application activity.
+      if [[ "$kind" == docker ]];then
+        local image size free maximum
+        image=$(jq -r --arg name "$name" '.inventory.docker[$name].imageId // ""' "$STATE_FILE")
+        if [[ -n "$image" ]];then
+          size=$(docker_cmd image inspect "$image" --format '{{.Size}}' 2>/dev/null) || size=''
+          maximum=$(jq -r '.limits.imageMaxBytes // 4294967296' "$POLICY_FILE")
+          if [[ "$size" =~ ^[0-9]+$ ]];then
+            ((size<=maximum)) || add_hold image-size "Previous image is larger than the configured $maximum byte recovery limit"
+            free=$(df -PB1 "$VAULT_MOUNT"|awk 'NR==2{print $4}')
+            [[ "$free" =~ ^[0-9]+$ ]] && ((free>=size+10737418240)) || add_hold recovery-space 'Vault space must cover the previous image plus 10 GiB reserve'
+          else add_hold image-evidence 'Previous image size could not be verified for recovery preparation';fi
+        fi
+      fi
+      if [[ "$kind" == docker ]];then
+        [[ -z "$backup_docker" ]] || add_hold backup "$backup_docker"
+        jq -e --arg name "$name" '.inventory.docker[$name].running==true and .inventory.docker[$name].managed=="dockerman"' "$STATE_FILE" >/dev/null || add_hold stopped 'Container stopped or not managed by DockerMan; no automatic start'
+      else [[ -z "$backup_plugin" ]] || add_hold backup "$backup_plugin";fi
+      quota_available "$kind" || add_hold quota "Rolling 24-hour $kind installation limit reached"
+      local total
+      total=$(jq --argjson since "$((now-86400))" '[.jobs[]|select((.dispatchedAt // 0)>=$since)]|length' "$STATE_FILE")
+      ((total<$(jq -r '.limits.dailyTotal // 8' "$POLICY_FILE"))) || add_hold total-quota 'Combined rolling 24-hour installation limit reached'
+      for lock in /tmp/backup_cache_appdata.lock /tmp/backup_boot_disk.lock;do
+        [[ ! -e "$lock" ]] || flock -s -n "$lock" -c true || add_hold backup-active "Protected ${lock##*/} operation active"
+      done
+      target_coordination "$kind" "$name" "$identity"
+      mode=-s;[[ "$COORD_EXCLUSIVE" != true ]] || mode=-x
+      [[ ! -e "$ARR_BACKUP_GATE" ]] || flock "$mode" -n "$ARR_BACKUP_GATE" -c true || add_hold coordination 'Existing application/backup script must finish; bounded handoff will be retried'
+      for lock in "${COORD_LOCKS[@]}";do
+        [[ ! -e "$lock" ]] || flock -s -n "$lock" -c true || add_hold producer "Existing ${lock##*/} producer must finish"
+      done
+      # Keep same-candidate suppression visible alongside other independent holds.
+      jq -e --arg key "$key" --arg c "$candidate" --argjson now "$now" 'any(.jobs[];.item==$key and .candidate==$c and (.status!="DEFERRED" or (.retryAt // (.startedAt+21600))>$now))' "$STATE_FILE" >/dev/null && add_hold journal 'Candidate already handled or unresolved; no blind reinstall'
+      cached=$(jq -c '.readinessAssessment // {}' <<<"$row")
+      if [[ "$kind" == docker ]] && ((now-$(jq -r '.at // 0' <<<"$cached")>=1800 && checks<4)) && within_budget 75;then
+        checks=$((checks+1))
+        readiness "$name" || true
+        if jq -e '(.ready|type)=="boolean"' "$TMP_DIR/readiness.json" >/dev/null 2>&1;then
+          cached=$(jq --argjson at "$now" '{at:$at,ready,detail}' "$TMP_DIR/readiness.json")
+          mutate --arg key "$key" --argjson evidence "$cached" '.items[$key].readinessAssessment=$evidence' || return 1
+        fi
+      fi
+      if [[ "$kind" == docker && "$name" =~ ^(sonarr|radarr)$ ]] && jq -e '.inventory.docker.recyclarr.running==true' "$STATE_FILE" >/dev/null;then
+        if within_budget 75;then readiness recyclarr || add_hold dependency "$(jq -r '.detail // "Recyclarr activity unavailable"' "$TMP_DIR/readiness.json" 2>/dev/null)";else add_hold dependency-pending 'Recyclarr sync readiness requires refresh before installation';fi
+      fi
+      if [[ "$kind" == plugin ]];then
+        if within_budget 75;then plugin_service_guard "$name" || add_hold plugin-dependency 'Host network/Plex GPU dependency readiness is busy or unverified';else add_hold dependency-pending 'Plugin dependency readiness requires refresh before installation';fi
+      fi
+      if [[ "$kind" == docker ]];then
+        if ((now-$(jq -r '.at // 0' <<<"$cached")>=1800));then add_hold readiness-pending 'Application activity evidence needs refresh before installation'
+        elif [[ $(jq -r '.ready // false' <<<"$cached") != true ]];then add_hold application "$(jq -r '.detail // "Application activity/readiness unavailable"' <<<"$cached"); evidence checked $(TZ=Asia/Singapore date -d "@$(jq -r .at <<<"$cached")" '+%Y-%m-%d %H:%M SGT')";fi
+      fi
+      retry=$(next_update_attempt "$retry") || return 1
+      jq -s 'unique_by(.code,.reason)' "$TMP_DIR/holds.ndjson" >"$TMP_DIR/holds.json" || return 1
+      mutate --arg key "$key" --arg c "$candidate" --argjson now "$now" --argjson retry "$retry" --slurpfile holds "$TMP_DIR/holds.json" '.items[$key].holds={at:$now,candidate:$c,nextAttemptAt:$retry,reasons:$holds[0]}' || return 1
+    done < <(jq -r '.items|to_entries|sort_by(.value.readinessAssessment.at // 0)|.[]|select(.value.available==true)|[.key,.value.kind,.value.name,.value.identity,.value.candidate]|@tsv' "$STATE_FILE")
+    SUMMARY="$saved_summary"
+}
+
 render_update_report() {
     local now day start
     now=$(date +%s);day=$(TZ=Asia/Singapore date +%F);start=$(TZ=Asia/Singapore date -d "$day 00:00:00" +%s)
@@ -775,7 +988,7 @@ render_update_report() {
       def approval($i): (if $i.kind=="docker" then $p.docker[$i.name] else $p.plugins[$i.name] end) as $a | $a.allow==true and $a.identity==$i.identity;
       def hold($i): (if $i.kind=="docker" then $p.docker[$i.name] else $p.plugins[$i.name] end).candidateHoldHours // $p.limits.candidateHoldHours // 24;
       def latest($key): [$s.jobs[]|select(.item==$key)]|sort_by(.dispatchedAt // .startedAt // 0)|last;
-      def reason($key;$i): latest($key) as $j |
+      def reason_legacy($key;$i): latest($key) as $j |
         if $i.name=="unRAIDServer.plg" then "OS update is manual; no OS installation or reboot"
         elif ($i.missingScans // 0)>0 then "Presence unconfirmed; waiting for a second complete inventory"
         elif $j!=null and ($j.status|IN("INTENT","VERIFYING","ATTENTION")) then "Update outcome: "+$j.status+"; "+($j.reason // "scheduled verification/reconciliation pending")
@@ -785,15 +998,20 @@ render_update_report() {
         elif (approval($i)|not) then "Identity is not approved; reporting only"
         elif $p.enabled!=true then "Automatic installation paused"
         elif $j!=null and $j.candidate==$i.candidate and ($j.status|IN("CLOSED_BY_OPERATOR","RETIRED","COMPLETED")) then "This candidate already handled; no automatic reinstall"
-        elif $j!=null and $j.candidate==$i.candidate and $j.status=="DEFERRED" and $j.startedAt>$now-21600 then "Retry backoff after: "+($j.reason // "pre-installation deferral")
+        elif $j!=null and $j.candidate==$i.candidate and $j.status=="DEFERRED" and ($j.retryAt // ($j.startedAt+21600))>$now then "Retry backoff after: "+($j.reason // "pre-installation deferral")
         elif $now-($i.candidateSeenAt // $now)<(hold($i)*3600) then "Candidate stability hold: "+((($now-($i.candidateSeenAt // $now))/3600|floor)|tostring)+"/"+(hold($i)|tostring)+"h"
         elif ($i.decision.at // 0)>=$start and $i.decision.candidate==$i.candidate then $i.decision.reason
-        elif any($s.jobs[];.status=="INTENT" or .status=="VERIFYING" or .status=="ATTENTION") then "Waiting for another installation to finish verification"
+        elif any($s.jobs[];.status=="INTENT" or .status=="VERIFYING" or .status=="ATTENTION") then "Earlier update needs reconciliation; dependency scope is checked before dispatch"
         elif ([$s.jobs[]|select((.dispatchedAt // 0)>$now-86400)]|length)>=($p.limits.dailyTotal // 8) then "Rolling 24-hour update limit reached"
         elif $i.kind=="docker" and ([$s.jobs[]|select(.kind=="docker" and (.dispatchedAt // 0)>$now-86400)]|length)>=($p.limits.dailyDocker // $p.limits.dailyTotal // 6) then "Rolling 24-hour Docker update limit reached"
         elif $i.kind=="plugin" and ([$s.jobs[]|select(.kind=="plugin" and (.dispatchedAt // 0)>$now-86400)]|length)>=($p.limits.dailyPlugins // 2) then "Rolling 24-hour plugin limit reached"
         elif $i.kind=="docker" and $s.inventory.docker[$i.name].running!=true then "Installed container is stopped; left stopped"
         else "Queued for the next eligible maintenance slot; one installer per run" end;
+      def reason($key;$i): latest($key) as $j |
+        if $i.holds!=null and $i.holds.candidate==$i.candidate then
+          (if ($i.holds.reasons|length)>0 then ($i.holds.reasons|map(.reason)|join("; ")) else "No observed hold; awaiting serialized installation slot and final checks" end)+
+          ". Next reassessment: "+($i.holds.nextAttemptAt|strflocaltime("%Y-%m-%d %H:%M SGT"))+"; assessment: "+($i.holds.at|strflocaltime("%Y-%m-%d %H:%M SGT"))
+        else reason_legacy($key;$i) end;
       "Daily system update report - "+$day+" (Singapore)",
       "Policy: "+(if $p.enabled then "automatic" else "paused" end)+"; starts "+$p.window.start+"-"+$p.window.end+"; daily limits "+(($p.limits.dailyDocker // $p.limits.dailyTotal // 6)|tostring)+" Docker / "+(($p.limits.dailyPlugins // 2)|tostring)+" plugin(s).",
       "", "UPDATED AND VERIFIED:",
@@ -919,8 +1137,12 @@ work yield, avoiding repeated collisions. Unrelated Docker apps remain eligible.
 Plex direct play/direct stream permits updates (brief playback interruption is
 possible); transcoding, database repair and backups still defer installation.
 Approval enables native updates within the existing configured channel. The age
-hold defaults to 24h; nightly/develop/unstable Docker tags default to 12h.
-Both measure this coordinator's observation, not registry publication.
+hold defaults to 6h for Docker, 1h for nightly/develop/unstable and 24h for plugins.
+All holds measure this coordinator's observation, not registry publication.
+Backup freshness follows the current appdata/boot User Scripts cron, allowing
+one delayed run and 12 hours for completion. Invalid schedules defer updates.
+Mover, non-correcting parity checks and unrelated remote copies are advisory.
+All observed holds and the next reassessment time appear in the grouped report.
 Unknown major OS/interface: installation stops. No OS install/reboot or automatic
 DB rollback is provided. Old image/config evidence does not guarantee DB rollback.
 HELP
@@ -983,6 +1205,7 @@ main() {
     [[ "${1:-}" == --check-only ]] || install_one || return 1
     if jq -e 'any(.jobs[];.status=="ATTENTION" or .status=="INTENT")' "$STATE_FILE" >/dev/null;then RESULT=ATTENTION;fi
     clean_recovery_sets || log WARNING 'Recovery-set retention deferred; existing evidence retained'
+    collect_update_holds || log WARNING 'Update hold assessment incomplete; existing observations retained'
     daily_update_report || return 1
     flush_notifications || { RESULT=ATTENTION;SUMMARY='Notification delivery failed; report retained for retry'; }
     mutate --arg mode "$MODE" --argjson now "$(date +%s)" '.lastCompletedAt=$now | (if $mode=="automatic" then .lastAutomaticRunAt=$now else . end) | .jobs |= with_entries(select(.value.status=="INTENT" or .value.status=="VERIFYING" or .value.status=="ATTENTION" or (.value.startedAt // 0)>=$now-90*86400 or ((.value.recoveryPath // "")!="" and (.value.recoveryPrunedAt // 0)==0)))'

@@ -52,5 +52,8 @@ printf '%s' '{"commands":[],"queue":{"records":[{"trackedDownloadState":"importP
 printf '%s' '{"commands":[{"status":"started"}],"queue":{"records":[],"totalRecords":0}}' | arr_activity_summary | jq -e '.ready==false' >/dev/null
 printf '%s' '{"commands":[],"queue":{"records":[{"trackedDownloadState":"importing"}],"totalRecords":1}}' | arr_activity_summary | jq -e '.ready==false' >/dev/null
 if printf '%s' '{"commands":[],"queue":{"records":[],"totalRecords":5}}' | arr_activity_summary >/dev/null 2>&1;then exit 1;fi
+printf '%s' '{"commands":[{"name":"DownloadedEpisodesScan","status":"queued"},{"name":"RssSync","status":"started"}],"queue":{"records":[{"trackedDownloadState":"downloading"},{"trackedDownloadState":"importPending"}],"totalRecords":2}}' | arr_activity_summary | jq -e .ready >/dev/null
+printf '%s' '{"commands":[{"name":"DownloadedEpisodesScan","status":"started"}],"queue":{"records":[],"totalRecords":0}}' | arr_activity_summary | jq -e '.ready==false' >/dev/null
+printf '%s' '{"commands":[{"name":"RssSync","status":"started","body":{"requiresDiskAccess":true}}],"queue":{"records":[],"totalRecords":0}}' | arr_activity_summary | jq -e '.ready==false' >/dev/null
 printf 'Arr active command/import protected; import warnings allowed; incomplete response refused\n'
 WATCHDOG
