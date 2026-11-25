@@ -55,7 +55,7 @@ write_report OK 'Recovered worker'
 # Findings and recovery failures must contain useful actions/evidence, while
 # changed progress alone must not resend the same incident.
 RECOVERY_FILE="$STATE_DIR/recovery.json"
-jq '.files["series/Example/episode.mkv"]={identity:["1","2","3","4","5"],issue:{id:"finding",kind:"decode_error",proofVersion:2,origin:"decode",confirmationKey:"fixture",confirmed:true,confirmedRuns:2,evidence:"Invalid NAL unit",offset:600}}' "$TMP_DIR/state.json" >"$fixture/new-state"
+jq '.files["series/Example/episode.mkv"]={identity:["1","2","3","4","5"],issue:{id:"finding",kind:"decode_error",proofVersion:3,origin:"decode",confirmationMethod:"normal-isolated-streams-v1",streamEvidence:[{primary:true,kind:"decode_error",exit:1}],confirmationKey:"fixture",confirmed:true,confirmedRuns:2,evidence:"Invalid NAL unit",offset:600}}' "$TMP_DIR/state.json" >"$fixture/new-state"
 gzip -c "$fixture/new-state" >"$STATE_FILE"
 jq -n --argjson now "$(date +%s)" '{schema:1,workflow:"arr-native",actions:{("a"*64):{app:"Sonarr",parentId:20,fileId:31,targets:[32],path:"series/Example/episode.mkv",identity:["1","2","3","4","5"],events:[],status:"review",startedAt:$now,updatedAt:$now,reason:"Search response unavailable; no retry"}}}' >"$RECOVERY_FILE"
 write_report WARNING 'Recovery needs review'
@@ -97,3 +97,21 @@ jq -e '(.body|contains("media unchanged")) and .notification=="sent"' "$STATUS_D
 write_report OK 'Repeated evidence review'
 [[ $(wc -l <"$fixture/calls") == $((old_calls+1)) ]]
 printf 'Evidence reclassification is explained and notified once\n'
+# Initial transient resource/time failures remain visible locally but quiet.
+jq '.resolved=[] | .files={"movies/transient.mkv":{identity:["1","2","3","4","5"],issue:{id:"transient",kind:"unverified_timeout",confirmed:false,confirmedRuns:0,alertable:false,evidence:"Decode time budget exceeded"}}}' "$TMP_DIR/state.json" | gzip -c >"$STATE_FILE"
+old_calls=$(wc -l <"$fixture/calls")
+write_report WARNING 'Initial transient audit problem; retry scheduled'
+[[ $(wc -l <"$fixture/calls") == "$old_calls" ]]
+jq -e '.notification=="suppressed" and .activeFindings==1 and .replacementCandidates==0 and .actionableFindings==0' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
+gzip -dc "$STATE_FILE" | jq '.files[].issue.alertable=true' | gzip -c >"$fixture/persistent.gz";mv "$fixture/persistent.gz" "$STATE_FILE"
+write_report WARNING 'Persistent audit problem; no replacement authorised'
+[[ $(wc -l <"$fixture/calls") == $((old_calls+1)) ]]
+jq -e '.notification=="sent" and .replacementCandidates==0 and (.body|contains("audit/review findings=1"))' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
+printf 'Initial transient findings remain quiet; persistent audit problems notify without replacement candidates\n'
+# Replacement counts and wording use the same primary-proof requirement.
+gzip -dc "$STATE_FILE" | jq '.files["movies/transient.mkv"] |= (. as $f | .issue={id:"primary",kind:"decode_error",identity:$f.identity,proofVersion:3,origin:"decode",confirmationMethod:"normal-isolated-streams-v1",confirmationKey:"fixture",confirmed:true,confirmedRuns:2,streamEvidence:[{index:0,type:"video",codec:"h264",primary:true,kind:"decode_error",exit:1,complete:false}]})' | gzip -c >"$fixture/primary.gz";mv "$fixture/primary.gz" "$STATE_FILE"
+write_report WARNING 'Confirmed primary failure fixture'
+jq -e '.replacementCandidates==1 and (.body|contains("Primary-stream decode failure")) and (.body|contains("#0 video (h264; primary)"))' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
+gzip -dc "$STATE_FILE" | jq '.files[].issue.streamEvidence[].primary=false' | gzip -c >"$fixture/aux.gz";mv "$fixture/aux.gz" "$STATE_FILE"
+write_report WARNING 'Primary evidence absent fixture'
+jq -e '.replacementCandidates==0 and (.body|contains("Suspected decode failure"))' "$STATUS_DIR/media_integrity_audit.json" >/dev/null

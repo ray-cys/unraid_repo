@@ -64,7 +64,7 @@ with tempfile.TemporaryDirectory() as folder:
     # Missing metadata/probe success alone is not proof of decode health.
     duration=10;fail=True;calls=0
     broken=execute(state);issue=broken.state['files']['movies/Example.mkv']['issue']
-    assert issue['confirmed'] and issue['kind']=='decode_error' and calls==2
+    assert issue['confirmed'] and issue['kind']=='decode_error' and calls==4
     assert broken.state['files']['movies/Example.mkv']['offset']==0
     assert issue['confirmedRuns']==1
     # Stale confirmed failures can be refreshed at the recorded failing range
@@ -121,7 +121,10 @@ with tempfile.TemporaryDirectory() as folder:
     # Re-evaluate old probe-only evidence without inheriting replacement proof.
     duration=1300;fail=False
     legacy=copy.deepcopy(broken.state);le=legacy['files']['movies/Example.mkv']
-    le['issue'].pop('proofVersion',None);le['issue'].update(confirmedRuns=9,confirmed=True)
+    le['issue'].pop('proofVersion',None);le['issue'].pop('origin',None);le['issue'].update(confirmedRuns=9,confirmed=True)
+    prior_decoder=copy.deepcopy(broken.state);prior_decoder['files']['movies/Example.mkv']['issue']['proofVersion']=2
+    prior_review=m.Audit(cfg,prior_decoder)
+    assert prior_review.state['files']['movies/Example.mkv']['issue']['kind']=='unverified_prior_decoder_evidence'
     review=m.Audit(cfg,legacy)
     assert review.state['files']['movies/Example.mkv']['issue']['kind']=='unverified_legacy_evidence'
     with contextlib.redirect_stdout(io.StringIO()):review.inventory()

@@ -324,3 +324,55 @@ Worker messages are newline-framed and bounded. The host retains partial input
 across read timeouts; malformed, oversized or incomplete messages fail the scan
 without creating a media-corruption finding. The last committed checkpoint is
 retained, and complete-library coverage is never inferred from a short check.
+
+## Independent stream confirmation (v2.4.0)
+
+Strict decoding is a screening check, not sufficient replacement evidence. After
+matching strict failures with wider seek context, the worker checks individual
+video/audio streams with normal FFmpeg error handling (without `-xerror` or the
+zero frame-error threshold). It uses up to 120 seconds of preceding context,
+starting from the beginning for early ranges. Confirmation is capped at 90 wall
+seconds within the remaining audit budget and eight streams. Insufficient time,
+unknown failures or excessive stream counts leave the finding unverified.
+
+The default video and audio tracks are primary; if a type has no default flag,
+the first track of that type is primary. Other tracks are still checked. This is
+a conservative automation policy, not a prediction of which track a Plex user
+will select. Failures confined to additional tracks require review and never
+trigger automatic whole-file replacement. Stream index, type, codec, primary
+selection, exit result, progress and bounded diagnostics are stored in the issue.
+
+The resulting categories are:
+
+- **Advisory:** narrowly recognised nonfatal diagnostics or successful seek-context
+  recovery. Retain evidence; routine healthy checks remain quiet.
+- **Audit/unverified:** killed/crashed processes, unsupported tools, permissions,
+  resource/time limits, storage reads, timestamp/filter/encoder/output problems,
+  incomplete progress or ambiguous container/stream evidence. No replacement.
+- **Recoverable media defect:** strict decoding fails repeatedly but every normal
+  stream check completes. Keep range coverage pending and request review; decoder
+  error concealment is not proof of undamaged playback. No replacement.
+- **Additional-track defect:** failures are confined to non-primary tracks and
+  other checks complete. Report the affected tracks for review. No replacement.
+- **Replacement candidate:** an isolated primary-stream decoder failure persists
+  under normal handling, with matching unchanged-file/range/toolchain/stream
+  evidence across two separate audit invocations. Existing exact Arr mapping,
+  monitoring, profile, capacity, action-window and import/recycling safeguards
+  still apply. Recovery remains disabled by default.
+
+Negative/signal process exits and common wrapper kill/crash statuses are excluded
+before diagnostic-text matching. Generic “invalid data”/“corrupt” wording alone
+cannot create replacement proof. Previous proof versions cannot authorise new
+recovery actions; existing native downloads/imports remain protected and followed.
+
+Transient timeout/resource/process failures get at most one additional attempt
+per file per invocation, with smaller ranges where applicable and sufficient
+remaining time. First transient findings stay visible in the local report but do
+not email. Recurrence in a separate invocation or age of at least one day makes
+an unresolved finding alertable. Storage read failures and other actionable
+findings continue to notify without authorising replacement. Existing coverage
+stall and missed-run monitoring remain independent.
+
+Grouped reports distinguish replacement-candidate counts from audit/review
+findings and include per-stream results. Existing deduplication and weekly
+unchanged-incident reminders remain in effect; healthy progress is quiet.

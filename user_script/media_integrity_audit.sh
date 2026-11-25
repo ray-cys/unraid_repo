@@ -3,7 +3,7 @@
 clearLog=true
 arrayStarted=true
 ###############################################################################
-# Media Integrity Audit v2.3.0 -- personal Unraid User Script
+# Media Integrity Audit v2.4.0 -- personal Unraid User Script
 #
 # PURPOSE / USE CASE
 # ------------------
@@ -187,14 +187,16 @@ usr_ops_arr_release_undispatched() (
 set -uo pipefail
 umask 077
 # Evidence policy: successful FFprobe diagnostics are not corruption proof.
-# Only nonzero decode failures repeated with wider seek context and matching
-# unchanged-file/range/toolchain evidence can confirm an incident. Two separate
+# Only isolated primary-stream failures under both strict and normal decoding
+# can authorize recovery. Signals, output errors and auxiliary/recoverable
+# defects never authorize replacement. Matching unchanged-file/range/toolchain
+# evidence can confirm an incident. Two separate
 # audit runs are required before Arr recovery eligibility. Nonfatal H.264 SEI
 # user-data/reference-startup diagnostics remain advisories; unknown diagnostics
 # stay unverified. Completed ranges prove decoder acceptance, not perfect visual
 # playback. Legacy probe-only incidents are re-evaluated without replacing media.
 # Worker transport failures preserve the last checkpoint and never accuse media.
-readonly SCRIPT_VERSION="2.3.0"
+readonly SCRIPT_VERSION="2.4.0"
 BAZARR_CONTAINER="bazarr"
 MEDIA_HOST_ROOT="/mnt/user/media"
 MEDIA_CONTAINER_ROOT="/data"
@@ -432,7 +434,15 @@ render_report() {
     temp=$(mktemp "$STATE_DIR/.report.XXXXXX") || return 1
     jq -n --slurpfile state "$TMP_DIR/state.json" --slurpfile stats "$TMP_DIR/stats.json" --slurpfile journal "$TMP_DIR/recovery-report.json" --slurpfile receipt "$TMP_DIR/delivery.json" \
       --argjson enabled "$AUTO_RECOVERY_ENABLED" --argjson now "$now" --argjson max "$NOTIFY_MAX_ITEMS" --arg status "$status" --arg reason "$reason" --arg mode "$MODE" --arg note "$RECOVERY_NOTE" '
+      def replacement_candidate:
+        .value as $f | $f.issue as $i |
+        $i.kind=="decode_error" and $i.proofVersion==3 and $i.origin=="decode" and
+        $i.confirmationMethod=="normal-isolated-streams-v1" and $i.confirmed==true and
+        ($i.confirmedRuns // 0)>=2 and $i.identity==$f.identity and ($i.confirmationKey|type)=="string" and
+        any($i.streamEvidence[]?; .primary==true and .kind=="decode_error" and .exit>0);
       [$state[0].files|to_entries[]|select(.value.issue!=null)] as $issues |
+      [$issues[]|select(replacement_candidate)] as $candidates |
+      [$issues[]|select(.value.issue.alertable!=false)] as $actionable |
       [$state[0].resolved[]?|select((.resolution // "")|startswith("Legacy probe-only"))|
         .notice=("reclassified:"+.id+":"+(.resolvedAt|tostring))|
         select(.notice as $k|($receipt[0].recoveryEvents // []|index($k))==null)] as $reclassified |
@@ -447,12 +457,12 @@ render_report() {
         pendingVerification:([$state[0].files[]|select((.verifiedAt // 0)==0)]|length),
         oldestPendingObservedAt:([$state[0].files[]|select((.verifiedAt // 0)==0)|.observedAt // empty]|min),
         pendingAgeUnknown:([$state[0].files[]|select((.verifiedAt // 0)==0 and (.observedAt // 0)==0)]|length)},
-       recoveryActions:($jobs|length),recoveryAttention:($attention|length),activeFindings:($issues|length),recoveries:([$jobs[]|select(.value.status=="recovered")]|length),
-       findingKeys:[$issues[]|.value.issue.id+":"+.value.issue.kind+":"+(.value.issue.confirmed|tostring)+":"+((.value.issue.confirmedRuns // 0)>=2|tostring)],
+       auditAttention:($note!="" or ($stats[0].inventoryErrors // 0)>0 or ($stats[0].inventoryComplete==false and ($stats[0].targeted // false)!=true)),recoveryActions:($jobs|length),recoveryAttention:($attention|length),replacementCandidates:($candidates|length),activeFindings:($issues|length),actionableFindings:($actionable|length),recoveries:([$jobs[]|select(.value.status=="recovered")]|length),
+       findingKeys:[$actionable[]|.value.issue.id+":"+.value.issue.kind+":"+(.value.issue.confirmed|tostring)+":"+((.value.issue.confirmedRuns // 0)>=2|tostring)],
        recoveryAttentionKeys:[$attention[].notice],noticeKeys:([$notices[:$max][].notice]+[$reclassified[:$max][].notice]),
-       summary:("Media integrity: "+$effective+"; findings="+($issues|length|tostring)+"; replacement updates="+($notices|length|tostring)),
+       summary:("Media integrity: "+$effective+"; findings="+($issues|length|tostring)+"; replacement candidates="+($candidates|length|tostring)+"; replacement updates="+($notices|length|tostring)),
        body:(["Media integrity audit: "+$effective,"Automatic replacement: "+(if $enabled then "ENABLED" else "DISABLED; original files remain unchanged" end),
-        "Run: "+$mode+"; "+$reason,"Checks passed: quick="+(($stats[0].quickPassed // 0)|tostring)+"; ranges="+(($stats[0].segmentsPassed // 0)|tostring)+"; full planned-range cycles="+(($stats[0].cyclesCompleted // 0)|tostring),
+        "Run: "+$mode+"; "+$reason,"Finding categories: replacement candidates="+($candidates|length|tostring)+"; audit/review findings="+(($issues|length)-($candidates|length)|tostring),"Checks passed: quick="+(($stats[0].quickPassed // 0)|tostring)+"; ranges="+(($stats[0].segmentsPassed // 0)|tostring)+"; full planned-range cycles="+(($stats[0].cyclesCompleted // 0)|tostring),
         "Coverage: known files="+($state[0].files|length|tostring)+"; fully decoded current versions="+([$state[0].files[]|select((.verifiedAt // 0)>0 and .coverage=="all_planned_segments_decoded")]|length|tostring)+"; pending initial/replacement verification="+([$state[0].files[]|select((.verifiedAt // 0)==0)]|length|tostring),
         "Original files and monitoring are retained until native Arr replacement. Arr owns imports and recycling; this script never moves/deletes library media or forces import.",
         "State note: "+$note,"", "Replacement actions and results:"]+
@@ -465,17 +475,17 @@ render_report() {
         "\n  Last API diagnostic: "+((.value.lastError // {})|tostring)+"\n  Recent transitions: "+((.value.events[-5:] // []|map(.status+": "+.reason))|join("; "))]+
        ["", "Evidence reclassifications (media unchanged):"]+
        [$reclassified[:$max][]|"- "+.path+"\n  Finding ID: "+.id+"\n  Action: "+.resolution]+
-       ["", "Current media findings:"]+
+       ["", "Current findings (media defects and audit limitations):"]+
        [$issues[:$max][]|"- "+.key+" | "+.value.issue.kind+"\n  Finding ID: "+.value.issue.id+"; separate confirming runs: "+((.value.issue.confirmedRuns // 0)|tostring)+
-        "\n  Evidence: "+((.value.issue.evidence // "")|.[0:650])+"\n  Next action: "+
-        (if .value.issue.kind=="decode_error" and .value.issue.proofVersion==2 and .value.issue.confirmed and (.value.issue.confirmedRuns // 0)>=2 then "Repeated decode failure confirmed in two independent runs. Replacement eligible only after exact Arr safety checks. "+(if $enabled then "Exact-rule selection is bounded; see job outcome." else "Recovery disabled; review evidence before enabling automation." end)
-         elif .value.issue.kind=="decode_error" then "Suspected decode failure; another independent matching observation is required. No replacement authorized." else "Unverified finding; review access, container, tool or resource evidence. No replacement authorized." end)]+
+        "\n  Stream checks: "+((.value.issue.streamEvidence // []|map("#"+((.index // "unknown")|tostring)+" "+(.type // "stream")+" ("+(.codec // "unknown codec")+"; "+(if .primary then "primary" else "additional" end)+"): "+.kind+"; exit="+(.exit|tostring)+"; range="+(if .complete then "completed" else "not completed" end)))|join("; "))+"\n  Evidence: "+((.value.issue.evidence // "")|.[0:650])+"\n  Next action: "+
+        (if replacement_candidate then "Primary-stream decode failure confirmed by strict and normal checks in two independent runs. Replacement eligible only after exact Arr safety checks. "+(if $enabled then "Exact-rule selection is bounded; see job outcome." else "Recovery disabled; review evidence before enabling automation." end)
+         elif .value.issue.kind=="recoverable_media_defect" then "Strict check failed but normal stream checks completed. Possible recoverable defect; review required, no automatic replacement." elif .value.issue.kind=="auxiliary_track_error" then "Failure is confined to an additional track. Main selected streams were checked separately; no automatic replacement." elif .value.issue.kind=="decode_error" then "Suspected decode failure; another independent matching observation is required. No replacement authorized." elif .value.issue.kind=="read_error" then "Storage read failed. Check the array, drive or mount before retrying; downloading another copy is not authorized." elif .value.issue.alertable==false then "Transient audit limitation; one bounded retry was allowed and future verification is pending. No replacement authorized; email is suppressed unless persistent." else "Audit could not verify this range. Review access, container, tool or resource evidence; no replacement authorized." end)]+
        ["", "Full verification requires all planned decode ranges; a download/import event alone does not prove integrity. Native bin retention continues independently. Verification alerts before the observed native retention expires (or after 24 hours when no deadline applies); no rollback is guaranteed. --recovery-status includes bounded transition history."]|join("\n"))}' >"$temp" || return 1
     body=$(jq -r .body "$temp"|head -c 23000|iconv -f UTF-8 -t UTF-8 -c || true)
     printf '%s\n' "$body" >"$STATE_DIR/latest-report.txt.new" && mv "$STATE_DIR/latest-report.txt.new" "$STATE_DIR/latest-report.txt" || return 1
     signature=$(jq -c '{status,findingKeys,recoveryAttentionKeys,note:$note,reason:$reason}' --arg note "$RECOVERY_NOTE" --arg reason "$( [[ "$status" != FAILED ]] || printf '%s' "$reason" )" "$temp"|sha256sum|awk '{print $1}')
     previous=$(jq -r '.signature // ""' "$TMP_DIR/delivery.json");last=$(jq -r '.sentAt // 0' "$TMP_DIR/delivery.json")
-    jq -e '.activeFindings>0 or .recoveryAttention>0 or .status=="FAILED" or .status=="WARNING"' "$temp" >/dev/null && attention=true
+    jq -e '.auditAttention==true or .actionableFindings>0 or .recoveryAttention>0 or .status=="FAILED" or (.status=="WARNING" and .activeFindings==0)'  "$temp" >/dev/null && attention=true
     if [[ "$MODE" != inventory ]] && { jq -e '.noticeKeys|length>0' "$temp" >/dev/null || [[ "$attention" == true && ( "$signature" != "$previous" || $((now-last)) -ge NOTIFICATION_REMINDER_SECONDS ) ]]; };then
         [[ "$attention" != true ]] || importance=warning;[[ "$status" != FAILED ]] || importance=alert
         jq -n --arg body "$body" --arg signature "$signature" --argjson epoch "$now" '{schema:1,body:$body,signature:$signature,epoch:$epoch}' >"$STATE_DIR/pending-notification.json.new" && mv "$STATE_DIR/pending-notification.json.new" "$STATE_DIR/pending-notification.json" || return 1
@@ -751,7 +761,7 @@ recovery_followup() {
     recovery_history "$job" "$history" "$(jq -r .downloadId "$job")" || return 1
     if jq -e 'any(.records[];.eventType=="downloadFailed" or .eventType=="downloadIgnored")' "$history" >/dev/null;then
         if recovery_prepare_retry "$id" "$job" "$history";then return 0;fi
-        recovery_set "$id" review 'Native download failed/ignored; automatic alternative was not authorised. Requires exact archive-failure evidence, unchanged monitored original and fewer than two attempts. Storage/manual/unknown failures stay protected; no blocklist or forced import.';return 0;fi
+        recovery_set "$id" review 'Native download failed/ignored; automatic alternative was not authorized. Requires exact archive-failure evidence, unchanged monitored original and fewer than two attempts. Storage/manual/unknown failures stay protected; no blocklist or forced import.';return 0;fi
     local owner="$TMP_DIR/native-followup-owner.json" parent_kind=movie
     [[ "$app" != Sonarr ]] || parent_kind=series
     recovery_api GET "/$parent_kind/$parent" "$owner" && [[ "$RECOVERY_HTTP" == 200 ]] || return 1
@@ -910,7 +920,7 @@ recovery_schedule() {
        .value.replacementPaths[]? as $path|{path:$path,deadline:($job.value.verificationDeadlineAt // 0),attempt:($state[0].files[$path].lastAttemptAt // 0)}]|
       unique_by(.path)|sort_by(.attempt,(if .deadline>0 then .deadline else 9999999999 end)) as $replacements|
       [$j[0].actions[]|select(.status=="required" or .status=="blocked" or .status=="retry_wait")|. as $job|
-       $state[0].files[.path] as $f|select($f.identity==$job.identity and $f.issue.kind=="decode_error" and $f.issue.proofVersion==2 and $f.issue.origin=="decode" and ($f.issue.confirmationKey|type)=="string" and $f.issue.confirmed==true and
+       $state[0].files[.path] as $f|select($f.identity==$job.identity and $f.issue.kind=="decode_error" and $f.issue.proofVersion==3 and $f.issue.origin=="decode" and $f.issue.confirmationMethod=="normal-isolated-streams-v1" and any($f.issue.streamEvidence[]?; .primary==true and .kind=="decode_error" and .exit>0) and ($f.issue.confirmationKey|type)=="string" and $f.issue.confirmed==true and
        ($f.issue.lastSeen // 0)<$now-48*3600 and ($f.lastAttemptAt // 0)<$now-86400)|{path:.path,attempt:($f.lastAttemptAt // 0)}]|
       unique_by(.path)|sort_by(.attempt) as $evidence|
       {recheckAfter:([$j[0].actions[]|select(.status=="verifying" and .resolutionSource=="recheck")|. as $job|.replacementPaths[]?|{key:.,value:$job.startedAt}]|from_entries),evidencePaths:[$evidence[:1][].path],paths:([$replacements[:(if ($evidence|length)>0 then 3 else 4 end)][].path]+[$evidence[:1][].path])}' >"$TMP_DIR/recovery-schedule.json"
@@ -945,7 +955,7 @@ recovery_resume_core() {
     [[ "$status" != retry_wait ]] || (( $(date +%s)>=$(jq -r '.retryAt // 0' "$job") )) || return 0
     [[ "$status" == required || "$status" == selected || "$status" == blocked || "$status" == retry_wait ]] || return 0
     [[ "$RECOVERY_ALLOW_GRAB" == true ]] && recovery_new_window_open || return 0
-    jq -e --slurpfile j "$job" --argjson cutoff "$(( $(date +%s)-48*3600 ))" '.files[$j[0].path] as $f|$f.identity==$j[0].identity and $f.issue.proofVersion==2 and $f.issue.origin=="decode" and ($f.issue.confirmationKey|type)=="string" and $f.issue.confirmed==true and $f.issue.confirmedRuns>=2 and $f.issue.lastSeen>=$cutoff' "$TMP_DIR/state.json" >/dev/null || { recovery_set "$id" blocked 'Fresh unchanged-file corruption evidence required before release selection; original retained';return 0; }
+    jq -e --slurpfile j "$job" --argjson cutoff "$(( $(date +%s)-48*3600 ))" '.files[$j[0].path] as $f|$f.identity==$j[0].identity and $f.issue.identity==$f.identity and $f.issue.kind=="decode_error" and $f.issue.proofVersion==3 and $f.issue.origin=="decode" and $f.issue.confirmationMethod=="normal-isolated-streams-v1" and any($f.issue.streamEvidence[]?; .primary==true and .kind=="decode_error" and .exit>0) and ($f.issue.confirmationKey|type)=="string" and $f.issue.confirmed==true and $f.issue.confirmedRuns>=2 and $f.issue.lastSeen>=$cutoff' "$TMP_DIR/state.json" >/dev/null || { recovery_set "$id" blocked 'Fresh unchanged-file corruption evidence required before release selection; original retained';return 0; }
     local last
     last=$(jq -r '.selectionAt // 0' "$job");(( $(date +%s)-last>=86400 )) || return 0
     jq '{key:.path,value:{identity,issue:.finding}}' "$job" >"$candidate"
@@ -1001,7 +1011,7 @@ recovery_process() {
         jq -e --slurpfile p "$plan" --argjson cutoff "$((now-30*86400))" 'all(.actions[];.app!=$p[0].app or .parentId!=$p[0].parentId or .startedAt<$cutoff)' "$RECOVERY_FILE" >/dev/null || continue
         recovery_update '.actions[$id]=$p[0]' --arg id "$id" --slurpfile p "$plan" || { rc=1;break; }
         count=$((count+1));recovery_resume "$id" || rc=1
-      done < <(jq -c --argjson cutoff "$((now-48*3600))" '.files|to_entries[]|select((.value.issue.lastSeen // 0)>=$cutoff and .value.issue.kind=="decode_error" and .value.issue.proofVersion==2 and .value.issue.origin=="decode" and (.value.issue.confirmationKey|type)=="string" and .value.issue.confirmed==true and (.value.issue.confirmedRuns // 0)>=2 and .value.issue.identity==.value.identity and (.value.replacementPending // false)==false)' "$TMP_DIR/state.json")
+      done < <(jq -c --argjson cutoff "$((now-48*3600))" '.files|to_entries[]|select((.value.issue.lastSeen // 0)>=$cutoff and .value.issue.kind=="decode_error" and .value.issue.proofVersion==3 and .value.issue.origin=="decode" and .value.issue.confirmationMethod=="normal-isolated-streams-v1" and any(.value.issue.streamEvidence[]?; .primary==true and .kind=="decode_error" and .exit>0) and (.value.issue.confirmationKey|type)=="string" and .value.issue.confirmed==true and (.value.issue.confirmedRuns // 0)>=2 and .value.issue.identity==.value.identity and (.value.replacementPending // false)==false)' "$TMP_DIR/state.json")
     fi
     exec {hold}>&-;exec {fd}>&-;return "$rc"
 }
@@ -1070,9 +1080,9 @@ def run_process(args,fd,seconds,beat,memory_mib):
                 if pipe:pipe.close()
         ACTIVE=None
 
-# Policy 2: probe diagnostics never prove corruption. Successful decoding still
+# Policy 3: probe diagnostics never prove corruption. Successful decoding still
 # requires positive frames and complete range progress; unknown stderr is reviewed.
-PROOF_VERSION=2
+PROOF_VERSION=3
 
 def benign_diagnostics(text):
     lines=[line.strip() for line in text.splitlines() if line.strip()]
@@ -1083,16 +1093,22 @@ def failure_signature(text):
     text=re.sub(r'0x[0-9a-f]+','ADDRESS',text.lower())
     return hashlib.sha256(text.strip().encode()).hexdigest()
 
-def classify(result,stage='decode'):
+def classify(result,stage='decode',codecs=()):
     if result['stop']:return result['stop']
     text=result['err'].lower()
+    if result['code']<0 or result['code'] in (126,127,137,139,143):return 'unverified_process_exit'
     if re.search(r'cannot allocate memory|out of memory|resource temporarily unavailable|pthread_create|permission denied|operation not permitted|decoder .*not found|unknown decoder|unsupported codec|not implemented',text):
         return 'unverified_tool_or_resource'
     if 'input/output error' in text:return 'read_error'
+    if re.search(r'non.monoton|invalid.*timestamp|error.*(?:muxing|muxer|filter|encoder|output)|failed to (?:configure|inject)|unable to.*output|error opening output',text):
+        return 'unverified_pipeline_error'
     if result['code']==0:
         return 'passed' if not text.strip() or benign_diagnostics(text) else 'unverified_decoder_warning'
     if stage=='probe':return 'unverified_container'
-    if re.search(r'invalid data|error (while|during) decoding|corrupt|truncat|invalid nal|moov atom not found|ebml header parsing failed|file ended prematurely|error submitting packet|error splitting',text) and not benign_diagnostics(text):
+    if re.search(r'error (while|during) decoding|invalid nal|error submitting packet to decoder|error splitting the input into nal|decode_slice_header error|invalid .* (?:frame|slice|macroblock)|corrupt decoded frame',text) and not benign_diagnostics(text):
+        return 'decode_error'
+    names='|'.join(re.escape(v.lower()) for v in codecs if isinstance(v,str) and v)
+    if names and re.search(r'\[[^\]\n]*\b(?:'+names+r')\s+@[^\]\n]*\]\s*[^\n]*(?:corrupt|truncat|invalid data|header damaged|crc mismatch)',text):
         return 'decode_error'
     return 'unverified_tool_error'
 
@@ -1104,7 +1120,7 @@ def validate_state(state,cfg):
         if (not isinstance(path,str) or path.startswith('/') or os.path.normpath(path)!=path or path.split('/')[0] not in cfg['libraries']
                 or not isinstance(entry,dict) or not isinstance(entry.get('identity'),list) or len(entry['identity'])!=5):
             raise ValueError('invalid state file identity/path')
-        for field in ('offset','verifiedAt','probeAt','notBefore','chunkSeconds'):
+        for field in ('offset','verifiedAt','probeAt','notBefore','chunkSeconds','seekWarmupSeconds'):
             value=entry.get(field,0)
             if not isinstance(value,(int,float)) or not math.isfinite(value) or value<0:raise ValueError('invalid numeric progress')
     return state
@@ -1123,7 +1139,7 @@ class Audit:
         for entry in self.state['files'].values():
             old=entry.get('issue')
             if old and old.get('kind')=='decode_error' and old.get('proofVersion')!=PROOF_VERSION:
-                old.update(kind='unverified_legacy_evidence',confirmed=False,confirmedRuns=0,lastConfirmedRunAt=0)
+                old.update(kind='unverified_prior_decoder_evidence' if old.get('origin')=='decode' else 'unverified_legacy_evidence',confirmed=False,confirmedRuns=0,lastConfirmedRunAt=0)
                 entry.update(notBefore=0,probeAt=0,verifiedAt=0,offset=old.get('offset') or 0)
                 entry.pop('coverage',None)
         self.stats={'startedAt':int(time.time()),'inventoryComplete':False,'inventoryFiles':0,'inventoryErrors':0,'symlinksSkipped':0,
@@ -1156,12 +1172,17 @@ class Audit:
         old=entry.get('issue') or {};now=int(time.time())
         confirmed=bool(confirmed and kind=='decode_error' and confirmation_key)
         same=old.get('identity')==entry['identity'] and old.get('kind')==kind and old.get('confirmed') and old.get('confirmationKey')==confirmation_key and old.get('proofVersion')==PROOF_VERSION
+        observation_same=old.get('identity')==entry['identity'] and old.get('kind')==kind
+        observations=old.get('observationRuns',1) if observation_same else 0
+        if not observation_same or old.get('lastObservedRunAt')!=self.runEpoch:observations+=1
+        transient=kind in ('unverified_timeout','unverified_tool_or_resource','unverified_process_exit')
         runs=(old.get('confirmedRuns',1) if same else 0)
         if confirmed and (not same or old.get('lastConfirmedRunAt')!=self.runEpoch):runs+=1
         entry['issue']={'id':hashlib.sha256(path.encode(errors='surrogateescape')).hexdigest()[:16],
-                        'kind':kind,'firstSeen':old.get('firstSeen',now),'lastSeen':now,'confirmed':confirmed,
+                        'kind':kind,'firstSeen':old.get('firstSeen',now) if observation_same else now,'lastSeen':now,'confirmed':confirmed,
                         'confirmedRuns':runs if confirmed else 0,'lastConfirmedRunAt':self.runEpoch if confirmed else 0,
                         'proofVersion':PROOF_VERSION,'origin':'decode' if confirmation_key else 'unverified','confirmationKey':confirmation_key,
+                        'observationRuns':observations,'lastObservedRunAt':self.runEpoch,'alertable':not transient or observations>=2 or (observation_same and now-old.get('firstSeen',now)>=86400),
                         'offset':offset,'evidence':evidence[-3000:],'identity':entry['identity'],'cleanRechecks':0}
         entry['notBefore']=now+(7*86400 if kind in ('decode_error','read_error','intermittent_error') else 86400)
         self.dirty=True
@@ -1249,7 +1270,7 @@ class Audit:
         return run_process(args,fd,min(seconds,max(1,self.remaining()-2)),self.beat,self.cfg['memoryMiB'])
     def probe(self,path,entry,fd):
         args=['ffprobe','-v','error','-protocol_whitelist','file','-show_entries',
-              'format=duration:stream=index,codec_type,codec_name,duration:stream_disposition=attached_pic','-of','json',f'/proc/self/fd/{fd}']
+              'format=duration:stream=index,codec_type,codec_name,duration:stream_disposition=attached_pic,default','-of','json',f'/proc/self/fd/{fd}']
         result=self.run_tool(args,fd,20);kind=classify(result,stage="probe")
         if not self.unchanged(path,entry,fd):
             entry['notBefore']=int(time.time())+300;return False
@@ -1270,9 +1291,66 @@ class Audit:
             entry['advisory']={'kind':'nonfatal_probe_diagnostic','evidence':result['err'][-3000:],'observedAt':int(time.time())}
             if (entry.get('issue') or {}).get('kind')=='unverified_legacy_evidence':
                 self.resolve(path,entry,'Legacy probe-only corruption classification withdrawn: valid metadata with nonfatal diagnostic; media unchanged, full decode verification still pending')
-        entry.update(probeAt=int(time.time()),duration=duration,video=videos,audio=audio)
+        entry.update(probeAt=int(time.time()),duration=duration,video=videos,audio=audio,
+                     streamDetails=[{'index':v['index'],'type':v.get('codec_type'),'codec':v.get('codec_name'),'default':bool(v.get('disposition',{}).get('default'))} for v in streams if v['index'] in videos+audio])
         self.stats['quickPassed']+=1;self.dirty=True
         return True
+    def retry_transient(self,entry):
+        issue=entry.get('issue') or {}
+        if issue.get('kind') not in ('unverified_timeout','unverified_tool_or_resource','unverified_process_exit'):return False
+        if entry.get('retryRunAt')!=self.runEpoch:entry.update(retryRunAt=self.runEpoch,retryCount=0)
+        if entry.get('retryCount',0)>=1 or self.remaining()<30:return False
+        entry['retryCount']=entry.get('retryCount',0)+1;entry['notBefore']=0
+        if issue.get('kind')!='unverified_timeout':entry['chunkSeconds']=max(15,float(entry.get('chunkSeconds',self.cfg['segmentSeconds']))/2)
+        return True
+    def normal_confirmation(self,path,entry,fd,args,offset,span):
+        # Isolate streams only for suspicious ranges. Normal handling is an
+        # independent check, not permission to discard/conceal errors as healthy.
+        deadline=time.monotonic()+min(90,max(0,self.remaining()-5))
+        if deadline-time.monotonic()<5:return 'unverified_confirmation_budget',[],None
+        if not entry.get('streamDetails') and not self.probe(path,entry,fd):
+            return 'unverified_stream_confirmation',[],None
+        details=entry['streamDetails'];primary=set()
+        for media_type in ('video','audio'):
+            group=[v for v in details if v['type']==media_type]
+            if group:primary.add(next((v['index'] for v in group if v['default']),group[0]['index']))
+        details=sorted(details,key=lambda v:(v['index'] not in primary,v['index']))
+        evidence=[];failures=[];uncertain=False
+        if len(details)>8:return 'unverified_stream_confirmation',[],None
+        for stream in details:
+            if deadline-time.monotonic()<5:return 'unverified_confirmation_budget',evidence,None
+            isolated=[];i=0
+            while i<len(args):
+                if args[i]=='-xerror':i+=1;continue
+                if args[i] in ('-max_error_rate','-map'):i+=2;continue
+                isolated.append(args[i]);i+=1
+            # No seek initialization is needed near the beginning. For later
+            # ranges use 120 seconds of context; cost stays wall-time bounded.
+            seek=max(0,offset-120);length=span+offset-seek
+            isolated[isolated.index('-ss')+1]=str(seek)
+            isolated[isolated.index('-t')+1]=str(length)
+            isolated[isolated.index('-sn'):isolated.index('-sn')]=['-map','0:'+str(stream['index'])]
+            result=self.run_tool(isolated,fd,min(self.cfg['segmentWallSeconds'],deadline-time.monotonic()))
+            self.stats['decodeWallSeconds']+=result['wall']
+            if not self.unchanged(path,entry,fd):return 'changed',evidence,None
+            kind=classify(result,codecs=[stream.get('codec')])
+            frames=[int(v) for v in re.findall(r'^frame=\s*([0-9]+)',result['out'],re.M)]
+            times=[int(v) for v in re.findall(r'^out_time_us=([0-9]+)',result['out'],re.M)]
+            complete=bool(times and max(times)>0 and (length<=10 or max(times)/1000000>=length-5) and (stream['type']=='audio' or (frames and max(frames)>0)))
+            evidence.append(dict(stream,index=stream['index'],primary=stream['index'] in primary,exit=result['code'],kind=kind,complete=complete,seek=seek,length=length,evidence=result['err'][-1200:]))
+            if kind=='decode_error':failures.append((stream,failure_signature(result['err'])))
+            elif result['code']==0 and complete and kind in ('passed','unverified_decoder_warning'):
+                pass
+            else:uncertain=True
+        # Auxiliary defects or mixed/incomplete evidence cannot authorize a
+        # whole-file replacement. Zero-exit decoding with errors is not a pass.
+        if uncertain:return 'unverified_stream_confirmation',evidence,None
+        if failures and all(v['index'] not in primary for v,_ in failures):return 'auxiliary_track_error',evidence,None
+        if failures:
+            key=hashlib.sha256(json.dumps([entry['identity'],offset,span,self.cfg['toolset'],[(v['index'],sig) for v,sig in failures],PROOF_VERSION]).encode()).hexdigest()
+            return 'decode_error',evidence,key
+        return 'recoverable_media_defect',evidence,None
+
     def segment(self,path,entry,fd):
         offset=float(entry.get('offset',0));duration=entry['duration']
         span=min(float(entry.get('chunkSeconds',self.cfg['segmentSeconds'])),duration-offset)
@@ -1284,13 +1362,15 @@ class Audit:
         for index in entry['video']+entry['audio']:args+=['-map',f'0:{index}']
         args+=['-sn','-dn','-filter_threads','1','-filter_complex_threads','1','-threads',str(self.cfg['threads']),
                '-progress','pipe:1','-f','null','/dev/null']
-        result=self.run_tool(args,fd,self.cfg['segmentWallSeconds']);kind=classify(result)
+        result=self.run_tool(args,fd,self.cfg['segmentWallSeconds']);kind=classify(result,codecs=[v.get('codec') for v in entry.get('streamDetails',[])])
+        if kind=='unverified_tool_error' and not entry.get('streamDetails') and self.remaining()>25:
+            if self.probe(path,entry,fd):kind=classify(result,codecs=[v.get('codec') for v in entry.get('streamDetails',[])])
         self.stats['decodeWallSeconds']+=result['wall']
         if not self.unchanged(path,entry,fd):return 'changed'
         if kind in ('cancelled','timeout'):
             if kind=='timeout' and self.remaining()>5:
                 entry['chunkSeconds']=max(15,span/2);self.issue(path,entry,'unverified_timeout','Decode range timed out; range size reduced, offset unchanged',offset)
-            return kind
+            return 'retry' if kind=='timeout' and self.retry_transient(entry) else kind
         if kind=='decode_error' and self.remaining()>30:
             # Retry with additional preceding context to avoid promoting seek
             # initialization failures. The same target range must still fail.
@@ -1299,10 +1379,9 @@ class Audit:
             retry[retry.index('-t')+1]=str(span+offset-retry_seek)
             again=self.run_tool(retry,fd,self.cfg['segmentWallSeconds']);self.stats['decodeWallSeconds']+=again['wall']
             if not self.unchanged(path,entry,fd):return 'changed'
-            again_kind=classify(again)
+            again_kind=classify(again,codecs=[v.get('codec') for v in entry.get('streamDetails',[])])
             if again_kind in ('cancelled','timeout'):return again_kind
             consistent=again_kind=='decode_error' and failure_signature(result['err'])==failure_signature(again['err'])
-            key=hashlib.sha256(json.dumps([entry['identity'],offset,span,self.cfg['toolset'],failure_signature(result['err'])]).encode()).hexdigest() if consistent else None
             if again_kind=='passed':
                 # A successful context retry must pass the same positive frame /
                 # duration checks below. Retain the diagnostic, not a corruption
@@ -1311,10 +1390,18 @@ class Audit:
                 entry['advisory']={'kind':'seek_context_recovered','evidence':result['err'][-3000:],'observedAt':int(time.time())}
                 result=again;kind='passed';length=span+offset-retry_seek
             else:
-                self.issue(path,entry,'decode_error' if consistent else 'intermittent_error',result['err'],offset,consistent,key)
+                if consistent:
+                    outcome,details,key=self.normal_confirmation(path,entry,fd,retry,offset,span)
+                    if outcome=='changed':return 'changed'
+                    self.issue(path,entry,outcome,result['err'],offset,outcome=='decode_error',key)
+                    entry['issue']['streamEvidence']=details
+                    entry['issue']['confirmationMethod']='normal-isolated-streams-v1'
+                else:
+                    self.issue(path,entry,'intermittent_error' if again_kind=='decode_error' else again_kind,again['err'],offset)
+                    if self.retry_transient(entry):return 'retry'
                 return 'issue'
         if kind!='passed':
-            self.issue(path,entry,kind,result['err'],offset);return 'issue'
+            self.issue(path,entry,kind,result['err'],offset);return 'retry' if self.retry_transient(entry) else 'issue'
         frames=[int(v) for v in re.findall(r'^frame=\s*([0-9]+)',result['out'],re.M)]
         output_times=[int(v) for v in re.findall(r'^out_time_us=([0-9]+)',result['out'],re.M)]
         if not frames or max(frames)==0 or not output_times or max(output_times)<=0:
@@ -1347,14 +1434,15 @@ class Audit:
         fd=None;start=time.monotonic()
         try:
             fd=self.open_file(path,entry)
-            if not entry.get('probeAt') and not self.probe(path,entry,fd):return
+            if not entry.get('probeAt') and not self.probe(path,entry,fd):
+                if not self.retry_transient(entry) or not self.probe(path,entry,fd):return
             if probe_only:return
             while not self.stopped() and time.monotonic()-start<self.cfg['fileSliceSeconds']:
                 outcome=self.segment(path,entry,fd)
                 self.checkpoint()
                 if outcome=='changed':entry['notBefore']=int(time.time())+300;entry['deferredReason']='File identity changed during decoding; no range credit'
                 if path in self.cfg.get('evidencePaths',[]) and outcome!='recheck':break
-                if outcome not in ('next','recheck'):break
+                if outcome not in ('next','recheck','retry'):break
         except FileNotFoundError:
             entry['notBefore']=int(time.time())+300;entry['deferredReason']='File removed/changed before opening; no range credit'
         except OSError as error:
