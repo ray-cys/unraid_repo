@@ -1,7 +1,7 @@
 #!/bin/bash
 clearLog=true
 arrayStarted=true
-# System Update Coordinator v1.4.0 -- personal Hubble maintenance.
+# System Update Coordinator v1.5.0 -- personal Hubble maintenance.
 # PURPOSE: Detect Docker/plugin/Unraid OS updates; automatically install only
 # explicitly approved, still-installed items during a bounded maintenance window.
 # Existing producers finish; expiring requests make new conflicting work yield.
@@ -10,7 +10,7 @@ arrayStarted=true
 # Native DockerMan/plugin installers retain their normal configuration semantics.
 # No OS installation/reboot, image-channel change, forced import or DB rollback.
 # SCHEDULE: */15 * * * *; registry polling has its own six-hour per-item cache.
-# New installs: 13:15-15:30 Singapore; at most one/run, six Docker + two plugins/rolling 24h.
+# New installs: 13:15-15:30 and 21:15-23:00 Singapore; at most one/run, six Docker + two plugins/rolling 24h.
 # Default Docker holds: stable 6h; nightly/develop/unstable 1h. Plugins 24h.
 # Backup freshness follows its User Scripts cron: tolerate one missed run plus
 # 12-hour completion grace. Active appdata/boot backup still blocks installs.
@@ -25,7 +25,11 @@ arrayStarted=true
 # New items default to notify-only, never inherit a broad wildcard approval.
 # STATE/LOG: /mnt/vault/cloud/logs/script/system_update_coordinator; atomic JSON,
 # private per-action recovery evidence, 2MiB log + two rotations, 30-day age bound.
-# Reports: actions, available/deferred updates and unverified checks at 15:45.
+# Reports: one grouped report at 23:15, after both maintenance windows.
+# Finish-by guards reserve 20 minutes before preparation, 13 before dispatch,
+# covering bounded installation/readiness plus a margin before fixed app work.
+# Native schedules are read every attempt; application schedules are never edited.
+# Two observed missed windows raise priority and a grouped warning, not a force update.
 # Up-to-date entries and empty reports stay quiet; urgent failures bypass batching.
 # Undelivered pages stay in a durable outbox.
 # Recovery: journal before native recreation. Uncertain installs are inspected,
@@ -87,7 +91,7 @@ usr_ops_append_log() {
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_VERSION="1.5.0"
 # Keep configured per-item holds when approving the same installed identity.
 # Daily rolling tags need a shorter hold to avoid perpetually chasing rebuilds.
 readonly APPROVAL_JQ='def approval($old;$identity;$allow;$kind;$epoch):
@@ -143,6 +147,9 @@ mutate(){ jq "$@" "$STATE_FILE" >"$TMP_DIR/state.next" && state_valid "$TMP_DIR/
 policy_valid(){ jq -e '
  .schema==1 and (.enabled|type)=="boolean" and (.docker|type)=="object" and (.plugins|type)=="object" and
  all(.docker[],.plugins[];(.allow|type)=="boolean" and (.identity|type)=="string" and (.candidateHoldHours==null or ((.candidateHoldHours|type)=="number" and .candidateHoldHours==(.candidateHoldHours|floor) and .candidateHoldHours>=1 and .candidateHoldHours<=168))) and
+ (.windows==null or ((.windows|type)=="array" and (.windows|length)>=1 and (.windows|length)<=4 and
+   all(.windows[];(.start|test("^([01][0-9]|2[0-3]):[0-5][0-9]$")) and (.end|test("^([01][0-9]|2[0-3]):[0-5][0-9]$")) and .start<.end) and
+   (.windows==(.windows|sort_by(.start))) and ([range(1;(.windows|length)) as $i|.windows[$i-1].end<=.windows[$i].start]|all) and .window==.windows[0])) and
  (.window.start|type)=="string" and (.window.end|type)=="string" and
  (.window.start|test("^([01][0-9]|2[0-3]):[0-5][0-9]$")) and (.window.end|test("^([01][0-9]|2[0-3]):[0-5][0-9]$")) and .window.start<.window.end and
  ((.limits.dailyTotal // 8)|type)=="number" and ((.limits.dailyDocker // .limits.dailyTotal // 6)|type)=="number" and ((.limits.dailyPlugins // 2)|type)=="number" and ((.limits.candidateHoldHours // 24)|type)=="number" and
@@ -169,10 +176,78 @@ event(){
  EVENTS=$((EVENTS+1))
 }
 
-window_open(){
- local now start end;now=$(TZ=Asia/Singapore date +%H:%M);start=$(jq -r .window.start "$POLICY_FILE");end=$(jq -r .window.end "$POLICY_FILE")
- [[ "$now" > "$start" || "$now" == "$start" ]] && [[ "$now" < "$end" ]]
+calendar_eval() {
+    # One timezone-aware calendar serves window selection, finish-by guards and
+    # reporting. External app configuration is read only by the watchdog CLI.
+    local mode="$1" now="$2" reserve="${3:-0}" name="${4:-}" kind="${5:-docker}" manifest="${6:-}"
+    [[ -n "$manifest" ]] || manifest='{}'
+    php -r '
+      [$mode,$now,$reserve,$name,$kind,$policyPath,$scriptPath]=array_slice($argv,1);$now=(int)$now;$reserve=(int)$reserve;
+      $p=json_decode(file_get_contents($policyPath),true,512,JSON_THROW_ON_ERROR);$windows=$p["windows"]??[$p["window"]];$zone=new DateTimeZone("Asia/Singapore");
+      $today=(new DateTimeImmutable("@".$now))->setTimezone($zone)->setTime(0,0);$spans=[];
+      for($d=0;$d<3;$d++)foreach($windows as $w){$day=$today->modify("+$d day");$a=new DateTimeImmutable($day->format("Y-m-d")." ".$w["start"],$zone);$b=new DateTimeImmutable($day->format("Y-m-d")." ".$w["end"],$zone);$spans[]=["start"=>$a->getTimestamp(),"end"=>$b->getTimestamp(),"id"=>$day->format("Y-m-d").":".$w["start"]];}
+      usort($spans,fn($a,$b)=>$a["start"]<=>$b["start"]);$current=null;$next=null;
+      foreach($spans as $s){if($s["start"]<=$now&&$now<$s["end"])$current=$s;$at=max($now,$s["start"]);$at=(int)(ceil($at/900)*900);if($at<$s["end"]&&$next===null)$next=$at;}
+      if($mode==="next"){echo json_encode(["at"=>$next]);exit;}
+      if($mode==="window"){echo json_encode(["ready"=>$current!==null,"current"=>$current,"nextAttemptAt"=>$next]);exit;}
+      $manifest=json_decode(stream_get_contents(STDIN),true,512,JSON_THROW_ON_ERROR);
+      if(($manifest["verified"]??false)!==true){echo json_encode(["ready"=>false,"detail"=>$manifest["detail"]??"Native schedule evidence unavailable","retryAt"=>$next]);exit;}
+      function values($expr,$lo,$hi){
+        $out=[];foreach(explode(",",strtolower($expr)) as $part){
+          if(!preg_match("~^(\\*|[0-9]+(?:-[0-9]+)?)(?:/([0-9]+))?$~D",$part,$m))throw new Exception("Unsupported cron syntax");
+          $step=isset($m[2])?(int)$m[2]:1;if($step<1)throw new Exception("Invalid cron step");
+          if($m[1]==="*"){ $a=$lo;$b=$hi; }elseif(str_contains($m[1],"-")){[$a,$b]=array_map("intval",explode("-",$m[1]));}else{$a=(int)$m[1];$b=isset($m[2])?$hi:$a;}
+          if($a<$lo||$b>$hi||$a>$b)throw new Exception("Invalid cron range");for($v=$a;$v<=$b;$v+=$step)$out[$v]=true;
+        }return array_keys($out);
+      }
+      function occurrence($event,$now){
+        $z=new DateTimeZone($event["timezone"]??"Asia/Singapore");$f=preg_split("/\\s+/",trim($event["cron"]));if(count($f)!==5)throw new Exception("Invalid schedule");
+        $mins=values($f[0],0,59);$hours=values($f[1],0,23);$dom=values($f[2],1,31);$months=values($f[3],1,12);$dow=values($f[4],0,7);if(in_array(7,$dow,true))$dow[]=0;
+        $duration=(int)($event["durationSeconds"]??0);if($duration<0||$duration>86400)throw new Exception("Invalid interval");
+        $day=(new DateTimeImmutable("@".$now))->setTimezone($z)->setTime(0,0)->modify("-1 day");$future=null;$activeUntil=0;
+        for($d=0;$d<10;$d++,$day=$day->modify("+1 day")){
+          if(!in_array((int)$day->format("n"),$months,true))continue;
+          $dm=in_array((int)$day->format("j"),$dom,true);$dw=in_array((int)$day->format("w"),$dow,true);
+          $match=!str_starts_with($f[2],"*")&&!str_starts_with($f[4],"*")?($dm||$dw):($dm&&$dw);if(!$match)continue;
+          foreach($hours as $h)foreach($mins as $m){$at=$day->setTime($h,$m)->getTimestamp();if($at<=$now&&$at+$duration>$now)$activeUntil=max($activeUntil,$at+$duration);if($at>=$now&&($future===null||$at<$future))$future=$at;}
+        }return [$future,$activeUntil];
+      }
+      $events=$manifest["events"]??[];$scripts=is_file($scriptPath)?json_decode(file_get_contents($scriptPath),true,512,JSON_THROW_ON_ERROR):[];
+      $related=["backup_cache_appdata","backup_boot_disk"];
+      if($kind==="plugin")$related=array_merge($related,["media_cleanup","media_torrent_management","media_plex_dbrepair","media_metadata_audit","media_integrity_audit"]);
+      if($kind==="docker"){
+        if(preg_match("/sonarr|radarr|sabnzbd|qbittorrent/",$name))$related=array_merge($related,["media_cleanup","media_torrent_management"]);
+        if(preg_match("/plex|kometa|metafusion|imagemaid/",$name))$related=array_merge($related,["media_plex_dbrepair","media_metadata_audit"]);
+        if($name==="bazarr")$related[]="media_integrity_audit";
+      }
+      foreach($related as $job){$key="/boot/config/plugins/user.scripts/scripts/$job/script";$s=$scripts[$key]??null;if(!$s||($s["frequency"]??"")==="disabled")continue;if(($s["frequency"]??"")!=="custom")throw new Exception("Unsupported related User Scripts schedule");$events[]=["label"=>$job,"cron"=>$s["custom"],"timezone"=>"Asia/Singapore","durationSeconds"=>60];}
+      $holds=[];$first=null;
+      if($current===null)$holds[]=["label"=>"Outside approved update windows","at"=>$next];
+      elseif($now+$reserve>$current["end"])$holds[]=["label"=>"Not enough time to finish before update window closes","at"=>$current["end"]];
+      foreach($events as $event){[$at,$active]=occurrence($event,$now);if($at!==null&&($first===null||$at<$first["at"]))$first=["label"=>$event["label"],"at"=>$at];
+        if($active>$now)$holds[]=["label"=>"Protected scheduled interval: ".$event["label"],"at"=>$active];
+        elseif($at!==null&&$at<=$now+$reserve)$holds[]=["label"=>"Finish-by buffer before ".$event["label"],"at"=>$at];
+      }
+      $detail=count($holds)?implode("; ",array_map(fn($h)=>$h["label"]." (".(new DateTimeImmutable("@".$h["at"]))->setTimezone($zone)->format("Y-m-d H:i T").")",$holds)):"Quiet interval verified; update budget fits before scheduled work";
+      echo json_encode(["ready"=>!count($holds),"detail"=>$detail,"holds"=>$holds,"nextEvent"=>$first,"retryAt"=>$next,"reservedSeconds"=>$reserve]);
+    ' "$mode" "$now" "$reserve" "$name" "$kind" "$POLICY_FILE" "$BACKUP_SCHEDULE_FILE" <<<"$manifest"
 }
+scheduled_work_guard() {
+    local kind="$1" name="$2" phase="${3:-prepare}" manifest='{"verified":true,"events":[]}' reserve=1200
+    [[ "$phase" != dispatch ]] || reserve=780
+    if [[ "$kind" == docker ]];then
+      if ! bounded 40 /bin/bash "$WATCHDOG_SCRIPT" --update-schedule "$name" >"$TMP_DIR/native-schedule.json" 2>"$TMP_DIR/native-schedule.err" || ! jq -e '.schema==1 and (.events|type)=="array"' "$TMP_DIR/native-schedule.json" >/dev/null 2>&1;then
+        SUMMARY="$name native schedule could not be verified; update deferred";return 1
+      fi
+      manifest=$(cat "$TMP_DIR/native-schedule.json")
+    fi
+    calendar_eval guard "$(date +%s)" "$reserve" "$name" "$kind" "$manifest" >"$TMP_DIR/schedule-guard.json" 2>"$TMP_DIR/schedule-guard.err" || { SUMMARY="$name schedule syntax/interface unverified; no update started";return 1; }
+    SUMMARY=$(jq -r .detail "$TMP_DIR/schedule-guard.json")
+    jq -e '.ready==true' "$TMP_DIR/schedule-guard.json" >/dev/null
+}
+
+window_open(){ calendar_eval window "$(date +%s)" | jq -e '.ready==true' >/dev/null; }
+
 within_budget(){ (( $(date +%s)<START_EPOCH+MAX_RUNTIME_SECONDS-${1:-0} )); }
 write_adapter(){ cat >"$TMP_DIR/native.php" <<'NATIVEPHP'
 <?php
@@ -254,7 +329,7 @@ initialize() {
     if [[ ! -f "$POLICY_FILE" ]];then
       adapter inventory >"$TMP_DIR/initial-inventory" || return 1
       jq "$APPROVAL_JQ"' (now|floor) as $epoch |
-        {schema:1,enabled:true,window:{start:"13:15",end:"15:30"},reportTime:"15:45",limits:{dailyTotal:8,dailyDocker:6,dailyPlugins:2,candidateHoldHours:24,imageMaxBytes:4294967296},
+        {schema:1,enabled:true,window:{start:"13:15",end:"15:30"},windows:[{start:"13:15",end:"15:30"},{start:"21:15",end:"23:00"}],reportTime:"23:15",limits:{dailyTotal:8,dailyDocker:6,dailyPlugins:2,candidateHoldHours:24,imageMaxBytes:4294967296},
          docker:(.docker|with_entries(.value=approval({};.value.repository;(.value.repository|length>0);"docker";$epoch))),
          plugins:(.plugins|with_entries(.value=approval({};.value.installed.url;(.key!="unRAIDServer.plg" and (.value.installed.url|startswith("https://")));"plugin";$epoch)))}' "$TMP_DIR/initial-inventory" >"$TMP_DIR/policy.initial" || return 1
       policy_valid "$TMP_DIR/policy.initial" && publish "$TMP_DIR/policy.initial" "$POLICY_FILE" || return 1
@@ -751,6 +826,7 @@ install_one() {
       approved=$(jq -r --arg kind "$kind" --arg name "$name" --arg identity "$identity" '(if $kind=="docker" then .docker[$name] else .plugins[$name] end) as $p | ($p.allow==true and $p.identity==$identity)' "$POLICY_FILE")
       [[ "$approved" == true ]] || continue
       pending_update_guard "$kind" "$name" "$identity" || { decision "$key" "$SUMMARY";continue; }
+      scheduled_work_guard "$kind" "$name" prepare || { decision "$key" "$SUMMARY";continue; }
       # Failed/rejected digest/version stays quarantined until it changes or an
       # operator explicitly resolves the job; no reinstall loops.
       jq -e --arg key "$key" --arg candidate "$candidate" --argjson cutoff "$((now-6*3600))" --argjson now "$now" 'all(.jobs[];.item!=$key or .candidate!=$candidate or (.status=="DEFERRED" and (.retryAt // (.startedAt+21600))<=$now))' "$STATE_FILE" >/dev/null || continue
@@ -804,7 +880,10 @@ install_one() {
         readiness "$name" || { decision "$key" "$(jq -r '.detail // "Application busy or readiness unverified"' "$TMP_DIR/readiness.json" 2>/dev/null)";defer_prepared "$job_id" 'Final application readiness/busy guard deferred before dispatch' || return 1;release_pre_dispatch;continue; }
         [[ "$fresh" == "$old_id" ]] || { defer_prepared "$job_id" 'Installed identity changed; native installer not called' || return 1;release_pre_dispatch;continue; }
       fi
-      job_update "$job_id" '.jobs[$id].status="INTENT" | .jobs[$id].dispatchedAt=$now | .jobs[$id].candidateHash=$hash' --arg hash "$( [[ "$kind" != plugin ]] || jq -r .candidate.sha256 "$TMP_DIR/fresh.json" )" --argjson now "$(date +%s)" || return 1
+      if ! scheduled_work_guard "$kind" "$name" dispatch;then
+        decision "$key" "$SUMMARY";defer_prepared "$job_id" "$SUMMARY" || return 1;release_pre_dispatch;continue
+      fi
+      job_update "$job_id" '.jobs[$id].status="INTENT" | .jobs[$id].dispatchedAt=$now | .jobs[$id].candidateHash=$hash | .items[.jobs[$id].item].missedUpdateWindows=0 | .items[.jobs[$id].item].updateWaitWindows={}' --arg hash "$( [[ "$kind" != plugin ]] || jq -r .candidate.sha256 "$TMP_DIR/fresh.json" )" --argjson now "$(date +%s)" || return 1
       INSTALL_ACTIVE=true
       if [[ "$kind" == docker ]];then bounded 420 "$NATIVE_DOCKER_UPDATE" "$name" >"$TMP_DIR/native-install.log" 2>&1 || native_rc=$?
       else bounded 300 "$NATIVE_PLUGIN" update "$name" >"$TMP_DIR/native-install.log" 2>&1 || native_rc=$?;fi
@@ -837,7 +916,7 @@ install_one() {
       fi
       return 0
     done < <(jq -r --slurpfile policy "$POLICY_FILE" --argjson now "$now" '
-      .items|to_entries|sort_by(.value.candidateSeenAt // 0)|.[]|.value as $i|
+      .items|to_entries|sort_by([-(.value.missedUpdateWindows // 0),(.value.candidateSeenAt // 0)])|.[]|.value as $i|
       (if $i.kind=="docker" then $policy[0].docker[$i.name] else $policy[0].plugins[$i.name] end) as $p|
       (($p.candidateHoldHours // $policy[0].limits.candidateHoldHours // 24)*3600) as $hold|
       select($i.missingScans==0 and $i.available==true and $i.checkStatus=="VERIFIED" and $i.candidateSeenAt<=$now-$hold)|
@@ -881,18 +960,45 @@ enforce_single_installer() {
     ! grep -Eq 'ca.update.applications/.+(updateDocker|updatePlugins)' <<<"$cron"
 }
 
-next_update_attempt() {
-    local now="${1:-$(date +%s)}" stamp day start end
-    stamp=$(( (now+899)/900*900 ));day=$(TZ=Asia/Singapore date -d "@$stamp" +%F)
-    start=$(TZ=Asia/Singapore date -d "$day $(jq -r .window.start "$POLICY_FILE")" +%s)
-    end=$(TZ=Asia/Singapore date -d "$day $(jq -r .window.end "$POLICY_FILE")" +%s)
-    if ((stamp<start));then stamp=$start
-    elif ((stamp>=end));then stamp=$(TZ=Asia/Singapore date -d "$day +1 day $(jq -r .window.start "$POLICY_FILE")" +%s);fi
-    printf '%s\n' "$stamp"
-}
+next_update_attempt() { calendar_eval next "${1:-$(date +%s)}" | jq -er .at; }
+
 add_hold() {
     jq -nc --arg code "$1" --arg reason "$2" '{code:$code,reason:$reason}' >>"$TMP_DIR/holds.ndjson"
 }
+track_update_windows() {
+    # Count only windows where this coordinator actually observed an approved,
+    # mature candidate. No retrospective guesses after downtime or installation.
+    local now="${1:-$(date +%s)}" current
+    current=$(calendar_eval window "$now") || return 1
+    mutate --argjson now "$now" --argjson current "$current" --slurpfile policy "$POLICY_FILE" '
+      .jobs as $jobs | $policy[0] as $p |
+      .items |= with_entries(.key as $key | .value |= (
+        reduce ((.updateWaitWindows // {})|to_entries[]|select(.value.status=="OPEN" and .value.end<=$now)) as $w (. ;
+          if $p.enabled!=true then .updateWaitWindows[$w.key].status="SKIPPED"
+          elif any($jobs[];.item==$key and (.dispatchedAt // 0)>=$w.value.start and (.dispatchedAt // 0)<$w.value.end) then
+            .updateWaitWindows[$w.key].status="UPDATED" | .missedUpdateWindows=0
+          else .updateWaitWindows[$w.key].status="MISSED" | .missedUpdateWindows=((.missedUpdateWindows // 0)+1) end) |
+        . as $i | (if .kind=="docker" then $p.docker[.name] else $p.plugins[.name] end) as $a |
+        if .available!=true then .missedUpdateWindows=0 | .updateWaitWindows={} else . end |
+        if $p.enabled==true and $current.current!=null and .name!="unRAIDServer.plg" and .available==true and .checkStatus=="VERIFIED" and (.missingScans // 0)==0 and
+           $a.allow==true and $a.identity==.identity and (.candidateSeenAt // $now)+(($a.candidateHoldHours // $p.limits.candidateHoldHours // 24)*3600)<=$now and
+           (any($jobs[];.item==$key and .candidate==$i.candidate and .status!="DEFERRED")|not) then
+          .updateWaitWindows[$current.current.id]=((.updateWaitWindows[$current.current.id] // $current.current)+{status:"OPEN"})
+        else . end |
+        .updateWaitWindows=((.updateWaitWindows // {})|to_entries|sort_by(.value.start)|.[-16:]|from_entries)
+      ))' || return 1
+}
+warn_starved_updates() {
+    local row name count detail day
+    [[ $(jq -r .enabled "$POLICY_FILE") == true ]] || return 0
+    day=$(TZ=Asia/Singapore date +%F)
+    while IFS= read -r row;do
+      name=$(jq -r .name <<<"$row");count=$(jq -r .missedUpdateWindows <<<"$row")
+      detail=$(jq -r '[.holds.reasons[]?.reason]|join("; ")' <<<"$row")
+      event normal 'Repeated update deferral; queue priority increased' "[WARNING] $name missed $count observed eligible update windows. Action: raised queue priority; all activity, backup and schedule guards remain enforced. Current observations: ${detail:-Final checks pending}. Delivery remains in the single grouped daily report; no app was stopped to force an update." "starved:$name:$day" || return 1
+    done < <(jq -c --slurpfile policy "$POLICY_FILE" '.items[]|. as $i|select(.available==true and (.missingScans // 0)==0 and (.missedUpdateWindows // 0)>=2)| (if .kind=="docker" then $policy[0].docker[.name] else $policy[0].plugins[.name] end) as $a|select($a.allow==true and $a.identity==$i.identity)' "$STATE_FILE")
+}
+
 collect_update_holds() {
     # Read-only assessment after installation work, so reporting cannot consume
     # its preparation budget. Cache expensive readiness for at most 30 minutes.
@@ -920,6 +1026,9 @@ collect_update_holds() {
       [[ -z "$array_reason" ]] || add_hold array "$array_reason"
       native_installer_idle || add_hold installer 'Native installer/package operation still active; all updates wait'
       pending_update_guard "$kind" "$name" "$identity" || add_hold pending "$SUMMARY"
+      if window_open;then
+        if within_budget 75;then scheduled_work_guard "$kind" "$name" prepare || add_hold scheduled-work "$SUMMARY";else add_hold schedule-pending 'Finish-by schedule evidence requires refresh before installation';fi
+      fi
       # Previous image archive limits are independent of application activity.
       if [[ "$kind" == docker ]];then
         local image size free maximum
@@ -1009,11 +1118,11 @@ render_update_report() {
         else "Queued for the next eligible maintenance slot; one installer per run" end;
       def reason($key;$i): latest($key) as $j |
         if $i.holds!=null and $i.holds.candidate==$i.candidate then
-          (if ($i.holds.reasons|length)>0 then ($i.holds.reasons|map(.reason)|join("; ")) else "No observed hold; awaiting serialized installation slot and final checks" end)+
+          (if ($i.missedUpdateWindows // 0)>=2 then "[WARNING] "+($i.missedUpdateWindows|tostring)+" eligible windows missed; priority increased. " else "" end)+(if ($i.holds.reasons|length)>0 then ($i.holds.reasons|map(.reason)|join("; ")) else "No observed hold; awaiting serialized installation slot and final checks" end)+
           ". Next reassessment: "+($i.holds.nextAttemptAt|strflocaltime("%Y-%m-%d %H:%M SGT"))+"; assessment: "+($i.holds.at|strflocaltime("%Y-%m-%d %H:%M SGT"))
         else reason_legacy($key;$i) end;
       "Daily system update report - "+$day+" (Singapore)",
-      "Policy: "+(if $p.enabled then "automatic" else "paused" end)+"; starts "+$p.window.start+"-"+$p.window.end+"; daily limits "+(($p.limits.dailyDocker // $p.limits.dailyTotal // 6)|tostring)+" Docker / "+(($p.limits.dailyPlugins // 2)|tostring)+" plugin(s).",
+      "Policy: "+(if $p.enabled then "automatic" else "paused" end)+"; windows "+(($p.windows // [$p.window])|map(.start+"-"+.end)|join(", "))+"; daily limits "+(($p.limits.dailyDocker // $p.limits.dailyTotal // 6)|tostring)+" Docker / "+(($p.limits.dailyPlugins // 2)|tostring)+" plugin(s).",
       "", "UPDATED AND VERIFIED:",
       ([$s.jobs[]|select(.status=="COMPLETED" and (.verifiedAt // 0)>=$start)] as $done |
         if ($done|length)==0 then "- None verified today."
@@ -1116,10 +1225,12 @@ No command: automatic policy evaluation, bounded checks, approved installation i
 --allow docker NAME             Approve exact installed image repository/channel.
 --allow plugin NAME.plg         Approve exact installed plugin source (OS excluded).
 --allow-installed              Approve current installed identities; OS stays manual.
---report-preview               Print saved update/defer summary; no install or email.
+--report-preview               Print saved holds, schedule cutoffs and next attempt; no install/email.
 --deny docker|plugin NAME       Disable approval; retain reporting.
 --pause / --resume              Pause/resume all new installations; checks continue.
---window HH:MM HH:MM            Set same-day Singapore maintenance window.
+--window HH:MM HH:MM            Set primary same-day Singapore window.
+--add-window HH:MM HH:MM        Add a non-overlapping window (maximum four).
+--remove-window HH:MM HH:MM     Remove a window; at least one must remain.
 --report-time HH:MM             Set the daily grouped report time (default 15:45).
 --hold docker|plugin NAME H     Override one installed identity hold (1-168 hours).
 --archive-limit GIB             Bound previous-image size/archive (1-8 GiB; default 4).
@@ -1131,6 +1242,13 @@ No command: automatic policy evaluation, bounded checks, approved installation i
 Removing an app/plugin needs no command: two complete inventories retire its entry.
 New/reinstalled identities default to reporting only and can be approved with CLI.
 No command changes Docker startup/template/application settings or image channels.
+The two default windows are 13:15-15:30 and 21:15-23:00 Singapore.
+The daily report defaults to 23:15 so both windows are included in one email.
+Native schedules and relevant User Scripts jobs are checked before preparation
+and dispatch; updates defer if the bounded restart cannot fit. Protected job
+schedules, Docker startup and app configuration are never changed.
+Two observed missed windows raise priority and a grouped warning; no guard is
+overridden and no active job is killed to force an update.
 Active conflicting scripts finish normally; updater waits up to 90 seconds, then
 retries on its existing schedule. Expiring 20-minute requests let new conflicting
 work yield, avoiding repeated collisions. Unrelated Docker apps remain eligible.
@@ -1174,7 +1292,12 @@ main() {
         policy_update --arg kind "$2" --arg name "$3" --argjson hours "$((10#$4))" 'if $kind=="docker" then .docker[$name].candidateHoldHours=$hours else .plugins[$name].candidateHoldHours=$hours end';return $?;;
       --archive-limit) [[ $# == 2 && "$2" =~ ^[1-8]$ ]] || return 2;policy_update --argjson bytes "$((10#$2*1073741824))" '.limits.imageMaxBytes=$bytes';return $?;;
       --report-time) [[ $# == 2 && "$2" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || return 2;policy_update --arg time "$2" '.reportTime=$time';return $?;;
-      --window) [[ $# == 3 && "$2" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ && "$3" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ && "$2" < "$3" ]] || return 2;policy_update --arg start "$2" --arg end "$3" '.window={start:$start,end:$end}';return $?;;
+      --window) [[ $# == 3 && "$2" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ && "$3" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ && "$2" < "$3" ]] || return 2;policy_update --arg start "$2" --arg end "$3" '.window={start:$start,end:$end} | if .windows!=null then .windows[0]=.window | .windows|=sort_by(.start) | .window=.windows[0] else . end';return $?;;
+      --add-window|--remove-window)
+        [[ $# == 3 && "$2" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ && "$3" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ && "$2" < "$3" ]] || return 2
+        if [[ "$1" == --add-window ]];then
+          policy_update --arg start "$2" --arg end "$3" '.windows=((.windows // [.window])+[{start:$start,end:$end}]|unique|sort_by(.start)) | .window=.windows[0]'
+        else policy_update --arg start "$2" --arg end "$3" '.windows=((.windows // [.window])|map(select(.start!=$start or .end!=$end))) | .window=.windows[0]';fi;return $?;;
       --resolve) [[ $# == 3 && -n "$3" && ${#3} -le 2000 ]] || return 2;jq -e --arg id "$2" '.jobs[$id]!=null and (.jobs[$id].status|IN("ATTENTION","VERIFYING","INTENT"))' "$STATE_FILE" >/dev/null || return 2;job_update "$2" '.jobs[$id].status="CLOSED_BY_OPERATOR" | .jobs[$id].resolutionNote=$note | .jobs[$id].closedAt=$now' --arg note "$3" --argjson now "$(date +%s)";return $?;;
       --report-preview) QUIET_FINISH=true;render_update_report;return $?;;
       --allow-installed)
@@ -1201,11 +1324,13 @@ main() {
     collect_inventory || { SUMMARY='Inventory unavailable/incomplete; no retirement or installation';return 1; }
     check_updates || return 1
     recover_preparation || return 1
+    track_update_windows || return 1
     reconcile_jobs || { RESULT=ATTENTION;SUMMARY='Pending update reconciliation incomplete; native actions not replayed'; }
     [[ "${1:-}" == --check-only ]] || install_one || return 1
     if jq -e 'any(.jobs[];.status=="ATTENTION" or .status=="INTENT")' "$STATE_FILE" >/dev/null;then RESULT=ATTENTION;fi
     clean_recovery_sets || log WARNING 'Recovery-set retention deferred; existing evidence retained'
     collect_update_holds || log WARNING 'Update hold assessment incomplete; existing observations retained'
+    warn_starved_updates || return 1
     daily_update_report || return 1
     flush_notifications || { RESULT=ATTENTION;SUMMARY='Notification delivery failed; report retained for retry'; }
     mutate --arg mode "$MODE" --argjson now "$(date +%s)" '.lastCompletedAt=$now | (if $mode=="automatic" then .lastAutomaticRunAt=$now else . end) | .jobs |= with_entries(select(.value.status=="INTENT" or .value.status=="VERIFYING" or .value.status=="ATTENTION" or (.value.startedAt // 0)>=$now-90*86400 or ((.value.recoveryPath // "")!="" and (.value.recoveryPrunedAt // 0)==0)))'

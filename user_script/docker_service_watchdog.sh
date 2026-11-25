@@ -54,7 +54,7 @@ usr_ops_append_log() {
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.14"
+readonly SCRIPT_VERSION="3.15"
 
 ###############################################################################
 # CONFIGURATION
@@ -1240,6 +1240,137 @@ print(json.dumps({'ready':ready,'classification':'ready' if ready else ('unverif
 PY
 }
 
+container_update_schedule() {
+    # Read scheduling inputs only; no Docker/app setting is changed. Unknown
+    # syntax defers that app rather than guessing a time or changing its clock.
+    local name="$1" info zone
+    valid_service_name "$name" || return 2
+    case "$name" in
+      kometa|imagemaid|metafusion)
+        docker_cmd exec -i "$name" python3 - "$name" <<'PYSCHEDULE'
+import datetime,json,os,re,sys,time
+from pathlib import Path
+name=sys.argv[1];events=[]
+zone=os.environ.get('TZ') or ('UTC' if time.timezone==0 else str(datetime.datetime.now().astimezone().tzinfo))
+def add(label,cron,duration=0):events.append(dict(label=label,cron=cron,timezone=zone,durationSeconds=duration))
+def clock(v):
+    m=re.fullmatch(r'(\d{2}):(\d{2})',v.strip());assert m and int(m[1])<24 and int(m[2])<60,'Invalid native schedule time'
+    return str(int(m[2]))+' '+str(int(m[1]))
+try:
+    if name=='kometa':
+        assert os.environ.get('KOMETA_RUN','false').lower() not in ('true','1'),'One-shot startup mode needs review'
+        values=os.environ.get('KOMETA_TIME','').split(',');assert values and all(v.strip() for v in values),'Native schedule unavailable'
+        for v in values:add('Kometa scheduled run',clock(v)+' * * *')
+    elif name=='imagemaid':
+        values=os.environ.get('SCHEDULE','').split(',');assert values and all(v.strip() for v in values)
+        days={'sunday':0,'monday':1,'tuesday':2,'wednesday':3,'thursday':4,'friday':5,'saturday':6}
+        for v in values:
+            parts=v.strip().split('|');assert 1<=len(parts)<=3
+            dow='*'
+            for part in parts[1:]:
+                m=re.fullmatch(r'weekly\((\w+)\)',part)
+                if m:assert m[1].lower() in days;dow=str(days[m[1].lower()])
+                else:assert part=='daily' or re.fullmatch(r'mode=[a-z]+',part),'Unknown ImageMaid schedule clause'
+            add('ImageMaid scheduled job',clock(parts[0])+' * * '+dow)
+    else:
+        import yaml
+        config=yaml.safe_load(Path('/config/kometa.yml').read_text());settings=config.get('settings',{})
+        assert isinstance(settings.get('schedule'),bool),'MetaFusion schedule flag unavailable'
+        if settings['schedule']:
+            values=settings.get('run_times');assert isinstance(values,list) and values
+            for v in values:add('MetaFusion scheduled run',clock(v)+' * * *')
+    print(json.dumps(dict(schema=1,name=name,verified=True,events=events)))
+except Exception as e:
+    print(json.dumps(dict(schema=1,name=name,verified=False,events=[],detail='Native schedule syntax/interface unavailable; update deferred')))
+PYSCHEDULE
+        ;;
+      recyclarr)
+        info=$(docker_cmd inspect recyclarr) || return 1
+        zone=$(jq -r '.[0].Config.Env|map(select(startswith("TZ="))|sub("^TZ=";""))|.[0] // "UTC"|if .=="" then "UTC" else . end' <<<"$info")
+        docker_cmd exec recyclarr cat /tmp/crontab | awk '!/^#/ && /\/cron\.sh/ {print $1,$2,$3,$4,$5}' |
+        jq -Rsc --arg zone "$zone" '{schema:1,name:"recyclarr",verified:(length>0),events:(split("\n")|map(select(length>0)|{label:"Recyclarr scheduled sync",cron:.,timezone:$zone,durationSeconds:0}))}';;
+      sabnzbd)
+        docker_cmd exec -i "$name" /lsiopy/bin/python3 - <<'PYSAB'
+import configobj,json,re,os
+try:
+    c=configobj.ConfigObj('/config/sabnzbd.ini',interpolation=False)['misc'];events=[]
+    lines=c.get('schedlines');assert isinstance(lines,list),'SAB schedule unavailable'
+    for line in lines:
+        p=line.split();assert len(p)>=5 and p[0] in ('0','1')
+        if p[0]=='0' or p[4] not in ('resume_post','pause_post','create_backup'):continue
+        assert p[1].isdigit() and int(p[1])<60 and p[2].isdigit() and int(p[2])<24 and re.fullmatch(r'[1-7]+',p[3])
+        cron=p[1]+' '+p[2]+' * * '+','.join(str(int(d)%7) for d in p[3])
+        events.append(dict(label='SAB '+p[4],cron=cron,timezone=os.environ.get('TZ') or 'UTC',durationSeconds=0))
+    print(json.dumps(dict(schema=1,name='sabnzbd',verified=True,events=events)))
+except Exception:
+    print(json.dumps(dict(schema=1,name='sabnzbd',verified=False,events=[],detail='Native SAB schedule unavailable; update deferred')))
+PYSAB
+        ;;
+      photoprism)
+        info=$(docker_cmd inspect photoprism) || return 1
+        jq '{schema:1,name:"photoprism",verified:true,events:[],settings:([.[0].Config.Env[]|capture("^(?<key>[^=]+)=(?<value>.*)$")|select(.key|test("^(PHOTOPRISM_(BACKUP_SCHEDULE|INDEX_SCHEDULE|DEFAULT_TIMEZONE|DISABLE_BACKUPS|BACKUP_PATH)|TZ)$"))]|from_entries)}' <<<"$info" |
+        php -r '
+          $d=json_decode(stream_get_contents(STDIN),true,512,JSON_THROW_ON_ERROR);$s=$d["settings"];
+          $zone=$s["PHOTOPRISM_DEFAULT_TIMEZONE"]??($s["TZ"]??"UTC");$zone=$zone?:"UTC";
+          $events=[];$valid=true;
+          foreach(["BACKUP"=>3600,"INDEX"=>3600] as $kind=>$duration){
+            if($kind==="BACKUP" && ($s["PHOTOPRISM_DISABLE_BACKUPS"]??"false")==="true")continue;
+            $v=$s["PHOTOPRISM_".$kind."_SCHEDULE"]??null;
+            if($v===null){$valid=false;continue;}if($v===""||$v==="false")continue;
+            $v=["@daily"=>"0 0 * * *","@hourly"=>"0 * * * *","@weekly"=>"0 0 * * 0"][$v]??$v;
+            if(count(preg_split("/\\s+/",trim($v)))!==5){$valid=false;continue;}
+            $events[]=["label"=>"PhotoPrism ".strtolower($kind),"cron"=>$v,"timezone"=>$zone,"durationSeconds"=>$duration];
+          }
+          echo json_encode(["schema"=>1,"name"=>"photoprism","verified"=>$valid,"events"=>$events,"detail"=>$valid?"Explicit native scheduling inputs verified":"Random/default/unknown PhotoPrism schedule needs review"]);
+        '; ;;
+      plex-media|plex-media-server)
+        info=$(docker_cmd inspect "$name") || return 1
+        zone=$(jq -r '.[0].Config.Env|map(select(startswith("TZ="))|sub("^TZ=";""))|.[0] // "UTC"|if .=="" then "UTC" else . end' <<<"$info")
+        docker_cmd exec "$name" cat '/config/Library/Application Support/Plex Media Server/Preferences.xml' |
+        php -r '
+          $x=@simplexml_load_string(stream_get_contents(STDIN),"SimpleXMLElement",LIBXML_NONET);if(!$x)exit(1);
+          $a=isset($x["ButlerStartHour"])?(string)$x["ButlerStartHour"]:"1";$b=isset($x["ButlerEndHour"])?(string)$x["ButlerEndHour"]:"7";
+          if(!ctype_digit($a)||!ctype_digit($b)||(int)$a>23||(int)$b>23)exit(1);
+          $duration=(((int)$b-(int)$a+24)%24)*3600;
+          echo json_encode(["schema"=>1,"verified"=>true,"events"=>[["label"=>"Plex native maintenance","cron"=>"0 ".$a." * * *","timezone"=>$argv[1],"durationSeconds"=>$duration?:86400]]]);
+        ' "$zone"; ;;
+      *) jq -n --arg name "$name" '{schema:1,name:$name,verified:true,events:[]}' ;;
+    esac
+}
+
+photoprism_backup_readiness() {
+    # Native scheduled backup intervals are reserved by the coordinator. These
+    # extra checks catch manual/overrunning backups without modifying the app.
+    local info pids path effective paths recent probe_rc=0
+    info=$(docker_cmd inspect photoprism) || return 1
+    path=$(jq -r '.[0].Config.Env|map(select(startswith("PHOTOPRISM_BACKUP_PATH="))|sub("^[^=]*=";""))|.[0] // "/photoprism/storage/backup"' <<<"$info")
+    [[ "$path" == /* && "$path" != / && "$path" != *$'\n'* ]] || return 1
+    effective=$(docker_cmd exec photoprism photoprism show config --tsv | awk -F '\t' '$1=="backup-path" {print $2}') || return 1
+    [[ "$effective" == /* && "$effective" != / && "$effective" != *$'\n'* ]] || return 1
+    # Some images/config files override BACKUP_PATH. Protect both the effective
+    # CLI location and the saved environment location; never rewrite either.
+    paths=$(jq -nc --arg a "$path" --arg b "$effective" '[$a,$b]|unique')
+    pids=$(docker_cmd top photoprism -eo pid,comm) || return 1
+    printf '%s' "$pids" | php -r '
+      $paths=array_map(fn($v)=>rtrim($v,"/")."/",json_decode($argv[1],true,512,JSON_THROW_ON_ERROR));$busy=false;$valid=false;
+      foreach(array_slice(explode("\n",stream_get_contents(STDIN)),1) as $line){
+        $v=preg_split("/\\s+/",trim($line));if(!ctype_digit($v[0]??""))continue;$pid=$v[0];$valid=true;
+        $cmd=@file_get_contents("/proc/$pid/cmdline");if($cmd===false)exit(2);
+        $words=str_replace("\0"," ",$cmd);
+        if(preg_match("~(?:^|/)(?:mariadb-dump|mysqldump|pg_dump|sqlite3)(?: |$)|photoprism (?:.* )?(?:backup|restore)(?: |$)~",$words))$busy=true;
+        $fds=glob("/proc/$pid/fd/*");if($fds===false)exit(2);
+        foreach($fds as $fd){$target=@readlink($fd);if($target!==false&&is_file($fd))foreach($paths as $path)if(str_starts_with($target,$path))$busy=true;}
+      }exit(!$valid?2:($busy?1:0));
+    ' "$paths" || probe_rc=$?
+    if ((probe_rc!=0));then
+      if ((probe_rc!=1));then return 1;fi
+      jq -n '{ready:false,classification:"busy",source:"native-photoprism-backup",detail:"PhotoPrism backup/restore process or open backup file detected; update waits for completion"}';return
+    fi
+    recent=$(docker_cmd exec photoprism sh -c 'for path do if test -d "$path";then find "$path" -maxdepth 3 -type f -mmin -2 -print -quit || exit 1;fi;done' _ "$path" "$effective") || return 1
+    if [[ -n "$recent" ]];then jq -n '{ready:false,classification:"busy",source:"native-photoprism-backup",detail:"PhotoPrism backup files changed within two minutes; short quiet period required before update"}'
+    else jq -n '{ready:true,classification:"ready",source:"native-photoprism-backup",detail:"No visible PhotoPrism backup activity or recent backup writes; scheduled backup interval protected separately"}';fi
+}
+
 vpn_readiness_json() (
     local reason=''
     log(){ :; }
@@ -1285,12 +1416,16 @@ d=json.load(r);d=d.get("data",d);assert isinstance(d,dict) and d.get("bazarr_ver
           esac
         fi
       else detail="Docker health: $health";result="$health";fi
+      # Native fallback evidence must enter the update-specific activity gates,
+      # just like Docker health and a direct HTTP readiness response.
+      if [[ -n "$evidence" ]] && jq -e '(.ready|type)=="boolean"' <<<"$evidence" >/dev/null 2>&1;then ready=$(jq -r .ready <<<"$evidence");fi
       if [[ "$purpose" == update && "$ready" == true ]];then
         case "$name" in
           kometa|imagemaid|recyclarr) [[ -n "$evidence" ]] || evidence=$(scheduler_readiness "$name" "$purpose" 2>/dev/null) || evidence='{"ready":false,"classification":"unverified","source":"native-scheduler","detail":"Scheduler readiness could not be verified"}';;
           sabnzbd) [[ -n "$evidence" ]] || evidence=$(sab_readiness "$purpose" 2>/dev/null) || evidence='{"ready":false,"classification":"unverified","source":"native-sab-api","detail":"SAB activity state could not be verified"}';;
           sonarr|radarr) evidence=$(arr_update_readiness "$name" 2>/dev/null) || evidence='{"ready":false,"classification":"unverified","source":"native-arr-activity","detail":"Native Arr command/import activity unavailable; update deferred"}';;
           plex-media|plex-media-server) evidence=$(plex_update_readiness "$name" 2>/dev/null) || evidence='{"ready":false,"classification":"unverified","source":"plex-sessions","detail":"Plex sessions could not be verified; update deferred"}';;
+          photoprism) evidence=$(photoprism_backup_readiness 2>/dev/null) || evidence='{"ready":false,"classification":"unverified","source":"native-photoprism-backup","detail":"PhotoPrism backup activity could not be verified; update deferred"}';;
           metafusion)
             if ! docker_cmd exec metafusion cat /tmp/metafusion-status.json | jq -e '.state=="idle"' >/dev/null 2>&1;then evidence='{"ready":false,"classification":"busy","source":"native-metafusion","detail":"MetaFusion is active or idle state unavailable; update deferred"}';fi;;
           pihole)
@@ -1929,20 +2064,22 @@ write_receipt() {
 }
 
 main() {
-    case "${1:-}" in --readiness|--update-readiness|--diagnose|--diagnose-vpn|--version|--help|-h|--maintenance) ;;
+    case "${1:-}" in --update-schedule|--readiness|--update-readiness|--diagnose|--diagnose-vpn|--version|--help|-h|--maintenance) ;;
         *) exec {STATE_EXPORT_FD}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
            if ! flock -s -n "$STATE_EXPORT_FD"; then printf 'State export active; watchdog invocation deferred.\n'; return 0; fi;;
     esac
     local spec name url expected allowed uptime status=OK failed=false command
     case "${1:-}" in
-        --help|-h) printf '%s\n' 'Usage: bash docker_service_watchdog.sh [--readiness CONTAINER|--update-readiness CONTAINER|--version|--diagnose-vpn|--diagnose CONTAINER [URL]|--maintenance CONTAINER MINUTES REASON|--record-job PROFILE EXIT_CODE [START_EPOCH]]'
+        --help|-h) printf '%s\n' 'Usage: bash docker_service_watchdog.sh [--readiness CONTAINER|--update-readiness CONTAINER|--update-schedule CONTAINER|--version|--diagnose-vpn|--diagnose CONTAINER [URL]|--maintenance CONTAINER MINUTES REASON|--record-job PROFILE EXIT_CODE [START_EPOCH]]'
             printf '%s\n' 'Schedule every five minutes. Recovery requires global AND per-service permission.' \
                 'Maintenance suppresses availability checks/restarts, freezes active findings, and expires within 24h.' \
                 'Remove /run/docker-service-maintenance/CONTAINER.manual.json to end a manual lease early.' \
                 'Healthy/unchanged runs stay silent. Failures and recovery require consecutive scans.' \
                 'Internal schedulers need native status, timestamped whole-run evidence, or producer receipts.' \
                 'Run docker_watchdog_liveness.sh independently every five minutes to monitor this script.' \
+                '--update-schedule prints native scheduling inputs for the updater; never changes app schedules.' \
                 '--diagnose-vpn prints read-only binding, exit-node, DNS and egress evidence; no state or notifications.'; return 0 ;;
+        --update-schedule) [[ $# == 2 ]] || return 2;container_update_schedule "$2";return $?;;
         --readiness|--update-readiness) [[ $# == 2 ]] || return 2;local purpose=health;[[ "$1" != --update-readiness ]] || purpose=update;readiness_json "$2" "$purpose";return $?;;
         --version) printf 'docker_service_watchdog.sh %s\n' "$SCRIPT_VERSION"; return 0 ;;
         --diagnose-vpn) [[ $# == 1 ]] || return 2; diagnose_vpn; return $? ;;

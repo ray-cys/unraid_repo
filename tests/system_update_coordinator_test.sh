@@ -50,7 +50,7 @@ printf 'Automatic identity-bound allowlist, stopped preservation, confirmed reti
 # Full native-action orchestration uses a fake installer with actual journal writes.
 now=$(date +%s);candidate="sha256:$(printf '%064d' 1)"
 mutate --arg c "$candidate" --argjson now "$now" '.items["docker:prowlarr"] += {candidate:$c,candidateSeenAt:($now-90000),available:true,checkStatus:"VERIFIED",checkedAt:$now}'
-window_open(){ return 0; };adapter_compatible(){ return 0; };maintenance_guard(){ return 0; };readiness(){ return 0; }
+window_open(){ return 0; };adapter_compatible(){ return 0; };maintenance_guard(){ return 0; };readiness(){ return 0; };scheduled_work_guard(){ return 0; }
 backup_evidence(){ printf '{"verified":true}' >"$TMP_DIR/backup-evidence.json"; }
 ROLLBACK_ROOT="$VAULT_MOUNT/backup/system_updates"
 prepare_recovery_set(){ mkdir -p "$ROLLBACK_ROOT/$3";cp "$TMP_DIR/definition-before.json" "$ROLLBACK_ROOT/$3/definition-before.json"; }
