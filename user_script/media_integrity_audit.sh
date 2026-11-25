@@ -3,7 +3,7 @@
 clearLog=true
 arrayStarted=true
 ###############################################################################
-# Media Integrity Audit v2.6.1 -- personal Unraid User Script
+# Media Integrity Audit v2.6.2 -- personal Unraid User Script
 #
 # PURPOSE / USE CASE
 # ------------------
@@ -30,10 +30,8 @@ arrayStarted=true
 #
 # BOUNDS / COORDINATION
 # ---------------------
-# Wednesday 09:30 and Sunday 07:00 Singapore time; at most two hours per run.
-# User Scripts custom cron: 30 9 * * 3. Native Sunday companion: 0 7 * * 0;
-# /boot/config/plugins/user.scripts/media_integrity_audit_sunday.cron honors the
-# primary job being disabled/cleared. No duplicate User Script is required.
+# Wednesday and Sunday 07:00 Singapore time; at most two hours per run.
+# Single User Scripts custom cron: 0 7 * * 0,3.
 # Use two video decoder threads, one audio/filter thread, nice 15, idle-class I/O
 # and a 2 GiB per-decoder virtual-address-space limit. This is not a container RAM
 # limit. Slow ranges shrink after timeout; timeouts/resource limits are unverified,
@@ -199,7 +197,7 @@ umask 077
 # stay unverified. Completed ranges prove decoder acceptance, not perfect visual
 # playback. Legacy probe-only incidents are re-evaluated without replacing media.
 # Worker transport failures preserve the last checkpoint and never accuse media.
-readonly SCRIPT_VERSION="2.6.1"
+readonly SCRIPT_VERSION="2.6.2"
 BAZARR_CONTAINER="bazarr"
 MEDIA_HOST_ROOT="/mnt/user/media"
 MEDIA_CONTAINER_ROOT="/data"
@@ -504,7 +502,7 @@ coverage_summary() {
         "; with passed decode ranges="+(.run.uniqueFilesDecoded|shown)+"; partially decoded="+(.run.uniqueFilesPartiallyDecoded|shown)+"; fully verified="+(.run.uniqueFilesCompleted|shown),
         "Overall files: "+(.overall|counts_line),
         "Deferred, blocked and periodic-due counts overlap coverage categories. Work remaining counts each file once.",
-        "Measured capacity: "+.capacity.status+"; representative runs="+(.capacity.samples|tostring)+"/3 minimum; schedule=Wednesday 09:30 / Sunday 07:00 Singapore; two hours per run.",
+        "Measured capacity: "+.capacity.status+"; representative runs="+(.capacity.samples|tostring)+"/3 minimum; schedule=Wednesday/Sunday 07:00 Singapore; two hours per run.",
         "Known-duration backlog estimate: "+(if .capacity.knownBacklogDaysLowerBound!=null then ((.capacity.knownBacklogDaysLowerBound|ceil)|tostring)+" days or more at measured net progress" else "not yet available" end)+"; pending files with unknown duration="+(.capacity.unknownDurations|shown)+". This is not a full-library completion promise.",
         "Per-library saved coverage:"]+
         [.libraries[]|"- "+.name+": inventory="+(.inventory.status|gsub("_";" "))+"; "+(.counts|counts_line)]+
@@ -610,7 +608,7 @@ render_report() {
     fi
     jq --argjson stalled "$stalled" '.stalledCompletedRuns=$stalled' "$temp" >"$temp.next" && mv "$temp.next" "$temp" || return 1
     local delivery=suppressed;((sent==0)) || delivery=sent;[[ ! -f "$STATE_DIR/pending-notification.json" ]] || delivery=failed
-    jq --arg notification "$delivery" --arg version "$SCRIPT_VERSION" --argjson progress "$progress_completed" --argjson completed "$completed" --argjson installed "$installed" --argjson first "$first" '.+{notification:$notification,scriptVersion:$version,schedule:{cron:"30 9 * * 3",additionalCron:["0 7 * * 0"],timezone:"Asia/Singapore",maxGapSeconds:432000},lastCompletedScanAt:$completed,lastProgressScanAt:$progress,installedAt:$installed,firstScheduledAt:$first}' "$temp" >"$STATUS_DIR/.media-integrity-audit.new" && mv "$STATUS_DIR/.media-integrity-audit.new" "$STATUS_DIR/media_integrity_audit.json" || return 1
+    jq --arg notification "$delivery" --arg version "$SCRIPT_VERSION" --argjson progress "$progress_completed" --argjson completed "$completed" --argjson installed "$installed" --argjson first "$first" '.+{notification:$notification,scriptVersion:$version,schedule:{cron:"0 7 * * 0,3",timezone:"Asia/Singapore",maxGapSeconds:432000},lastCompletedScanAt:$completed,lastProgressScanAt:$progress,installedAt:$installed,firstScheduledAt:$first}' "$temp" >"$STATUS_DIR/.media-integrity-audit.new" && mv "$STATUS_DIR/.media-integrity-audit.new" "$STATUS_DIR/media_integrity_audit.json" || return 1
     RUN_REPORT_WRITTEN=true;log INFO "$(jq -r .summary "$temp")";rm -f "$temp"
 }
 
@@ -1786,7 +1784,7 @@ main() {
       --version) printf 'media_integrity_audit.sh %s\n' "$SCRIPT_VERSION";return 0;;
       --help|-h) printf '%s\n' 'Usage: bash script [--version|--status|--inventory-only|--recovery-status|--recover-only|--help]' \
         'Default: Wednesday/Sunday scan through Bazarr. Recovery is disabled by configuration; no installation or Docker changes.' \
-        'Wednesday 09:30 / Sunday 07:00 SGT, two-hour runtime, two video threads, low CPU/I/O priority.' \
+        'Wednesday/Sunday 07:00 SGT, two-hour runtime, two video threads, low CPU/I/O priority.' \
         'Quick probes and resumable overlapping decode ranges are separate evidence; pending files remain unverified.' \
         'Missing mounts, maintenance, active parity/Mover/backups or Plex transcoding defer/stop work.' \
         '--status reads only saved receipts. --inventory-only stats library paths and saves inventory; no decoding or normal email.' \
