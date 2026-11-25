@@ -2,7 +2,7 @@
 # shellcheck disable=SC2034
 clearLog=true
 arrayStarted=true
-# Backup freshness, delivery and runtime-compatibility audit v1.10.
+# Backup freshness, delivery and runtime-compatibility audit v1.11.
 # Schedule: 20 * * * *. Reads local receipts/manifests only: no WOL, remote
 # connection, media hashing, container actions or cleanup. One lifecycle email
 # for changed findings, recovery, or a 24-hour reminder. Failed delivery retries.
@@ -56,7 +56,7 @@ usr_ops_append_log() {
 }
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
-readonly SCRIPT_VERSION="1.10"
+readonly SCRIPT_VERSION="1.11"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/backup_health_audit}"
 APPDATA_ROOT="${APPDATA_ROOT:-/mnt/vault/backup/cache}"
@@ -99,15 +99,19 @@ audit_disk_health_monitor() {
     fi
 }
 audit_media_integrity_monitor() {
-    local receipt="$STATUS_DIR/media_integrity_audit.json" completed first
+    local receipt="$STATUS_DIR/media_integrity_audit.json" completed first max_gap progress
     if ! jq -e '.schema==1 and (.lastCompletedScanAt|type)=="number" and (.firstScheduledAt|type)=="number"' "$receipt" >/dev/null 2>&1; then
         finding 'Media integrity audit: completion/schedule receipt missing or invalid';return
     fi
     completed=$(jq -r .lastCompletedScanAt "$receipt");first=$(jq -r .firstScheduledAt "$receipt")
-    if (( completed>0 )); then check_age 'Media integrity audit invocation' "$completed" "$((8*86400))"
+    progress=$(jq -r --argjson now "$NOW" '.lastProgressScanAt as $p | if ($p|type)=="number" and $p>0 and $p<=$now+300 then $p else 0 end' "$receipt")
+    ((progress<=completed)) || completed="$progress"
+    max_gap=$(jq -r '.schedule.maxGapSeconds // 691200' "$receipt")
+    [[ "$max_gap" =~ ^[1-9][0-9]*$ ]] && ((max_gap>=86400 && max_gap<=1382400)) || max_gap=691200
+    if (( completed>0 )); then check_age 'Media integrity audit completion/progress' "$completed" "$max_gap"
     elif (( first<=0 || NOW>first+86400 )); then finding 'Media integrity audit: first scheduled scan has not completed within its grace period';fi
     if jq -e '.notification=="failed"' "$receipt" >/dev/null; then finding 'Media integrity audit: grouped notification delivery failed; pending report retained';fi
-    # Individual media findings remain owned by the weekly audit, not repeated
+    # Individual media findings remain owned by the scheduled audit, not repeated
     # in this hourly backup/runtime notification stream.
 }
 
@@ -118,7 +122,7 @@ audit_media_coordination() {
       [[ $(jq -r '.weeklyReportStatus // "OK"' "$receipt") != FAILED ]] || finding 'Media metadata weekly reporting failed; exact pending report retained for retry'
     else finding 'Media metadata audit: valid run receipt missing';fi
     receipt="$STATUS_DIR/media_integrity_audit.json"
-    if jq -e '(.stalledCompletedRuns // 0)>=3' "$receipt" >/dev/null 2>&1;then finding 'Media integrity audit: three completed scans made no measurable coverage progress; review resource holds and scan budget';fi
+    if jq -e '(.stalledCompletedRuns // 0)>=3 and (.progress.capacity.attention // false)!=true' "$receipt" >/dev/null 2>&1;then finding 'Media integrity audit: three completed scans made no measurable coverage progress; review resource holds and scan budget';fi
 }
 
 audit_update_coordinator() {

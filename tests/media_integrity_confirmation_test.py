@@ -47,7 +47,7 @@ with tempfile.TemporaryDirectory() as folder:
     assert all(float(v[v.index('-ss')+1])==480 for v in normal)
     mode='auxiliary';a,e,_=audit_run();assert e['issue']['kind']=='auxiliary_track_error' and not e['issue']['confirmed']
     assert [v['index'] for v in e['issue']['streamEvidence'] if v['kind']=='decode_error']==[2]
-    mode='primary';a,e,_=audit_run();assert e['issue']['confirmed'] and e['issue']['confirmedRuns']==1 and e['issue']['proofVersion']==3
+    mode='primary';a,e,_=audit_run();assert e['issue']['confirmed'] and e['issue']['confirmedRuns']==1 and e['issue']['proofVersion']==4
     a2,e2,_=audit_run(a.state,run_epoch=100);assert e2['issue']['confirmedRuns']==1
     a3,e3,_=audit_run(a2.state,run_epoch=200);assert e3['issue']['confirmedRuns']==2
     assert e3['issue']['confirmationMethod']=='normal-isolated-streams-v1'

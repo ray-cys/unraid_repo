@@ -15,3 +15,9 @@ FINDINGS=();audit_media_integrity_monitor;[[ ${#FINDINGS[@]} == 0 ]]
 jq '.notification="failed"' "$fixture/media_integrity_audit.json" >"$fixture/next";mv "$fixture/next" "$fixture/media_integrity_audit.json"
 FINDINGS=();audit_media_integrity_monitor;[[ ${#FINDINGS[@]} == 1 ]]
 printf 'Initial-schedule grace, missed completion, no duplicate media findings and delivery-failure monitoring passed\n'
+jq --argjson now "$NOW" '.notification="sent"|.schedule={maxGapSeconds:432000}|.lastCompletedScanAt=($now-6*86400)' "$fixture/media_integrity_audit.json" >"$fixture/next";mv "$fixture/next" "$fixture/media_integrity_audit.json"
+FINDINGS=();audit_media_integrity_monitor;[[ ${#FINDINGS[@]} == 1 ]]
+printf 'Twice-weekly schedule receipt applies a five-day completion grace\n'
+jq --argjson now "$NOW" '.lastProgressScanAt=($now-2*86400)' "$fixture/media_integrity_audit.json" >"$fixture/next";mv "$fixture/next" "$fixture/media_integrity_audit.json"
+FINDINGS=();audit_media_integrity_monitor;[[ ${#FINDINGS[@]} == 0 ]]
+printf 'Guarded partial runs count only via saved successful progress, without fake completions\n'

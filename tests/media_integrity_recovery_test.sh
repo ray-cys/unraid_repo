@@ -49,7 +49,7 @@ setup() {
  if [[ "$app" == Radarr ]];then relative=movies/Example/film.mkv;else relative=series/Example/film.mkv;fi
  api_path="/data/$relative";printf original-damaged >"$MEDIA_HOST_ROOT/$relative"
  recovery_file_tool identity "$relative" >"$fixture/identity"
- jq -n --arg path "$relative" --argjson now "$(date +%s)" --slurpfile i "$fixture/identity" '{schema:1,toolset:"fixture",files:{($path):{identity:$i[0],issue:{id:"finding",kind:"decode_error",proofVersion:3,origin:"decode",confirmationMethod:"normal-isolated-streams-v1",streamEvidence:[{primary:true,kind:"decode_error",exit:1}],confirmationKey:"fixture",confirmed:true,confirmedRuns:2,lastSeen:$now,identity:$i[0]}}}}' >"$TMP_DIR/state.json"
+ jq -n --arg path "$relative" --argjson now "$(date +%s)" --slurpfile i "$fixture/identity" '{schema:1,toolset:"fixture",files:{($path):{identity:$i[0],issue:{id:"finding",kind:"decode_error",proofVersion:4,origin:"decode",confirmationMethod:"normal-isolated-streams-v1",streamEvidence:[{primary:true,kind:"decode_error",exit:1}],confirmationKey:"fixture",confirmed:true,confirmedRuns:2,lastSeen:$now,identity:$i[0]}}}}' >"$TMP_DIR/state.json"
 }
 setup Radarr;AUTO_RECOVERY_ENABLED=false;recovery_process;[[ ! -s "$requests" ]]
 AUTO_RECOVERY_ENABLED=true
@@ -77,7 +77,7 @@ for app in Radarr Sonarr;do
  replacement=true;printf healthy-replacement-longer >"$MEDIA_HOST_ROOT/$relative"
  recovery_process;jq -e 'all(.actions[];.status=="verifying")' "$RECOVERY_FILE" >/dev/null
  recovery_file_tool identity "$relative" >"$fixture/new-identity"
- jq --arg path "$relative" --slurpfile i "$fixture/new-identity" --argjson now "$(date +%s)" '.files[$path]={identity:$i[0],verifiedAt:$now,coverage:"all_planned_segments_decoded"}' "$TMP_DIR/state.json" >"$fixture/new";mv "$fixture/new" "$TMP_DIR/state.json"
+ jq --arg path "$relative" --slurpfile i "$fixture/new-identity" --argjson now "$(date +%s)" '.files[$path]={identity:$i[0],verifiedAt:$now,verificationPolicy:2,coverage:"all_planned_segments_decoded"}' "$TMP_DIR/state.json" >"$fixture/new";mv "$fixture/new" "$TMP_DIR/state.json"
  recovery_process;jq -e 'all(.actions[];.status=="recovered" and .replacementVerifiedAt>0 and (.events|length)>0)' "$RECOVERY_FILE" >/dev/null
  [[ $(rg -c '^POST /release' "$requests") == 1 && ! -e "$MEDIA_HOST_ROOT/repair_hold" ]]
 done

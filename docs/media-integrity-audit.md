@@ -6,7 +6,7 @@ container, mount, image, startup setting or application configuration is added.
 
 ## Schedule and scope
 
-Run `30 9 * * 3`: Wednesdays at 09:30 Asia/Singapore, for up to two hours of work.
+Run `30 9 * * 0,3`: Wednesdays and Sundays at 09:30 Asia/Singapore, for up to two hours per invocation.
 The first scheduled run is 25 November 2026. Scope is the existing
 `/mnt/user/media/{movies,series,formula1}` bind at `/data`. Download/quarantine
 folders, the secure library, symlinks, ISO/IMG, standalone audio and subtitles are
@@ -33,7 +33,7 @@ seek indexes, incorrect duration metadata, unsupported codecs, timeouts and empt
 or short decoder output can leave coverage unverified. A decoded range does not
 certify untested ranges. Previously successful unchanged files become due again
 after 180 days to avoid trusting metadata forever. There is no claim that a large
-library can be fully rechecked within 180 days under a two-hour weekly budget.
+library can be fully rechecked within 180 days under two scheduled two-hour runs per week.
 
 Among eligible deep work, new/changed files receive a 60% time share and periodic
 work 40% when both exist. In-progress files are resumed before new cycles. A
@@ -66,7 +66,7 @@ briefly share the operational-state export lock. Appdata backup may stop Bazarr;
 then the last confirmed checkpoint remains and the unfinished range is retried.
 No backup or Docker restart is triggered. Optional Arr recovery is installed but disabled. Its short executor uses the existing backup/metadata gates and audit lock; the long decoder scan never holds the appdata gate.
 
-Backup Health Audit checks the new schedule, overdue weekly completions and failed
+Backup Health Audit checks the new schedule, overdue scheduled completions and failed
 notification delivery, without repeating individual media errors. The ISS vault
 workflow includes the compressed queue in its existing operational-state export.
 
@@ -136,7 +136,7 @@ Do not delete state to hide findings or claim previously unchecked media healthy
 
 ## Arr-native replacement (v2.1.1, disabled by default)
 
-`AUTO_RECOVERY_ENABLED=false` remains installed on Hubble. Observe several weekly
+`AUTO_RECOVERY_ENABLED=false` remains installed on Hubble. Observe several scheduled
 runs before enabling it in the script. No CLI/environment argument overrides
 this switch. The persistent `recovery.json` is installed as an empty
 `{"schema":1,"workflow":"arr-native","actions":{}}` document; missing, invalid,
@@ -184,7 +184,7 @@ Process:
    five-minute Arr monitor. These passes stat/decode only up to four exact
    replacement paths, without walking/pruning the full library queue. Reuse
    checkpoints and low-priority decoder limits, with at most 75 seconds worker
-   time per pass. Normal weekly auditing remains Wednesday 09:30 SGT, two hours.
+   time per pass. Normal auditing runs Wednesday/Sunday 09:30 Singapore time, up to two hours each.
 8. Mark `recovered` only after every exact current replacement passes all planned
    decode ranges. Arr recycles/removes the original using its normal policy;
    this script performs no second delete/move. Native import is not promised
@@ -413,3 +413,61 @@ Counters and explicit last-success tracking begin with v2.5.0. Older runs show
 “not recorded” where the evidence did not exist, rather than inventing historical
 counts or declaring an arbitrary file the last success. Existing saved file
 coverage and offsets remain usable immediately and are not reset.
+
+## Coverage correctness, recovery and capacity (v2.6.0)
+
+- Every decode interval, including short files and final tails, must report
+  positive progress reaching its planned duration. Timing tolerance scales with
+  range length and is capped at 0.5 seconds; there is no ten-second exemption.
+  Stream confirmation uses known per-stream start/duration information where
+  available, so a legitimately shorter additional track is not required to
+  extend across the whole container timeline. Ambiguous short output stays
+  unverified and never independently authorises replacement.
+- Incidents retain the original failed interval. Two clean passes must cover that
+  entire interval; reducing chunks after a timeout cannot resolve a larger failed
+  range with only its first smaller piece. Audit limitations are stored separately
+  in `auditIssue` when a media finding already exists. Successful probes resolve
+  probe-stage limitations without clearing decoder incidents. Native recovery
+  completion additionally requires current duration-proof policy 2.
+- Old decoded prefixes/full-cycle proofs without the new duration policy are
+  queued for verification again. The old values remain in `priorCoverage` for
+  explanation; cached metadata, inventory and native recovery journals are kept.
+  In Hubble’s pre-update state this affects four partial prefixes, not all 9,993
+  cached metadata records. Replacement evidence now uses proof version 4.
+- Notifications show replacement candidates first, then storage errors, then
+  other actionable findings. Quiet first-occurrence transient findings do not
+  consume the display slots. Omitted counts are explicit; previously omitted
+  findings rotate within their priority group on later delivery opportunities.
+  Rotation/progress does not bypass deduplication or cause another email on the
+  second weekly run. New findings, native recovery events and delivery retries
+  retain their existing behaviour; unchanged-issue reminders remain seven days.
+- Checkpoints are bounded and semantically validated before publication, including
+  schema, normalised relative paths, identity shape, finite progress and failed
+  intervals. New data is flushed, and the current valid file is renamed into the
+  previous-checkpoint slot without making another full copy. An invalid current
+  file cannot poison the last valid rollback. Failed publication restores the
+  previous current file; invalid reporting state is never displayed as healthy
+  empty inventory.
+- Three consecutive successful ranges gradually grow a reduced chunk back toward
+  the configured ten-minute cap. Resource failures reset the clean streak. CPU,
+  memory, thread and overall runtime limits do not increase.
+- Decoder signatures remove memory addresses, presentation timestamps, duplicate
+  lines and repeated-message summaries. Stream numbers, diagnostic numbers,
+  offsets and codec details remain significant. File/range/toolchain checks are
+  unchanged, so log formatting alone no longer prevents matching confirmations.
+- Capacity uses up to six real, non-targeted scan samples with
+  at least an hour of configured worker budget. Gracefully limited runs still
+  count at their actual net progress, so workload holds do not inflate the
+  estimated weekly capacity. At least three samples are needed
+  before warning about persistent stalls or a known-duration backlog exceeding
+  the 180-day target. Estimates use net saved coverage progress per observed run,
+  not optimistic synthetic decoder speed. Unknown durations remain explicit, and
+  the estimate is a lower bound for known work, not a full-library completion
+  date. Capacity warnings join existing grouped notifications with stable keys.
+
+The live schedule is Wednesday/Sunday 09:30 Singapore time. Hubble’s Sunday media
+backup starts at 10:00, so the existing workload guard may checkpoint/defer the
+Sunday audit after roughly 30 minutes. No backup schedule or Docker configuration
+is changed. Backup Health Audit uses the receipt’s five-day completion/progress grace for
+this twice-weekly schedule; a guarded Sunday run counts only when it actually
+saves successful probe/range progress, without falsely marking it a completed run; individual media findings and capacity warnings owned by this audit are not duplicated there.

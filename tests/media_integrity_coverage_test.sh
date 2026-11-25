@@ -6,12 +6,12 @@ source "$repo/user_script/media_integrity_audit.sh"
 fixture=$(mktemp -d);trap 'rm -rf "$fixture"' EXIT
 TMP_DIR="$fixture";now=$(date +%s)
 jq -n --argjson now "$now" '{schema:1,files:{
- "movies/Done/a.mkv":{verifiedAt:$now,coverage:"all_planned_segments_decoded",lastAttemptAt:$now},
+ "movies/Done/a.mkv":{verifiedAt:$now,verificationPolicy:2,coverage:"all_planned_segments_decoded",lastAttemptAt:$now},
  "movies/Partial/a.mkv":{offset:600,probeAt:$now,lastAttemptAt:$now},
  "movies/Probe/a.mkv":{probeAt:$now,lastAttemptAt:$now},
  "series/Pending/Season 01/a.mkv":{},
  "series/Blocked/Season 01/a.mkv":{lastAttemptAt:$now,notBefore:($now+3600),issue:{kind:"read_error"}},
- "formula1/Old/a.mkv":{verifiedAt:($now-200*86400),coverage:"all_planned_segments_decoded",lastAttemptAt:($now-200*86400)}
+ "formula1/Old/a.mkv":{verifiedAt:($now-200*86400),verificationPolicy:2,coverage:"all_planned_segments_decoded",lastAttemptAt:($now-200*86400)}
  },lastActivity:{attempt:{path:"series/Blocked/Season 01/a.mkv",epoch:$now,kind:"read_error",nextOffset:0},success:{path:"movies/Partial/a.mkv",epoch:$now,kind:"decode_range_passed",nextOffset:600,duration:7200}}}' >"$TMP_DIR/state.json"
 jq -n --argjson now "$now" '{startedAt:$now,mode:"scan",uniqueFilesAttempted:3,uniqueFilesOpened:2,uniqueMetadataPassed:1,uniqueFilesDecoded:1,uniqueFilesPartiallyDecoded:1,uniqueFilesCompleted:0,inventoryByLibrary:{movies:{status:"complete",files:3},series:{status:"partial",files:2},formula1:{status:"not_started",files:0}}}' >"$TMP_DIR/stats.json"
 coverage_summary

@@ -55,7 +55,7 @@ write_report OK 'Recovered worker'
 # Findings and recovery failures must contain useful actions/evidence, while
 # changed progress alone must not resend the same incident.
 RECOVERY_FILE="$STATE_DIR/recovery.json"
-jq '.files["series/Example/episode.mkv"]={identity:["1","2","3","4","5"],issue:{id:"finding",kind:"decode_error",proofVersion:3,origin:"decode",confirmationMethod:"normal-isolated-streams-v1",streamEvidence:[{primary:true,kind:"decode_error",exit:1}],confirmationKey:"fixture",confirmed:true,confirmedRuns:2,evidence:"Invalid NAL unit",offset:600}}' "$TMP_DIR/state.json" >"$fixture/new-state"
+jq '.files["series/Example/episode.mkv"]={identity:["1","2","3","4","5"],issue:{id:"finding",kind:"decode_error",proofVersion:4,origin:"decode",confirmationMethod:"normal-isolated-streams-v1",streamEvidence:[{primary:true,kind:"decode_error",exit:1}],confirmationKey:"fixture",confirmed:true,confirmedRuns:2,evidence:"Invalid NAL unit",offset:600}}' "$TMP_DIR/state.json" >"$fixture/new-state"
 gzip -c "$fixture/new-state" >"$STATE_FILE"
 jq -n --argjson now "$(date +%s)" '{schema:1,workflow:"arr-native",actions:{("a"*64):{app:"Sonarr",parentId:20,fileId:31,targets:[32],path:"series/Example/episode.mkv",identity:["1","2","3","4","5"],events:[],status:"review",startedAt:$now,updatedAt:$now,reason:"Search response unavailable; no retry"}}}' >"$RECOVERY_FILE"
 write_report WARNING 'Recovery needs review'
@@ -109,7 +109,7 @@ write_report WARNING 'Persistent audit problem; no replacement authorised'
 jq -e '.notification=="sent" and .replacementCandidates==0 and (.body|contains("audit/review findings=1"))' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
 printf 'Initial transient findings remain quiet; persistent audit problems notify without replacement candidates\n'
 # Replacement counts and wording use the same primary-proof requirement.
-gzip -dc "$STATE_FILE" | jq '.files["movies/transient.mkv"] |= (. as $f | .issue={id:"primary",kind:"decode_error",identity:$f.identity,proofVersion:3,origin:"decode",confirmationMethod:"normal-isolated-streams-v1",confirmationKey:"fixture",confirmed:true,confirmedRuns:2,streamEvidence:[{index:0,type:"video",codec:"h264",primary:true,kind:"decode_error",exit:1,complete:false}]})' | gzip -c >"$fixture/primary.gz";mv "$fixture/primary.gz" "$STATE_FILE"
+gzip -dc "$STATE_FILE" | jq '.files["movies/transient.mkv"] |= (. as $f | .issue={id:"primary",kind:"decode_error",identity:$f.identity,proofVersion:4,origin:"decode",confirmationMethod:"normal-isolated-streams-v1",confirmationKey:"fixture",confirmed:true,confirmedRuns:2,streamEvidence:[{index:0,type:"video",codec:"h264",primary:true,kind:"decode_error",exit:1,complete:false}]})' | gzip -c >"$fixture/primary.gz";mv "$fixture/primary.gz" "$STATE_FILE"
 write_report WARNING 'Confirmed primary failure fixture'
 jq -e '.replacementCandidates==1 and (.body|contains("Primary-stream decode failure")) and (.body|contains("#0 video (h264; primary)"))' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
 gzip -dc "$STATE_FILE" | jq '.files[].issue.streamEvidence[].primary=false' | gzip -c >"$fixture/aux.gz";mv "$fixture/aux.gz" "$STATE_FILE"
@@ -122,3 +122,23 @@ gzip -dc "$STATE_FILE" | jq '.lastActivity.attempt={path:"movies/Example.mkv",ep
 write_report WARNING 'Same finding; more progress'
 [[ $(wc -l <"$fixture/calls") == "$old_calls" ]]
 jq -e '.progress.run.uniqueFilesAttempted==42 and (.body|contains("Last attempted file: movies/Example.mkv")) and .notification=="suppressed"' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
+# Quiet transient rows cannot hide a primary failure beyond the display limit.
+jq -n --argjson now "$(date +%s)" '{schema:1,files:((reduce range(0;12) as $i ({}; .["movies/Quiet\($i)/file.mkv"]={identity:["1","2","3","4","5"],issue:{id:("quiet"+($i|tostring)),kind:"unverified_timeout",confirmed:false,confirmedRuns:0,alertable:false,firstSeen:1,evidence:"timeout"}})) + {"movies/Critical/file.mkv":{identity:["1","2","3","4","5"],issue:{id:"priority",kind:"decode_error",identity:["1","2","3","4","5"],proofVersion:4,origin:"decode",confirmationMethod:"normal-isolated-streams-v1",confirmationKey:"fixture",confirmed:true,confirmedRuns:2,firstSeen:$now,streamEvidence:[{index:0,type:"video",codec:"h264",primary:true,kind:"decode_error",exit:1,complete:false}],evidence:"Invalid NAL"}}})}' | gzip -c >"$STATE_FILE"
+write_report WARNING 'Priority ordering fixture'
+jq -e '.activeFindings==13 and .actionableFindings==1 and .displayedFindingIds==["priority"] and (.body|contains("- movies/Critical/file.mkv")) and (.body|contains("Quiet transient findings=12"))' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
+# Preserve the primary incident while exposing its separate audit limitation.
+gzip -dc "$STATE_FILE" | jq '.files["movies/Critical/file.mkv"].auditIssue={id:"separate-audit",kind:"read_error",evidence:"EIO",confirmed:false,confirmedRuns:0}' | gzip -c >"$fixture/separate.gz";mv "$fixture/separate.gz" "$STATE_FILE"
+write_report WARNING 'Separate media and storage evidence fixture'
+jq -e '.activeFindings==14 and .replacementCandidates==1 and (.displayedFindingIds|index("priority"))!=null and (.displayedFindingIds|index("separate-audit"))!=null' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
+# Omitted rows rotate only on later existing delivery opportunities.
+jq -n '{schema:1,files:(reduce range(0;12) as $i ({}; .["movies/Action\($i)/file.mkv"]={identity:["1","2","3","4","5"],issue:{id:("action"+($i|tostring)),kind:"read_error",evidence:"EIO",confirmed:false,confirmedRuns:0,firstSeen:1}}))}' | gzip -c >"$STATE_FILE"
+write_report WARNING 'More findings than notification slots'
+jq -e '(.displayedFindingIds|length)==8 and (.body|contains("4 omitted"))' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
+jq '.displayedFindingIds' "$STATUS_DIR/media_integrity_audit.json" >"$fixture/shown-first"
+old_calls=$(wc -l <"$fixture/calls")
+write_report WARNING 'Same findings second scheduled run'
+[[ $(wc -l <"$fixture/calls") == "$old_calls" ]]
+jq '.sentAt=0' "$STATE_DIR/notified.json" >"$fixture/receipt";mv "$fixture/receipt" "$STATE_DIR/notified.json"
+write_report WARNING 'Weekly reminder opportunity'
+jq -e --slurpfile first "$fixture/shown-first" '[.displayedFindingIds[]|select(. as $id|($first[0]|index($id))==null)]|length==4' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
+printf 'Priority incidents remain visible; separate audit evidence and weekly-only omitted-row rotation passed\n'

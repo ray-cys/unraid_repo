@@ -3,7 +3,7 @@
 clearLog=true
 arrayStarted=true
 ###############################################################################
-# Media Integrity Audit v2.5.0 -- personal Unraid User Script
+# Media Integrity Audit v2.6.0 -- personal Unraid User Script
 #
 # PURPOSE / USE CASE
 # ------------------
@@ -20,7 +20,7 @@ arrayStarted=true
 # receive a bounded stream/container probe, with up to 25% of the run (30 minutes)
 # front-loaded for broad new-file coverage before expensive decoding. Deep work decodes every selected
 # video and audio stream in successive, overlapping ten-minute media ranges;
-# save the next range so long files resume on a later weekly run. This is full
+# save the next range so long files resume on a later scheduled run. This is full
 # planned-range coverage, NOT a single linear read, checksum baseline, subtitle
 # check, visual-quality test, or proof that every Plex client plays the file.
 # Size/mtime/ctime/inode changes invalidate progress. Unchanged successful files
@@ -30,7 +30,7 @@ arrayStarted=true
 #
 # BOUNDS / COORDINATION
 # ---------------------
-# Wednesday 09:30 Singapore time (30 9 * * 3); at most two hours per invocation.
+# Wednesday and Sunday 09:30 Singapore time (30 9 * * 0,3); at most two hours per invocation.
 # Use two video decoder threads, one audio/filter thread, nice 15, idle-class I/O
 # and a 2 GiB per-decoder virtual-address-space limit. This is not a container RAM
 # limit. Slow ranges shrink after timeout; timeouts/resource limits are unverified,
@@ -64,7 +64,7 @@ arrayStarted=true
 # profile changes, blocklisting, forced import or script-managed bin handoff.
 # Arr owns normal replacement and recycling. Exact download history/import/file
 # identity plus complete planned-range decoding are required before RECOVERED.
-# Existing monitor runs bounded priority verification between weekly scans; only
+# Existing monitor runs bounded priority verification between scheduled scans; only
 # new grabs use 00/04/08/12/16/20:00-09 SGT windows. Same audit/backup/metadata
 # locks and exact-target ownership protect complementary script automation.
 # Replacement-required/blocked/completed events are grouped and delivery-tracked.
@@ -196,7 +196,7 @@ umask 077
 # stay unverified. Completed ranges prove decoder acceptance, not perfect visual
 # playback. Legacy probe-only incidents are re-evaluated without replacing media.
 # Worker transport failures preserve the last checkpoint and never accuse media.
-readonly SCRIPT_VERSION="2.5.0"
+readonly SCRIPT_VERSION="2.6.0"
 BAZARR_CONTAINER="bazarr"
 MEDIA_HOST_ROOT="/mnt/user/media"
 MEDIA_CONTAINER_ROOT="/data"
@@ -367,7 +367,9 @@ load_state() {
         [[ "$file" != "$PREVIOUS_STATE_FILE" && -f "$PREVIOUS_STATE_FILE" ]] && unpack_state "$PREVIOUS_STATE_FILE" || return 1
         file="$PREVIOUS_STATE_FILE";RECOVERY_NOTE='Current state invalid; resumed previous validated checkpoint; recent work may repeat'
     fi
-    cp -- "$file" "$PREVIOUS_STATE_FILE.new" 2>/dev/null && gzip -t "$PREVIOUS_STATE_FILE.new" 2>/dev/null && mv -f "$PREVIOUS_STATE_FILE.new" "$PREVIOUS_STATE_FILE" || true
+    # The publisher rotates the immediately preceding validated checkpoint.
+    # Loading state does not rewrite that rollback copy.
+    return 0
 }
 
 unpack_state() {
@@ -376,10 +378,16 @@ unpack_state() {
     if ! timeout 15 gzip -dc -- "$file" 2>/dev/null | head -c "$((MAX_STATE_BYTES+1))" >"$TMP_DIR/state.json"; then return 1; fi
     bytes=$(stat -c %s "$TMP_DIR/state.json")
     (( bytes<=MAX_STATE_BYTES )) && jq -e '
-      .schema==1 and (.files|type)=="object" and
+      .schema==1 and (.files|type)=="object" and (.files|length)<=200000 and
+      (.hostRoot==null or ((.hostRoot|type)=="string" and (.hostRoot|startswith("/")))) and
       all(.files|to_entries[];
-        (.key|type)=="string" and (.key|test("(^/|(^|/)\\.\\.?(/|$))")|not) and
+        (.key|type)=="string" and (.key|contains("/")) and (.key|test("//|/$|^$")|not) and (.key|test("(^/|(^|/)\\.\\.?(/|$))")|not) and
         (.value|type)=="object" and (.value.identity|type)=="array" and (.value.identity|length)==5 and
+        all(.value.identity[];type=="string" or type=="number") and
+        all(.value|to_entries[]|select(.key=="offset" or .key=="probeAt" or .key=="verifiedAt" or .key=="notBefore" or .key=="chunkSeconds" or .key=="duration");(.value|type)=="number" and .value>=0 and (.value|isfinite)) and
+        (.value.duration==null or (.value.duration>0 and .value.duration<=604800 and (.value.offset // 0)<=.value.duration+0.05)) and
+        all([.value.issue,.value.auditIssue][]; .==null or ((.id|type)=="string" and (.kind|type)=="string" and
+          (.failedRange==null or ((.failedRange.start|type)=="number" and (.failedRange.end|type)=="number" and .failedRange.start>=0 and .failedRange.end>.failedRange.start and .failedRange.end<=604800 and (.failedRange.start|isfinite) and (.failedRange.end|isfinite))))) and
         (.value.issue==null or ((.value.issue|type)=="object" and (.value.issue.id|type)=="string" and (.value.issue.kind|type)=="string")))
       ' "$TMP_DIR/state.json" >/dev/null
 }
@@ -395,12 +403,33 @@ commit_checkpoint() {
     local payload="$1" stats="$2" temp fd
     temp=$(mktemp "$STATE_DIR/.state.XXXXXX") || return 1
     if ! base64 -d "$payload" >"$temp" || ! gzip -t "$temp"; then rm -f "$temp";return 1;fi
+    # Validate bounded decompressed JSON before touching either durable copy.
+    local validation
+    validation=$(mktemp -d /tmp/media-integrity-checkpoint.XXXXXX) || { rm -f "$temp";return 1; }
+    if ! ( TMP_DIR="$validation";unpack_state "$temp" ) || ! jq -e 'type=="object"' "$stats" >/dev/null; then
+        rm -rf "$validation";rm -f "$temp";return 1
+    fi
+    local old_valid=false
+    if [[ -f "$STATE_FILE" ]] && ( TMP_DIR="$validation";unpack_state "$STATE_FILE" );then old_valid=true;fi
+    rm -rf "$validation"
+    if ! timeout 10 sync -f "$temp";then rm -f "$temp";return 1;fi
     exec {fd}>"$STATE_EXPORT_LOCK" || { rm -f "$temp";return 1; }
     if ! flock -s -w 5 "$fd"; then exec {fd}>&-;rm -f "$temp";return 75;fi
-    mv -f "$temp" "$STATE_FILE";local rc=$?
+    if [[ -L "$STATE_FILE" || -L "$PREVIOUS_STATE_FILE" ]];then exec {fd}>&-;rm -f "$temp";return 1;fi
+    # Rename the immutable previous current file rather than writing a second
+    # copy of the whole queue. If publication is interrupted, load_state resumes
+    # the previous validated file; export readers are excluded by their lock.
+    if [[ "$old_valid" == true ]] && ! mv -f "$STATE_FILE" "$PREVIOUS_STATE_FILE";then exec {fd}>&-;rm -f "$temp";return 1;fi
+    local rc=0
+    if ! mv -f "$temp" "$STATE_FILE";then
+        [[ ! -f "$PREVIOUS_STATE_FILE" ]] || mv -f "$PREVIOUS_STATE_FILE" "$STATE_FILE"
+        rm -f "$temp";rc=1
+    fi
     exec {fd}>&-
+    ((rc==0)) || return "$rc"
+    timeout 10 sync -f "$STATE_FILE" || return 1
     cp "$stats" "$TMP_DIR/stats.json"
-    return "$rc"
+
 }
 
 integrity_notify() {
@@ -437,17 +466,17 @@ coverage_summary() {
           .workRemaining+=(if $r.bucket!="verified" or $r.periodicDue then 1 else 0 end)) |
         .awaitingVerification=(.total-.verified);
       [$state[0].files|to_entries[]|.key as $path|.value as $f|
-        (($f.verifiedAt // 0)>0 and $f.coverage=="all_planned_segments_decoded" and $f.issue==null and ($f.replacementPending // false)==false) as $verified |
+        (($f.verifiedAt // 0)>0 and $f.coverage=="all_planned_segments_decoded" and $f.verificationPolicy==2 and $f.issue==null and $f.auditIssue==null and ($f.replacementPending // false)==false) as $verified |
         {path:$path,library:($path|split("/")[0]),directory:($path|split("/")|.[0:-1]|join("/")),
          bucket:(if $verified then "verified" elif ($f.offset // 0)>0 then "partial" elif ($f.probeAt // 0)>0 then "metadataOnly" elif ($f.lastAttemptAt // 0)>0 or ($f.verifiedAt // 0)>0 or ($f.previousVerifiedAt // 0)>0 then "attemptedUnverified" else "untouched" end),
-         deferred:(($f.notBefore // 0)>$now),blocked:($f.issue!=null),lastAttemptAt:($f.lastAttemptAt // 0),
+         deferred:(($f.notBefore // 0)>$now),blocked:($f.issue!=null or $f.auditIssue!=null),lastAttemptAt:($f.lastAttemptAt // 0),
          periodicDue:($f.cycleLane=="old" or (($f.verifiedAt // 0)>0 and $now-$f.verifiedAt>=$days*86400))}] as $rows |
       ($rows|tally) as $overall |
       [$libraries[] as $library | {name:$library,counts:([$rows[]|select(.library==$library)]|tally),
         inventory:($stats[0].inventoryByLibrary[$library] // {status:(if $stats[0].inventoryComplete==true then "complete" else "not_recorded" end),files:null})}] as $byLibrary |
       [$rows|group_by(.directory)[]|{path:.[0].directory,counts:(tally),lastAttemptAt:(map(.lastAttemptAt)|max)}|
         .status=(if .counts.verified==.counts.total and .counts.periodicDue==0 then "complete" elif .counts.untouched==.counts.total then "untouched" else "in_progress" end)] as $folders |
-      {schema:1,mediaRoot:($state[0].hostRoot // $root),overall:$overall,libraries:$byLibrary,lastActivity:($state[0].lastActivity // {}),
+      {schema:1,capacity:($state[0].capacity // {status:"collecting",samples:0,unknownDurations:null,attention:false}),mediaRoot:($state[0].hostRoot // $root),overall:$overall,libraries:$byLibrary,lastActivity:($state[0].lastActivity // {}),
        run:{startedAt:($stats[0].startedAt // null),finishedAt:($stats[0].finishedAt // null),mode:($stats[0].mode // "not_recorded"),
         uniqueFilesAttempted:($stats[0].uniqueFilesAttempted // null),uniqueFilesOpened:($stats[0].uniqueFilesOpened // null),uniqueMetadataPassed:($stats[0].uniqueMetadataPassed // null),
         uniqueFilesDecoded:($stats[0].uniqueFilesDecoded // null),uniqueFilesPartiallyDecoded:($stats[0].uniqueFilesPartiallyDecoded // null),uniqueFilesCompleted:($stats[0].uniqueFilesCompleted // null)},
@@ -472,6 +501,8 @@ coverage_summary() {
         "; with passed decode ranges="+(.run.uniqueFilesDecoded|shown)+"; partially decoded="+(.run.uniqueFilesPartiallyDecoded|shown)+"; fully verified="+(.run.uniqueFilesCompleted|shown),
         "Overall files: "+(.overall|counts_line),
         "Deferred, blocked and periodic-due counts overlap coverage categories. Work remaining counts each file once.",
+        "Measured capacity: "+.capacity.status+"; representative runs="+(.capacity.samples|tostring)+"/3 minimum; schedule=Wednesday/Sunday 09:30 Singapore; two hours per run.",
+        "Known-duration backlog estimate: "+(if .capacity.knownBacklogDaysLowerBound!=null then ((.capacity.knownBacklogDaysLowerBound|ceil)|tostring)+" days or more at measured net progress" else "not yet available" end)+"; pending files with unknown duration="+(.capacity.unknownDurations|shown)+". This is not a full-library completion promise.",
         "Per-library saved coverage:"]+
         [.libraries[]|"- "+.name+": inventory="+(.inventory.status|gsub("_";" "))+"; "+(.counts|counts_line)]+
         [activity_line("Last attempted file";.lastActivity.attempt),activity_line("Last successful check";.lastActivity.success),activity_line("Last passed decode";.lastActivity.decoded),
@@ -484,7 +515,10 @@ coverage_summary() {
 render_report() {
     local status="$1" reason="$2" now temp body importance=normal previous="" last=0 signature attention=false sent=0
     now=$(date +%s)
-    [[ ! -f "$STATE_FILE" ]] || unpack_state "$STATE_FILE" || true
+    if [[ -f "$STATE_FILE" ]] && ! unpack_state "$STATE_FILE";then
+        status=FAILED;reason='Current checkpoint invalid; prior validated evidence retained; no healthy result inferred'
+        unpack_state "$PREVIOUS_STATE_FILE" || printf '{"schema":1,"files":{}}' >"$TMP_DIR/state.json"
+    fi
     jq -e '.schema==1 and (.files|type)=="object"' "$TMP_DIR/state.json" >/dev/null 2>&1 || printf '{"schema":1,"files":{}}' >"$TMP_DIR/state.json"
     [[ -f "$TMP_DIR/stats.json" ]] || printf '{}' >"$TMP_DIR/stats.json"
     if recovery_valid;then cp "$RECOVERY_FILE" "$TMP_DIR/recovery-report.json";else printf '{"schema":1,"workflow":"arr-native","actions":{}}' >"$TMP_DIR/recovery-report.json";fi
@@ -495,13 +529,17 @@ render_report() {
       --argjson enabled "$AUTO_RECOVERY_ENABLED" --argjson now "$now" --argjson max "$NOTIFY_MAX_ITEMS" --arg status "$status" --arg reason "$reason" --arg mode "$MODE" --arg note "$RECOVERY_NOTE" '
       def replacement_candidate:
         .value as $f | $f.issue as $i |
-        $i.kind=="decode_error" and $i.proofVersion==3 and $i.origin=="decode" and
+        (.issueSlot // "issue")!="auditIssue" and $i.kind=="decode_error" and $i.proofVersion==4 and $i.origin=="decode" and
         $i.confirmationMethod=="normal-isolated-streams-v1" and $i.confirmed==true and
         ($i.confirmedRuns // 0)>=2 and $i.identity==$f.identity and ($i.confirmationKey|type)=="string" and
         any($i.streamEvidence[]?; .primary==true and .kind=="decode_error" and .exit>0);
-      [$state[0].files|to_entries[]|select(.value.issue!=null)] as $issues |
+      [$state[0].files|to_entries[]|. as $file|["issue","auditIssue"][] as $slot|select($file.value[$slot]!=null)|
+        $file+{issueSlot:$slot,value:($file.value+{issue:$file.value[$slot]})}] as $rawIssues |
+      ($rawIssues|map(.notificationPriority=(if replacement_candidate then 0 elif .value.issue.kind=="read_error" then 1 elif .value.issue.alertable!=false then 2 else 3 end))|sort_by(.notificationPriority,(if (.value.issue.id as $id|($receipt[0].displayedFindingIds // []|index($id))==null) then 0 else 1 end),(.value.issue.firstSeen // 0),.key)) as $issues |
       [$issues[]|select(replacement_candidate)] as $candidates |
       [$issues[]|select(.value.issue.alertable!=false)] as $actionable |
+      ([$actionable|group_by(.notificationPriority)[]|.[0]]|.[0:$max]) as $reserved |
+      (($reserved+[$actionable[]|select(.value.issue.id as $id|([$reserved[].value.issue.id]|index($id))==null)])|.[0:$max]|sort_by(.notificationPriority,.key)) as $displayed |
       [$state[0].resolved[]?|select((.resolution // "")|startswith("Legacy probe-only"))|
         .notice=("reclassified:"+.id+":"+(.resolvedAt|tostring))|
         select(.notice as $k|($receipt[0].recoveryEvents // []|index($k))==null)] as $reclassified |
@@ -510,15 +548,15 @@ render_report() {
         (.value.status=="verifying" and $now>=(.value.verificationAttentionAt // ((.value.importedAt // .value.startedAt)+86400))))|
         select(.notice as $k|($receipt[0].recoveryEvents // []|index($k))==null)] as $notices |
       [$jobs[]|select(.value.status=="required" or .value.status=="blocked" or .value.status=="review" or .value.status=="retry_wait" or (.value.status=="verifying" and $now>=(.value.verificationAttentionAt // ((.value.importedAt // .value.startedAt)+86400))))] as $attention |
-      (if $status=="FAILED" then "FAILED" elif ($issues|length)>0 or ($attention|length)>0 or $note!="" then "WARNING" else $status end) as $effective |
+      (if $status=="FAILED" then "FAILED" elif ($issues|length)>0 or ($attention|length)>0 or $note!="" or $progress[0].capacity.attention==true then "WARNING" else $status end) as $effective |
       {schema:1,name:"media_integrity_audit",progress:($progress[0]|del(.body)),status:$effective,epoch:$now,mode:$mode,recoveryEnabled:$enabled,stats:$stats[0],
        coverage:{knownFiles:$progress[0].overall.total,fullyVerified:$progress[0].overall.verified,
         pendingVerification:$progress[0].overall.awaitingVerification,
         oldestPendingObservedAt:([$state[0].files[]|select((.verifiedAt // 0)==0)|.observedAt // empty]|min),
         pendingAgeUnknown:([$state[0].files[]|select((.verifiedAt // 0)==0 and (.observedAt // 0)==0)]|length)},
-       auditAttention:($note!="" or ($stats[0].inventoryErrors // 0)>0 or ($stats[0].inventoryComplete==false and ($stats[0].targeted // false)!=true)),recoveryActions:($jobs|length),recoveryAttention:($attention|length),replacementCandidates:($candidates|length),activeFindings:($issues|length),actionableFindings:($actionable|length),recoveries:([$jobs[]|select(.value.status=="recovered")]|length),
-       findingKeys:[$actionable[]|.value.issue.id+":"+.value.issue.kind+":"+(.value.issue.confirmed|tostring)+":"+((.value.issue.confirmedRuns // 0)>=2|tostring)],
-       recoveryAttentionKeys:[$attention[].notice],noticeKeys:([$notices[:$max][].notice]+[$reclassified[:$max][].notice]),
+       auditAttention:($progress[0].capacity.attention==true or $note!="" or ($stats[0].inventoryErrors // 0)>0 or ($stats[0].inventoryComplete==false and ($stats[0].targeted // false)!=true)),recoveryActions:($jobs|length),recoveryAttention:($attention|length),replacementCandidates:($candidates|length),activeFindings:($issues|length),actionableFindings:($actionable|length),recoveries:([$jobs[]|select(.value.status=="recovered")]|length),
+       findingKeys:[$actionable|sort_by(.value.issue.id)[]|.value.issue.id+":"+.value.issue.kind+":"+(.value.issue.confirmed|tostring)+":"+((.value.issue.confirmedRuns // 0)>=2|tostring)],
+       recoveryAttentionKeys:[$attention[].notice],displayedFindingIds:[$displayed[].value.issue.id],noticeKeys:([$notices[:$max][].notice]+[$reclassified[:$max][].notice]),
        summary:("Media integrity: "+$effective+"; findings="+($issues|length|tostring)+"; replacement candidates="+($candidates|length|tostring)+"; replacement updates="+($notices|length|tostring)),
        body:(["Media integrity audit: "+$effective,"Automatic replacement: "+(if $enabled then "ENABLED" else "DISABLED; original files remain unchanged" end),
         "Run: "+$mode+"; "+$reason,"Finding categories: replacement candidates="+($candidates|length|tostring)+"; audit/review findings="+(($issues|length)-($candidates|length)|tostring),"Checks passed: quick="+(($stats[0].quickPassed // 0)|tostring)+"; ranges="+(($stats[0].segmentsPassed // 0)|tostring)+"; full planned-range cycles="+(($stats[0].cyclesCompleted // 0)|tostring),
@@ -534,22 +572,22 @@ render_report() {
         "\n  Last API diagnostic: "+((.value.lastError // {})|tostring)+"\n  Recent transitions: "+((.value.events[-5:] // []|map(.status+": "+.reason))|join("; "))]+
        ["", "Evidence reclassifications (media unchanged):"]+
        [$reclassified[:$max][]|"- "+.path+"\n  Finding ID: "+.id+"\n  Action: "+.resolution]+
-       ["", "Current findings (media defects and audit limitations):"]+
-       [$issues[:$max][]|"- "+.key+" | "+.value.issue.kind+"\n  Finding ID: "+.value.issue.id+"; separate confirming runs: "+((.value.issue.confirmedRuns // 0)|tostring)+
+       ["", "Current actionable findings (replacement/storage issues first):", "Showing "+([$displayed[]]|length|tostring)+" of "+($actionable|length|tostring)+" actionable findings; "+((($actionable|length)-$max)|if .>0 then tostring else "0" end)+" omitted. Quiet transient findings="+(($issues|length)-($actionable|length)|tostring)+"; all remain in saved state."]+
+       [$displayed[]|"- "+.key+" | "+.value.issue.kind+"\n  Finding ID: "+.value.issue.id+"; separate confirming runs: "+((.value.issue.confirmedRuns // 0)|tostring)+
         "\n  Stream checks: "+((.value.issue.streamEvidence // []|map("#"+((.index // "unknown")|tostring)+" "+(.type // "stream")+" ("+(.codec // "unknown codec")+"; "+(if .primary then "primary" else "additional" end)+"): "+.kind+"; exit="+(.exit|tostring)+"; range="+(if .complete then "completed" else "not completed" end)))|join("; "))+"\n  Evidence: "+((.value.issue.evidence // "")|.[0:650])+"\n  Next action: "+
         (if replacement_candidate then "Primary-stream decode failure confirmed by strict and normal checks in two independent runs. Replacement eligible only after exact Arr safety checks. "+(if $enabled then "Exact-rule selection is bounded; see job outcome." else "Recovery disabled; review evidence before enabling automation." end)
          elif .value.issue.kind=="recoverable_media_defect" then "Strict check failed but normal stream checks completed. Possible recoverable defect; review required, no automatic replacement." elif .value.issue.kind=="auxiliary_track_error" then "Failure is confined to an additional track. Main selected streams were checked separately; no automatic replacement." elif .value.issue.kind=="decode_error" then "Suspected decode failure; another independent matching observation is required. No replacement authorized." elif .value.issue.kind=="read_error" then "Storage read failed. Check the array, drive or mount before retrying; downloading another copy is not authorized." elif .value.issue.alertable==false then "Transient audit limitation; one bounded retry was allowed and future verification is pending. No replacement authorized; email is suppressed unless persistent." else "Audit could not verify this range. Review access, container, tool or resource evidence; no replacement authorized." end)]+
        ["", "Full verification requires all planned decode ranges; a download/import event alone does not prove integrity. Native bin retention continues independently. Verification alerts before the observed native retention expires (or after 24 hours when no deadline applies); no rollback is guaranteed. --recovery-status includes bounded transition history."]|join("\n"))}' >"$temp" || return 1
     body=$(jq -r .body "$temp"|head -c 23000|iconv -f UTF-8 -t UTF-8 -c || true)
     printf '%s\n' "$body" >"$STATE_DIR/latest-report.txt.new" && mv "$STATE_DIR/latest-report.txt.new" "$STATE_DIR/latest-report.txt" || return 1
-    signature=$(jq -c '{status,findingKeys,recoveryAttentionKeys,note:$note,reason:$reason}' --arg note "$RECOVERY_NOTE" --arg reason "$( [[ "$status" != FAILED ]] || printf '%s' "$reason" )" "$temp"|sha256sum|awk '{print $1}')
+    signature=$(jq -c '{status,findingKeys,recoveryAttentionKeys,capacityKey:.progress.capacity.status,note:$note,reason:$reason}' --arg note "$RECOVERY_NOTE" --arg reason "$( [[ "$status" != FAILED ]] || printf '%s' "$reason" )" "$temp"|sha256sum|awk '{print $1}')
     previous=$(jq -r '.signature // ""' "$TMP_DIR/delivery.json");last=$(jq -r '.sentAt // 0' "$TMP_DIR/delivery.json")
     jq -e '.auditAttention==true or .actionableFindings>0 or .recoveryAttention>0 or .status=="FAILED" or (.status=="WARNING" and .activeFindings==0)'  "$temp" >/dev/null && attention=true
     if [[ "$MODE" != inventory ]] && { jq -e '.noticeKeys|length>0' "$temp" >/dev/null || [[ "$attention" == true && ( "$signature" != "$previous" || $((now-last)) -ge NOTIFICATION_REMINDER_SECONDS ) ]]; };then
         [[ "$attention" != true ]] || importance=warning;[[ "$status" != FAILED ]] || importance=alert
         jq -n --arg body "$body" --arg signature "$signature" --argjson epoch "$now" '{schema:1,body:$body,signature:$signature,epoch:$epoch}' >"$STATE_DIR/pending-notification.json.new" && mv "$STATE_DIR/pending-notification.json.new" "$STATE_DIR/pending-notification.json" || return 1
         if [[ -x "$NOTIFY_BIN" ]] && integrity_notify timeout 30 "$NOTIFY_BIN" -i "$importance" -s 'Media Integrity Audit' -d "$(jq -r .summary "$temp")" -m "$body";then
-            jq --arg signature "$signature" --argjson sentAt "$now" --slurpfile report "$temp" '.signature=$signature | .sentAt=$sentAt | .recoveryEvents=((.recoveryEvents // [])+$report[0].noticeKeys|unique|.[-512:])' "$TMP_DIR/delivery.json" >"$STATE_DIR/notified.json.new" && mv "$STATE_DIR/notified.json.new" "$STATE_DIR/notified.json" || return 1
+            jq --arg signature "$signature" --argjson sentAt "$now" --slurpfile report "$temp" '.signature=$signature | .sentAt=$sentAt | .recoveryEvents=((.recoveryEvents // [])+$report[0].noticeKeys|unique|.[-512:]) | .displayedFindingIds=$report[0].displayedFindingIds' "$TMP_DIR/delivery.json" >"$STATE_DIR/notified.json.new" && mv "$STATE_DIR/notified.json.new" "$STATE_DIR/notified.json" || return 1
             rm -f "$STATE_DIR/pending-notification.json";sent=1
         else log WARNING 'Grouped integrity notification failed; delivery remains pending';fi
     elif [[ "$attention" == false ]];then rm -f "$STATE_DIR/pending-notification.json";fi
@@ -559,6 +597,9 @@ render_report() {
         completed=$(jq -r '.lastCompletedScanAt // 0' "$STATUS_DIR/media_integrity_audit.json");installed=$(jq -r '.installedAt // .epoch' "$STATUS_DIR/media_integrity_audit.json");first=$(jq -r '.firstScheduledAt // .epoch' "$STATUS_DIR/media_integrity_audit.json")
     fi
     if [[ "$MODE" == scan && "$WORKER_FINISHED" == true && "$status" != FAILED && "$status" != DEFERRED ]] && jq -e '.inventoryComplete==true' "$TMP_DIR/stats.json" >/dev/null;then completed="$now";fi
+    local progress_completed=0
+    [[ ! -f "$STATUS_DIR/media_integrity_audit.json" ]] || progress_completed=$(jq -r '.lastProgressScanAt // 0' "$STATUS_DIR/media_integrity_audit.json")
+    if [[ "$MODE" == scan && "$WORKER_FINISHED" == true && "$status" != FAILED ]] && jq -e '.inventoryComplete==true and ((.segmentsPassed // 0)>0 or (.quickPassed // 0)>0)' "$TMP_DIR/stats.json" >/dev/null;then progress_completed="$now";fi
     local stalled=0
     [[ ! -f "$STATUS_DIR/media_integrity_audit.json" ]] || stalled=$(jq -r '.stalledCompletedRuns // 0' "$STATUS_DIR/media_integrity_audit.json")
     if [[ "$MODE" == scan && "$WORKER_FINISHED" == true && "$status" != DEFERRED && "$status" != FAILED ]];then
@@ -566,7 +607,7 @@ render_report() {
     fi
     jq --argjson stalled "$stalled" '.stalledCompletedRuns=$stalled' "$temp" >"$temp.next" && mv "$temp.next" "$temp" || return 1
     local delivery=suppressed;((sent==0)) || delivery=sent;[[ ! -f "$STATE_DIR/pending-notification.json" ]] || delivery=failed
-    jq --arg notification "$delivery" --arg version "$SCRIPT_VERSION" --argjson completed "$completed" --argjson installed "$installed" --argjson first "$first" '.+{notification:$notification,scriptVersion:$version,lastCompletedScanAt:$completed,installedAt:$installed,firstScheduledAt:$first}' "$temp" >"$STATUS_DIR/.media-integrity-audit.new" && mv "$STATUS_DIR/.media-integrity-audit.new" "$STATUS_DIR/media_integrity_audit.json" || return 1
+    jq --arg notification "$delivery" --arg version "$SCRIPT_VERSION" --argjson progress "$progress_completed" --argjson completed "$completed" --argjson installed "$installed" --argjson first "$first" '.+{notification:$notification,scriptVersion:$version,schedule:{cron:"30 9 * * 0,3",timezone:"Asia/Singapore",maxGapSeconds:432000},lastCompletedScanAt:$completed,lastProgressScanAt:$progress,installedAt:$installed,firstScheduledAt:$first}' "$temp" >"$STATUS_DIR/.media-integrity-audit.new" && mv "$STATUS_DIR/.media-integrity-audit.new" "$STATUS_DIR/media_integrity_audit.json" || return 1
     RUN_REPORT_WRITTEN=true;log INFO "$(jq -r .summary "$temp")";rm -f "$temp"
 }
 
@@ -856,7 +897,7 @@ recovery_followup() {
     recovery_update '.actions[$id].replacementPaths=[$rows[].path] | .actions[$id].replacementFiles=$rows | .actions[$id].importedAt=([$rows[].importedAt]|min)' --arg id "$id" --slurpfile rows "$rows" || return 1
     recovery_retention "$id" "$job" || return 1
     if jq -e --slurpfile rows "$rows" --slurpfile j "$job" 'all($rows[];. as $r|$r.path as $p| .identity as $i|
-       $state[0].files[$p] as $f|$f!=null and $f.identity==$i and $f.issue==null and ($f.verifiedAt // 0)>=$j[0].startedAt)' \
+       $state[0].files[$p] as $f|$f!=null and $f.identity==$i and $f.issue==null and $f.auditIssue==null and $f.verificationPolicy==2 and $f.coverage=="all_planned_segments_decoded" and ($f.verifiedAt // 0)>=$j[0].startedAt)' \
        --slurpfile state "$TMP_DIR/state.json" -n >/dev/null;then
         recovery_update '.actions[$id].replacementVerifiedAt=$now | .actions[$id].resolutionSource="native" | .actions[$id].lastError=null' --arg id "$id" --argjson now "$(date +%s)" || return 1
         recovery_set "$id" recovered 'Replacement completed: exact native download/import/file IDs and current filesystem version passed all planned decode ranges. Arr performed replacement and owns original recycling; script performed no media move/delete.'
@@ -929,7 +970,7 @@ recovery_observe_external() {
         recovery_file_tool identity "$path" >"$TMP_DIR/external-identity.json" || return 1
         jq -cn --arg path "$path" --argjson file "$file" --argjson added "$added" --slurpfile i "$TMP_DIR/external-identity.json" '{path:$path,fileId:$file,identity:$i[0],importedAt:$added}' >>"$rows"
         [[ "$file" == "$(jq -r .fileId "$job")" ]] && jq -e --slurpfile j "$job" '.==$j[0].identity' "$TMP_DIR/external-identity.json" >/dev/null || old_same=false
-        jq -e --arg path "$path" --slurpfile i "$TMP_DIR/external-identity.json" --slurpfile j "$job" '.files[$path] as $f|$f.identity==$i[0] and $f.issue==null and ($f.verifiedAt // 0)>=$j[0].startedAt and $f.coverage=="all_planned_segments_decoded"' "$TMP_DIR/state.json" >/dev/null || all_verified=false
+        jq -e --arg path "$path" --slurpfile i "$TMP_DIR/external-identity.json" --slurpfile j "$job" '.files[$path] as $f|$f.identity==$i[0] and $f.issue==null and $f.auditIssue==null and $f.verificationPolicy==2 and $f.coverage=="all_planned_segments_decoded" and ($f.verifiedAt // 0)>=$j[0].startedAt and $f.coverage=="all_planned_segments_decoded"' "$TMP_DIR/state.json" >/dev/null || all_verified=false
     done < <(jq -r '.targets[]' "$job")
     if [[ "$old_same" == true && "$monitored" == false ]];then
         recovery_set "$id" cancelled 'Recovery cancelled: native monitoring is now off while the exact original remains present. Monitoring/user intent preserved; no replacement or deletion performed.';return $?
@@ -979,7 +1020,7 @@ recovery_schedule() {
        .value.replacementPaths[]? as $path|{path:$path,deadline:($job.value.verificationDeadlineAt // 0),attempt:($state[0].files[$path].lastAttemptAt // 0)}]|
       unique_by(.path)|sort_by(.attempt,(if .deadline>0 then .deadline else 9999999999 end)) as $replacements|
       [$j[0].actions[]|select(.status=="required" or .status=="blocked" or .status=="retry_wait")|. as $job|
-       $state[0].files[.path] as $f|select($f.identity==$job.identity and $f.issue.kind=="decode_error" and $f.issue.proofVersion==3 and $f.issue.origin=="decode" and $f.issue.confirmationMethod=="normal-isolated-streams-v1" and any($f.issue.streamEvidence[]?; .primary==true and .kind=="decode_error" and .exit>0) and ($f.issue.confirmationKey|type)=="string" and $f.issue.confirmed==true and
+       $state[0].files[.path] as $f|select($f.identity==$job.identity and $f.issue.kind=="decode_error" and $f.issue.proofVersion==4 and $f.issue.origin=="decode" and $f.issue.confirmationMethod=="normal-isolated-streams-v1" and any($f.issue.streamEvidence[]?; .primary==true and .kind=="decode_error" and .exit>0) and ($f.issue.confirmationKey|type)=="string" and $f.issue.confirmed==true and
        ($f.issue.lastSeen // 0)<$now-48*3600 and ($f.lastAttemptAt // 0)<$now-86400)|{path:.path,attempt:($f.lastAttemptAt // 0)}]|
       unique_by(.path)|sort_by(.attempt) as $evidence|
       {recheckAfter:([$j[0].actions[]|select(.status=="verifying" and .resolutionSource=="recheck")|. as $job|.replacementPaths[]?|{key:.,value:$job.startedAt}]|from_entries),evidencePaths:[$evidence[:1][].path],paths:([$replacements[:(if ($evidence|length)>0 then 3 else 4 end)][].path]+[$evidence[:1][].path])}' >"$TMP_DIR/recovery-schedule.json"
@@ -1014,7 +1055,7 @@ recovery_resume_core() {
     [[ "$status" != retry_wait ]] || (( $(date +%s)>=$(jq -r '.retryAt // 0' "$job") )) || return 0
     [[ "$status" == required || "$status" == selected || "$status" == blocked || "$status" == retry_wait ]] || return 0
     [[ "$RECOVERY_ALLOW_GRAB" == true ]] && recovery_new_window_open || return 0
-    jq -e --slurpfile j "$job" --argjson cutoff "$(( $(date +%s)-48*3600 ))" '.files[$j[0].path] as $f|$f.identity==$j[0].identity and $f.issue.identity==$f.identity and $f.issue.kind=="decode_error" and $f.issue.proofVersion==3 and $f.issue.origin=="decode" and $f.issue.confirmationMethod=="normal-isolated-streams-v1" and any($f.issue.streamEvidence[]?; .primary==true and .kind=="decode_error" and .exit>0) and ($f.issue.confirmationKey|type)=="string" and $f.issue.confirmed==true and $f.issue.confirmedRuns>=2 and $f.issue.lastSeen>=$cutoff' "$TMP_DIR/state.json" >/dev/null || { recovery_set "$id" blocked 'Fresh unchanged-file corruption evidence required before release selection; original retained';return 0; }
+    jq -e --slurpfile j "$job" --argjson cutoff "$(( $(date +%s)-48*3600 ))" '.files[$j[0].path] as $f|$f.identity==$j[0].identity and $f.issue.identity==$f.identity and $f.issue.kind=="decode_error" and $f.issue.proofVersion==4 and $f.issue.origin=="decode" and $f.issue.confirmationMethod=="normal-isolated-streams-v1" and any($f.issue.streamEvidence[]?; .primary==true and .kind=="decode_error" and .exit>0) and ($f.issue.confirmationKey|type)=="string" and $f.issue.confirmed==true and $f.issue.confirmedRuns>=2 and $f.issue.lastSeen>=$cutoff' "$TMP_DIR/state.json" >/dev/null || { recovery_set "$id" blocked 'Fresh unchanged-file corruption evidence required before release selection; original retained';return 0; }
     local last
     last=$(jq -r '.selectionAt // 0' "$job");(( $(date +%s)-last>=86400 )) || return 0
     jq '{key:.path,value:{identity,issue:.finding}}' "$job" >"$candidate"
@@ -1070,7 +1111,7 @@ recovery_process() {
         jq -e --slurpfile p "$plan" --argjson cutoff "$((now-30*86400))" 'all(.actions[];.app!=$p[0].app or .parentId!=$p[0].parentId or .startedAt<$cutoff)' "$RECOVERY_FILE" >/dev/null || continue
         recovery_update '.actions[$id]=$p[0]' --arg id "$id" --slurpfile p "$plan" || { rc=1;break; }
         count=$((count+1));recovery_resume "$id" || rc=1
-      done < <(jq -c --argjson cutoff "$((now-48*3600))" '.files|to_entries[]|select((.value.issue.lastSeen // 0)>=$cutoff and .value.issue.kind=="decode_error" and .value.issue.proofVersion==3 and .value.issue.origin=="decode" and .value.issue.confirmationMethod=="normal-isolated-streams-v1" and any(.value.issue.streamEvidence[]?; .primary==true and .kind=="decode_error" and .exit>0) and (.value.issue.confirmationKey|type)=="string" and .value.issue.confirmed==true and (.value.issue.confirmedRuns // 0)>=2 and .value.issue.identity==.value.identity and (.value.replacementPending // false)==false)' "$TMP_DIR/state.json")
+      done < <(jq -c --argjson cutoff "$((now-48*3600))" '.files|to_entries[]|select((.value.issue.lastSeen // 0)>=$cutoff and .value.issue.kind=="decode_error" and .value.issue.proofVersion==4 and .value.issue.origin=="decode" and .value.issue.confirmationMethod=="normal-isolated-streams-v1" and any(.value.issue.streamEvidence[]?; .primary==true and .kind=="decode_error" and .exit>0) and (.value.issue.confirmationKey|type)=="string" and .value.issue.confirmed==true and (.value.issue.confirmedRuns // 0)>=2 and .value.issue.identity==.value.identity and (.value.replacementPending // false)==false)' "$TMP_DIR/state.json")
     fi
     exec {hold}>&-;exec {fd}>&-;return "$rc"
 }
@@ -1139,9 +1180,9 @@ def run_process(args,fd,seconds,beat,memory_mib):
                 if pipe:pipe.close()
         ACTIVE=None
 
-# Policy 3: probe diagnostics never prove corruption. Successful decoding still
+# Policy 4: probe diagnostics never prove corruption. Successful decoding still
 # requires positive frames and complete range progress; unknown stderr is reviewed.
-PROOF_VERSION=3
+PROOF_VERSION=4
 
 def benign_diagnostics(text):
     lines=[line.strip() for line in text.splitlines() if line.strip()]
@@ -1149,8 +1190,23 @@ def benign_diagnostics(text):
     return bool(lines) and any(not line.lower().startswith('last message repeated') for line in lines) and all(re.fullmatch(r'SEI type 5 size \d+ truncated at \d+|number of reference frames \(0\+\d+\) exceeds max \(\d+; probably corrupt input\), discarding one|Last message repeated \d+ times',line,re.I) for line in lines)
 
 def failure_signature(text):
-    text=re.sub(r'0x[0-9a-f]+','ADDRESS',text.lower())
-    return hashlib.sha256(text.strip().encode()).hexdigest()
+    # Normalise presentation noise only; preserve stream numbers, error numbers,
+    # offsets and codec details. Distinct failure positions remain distinct keys.
+    lines=[]
+    for line in text.lower().splitlines():
+        if re.search(r'last message repeated \d+ times',line):continue
+        line=re.sub(r'0x[0-9a-f]+','ADDRESS',line)
+        line=re.sub(r'^\[?\d{4}-\d\d-\d\d[ t]\d\d:\d\d:\d\d(?:[.,]\d+)?\]?\s*','',line)
+        line=' '.join(line.split())
+        if line:lines.append(line)
+    return hashlib.sha256('\n'.join(sorted(set(lines))).encode()).hexdigest()
+
+def complete_progress(result,expected,video=True):
+    frames=[int(v) for v in re.findall(r'^frame=\s*([0-9]+)',result['out'],re.M)]
+    times=[int(v)/1000000 for v in re.findall(r'^out_time_us=([0-9]+)',result['out'],re.M)]
+    # Scale tolerance for short tails; never exempt the entire final range.
+    tolerance=min(0.5,max(0.02,expected*0.02))
+    return bool(times and max(times)>0 and max(times)>=expected-tolerance and (not video or (frames and max(frames)>0)))
 
 def classify(result,stage='decode',codecs=()):
     if result['stop']:return result['stop']
@@ -1187,6 +1243,7 @@ def validate_state(state,cfg):
 class Audit:
     def __init__(self,cfg,state):
         self.cfg=cfg;self.state=validate_state(state,cfg);self.start=time.monotonic();self.deadline=self.start+cfg['budgetSeconds']
+        self.active_range=None;self.active_stage=None
         self.runEpoch=int(time.time());self.last_heartbeat=0;self.last_checkpoint=0;self.dirty=True
         self.state.update(hostRoot=cfg['hostRoot'],libraries=cfg['libraries'])
         self.state.setdefault('resolved',[]);self.state.setdefault('runs',[])
@@ -1195,6 +1252,12 @@ class Audit:
                 if entry.get('issue'):
                     entry['notBefore']=0;entry['probeAt']=0;entry['issue']['confirmedRuns']=0;entry['issue']['confirmed']=False;entry['issue']['lastConfirmedRunAt']=0
         self.state['toolset']=cfg['toolset']
+        for entry in self.state['files'].values():
+            if (entry.get('offset',0)>0 or entry.get('verifiedAt',0)>0) and entry.get('verificationPolicy')!=2:
+                entry['priorCoverage']={'offset':entry.get('offset',0),'verifiedAt':entry.get('verifiedAt',0),'reason':'Duration-proof policy upgraded; metadata retained'}
+                entry.update(offset=0,verifiedAt=0,notBefore=0)
+                entry.pop('coverage',None)
+            entry['verificationPolicy']=2
         for entry in self.state['files'].values():
             old=entry.get('issue')
             if old and old.get('kind')=='decode_error' and old.get('proofVersion')!=PROOF_VERSION:
@@ -1205,6 +1268,7 @@ class Audit:
                     'unsupportedImages':0,'newChanged':0,'quickPassed':0,'segmentsPassed':0,'cyclesCompleted':0,
                     'decodeWallSeconds':0.0,'mediaSecondsDecoded':0.0,'reason':'','mode':cfg['mode']}
         self.found=set();self.seen=set()
+        self.initial_progress={p:(float(e.get('duration',0)) if e.get('verifiedAt',0)>0 and self.runEpoch-e['verifiedAt']<cfg['recheckDays']*86400 else float(e.get('offset',0))) for p,e in self.state['files'].items()}
         self.run_paths={name:set() for name in ('attempted','opened','probed','ranges','completed')}
         self.stats['inventoryByLibrary']={name:{'status':'not_started','files':0} for name in cfg['libraries']}
     def progress_counts(self):
@@ -1244,6 +1308,7 @@ class Audit:
             emit({'type':'checkpoint-end','stats':self.state['lastRun']})
         self.last_checkpoint=time.monotonic();self.dirty=False
     def issue(self,path,entry,kind,evidence,offset=None,confirmed=False,confirmation_key=None):
+        entry['healthyRangeStreak']=0
         old=entry.get('issue') or {};now=int(time.time())
         confirmed=bool(confirmed and kind=='decode_error' and confirmation_key)
         same=old.get('identity')==entry['identity'] and old.get('kind')==kind and old.get('confirmed') and old.get('confirmationKey')==confirmation_key and old.get('proofVersion')==PROOF_VERSION
@@ -1253,17 +1318,25 @@ class Audit:
         transient=kind in ('unverified_timeout','unverified_tool_or_resource','unverified_process_exit')
         runs=(old.get('confirmedRuns',1) if same else 0)
         if confirmed and (not same or old.get('lastConfirmedRunAt')!=self.runEpoch):runs+=1
-        entry['issue']={'id':hashlib.sha256(path.encode(errors='surrogateescape')).hexdigest()[:16],
+        slot='auditIssue' if old.get('identity')==entry['identity'] and old.get('kind') in ('decode_error','recoverable_media_defect','auxiliary_track_error','unverified_prior_decoder_evidence') and kind not in ('decode_error','recoverable_media_defect','auxiliary_track_error') else 'issue'
+        if slot=='auditIssue':
+            old=entry.get(slot) or {};observation_same=old.get('identity')==entry['identity'] and old.get('kind')==kind
+            observations=old.get('observationRuns',0)+(old.get('lastObservedRunAt')!=self.runEpoch) if observation_same else 1
+        self.last_issue_slot=slot
+        entry[slot]={'id':hashlib.sha256((path+('' if slot=='issue' else '|audit')).encode(errors='surrogateescape')).hexdigest()[:16],
                         'kind':kind,'firstSeen':old.get('firstSeen',now) if observation_same else now,'lastSeen':now,'confirmed':confirmed,
                         'confirmedRuns':runs if confirmed else 0,'lastConfirmedRunAt':self.runEpoch if confirmed else 0,
                         'proofVersion':PROOF_VERSION,'origin':'decode' if confirmation_key else 'unverified','confirmationKey':confirmation_key,
                         'observationRuns':observations,'lastObservedRunAt':self.runEpoch,'alertable':not transient or observations>=2 or (observation_same and now-old.get('firstSeen',now)>=86400),
+                        'stage':self.active_stage or ('decode' if offset is not None else 'storage'),'failedRange':dict(self.active_range) if offset is not None and self.active_range else old.get('failedRange'),
                         'offset':offset,'evidence':evidence[-3000:],'identity':entry['identity'],'cleanRechecks':0}
+        if old.get('identity')==entry['identity'] and old.get('failedRange') and entry[slot].get('failedRange'):
+            entry[slot]['failedRange']={'start':min(old['failedRange']['start'],entry[slot]['failedRange']['start']),'end':max(old['failedRange']['end'],entry[slot]['failedRange']['end'])}
         entry['notBefore']=now+(7*86400 if kind in ('decode_error','read_error','intermittent_error') else 86400)
         self.dirty=True
-    def resolve(self,path,entry,reason):
-        if entry.get('issue'):
-            self.state['resolved'].append(dict(entry.pop('issue'),path=path,resolvedAt=int(time.time()),resolution=reason))
+    def resolve(self,path,entry,reason,slot='issue'):
+        if entry.get(slot):
+            self.state['resolved'].append(dict(entry.pop(slot),path=path,resolvedAt=int(time.time()),resolution=reason))
             self.dirty=True
     def inventory(self):
         root=self.cfg['root'];complete=True
@@ -1277,7 +1350,8 @@ class Audit:
                     if not stat.S_ISREG(st.st_mode):raise ValueError('not regular replacement')
                     self.found.add(rel);self.seen.add(rel);current=identity(st);old=self.state['files'].get(rel)
                     if not old or old['identity']!=current:
-                        self.state['files'][rel]={'identity':current,'observedAt':int(time.time()),'probeAt':0,'verifiedAt':0,'offset':0,'chunkSeconds':self.cfg['segmentSeconds'],'notBefore':0,'cycleLane':'new'}
+                        self.state['files'][rel]={'verificationPolicy':2,'identity':current,'observedAt':int(time.time()),'probeAt':0,'verifiedAt':0,'offset':0,'chunkSeconds':self.cfg['segmentSeconds'],'notBefore':0,'cycleLane':'new'}
+                        if old and old.get('issue'):self.state['files'][rel]['issue']=old['issue'];self.state['files'][rel]['replacementPending']=True
                 except OSError:self.stats['inventoryErrors']+=1
             for rel,after in self.cfg.get('recheckAfter',{}).items():
                 e=self.state['files'].get(rel)
@@ -1320,7 +1394,7 @@ class Audit:
                             current=identity(item.stat(follow_symlinks=False));self.found.add(rel)
                             old=self.state['files'].get(rel)
                             if old is None or old['identity']!=current:
-                                entry={'identity':current,'observedAt':int(time.time()),'probeAt':0,'verifiedAt':0,'offset':0,'chunkSeconds':self.cfg['segmentSeconds'],
+                                entry={'verificationPolicy':2,'identity':current,'observedAt':int(time.time()),'probeAt':0,'verifiedAt':0,'offset':0,'chunkSeconds':self.cfg['segmentSeconds'],
                                        'lastAttemptAt':0,'notBefore':0,'cycleLane':'new'}
                                 if old and old.get('issue'):entry['issue']=old['issue'];entry['replacementPending']=True
                                 self.state['files'][rel]=entry;self.stats['newChanged']+=1;self.dirty=True
@@ -1334,6 +1408,7 @@ class Audit:
             for path in list(self.state['files']):
                 if path not in self.seen:
                     self.resolve(path,self.state['files'][path],'File no longer in a complete library inventory; no repair was performed')
+                    self.resolve(path,self.state['files'][path],'File no longer in a complete library inventory; audit limitation closed without repair','auditIssue')
                     del self.state['files'][path];self.dirty=True
         self.checkpoint(True)
     def open_file(self,path,entry):
@@ -1351,8 +1426,9 @@ class Audit:
         if self.stopped():return {'code':-1,'out':'','err':'','stop':'cancelled','wall':0}
         return run_process(args,fd,min(seconds,max(1,self.remaining()-2)),self.beat,self.cfg['memoryMiB'])
     def probe(self,path,entry,fd):
+        self.active_stage='probe'
         args=['ffprobe','-v','error','-protocol_whitelist','file','-show_entries',
-              'format=duration:stream=index,codec_type,codec_name,duration:stream_disposition=attached_pic,default','-of','json',f'/proc/self/fd/{fd}']
+              'format=duration,start_time:stream=index,codec_type,codec_name,duration,start_time:stream_disposition=attached_pic,default','-of','json',f'/proc/self/fd/{fd}']
         result=self.run_tool(args,fd,20);kind=classify(result,stage="probe")
         if not self.unchanged(path,entry,fd):
             entry['notBefore']=int(time.time())+300;return False
@@ -1374,12 +1450,15 @@ class Audit:
             if (entry.get('issue') or {}).get('kind')=='unverified_legacy_evidence':
                 self.resolve(path,entry,'Legacy probe-only corruption classification withdrawn: valid metadata with nonfatal diagnostic; media unchanged, full decode verification still pending')
         entry.update(probeAt=int(time.time()),duration=duration,video=videos,audio=audio,
-                     streamDetails=[{'index':v['index'],'type':v.get('codec_type'),'codec':v.get('codec_name'),'default':bool(v.get('disposition',{}).get('default'))} for v in streams if v['index'] in videos+audio])
+                     streamDetails=[{'index':v['index'],'type':v.get('codec_type'),'codec':v.get('codec_name'),'default':bool(v.get('disposition',{}).get('default')),'duration':v.get('duration'),'start':v.get('start_time')} for v in streams if v['index'] in videos+audio])
+        entry['formatStart']=data.get('format',{}).get('start_time',0)
+        for slot in ('issue','auditIssue'):
+            if (entry.get(slot) or {}).get('stage')=='probe':self.resolve(path,entry,'Metadata probe succeeded on the unchanged file; prior probe limitation resolved; deep coverage remains separate',slot)
         self.run_paths['probed'].add(path);self.activity(path,entry,'metadata_probe_passed')
         self.stats['quickPassed']+=1;self.dirty=True
         return True
     def retry_transient(self,entry):
-        issue=entry.get('issue') or {}
+        issue=entry.get('auditIssue') or entry.get('issue') or {}
         if issue.get('kind') not in ('unverified_timeout','unverified_tool_or_resource','unverified_process_exit'):return False
         if entry.get('retryRunAt')!=self.runEpoch:entry.update(retryRunAt=self.runEpoch,retryCount=0)
         if entry.get('retryCount',0)>=1 or self.remaining()<30:return False
@@ -1393,6 +1472,7 @@ class Audit:
         if deadline-time.monotonic()<5:return 'unverified_confirmation_budget',[],None
         if not entry.get('streamDetails') and not self.probe(path,entry,fd):
             return 'unverified_stream_confirmation',[],None
+        self.active_stage='decode'
         details=entry['streamDetails'];primary=set()
         for media_type in ('video','audio'):
             group=[v for v in details if v['type']==media_type]
@@ -1413,14 +1493,20 @@ class Audit:
             isolated[isolated.index('-ss')+1]=str(seek)
             isolated[isolated.index('-t')+1]=str(length)
             isolated[isolated.index('-sn'):isolated.index('-sn')]=['-map','0:'+str(stream['index'])]
+            expected=length
+            try:
+                stream_duration=float(stream.get('duration'));stream_start=float(stream.get('start') or 0)-float(entry.get('formatStart') or 0)
+                if math.isfinite(stream_duration) and stream_duration>0 and math.isfinite(stream_start):expected=max(0,min(seek+length,stream_start+stream_duration)-max(seek,stream_start))
+            except (TypeError,ValueError):pass
+            if expected==0:
+                evidence.append(dict(stream,primary=stream['index'] in primary,exit=0,kind='outside_stream_timeline',complete=True,expectedSeconds=0))
+                continue
             result=self.run_tool(isolated,fd,min(self.cfg['segmentWallSeconds'],deadline-time.monotonic()))
             self.stats['decodeWallSeconds']+=result['wall']
             if not self.unchanged(path,entry,fd):return 'changed',evidence,None
             kind=classify(result,codecs=[stream.get('codec')])
-            frames=[int(v) for v in re.findall(r'^frame=\s*([0-9]+)',result['out'],re.M)]
-            times=[int(v) for v in re.findall(r'^out_time_us=([0-9]+)',result['out'],re.M)]
-            complete=bool(times and max(times)>0 and (length<=10 or max(times)/1000000>=length-5) and (stream['type']=='audio' or (frames and max(frames)>0)))
-            evidence.append(dict(stream,index=stream['index'],primary=stream['index'] in primary,exit=result['code'],kind=kind,complete=complete,seek=seek,length=length,evidence=result['err'][-1200:]))
+            complete=complete_progress(result,expected,video=stream['type']=='video')
+            evidence.append(dict(stream,index=stream['index'],primary=stream['index'] in primary,exit=result['code'],kind=kind,complete=complete,expectedSeconds=expected,seek=seek,length=length,evidence=result['err'][-1200:]))
             if kind=='decode_error':failures.append((stream,failure_signature(result['err'])))
             elif result['code']==0 and complete and kind in ('passed','unverified_decoder_warning'):
                 pass
@@ -1435,9 +1521,21 @@ class Audit:
         return 'recoverable_media_defect',evidence,None
 
     def segment(self,path,entry,fd):
+        self.active_stage='decode'
         offset=float(entry.get('offset',0));duration=entry['duration']
+        for slot in ('issue','auditIssue'):
+            incident=entry.get(slot) or {}
+            if incident and not entry.get('replacementPending') and incident.get('stage')!='probe':
+                failed=incident.get('failedRange')
+                if not failed:
+                    start=float(incident.get('offset') or 0)
+                    end=max([float(v.get('seek',start))+float(v.get('length',0)) for v in incident.get('streamEvidence',[])] or [min(duration,start+self.cfg['segmentSeconds'])])
+                    failed={'start':start,'end':min(duration,end)};incident['failedRange']=failed
+                if offset<failed['start'] or offset>=failed['end']:offset=failed['start'];entry['offset']=offset
+
         span=min(float(entry.get('chunkSeconds',self.cfg['segmentSeconds'])),duration-offset)
         if span<=0:return 'complete'
+        self.active_range={'start':offset,'end':offset+span}
         seek=max(0,offset-max(2,min(30,float(entry.get("seekWarmupSeconds",2)))));length=span+offset-seek
         args=['ffmpeg','-hide_banner','-nostdin','-v','error','-xerror','-max_error_rate','0','-nostats','-stats_period','5',
               '-protocol_whitelist','file','-threads:v',str(self.cfg['threads']),'-threads:a','1',
@@ -1448,6 +1546,7 @@ class Audit:
         result=self.run_tool(args,fd,self.cfg['segmentWallSeconds']);kind=classify(result,codecs=[v.get('codec') for v in entry.get('streamDetails',[])])
         if kind=='unverified_tool_error' and not entry.get('streamDetails') and self.remaining()>25:
             if self.probe(path,entry,fd):kind=classify(result,codecs=[v.get('codec') for v in entry.get('streamDetails',[])])
+        self.active_stage='decode'
         self.stats['decodeWallSeconds']+=result['wall']
         if not self.unchanged(path,entry,fd):return 'changed'
         if kind in ('cancelled','timeout'):
@@ -1477,8 +1576,8 @@ class Audit:
                     outcome,details,key=self.normal_confirmation(path,entry,fd,retry,offset,span)
                     if outcome=='changed':return 'changed'
                     self.issue(path,entry,outcome,result['err'],offset,outcome=='decode_error',key)
-                    entry['issue']['streamEvidence']=details
-                    entry['issue']['confirmationMethod']='normal-isolated-streams-v1'
+                    entry[self.last_issue_slot]['streamEvidence']=details
+                    entry[self.last_issue_slot]['confirmationMethod']='normal-isolated-streams-v1'
                 else:
                     self.issue(path,entry,'intermittent_error' if again_kind=='decode_error' else again_kind,again['err'],offset)
                     if self.retry_transient(entry):return 'retry'
@@ -1493,25 +1592,36 @@ class Audit:
         expected_end=offset+span
         # A successful but substantially short decode is not silently credited
         # for a duration advertised only by a broken/truncated container header.
-        if length>10 and max(output_times)/1000000 < length-5:
+        if not complete_progress(result,length):
             self.issue(path,entry,'unverified_short_decode','Decoded output ended before the planned range; duration/header review required',offset)
             return 'issue'
         if result['err'].strip():entry['advisory']={'kind':'nonfatal_decode_diagnostic','evidence':result['err'][-3000:],'observedAt':int(time.time())}
-        old=entry.get('issue')
-        if old and not entry.get('replacementPending'):
-            old['cleanRechecks']=old.get('cleanRechecks',0)+1
-            if old['cleanRechecks']<2:return 'recheck'
-            self.resolve(path,entry,'Two successful unchanged-file rechecks of the previously failing probe/range; remaining ranges are tracked separately')
+        rewind=None
+        for slot in ('issue','auditIssue'):
+            old=entry.get(slot)
+            if not old or entry.get('replacementPending'):continue
+            failed=old.get('failedRange')
+            if not failed:continue
+            until=old.get('cleanUntil',failed['start'])
+            if offset<=until+0.001 and expected_end>until:old['cleanUntil']=min(expected_end,failed['end'])
+            if old.get('cleanUntil',failed['start'])>=failed['end']-0.001:
+                old['cleanRechecks']=old.get('cleanRechecks',0)+1;old['cleanUntil']=failed['start']
+                if old['cleanRechecks']>=2:self.resolve(path,entry,'Two complete unchanged-file rechecks covered the entire original failed interval; remaining file coverage is tracked separately',slot)
+                else:rewind=failed['start'] if rewind is None else min(rewind,failed['start'])
         entry['offset']=expected_end;entry['notBefore']=0
+        entry['healthyRangeStreak']=entry.get('healthyRangeStreak',0)+1
+        if entry['healthyRangeStreak']>=3 and not entry.get('issue') and not entry.get('auditIssue'):
+            entry['chunkSeconds']=min(self.cfg['segmentSeconds'],max(15,float(entry.get('chunkSeconds',self.cfg['segmentSeconds']))*2));entry['healthyRangeStreak']=0
+        if rewind is not None:entry['offset']=rewind
         self.run_paths['ranges'].add(path);self.activity(path,entry,'decode_range_passed')
         self.stats['segmentsPassed']+=1;self.stats['mediaSecondsDecoded']+=span;self.dirty=True
-        if expected_end>=duration-0.05:
-            entry.update(verifiedAt=int(time.time()),offset=0,probeAt=int(time.time()),coverage='all_planned_segments_decoded')
+        if expected_end>=duration-0.05 and not entry.get('auditIssue') and (not entry.get('issue') or entry.get('replacementPending')):
+            entry.update(verificationPolicy=2,verifiedAt=int(time.time()),offset=0,probeAt=int(time.time()),coverage='all_planned_segments_decoded')
             if entry.pop('replacementPending',False):self.resolve(path,entry,'Replacement file completed all planned decode ranges; source version changed')
             entry.pop('cycleLane',None)
             self.run_paths['completed'].add(path);self.activity(path,entry,'full_cycle_passed')
             self.stats['cyclesCompleted']+=1;return 'complete'
-        return 'next'
+        return 'recheck' if rewind is not None else 'next'
     def work(self,path,probe_only=False):
         self.run_paths['attempted'].add(path)
         entry=self.state['files'][path];entry['lastAttemptAt']=int(time.time());entry.pop('deferredReason',None);self.dirty=True
@@ -1544,16 +1654,35 @@ class Audit:
             self.attempt(path,entry,outcome)
             if fd is not None:os.close(fd)
             self.checkpoint()
+    def capacity_metrics(self):
+        files=self.state['files'];now=int(time.time())
+        eligible=[r for r in self.state.get('capacityRuns',[]) if r.get('budgetSeconds',0)>=3600 and not r.get('failed')]
+        pending=[e for e in files.values() if not e.get('verifiedAt') or now-e['verifiedAt']>=self.cfg['recheckDays']*86400]
+        known=sum(max(0,float(e.get('duration',0))-float(e.get('offset',0))) for e in pending)
+        weekly=(sum(r.get('netMediaSeconds',0) for r in eligible)/len(eligible)*2) if eligible else 0
+        days=known/weekly*7 if weekly>0 else None
+        stalled=len(eligible)>=3 and all(r.get('netMediaSeconds',0)==0 for r in eligible[-3:]) and bool(pending)
+        status='collecting' if len(eligible)<3 else 'stalled' if stalled else 'behind_target' if days is not None and days>self.cfg['recheckDays'] else 'within_measured_budget'
+        self.state['capacity']={'status':status,'samples':len(eligible),'runsPerWeek':2,'runBudgetSeconds':7200,'knownRemainingSeconds':known,'unknownDurations':sum(not e.get('duration') for e in pending),'observedNetMediaSecondsPerWeek':weekly,'knownBacklogDaysLowerBound':days,'attention':status in ('stalled','behind_target')}
     def finish(self):
         self.progress_counts()
         now=int(time.time());files=self.state['files'];stats=self.stats
         stats.update(elapsedSeconds=int(time.monotonic()-self.start),finishedAt=now,
                      pendingInitial=sum(not f.get('verifiedAt') and f.get('cycleLane')!='old' for f in files.values()),
                      pendingPeriodic=sum(f.get('cycleLane')=='old' or (bool(f.get('verifiedAt')) and now-f['verifiedAt']>=self.cfg['recheckDays']*86400) for f in files.values()),
-                     activeFindings=sum(bool(f.get('issue')) for f in files.values()),
+                     activeFindings=sum(bool(f.get('issue'))+bool(f.get('auditIssue')) for f in files.values()),
                      deferredFiles=sum(f.get('notBefore',0)>now for f in files.values()),
                      inProgress=sum(f.get('offset',0)>0 for f in files.values()))
         self.state['resolved']=[r for r in self.state['resolved'] if now-r['resolvedAt']<=30*86400]
+        if self.cfg['mode']=='scan' and not self.cfg.get('targeted'):
+            duration_known=sum(float(f.get('duration',0)) for f in files.values())
+            outstanding=sum(max(0,float(f.get('duration',0))-float(f.get('offset',0))) for f in files.values() if not f.get('verifiedAt') or now-f.get('verifiedAt',0)>=self.cfg['recheckDays']*86400)
+            stats['budgetSeconds']=self.cfg['budgetSeconds']
+            stats['netMediaSeconds']=sum(max(0,(float(e.get('duration',0)) if e.get('verifiedAt') else float(e.get('offset',0)))-self.initial_progress.get(p,0)) for p,e in files.items() if not e.get('issue') and not e.get('auditIssue'))
+            stats['capacity']={'knownDurationSeconds':duration_known,'knownRemainingSeconds':outstanding,'unknownDurations':sum(not f.get('duration') for f in files.values()),'fullyVerified':sum(bool(f.get('verifiedAt')) for f in files.values())}
+            history=[r for r in self.state.get('capacityRuns',[]) if r.get('finishedAt',0)!=now]
+            self.state['capacityRuns']=(history+[dict(stats)])[-6:]
+        self.capacity_metrics()
         self.state['runs']=(self.state['runs']+[dict(stats)])[-12:]
         self.state['toolset']=self.cfg['toolset'];self.dirty=True;self.checkpoint(True)
         emit({'type':'complete','stats':stats})
@@ -1575,7 +1704,7 @@ class Audit:
                 if path in self.cfg.get('evidencePaths',[]):continue
                 f=self.state['files'][path]
                 if f.get('notBefore',0)>now:continue
-                if f.get('issue'):new.append(path)
+                if f.get('issue') or f.get('auditIssue'):new.append(path)
                 elif not f.get('verifiedAt'):
                     (old if f.get('cycleLane')=='old' else new).append(path)
                 elif now-f['verifiedAt']>=self.cfg['recheckDays']*86400:old.append(path)
@@ -1653,8 +1782,8 @@ main() {
     case "${1:-}" in
       --version) printf 'media_integrity_audit.sh %s\n' "$SCRIPT_VERSION";return 0;;
       --help|-h) printf '%s\n' 'Usage: bash script [--version|--status|--inventory-only|--recovery-status|--recover-only|--help]' \
-        'Default: weekly scan through Bazarr. Recovery is disabled by configuration; no installation or Docker changes.' \
-        'Wednesday 09:30 SGT, two-hour runtime, two video threads, low CPU/I/O priority.' \
+        'Default: Wednesday/Sunday scan through Bazarr. Recovery is disabled by configuration; no installation or Docker changes.' \
+        'Wednesday/Sunday 09:30 SGT, two-hour runtime, two video threads, low CPU/I/O priority.' \
         'Quick probes and resumable overlapping decode ranges are separate evidence; pending files remain unverified.' \
         'Missing mounts, maintenance, active parity/Mover/backups or Plex transcoding defer/stop work.' \
         '--status reads only saved receipts. --inventory-only stats library paths and saves inventory; no decoding or normal email.' \
