@@ -1,0 +1,3 @@
+# Sunday companion to the Wednesday User Scripts schedule. Disabling/clearing
+# the primary custom schedule or removing the script prevents this launch.
+0 7 * * 0 /usr/bin/jq -e '.["/boot/config/plugins/user.scripts/scripts/media_integrity_audit/script"] | .frequency == "custom" and ((.custom // "") | test("[^[:space:]]"))' /boot/config/plugins/user.scripts/schedule.json >/dev/null 2>&1 && /usr/local/emhttp/plugins/user.scripts/startCustom.php /boot/config/plugins/user.scripts/scripts/media_integrity_audit/script >/dev/null 2>&1

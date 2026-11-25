@@ -15,6 +15,7 @@ mkdir -p "$RECOVERY_BOOT_ROOT/config/plugins/user.scripts/scripts/example"
 printf 'DOCKER_ENABLED="yes"\n' >"$RECOVERY_BOOT_ROOT/config/docker.cfg"
 printf '#!/bin/bash\nprintf hello\n' >"$RECOVERY_BOOT_ROOT/config/plugins/user.scripts/scripts/example/script"
 printf '{"job":{"script":"/boot/config/plugins/user.scripts/scripts/example/script","frequency":"daily"}}' >"$RECOVERY_BOOT_ROOT/config/plugins/user.scripts/schedule.json"
+printf '0 7 * * 0 true\n' >"$RECOVERY_BOOT_ROOT/config/plugins/user.scripts/media_integrity_audit_sunday.cron"
 recovery_docker() {
     case "$*" in
         'ps -aq --no-trunc') printf 'aaaaaaaaaaaa\n';;
@@ -25,6 +26,7 @@ recovery_docker() {
     esac
 }
 vault_capture_recovery "$TEST_ROOT/recovery"
+[[ -s "$TEST_ROOT/recovery/boot-config/config/plugins/user.scripts/media_integrity_audit_sunday.cron" ]]
 jq -e '.runtimeStatus=="complete" and .containerCount==1 and .namedVolumeMounts==1' "$TEST_ROOT/recovery/inventory.json" >/dev/null
 jq -e '.[0].matchingConfiguredSources==[] and (.[1].payloadStatus|startswith("named-volume"))' "$TEST_ROOT/recovery/coverage.json" >/dev/null
 [[ "$RECOVERY_CAPTURE_WARNING" == true ]]

@@ -106,7 +106,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.19"
+readonly SCRIPT_VERSION="1.20"
 
 ###############################################################################
 # CONFIGURATION
@@ -893,7 +893,7 @@ vault_capture_recovery() {
         while IFS= read -r -d '' file; do
             rel=${file#"$boot/"}
             case "$rel" in
-                config/docker.cfg|config/network.cfg|config/network-rules.cfg|config/ident.cfg|config/shares/*.cfg|config/plugins/dockerMan/templates-user/*.xml|config/plugins/user.scripts/schedule.json|config/plugins/user.scripts/customSchedule.cron|config/plugins/user.scripts/scripts/*/script|config/plugins/user.scripts/scripts/*/name|config/plugins/user.scripts/scripts/*/description) ;;
+                config/docker.cfg|config/network.cfg|config/network-rules.cfg|config/ident.cfg|config/shares/*.cfg|config/plugins/dockerMan/templates-user/*.xml|config/plugins/user.scripts/schedule.json|config/plugins/user.scripts/customSchedule.cron|config/plugins/user.scripts/media_integrity_audit_sunday.cron|config/plugins/user.scripts/scripts/*/script|config/plugins/user.scripts/scripts/*/name|config/plugins/user.scripts/scripts/*/description) ;;
                 *) continue;;
             esac
             [[ "$rel" != *$'\n'* && "$rel" != *$'\r'* && $(realpath -e "$file") == "$file" ]] || return 1

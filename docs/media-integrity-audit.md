@@ -6,7 +6,7 @@ container, mount, image, startup setting or application configuration is added.
 
 ## Schedule and scope
 
-Run `30 9 * * 0,3`: Wednesdays and Sundays at 09:30 Asia/Singapore, for up to two hours per invocation.
+Run Wednesdays at 09:30 and Sundays at 07:00 Asia/Singapore, for up to two hours per invocation. Wednesday uses `30 9 * * 3` in User Scripts; Sunday uses `0 7 * * 0` in the persistent native cron companion described below.
 The first scheduled run is 25 November 2026. Scope is the existing
 `/mnt/user/media/{movies,series,formula1}` bind at `/data`. Download/quarantine
 folders, the secure library, symlinks, ISO/IMG, standalone audio and subtitles are
@@ -184,7 +184,7 @@ Process:
    five-minute Arr monitor. These passes stat/decode only up to four exact
    replacement paths, without walking/pruning the full library queue. Reuse
    checkpoints and low-priority decoder limits, with at most 75 seconds worker
-   time per pass. Normal auditing runs Wednesday/Sunday 09:30 Singapore time, up to two hours each.
+   time per pass. Normal auditing runs Wednesday 09:30 / Sunday 07:00 Singapore time, up to two hours each.
 8. Mark `recovered` only after every exact current replacement passes all planned
    decode ranges. Arr recycles/removes the original using its normal policy;
    this script performs no second delete/move. Native import is not promised
@@ -465,9 +465,30 @@ coverage and offsets remain usable immediately and are not reset.
   the estimate is a lower bound for known work, not a full-library completion
   date. Capacity warnings join existing grouped notifications with stable keys.
 
-The live schedule is Wednesday/Sunday 09:30 Singapore time. Hubble’s Sunday media
-backup starts at 10:00, so the existing workload guard may checkpoint/defer the
-Sunday audit after roughly 30 minutes. No backup schedule or Docker configuration
-is changed. Backup Health Audit uses the receipt’s five-day completion/progress grace for
-this twice-weekly schedule; a guarded Sunday run counts only when it actually
-saves successful probe/range progress, without falsely marking it a completed run; individual media findings and capacity warnings owned by this audit are not duplicated there.
+The live schedule is Wednesday 09:30–11:30 and Sunday 07:00–09:00 Singapore
+time. Sunday leaves one hour before the existing 10:00 media backup. Workload
+guards remain active, so unexpected backups, parity/Mover activity or Plex
+transcoding can still defer scanning. No backup or Docker schedule is changed.
+Backup Health Audit retains the five-day completion/progress grace; meaningful
+partial progress does not falsely claim a completed scan, and media findings or
+capacity warnings are not duplicated in its notifications.
+
+### Split start times in User Scripts (v2.6.1)
+
+User Scripts stores one custom cron expression per script. Keep the primary entry
+as Wednesday `30 9 * * 3`. Install the repository companion
+`user_script/schedules/media_integrity_audit_sunday.cron` at
+`/boot/config/plugins/user.scripts/media_integrity_audit_sunday.cron` and run
+Unraid’s existing `update_cron` command after installation/removal. Unraid loads
+this plugin cron file on subsequent cron regeneration and boots.
+
+The Sunday entry launches the same native User Scripts runner and script. It
+first checks that the primary job is still custom-scheduled with a nonempty
+expression. Disabling or clearing that job, or deleting its schedule entry,
+prevents Sunday launches too. There is no additional User Script folder or copy
+of the audit. If retiring this arrangement permanently, remove the companion
+cron file and refresh cron. Weekly unchanged-issue reminders and the two-hour
+per-run limit are unchanged.
+
+The existing vault recovery inventory includes the Sunday companion cron file
+alongside the primary schedule and script. Boot-disk backups also retain it.
