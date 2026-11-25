@@ -397,6 +397,7 @@ AUTO_RESTART=false; LOG_MAX_BYTES=1048576; LOCK_FILE="$TEST_ROOT/main.lock"
 STATUS_DIR="$TEST_ROOT/status"; UPTIME_FILE="$TEST_ROOT/uptime"
 printf '99999.00 0.00\n' >"$UPTIME_FILE"
 docker() { return 0; }
+watchdog_schedule_inventory(){ return 0; }
 (main) >"$TEST_ROOT/main.log" 2>&1 || { cat "$TEST_ROOT/main.log" >&2; fail 'main orchestration failed'; }
 jq -e --arg version "$SCRIPT_VERSION" '.status == "OK" and .scriptVersion == $version' "$STATUS_DIR/docker_service_watchdog.json" >/dev/null || fail 'main receipt incorrect'
 jq -e '.phase == "completed" and .executionComplete == true and .failures == 0' "$HEARTBEAT_FILE" >/dev/null || fail 'main heartbeat not finalized'

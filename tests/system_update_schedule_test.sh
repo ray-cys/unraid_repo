@@ -6,6 +6,10 @@ fixture=$(mktemp -d);trap 'rm -rf "$fixture"' EXIT
 source "$repo/user_script/system_update_coordinator.sh"
 POLICY_FILE="$fixture/policy.json";BACKUP_SCHEDULE_FILE="$fixture/scripts.json";TMP_DIR="$fixture";STATE_FILE="$fixture/state.json";STATE_EXPORT_LOCK="$fixture/export.lock";LOG_FILE="$fixture/log";RUN_ID=fixture
 printf '{}' >"$BACKUP_SCHEDULE_FILE"
+mkdir -p "$fixture/scripts/system_update_coordinator" "$fixture/scripts/media_health_monitor" "$fixture/scripts/media_torrent_management"
+for name in system_update_coordinator media_health_monitor media_torrent_management;do printf '#!/bin/bash\n' >"$fixture/scripts/$name/script";done
+seed_updater(){ jq '.["/boot/config/plugins/user.scripts/scripts/system_update_coordinator/script"]={frequency:"custom",custom:"*/15 * * * *"}' "$BACKUP_SCHEDULE_FILE" >"$fixture/seed";mv "$fixture/seed" "$BACKUP_SCHEDULE_FILE"; }
+seed_updater
 jq -n '{schema:1,enabled:true,window:{start:"13:15",end:"15:30"},windows:[{start:"13:15",end:"15:30"},{start:"21:15",end:"23:00"}],limits:{dailyDocker:6,dailyPlugins:2,dailyTotal:8},docker:{kometa:{identity:"kometa",allow:true,candidateHoldHours:1}},plugins:{}}' >"$POLICY_FILE"
 policy_valid "$POLICY_FILE"
 epoch(){ TZ=Asia/Singapore date -d "$1" +%s; }
@@ -31,9 +35,14 @@ jq '.windows[1].start="15:00"' "$POLICY_FILE" >"$fixture/bad"
 if policy_valid "$fixture/bad";then echo 'Overlapping windows accepted';exit 1;fi
 # Routine monitors must not make a 20-minute quiet interval impossible.
 jq -n '{"/boot/config/plugins/user.scripts/scripts/media_health_monitor/script":{frequency:"custom",custom:"*/5 * * * *"},"/boot/config/plugins/user.scripts/scripts/media_torrent_management/script":{frequency:"custom",custom:"0 */2 * * *"}}' >"$BACKUP_SCHEDULE_FILE"
+seed_updater
 calendar_eval guard "$(epoch '2026-11-26 13:15:00')" 1200 radarr docker "$empty" | jq -e .ready >/dev/null
 calendar_eval guard "$(epoch '2026-11-26 13:45:00')" 1200 radarr docker "$empty" | jq -e '.ready==false' >/dev/null
 calendar_eval guard "$(epoch '2026-11-26 13:45:00')" 1200 test.plg plugin "$empty" | jq -e '.ready==false' >/dev/null
+cp "$BACKUP_SCHEDULE_FILE" "$fixture/polling.before"
+jq '.["/boot/config/plugins/user.scripts/scripts/system_update_coordinator/script"].custom="0 * * * *"' "$BACKUP_SCHEDULE_FILE" >"$fixture/next";mv "$fixture/next" "$BACKUP_SCHEDULE_FILE"
+[[ $(next_update_attempt "$(epoch '2026-11-26 13:16:00')") == "$(epoch '2026-11-26 14:00:00')" ]]
+cp "$fixture/polling.before" "$BACKUP_SCHEDULE_FILE"
 printf 'Both windows, finish-by budgets, native boundaries, odd-day backups, overlap rejection and monitor exclusion passed\n'
 # One miss per observed window, not once per 15-minute invocation.
 jq -n '{schema:1,items:{"docker:kometa":{kind:"docker",name:"kometa",identity:"kometa",candidate:"new",candidateSeenAt:0,available:true,checkStatus:"VERIFIED",missingScans:0}},jobs:{},outbox:[],delivered:{}}' >"$STATE_FILE"

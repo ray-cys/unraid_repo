@@ -8,7 +8,7 @@ set -euo pipefail
 source "$repo/user_script/system_update_coordinator.sh"
 CA_SETTINGS_ROOT="$fixture/ca";USER_SCRIPTS_ROOT="$fixture/scripts";mkdir -p "$CA_SETTINGS_ROOT" "$USER_SCRIPTS_ROOT/scripts/system_update_coordinator"
 printf '#!/bin/bash\n' >"$USER_SCRIPTS_ROOT/scripts/system_update_coordinator/script"
-printf '{"/boot/config/plugins/user.scripts/scripts/system_update_coordinator/script":{"frequency":"custom"}}' >"$USER_SCRIPTS_ROOT/schedule.json"
+printf '{"/boot/config/plugins/user.scripts/scripts/system_update_coordinator/script":{"frequency":"custom","custom":"*/15 * * * *"}}' >"$USER_SCRIPTS_ROOT/schedule.json"
 printf '{"cron":{"dockerCronFrequency":"Custom"},"global":{"dockerUpdateAll":"yes","keep":"retained"}}' >"$CA_SETTINGS_ROOT/DockerUpdateSettings.json"
 printf '{"cron":{"pluginCronFrequency":"Weekly"},"Global":"true","keep":"retained"}' >"$CA_SETTINGS_ROOT/AutoUpdateSettings.json"
 printf '0 7 * * * old-docker-updater\n' >"$CA_SETTINGS_ROOT/docker_update.cron"

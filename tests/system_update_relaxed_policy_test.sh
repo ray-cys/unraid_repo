@@ -7,6 +7,10 @@ source "$repo/user_script/system_update_coordinator.sh"
 TMP_DIR="$fixture";STATE_FILE="$fixture/state.json";STATE_EXPORT_LOCK="$fixture/export.lock";POLICY_FILE="$fixture/policy.json"
 BACKUP_SCHEDULE_FILE="$fixture/schedule.json"
 printf '{"/boot/config/plugins/user.scripts/scripts/backup_cache_appdata/script":{"frequency":"custom","custom":"38 5 * * 2,4,6"},"/boot/config/plugins/user.scripts/scripts/backup_boot_disk/script":{"frequency":"custom","custom":"0 19 * * 1,3,6"}}' >"$BACKUP_SCHEDULE_FILE"
+mkdir -p "$fixture/scripts/backup_cache_appdata" "$fixture/scripts/backup_boot_disk" "$fixture/scripts/system_update_coordinator"
+for name in backup_cache_appdata backup_boot_disk system_update_coordinator;do printf '#!/bin/bash\n' >"$fixture/scripts/$name/script";done
+jq '.["/boot/config/plugins/user.scripts/scripts/system_update_coordinator/script"]={frequency:"custom",custom:"*/15 * * * *"}' "$BACKUP_SCHEDULE_FILE" >"$fixture/seed";mv "$fixture/seed" "$BACKUP_SCHEDULE_FILE"
+cp "$BACKUP_SCHEDULE_FILE" "$fixture/good-schedule"
 if command -v php >/dev/null;then
   now=$(TZ=Asia/Singapore date -d '2026-11-26 13:15:00' +%s)
   result=$(backup_schedule_window docker "$now")
@@ -18,6 +22,7 @@ if command -v php >/dev/null;then
   [[ $(backup_schedule_window docker "$later" | jq -r .cutoff) == "$expected" ]]
   jq '.["/boot/config/plugins/user.scripts/scripts/backup_cache_appdata/script"].custom="not a cron"' "$BACKUP_SCHEDULE_FILE" >"$fixture/next";mv "$fixture/next" "$BACKUP_SCHEDULE_FILE"
   if backup_schedule_window docker "$now" >/dev/null;then echo 'Invalid cron accepted';exit 1;fi
+  cp "$fixture/good-schedule" "$BACKUP_SCHEDULE_FILE"
   printf 'Actual backup schedule, one missed run, finish grace and invalid-schedule protection passed\n'
 fi
 jq -n '{schema:1,items:{},jobs:{failed:{kind:"docker",name:"radarr",identity:"radarr:nightly",status:"ATTENTION",installerFinishedVerified:true}},outbox:[]}' >"$STATE_FILE"
