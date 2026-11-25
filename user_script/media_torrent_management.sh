@@ -2,7 +2,7 @@
 clearLog=true
 
 ###############################################################################
-# Data Management v3.3
+# Data Management v3.4
 #
 # PURPOSE
 # -------
@@ -105,7 +105,7 @@ usr_ops_append_log() {
 }
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
-readonly SCRIPT_VERSION="3.3"
+readonly SCRIPT_VERSION="3.4"
 
 umask 0002
 
@@ -1568,6 +1568,23 @@ refresh_vuetorrent_if_due() {
     printf '%s\n' "$now" >"$TRANSFER_STATE_DIR/.webui-updated-at" && mv "$TRANSFER_STATE_DIR/.webui-updated-at" "$TRANSFER_STATE_DIR/webui-updated-at"
 }
 
+# Expiring updater handoff: current operations finish; new conflicting work
+# yields before reading/mutating app state. Never deletes or overrides a lock.
+app_update_requested() {
+    local scope="$1" file now boot seen=0
+    now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || return 1
+    for file in "${APP_UPDATE_REQUEST_DIR:-/run/docker-update-requests}/"*.json;do
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        seen=$((seen+1));((seen<=128)) || break
+        (( $(stat -c %s "$file" 2>/dev/null || printf 999999)<=8192 )) || continue
+        if jq -e --arg scope "$scope" --arg boot "$boot" --argjson now "$now" '
+          .schema==1 and .owner=="system_update_coordinator" and .boot==$boot and
+          (.expires|type)=="number" and .expires>$now and .expires<=$now+1200 and
+          (.scopes|type)=="array" and (.scopes|index($scope))!=null' "$file" >/dev/null 2>&1;then return 0;fi
+    done
+    return 1
+}
+
 acquire_operation_coordination() {
     local now until version_file="${UNRAID_VERSION_FILE:-/etc/unraid-version}" version
     if [[ -r "$version_file" ]]; then
@@ -1576,6 +1593,7 @@ acquire_operation_coordination() {
     fi
     exec {ARR_OPERATION_FD}>"${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}" || return 1
     flock -s -n "$ARR_OPERATION_FD" || return 75
+    app_update_requested torrent && return 75
     now=$(date +%s)
     until=$(cat "${ARR_BACKUP_GRACE:-/run/arr-appdata-recovery-until}" 2>/dev/null || true)
     if [[ "$until" =~ ^[0-9]+$ ]] && (( until>now && until<=now+120 )); then return 75; fi

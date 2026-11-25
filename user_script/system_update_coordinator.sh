@@ -1,9 +1,12 @@
 #!/bin/bash
 clearLog=true
 arrayStarted=true
-# System Update Coordinator v1.2.0 -- personal Hubble maintenance.
+# System Update Coordinator v1.3.0 -- personal Hubble maintenance.
 # PURPOSE: Detect Docker/plugin/Unraid OS updates; automatically install only
 # explicitly approved, still-installed items during a bounded maintenance window.
+# Existing producers finish; expiring requests make new conflicting work yield.
+# Unrelated Docker updates share the backup gate instead of blocking Arr scans.
+# Plex direct play/stream is allowed; audio/video/background transcodes defer.
 # Native DockerMan/plugin installers retain their normal configuration semantics.
 # No OS installation/reboot, image-channel change, forced import or DB rollback.
 # SCHEDULE: */15 * * * *; registry polling has its own six-hour per-item cache.
@@ -76,7 +79,7 @@ usr_ops_append_log() {
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.3.0"
 # Keep configured per-item holds when approving the same installed identity.
 # Daily rolling tags need a shorter hold to avoid perpetually chasing rebuilds.
 readonly APPROVAL_JQ='def approval($old;$identity;$allow;$kind;$epoch):
@@ -104,6 +107,10 @@ MAX_CHECKS_PER_RUN=4
 CHECK_INTERVAL_SECONDS=21600
 BACKUP_MAX_AGE_SECONDS=$((80*3600))
 DOCKER_MAINTENANCE_DIR="${DOCKER_MAINTENANCE_DIR:-/run/docker-service-maintenance}"
+APP_UPDATE_REQUEST_DIR="${APP_UPDATE_REQUEST_DIR:-/run/docker-update-requests}"
+COORDINATION_WAIT_SECONDS="${COORDINATION_WAIT_SECONDS:-90}"
+CURRENT_REQUEST='' REQUEST_KEEP=false GUARD_GLOBAL=false
+PRODUCER_FDS=()
 TMP_DIR='' START_EPOCH=0 RUN_ID='' RESULT=OK SUMMARY='' RECOVERY_REASON='' INSTALL_ACTIVE=false UPDATE_FD='' EXPORT_FD='' LEASE_FILE='' OWN_GATE_FD='' MAINT_FD='' EVENTS=0
 log(){ local level="$1";shift;local line;line=$(OPS_RUN_ID="${RUN_ID:-$$}" usr_ops_log_line "$level" "${PHASE:-MAIN}" "$*");printf '%s\n' "$line";[[ ! -d "$STATE_DIR" ]] || usr_ops_append_log "$LOG_FILE" "$line"; }
 valid_name(){ [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; }
@@ -352,20 +359,96 @@ backup_evidence() {
     fi
 }
 
+release_operation_locks() {
+    local fd
+    [[ -z "${OWN_GATE_FD:-}" ]] || exec {OWN_GATE_FD}>&-
+    OWN_GATE_FD=''
+    for fd in "${PRODUCER_FDS[@]}";do exec {fd}>&-;done
+    PRODUCER_FDS=()
+}
+clear_update_request() {
+    local file="${1:-${CURRENT_REQUEST:-}}"
+    [[ -n "$file" && -f "$file" && ! -L "$file" ]] || return 0
+    jq -e '.schema==1 and .owner=="system_update_coordinator"' "$file" >/dev/null 2>&1 || return 1
+    rm -f -- "$file"
+}
+request_update_handoff() {
+    local name="$1" scopes="$2" temp now file
+    CURRENT_REQUEST='';REQUEST_KEEP=false
+    [[ "$scopes" != '[]' ]] || return 0
+    valid_name "$name" || return 1
+    [[ ! -L "$APP_UPDATE_REQUEST_DIR" ]] || return 1
+    mkdir -p "$APP_UPDATE_REQUEST_DIR" || return 1
+    file="$APP_UPDATE_REQUEST_DIR/$name.json";now=$(date +%s)
+    if [[ -e "$file" ]];then
+      [[ ! -L "$file" ]] && jq -e --arg name "$name" '.owner=="system_update_coordinator" and .target==$name' "$file" >/dev/null 2>&1 || { SUMMARY="Update handoff for $name cannot be owned safely; existing request preserved";return 1; }
+    fi
+    temp=$(mktemp "$APP_UPDATE_REQUEST_DIR/.request.XXXXXX") || return 1
+    jq -n --arg name "$name" --arg run "$RUN_ID" --arg boot "$(cat /proc/sys/kernel/random/boot_id)" --argjson now "$now" --argjson scopes "$scopes" \
+      '{schema:1,owner:"system_update_coordinator",target:$name,runId:$run,boot:$boot,issuedAt:$now,expires:($now+1200),scopes:$scopes,phase:"waiting",reason:"Approved update handoff; existing producer may finish; new conflicting work yields"}' >"$temp" && mv "$temp" "$file" || return 1
+    CURRENT_REQUEST="$file"
+}
+prune_update_requests() {
+    local file now boot
+    [[ ! -L "$APP_UPDATE_REQUEST_DIR" ]] || return 1
+    now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id)
+    for file in "$APP_UPDATE_REQUEST_DIR/"*.json;do
+      [[ -f "$file" && ! -L "$file" ]] || continue
+      if jq -e --arg boot "$boot" --argjson now "$now" '.owner=="system_update_coordinator" and (.boot!=$boot or ((.expires|type)=="number" and .expires<=$now))' "$file" >/dev/null 2>&1;then rm -f -- "$file";fi
+    done
+}
 maintenance_guard() {
-    local lock values hour minute
-    for lock in /tmp/backup_cache_appdata.lock /tmp/backup_boot_disk.lock /tmp/backup_media_remote.lock /run/backup_vault_remote.lock /run/media_plex_dbrepair.lock /run/backup_restore_drill.lock /run/media_cleanup.lock /run/media_integrity_audit.lock;do
+    local kind="${1:-plugin}" name="${2:-plugin}" identity="${3:-}" lock values fd scopes='[]' exclusive=false family="${2:-plugin} ${3:-}"
+    [[ "$COORDINATION_WAIT_SECONDS" =~ ^[0-9]+$ ]] && ((COORDINATION_WAIT_SECONDS<=120)) || { SUMMARY="Invalid coordination wait limit";return 1; }
+    local deadline=$(( $(date +%s)+COORDINATION_WAIT_SECONDS ))
+    family=${family,,}
+    release_operation_locks
+    [[ "${REQUEST_KEEP:-false}" == true ]] || clear_update_request || return 1
+    CURRENT_REQUEST='';REQUEST_KEEP=false;GUARD_GLOBAL=true
+    for lock in /tmp/backup_cache_appdata.lock /tmp/backup_boot_disk.lock /tmp/backup_media_remote.lock /run/backup_vault_remote.lock /run/backup_restore_drill.lock;do
       if [[ -e "$lock" ]];then flock -s -n "$lock" -c true || { SUMMARY="Maintenance deferred: ${lock##*/} active";return 1; };fi
     done
-    # Do not compete with manual/native package or container installations.
     pgrep -f '(^|/)(update_container|installpkg|upgradepkg|removepkg)([[:space:]]|$)|/scripts/plugin (install|update|remove)([[:space:]]|$)' >/dev/null && { SUMMARY='Maintenance deferred: native installer/package operation active';return 1; }
     pgrep -f '(^|/)(mover|mover\.old)([[:space:]]|$)|mover\.php' >/dev/null && { SUMMARY='Maintenance deferred: Mover active';return 1; }
-    values=$(bounded 5 /usr/local/sbin/mdcmd status) || return 1
-    grep -q '^mdState=STARTED$' <<<"$values" || return 1
-    # Only active parity/check/rebuild I/O; a stale position is not active work.
+    values=$(bounded 5 /usr/local/sbin/mdcmd status) || { SUMMARY='Array activity could not be verified';return 1; }
+    grep -q '^mdState=STARTED$' <<<"$values" || { SUMMARY='Array is not started';return 1; }
     [[ $(awk -F= '$1=="mdResync"{print $2}' <<<"$values") == 0 ]] || { SUMMARY='Maintenance deferred: active array operation';return 1; }
-    exec {OWN_GATE_FD}>"$ARR_BACKUP_GATE";flock -x -n "$OWN_GATE_FD" || { exec {OWN_GATE_FD}>&-;SUMMARY='Maintenance deferred: application producer/monitor active';return 1; }
+    GUARD_GLOBAL=false
+    local -a producer_locks=()
+    if [[ "$kind" == plugin || "$family" =~ sonarr|radarr|sabnzbd|prowlarr ]];then
+      exclusive=true;scopes='["arr","torrent","metadata","integrity"]'
+      [[ "$kind" != plugin ]] || producer_locks+=(/run/media_plex_dbrepair.lock)
+    elif [[ "$family" == *qbittorrent* ]];then
+      scopes='["torrent"]';producer_locks+=(/tmp/media_torrent_management.lock)
+    elif [[ "$family" =~ plex|kometa|metafusion|imagemaid ]];then
+      scopes='["metadata"]';producer_locks+=("${METADATA_AUDIT_LOCK:-/mnt/vault/cloud/logs/script/media_metadata_audit/audit.lock}")
+      [[ "$family" != *plex* ]] || producer_locks+=(/run/media_plex_dbrepair.lock)
+    elif [[ "$family" == *bazarr* ]];then
+      scopes='["integrity"]';producer_locks+=(/run/media_integrity_audit.lock)
+    fi
+    request_update_handoff "$name" "$scopes" || return 1
+    # Wait only for existing consumers, never remove their lock. The expiring
+    # request survives a busy attempt so the next scheduled run can resume.
+    for lock in "${producer_locks[@]}";do
+      [[ -e "$lock" ]] || continue
+      exec {fd}>"$lock" || return 1
+      if ! flock -s -w "$((deadline>$(date +%s) ? deadline-$(date +%s) : 0))" "$fd";then
+        exec {fd}>&-;REQUEST_KEEP=true;SUMMARY="$name update waiting for ${lock##*/} to finish; bounded handoff remains queued; no app stopped";return 1
+      fi
+      PRODUCER_FDS+=("$fd")
+    done
+    exec {OWN_GATE_FD}>"$ARR_BACKUP_GATE" || return 1
+    local mode=-s;[[ "$exclusive" != true ]] || mode=-x
+    if ! flock "$mode" -w "$((deadline>$(date +%s) ? deadline-$(date +%s) : 0))" "$OWN_GATE_FD";then
+      REQUEST_KEEP=true;SUMMARY="$name update waiting for existing application/backup operation to finish; next eligible run resumes after verification; no lock bypassed";return 1
+    fi
+    # Recyclarr has its own native scheduler, outside the shared script gate.
+    if [[ "$kind" == docker && "$family" =~ sonarr|radarr ]] && jq -e '.docker.recyclarr.running==true' "$TMP_DIR/inventory.json" >/dev/null 2>&1;then
+      readiness recyclarr || { REQUEST_KEEP=true;SUMMARY="$name update waiting for native Recyclarr sync/idle verification; no app stopped";return 1; }
+    fi
+    SUMMARY="$name maintenance handoff acquired; existing conflicting operations completed"
 }
+
 
 readiness() {
     local name="$1"
@@ -470,7 +553,7 @@ recover_preparation() {
 }
 
 defer_prepared() {
-    job_update "$1" '.jobs[$id].status="DEFERRED" | .jobs[$id].reason=$reason' --arg reason "$2" || return 1
+    job_update "$1" '.jobs[$id].status="DEFERRED" | .jobs[$id].reason=$reason | .jobs[$id].retryAt=$retry' --argjson retry "$(( $(date +%s)+300 ))" --arg reason "$2" || return 1
     cleanup_unissued_set "$1" || true
 }
 
@@ -485,6 +568,7 @@ reconcile_jobs() {
         continue
       fi
       if job_verified "$id";then
+        clear_update_request "$APP_UPDATE_REQUEST_DIR/$name.json" || return 1
         count=$(jq -r --arg id "$id" '.jobs[$id].verifiedScans // 0' "$STATE_FILE");count=$((count+1))
         job_update "$id" '.jobs[$id].verifiedScans=$count' --argjson count "$count" || return 1
         if ((count>=2));then
@@ -556,7 +640,7 @@ install_one() {
       [[ "$approved" == true ]] || continue
       # Failed/rejected digest/version stays quarantined until it changes or an
       # operator explicitly resolves the job; no reinstall loops.
-      jq -e --arg key "$key" --arg candidate "$candidate" --argjson cutoff "$((now-6*3600))" 'all(.jobs[];.item!=$key or .candidate!=$candidate or (.status=="DEFERRED" and .startedAt<$cutoff))' "$STATE_FILE" >/dev/null || continue
+      jq -e --arg key "$key" --arg candidate "$candidate" --argjson cutoff "$((now-6*3600))" --argjson now "$now" 'all(.jobs[];.item!=$key or .candidate!=$candidate or (.status=="DEFERRED" and (.retryAt // (.startedAt+21600))<=$now))' "$STATE_FILE" >/dev/null || continue
       quota_available "$kind" || { decision "$key" "Rolling 24-hour $kind update limit reached";continue; }
       backup_evidence "$kind" || { decision "$key" "Recent verified backup evidence unavailable";log INFO "$name: DEFERRED; recent verified backup evidence unavailable";continue; }
       if [[ "$kind" == docker ]];then
@@ -576,7 +660,17 @@ install_one() {
         bounded 30 "$NATIVE_PLUGIN" validate "/tmp/plugins/$name" >"$TMP_DIR/plugin-validate.log" 2>&1 || { decision "$key" "Native plugin package/hash validation failed";continue; }
       fi
       if [[ "$kind" == plugin ]];then plugin_service_guard "$name" || { decision "$key" "Host network or Plex/GPU dependency is active/unverified; plugin update deferred";continue; };fi
-      maintenance_guard || { decision "$key" "${SUMMARY:-Maintenance guard unavailable}";log INFO "${SUMMARY:-Maintenance conditions unavailable; installation deferred}";return 0; }
+      if ! maintenance_guard "$kind" "$name" "$identity";then
+        decision "$key" "${SUMMARY:-Maintenance guard unavailable}";log INFO "${SUMMARY:-Maintenance conditions unavailable; installation deferred}"
+        release_operation_locks
+        [[ "$GUARD_GLOBAL" != true ]] || return 0
+        continue
+      fi
+      # The producer finished while we waited; prove current readiness again.
+      if [[ "$kind" == docker ]] && ! readiness "$name";then
+        decision "$key" "$(jq -r '.detail // "Application busy after handoff; update deferred"' "$TMP_DIR/readiness.json" 2>/dev/null)"
+        clear_update_request;CURRENT_REQUEST='';REQUEST_KEEP=false;release_operation_locks;continue
+      fi
       decision "$key" "Recovery preparation started"
       PHASE=install;job_id="$(date +%Y%m%d_%H%M%S)_${kind}_${name}_$$"
       recovery_path="$ROLLBACK_ROOT/$job_id"
@@ -616,6 +710,10 @@ install_one() {
         [[ "$kind" != plugin ]] || first_evidence='expected plugin version/source/manifest and completed native task verified'
         event normal 'Update installed; follow-up verification pending' "$name: native installer completed; $first_evidence. A second scheduled observation will confirm stability. Recovery set: $recovery_path. No image channel or application settings were changed by this coordinator." "installed:$job_id" || return 1
       elif [[ "${VERIFY_REASON:-}" == readiness ]];then
+        REQUEST_KEEP=true
+        if [[ -n "$CURRENT_REQUEST" && -f "$CURRENT_REQUEST" ]];then
+          jq --argjson expires "$(( $(date +%s)+1200 ))" '.expires=$expires | .phase="startup_grace"' "$CURRENT_REQUEST" >"$TMP_DIR/request-startup" && mv "$TMP_DIR/request-startup" "$CURRENT_REQUEST" || return 1
+        fi
         event normal 'Update installed; startup verification pending' "$name: expected image digest and retained configuration verified; application readiness is still pending within the 20-minute startup grace. Further installations and watchdog restarts remain held while scheduled reconciliation checks actual readiness. Recovery set: $recovery_path." "startup:$job_id" || return 1
       else
         RESULT=ATTENTION
@@ -711,7 +809,7 @@ render_update_report() {
         .key as $key|.value as $i|
         if ($i.checkStatus=="VERIFIED" and $i.available!=true and ($i.missingScans // 0)==0) then empty
         elif any($s.jobs[];.item==$key and ((.status|IN("INTENT","VERIFYING","ATTENTION")) or (.status=="COMPLETED" and .candidate==$i.candidate and (.verifiedAt // 0)>=$start))) then empty
-        else "- "+$i.kind+"/"+$i.name+": "+reason($key;$i)+". Last check: "+(if ($i.checkedAt // 0)>0 then ($i.checkedAt|strflocaltime("%Y-%m-%d %H:%M SGT")) else "not yet performed" end) end),
+        else "- "+$i.kind+"/"+$i.name+": "+reason($key;$i)+". Update evidence checked: "+(if ($i.checkedAt // 0)>0 then ($i.checkedAt|strflocaltime("%Y-%m-%d %H:%M SGT")) else "not yet performed" end)+(if ($i.decision.at // 0)>0 then "; installation decision: "+($i.decision.at|strflocaltime("%Y-%m-%d %H:%M SGT")) else "" end) end),
       "", "Removed items retire after two complete inventories. No OS installation, reboot or automatic database rollback is performed."'
 }
 
@@ -771,7 +869,8 @@ finish() {
       rm -f -- "$LEASE_FILE"
     fi
     [[ -z "${MAINT_FD:-}" ]] || exec {MAINT_FD}>&-
-    [[ -z "${OWN_GATE_FD:-}" ]] || exec {OWN_GATE_FD}>&-
+    release_operation_locks
+    [[ "$REQUEST_KEEP" == true ]] || clear_update_request || true
     ((rc==0)) || RESULT=FAILED
     if ((rc!=0)) && [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && state_valid "$STATE_FILE";then
       event alert 'Coordinator stopped before completion' "${SUMMARY:-Coordinator operation failed}. Durable intents and recovery evidence were retained. No uncertain installer action will be replayed; next scheduled run reconciles actual state." coordinator-execution-failed || true
@@ -814,6 +913,11 @@ No command: automatic policy evaluation, bounded checks, approved installation i
 Removing an app/plugin needs no command: two complete inventories retire its entry.
 New/reinstalled identities default to reporting only and can be approved with CLI.
 No command changes Docker startup/template/application settings or image channels.
+Active conflicting scripts finish normally; updater waits up to 90 seconds, then
+retries on its existing schedule. Expiring 20-minute requests let new conflicting
+work yield, avoiding repeated collisions. Unrelated Docker apps remain eligible.
+Plex direct play/direct stream permits updates (brief playback interruption is
+possible); transcoding, database repair and backups still defer installation.
 Approval enables native updates within the existing configured channel. The age
 hold defaults to 24h; nightly/develop/unstable Docker tags default to 12h.
 Both measure this coordinator's observation, not registry publication.
@@ -835,6 +939,7 @@ main() {
       fi
       return 1
     fi
+    prune_update_requests
     trap finish EXIT
     trap 'SUMMARY="Update coordinator interrupted; durable intent retained";exit 143' INT TERM HUP
     case "${1:-}" in

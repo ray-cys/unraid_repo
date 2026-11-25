@@ -1,6 +1,6 @@
 #!/bin/bash
 clearLog=true
-# Docker Service Watchdog v3.12 -- Unraid service availability and bounded recovery.
+# Docker Service Watchdog v3.13 -- Unraid service availability and bounded recovery.
 # Optional schedule: every five minutes. Pi-hole and application-specific health
 # remain owned by the DNS and Arr monitors. Recovery follows Hubble's existing
 # per-service permissions; VPN/configuration findings never request restarts.
@@ -54,7 +54,7 @@ usr_ops_append_log() {
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.12"
+readonly SCRIPT_VERSION="3.13"
 
 ###############################################################################
 # CONFIGURATION
@@ -1132,18 +1132,75 @@ print(json.dumps({'ready':bool(ready),'classification':'ready' if ready else 'bu
 PY
 }
 
+plex_sessions_summary() {
+    # Parse only decisions/counts; never print session titles, users or tokens.
+    php -r '
+      $x=@simplexml_load_string(stream_get_contents(STDIN),"SimpleXMLElement",LIBXML_NONET);
+      if(!$x||$x->getName()!=="MediaContainer"||!isset($x["size"])||!preg_match("/^[0-9]+$/",(string)$x["size"]))exit(1);
+      $total=0;$transcodes=0;$remux=0;$unknown=0;
+      foreach($x->children() as $session){
+        if(!in_array($session->getName(),["Video","Track","Photo"],true)){ $unknown++;continue; }
+        $total++;$transcode=false;$copy=false;$uncertain=false;
+        foreach($session->xpath(".//TranscodeSession|.//Media|.//Stream") as $node){
+          $isTranscode=$node->getName()==="TranscodeSession";$decisions=[];
+          foreach(["videoDecision","audioDecision"] as $key)if(isset($node[$key]))$decisions[]=(string)$node[$key];
+          if($node->getName()==="Stream" && in_array((string)$node["streamType"],["1","2"],true) && isset($node["decision"]))$decisions[]=(string)$node["decision"];
+          if($isTranscode && !$decisions)$uncertain=true;
+          foreach($decisions as $decision){
+            $d=strtolower(str_replace([" ","_","-"],"",$decision));
+            if($d==="transcode")$transcode=true;
+            elseif(!in_array($d,["copy","directplay","directstream","none"],true))$uncertain=true;
+          }
+          if($isTranscode && $decisions && !$transcode && !$uncertain)$copy=true;
+        }
+        if($transcode)$transcodes++;elseif($uncertain)$unknown++;elseif($copy)$remux++;
+      }
+      if($total!==(int)$x["size"])exit(1);
+      $processes=(int)$argv[1];$background=max(0,$processes-$transcodes-$remux);
+      $ready=$transcodes===0 && $background===0 && $unknown===0;
+      echo json_encode(["ready"=>$ready,"classification"=>$ready?"ready":($unknown?"unverified":"busy"),"source"=>"plex-transcode-activity","sessions"=>$total,"transcodingSessions"=>$transcodes,"directStreamSessions"=>$remux,"backgroundTranscoders"=>$background,"unverifiedSessions"=>$unknown,
+        "detail"=>$unknown?"Plex playback/transcode decisions are incomplete; update deferred":($ready?"No audio/video transcoding; ".($total-$remux)." direct-play and ".$remux." direct-stream session(s) allowed; playback may briefly reconnect during update":$transcodes." transcoding session(s), ".$background." background transcoder(s); update deferred")]);
+    ' "$1"
+}
 plex_update_readiness() {
-    local name="$1" count
-    # Token stays inside the container and curl configuration on standard input;
-    # it is never printed, persisted or passed in a process argument.
-    count=$(docker_cmd exec "$name" sh -c '
+    local name="$1" processes output
+    output=$(docker_cmd top "$name" -eo pid,comm) || return 1
+    processes=$(awk 'NR>1 && /Plex Transcoder/ {n++} END {print n+0}' <<<"$output")
+    docker_cmd exec "$name" sh -c '
       token=$(sed -n "s/.*PlexOnlineToken=\"\([^\"]*\)\".*/\1/p" "/config/Library/Application Support/Plex Media Server/Preferences.xml")
       case "$token" in ""|*[!A-Za-z0-9_-]*) exit 1;;esac
-      printf "header = \"X-Plex-Token: %s\"\n" "$token" | curl --config - --silent --fail --noproxy "*" --max-time 5 --max-filesize 262144 http://127.0.0.1:32400/status/sessions' 2>/dev/null |
-      php -r '$x=@simplexml_load_string(stream_get_contents(STDIN),"SimpleXMLElement",LIBXML_NONET);if(!$x||$x->getName()!=="MediaContainer"||!isset($x["size"]))exit(1);echo (int)$x["size"];') || return 1
-    [[ "$count" =~ ^[0-9]+$ ]] || return 1
-    jq -n --argjson count "$count" '{ready:($count==0),classification:(if $count==0 then "ready" else "busy" end),source:"plex-sessions",detail:(if $count==0 then "No active Plex playback sessions" else ($count|tostring)+" active Plex session(s); update deferred" end)}'
+      printf "header = \"X-Plex-Token: %s\"\n" "$token" | curl --config - --silent --fail --noproxy "*" --max-time 5 --max-filesize 262144 http://127.0.0.1:32400/status/sessions' 2>/dev/null | plex_sessions_summary "$processes"
 }
+
+arr_activity_summary() {
+    jq -e '
+      if (.commands|type)!="array" or (.queue.records|type)!="array" or (.queue.totalRecords|type)!="number" or .queue.totalRecords>(.queue.records|length) then error("Incomplete Arr activity evidence") else . end |
+      [.commands[]|select((.status|ascii_downcase)=="started" or (.status|ascii_downcase)=="queued" or (.status|ascii_downcase)=="running")] as $commands |
+      [.queue.records[]|select((.trackedDownloadState // ""|ascii_downcase)=="importing" or (.trackedDownloadState // ""|ascii_downcase)=="processing")] as $imports |
+      {ready:($commands|length)==0 and ($imports|length)==0,classification:(if ($commands|length)+($imports|length)>0 then "busy" else "ready" end),source:"native-arr-activity",activeCommands:($commands|length),activeImports:($imports|length),detail:(if ($commands|length)+($imports|length)>0 then "Native Arr command/import operation active; update deferred until completion" else "Native Arr command/import activity idle; queued downloads and import warnings alone do not block updates" end)}'
+}
+arr_update_readiness() {
+    local name="$1"
+    # Arr images need only their existing shell/curl; credentials stay inside
+    # the container and are supplied through curl stdin, never process arguments.
+    docker_cmd exec "$name" sh -c '
+      config=/config/config.xml
+      key=$(sed -n "s:.*<ApiKey>\([^<]*\)</ApiKey>.*:\1:p" "$config")
+      port=$(sed -n "s:.*<Port>\([^<]*\)</Port>.*:\1:p" "$config")
+      base=$(sed -n "s:.*<UrlBase>\([^<]*\)</UrlBase>.*:\1:p" "$config")
+      case "$key" in ""|*[!a-zA-Z0-9]*) exit 1;;esac
+      case "$port" in ""|*[!0-9]*) exit 1;;esac
+      fetch(){ printf "header = \"X-Api-Key: %s\"\n" "$key" | curl --config - --noproxy "*" --silent --fail --connect-timeout 3 --max-time 6 --max-filesize 4194304 "$1"; }
+      for version in v3 v5;do
+        url="http://127.0.0.1:$port${base%/}/api/$version"
+        commands=$(fetch "$url/command") || continue
+        queue=$(fetch "$url/queue?page=1&pageSize=1000&includeUnknownMovieItems=true&includeUnknownSeriesItems=true") || exit 1
+        printf "{\"commands\":%s,\"queue\":%s}\n" "$commands" "$queue"
+        exit 0
+      done
+      exit 1' | arr_activity_summary
+}
+
 
 sab_readiness() {
     local purpose="$1"
@@ -1215,6 +1272,7 @@ d=json.load(r);d=d.get("data",d);assert isinstance(d,dict) and d.get("bazarr_ver
         case "$name" in
           kometa|imagemaid|recyclarr) [[ -n "$evidence" ]] || evidence=$(scheduler_readiness "$name" "$purpose" 2>/dev/null) || evidence='{"ready":false,"classification":"unverified","source":"native-scheduler","detail":"Scheduler readiness could not be verified"}';;
           sabnzbd) [[ -n "$evidence" ]] || evidence=$(sab_readiness "$purpose" 2>/dev/null) || evidence='{"ready":false,"classification":"unverified","source":"native-sab-api","detail":"SAB activity state could not be verified"}';;
+          sonarr|radarr) evidence=$(arr_update_readiness "$name" 2>/dev/null) || evidence='{"ready":false,"classification":"unverified","source":"native-arr-activity","detail":"Native Arr command/import activity unavailable; update deferred"}';;
           plex-media|plex-media-server) evidence=$(plex_update_readiness "$name" 2>/dev/null) || evidence='{"ready":false,"classification":"unverified","source":"plex-sessions","detail":"Plex sessions could not be verified; update deferred"}';;
           metafusion)
             if ! docker_cmd exec metafusion cat /tmp/metafusion-status.json | jq -e '.state=="idle"' >/dev/null 2>&1;then evidence='{"ready":false,"classification":"busy","source":"native-metafusion","detail":"MetaFusion is active or idle state unavailable; update deferred"}';fi;;

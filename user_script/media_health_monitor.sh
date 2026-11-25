@@ -1,8 +1,13 @@
 #!/bin/bash
 clearLog=true
 
+# Read-only version lookup must return before state, API or automation setup.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]];then
+    printf 'media_health_monitor.sh 3.23.0\n';exit 0
+fi
+
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.22.1
+# ARR Health / Download / Import Monitor v3.23.0
 #
 # PURPOSE
 # -------
@@ -6992,7 +6997,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'Media Health Monitor v3.22.1 lifecycle commands' \
+        'Media Health Monitor v3.23.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -16858,6 +16863,23 @@ require_command pgrep
 # resolve issues, send reminders, poll APIs, or submit recovery commands.
 # CLI state administration remains available during a backup.
 ###############################################################################
+# Expiring updater handoff: current operations finish; new conflicting work
+# yields before reading/mutating app state. Never deletes or overrides a lock.
+app_update_requested() {
+    local scope="$1" file now boot seen=0
+    now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || return 1
+    for file in "${APP_UPDATE_REQUEST_DIR:-/run/docker-update-requests}/"*.json;do
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        seen=$((seen+1));((seen<=128)) || break
+        (( $(stat -c %s "$file" 2>/dev/null || printf 999999)<=8192 )) || continue
+        if jq -e --arg scope "$scope" --arg boot "$boot" --argjson now "$now" '
+          .schema==1 and .owner=="system_update_coordinator" and .boot==$boot and
+          (.expires|type)=="number" and .expires>$now and .expires<=$now+1200 and
+          (.scopes|type)=="array" and (.scopes|index($scope))!=null' "$file" >/dev/null 2>&1;then return 0;fi
+    done
+    return 1
+}
+
 ARR_BACKUP_GATE="${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}"
 ARR_BACKUP_GRACE="${ARR_BACKUP_GRACE:-/run/arr-appdata-recovery-until}"
 ARR_BACKUP_DEFERRED_AT="${ARR_BACKUP_DEFERRED_AT:-/run/media-health-monitor-backup-deferred-at}"
@@ -16865,6 +16887,7 @@ if [[ $# == 0 ]]; then
     exec {ARR_BACKUP_GATE_FD}>"$ARR_BACKUP_GATE" || exit 3
     arr_backup_deferred=false
     flock -s -n "$ARR_BACKUP_GATE_FD" || arr_backup_deferred=true
+    app_update_requested arr && arr_backup_deferred=true
     arr_grace_until=$(cat "$ARR_BACKUP_GRACE" 2>/dev/null || true)
     arr_gate_now=$(date +%s)
     if [[ "$arr_grace_until" =~ ^[0-9]+$ ]] &&
@@ -16979,6 +17002,9 @@ case "${1:-}" in
         print_lifecycle_command_help
         exit 0
         ;;
+    *)
+        if (( $#>0 ));then printf 'Unknown command: %s; use --help\n' "$1" >&2;exit 2;fi
+        ;;
 esac
 
 if [[ -r "${UNRAID_VERSION_FILE:-/etc/unraid-version}" ]]; then
@@ -17012,7 +17038,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | Media Health Monitor v3.22.1"
+    "START | Media Health Monitor v3.23.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -17025,7 +17051,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting Media Health Monitor v3.22.1"
+debug_log "Starting Media Health Monitor v3.23.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -17657,7 +17683,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "Media Health Monitor v3.22.1 completed"
+log "Media Health Monitor v3.23.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""

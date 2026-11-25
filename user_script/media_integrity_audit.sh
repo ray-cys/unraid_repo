@@ -3,7 +3,7 @@
 clearLog=true
 arrayStarted=true
 ###############################################################################
-# Media Integrity Audit v2.6.2 -- personal Unraid User Script
+# Media Integrity Audit v2.6.3 -- personal Unraid User Script
 #
 # PURPOSE / USE CASE
 # ------------------
@@ -197,7 +197,7 @@ umask 077
 # stay unverified. Completed ranges prove decoder acceptance, not perfect visual
 # playback. Legacy probe-only incidents are re-evaluated without replacing media.
 # Worker transport failures preserve the last checkpoint and never accuse media.
-readonly SCRIPT_VERSION="2.6.2"
+readonly SCRIPT_VERSION="2.6.3"
 BAZARR_CONTAINER="bazarr"
 MEDIA_HOST_ROOT="/mnt/user/media"
 MEDIA_CONTAINER_ROOT="/data"
@@ -1088,6 +1088,23 @@ recovery_resume_core() {
     jq --arg id "$id" '.actions[$id]' "$RECOVERY_FILE" >"$job"
     recovery_correlate "$id" "$job" || recovery_set "$id" review 'Grab sent once; exact native download identity not yet established. No replay; follow-up reads history before further action.'
 }
+# Expiring updater handoff: current operations finish; new conflicting work
+# yields before reading/mutating app state. Never deletes or overrides a lock.
+app_update_requested() {
+    local scope="$1" file now boot seen=0
+    now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || return 1
+    for file in "${APP_UPDATE_REQUEST_DIR:-/run/docker-update-requests}/"*.json;do
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        seen=$((seen+1));((seen<=128)) || break
+        (( $(stat -c %s "$file" 2>/dev/null || printf 999999)<=8192 )) || continue
+        if jq -e --arg scope "$scope" --arg boot "$boot" --argjson now "$now" '
+          .schema==1 and .owner=="system_update_coordinator" and .boot==$boot and
+          (.expires|type)=="number" and .expires>$now and .expires<=$now+1200 and
+          (.scopes|type)=="array" and (.scopes|index($scope))!=null' "$file" >/dev/null 2>&1;then return 0;fi
+    done
+    return 1
+}
+
 recovery_process() {
     [[ "$AUTO_RECOVERY_ENABLED" == true ]] || return 0
     recovery_platform_ready && recovery_valid || { RECOVERY_NOTE='Recovery platform/journal unavailable; no mutation allowed';return 1; }
@@ -1095,6 +1112,7 @@ recovery_process() {
     RECOVERY_DEADLINE=$(( $(date +%s)+RECOVERY_MAX_SECONDS ))
     local fd hold id row count=0 rc=0 candidate="$TMP_DIR/native-candidate-plan.json" plan="$TMP_DIR/native-new-plan.json" now
     exec {fd}>"$ARR_BACKUP_GATE" || return 1;flock -s -n "$fd" || { exec {fd}>&-;return 0; }
+    if app_update_requested integrity;then exec {fd}>&-;return 0;fi
     exec {hold}>/tmp/arr_metadata_quarantine.lock || { exec {fd}>&-;return 1; };flock -n "$hold" || { exec {fd}>&-;exec {hold}>&-;return 0; }
     RECOVERY_NEW_GRABS=0
     while read -r id;do (( $(date +%s)<RECOVERY_DEADLINE )) || break;recovery_update ' if $now-(.actions[$id].checkedAt // 0)>=900 then .actions[$id].checkedAt=$now else . end ' --arg id "$id" --argjson now "$(date +%s)" || break;if ! recovery_resume "$id";then
@@ -1832,6 +1850,7 @@ main() {
     find "$STATE_DIR" -maxdepth 1 -type f \( -name 'media-integrity-audit.log.1' -o -name 'media-integrity-audit.log.2' \) -mtime +29 -delete
     log INFO "Media Integrity Audit v$SCRIPT_VERSION started; mode=$MODE; scope=${LIBRARY_SUBDIRS[*]}; budget=${MAX_RUNTIME_SECONDS}s"
     if ! load_state; then write_report FAILED 'State invalid/unrecoverable; original state preserved and no scan started';return 1;fi
+    if app_update_requested integrity;then write_report DEFERRED "Bazarr or coordinated Arr update requested; existing coverage and recovery state retained";return 0;fi
     if ! workload_guard; then
         status=DEFERRED
         case "$GUARD_REASON" in *unavailable*|*unverified*|*stopped*|*symlinked*) status=FAILED;; esac

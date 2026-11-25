@@ -56,7 +56,7 @@ usr_ops_append_log() {
 }
 # END EMBEDDED OPERATIONS CONTRACT
 set -uo pipefail
-readonly SCRIPT_VERSION="3.2"
+readonly SCRIPT_VERSION="3.3"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/media_metadata_audit}"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 NOTIFY_BIN="${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}"
@@ -505,6 +505,23 @@ PYWEEKLY
     rm -f "$result" "$pending"
 }
 
+# Expiring updater handoff: current operations finish; new conflicting work
+# yields before reading/mutating app state. Never deletes or overrides a lock.
+app_update_requested() {
+    local scope="$1" file now boot seen=0
+    now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || return 1
+    for file in "${APP_UPDATE_REQUEST_DIR:-/run/docker-update-requests}/"*.json;do
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        seen=$((seen+1));((seen<=128)) || break
+        (( $(stat -c %s "$file" 2>/dev/null || printf 999999)<=8192 )) || continue
+        if jq -e --arg scope "$scope" --arg boot "$boot" --argjson now "$now" '
+          .schema==1 and .owner=="system_update_coordinator" and .boot==$boot and
+          (.expires|type)=="number" and .expires>$now and .expires<=$now+1200 and
+          (.scopes|type)=="array" and (.scopes|index($scope))!=null' "$file" >/dev/null 2>&1;then return 0;fi
+    done
+    return 1
+}
+
 main() {
     if [[ ${1:-} == --version ]]; then printf 'media_metadata_audit.sh %s\n' "$SCRIPT_VERSION"; return; fi
     if [[ ${1:-} == --help ]]; then
@@ -525,7 +542,7 @@ main() {
     METADATA_STARTED=$(date +%s);METADATA_RUN_ID="${METADATA_STARTED}_$$";METADATA_STATUS=RUNNING;METADATA_PHASE=weekly-report;METADATA_SUMMARY='Audit started';METADATA_WEEKLY_STATUS=RUNNING
     trap 'metadata_finish "$?"' EXIT
     # Planned container downtime is a maintenance deferral, not failed reporting.
-    exec {gate}>"${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}";flock -s -n "$gate" || { METADATA_STATUS=DEFERRED;METADATA_WEEKLY_STATUS=DEFERRED;METADATA_SUMMARY='Scheduled application maintenance active; reporting and configuration changes deferred';return 0; }
+    exec {gate}>"${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}";flock -s -n "$gate" && ! app_update_requested metadata || { METADATA_STATUS=DEFERRED;METADATA_WEEKLY_STATUS=DEFERRED;METADATA_SUMMARY='Scheduled application maintenance active; reporting and configuration changes deferred';return 0; }
     local weekly_rc=0
     weekly_media_report false || weekly_rc=$?
     METADATA_WEEKLY_STATUS=OK;((weekly_rc==0)) || METADATA_WEEKLY_STATUS=FAILED
