@@ -169,3 +169,5 @@ assert m.classify(dict(code=0,stop='',err='Invalid NAL unit'))=='unverified_deco
 assert m.classify(dict(code=1,stop='',err='Invalid NAL unit'),stage='probe')=='unverified_container'
 assert m.classify(dict(code=1,stop='',err='Invalid NAL unit'))=='decode_error'
 print('Nonfatal diagnostics, unknown warnings and probe-only failure classification passed')
+
+assert m.classify(dict(code=0,stop='',err='Last message repeated 10 times'))=='unverified_decoder_warning'

@@ -1077,7 +1077,7 @@ PROOF_VERSION=2
 def benign_diagnostics(text):
     lines=[line.strip() for line in text.splitlines() if line.strip()]
     lines=[re.sub(r'^(?:\[[^\]]+\]\s*)+','',line) for line in lines]
-    return bool(lines) and all(re.fullmatch(r'SEI type 5 size \d+ truncated at \d+|number of reference frames \(0\+\d+\) exceeds max \(\d+; probably corrupt input\), discarding one|Last message repeated \d+ times',line,re.I) for line in lines)
+    return bool(lines) and any(not line.lower().startswith('last message repeated') for line in lines) and all(re.fullmatch(r'SEI type 5 size \d+ truncated at \d+|number of reference frames \(0\+\d+\) exceeds max \(\d+; probably corrupt input\), discarding one|Last message repeated \d+ times',line,re.I) for line in lines)
 
 def failure_signature(text):
     text=re.sub(r'0x[0-9a-f]+','ADDRESS',text.lower())
