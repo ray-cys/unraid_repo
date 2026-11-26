@@ -1,6 +1,9 @@
 #!/bin/bash
+# CHECKPOINT EVIDENCE: records current-boot archive metadata after read-back;
+# backup_health_audit independently detects staleness without a new timer.
+# Unchanged archives stay valid; empty sources require independent empty read-back.
 clearLog=true
-# RAM-log readiness and lifecycle monitor v3.2 (Unraid User Scripts).
+# RAM-log readiness and lifecycle monitor v3.3 (Unraid User Scripts).
 # Schedule: */10 * * * * (unchanged). Normal runs check RAM-log health and save
 # changed logs to vault at most once per interval. Application logs are never
 # deleted/truncated/rotated. --prepare is the existing PRE-DOCKER boot hook;
@@ -202,7 +205,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
-readonly SCRIPT_VERSION="3.2.1"
+readonly SCRIPT_VERSION="3.3.0"
 RAMLOG_PATH="${RAMLOG_PATH:-/mnt/ramlogs}"
 RAMLOG_SIZE="${RAMLOG_SIZE:-2G}"
 RAMLOG_APPS=(sonarr radarr prowlarr bazarr tautulli recyclarr sabnzbd qbittorrent imagemaid seerr lumunarr)
@@ -410,8 +413,19 @@ run_ramlog_archive() {
     result=$(mktemp "$STATE_DIR/.archive-result.XXXXXX") || return 1
     timeout --kill-after=2 "$ARCHIVE_TIMEOUT_SECONDS" /bin/bash "$SELF_PATH" --archive "$reason" >"$result" 2>&1 || rc=$?
     cat "$result"
-    if ((rc==0)) && grep -Eq 'Archive checkpoint (not due|unchanged)|Completed RAM-log archive:' "$result";then
-        local checked_tmp
+    if ((rc==0)) && grep -Eq 'Archive checkpoint (not due|unchanged)|Completed RAM-log archive:|Archive skipped: RAM log tree has no regular files' "$result";then
+        local checked_tmp checkpoint newest='' candidate boot
+        boot=$(cat /proc/sys/kernel/random/boot_id)
+        while IFS= read -r candidate;do
+            if archive_generation_valid "$candidate" && [[ $(jq -r .bootId "$candidate/manifest.json") == "$boot" ]];then newest="$candidate";break;fi
+        done < <(find "$ARCHIVE_ROOT" -mindepth 1 -maxdepth 1 -type d -name 'ramlogs_*' | sort -r)
+        if grep -q 'Archive skipped: RAM log tree has no regular files' "$result";then
+            checkpoint=$(mktemp "$STATE_DIR/.checkpoint.XXXXXX") || return 1
+            jq -n --arg boot "$boot" --arg source "$RAMLOG_PATH" --argjson at "$(date +%s)" '{schema:1,bootId:$boot,checkedAt:$at,empty:true,source:$source}' >"$checkpoint" && mv "$checkpoint" "$STATE_DIR/checkpoint.json" || rc=1
+        elif [[ -n "$newest" ]];then
+            checkpoint=$(mktemp "$STATE_DIR/.checkpoint.XXXXXX") || return 1
+            jq -n --arg boot "$boot" --arg path "$newest" --arg manifest "$(sha256sum "$newest/manifest.json"|cut -d ' ' -f1)" --argjson bytes "$(stat -c %s "$newest/payload.tar.gz")" --argjson at "$(date +%s)" '{schema:1,bootId:$boot,checkedAt:$at,path:$path,manifestSha256:$manifest,payloadBytes:$bytes}' >"$checkpoint" && mv "$checkpoint" "$STATE_DIR/checkpoint.json" || rc=1
+        fi
         checked_tmp=$(mktemp "$STATE_DIR/.archive-checked.XXXXXX") && date +%s >"$checked_tmp" && mv "$checked_tmp" "$STATE_DIR/archive-checked.epoch" || rc=1
     fi
     if ((rc!=0)); then ARCHIVE_LAST_ERROR="Archive attempt failed (exit=$rc). $(tail -n 3 "$result") Previous completed snapshots were retained."; fi
@@ -501,7 +515,7 @@ monitor_ramlogs() {
     if mountpoint -q /mnt/vault; then
         mkdir -p -- "$STATUS_DIR" || return 1
         temp=$(mktemp "$STATUS_DIR/.ramlog.XXXXXX") || return 1
-        jq --argjson checked "$(cat "$STATE_DIR/archive-checked.epoch" 2>/dev/null || printf 0)" --arg name ram_logs_watchdog '{name:$name,status:.condition,summary:.reason,epoch:.epoch,archiveCheckedAt:$checked}' "$STATE_DIR/state.json" >"$temp" && mv "$temp" "$STATUS_DIR/ram_logs_watchdog.json" || return 1
+        jq --slurpfile checkpoint <(cat "$STATE_DIR/checkpoint.json" 2>/dev/null || printf '{}') --argjson checked "$(cat "$STATE_DIR/archive-checked.epoch" 2>/dev/null || printf 0)" --arg name ram_logs_watchdog '{name:$name,status:.condition,summary:.reason,epoch:.epoch,archiveCheckedAt:$checked,checkpoint:($checkpoint[0] // {})}' "$STATE_DIR/state.json" >"$temp" && mv "$temp" "$STATUS_DIR/ram_logs_watchdog.json" || return 1
     fi
     [[ "$condition" != CRITICAL ]]
 }

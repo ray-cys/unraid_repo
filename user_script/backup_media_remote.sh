@@ -1,8 +1,12 @@
 #!/bin/bash
+# COMPLETION EVIDENCE: schema-2 last-success and last-attempt receipts retain per-job
+# outcomes/policy identity. Success is published before shutdown/mail; unchanged
+# files use rsync size/mtime selection, not a full mirror rehash. --evidence-status
+# reads receipts without SSH or waking ISS. Missing statistics/read-back fail proof.
 clearLog=true
 
 ###############################################################################
-# Media Remote Backup v2.7
+# Media Remote Backup v2.8
 #
 # PURPOSE
 # -------
@@ -483,7 +487,7 @@ LOCK_FILE="/tmp/backup_media_remote.lock"
 
 
 readonly SCRIPT_ID="backup_media_remote"
-readonly SCRIPT_VERSION="2.7.1"
+readonly SCRIPT_VERSION="2.8.0"
 
 ###############################################################################
 # SHARED ISS COORDINATION AND TRANSPORT (embedded; standalone User Script)
@@ -690,6 +694,34 @@ backup_phase() {
     BACKUP_PHASE="$1"; BACKUP_PHASE_STARTED="$now"
 }
 BACKUP_PHASE_STARTED=$BACKUP_STARTED
+# Versioned producer evidence: publish data-copy success before shutdown/mail.
+# Rsync validates transferred data; unchanged files retain its size/mtime check.
+media_completion_evidence() {
+    local status="$1" phase="$2" now temp data='[]' descriptor label src dest excludes bw policy run
+    mountpoint -q "${MEDIA_EVIDENCE_MOUNT:-/mnt/vault}" || return 1
+    mkdir -p "$STATUS_DIR" || return 1
+    policy=$(printf '%s\0' "$REMOTE" "${BACKUP_JOBS[@]}" "${DEFAULT_EXCLUDES[@]}" "${RSYNC_BASE_ARGS[@]}"|sha256sum|cut -d ' ' -f1)
+    run="${RUN_STAMP:-$BACKUP_STARTED}-$BACKUP_STARTED";now=$(date +%s)
+    for descriptor in "${BACKUP_JOBS[@]}";do
+        IFS='|' read -r label src dest excludes bw <<<"$descriptor"
+        [[ -n "$label" ]] || continue
+        data=$(jq -nc --argjson data "$data" --arg name "$label" --arg source "$src" --arg destination "$dest" --arg reason "${RESULT_REASON[$label]:-Not run}" \
+          --argjson code "${RESULT_CODE[$label]:-1}" --argjson sent "${BYTES_SENT[$label]:-0}" --argjson bytes "${TRANSFERRED_BYTES[$label]:-0}" --argjson files "${FILES_TRANSFERRED[$label]:-0}" --argjson deleted "${DELETED_FILES[$label]:-0}" \
+          '$data+[{name:$name,source:$source,destination:$destination,exitCode:$code,reason:$reason,bytesSent:$sent,transferredBytes:$bytes,filesTransferred:$files,deletedFiles:$deleted}]') || return 1
+    done
+    temp=$(mktemp "$STATUS_DIR/.media-completion.XXXXXX") || return 1
+    jq -n --arg run "$run" --arg status "$status" --arg phase "$phase" --arg policy "$policy" --arg remote "$REMOTE" --arg version "$SCRIPT_VERSION" --arg error "${BACKUP_LAST_ERROR:-}" \
+      --argjson jobs "$data" --argjson epoch "$now" --argjson started "$BACKUP_STARTED" \
+      '{schema:2,name:"backup_media_remote",runId:$run,status:$status,phase:$phase,epoch:$epoch,startedAt:$started,policySha256:$policy,remote:$remote,scriptVersion:$version,lastError:$error,jobs:$jobs,
+        copy:(if $status=="OK" then "OK" else "UNVERIFIED" end),verification:(if $status=="OK" then "rsync_transfer_verified" else "not_verified" end),
+        scope:"Rsync exit zero with complete statistics and stable source/lease read-back; transferred data checksums, unchanged files size/mtime; not a full mirror rehash"}' >"$temp" || { rm -f "$temp";return 1; }
+    if [[ "$status" == OK ]];then
+        jq -e '(.jobs|length)>0 and all(.jobs[];.exitCode==0)' "$temp" >/dev/null || { rm -f "$temp";return 1; }
+        chmod 600 "$temp";sync -f "$temp" || return 1
+        mv "$temp" "$STATUS_DIR/backup_media_remote.last-success.json" || return 1
+    else chmod 600 "$temp";mv "$temp" "$STATUS_DIR/backup_media_remote.last-attempt.json" || return 1;fi
+}
+
 backup_finish() {
     local rc=$? status=OK temp summary
     trap - EXIT INT TERM PIPE
@@ -703,6 +735,7 @@ backup_finish() {
     summary="${SCRIPT_ID} v${SCRIPT_VERSION}; copy=$BACKUP_RESULT; verify=$VERIFICATION_RESULT; retention=$RETENTION_RESULT; phase=$BACKUP_PHASE; duration=$(( $(date +%s)-BACKUP_STARTED ))s; shutdown=$SHUTDOWN_RESULT ${REMOTE_SHUTDOWN_SKIPPED_REASON:-}"
     if (( rc != 0 )) && [[ "$BACKUP_NOTIFIED" != true && -x "${NOTIFY_BIN:-}" ]]; then
         if usr_ops_notify timeout 30 "$NOTIFY_BIN" -i alert -s "$NOTIFY_SUBJECT" -d 'Backup failed' -m "$summary
+Failure detail: ${BACKUP_LAST_ERROR:-No detailed error recorded; inspect the failed phase above.}
 Log: $LOG_FILE" >/dev/null 2>&1; then NOTIFICATION_RESULT=sent; else NOTIFICATION_RESULT=failed; fi
     fi
     [[ "$NOTIFICATION_RESULT" != failed && "$NOTIFICATION_RESULT" != unavailable || "$status" != OK ]] || status=WARNING
@@ -712,6 +745,7 @@ Log: $LOG_FILE" >/dev/null 2>&1; then NOTIFICATION_RESULT=sent; else NOTIFICATIO
             jq -n --arg name "$SCRIPT_ID" --arg status "$status" --arg summary "$summary" --arg phase "$BACKUP_PHASE" --arg copy "$BACKUP_RESULT" --arg verification "$VERIFICATION_RESULT" --arg retention "$RETENTION_RESULT" --arg notification "$NOTIFICATION_RESULT" --arg shutdown "$SHUTDOWN_RESULT" --arg shutdown_reason "${REMOTE_SHUTDOWN_SKIPPED_REASON:-}" --arg version "$SCRIPT_VERSION" --arg log "$LOG_FILE" --argjson duration "$(( $(date +%s)-BACKUP_STARTED ))" --argjson epoch "$(date +%s)" \
             '{name:$name,status:$status,summary:$summary,phase:$phase,copy:$copy,verification:$verification,retention:$retention,notification:$notification,shutdown:$shutdown,shutdown_reason:$shutdown_reason,scriptVersion:$version,duration_seconds:$duration,log:$log,epoch:$epoch}' >"$temp" && mv -f -- "$temp" "$STATUS_DIR/$SCRIPT_ID.json"
     fi
+    [[ "$BACKUP_RESULT" == OK && "$VERIFICATION_RESULT" == rsync_transfer_verified ]] || media_completion_evidence UNVERIFIED "$BACKUP_PHASE" || true
     [[ -z "$LEASE_INPUT" ]] || exec {LEASE_INPUT}>&-
     [[ -z "$LEASE_PID" ]] || { kill "$LEASE_PID" 2>/dev/null || true; wait "$LEASE_PID" 2>/dev/null || true; }
     [[ ${#TRANSPORT_OPTIONS[@]} == 0 ]] || ssh "${TRANSPORT_OPTIONS[@]}" -O exit "$REMOTE" >/dev/null 2>&1 || true
@@ -802,6 +836,7 @@ log() {
     shift 2
 
     local message="$*"
+    [[ "$level" != ERROR ]] || BACKUP_LAST_ERROR="$category: $message"
     backup_bound_log "$LOG_FILE" "$MAX_MAIN_LOG_BYTES" || return 1
 
     usr_ops_log_line "$level" "$category" "$message" |
@@ -1412,7 +1447,7 @@ rsync_stat_number() {
 
     value="$(
         grep -F "$heading" "$file" 2>/dev/null |
-            tail -n 1 |
+            tail -n 1 -- - |
             sed -E \
                 's/^[^:]*:[[:space:]]*([0-9,]+).*/\1/' |
             tr -d ','
@@ -1785,6 +1820,7 @@ rsync_exit_description() {
         23)  printf 'Partial transfer due to error' ;;
         24)  printf 'Partial transfer due to vanished source files' ;;
         30)  printf 'Data-transfer timeout' ;;
+        74)  printf 'Completion evidence or diagnostics unavailable' ;;
         255) printf 'SSH connection failure' ;;
         *)   printf 'Unknown rsync exit code %s' "$code" ;;
     esac
@@ -1807,7 +1843,7 @@ extract_rsync_errors() {
             'error|warning|failed|permission denied|host key|connection refused|no route|timed out|timeout' \
             "$file" \
             2>/dev/null |
-            tail -n "$max_lines" ||
+            tail -n "$max_lines" -- - ||
             true
     )"
 
@@ -1915,8 +1951,10 @@ rsync_label() {
         fi
         local job_started job_elapsed
         job_started=$(date +%s)
-        "${command[@]}" 2>&1 | tail -c "$MAX_RAW_LOG_BYTES" >"$tmp_log"
-        status="${PIPESTATUS[0]}"
+        LC_ALL=C "${command[@]}" 2>&1 | tail -c "$MAX_RAW_LOG_BYTES" -- - >"$tmp_log"
+        local -a transfer_status=("${PIPESTATUS[@]}")
+        status="${transfer_status[0]}"
+        if ((transfer_status[1]!=0));then status=74;BACKUP_LAST_ERROR="[$label] Transfer diagnostics could not be written; completion evidence unavailable";fi
         job_elapsed=$(( $(date +%s)-job_started ))
         tail -n 35 -- "$tmp_log" >>"$LOG_FILE"
         log RSYNC INFO "[$label] attempt duration=${job_elapsed}s"
@@ -1938,6 +1976,11 @@ rsync_label() {
             RAW_LOG_BY_LABEL["$label"]="$saved_log"
         fi
 
+        if ((status==0));then
+            if ! grep -q '^Total bytes sent:' "$tmp_log" || ! grep -q '^Number of files:' "$tmp_log" || ! backup_source_ready "$src" || ! backup_lease_alive;then
+                status=74;BACKUP_LAST_ERROR="[$label] Transfer returned zero but statistics or final source/lease evidence is incomplete"
+            fi
+        fi
         if [ "$status" -eq 0 ]; then
             RESULT_CODE["$label"]=0
             RESULT_REASON["$label"]="Success"
@@ -2507,6 +2550,14 @@ Log: ${LOG_FILE}"
 ###############################################################################
 
 main() {
+    case "${1:-}" in
+      --evidence-status) jq -n --arg scope 'Producer receipts only; no transfer, SSH or wake performed' \
+        --slurpfile success <(if [[ -f "$STATUS_DIR/backup_media_remote.last-success.json" ]];then cat "$STATUS_DIR/backup_media_remote.last-success.json";else printf null;fi) \
+        --slurpfile attempt <(if [[ -f "$STATUS_DIR/backup_media_remote.last-attempt.json" ]];then cat "$STATUS_DIR/backup_media_remote.last-attempt.json";else printf null;fi) \
+        '{scope:$scope,lastVerifiedSuccess:$success[0],lastFailedAttempt:$attempt[0]}';return $?;;
+      --version) printf 'backup_media_remote.sh %s\n' "$SCRIPT_VERSION";return 0;;
+      '') ;; *) printf 'Usage: bash script [--evidence-status|--version]\n';return 2;;
+    esac
     exec 9>"$LOCK_FILE"
 
     if ! flock -n 9; then
@@ -2669,7 +2720,13 @@ No live rsync was started."
         BACKUP_RESULT=FAILED; VERIFICATION_RESULT=FAILED
     else
         if [[ "$DRY_RUN" == true ]]; then BACKUP_RESULT=DRY_RUN; VERIFICATION_RESULT=not_performed
-        else BACKUP_RESULT=OK; VERIFICATION_RESULT=rsync_transfer_verified; fi
+        else
+            BACKUP_RESULT=OK; VERIFICATION_RESULT=rsync_transfer_verified
+            if ! media_completion_evidence OK transfer;then
+                backup_failed=1;BACKUP_RESULT=FAILED;VERIFICATION_RESULT=not_verified
+                log EVIDENCE ERROR 'Copy completed but durable completion evidence could not be published; previous verified receipt retained'
+            fi
+        fi
     fi
 
 

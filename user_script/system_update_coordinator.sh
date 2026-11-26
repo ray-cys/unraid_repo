@@ -1,7 +1,10 @@
 #!/bin/bash
+# CRON VERIFICATION: before new installations, normalized live launcher timing
+# must match installed enabled dynamic schedules. Drift is reported; discovery
+# continues, but no extra timer is created and no launcher shell text is executed.
 clearLog=true
 arrayStarted=true
-# System Update Coordinator v1.6.0 -- personal Hubble maintenance.
+# System Update Coordinator v1.7.0 -- personal Hubble maintenance.
 # PURPOSE: Detect Docker/plugin/Unraid OS updates; automatically install only
 # explicitly approved, still-installed items during a bounded maintenance window.
 # Existing producers finish; expiring requests make new conflicting work yield.
@@ -419,10 +422,37 @@ usr_scripts_schedule_evidence() {
     else printf '{"verified":false,"reason":"Native schedule inventory unavailable"}\n';fi
     rm -f -- "$tmp"
 }
+
+# Compare normalized timing and exact launcher paths without evaluating shell.
+# A cached schedule or matching path alone does not prove correct dispatch.
+usr_scripts_verify_cron() {
+    php /dev/stdin "$1" "$2" "${USER_SCRIPTS_NATIVE_HOOK_ROOT:-/usr/local/emhttp/plugins/user.scripts/cron}" <<'US_CRON_VERIFY'
+<?php
+try {
+ [$catalogFile,$cronFile,$hooks]=array_slice($argv,1);$c=json_decode(file_get_contents($catalogFile),true,512,JSON_THROW_ON_ERROR);
+ if(($c['valid']??false)!==true||!is_file($cronFile)||!is_readable($cronFile))throw new RuntimeException('Live scheduling evidence unavailable');
+ function pathArg($s){$out='';$quote=null;$n=strlen($s);for($i=0;$i<$n;$i++){$ch=$s[$i];if($quote==="'"){if($ch==="'")$quote=null;else $out.=$ch;}elseif($quote==='"'){if($ch==='"')$quote=null;elseif($ch==='$'||$ch==='`')throw new RuntimeException('Expansion in launcher path refused');elseif($ch==='\\'&&$i+1<$n)$out.=$s[++$i];else $out.=$ch;}else{if($ch==="'"||$ch==='"')$quote=$ch;elseif($ch==='\\'&&$i+1<$n)$out.=$s[++$i];elseif(ctype_space($ch)||str_contains('$`;|&<>',$ch))throw new RuntimeException('Unexpected launcher arguments');else $out.=$ch;}}if($quote!==null)throw new RuntimeException('Unclosed launcher quoting');return $out;}
+ function cronSignature($s){$s=trim(strtolower($s));$macros=['@hourly'=>'0 * * * *','@daily'=>'0 0 * * *','@midnight'=>'0 0 * * *','@weekly'=>'0 0 * * 0','@monthly'=>'0 0 1 * *','@yearly'=>'0 0 1 1 *','@annually'=>'0 0 1 1 *'];if($s==='@reboot')return 'reboot';$s=$macros[$s]??$s;$f=preg_split('/\s+/',$s);if(count($f)!==5)throw new RuntimeException('Unexpected cron field count');$names=[3=>['jan'=>1,'feb'=>2,'mar'=>3,'apr'=>4,'may'=>5,'jun'=>6,'jul'=>7,'aug'=>8,'sep'=>9,'oct'=>10,'nov'=>11,'dec'=>12],4=>['sun'=>0,'mon'=>1,'tue'=>2,'wed'=>3,'thu'=>4,'fri'=>5,'sat'=>6]];foreach($names as $i=>$map)$f[$i]=preg_replace_callback('/[a-z]+/',fn($m)=>isset($map[$m[0]])?(string)$map[$m[0]]:throw new RuntimeException('Unknown cron name'),$f[$i]);$result=[];foreach([[0,59],[0,23],[1,31],[1,12],[0,7]] as $i=>[$lo,$hi]){$values=[];foreach(explode(',',$f[$i]) as $piece){if(!preg_match('~^(\*|[0-9]+(?:-[0-9]+)?)(?:/([0-9]+))?$~D',$piece,$m))throw new RuntimeException('Invalid cron expression');$step=(int)($m[2]??1);if($step<1)throw new RuntimeException('Invalid cron step');if($m[1]==='*'){$a=$lo;$b=$hi;}elseif(str_contains($m[1],'-'))[$a,$b]=array_map('intval',explode('-',$m[1]));else{$a=(int)$m[1];$b=isset($m[2])?$hi:$a;}if($a<$lo||$b>$hi||$a>$b)throw new RuntimeException('Cron value out of range');for($v=$a;$v<=$b;$v+=$step)$values[$i===4&&$v===7?0:$v]=true;}ksort($values);$result[]=array_keys($values);}$result[]=[str_starts_with($f[2],'*'),str_starts_with($f[4],'*')];return json_encode($result);}
+ $actual=[];$issues=[];
+ foreach(explode("\n",file_get_contents($cronFile)) as $line){if(trim($line)===''||preg_match('/^\s*#/',$line)||!str_contains($line,'/user.scripts/startCustom.php'))continue;
+  if(!preg_match('~^\s*(.*?)\s+/usr/local/emhttp/plugins/user\.scripts/startCustom\.php\s+(.+?)\s+>\s*/dev/null\s+2>&1\s*$~D',$line,$m)){$issues[]='Unrecognized User Scripts launcher line; no shell code executed';continue;}
+  try{$path=pathArg($m[2]);$path=preg_replace('~^/usr/local/emhttp/plugins/user\.scripts/scripts/~','/boot/config/plugins/user.scripts/scripts/',$path);$actual[$path][]=cronSignature($m[1]);}catch(Throwable $e){$issues[]='Invalid live launcher timing/path: '.$e->getMessage();}
+ }
+ $wanted=[];
+ foreach($c['jobs'] as $job){if(!$job['present']||!$job['enabled'])continue;
+  if($job['frequency']==='custom'){$path=$job['path'];$wanted[$path]=true;$expected=cronSignature($job['event']?'@reboot':($job['cron']??''));if(!isset($actual[$path]))$issues[]=$job['name'].': active launcher missing';elseif(count($actual[$path])!==1)$issues[]=$job['name'].': duplicate live launchers';elseif($actual[$path][0]!==$expected)$issues[]=$job['name'].': live cron timing differs from schedule.json';}
+  elseif(in_array($job['frequency'],['hourly','daily','weekly','monthly'],true)){if(!$job['cron'])$issues[]=$job['name'].': native dispatcher timing unavailable';$hook=$hooks.'/user.script.start.'.$job['frequency'].'.sh';if(!is_readable($hook)||!str_contains(file_get_contents($hook),'startSchedule.php'))$issues[]=$job['name'].': native dispatcher hook unavailable';}
+ }
+ foreach($actual as $path=>$times)if(!isset($wanted[$path]))$issues[]='Launcher has no installed enabled schedule: '.$path;
+ echo json_encode(['schema'=>1,'valid'=>!$issues,'checkedAt'=>time(),'issues'=>array_values(array_unique($issues))],JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR);
+ if($issues)exit(1);
+}catch(Throwable $e){echo json_encode(['schema'=>1,'valid'=>false,'issues'=>[$e->getMessage()]]);exit(1);}
+US_CRON_VERIFY
+}
 # END EMBEDDED USER SCRIPTS CATALOG
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="1.6.1"
+readonly SCRIPT_VERSION="1.7.0"
 # Keep configured per-item holds when approving the same installed identity.
 # Daily rolling tags need a shorter hold to avoid perpetually chasing rebuilds.
 readonly APPROVAL_JQ='def approval($old;$identity;$allow;$kind;$epoch):
@@ -712,6 +742,21 @@ reconcile_script_schedules() {
     done < <(jq -c '.events[]?' "$result")
     if [[ "$ids" != '[]' || "$reload" == true ]];then usr_scripts_registry_ack "$ids" "$reload" || return 1;fi
 }
+verify_live_schedule_timing() {
+    local catalog="$TMP_DIR/cron-catalog.json" cron="$TMP_DIR/live.cron" result="$TMP_DIR/cron-verification.json" old issue signature
+    old=$(jq -r 'if .scheduleVerification.valid==false then false else true end' "$STATE_FILE")
+    usr_scripts_catalog "$BACKUP_SCHEDULE_FILE" "${USER_SCRIPTS_PHYSICAL_ROOT:-$(dirname "$BACKUP_SCHEDULE_FILE")/scripts}" >"$catalog" || return 1
+    bounded 8 crontab -c /etc/cron.d -l >"$cron" || return 1
+    usr_scripts_verify_cron "$catalog" "$cron" >"$result" || true
+    jq -e '.schema==1 and (.valid|type)=="boolean" and (.issues|type)=="array"' "$result" >/dev/null || return 1
+    mutate --slurpfile result "$result" '.scheduleVerification=$result[0]' || return 1
+    if ! jq -e .valid "$result" >/dev/null;then
+        RESULT=ATTENTION
+        issue=$(jq -r '.issues|join("; ")' "$result");signature=$(jq -c .issues "$result"|sha256sum|cut -d ' ' -f1)
+        event warning 'User Scripts scheduling requires attention' "$issue. Update discovery continues; new installations wait until live timing matches the dynamic schedule. No application configuration was changed." "cron-drift:$signature" || return 1
+    elif [[ "$old" == false ]];then event normal 'User Scripts scheduling restored' 'Live launchers and normalized timing now match installed enabled schedules; normal installation eligibility can resume.' cron-restored || return 1;fi
+}
+
 report_retired_updates() {
     local row key name id
     while IFS= read -r row;do
@@ -1373,6 +1418,7 @@ collect_update_holds() {
     while IFS=$'\t' read -r key kind name identity candidate;do
       within_budget 30 || break
       : >"$TMP_DIR/holds.ndjson"
+      jq -e '.scheduleVerification.valid!=false' "$STATE_FILE" >/dev/null || add_hold cron-timing "Live cron timing differs from the dynamic schedule; installation waits for reconciliation"
       row=$(jq -c --arg key "$key" '.items[$key]' "$STATE_FILE")
       hours=$(jq -r --arg kind "$kind" --arg name "$name" '(if $kind=="docker" then .docker[$name] else .plugins[$name] end).candidateHoldHours // .limits.candidateHoldHours // 24' "$POLICY_FILE")
       age=$(( $(jq -r '.candidateSeenAt // 0' <<<"$row")+hours*3600 ));retry=$((now+1));((age<=retry)) || retry=$age
@@ -1689,13 +1735,14 @@ main() {
       *) return 2;;
     esac
     reconcile_script_schedules || { SUMMARY="Schedule reconciliation deferred: ${SUMMARY:-inventory unverified}";return 1; }
+    verify_live_schedule_timing || { RESULT=ATTENTION;SUMMARY="Live cron verification unavailable; installation prohibited";return 1; }
     collect_inventory || { SUMMARY='Inventory unavailable/incomplete; no retirement or installation';return 1; }
     report_retired_updates || return 1
     check_updates || return 1
     recover_preparation || return 1
     track_update_windows || return 1
     reconcile_jobs || { RESULT=ATTENTION;SUMMARY='Pending update reconciliation incomplete; native actions not replayed'; }
-    [[ "${1:-}" == --check-only ]] || install_one || return 1
+    if [[ "${1:-}" != --check-only ]] && jq -e '.scheduleVerification.valid==true' "$STATE_FILE" >/dev/null;then install_one || return 1;fi
     if jq -e 'any(.jobs[];.status=="ATTENTION" or .status=="INTENT")' "$STATE_FILE" >/dev/null;then RESULT=ATTENTION;fi
     clean_recovery_sets || log WARNING 'Recovery-set retention deferred; existing evidence retained'
     collect_update_holds || log WARNING 'Update hold assessment incomplete; existing observations retained'

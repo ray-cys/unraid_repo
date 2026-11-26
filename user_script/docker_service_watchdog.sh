@@ -1,4 +1,7 @@
 #!/bin/bash
+# UI-only profiles use bounded native backend APIs for SABnzbd, Bazarr, Tautulli
+# and PhotoPrism. Credentials stay inside containers; no configuration is changed.
+# Unverified/disabled API authentication never authorizes an automatic restart.
 clearLog=true
 # Docker Service Watchdog v3.13 -- Unraid service availability and bounded recovery.
 # Optional schedule: every five minutes. Pi-hole and application-specific health
@@ -382,10 +385,37 @@ usr_scripts_schedule_evidence() {
     else printf '{"verified":false,"reason":"Native schedule inventory unavailable"}\n';fi
     rm -f -- "$tmp"
 }
+
+# Compare normalized timing and exact launcher paths without evaluating shell.
+# A cached schedule or matching path alone does not prove correct dispatch.
+usr_scripts_verify_cron() {
+    php /dev/stdin "$1" "$2" "${USER_SCRIPTS_NATIVE_HOOK_ROOT:-/usr/local/emhttp/plugins/user.scripts/cron}" <<'US_CRON_VERIFY'
+<?php
+try {
+ [$catalogFile,$cronFile,$hooks]=array_slice($argv,1);$c=json_decode(file_get_contents($catalogFile),true,512,JSON_THROW_ON_ERROR);
+ if(($c['valid']??false)!==true||!is_file($cronFile)||!is_readable($cronFile))throw new RuntimeException('Live scheduling evidence unavailable');
+ function pathArg($s){$out='';$quote=null;$n=strlen($s);for($i=0;$i<$n;$i++){$ch=$s[$i];if($quote==="'"){if($ch==="'")$quote=null;else $out.=$ch;}elseif($quote==='"'){if($ch==='"')$quote=null;elseif($ch==='$'||$ch==='`')throw new RuntimeException('Expansion in launcher path refused');elseif($ch==='\\'&&$i+1<$n)$out.=$s[++$i];else $out.=$ch;}else{if($ch==="'"||$ch==='"')$quote=$ch;elseif($ch==='\\'&&$i+1<$n)$out.=$s[++$i];elseif(ctype_space($ch)||str_contains('$`;|&<>',$ch))throw new RuntimeException('Unexpected launcher arguments');else $out.=$ch;}}if($quote!==null)throw new RuntimeException('Unclosed launcher quoting');return $out;}
+ function cronSignature($s){$s=trim(strtolower($s));$macros=['@hourly'=>'0 * * * *','@daily'=>'0 0 * * *','@midnight'=>'0 0 * * *','@weekly'=>'0 0 * * 0','@monthly'=>'0 0 1 * *','@yearly'=>'0 0 1 1 *','@annually'=>'0 0 1 1 *'];if($s==='@reboot')return 'reboot';$s=$macros[$s]??$s;$f=preg_split('/\s+/',$s);if(count($f)!==5)throw new RuntimeException('Unexpected cron field count');$names=[3=>['jan'=>1,'feb'=>2,'mar'=>3,'apr'=>4,'may'=>5,'jun'=>6,'jul'=>7,'aug'=>8,'sep'=>9,'oct'=>10,'nov'=>11,'dec'=>12],4=>['sun'=>0,'mon'=>1,'tue'=>2,'wed'=>3,'thu'=>4,'fri'=>5,'sat'=>6]];foreach($names as $i=>$map)$f[$i]=preg_replace_callback('/[a-z]+/',fn($m)=>isset($map[$m[0]])?(string)$map[$m[0]]:throw new RuntimeException('Unknown cron name'),$f[$i]);$result=[];foreach([[0,59],[0,23],[1,31],[1,12],[0,7]] as $i=>[$lo,$hi]){$values=[];foreach(explode(',',$f[$i]) as $piece){if(!preg_match('~^(\*|[0-9]+(?:-[0-9]+)?)(?:/([0-9]+))?$~D',$piece,$m))throw new RuntimeException('Invalid cron expression');$step=(int)($m[2]??1);if($step<1)throw new RuntimeException('Invalid cron step');if($m[1]==='*'){$a=$lo;$b=$hi;}elseif(str_contains($m[1],'-'))[$a,$b]=array_map('intval',explode('-',$m[1]));else{$a=(int)$m[1];$b=isset($m[2])?$hi:$a;}if($a<$lo||$b>$hi||$a>$b)throw new RuntimeException('Cron value out of range');for($v=$a;$v<=$b;$v+=$step)$values[$i===4&&$v===7?0:$v]=true;}ksort($values);$result[]=array_keys($values);}$result[]=[str_starts_with($f[2],'*'),str_starts_with($f[4],'*')];return json_encode($result);}
+ $actual=[];$issues=[];
+ foreach(explode("\n",file_get_contents($cronFile)) as $line){if(trim($line)===''||preg_match('/^\s*#/',$line)||!str_contains($line,'/user.scripts/startCustom.php'))continue;
+  if(!preg_match('~^\s*(.*?)\s+/usr/local/emhttp/plugins/user\.scripts/startCustom\.php\s+(.+?)\s+>\s*/dev/null\s+2>&1\s*$~D',$line,$m)){$issues[]='Unrecognized User Scripts launcher line; no shell code executed';continue;}
+  try{$path=pathArg($m[2]);$path=preg_replace('~^/usr/local/emhttp/plugins/user\.scripts/scripts/~','/boot/config/plugins/user.scripts/scripts/',$path);$actual[$path][]=cronSignature($m[1]);}catch(Throwable $e){$issues[]='Invalid live launcher timing/path: '.$e->getMessage();}
+ }
+ $wanted=[];
+ foreach($c['jobs'] as $job){if(!$job['present']||!$job['enabled'])continue;
+  if($job['frequency']==='custom'){$path=$job['path'];$wanted[$path]=true;$expected=cronSignature($job['event']?'@reboot':($job['cron']??''));if(!isset($actual[$path]))$issues[]=$job['name'].': active launcher missing';elseif(count($actual[$path])!==1)$issues[]=$job['name'].': duplicate live launchers';elseif($actual[$path][0]!==$expected)$issues[]=$job['name'].': live cron timing differs from schedule.json';}
+  elseif(in_array($job['frequency'],['hourly','daily','weekly','monthly'],true)){if(!$job['cron'])$issues[]=$job['name'].': native dispatcher timing unavailable';$hook=$hooks.'/user.script.start.'.$job['frequency'].'.sh';if(!is_readable($hook)||!str_contains(file_get_contents($hook),'startSchedule.php'))$issues[]=$job['name'].': native dispatcher hook unavailable';}
+ }
+ foreach($actual as $path=>$times)if(!isset($wanted[$path]))$issues[]='Launcher has no installed enabled schedule: '.$path;
+ echo json_encode(['schema'=>1,'valid'=>!$issues,'checkedAt'=>time(),'issues'=>array_values(array_unique($issues))],JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR);
+ if($issues)exit(1);
+}catch(Throwable $e){echo json_encode(['schema'=>1,'valid'=>false,'issues'=>[$e->getMessage()]]);exit(1);}
+US_CRON_VERIFY
+}
 # END EMBEDDED USER SCRIPTS CATALOG
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.16.1"
+readonly SCRIPT_VERSION="3.17.0"
 
 ###############################################################################
 # CONFIGURATION
@@ -1764,29 +1794,14 @@ readiness_json() {
       if [[ "$health" == healthy ]];then ready=true;source=docker-health;detail='Docker application health is healthy';result=ready
       elif [[ "$health" == none ]];then
         for spec in "${SERVICE_SPECS[@]}";do [[ "${spec%%|*}" != "$name" ]] || { IFS='|' read -r _ url _ <<<"$spec";break; };done
-        readiness_probe "$name" "$url" || true
+        endpoint_healthy "$url" "$name" || true
         result="$PROBE_RESULT";detail="$PROBE_MESSAGE";source=application-probe
         [[ "$result" != ready ]] || ready=true
-        if [[ "$name" == bazarr && "$ready" == false ]];then
-          if docker_cmd exec bazarr sh -c 'for py in /lsiopy/bin/python3 /app/bazarr/bin/python3 python3;do if "$py" -c "import sys;sys.path[:0]=[\"/app/bazarr/bin/libs\",\"/app/bazarr/libs\"];import yaml" >/dev/null 2>&1;then exec "$py" -c "$1";fi;done;exit 1' _ 'import json, pathlib, urllib.request, sys
-sys.path[:0]=["/app/bazarr/bin/libs","/app/bazarr/libs"]
-import yaml
-p=pathlib.Path("/config/config/config.yaml"); c=yaml.safe_load(p.read_text()); g=c.get("general",{}); key=c.get("auth",{}).get("apikey","")
-assert isinstance(key,str) and key
-base=(g.get("base_url") or "").rstrip("/")
-u="http://127.0.0.1:"+str(g.get("port",6767))+base+"/api/system/status"
-r=urllib.request.urlopen(urllib.request.Request(u,headers={"X-API-KEY":key}),timeout=5)
-d=json.load(r);d=d.get("data",d);assert isinstance(d,dict) and d.get("bazarr_version")
-' >/dev/null 2>&1;then ready=true;source=native-bazarr-api;detail='Bazarr authenticated native system status validated';result=ready;fi
-        fi
         if [[ "$ready" == false ]];then
           case "$name" in
             kometa|imagemaid|recyclarr) evidence=$(scheduler_readiness "$name" "$purpose" 2>/dev/null) || evidence='{"ready":false,"classification":"unverified","source":"native-scheduler","detail":"Scheduler process/native completion evidence could not be verified; update deferred"}';;
             sabnzbd) evidence=$(sab_readiness "$purpose" 2>/dev/null) || evidence='{"ready":false,"classification":"unverified","source":"native-sab-api","detail":"Authenticated SAB queue/history could not be verified; update deferred"}';;
-            photoprism)
-              if docker_cmd exec photoprism curl --noproxy '*' --silent --fail --max-time 5 --max-filesize 65536 http://127.0.0.1:2342/api/v1/status 2>/dev/null | jq -e '.status=="operational"' >/dev/null;then
-                evidence='{"ready":true,"classification":"ready","source":"native-photoprism-api","detail":"PhotoPrism native status is operational"}'
-              else evidence='{"ready":false,"classification":"unverified","source":"native-photoprism-api","detail":"PhotoPrism native status API unavailable/unrecognized; update deferred"}';fi;;
+
           esac
         fi
       else detail="Docker health: $health";result="$health";fi
@@ -2033,8 +2048,86 @@ readiness_probe() {
     PROBE_RESULT=ready; PROBE_MESSAGE="Application readiness response validated (target=$target; route=$((route_index + 1)))"
 }
 
+# Bounded native API checks use only configuration already inside the container.
+# Never print keys, response bodies or exception URLs; UI recognition is not proof.
+application_backend_probe() {
+    local name="$1" profile="${PROFILE_BY_NAME[$1]:-$1}"
+    case "$profile" in
+      bazarr|tautulli|sabnzbd)
+        docker_cmd exec -i "$name" sh -c 'for py in /lsiopy/bin/python3 /usr/local/bin/python3 python3;do if command -v "$py" >/dev/null 2>&1;then exec "$py" - "$1";fi;done;exit 1' _ "$profile" <<'NATIVE_BACKEND'
+import configparser,json,sys,urllib.error,urllib.parse,urllib.request
+from pathlib import Path
+profile=sys.argv[1]
+def result(ready,classification,detail):
+    print(json.dumps(dict(schema=1,ready=ready,classification=classification,source='native-'+profile+'-api',detail=detail)))
+try:
+    headers={};base='';port=0
+    if profile=='bazarr':
+        sys.path[:0]=['/app/bazarr/bin/libs','/app/bazarr/libs']
+        import yaml
+        c=yaml.safe_load(Path('/config/config/config.yaml').read_text());g=c.get('general',{})
+        key=c.get('auth',{}).get('apikey','');assert isinstance(key,str) and key
+        port=int(g.get('port',6767));base=(g.get('base_url') or '').rstrip('/')
+        path='/api/system/status';headers={'X-API-KEY':key}
+    elif profile=='tautulli':
+        c=configparser.ConfigParser(interpolation=None,strict=False);assert c.read('/config/config.ini')
+        g={k:v.strip().strip(chr(34)).strip(chr(39)) for k,v in c['General'].items()};key=g.get('api_key','');assert key and g.get('api_enabled','1').lower() not in ('0','false')
+        port=int(g.get('http_port',8181));base=g.get('http_root','').rstrip('/')
+        assert g.get('enable_https','0').lower() not in ('1','true'),'Internal TLS requires explicit validated route'
+        path='/api/v2?'+urllib.parse.urlencode({'apikey':key,'cmd':'get_tautulli_info'})
+    else:
+        import configobj
+        g=configobj.ConfigObj('/config/sabnzbd.ini',interpolation=False)['misc'];key=g['api_key'];assert key
+        port=int(g.get('port',8080));base=str(g.get('url_base','')).rstrip('/')
+        path='/api?'+urllib.parse.urlencode({'apikey':key,'mode':'queue','output':'json','limit':1})
+    assert 0<port<65536 and (not base or base.startswith('/'))
+    request=urllib.request.Request('http://127.0.0.1:'+str(port)+base+path,headers=headers)
+except Exception:
+    result(False,'unconfigured','Native backend configuration/runtime unavailable or API disabled; automatic recovery prohibited');sys.exit(0)
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self,*args,**kwargs):
+        return None
+try:
+    with urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect()).open(request,timeout=5) as response:
+        raw=response.read(131073);assert len(raw)<=131072;data=json.loads(raw)
+    if profile=='bazarr':
+        data=data.get('data',data);assert isinstance(data,dict) and isinstance(data.get('bazarr_version'),str)
+    elif profile=='tautulli':
+        data=data['response'];assert data.get('result')=='success' and isinstance(data.get('data'),dict) and data['data'].get('tautulli_version')
+    else:
+        data=data['queue'];assert isinstance(data,dict) and isinstance(data.get('status'),str) and isinstance(data.get('slots'),list)
+    result(True,'ready','Authenticated native '+profile+' backend response validated')
+except urllib.error.HTTPError as error:
+    category='authentication' if error.code in (401,403) else ('backend_failure' if 500<=error.code<=599 else 'unconfigured')
+    result(False,category,'Native backend returned HTTP '+str(error.code)+'; no credentials or response body recorded')
+except Exception:
+    result(False,'unconfigured','Native backend response unavailable/unrecognized; configuration/transport evidence requires review; automatic recovery prohibited')
+NATIVE_BACKEND
+        ;;
+      photoprism)
+        if docker_cmd exec "$name" curl --noproxy '*' --silent --fail --max-time 5 --max-filesize 65536 http://127.0.0.1:2342/api/v1/status 2>/dev/null | jq -e '.status=="operational"' >/dev/null;then
+            jq -n '{schema:1,ready:true,classification:"ready",source:"native-photoprism-api",detail:"PhotoPrism native backend status is operational"}'
+        else jq -n '{schema:1,ready:false,classification:"unconfigured",source:"native-photoprism-api",detail:"PhotoPrism backend status unavailable/unrecognized; automatic recovery prohibited"}';fi;;
+      *) return 2;;
+    esac
+}
+
 endpoint_healthy() {
-    readiness_probe "${2:-service}" "$1"
+    local name="${2:-service}" evidence rc=0
+    readiness_probe "$name" "$1" || rc=$?
+    ((rc==0)) || return "$rc"
+    [[ "$PROBE_RESULT" == reachable ]] || return 0
+    case "${PROFILE_BY_NAME[$name]:-$name}" in bazarr|tautulli|sabnzbd|photoprism) ;; *) return 0;;esac
+    if ! evidence=$(application_backend_probe "$name" 2>/dev/null) || ! jq -e '.schema==1 and (.ready|type)=="boolean" and (.classification|type)=="string"' <<<"$evidence" >/dev/null 2>&1;then
+        PROBE_RESULT=unconfigured;PROBE_MESSAGE='UI reachable; native backend evidence unavailable; automatic recovery prohibited';return 0
+    fi
+    PROBE_MESSAGE=$(jq -r .detail <<<"$evidence")
+    case "$(jq -r .classification <<<"$evidence")" in
+      ready) PROBE_RESULT=ready;;
+      backend_failure) PROBE_RESULT=unexpected;return 1;;
+      authentication) PROBE_RESULT=authentication;;
+      *) PROBE_RESULT=unconfigured;;
+    esac
 }
 
 diagnose_service() {
@@ -2057,7 +2150,7 @@ diagnose_service() {
     resolved="$url"
     if [[ -z "$resolved" && -n "$rule" ]]; then resolved="$(probe_url "$name" "$info" "$port" "$path" || true)"; fi
     printf 'Resolved probe: %s\n' "$(safe_probe_target "${resolved:-not configured}")"
-    readiness_probe "$name" "$url" || true
+    endpoint_healthy "$url" "$name" || true
     printf 'Probe classification: %s\nEvidence: %s\n' "$PROBE_RESULT" "$PROBE_MESSAGE"
     printf 'No monitoring state, notifications, or container actions were performed.\n'
 }

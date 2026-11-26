@@ -1,4 +1,7 @@
 #!/bin/bash
+# PRESENTATION: health-presentation.json separates current workflow errors from
+# retained historical events. Maintenance availability/resume receipts describe
+# backup deferrals without clearing issues or permitting pipeline mutations.
 clearLog=true
 
 # Read-only version lookup must return before state, API or automation setup.
@@ -7,7 +10,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]];then
 fi
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.23.1
+# ARR Health / Download / Import Monitor v3.24.0
 #
 # PURPOSE
 # -------
@@ -815,6 +818,33 @@ usr_scripts_schedule_evidence() {
           if length==1 then .[0]|{verified:true,cron,frequency,event,timezone:"Asia/Singapore",intervalSeconds:(if ($window.lastDue|type)=="number" and ($window.cutoff|type)=="number" then $window.lastDue-$window.cutoff else null end)} else {verified:false,reason:"Enabled schedule missing or ambiguous"} end' "$tmp"
     else printf '{"verified":false,"reason":"Native schedule inventory unavailable"}\n';fi
     rm -f -- "$tmp"
+}
+
+# Compare normalized timing and exact launcher paths without evaluating shell.
+# A cached schedule or matching path alone does not prove correct dispatch.
+usr_scripts_verify_cron() {
+    php /dev/stdin "$1" "$2" "${USER_SCRIPTS_NATIVE_HOOK_ROOT:-/usr/local/emhttp/plugins/user.scripts/cron}" <<'US_CRON_VERIFY'
+<?php
+try {
+ [$catalogFile,$cronFile,$hooks]=array_slice($argv,1);$c=json_decode(file_get_contents($catalogFile),true,512,JSON_THROW_ON_ERROR);
+ if(($c['valid']??false)!==true||!is_file($cronFile)||!is_readable($cronFile))throw new RuntimeException('Live scheduling evidence unavailable');
+ function pathArg($s){$out='';$quote=null;$n=strlen($s);for($i=0;$i<$n;$i++){$ch=$s[$i];if($quote==="'"){if($ch==="'")$quote=null;else $out.=$ch;}elseif($quote==='"'){if($ch==='"')$quote=null;elseif($ch==='$'||$ch==='`')throw new RuntimeException('Expansion in launcher path refused');elseif($ch==='\\'&&$i+1<$n)$out.=$s[++$i];else $out.=$ch;}else{if($ch==="'"||$ch==='"')$quote=$ch;elseif($ch==='\\'&&$i+1<$n)$out.=$s[++$i];elseif(ctype_space($ch)||str_contains('$`;|&<>',$ch))throw new RuntimeException('Unexpected launcher arguments');else $out.=$ch;}}if($quote!==null)throw new RuntimeException('Unclosed launcher quoting');return $out;}
+ function cronSignature($s){$s=trim(strtolower($s));$macros=['@hourly'=>'0 * * * *','@daily'=>'0 0 * * *','@midnight'=>'0 0 * * *','@weekly'=>'0 0 * * 0','@monthly'=>'0 0 1 * *','@yearly'=>'0 0 1 1 *','@annually'=>'0 0 1 1 *'];if($s==='@reboot')return 'reboot';$s=$macros[$s]??$s;$f=preg_split('/\s+/',$s);if(count($f)!==5)throw new RuntimeException('Unexpected cron field count');$names=[3=>['jan'=>1,'feb'=>2,'mar'=>3,'apr'=>4,'may'=>5,'jun'=>6,'jul'=>7,'aug'=>8,'sep'=>9,'oct'=>10,'nov'=>11,'dec'=>12],4=>['sun'=>0,'mon'=>1,'tue'=>2,'wed'=>3,'thu'=>4,'fri'=>5,'sat'=>6]];foreach($names as $i=>$map)$f[$i]=preg_replace_callback('/[a-z]+/',fn($m)=>isset($map[$m[0]])?(string)$map[$m[0]]:throw new RuntimeException('Unknown cron name'),$f[$i]);$result=[];foreach([[0,59],[0,23],[1,31],[1,12],[0,7]] as $i=>[$lo,$hi]){$values=[];foreach(explode(',',$f[$i]) as $piece){if(!preg_match('~^(\*|[0-9]+(?:-[0-9]+)?)(?:/([0-9]+))?$~D',$piece,$m))throw new RuntimeException('Invalid cron expression');$step=(int)($m[2]??1);if($step<1)throw new RuntimeException('Invalid cron step');if($m[1]==='*'){$a=$lo;$b=$hi;}elseif(str_contains($m[1],'-'))[$a,$b]=array_map('intval',explode('-',$m[1]));else{$a=(int)$m[1];$b=isset($m[2])?$hi:$a;}if($a<$lo||$b>$hi||$a>$b)throw new RuntimeException('Cron value out of range');for($v=$a;$v<=$b;$v+=$step)$values[$i===4&&$v===7?0:$v]=true;}ksort($values);$result[]=array_keys($values);}$result[]=[str_starts_with($f[2],'*'),str_starts_with($f[4],'*')];return json_encode($result);}
+ $actual=[];$issues=[];
+ foreach(explode("\n",file_get_contents($cronFile)) as $line){if(trim($line)===''||preg_match('/^\s*#/',$line)||!str_contains($line,'/user.scripts/startCustom.php'))continue;
+  if(!preg_match('~^\s*(.*?)\s+/usr/local/emhttp/plugins/user\.scripts/startCustom\.php\s+(.+?)\s+>\s*/dev/null\s+2>&1\s*$~D',$line,$m)){$issues[]='Unrecognized User Scripts launcher line; no shell code executed';continue;}
+  try{$path=pathArg($m[2]);$path=preg_replace('~^/usr/local/emhttp/plugins/user\.scripts/scripts/~','/boot/config/plugins/user.scripts/scripts/',$path);$actual[$path][]=cronSignature($m[1]);}catch(Throwable $e){$issues[]='Invalid live launcher timing/path: '.$e->getMessage();}
+ }
+ $wanted=[];
+ foreach($c['jobs'] as $job){if(!$job['present']||!$job['enabled'])continue;
+  if($job['frequency']==='custom'){$path=$job['path'];$wanted[$path]=true;$expected=cronSignature($job['event']?'@reboot':($job['cron']??''));if(!isset($actual[$path]))$issues[]=$job['name'].': active launcher missing';elseif(count($actual[$path])!==1)$issues[]=$job['name'].': duplicate live launchers';elseif($actual[$path][0]!==$expected)$issues[]=$job['name'].': live cron timing differs from schedule.json';}
+  elseif(in_array($job['frequency'],['hourly','daily','weekly','monthly'],true)){if(!$job['cron'])$issues[]=$job['name'].': native dispatcher timing unavailable';$hook=$hooks.'/user.script.start.'.$job['frequency'].'.sh';if(!is_readable($hook)||!str_contains(file_get_contents($hook),'startSchedule.php'))$issues[]=$job['name'].': native dispatcher hook unavailable';}
+ }
+ foreach($actual as $path=>$times)if(!isset($wanted[$path]))$issues[]='Launcher has no installed enabled schedule: '.$path;
+ echo json_encode(['schema'=>1,'valid'=>!$issues,'checkedAt'=>time(),'issues'=>array_values(array_unique($issues))],JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR);
+ if($issues)exit(1);
+}catch(Throwable $e){echo json_encode(['schema'=>1,'valid'=>false,'issues'=>[$e->getMessage()]]);exit(1);}
+US_CRON_VERIFY
 }
 # END EMBEDDED USER SCRIPTS CATALOG
 # BEGIN SCHEDULED EXECUTION SUPERVISOR
@@ -7333,7 +7363,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'Media Health Monitor v3.23.1 lifecycle commands' \
+        'Media Health Monitor v3.24.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -7838,6 +7868,11 @@ notification_record_text() {
                 else " [" + (.severity // "INFO") + "]"
             end
           )
+          + (if ((.classification // "") | test("^(ARR_DOWNLOAD_FAILED_HISTORY|SAB_DOWNLOAD_FAILED_.*|SAB_ERROR|SAB_WARNING)$"))
+             then "\n  Evidence: recorded application event; this event alone does not prove a current service or import failure."
+             elif .classification == "DOWNLOAD_FLOW_REVIEW_REQUIRED"
+             then "\n  Evidence: historical outcome remains unverified; current API evidence does not prove import or cancellation."
+             else "" end)
           + (
                 if ($event == "new" or $event == "reminder" or $event == "flapping") and $ackId != ""
                 then "\n  Ack ID: " + $ackId
@@ -7852,7 +7887,7 @@ notification_record_text() {
           )
           + (
                 if (.age // "") != "" and (.age // "") != "0"
-                then "\n  Age: " + (.age | tostring) + "h"
+                then "\n  Tracked issue age: " + (.age | tostring) + "h"
                 else ""
             end
           )
@@ -8457,9 +8492,8 @@ record_monitor_schedule_issue() {
     maintenance_seen=$(cat "${ARR_BACKUP_DEFERRED_AT:-/run/media-health-monitor-backup-deferred-at}" 2>/dev/null || true)
     if [[ "$maintenance_seen" =~ ^[0-9]+$ ]] &&
        (( maintenance_seen > PREVIOUS_RUN_STARTED_AT && maintenance_seen <= START_TIME &&
-          START_TIME - maintenance_seen <= allowed_gap * 60 )); then
+          START_TIME - maintenance_seen <= 86400 )); then
         log "MAINTENANCE: Previous monitoring interval includes scheduled backup deferrals; schedule-gap alert suppressed"
-        rm -f -- "$ARR_BACKUP_DEFERRED_AT"
         return 0
     fi
     (( PREVIOUS_RUN_STARTED_AT > 0 )) || return
@@ -17236,7 +17270,8 @@ monitor_maintenance_availability() {
         done
         local started_epoch started_value
         started_value=$(timeout --kill-after=2 3 docker inspect --format '{{.State.StartedAt}}' "$container" 2>/dev/null) || started_value=''
-        started_epoch=$(date -d "$started_value" +%s 2>/dev/null) || started_epoch=0
+        started_epoch=0
+        [[ -z "$started_value" ]] || started_epoch=$(date -d "$started_value" +%s 2>/dev/null) || started_epoch=0
         if ((started_epoch>0 && started_epoch<=now && now-started_epoch<120));then expected=true;fi
         ready=false;result=''
         if [[ "$app" == SABnzbd ]];then
@@ -17249,7 +17284,7 @@ monitor_maintenance_availability() {
         data=$(jq -nc --argjson data "$data" --arg app "$app" --argjson ready "$ready" --argjson expected "$expected" '$data+[{app:$app,ready:$ready,expectedMaintenance:$expected}]')
     done
     tmp=$(mktemp "$STATE_DIR/.maintenance-availability.XXXXXX") || return 1
-    jq -n --argjson at "$now" --argjson services "$data" '{schema:1,epoch:$at,mode:"read_only_maintenance",services:$services}' >"$tmp" && mv "$tmp" "$STATE_DIR/maintenance-availability.json"
+    jq -n --argjson at "$now" --argjson services "$data" --argjson since "$(cat "${ARR_BACKUP_DEFERRED_AT:-/run/media-health-monitor-backup-deferred-at}" 2>/dev/null || printf '%s' "$now")" '{schema:2,epoch:$at,deferredSince:$since,deferredSeconds:($at-$since),mode:"read_only_maintenance",actions:"Pipeline mutations and issue resolution deferred; service availability checked independently",services:$services}' >"$tmp" && mv "$tmp" "$STATE_DIR/maintenance-availability.json"
 }
 
 ARR_BACKUP_GATE="${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}"
@@ -17267,9 +17302,9 @@ if [[ $# == 0 ]]; then
         arr_backup_deferred=true
     fi
     if [[ "$arr_backup_deferred" == true ]]; then
-        printf '%s\n' "$START_TIME" >"$ARR_BACKUP_DEFERRED_AT"
+        [[ -s "$ARR_BACKUP_DEFERRED_AT" ]] || printf '%s\n' "$START_TIME" >"$ARR_BACKUP_DEFERRED_AT"
         monitor_maintenance_availability || log "WARNING: Read-only maintenance availability evidence could not be saved"
-        log "MAINTENANCE: Pipeline actions deferred; bounded read-only service probes recorded separately; existing issues preserved"
+        log "MAINTENANCE: Pipeline actions deferred for $((arr_gate_now-$(cat "$ARR_BACKUP_DEFERRED_AT")))s; bounded read-only service probes recorded separately; existing issues preserved"
         exit 0
     fi
 fi
@@ -17411,7 +17446,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | Media Health Monitor v3.23.1"
+    "START | Media Health Monitor v3.24.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -17424,7 +17459,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting Media Health Monitor v3.23.1"
+debug_log "Starting Media Health Monitor v3.24.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -18040,6 +18075,21 @@ prune_state
 
 assess_pipeline_health
 
+# Presentation separates retained historical evidence from current workflow errors.
+# Historical records keep their IDs/lifecycle and are not silently resolved here.
+health_presentation=$(mktemp "$STATE_DIR/.health-presentation.XXXXXX") || exit 3
+jq -n --arg status "$PIPELINE_STATUS" --arg reason "$PIPELINE_REASON" --argjson at "$(date +%s)" --argjson live "$PIPELINE_LIVE_ERROR_COUNT" --argjson history "$EVENT_ONLY_ERROR_COUNT" --argjson warnings "$WARNING_COUNT" '{schema:1,epoch:$at,status:$status,reason:$reason,currentWorkflowErrors:$live,historicalEventErrors:$history,warningsAndReview:$warnings,scope:"Historical events remain review evidence; currentWorkflowErrors excludes event-only errors"}' >"$health_presentation" && mv "$health_presentation" "$STATE_DIR/health-presentation.json" || exit 3
+if [[ -s "$ARR_BACKUP_DEFERRED_AT" ]];then
+    deferred_since=$(cat "$ARR_BACKUP_DEFERRED_AT")
+    if [[ "$deferred_since" =~ ^[0-9]+$ ]];then
+        log "MAINTENANCE: Full monitoring resumed after $((START_TIME-deferred_since))s; deferred issues were preserved and are now rechecked"
+        maintenance_resume=$(mktemp "$STATE_DIR/.maintenance-resume.XXXXXX") || exit 3
+        jq -n --argjson since "$deferred_since" --argjson resumed "$START_TIME" '{schema:1,deferredSince:$since,resumedAt:$resumed,deferredSeconds:($resumed-$since),mode:"full_monitoring_resumed"}' >"$maintenance_resume" && mv "$maintenance_resume" "$STATE_DIR/maintenance-resume.json" || exit 3
+        rm -f "$ARR_BACKUP_DEFERRED_AT"
+    fi
+fi
+log "HEALTH PRESENTATION: current workflow errors=$PIPELINE_LIVE_ERROR_COUNT; retained historical event errors=$EVENT_ONLY_ERROR_COUNT; warnings/review=$WARNING_COUNT"
+
 determine_detailed_summary_policy
 
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
@@ -18056,7 +18106,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "Media Health Monitor v3.23.1 completed"
+log "Media Health Monitor v3.24.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""

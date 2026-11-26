@@ -385,9 +385,36 @@ usr_scripts_schedule_evidence() {
     else printf '{"verified":false,"reason":"Native schedule inventory unavailable"}\n';fi
     rm -f -- "$tmp"
 }
+
+# Compare normalized timing and exact launcher paths without evaluating shell.
+# A cached schedule or matching path alone does not prove correct dispatch.
+usr_scripts_verify_cron() {
+    php /dev/stdin "$1" "$2" "${USER_SCRIPTS_NATIVE_HOOK_ROOT:-/usr/local/emhttp/plugins/user.scripts/cron}" <<'US_CRON_VERIFY'
+<?php
+try {
+ [$catalogFile,$cronFile,$hooks]=array_slice($argv,1);$c=json_decode(file_get_contents($catalogFile),true,512,JSON_THROW_ON_ERROR);
+ if(($c['valid']??false)!==true||!is_file($cronFile)||!is_readable($cronFile))throw new RuntimeException('Live scheduling evidence unavailable');
+ function pathArg($s){$out='';$quote=null;$n=strlen($s);for($i=0;$i<$n;$i++){$ch=$s[$i];if($quote==="'"){if($ch==="'")$quote=null;else $out.=$ch;}elseif($quote==='"'){if($ch==='"')$quote=null;elseif($ch==='$'||$ch==='`')throw new RuntimeException('Expansion in launcher path refused');elseif($ch==='\\'&&$i+1<$n)$out.=$s[++$i];else $out.=$ch;}else{if($ch==="'"||$ch==='"')$quote=$ch;elseif($ch==='\\'&&$i+1<$n)$out.=$s[++$i];elseif(ctype_space($ch)||str_contains('$`;|&<>',$ch))throw new RuntimeException('Unexpected launcher arguments');else $out.=$ch;}}if($quote!==null)throw new RuntimeException('Unclosed launcher quoting');return $out;}
+ function cronSignature($s){$s=trim(strtolower($s));$macros=['@hourly'=>'0 * * * *','@daily'=>'0 0 * * *','@midnight'=>'0 0 * * *','@weekly'=>'0 0 * * 0','@monthly'=>'0 0 1 * *','@yearly'=>'0 0 1 1 *','@annually'=>'0 0 1 1 *'];if($s==='@reboot')return 'reboot';$s=$macros[$s]??$s;$f=preg_split('/\s+/',$s);if(count($f)!==5)throw new RuntimeException('Unexpected cron field count');$names=[3=>['jan'=>1,'feb'=>2,'mar'=>3,'apr'=>4,'may'=>5,'jun'=>6,'jul'=>7,'aug'=>8,'sep'=>9,'oct'=>10,'nov'=>11,'dec'=>12],4=>['sun'=>0,'mon'=>1,'tue'=>2,'wed'=>3,'thu'=>4,'fri'=>5,'sat'=>6]];foreach($names as $i=>$map)$f[$i]=preg_replace_callback('/[a-z]+/',fn($m)=>isset($map[$m[0]])?(string)$map[$m[0]]:throw new RuntimeException('Unknown cron name'),$f[$i]);$result=[];foreach([[0,59],[0,23],[1,31],[1,12],[0,7]] as $i=>[$lo,$hi]){$values=[];foreach(explode(',',$f[$i]) as $piece){if(!preg_match('~^(\*|[0-9]+(?:-[0-9]+)?)(?:/([0-9]+))?$~D',$piece,$m))throw new RuntimeException('Invalid cron expression');$step=(int)($m[2]??1);if($step<1)throw new RuntimeException('Invalid cron step');if($m[1]==='*'){$a=$lo;$b=$hi;}elseif(str_contains($m[1],'-'))[$a,$b]=array_map('intval',explode('-',$m[1]));else{$a=(int)$m[1];$b=isset($m[2])?$hi:$a;}if($a<$lo||$b>$hi||$a>$b)throw new RuntimeException('Cron value out of range');for($v=$a;$v<=$b;$v+=$step)$values[$i===4&&$v===7?0:$v]=true;}ksort($values);$result[]=array_keys($values);}$result[]=[str_starts_with($f[2],'*'),str_starts_with($f[4],'*')];return json_encode($result);}
+ $actual=[];$issues=[];
+ foreach(explode("\n",file_get_contents($cronFile)) as $line){if(trim($line)===''||preg_match('/^\s*#/',$line)||!str_contains($line,'/user.scripts/startCustom.php'))continue;
+  if(!preg_match('~^\s*(.*?)\s+/usr/local/emhttp/plugins/user\.scripts/startCustom\.php\s+(.+?)\s+>\s*/dev/null\s+2>&1\s*$~D',$line,$m)){$issues[]='Unrecognized User Scripts launcher line; no shell code executed';continue;}
+  try{$path=pathArg($m[2]);$path=preg_replace('~^/usr/local/emhttp/plugins/user\.scripts/scripts/~','/boot/config/plugins/user.scripts/scripts/',$path);$actual[$path][]=cronSignature($m[1]);}catch(Throwable $e){$issues[]='Invalid live launcher timing/path: '.$e->getMessage();}
+ }
+ $wanted=[];
+ foreach($c['jobs'] as $job){if(!$job['present']||!$job['enabled'])continue;
+  if($job['frequency']==='custom'){$path=$job['path'];$wanted[$path]=true;$expected=cronSignature($job['event']?'@reboot':($job['cron']??''));if(!isset($actual[$path]))$issues[]=$job['name'].': active launcher missing';elseif(count($actual[$path])!==1)$issues[]=$job['name'].': duplicate live launchers';elseif($actual[$path][0]!==$expected)$issues[]=$job['name'].': live cron timing differs from schedule.json';}
+  elseif(in_array($job['frequency'],['hourly','daily','weekly','monthly'],true)){if(!$job['cron'])$issues[]=$job['name'].': native dispatcher timing unavailable';$hook=$hooks.'/user.script.start.'.$job['frequency'].'.sh';if(!is_readable($hook)||!str_contains(file_get_contents($hook),'startSchedule.php'))$issues[]=$job['name'].': native dispatcher hook unavailable';}
+ }
+ foreach($actual as $path=>$times)if(!isset($wanted[$path]))$issues[]='Launcher has no installed enabled schedule: '.$path;
+ echo json_encode(['schema'=>1,'valid'=>!$issues,'checkedAt'=>time(),'issues'=>array_values(array_unique($issues))],JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR);
+ if($issues)exit(1);
+}catch(Throwable $e){echo json_encode(['schema'=>1,'valid'=>false,'issues'=>[$e->getMessage()]]);exit(1);}
+US_CRON_VERIFY
+}
 # END EMBEDDED USER SCRIPTS CATALOG
 set -uo pipefail
-readonly SCRIPT_VERSION="1.12.2"
+readonly SCRIPT_VERSION="1.13.0"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/backup_health_audit}"
 APPDATA_ROOT="${APPDATA_ROOT:-/mnt/vault/backup/cache}"
@@ -526,25 +553,13 @@ audit_runtime() {
       for path in backup_cache_appdata backup_boot_disk backup_media_remote backup_vault_remote;do
         jq -e --arg role "$path" 'any(.jobs[];(.role==$role or .name==$role) and .present and .enabled)' "$AUDIT_CATALOG_FILE" >/dev/null || { finding "Scheduling: required backup protection missing or disabled: $path; replacement required";missing=true; }
       done
-      while IFS=$'\t' read -r path command;do
-        if [[ "$command" == custom ]];then
-          local expected actual
-          expected=$(jq -r --arg path "$path" '.jobs[$path].cron // ""' "$AUDIT_CATALOG_FILE")
-          actual=$(awk -v path="$path" 'index($0,path) && $0 !~ /^[[:space:]]*#/ {if ($1 ~ /^@/) print $1;else print $1" "$2" "$3" "$4" "$5;exit}' <<<"$cron")
-          if [[ -z "$actual" ]];then finding "Scheduling: enabled script is absent from active cron: $path";missing=true
-          elif [[ "$actual" != "$expected" ]];then
-            # Named months/days and macros are equivalent after normalization;
-            # compare against the preserved native custom expression as well.
-            local original
-            local schedule_key
-            schedule_key=$(jq -r --arg path "$path" '.jobs[$path].keys[0]' "$AUDIT_CATALOG_FILE")
-            original=$(jq -r --arg key "$schedule_key" '.[$key].custom' "${USER_SCRIPTS_SCHEDULE_FILE:-/boot/config/plugins/user.scripts/schedule.json}"|awk '{$1=$1;print}')
-            [[ "$actual" == "$original" ]] || { finding "Scheduling: active cron timing differs from schedule.json: $path";missing=true; }
-          fi
-        elif [[ "$command" != boot && "$command" != start && "$command" != stop ]];then
-          grep -Fq 'startSchedule.php' /usr/local/emhttp/plugins/user.scripts/cron/"user.script.start.$command.sh" 2>/dev/null || { finding "Scheduling: native $command dispatch hook unavailable";missing=true; }
-        fi
-      done < <(jq -r '.jobs[]|select(.present and .enabled)|[.path,.frequency]|@tsv' "$AUDIT_CATALOG_FILE")
+      local live_cron="$AUDIT_CATALOG_FILE.cron" verification="$AUDIT_CATALOG_FILE.verification" issue
+      printf '%s\n' "$cron" >"$live_cron"
+      if ! usr_scripts_verify_cron "$AUDIT_CATALOG_FILE" "$live_cron" >"$verification";then
+        while IFS= read -r issue;do finding "Scheduling: $issue";done < <(jq -r '.issues[]?' "$verification")
+        missing=true
+      fi
+      rm -f -- "$live_cron" "$verification"
       local orphans
       orphans=$(jq '[.jobs[]|select(.present|not)]|length' "$AUDIT_CATALOG_FILE")
       ((orphans==0)) || ACTIONS+=("Scheduling: $orphans absent-script reference(s) excluded from active checks; registry will retire confirmed leftovers")
@@ -624,12 +639,35 @@ audit_script_executions() {
       operation_pid=$(jq -r '.pid // 0' "$operation" 2>/dev/null)
       if ! [[ "$operation_pid" =~ ^[1-9][0-9]*$ ]] || ! kill -0 "$operation_pid" 2>/dev/null;then finding 'Plex DBRepair: interrupted operation journal retained; updates/recovery held for reconciliation';fi
     fi
-    local archives="${RAMLOG_ARCHIVE_ROOT:-/mnt/vault/cloud/logs/ram_logs_watchdog_archives}" newest=0 stamp
-    if audit_script_active ram_logs_watchdog;then
-      while IFS= read -r -d '' record;do stamp=$(jq -r '.createdAt // 0' "$record" 2>/dev/null);[[ "$stamp" =~ ^[0-9]+$ ]] && ((stamp<=newest)) || { [[ "$stamp" =~ ^[0-9]+$ ]] && newest="$stamp"; };done < <(find "$archives" -mindepth 2 -maxdepth 2 -name manifest.json -type f -print0 2>/dev/null)
-      stamp=$(jq -r '.archiveCheckedAt // 0' "$STATUS_DIR/ram_logs_watchdog.json" 2>/dev/null)
-      [[ "$stamp" =~ ^[0-9]+$ ]] && ((stamp>newest && newest>0)) && newest="$stamp"
-      ((newest>0 && NOW-newest<3600)) || finding 'RAM logs: no completed vault checkpoint observed within one hour; crash-log recovery coverage needs review'
+    local receipt="$STATUS_DIR/ram_logs_watchdog.json" checkpoint path manifest bytes checked boot_now archives="${RAMLOG_ARCHIVE_ROOT:-/mnt/vault/cloud/logs/ram_logs_watchdog_archives}"
+    boot_now=$(cat /proc/sys/kernel/random/boot_id)
+    if audit_script_active ram_logs_watchdog && (( $(cut -d . -f1 /proc/uptime)>=1800 ));then
+      checked=$(jq -r '.checkpoint.checkedAt // 0' "$receipt" 2>/dev/null)
+      path=$(jq -r '.checkpoint.path // ""' "$receipt" 2>/dev/null)
+      checkpoint=false
+      case "$path" in "${RAMLOG_ARCHIVE_ROOT:-/mnt/vault/cloud/logs/ram_logs_watchdog_archives}"/ramlogs_*)
+        if [[ $(dirname "$path") == "$archives" && -f "$path/.owner" && ! -L "$path/.owner" && $(cat "$path/.owner") == ramlog_archive && -d "$path" && ! -L "$path" && -f "$path/manifest.json" && ! -L "$path/manifest.json" && -f "$path/payload.tar.gz" && ! -L "$path/payload.tar.gz" ]];then
+          manifest=$(sha256sum "$path/manifest.json"|cut -d ' ' -f1);bytes=$(stat -c %s "$path/payload.tar.gz")
+          jq -e --arg boot "$boot_now" --arg manifest "$manifest" --argjson bytes "$bytes" '.checkpoint.bootId==$boot and .checkpoint.manifestSha256==$manifest and .checkpoint.payloadBytes==$bytes' "$receipt" >/dev/null 2>&1 && checkpoint=true
+        fi;;esac
+      if jq -e --arg boot "$boot_now" '.checkpoint.bootId==$boot and .checkpoint.empty==true' "$receipt" >/dev/null 2>&1;then
+        local ram_source="${RAMLOG_PATH:-/mnt/ramlogs}"
+        if [[ $(jq -r '.checkpoint.source // ""' "$receipt") == "$ram_source" ]] && mountpoint -q "$ram_source" && [[ $(findmnt -rn -T "$ram_source" -o FSTYPE) == tmpfs && -z $(find "$ram_source" -type f -print -quit) ]];then checkpoint=true;fi
+      fi
+      local ram_window ram_cutoff
+      ram_window=$(usr_scripts_due_window "$AUDIT_CATALOG_FILE" ram_logs_watchdog "$NOW" 1800 3600) || ram_window='{"cutoff":0}'
+      ram_cutoff=$(jq -r '.cutoff // 0' <<<"$ram_window");((ram_cutoff<=NOW-3600)) || ram_cutoff=$((NOW-3600))
+      if ! [[ "$checked" =~ ^[0-9]+$ ]] || ((checked>NOW+60 || checked<ram_cutoff)) || [[ "$checkpoint" != true ]];then
+        finding 'RAM logs: current-boot checkpoint is stale or its archive read-back does not match; previous archives retained, crash-log coverage requires attention'
+      fi
+    fi
+    if audit_script_active syslog_watchdog && (( $(cut -d . -f1 /proc/uptime)>=1800 ));then
+      receipt="$STATUS_DIR/syslog_watchdog.json"
+      # Dynamic schedule owns the allowance; disabled/retired scripts are excluded.
+      local freshness cutoff
+      freshness=$(usr_scripts_due_window "$AUDIT_CATALOG_FILE" syslog_watchdog "$NOW" 600 900) || freshness='{"cutoff":0}'
+      cutoff=$(jq -r '.cutoff // 0' <<<"$freshness")
+      jq -e --arg boot "$boot_now" --argjson now "$NOW" --argjson cutoff "$cutoff" '.schema==1 and .bootId==$boot and .lastSuccessfulScanAt<=$now+60 and .lastSuccessfulScanAt>=$cutoff and $cutoff>0' "$receipt" >/dev/null 2>&1 || finding 'Syslog watchdog: no recent successful scan and delivery receipt within the current schedule allowance; execution alone does not prove monitoring coverage'
     fi
 }
 
@@ -650,7 +688,12 @@ audit_backups() {
     epoch=0
     if [[ -n "$latest" && -f "$FLASH_ROOT/$latest.sha256" ]]; then epoch=$(stat -c %Y "$FLASH_ROOT/$latest"); ACTIONS+=("Flash generation: $latest; checksum sidecar present (ZIP payload not rehashed)."); fi
     check_age Flash "$epoch" "$FLASH_MAX_AGE_SECONDS" backup_boot_disk 43200
-    if [[ -f "$STATUS_DIR/backup_media_remote.json" ]] && jq -e '.copy=="OK" and .verification=="rsync_transfer_verified"' "$STATUS_DIR/backup_media_remote.json" >/dev/null; then
+    local mirror_success="$STATUS_DIR/backup_media_remote.last-success.json" mirror_attempt="$STATUS_DIR/backup_media_remote.last-attempt.json"
+    if [[ -f "$mirror_success" ]] && jq -e '.schema==2 and .copy=="OK" and .verification=="rsync_transfer_verified" and (.jobs|length)>0 and all(.jobs[];.exitCode==0)' "$mirror_success" >/dev/null;then
+        copy_epoch=$(jq -r .epoch "$mirror_success")
+        ACTIONS+=("Media mirror: structured per-job completion recorded; transferred-file checksums verified by rsync; unchanged files were not fully rehashed.")
+        if [[ -f "$mirror_attempt" ]] && jq -e --argjson completed "$copy_epoch" '.epoch>$completed' "$mirror_attempt" >/dev/null;then finding "Media mirror: latest attempt did not complete verification. $(jq -r '.lastError // .status' "$mirror_attempt") Previous successful evidence retained.";fi
+    elif [[ -f "$STATUS_DIR/backup_media_remote.json" ]] && jq -e '.copy=="OK" and .verification=="rsync_transfer_verified"' "$STATUS_DIR/backup_media_remote.json" >/dev/null; then
         copy_epoch=$(jq -r .epoch "$STATUS_DIR/backup_media_remote.json")
     else
         # Cutover compatibility: the previous successful mirror predates atomic

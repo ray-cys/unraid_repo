@@ -1,4 +1,7 @@
 #!/bin/bash
+# FRESHNESS: successful scan/delivery publishes a current-boot receipt to the
+# central status directory. The hourly backup audit checks enabled dynamic cadence;
+# a failed invocation cannot advance that successful-scan timestamp.
 clearLog=true
 
 ###############################################################################
@@ -223,7 +226,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
-readonly SCRIPT_VERSION="1.4.1"
+readonly SCRIPT_VERSION="1.5.0"
 
 
 ###############################################################################
@@ -1326,6 +1329,12 @@ main() {
     # Exit status
     # -----------------------------------------------------------------------
 
+    if ((final_exit==0)) && mountpoint -q /mnt/vault;then
+        local receipt_root="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}" receipt
+        mkdir -p "$receipt_root" || return 1
+        receipt=$(mktemp "$receipt_root/.syslog-watchdog.XXXXXX") || return 1
+        jq -n --arg boot "$(cat /proc/sys/kernel/random/boot_id)" --argjson at "$(date +%s)" '{schema:1,name:"syslog_watchdog",bootId:$boot,lastSuccessfulScanAt:$at,epoch:$at,status:"OK",scope:"New syslog entries and log filesystem utilization checked; notification delivery completed"}' >"$receipt" && chmod 600 "$receipt" && mv "$receipt" "$receipt_root/syslog_watchdog.json" || return 1
+    fi
     return "$final_exit"
 }
 
