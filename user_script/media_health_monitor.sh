@@ -6,11 +6,11 @@ clearLog=true
 
 # Read-only version lookup must return before state, API or automation setup.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]];then
-    printf 'media_health_monitor.sh 3.26.0\n';exit 0
+    printf 'media_health_monitor.sh 3.27.0\n';exit 0
 fi
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.26.0
+# ARR Health / Download / Import Monitor v3.27.0
 #
 # PURPOSE
 # -------
@@ -1274,8 +1274,8 @@ POLICY_MAX_ACTIONS_PER_RUN=2
 POLICY_MAX_ACTIONS_PER_DAY=4
 POLICY_BURST_LIMIT=5
 # Alert if preserved rejected payloads still await cleanup after its normal
-# 336-hour eligibility window plus 48 hours; adjust if that threshold changes.
-POLICY_CLEANUP_EXPECTED_HOURS=384
+# six-hour rejection eligibility plus daily scheduling/startup allowance.
+POLICY_CLEANUP_EXPECTED_HOURS=48
 
 # Native import events are preserved before Arr history ages out. The cleanup
 # script resolves these exact file IDs to current paths, including renames.
@@ -7387,7 +7387,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'Media Health Monitor v3.26.0 lifecycle commands' \
+        'Media Health Monitor v3.27.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -7879,6 +7879,10 @@ notification_record_text() {
           + (
                 if $event == "resolved"
                 then " [RESOLVED]"
+                elif $event == "progress"
+                then " [" + (.severity // "INFO") + "] [PROGRESS]"
+                elif $event == "completed"
+                then " [" + (.severity // "INFO") + "] [COMPLETED]"
                 elif $event == "reconciled"
                 then " [" + (.severity // "INFO") + "] [AUTO-RECONCILED]"
                 elif $event == "batch-dismissed"
@@ -7958,7 +7962,7 @@ send_notification_page() {
     local reconciled
     local dismissed
     local reminders
-    local flapping
+    local flapping progress completed
     local body=""
     local record
     local entry
@@ -8006,6 +8010,7 @@ send_notification_page() {
             ;;
     esac
 
+    IFS=$'\t' read -r progress completed < <(jq -sr '[([.[]|select(.event=="progress")]|length),([.[]|select(.event=="completed")]|length)]|@tsv' "$page_file")
     description="Media Health Monitor - ${batch_total} Update(s)"
 
     if (( page_total > 1 )); then
@@ -8014,6 +8019,7 @@ send_notification_page() {
 
     body="Health/activity updates: ${batch_total}"$'\n'
     body+="This batch: ${page_items} | Info: ${info_new} | Warnings: ${warning_new} | Errors: ${error_new} | Resolved: ${resolved}"$'\n'
+    body+="Workflow progress: ${progress} | Completed: ${completed}"$'\n'
     body+="Auto-reconciled: ${reconciled} | Manually dismissed: ${dismissed}"$'\n'
     body+="Reminders: ${reminders} | Flapping: ${flapping}"$'\n'
 
@@ -11536,7 +11542,8 @@ process_sab_orphans() {
         # cleanup deadline passes instead of suppressing a stuck cleanup forever.
         if policy_disposition_matches "$owner" "$nzo_id" "$item"; then
             mark_sab_filesystem_checked "$fs_last"
-            if (( age >= POLICY_CLEANUP_EXPECTED_HOURS )); then
+            if jq -e --arg id "${nzo_id,,}" '.actions[$id].cleanup.status=="manual_restore"' "${POLICY_STATE_FILE:-$STATE_DIR/policy-actions.json}" >/dev/null;then continue;fi
+            if (( now-$(jq -r --arg id "${nzo_id,,}" '.actions[$id].startedAt' "${POLICY_STATE_FILE:-$STATE_DIR/policy-actions.json}") >= POLICY_CLEANUP_EXPECTED_HOURS*3600 )); then
                 record_normalized_issue "SABnzbd:policy-cleanup:${nzo_id,,}" SABnzbd "$name" \
                   SAB_STRANDED_POLICY_CLEANUP WARNING waiting \
                   'Verified rejected payload still awaits quarantine beyond expected cleanup window' "$age" \
@@ -16757,6 +16764,11 @@ automation_report() {
         if [ "$(jq -r '.outcome' "$file")" = import_verified ]; then
             detail+=$'\n'"Eventual exact-target import verified on two scans; Arr file ID $(jq -r '.verifiedFileId' "$file"). No command was replayed to infer this result."
         fi
+        # Once retries are exhausted, one current per-download assessment
+        # replaces the stale individual failure cards. Import proof takes
+        # precedence over an older command failure, without rewriting history.
+        if [[ "$(jq -r '.kind' "$file")" == import-retry && "$(jq -r '.outcome // "pending"' "$file")" != import_verified && "$status" != intent ]] && jq -e --arg key "$app:$(jq -r '.downloadId|ascii_downcase' "$file")" '.retryExhaustions[$key].status=="review_required" or .retryExhaustions[$key].status=="handed_to_policy"' "$AUTOMATION_STATE_FILE" >/dev/null;then continue;fi
+        [[ "$(jq -r '.outcome // "pending"' "$file")" != import_verified ]] || status=completed
         if [ "$status" = failed ]; then
             record_normalized_issue "AUTO:ACTION:$id" "$app" "$title" ARR_AUTOMATION_COMMAND_FAILED WARNING failed \
               'Arr reported that the bounded command failed' 0 "$detail No immediate retry was submitted; original queue warnings and attempt limits remain in force."
@@ -16771,12 +16783,58 @@ automation_report() {
     done < <(jq -c --slurpfile state "$STATE_FILE" '.actions|to_entries[]|select(.value.status=="intent" or .value.status=="failed" or ($state[0].monitor.automationNotifications[.key] // "")!=("action:submitted:"+(.value.outcome // "pending")))' "$AUTOMATION_STATE_FILE")
 }
 
+# No mutation is authorized by retry exhaustion. Fresh queue evidence is
+# classified again; existing policy handling alone may reject an exact release.
+automation_retry_exhaustion() {
+    if jq -e '(.retryExhaustions|type)=="object"' "$AUTOMATION_STATE_FILE" >/dev/null;then
+      automation_state_update '. as $s|.retryExhaustions|=with_entries(.key as $key|if .value.status!="resolved" and any($s.actions[];.kind=="import-retry" and (.app+":"+(.downloadId|ascii_downcase))==$key and .outcome=="import_verified") then .value.status="resolved"|.value.reason="Exact-target import verified; retry escalation resolved"|.value.resolvedAt=$now else . end)' --argjson now "$START_TIME" || return 1
+    fi
+    local record app id queue rows item file="$TMP_DIR/retry-exhaustion.json" reason cause last key patch
+    while IFS= read -r record;do
+      runtime_budget_allows_optional_phase retry-exhaustion || break
+      app=$(jq -r .app <<<"$record");id=$(jq -r .downloadId <<<"$record");key="$app:$id"
+      last=$(jq -r .lastStartedAt <<<"$record")
+      ((START_TIME-last>=14400)) || continue
+      case "$app" in Sonarr) queue="$SONARR_QUEUE";;Radarr) queue="$RADARR_QUEUE";;*) continue;;esac
+      [[ -s "$queue" ]] || continue
+      jq --arg id "$id" '[.records[]?|select((.downloadId // ""|ascii_downcase)==$id)]' "$queue" >"$file" || return 1
+      rows=$(jq length "$file")
+      cause=unverified_queue_outcome
+      reason='Current queue does not prove an import or safe rejection; payload retained. No fourth retry or speculative search was submitted.'
+      if [[ "$rows" == 1 ]];then
+        item=$(jq -c '.[0]' "$file")
+        case "$(policy_queue_reason "$item")" in
+          redundant|replace) cause=policy_reassessment;reason='Fresh reasons now match a supported policy case. Existing exact-ID/profile/history/stability/window checks must authorize any rejection and replacement; exhausted retries supply no deletion authority.';;
+          *)
+            if jq -e 'any(.[0].statusMessages[]?.messages[]?;test("permission|access.*denied|read.only|disk|space|mount|authentication";"i"))' "$file" >/dev/null;then
+              cause=underlying_service_or_storage;reason='Persistent access/storage/service fault requires correction. Payload retained; replacement downloads would not fix this condition.'
+            elif jq -e 'all(.[0].statusMessages[]?.messages[]?;test("being used by another process|sharing violation|resource (temporarily unavailable|busy)|temporarily locked";"i")) and ([.[0].statusMessages[]?.messages[]?]|length)>0' "$file" >/dev/null;then
+              cause=persistent_file_lock;reason='Transient lock/busy condition persisted through three native Auto import attempts. Further attempts stopped; review the process holding the path. Payload retained.'
+            else cause=identity_or_unhandled_reason;reason='Fresh reasons do not authorize automatic rejection. Exact identity, mixed warnings or unsupported import conditions require review; payload retained.';fi;;
+        esac
+      elif ((rows>1));then cause=pack_or_duplicate_tracking;reason='Multiple current queue rows share this download. Pack/duplicate tracking remains protected; no fourth retry or automatic rejection was submitted.';fi
+      local disposition=review_required policy="${POLICY_STATE_FILE:-$STATE_DIR/policy-actions.json}"
+      if [[ "$cause" == policy_reassessment && -f "$policy" ]] && policy_validate_journal "$policy" && jq -e --arg id "$id" --arg app "$app" '.actions[$id].app==$app' "$policy" >/dev/null;then disposition=handed_to_policy;fi
+      patch=$(jq -nc --arg disposition "$disposition" --arg cause "$cause" --arg reason "$reason" --arg app "$app" --arg id "$id" --argjson at "$START_TIME" '{app:$app,downloadId:$id,status:$disposition,cause:$cause,reason:$reason,checkedAt:$at}')
+      automation_state_update '.retryExhaustions //= {}|.retryExhaustions[$key]=$patch|.retryExhaustions|=with_entries(select(.value.checkedAt>=$cutoff))' --arg key "$key" --argjson patch "$patch" --argjson cutoff "$((START_TIME-90*86400))" || return 1
+      [[ "$disposition" != handed_to_policy ]] || continue
+      record_normalized_issue "AUTO:RETRY_EXHAUSTED:$key" "$app" 'Import retry limit reached' ARR_IMPORT_RETRY_EXHAUSTED WARNING "$cause" "$reason" 0 \
+        "Download ID: $id. Attempts: $AUTOMATION_IMPORT_RETRY_MAX_ATTEMPTS/$AUTOMATION_IMPORT_RETRY_MAX_ATTEMPTS; at least four hours since the final attempt. $reason Original native reasons: $(jq -r '[.[]|.statusMessages[]?.messages[]?]|unique|join("; ")' "$file")"
+    done < <(jq -c --argjson max "$AUTOMATION_IMPORT_RETRY_MAX_ATTEMPTS" '[.actions[]|select(.kind=="import-retry")]|group_by([.app,(.downloadId|ascii_downcase)])|.[]|select(length>=$max and all(.[];.outcome!="import_verified" and .status!="intent"))|sort_by(.startedAt)|select(.[-1].status=="completed" or .[-1].status=="failed")|{app:.[0].app,downloadId:(.[0].downloadId|ascii_downcase),lastStartedAt:.[-1].startedAt}' "$AUTOMATION_STATE_FILE")
+}
+
+automation_preserve_retry_exhaustion() {
+    [[ -f "$STATE_FILE" ]] || return 0
+    local key
+    while IFS= read -r key;do mark_seen "$key";done < <(jq -r '.issues|to_entries[]|select(.key|startswith("AUTO:RETRY_EXHAUSTED:"))|select(.value.active==true)|.key' "$STATE_FILE")
+}
 process_arr_automation() {
     [ -f "${AUTOMATION_STATE_FILE:-}" ] && automation_document_valid "$AUTOMATION_STATE_FILE" actions || return 0
     if automation_api_ready; then
         automation_reconcile_commands || return 1
         automation_followup_imports || return 1
-    fi
+        automation_retry_exhaustion || { automation_preserve_retry_exhaustion;return 1; }
+    else automation_preserve_retry_exhaustion;fi
     if [ "$ARR_AUTOMATION_ENABLED" = true ] && [ "$AUTOMATION_CONTROLS_OK" = true ] && automation_window_open; then
         automation_import_retries || true
         automation_missing_searches || true
@@ -16939,11 +16997,13 @@ policy_build_candidate() {
             capture("score (?<score>-?[0-9]+) .*profile minimum (?<minimum>-?[0-9]+)$";"i") |
             (.score|tonumber)==$q.customFormatScore and (.minimum|tonumber)==$p[0].minFormatScore)' <<<"$item" >/dev/null || return 1
     fi
-    jq -n --arg app "$app" --arg id "$id" --arg mode "$mode" --arg kind "$kind" --arg command "$command" --arg field "$ids_field" \
+    local profile_signature=''
+    if [[ -f "${AUTOMATION_STATE_FILE:-}" ]];then profile_signature=$(jq -r --arg app "$app" '.profiles[$app].signature // ""' "$AUTOMATION_STATE_FILE") || return 1;fi
+    jq -n --arg profileSignature "$profile_signature" --arg app "$app" --arg id "$id" --arg mode "$mode" --arg kind "$kind" --arg command "$command" --arg field "$ids_field" \
       --argjson targetId "$target_id" --argjson parentId "$parent_id" --argjson queueId "$queue_id" --slurpfile queue_item "$item_file" \
       --slurpfile target "$target" --slurpfile parent "$parent" --slurpfile profile "$profile" --slurpfile file "$file" --slurpfile sab "$sab" \
       '$queue_item[0] as $item | {app:$app,downloadId:$id,mode:$mode,kind:$kind,targetId:$targetId,parentId:$parentId,queueId:$queueId,
-        title:$item.title,warning:[$item.statusMessages[]?.messages[]?],command:{name:$command,($field):[$targetId]},
+        title:$item.title,profileSignature:$profileSignature,warning:[$item.statusMessages[]?.messages[]?],command:{name:$command,($field):[$targetId]},
         fileId:($file[0].id // 0),filePath:($file[0].path // ""),profile:$profile[0],target:$target[0],parent:$parent[0],
         sab:($sab[0]|{nzo_id,name,storage,completed,category}),queue:$item}' >"$output"
 }
@@ -17097,14 +17157,49 @@ policy_check_replacement() {
     policy_update_action "$id" "{\"replacementState\":\"import_verified\",\"replacementFileId\":$file_id,\"replacementImportedAt\":$epoch}"
 }
 
+# Read companion receipts; cleanup never writes this monitor's journal.
+# A missing source, a completed search or an HTTP 2xx alone cannot resolve work.
+policy_reconcile_cleanup() {
+    local file="${MEDIA_POLICY_CLEANUP_RECEIPT:-/mnt/vault/cloud/logs/script/media_cleanup/sab/policy-cleanup.json}" sources="${MEDIA_CLEANUP_SOURCE_RECEIPTS:-/mnt/vault/cloud/logs/script/media_cleanup/sab/source-removals.json}" empty="$TMP_DIR/policy-cleanup-empty.json" next="$TMP_DIR/policy-cleanup-merged.json"
+    printf '{"schema":1,"actions":{},"records":{}}' >"$empty"
+    if [[ -e "$file" ]];then [[ ! -L "$file" ]] && jq -e '.schema==1 and (.actions|type)=="object"' "$file" >/dev/null || return 1;else file="$empty";fi
+    if [[ -e "$sources" ]];then [[ ! -L "$sources" ]] && jq -e '.schema==1 and (.records|type)=="object"' "$sources" >/dev/null || return 1;else sources="$empty";fi
+    jq --slurpfile cleanup "$file" --slurpfile sources "$sources" --argjson now "$START_TIME" '
+      ([$sources[0].records[]?|select(.proofKind=="policy-disposition" and (.at|type)=="number" and .at<=$now+300)]|sort_by(.at)|INDEX([.app,.downloadId,.policyStartedAt,.targetId]|tojson)) as $sourceIndex |
+      .actions |= with_entries(.value as $p | .value |= (
+        $sourceIndex[([$p.app,$p.downloadId,$p.startedAt,$p.targetId]|tojson)] as $entry |
+        (if $entry!=null and $entry.sab==$p.sab and $entry.at>=$p.startedAt then $entry else null end) as $committed |
+        $cleanup[0].actions[$p.downloadId] as $c |
+        if $committed!=null and ($committed.action=="restored" or $committed.action=="restore_requested") then .cleanup={status:"manual_restore",reason:"Operator restore/request recorded; automatic re-quarantine held",sourcePath:$committed.originalPath,at:$committed.at}
+        elif $committed!=null and $committed.action=="quarantined" and $committed.sourceAbsent==true and ($committed.originalPath|type)=="string" and ($committed.destination|type)=="string" then .cleanup={status:"quarantined",reason:"Committed quarantine and source-removal proof verified",sourcePath:$committed.originalPath,quarantinePath:$committed.destination,at:$committed.at}
+        elif $c!=null and $c.app==$p.app and $c.policyStartedAt==$p.startedAt and $c.targetId==$p.targetId and $c.sab==$p.sab and
+          ($c.at|type)=="number" and $c.at>=$p.startedAt and $c.at<=$now+300 and
+          (["blocked","deferred","failed","source_unverified","waiting_grace","manual_restore"]|index($c.status))!=null then .cleanup=$c
+        else .cleanup //= {status:"pending",reason:"Awaiting exact cleanup acknowledgement"} end |
+        .workflow=(if .status!="done" then "rejection_unverified" elif .cleanup.status=="quarantined" and (.mode=="redundant" or .replacementState=="import_verified") then "resolved"
+          elif .cleanup.status=="manual_restore" then "manual_hold"
+          elif .cleanup.status=="failed" or .cleanup.status=="blocked" or .cleanup.status=="source_unverified" then "cleanup_blocked"
+          elif .mode=="replace" and .replacementState!="import_verified" then "replacement_import_pending" else "cleanup_pending" end)))' "$POLICY_STATE_FILE" >"$next" || return 1
+    policy_publish "$next" "$POLICY_STATE_FILE"
+}
+policy_notification_signature() {
+    jq -r '
+      "policy:"+.status+":"+(.replacementState // "waiting")+":"+((.replacementFileId // 0)|tostring)+":"+(.workflow // "pending")+":"+(.cleanup.status // "pending")+":"+(.cleanup.reason // "")'
+}
+
 policy_report_actions() {
+    if ! policy_reconcile_cleanup;then
+      record_normalized_issue Monitor:policy-cleanup-receipt Monitor 'Cleanup receipt unavailable' ARR_POLICY_AUTOMATION WARNING unverified-cleanup 'Companion cleanup evidence is invalid/unavailable' 0 'Existing policy/cleanup state preserved. No disappearance, quarantine or resolution was inferred; inspect receipt storage.'
+    fi
     local action id status severity detail app title
     while IFS= read -r action; do
         id=$(jq -r '.downloadId' <<<"$action"); status=$(jq -r '.status' <<<"$action"); app=$(jq -r '.app' <<<"$action"); title=$(jq -r '.title' <<<"$action")
         severity=WARNING; [ "$status" != done ] || severity=INFO
-        detail="Download ID: $id"$'\n'"Original warning: $(jq -r '.warning|join("; ")' <<<"$action")"$'\n'
+        detail="Workflow: $(jq -r '.workflow // "pending"' <<<"$action"). Download ID: $id"$'\n'"Cleanup: $(jq -r '.cleanup.status // "pending"' <<<"$action"); $(jq -r '.cleanup.reason // "Awaiting exact acknowledgement"' <<<"$action")."$'\n'
         if [ "$status" = done ]; then
-            detail+="Queue removal and native disposition verified. Payload preserved for guarded quarantine by media_cleanup sab; library unchanged."$'\n'
+            if [[ "$(jq -r '.cleanup.status // "pending"' <<<"$action")" == quarantined ]];then
+                detail+="Payload quarantined: $(jq -r .cleanup.sourcePath <<<"$action") -> $(jq -r .cleanup.quarantinePath <<<"$action"). Committed source-removal receipt verified; configured quarantine retention applies."$'\n'
+            else detail+="Queue removal and native disposition verified. Payload retained pending guarded quarantine by media_cleanup; library unchanged by rejection."$'\n';fi
             if [ "$(jq -r '.mode' <<<"$action")" = replace ]; then
                 if [ "$(jq -r '.replacementState // "waiting"' <<<"$action")" = import_verified ]; then
                     if [[ "$(jq -r '.resolutionSource // ""' <<<"$action")" == verified-current-file ]];then
@@ -17128,19 +17223,25 @@ policy_report_actions() {
         else
             detail+="Checkpoint: $status. Request outcome or next action is not fully verified; automatic mutation replay prohibited. Payload preserved."
         fi
+        detail+=$'\n'"Original warning: $(jq -r '(.warning // [])|join("; ")' <<<"$action")"
         local signature
-        signature=$(jq -r '"policy:"+.status+":"+(.replacementState // "waiting")+":"+((.replacementFileId // 0)|tostring)' <<<"$action")
+        signature=$(policy_notification_signature <<<"$action")
+        if [[ "$status" == done && "$(jq -r '.cleanup.status // "pending"' <<<"$action")" != quarantined && "$(jq -r '.cleanup.status // "pending"' <<<"$action")" != manual_restore ]] && ((START_TIME-$(jq -r .startedAt <<<"$action")>=POLICY_CLEANUP_EXPECTED_HOURS*3600));then
+            record_normalized_issue "POLICY:CLEANUP:$id" "$app" "$title" ARR_POLICY_CLEANUP_BLOCKED WARNING cleanup-blocked 'Verified rejection still awaits cleanup acknowledgement' 0 "$detail No repeated rejection/search was sent. Latest cleanup blocker above identifies the required action."
+        fi
         if [ "$status" = done ]; then
             local sent; sent=$(jq -r --arg id "$id" '.monitor.policyNotifications[$id] // ""' "$STATE_FILE")
             if [ "$sent" != "$signature" ]; then
-                queue_group_notification "POLICY:ACTION:$id" "$signature" "$app" "$title" ARR_POLICY_AUTOMATION INFO 0 "$detail" reconciled
+                local outcome_event=progress
+                [[ "$(jq -r '.workflow // "pending"' <<<"$action")" != resolved ]] || outcome_event=completed
+                queue_group_notification "POLICY:ACTION:$id" "$signature" "$app" "$title" ARR_POLICY_AUTOMATION INFO 0 "$detail" "$outcome_event"
             fi
         else
             record_normalized_issue "POLICY:$id" "$app" "$title" ARR_POLICY_AUTOMATION "$severity" "$status" \
               "Policy action: $status" 0 "$detail" 1 0 0
         fi
     done < <(jq -c --slurpfile monitor "$STATE_FILE" --argjson now "$START_TIME" '
-      .actions[] | ("policy:"+.status+":"+(.replacementState // "waiting")+":"+((.replacementFileId // 0)|tostring)) as $signature |
+      .actions[] | ("policy:"+.status+":"+(.replacementState // "waiting")+":"+((.replacementFileId // 0)|tostring)+":"+(.workflow // "pending")+":"+(.cleanup.status // "pending")+":"+(.cleanup.reason // "")) as $signature |
       select(.status!="done" or ($monitor[0].monitor.policyNotifications[.downloadId] // "")!=$signature or
         (.mode=="replace" and (.replacementState // "")!="import_verified" and $now-.startedAt>=7*86400))' "$POLICY_STATE_FILE")
 }
@@ -17255,6 +17356,7 @@ process_policy_remediation() {
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --automation-status ]]; then
     if [ -f "$STATE_DIR/automation-actions.json" ]; then
         jq '{profiles,missing:(.missing|with_entries(.value |= {baselineAt,baselineCount:(.baselineIds|length),surveyedAt,window,cursor,selectedIds:[.selected[]?.id]})),
+          retryExhaustions:([(.retryExhaustions // {})[]]|sort_by(.checkedAt)|reverse|.[:50]),
           actionCount:(.actions|length),recentActions:([.actions[]|{app,kind,targetId,downloadId,status,outcome,commandId,startedAt}]|sort_by(.startedAt)|reverse|.[:50])}' "$STATE_DIR/automation-actions.json"
     else printf 'No automation state recorded.\n'; fi
     exit $?
@@ -17262,14 +17364,16 @@ fi
 
 # Policy action inventory:
 # /bin/bash /boot/config/plugins/user.scripts/scripts/media_health_monitor/script --policy-actions
-# Columns: app, download ID, action, checkpoint, target ID, replacement state.
+# Columns: app, download ID, action, checkpoint, target ID, replacement state,
+# workflow, cleanup status, blocker/reason, original path and quarantine path.
+# This reads saved receipts only; it does not contact Arr or submit any action.
 # "intent" or "search_uncertain" means a request may have succeeded before a
 # timeout; do not delete the journal or retry it manually without reviewing Arr.
 # Scheduled scans re-read native outcomes and resume verified next steps only.
 # POLICY_AUTOMATION_ENABLED=false pauses new actions and keeps monitoring.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --policy-actions ]]; then
     if [ -f "$STATE_DIR/policy-actions.json" ]; then
-        jq -r '.actions[] | [.app,.downloadId,.mode,.status,.targetId,(.replacementState // "not verified")] | @tsv' "$STATE_DIR/policy-actions.json"
+        jq -r '.actions[] | [.app,.downloadId,.mode,.status,.targetId,(.replacementState // "not verified"),(.workflow // "pending"),(.cleanup.status // "pending"),(.cleanup.reason // "Awaiting cleanup acknowledgement"),(.cleanup.sourcePath // ""),(.cleanup.quarantinePath // "")] | @tsv' "$STATE_DIR/policy-actions.json"
     else
         printf 'No policy actions recorded.\n'
     fi
@@ -17530,7 +17634,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | Media Health Monitor v3.26.0"
+    "START | Media Health Monitor v3.27.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -17543,7 +17647,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting Media Health Monitor v3.26.0"
+debug_log "Starting Media Health Monitor v3.27.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -18190,7 +18294,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "Media Health Monitor v3.26.0 completed"
+log "Media Health Monitor v3.27.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""

@@ -282,7 +282,7 @@ fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
 umask 077
-MC_VERSION="1.8.0"
+MC_VERSION="1.9.0"
 # One execution switch across every module. Conflicting/unused flags fail before work.
 # In preview, quarantine purge becomes audit; restore requires an explicit execute flag.
 MC_DRY_RUN=false
@@ -6714,7 +6714,7 @@ set -uo pipefail
 # CONFIGURATION
 ###############################################################################
 
-VERSION="2.8.0"
+VERSION="2.9.0"
 
 # ---------------------------------------------------------------------------
 # Execution behavior
@@ -6741,6 +6741,9 @@ APP_BACKUP_RETENTION_DAYS="${APP_BACKUP_RETENTION_DAYS:-7}"
 # A conservative grace period. Radarr/Sonarr also regard aggressive SAB
 # history retention (less than 14 days) as unsafe.
 MIN_COMPLETED_AGE_HOURS="${MIN_COMPLETED_AGE_HOURS:-336}"
+# Exact, fully verified monitor rejections may use the next daily cleanup.
+# Ordinary imports/orphans keep their existing minimum age and all path guards.
+MIN_POLICY_REJECTION_AGE_HOURS="${MIN_POLICY_REJECTION_AGE_HOURS:-6}"
 
 # Special working-folder audit runs inside completed-download cleanup, using the
 # same APIs, locks, quarantine limits and daily outbox. No separate schedule.
@@ -6961,7 +6964,7 @@ is_false() {
 }
 
 OPS_SCRIPT_NAME="arr_sabnzbd_cleanup"
-OPS_SCRIPT_VERSION="2.8.0"
+OPS_SCRIPT_VERSION="2.9.0"
 OPS_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
 OPS_ATTENTION_DETAILS=""
 OPS_ATTENTION_FILE=""
@@ -7534,6 +7537,8 @@ validate_stranded_environment() {
   validate_boolean "SONARR_ENABLED" "$SONARR_ENABLED" || valid=false
   validate_boolean "RADARR_ENABLED" "$RADARR_ENABLED" || valid=false
   validate_integer "MIN_COMPLETED_AGE_HOURS" "$MIN_COMPLETED_AGE_HOURS" || valid=false
+  validate_integer "MIN_POLICY_REJECTION_AGE_HOURS" "$MIN_POLICY_REJECTION_AGE_HOURS" || valid=false
+  [[ "$MIN_POLICY_REJECTION_AGE_HOURS" =~ ^[0-9]+$ ]] && ((MIN_POLICY_REJECTION_AGE_HOURS>=6)) || valid=false
   validate_integer "MIN_PATH_STABLE_HOURS" "$MIN_PATH_STABLE_HOURS" || valid=false
   validate_integer "MAX_QUARANTINES_PER_RUN" "$MAX_QUARANTINES_PER_RUN" || valid=false
   validate_integer "SAB_HISTORY_PAGE_SIZE" "$SAB_HISTORY_PAGE_SIZE" || valid=false
@@ -8646,8 +8651,8 @@ record_sab_source_removal() {
     [[ -f "$path" ]] || printf '{"schema":1,"records":{}}' >"$path"
     temp=$(mktemp "$root/.source-removal.XXXXXX") || return 1
     jq --arg source "$source" --arg destination "$destination" --slurpfile manifest "$manifest" --argjson at "$(date +%s)" '
-      .records[$source]={originalPath:$source,destination:$destination,at:$at,sourceAbsent:true,downloadId:$manifest[0].downloadId,action:"quarantined",proofKind:($manifest[0].importProof.proofKind // "verified-cleanup")} |
-      .records|=with_entries(select(.value.at>=$at-90*86400)) | .records|=(to_entries|sort_by(.value.at)|reverse|.[:10000]|from_entries)' "$path" >"$temp" && ops_publish_checkpoint "$temp" "$path"
+      .records[$source]={originalPath:$source,destination:$destination,at:$at,sourceAbsent:true,app:$manifest[0].owner,downloadId:($manifest[0].downloadId|ascii_downcase),policyStartedAt:($manifest[0].importProof.policyReceipt.startedAt // null),targetId:($manifest[0].importProof.policyReceipt.targetId // null),sab:($manifest[0].importProof.policyReceipt.sab // null),action:"quarantined",proofKind:($manifest[0].importProof.proofKind // "verified-cleanup")} |
+      .records|=with_entries(select(.value.action=="restored" or .value.action=="restore_requested" or .value.at>=$at-90*86400)) | .records|=(to_entries|sort_by(.value.at)|reverse|.[:10000]|from_entries)' "$path" >"$temp" && ops_publish_checkpoint "$temp" "$path"
 }
 
 quarantine_payload() {
@@ -8765,6 +8770,16 @@ inspect_quarantines() {
   done <"$list"
 }
 
+record_policy_restore() {
+    local source="$1" manifest="$2" action="$3" file="$LOG_DIR/source-removals.json" temp
+    [[ ! -L "$file" ]] || return 1
+    [[ -f "$file" ]] || printf '{"schema":1,"records":{}}' >"$file"
+    temp=$(mktemp "$LOG_DIR/.restore-proof.XXXXXX") || return 1
+    jq --arg source "$source" --arg action "$action" --slurpfile m "$manifest" --argjson at "$(date +%s)" '
+      .records[$source]={originalPath:$source,action:$action,sourceAbsent:false,app:$m[0].owner,downloadId:($m[0].downloadId|ascii_downcase),at:$at,
+        proofKind:($m[0].importProof.proofKind // "verified-cleanup"),policyStartedAt:($m[0].importProof.policyReceipt.startedAt // null),targetId:($m[0].importProof.policyReceipt.targetId // null),sab:($m[0].importProof.policyReceipt.sab // null)}' "$file" >"$temp" && ops_publish_checkpoint "$temp" "$file"
+}
+
 restore_quarantine_payload() {
   OPS_QUARANTINE_ROOT="$QUARANTINE_DIR_REAL"
   OPS_RESTORE_ROOTS=("$SAB_MOVIE_DIR_REAL" "$SAB_TV_DIR_REAL")
@@ -8786,12 +8801,14 @@ restore_quarantine_payload() {
   operation_id=$(ops_operation_begin restore "$wrapper/payload" "$destination" "$PURGE_RECEIPT_DIR/$RUN_ID.jsonl") || { log ERROR "Cannot flush restore checkpoint; payload preserved."; return 1; }
   check_mover_guard "immediately before manual restore" || return $?
   ops_operation_paths_valid "$wrapper/payload" "$destination" || return 1
+  record_policy_restore "$destination" "$manifest" restore_requested || return 1
   mv -T -n -- "$wrapper/payload" "$destination" || return 1
   [[ ! -e "$wrapper/payload" && ! -L "$wrapper/payload" && -e "$destination" ]] || { log ERROR "Restore was not completed; existing paths and checkpoint preserved."; return 1; }
   jq -c --argjson at "$(date +%s)" '. + {auditEvent:"restore_verified",at:$at}' "$manifest" >>"$PURGE_RECEIPT_DIR/$RUN_ID.jsonl" || return 1
   ops_flush_move "$wrapper/payload" "$destination" || return 1
   ops_flush_file "$PURGE_RECEIPT_DIR/$RUN_ID.jsonl" || return 1
   ops_operation_finish "$operation_id" "Restore verified by successful move, source absence and destination presence" || return 1
+  record_policy_restore "$destination" "$manifest" restored || return 1
   rm -f -- "$manifest"; rmdir -- "$wrapper" 2>/dev/null || true
   RECOVERY_DETAILS+=("Restored $destination from $wrapper/payload; existing destinations were not overwritten. Permissions outside quarantine were not changed. $partial_notice")
   ((RECOVERED++)) || true
@@ -9202,6 +9219,45 @@ process_orphan_folders() {
   ops_publish_checkpoint "$work" "$state"
 }
 
+# Producer-owned handoff. Only identity-matched, verified policy dispositions
+# can use the shorter age; full current API/path/video proof remains mandatory.
+policy_cleanup_match() {
+    POLICY_CLEANUP_MATCHED=false;POLICY_CLEANUP_MANUAL_RESTORE=false
+    [[ -f "$POLICY_DISPOSITION_FILE" && ! -L "$POLICY_DISPOSITION_FILE" ]] || return 1
+    arr_policy_receipt_document_valid "$POLICY_DISPOSITION_FILE" || return 1
+    local input="$TMP_DIR/policy-cleanup-sab.json"
+    printf '%s' "$3" >"$input" || return 1
+    jq -e --arg app "$1" --arg id "${2,,}" --slurpfile item "$input" '
+      .actions[$id]|select(.app==$app and .status=="done" and .queueVerified==true and
+      (.mode=="redundant" or .mode=="replace") and .sab==($item[0]|{nzo_id,name,storage,completed,category}))' "$POLICY_DISPOSITION_FILE" >"$TMP_DIR/policy-cleanup-match.json" || return 1
+    POLICY_CLEANUP_MATCHED=true
+    local removals="$LOG_DIR/source-removals.json"
+    if [[ -f "$removals" && ! -L "$removals" ]] && jq -e --slurpfile p "$TMP_DIR/policy-cleanup-match.json" '
+      any(.records[]?;.downloadId==$p[0].downloadId and .app==$p[0].app and .policyStartedAt==$p[0].startedAt and .sab==$p[0].sab and (.action=="restored" or .action=="restore_requested"))' "$removals" >/dev/null;then POLICY_CLEANUP_MANUAL_RESTORE=true;fi
+}
+policy_cleanup_current_profile() {
+    local root key expected actual profiles="$TMP_DIR/cleanup-current-profiles.json" formats="$TMP_DIR/cleanup-current-formats.json"
+    expected=$(jq -r '.profileSignature // ""' "$TMP_DIR/policy-cleanup-match.json")
+    [[ "$expected" =~ ^[a-f0-9]{64}$ ]] || return 1
+    case "$1" in Sonarr) root="${SONARR_URL%/}/api/v3";key="$SONARR_API_KEY";;Radarr) root="${RADARR_URL%/}/api/v3";key="$RADARR_API_KEY";;*) return 1;;esac
+    arr_get "$root/qualityprofile" "$key" "$profiles" && arr_get "$root/customformat" "$key" "$formats" || return 1
+    actual=$(jq -nSc --slurpfile p "$profiles" --slurpfile f "$formats" '{profiles:[$p[0]|sort_by(.id)[]|{id,cutoff,upgradeAllowed,minFormatScore,cutoffFormatScore,minUpgradeFormatScore,items,formatItems}],formats:[$f[0]|sort_by(.id)[]|{id,specifications,includeCustomFormatWhenRenaming}]}' |sha256sum|cut -d ' ' -f1) || return 1
+    [[ "$expected" == "$actual" ]]
+}
+
+policy_cleanup_record() {
+    [[ "${POLICY_CLEANUP_MATCHED:-false}" == true ]] || return 0
+    is_true "$DRY_RUN" && return 0
+    local status="$1" reason="$2" source="${3:-}" destination="${4:-}" file="$LOG_DIR/policy-cleanup.json" temp
+    [[ ! -L "$file" ]] || return 1
+    [[ -e "$file" ]] || printf '{"schema":1,"actions":{}}' >"$file"
+    jq -e '.schema==1 and (.actions|type)=="object"' "$file" >/dev/null || return 1
+    temp=$(mktemp "$LOG_DIR/.policy-cleanup.XXXXXX") || return 1
+    jq --slurpfile policy "$TMP_DIR/policy-cleanup-match.json" --arg status "$status" --arg reason "$reason" --arg source "$source" --arg destination "$destination" --argjson now "$(date +%s)" '
+      $policy[0] as $p | .actions[$p.downloadId]={app:$p.app,downloadId:$p.downloadId,policyStartedAt:$p.startedAt,targetId:$p.targetId,sab:$p.sab,status:$status,reason:$reason,sourcePath:$source,quarantinePath:$destination,at:$now} |
+      .actions|=with_entries(select(.value.at>=$now-90*86400))|.actions|=(to_entries|sort_by(.value.at)|reverse|.[:2000]|from_entries)' "$file" >"$temp" && ops_publish_checkpoint "$temp" "$file"
+}
+
 process_completed_jobs() {
   local item
   local status
@@ -9219,13 +9275,14 @@ process_completed_jobs() {
   local proof_status
   local verified_paths
   local source_media
-  local quarantine_status
+  local quarantine_status policy_fast=false
 
   log "INFO" "Evaluating completed SABnzbd jobs."
 
   while IFS= read -r item; do
     mc_work_allowed sab || return 21
     ((SCANNED++)) || true
+    POLICY_CLEANUP_MATCHED=false;source_path="";policy_fast=false
 
     status="$(jq -r '.status // ""' <<<"$item")"
     [[ "${status,,}" == "completed" ]] || continue
@@ -9256,6 +9313,12 @@ process_completed_jobs() {
       continue
     fi
 
+    policy_cleanup_match "$owner" "$download_id" "$item" || true
+    if [[ "${POLICY_CLEANUP_MANUAL_RESTORE:-false}" == true ]];then
+      ((SAFETY_SKIPPED++)) || true
+      policy_cleanup_record manual_restore 'Operator restored/requested restoration of this payload; automatic re-quarantine held' || return 1
+      continue
+    fi
     completed_epoch="$(sab_completed_epoch "$item")"
     [[ "$completed_epoch" =~ ^[0-9]+$ ]] || completed_epoch=0
 
@@ -9269,13 +9332,19 @@ process_completed_jobs() {
     (( age_hours >= 0 )) || age_hours=0
 
     if (( age_hours < MIN_COMPLETED_AGE_HOURS )); then
-      ((TOO_YOUNG++)) || true
-      continue
+      if [[ "$POLICY_CLEANUP_MATCHED" != true ]] || ((age_hours<MIN_POLICY_REJECTION_AGE_HOURS));then
+        ((TOO_YOUNG++)) || true
+        policy_cleanup_record waiting_grace 'Six-hour verified-rejection grace not completed' || return 1
+        continue
+      fi
+      policy_fast=true
+      log INFO "Verified policy-rejection fast eligibility: $job_name [$download_id], ${age_hours}h; full queue, identity, source and destination proofs remain required"
     fi
 
     if download_is_active_anywhere "$download_id"; then
       ((QUEUE_PROTECTED++)) || true
       log "INFO" "Queue-protected completed job: $job_name [$download_id]"
+      policy_cleanup_record blocked 'Download remains in an active queue' || return 1
       continue
     fi
 
@@ -9284,12 +9353,14 @@ process_completed_jobs() {
 
     if [[ -z "$source_path" || ! -e "$source_path" ]]; then
       ((PATH_MISSING++)) || true
+      policy_cleanup_record source_unverified 'Source path missing or unmappable; absence alone does not prove cleanup' "$source_path" || return 1
       continue
     fi
 
     if ! path_is_stable "$source_path"; then
       ((PATH_UNSTABLE++)) || true
       log "INFO" "Recently changed path remains protected: $source_path"
+      policy_cleanup_record blocked 'Source path recently changed' "$source_path" || return 1
       continue
     fi
 
@@ -9302,16 +9373,19 @@ process_completed_jobs() {
       10|11)
         ((HISTORY_UNPROVEN++)) || true
         log "INFO" "Import history not proven; preserving: $job_name [$download_id]"
+        policy_cleanup_record blocked 'Current exact import/disposition proof unavailable' "$source_path" || return 1
         continue
         ;;
       12)
         ((DESTINATION_UNVERIFIED++)) || true
         log "WARNING" "Imported library destination not verified; preserving: $job_name [$download_id]"
+        policy_cleanup_record blocked 'Current target/library destination not verified' "$source_path" || return 1
         continue
         ;;
       13)
         ((SOURCE_UNACCOUNTED++)) || true
         log "WARNING" "Remaining source media not fully accounted for; preserving: $job_name [$download_id]"
+        policy_cleanup_record blocked 'Extra video or unaccounted source media; possible pack' "$source_path" || return 1
         continue
         ;;
       *)
@@ -9321,12 +9395,19 @@ process_completed_jobs() {
         ;;
     esac
 
+    if [[ "$POLICY_CLEANUP_MATCHED" == true ]] && { [[ "$policy_fast" == true ]] || jq -e '.profileSignature|type=="string" and length>0' "$TMP_DIR/policy-cleanup-match.json" >/dev/null; } && ! policy_cleanup_current_profile "$owner";then
+      ((SAFETY_SKIPPED++)) || true
+      policy_cleanup_record blocked 'Current quality/custom-format policy changed or cannot be verified; faster cleanup held' "$source_path" || return 1
+      continue
+    fi
+
     # Recheck mutable filesystem state immediately before declaring
     # eligibility. Execute mode also refreshes all live queues so an API
     # snapshot cannot become stale during a long run.
     if ! proof_paths_still_valid "$proof_file"; then
       ((DESTINATION_UNVERIFIED++)) || true
       log "WARNING" "Imported destination changed during validation; preserving: $job_name [$download_id]"
+      policy_cleanup_record blocked 'Destination proof changed during final validation' "$source_path" || return 1
       continue
     fi
 
@@ -9334,6 +9415,7 @@ process_completed_jobs() {
       ((ERRORS++)) || true
       ((SAFETY_SKIPPED++)) || true
       log "ERROR" "Unable to refresh active queues; preserving: $job_name [$download_id]"
+      policy_cleanup_record blocked 'Final active queue refresh failed' "$source_path" || return 1
       continue
     fi
 
@@ -9344,6 +9426,7 @@ process_completed_jobs() {
     then
       ((QUEUE_PROTECTED++)) || true
       log "INFO" "Candidate changed during validation; preserving: $job_name [$download_id]"
+      policy_cleanup_record blocked 'Active queue/source path/idle proof changed before quarantine' "$source_path" || return 1
       continue
     fi
 
@@ -9369,6 +9452,7 @@ process_completed_jobs() {
 
     if (( MAX_QUARANTINES_PER_RUN > 0 && QUARANTINED >= MAX_QUARANTINES_PER_RUN )) && ! is_true "$DRY_RUN"; then
       log "WARNING" "Per-run quarantine limit reached; preserving remaining candidates."
+      policy_cleanup_record deferred 'Daily quarantine action limit reached' "$source_path" || return 1
       continue
     fi
 
@@ -9394,10 +9478,12 @@ process_completed_jobs() {
         log "INFO" "Action: moved to quarantine"
       fi
     elif (( quarantine_status == 20 || quarantine_status == 21 )); then
+      policy_cleanup_record deferred 'Mover or runtime budget deferred quarantine' "$source_path" || return 1
       return "$quarantine_status"
     else
       ((ERRORS++)) || true
       log "ERROR" "Failed to quarantine: $source_path"
+      policy_cleanup_record failed 'Quarantine did not complete; existing intent/source evidence retained' "$source_path" "${LAST_QUARANTINE_DESTINATION:-}" || return 1
     fi
   done < <(jq -c '.[]?' "$SAB_HISTORY_FILE")
 }

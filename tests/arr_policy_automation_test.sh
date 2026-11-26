@@ -8,6 +8,8 @@ export MEDIA_INTEGRITY_RECOVERY_FILE="$fixture/recovery.json"
 printf '{"schema":1,"workflow":"arr-native","actions":{}}' >"$MEDIA_INTEGRITY_RECOVERY_FILE"
 trap 'rm -rf -- "$fixture"' EXIT
 TMP_DIR="$fixture"; STATE_DIR="$fixture"; POLICY_STATE_FILE="$fixture/policy-actions.json"; START_TIME=100000
+MEDIA_POLICY_CLEANUP_RECEIPT="$fixture/no-cleanup.json"
+MEDIA_CLEANUP_SOURCE_RECEIPTS="$fixture/no-source-removals.json"
 sync() { :; }
 log() { :; }
 POLICY_GRACE_HOURS=6
