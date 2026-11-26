@@ -86,3 +86,12 @@ Use the existing read-only command to inspect saved pack and command evidence:
 Maintain the shared sources in `tools/media_pack_{contract,monitor,cleanup}.sh` and `tools/media_pack_inventory.py`, then run `python3 tools/sync_media_pack.py`. Both deployed scripts embed these sources; no additional runtime library is needed.
 
 Read-only review uses the existing commands: `bash SCRIPT --policy-actions` now appends workflow, cleanup status, blocker and original/quarantine paths to the existing columns; `bash SCRIPT --automation-status` includes up to 50 latest retry-exhaustion assessments. Neither command polls applications, sends notifications or submits actions. Email labels distinguish `[PROGRESS]` from `[COMPLETED]` and include matching batch counts; pending replacement searches are not described as completed recovery.
+
+
+The execution audit reads each receipt into one RAM snapshot before evaluating its
+status, PID, boot identity and timestamps. If a worker has just exited while its
+supervisor is committing the final receipt, two bounded one-second read-backs
+observe completion, failure or a newer invocation before diagnosing interruption.
+A worker observed alive is evaluated from that same receipt generation. Persistent
+dead-worker/previous-boot records, failed exits and excessive runtimes still report;
+no producer status, schedule or execution receipt is rewritten by reconciliation.

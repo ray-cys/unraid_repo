@@ -1,8 +1,10 @@
 #!/bin/bash
+# Execution audit: consistent receipt snapshots and bounded completion read-back
+# avoid false interruption alerts when a worker exits during the audit.
 # shellcheck disable=SC2034
 clearLog=true
 arrayStarted=true
-# Backup freshness, delivery and runtime-compatibility audit v1.12.
+# Backup freshness, delivery and runtime-compatibility audit v1.14.1.
 # Schedule: 20 * * * *. Reads local receipts/manifests only: no WOL, remote
 # connection, media hashing, container actions or cleanup. One lifecycle email
 # for changed findings, recovery, or a 24-hour reminder. Failed delivery retries.
@@ -438,7 +440,7 @@ US_CRON_VERIFY
 }
 # END EMBEDDED USER SCRIPTS CATALOG
 set -uo pipefail
-readonly SCRIPT_VERSION="1.14.0"
+readonly SCRIPT_VERSION="1.14.1"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/backup_health_audit}"
 APPDATA_ROOT="${APPDATA_ROOT:-/mnt/vault/backup/cache}"
@@ -612,6 +614,33 @@ execution_finding() {
     if [[ "$role" == media_torrent_management ]];then audit_log "Console-only torrent execution finding: $*";else finding "$*";fi
 }
 
+# Read one atomic receipt generation. A short-lived worker may exit before its
+# supervising parent publishes completion; re-read that narrow handoff before
+# reporting an interruption. Never mix PID/status/timestamps from different runs.
+audit_execution_worker_active() {
+    local record="$1" boot="$2" pid process_start
+    pid=$(jq -r .pid "$record")
+    [[ "$pid" =~ ^[1-9][0-9]*$ && $(jq -r .boot "$record") == "$boot" ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    process_start=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null|awk '{print $20}') || return 1
+    [[ -n "$process_start" && "$process_start" == $(jq -r '.processStart // ""' "$record") ]]
+}
+audit_snapshot_execution() {
+    local source="$1" snapshot="$2" boot="$3" attempt status
+    AUDIT_EXECUTION_WORKER_ACTIVE=false
+    for attempt in 0 1 2;do
+      jq -ce 'select(type=="object")' "$source" >"$snapshot" || return 1
+      jq -e '.schema==1 and (.executionStatus|IN("RUNNING","COMPLETED","FAILED")) and (.startedAt|type)=="number"' "$snapshot" >/dev/null || return 1
+      status=$(jq -r .executionStatus "$snapshot")
+      [[ "$status" == RUNNING ]] || return 0
+      if audit_execution_worker_active "$snapshot" "$boot";then AUDIT_EXECUTION_WORKER_ACTIVE=true;return 0;fi
+      # A previous boot is definite interruption, not a closing-parent race.
+      [[ $(jq -r .boot "$snapshot") == "$boot" ]] || return 0
+      ((attempt==2)) || sleep 1
+    done
+    return 0
+}
+
 audit_script_executions() {
     [[ -s "${AUDIT_CATALOG_FILE:-}" ]] || return 0
     local name role record epoch window cutoff now="$NOW" pid boot status first grace max_active native_summary inventory="$STATE_DIR/execution-inventory.json" tmp
@@ -619,6 +648,8 @@ audit_script_executions() {
     tmp=$(mktemp "$STATE_DIR/.execution-inventory.XXXXXX") || return 1
     jq --slurpfile catalog "$AUDIT_CATALOG_FILE" --argjson now "$NOW" '.scripts as $old | .scripts=([$catalog[0].jobs[]|select(.present and .enabled)|{key:.name,value:($old[.name] // {firstSeen:$now})}]|from_entries)' "$inventory" >"$tmp" && mv "$tmp" "$inventory" || return 1
     boot=$(cat /proc/sys/kernel/random/boot_id)
+    AUDIT_EXECUTION_SNAPSHOT=$(mktemp /tmp/backup-health-execution.XXXXXX) || return 1
+    local source_record
     while IFS=$'\t' read -r name role;do
         [[ "$role" != backup_health_audit ]] || continue
         record="${USR_OPS_EXECUTION_ROOT:-/run/user-script-execution}/$role.json"
@@ -632,7 +663,9 @@ audit_script_executions() {
             ((first>=cutoff)) || execution_finding "$role" "$name: no completion receipt after two eligible schedule occurrences and finish grace"
             continue
         fi
-        if ! jq -e '.schema==1 and (.executionStatus|IN("RUNNING","COMPLETED","FAILED")) and (.startedAt|type=="number")' "$record" >/dev/null;then execution_finding "$role" "$name: execution receipt invalid; previous workflow data retained";continue;fi
+        source_record="$record"
+        if ! audit_snapshot_execution "$source_record" "$AUDIT_EXECUTION_SNAPSHOT" "$boot";then execution_finding "$role" "$name: execution receipt invalid; previous workflow data retained";continue;fi
+        record="$AUDIT_EXECUTION_SNAPSHOT"
         status=$(jq -r .executionStatus "$record");epoch=$(jq -r '.lastCompletedAt // 0' "$record")
         if [[ "$status" == FAILED ]];then
           native_summary=$(jq -r '.summary // "No separate producer summary was saved"' "$STATUS_DIR/$role.json" 2>/dev/null) || native_summary='No separate producer summary was saved'
@@ -640,8 +673,10 @@ audit_script_executions() {
           execution_finding "$role" "$name: latest execution failed (exit=$(jq -r .lastExitCode "$record")). Outcome: ${native_summary:0:1500}"
         fi
         if [[ "$status" == RUNNING ]];then
-            pid=$(jq -r .pid "$record")
-            if [[ $(jq -r .boot "$record") != "$boot" ]] || ! kill -0 "$pid" 2>/dev/null || [[ $(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null|awk '{print $20}') != $(jq -r '.processStart // ""' "$record") ]];then execution_finding "$role" "$name: recorded execution ended without a completion receipt; review interruption evidence";fi
+            if [[ "$AUDIT_EXECUTION_WORKER_ACTIVE" != true ]];then
+                execution_finding "$role" "$name: recorded execution ended without a completion receipt after bounded read-back; review interruption evidence"
+                continue
+            fi
             # Report overruns without terminating active backup/database work.
             max_active=$((grace*2));((max_active>=1800)) || max_active=1800
             case "$role" in backup_cache_appdata) max_active=21600;;backup_boot_disk) max_active=14400;;backup_media_remote|backup_vault_remote) max_active=86400;;media_plex_dbrepair) max_active=43200;;esac
@@ -650,6 +685,7 @@ audit_script_executions() {
         fi
         ((first>=cutoff || epoch>=cutoff)) || execution_finding "$role" "$name: no completed invocation within its current schedule allowance"
     done < <(jq -r '.jobs[]|select(.present and .enabled)|[.name,.role]|@tsv' "$AUDIT_CATALOG_FILE")
+    rm -f -- "$AUDIT_EXECUTION_SNAPSHOT";AUDIT_EXECUTION_SNAPSHOT=''
     local pending count
     pending="${USR_OPS_DELIVERY_ROOT:-$STATUS_DIR/notification-outbox}"
     count=$({ find "$pending" "${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}" -maxdepth 1 -type f -name '*.json' 2>/dev/null || true; }|wc -l)
@@ -810,7 +846,7 @@ main() {
     flock -n 9 || return 0
     exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || return 1
     flock -s -n "$export_fd" || return 0
-    trap '[[ -z "${AUDIT_CATALOG_FILE:-}" ]] || rm -f -- "$AUDIT_CATALOG_FILE"' EXIT
+    trap '[[ -z "${AUDIT_CATALOG_FILE:-}" ]] || rm -f -- "$AUDIT_CATALOG_FILE"; [[ -z "${AUDIT_EXECUTION_SNAPSHOT:-}" ]] || rm -f -- "$AUDIT_EXECUTION_SNAPSHOT"' EXIT
     local previous='' last=0 fingerprint temp status=OK importance=normal body
     audit_runtime; audit_deployed_code; audit_restore_coverage; audit_ram_archive_payloads; usr_ops_retry_deliveries || true; audit_script_executions; audit_backups; audit_recovery_inventory; audit_disk_health_monitor; audit_media_integrity_monitor; audit_media_coordination; audit_update_coordinator
     fingerprint=$(printf '%s\n' "${FINDINGS[@]}" | sort | sha256sum | awk '{print $1}')
