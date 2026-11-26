@@ -157,3 +157,16 @@ vault_remote_restore_drill
 [[ $(wc -l <"$REMOTE_VERSION_ROOT/restore_drill/calls") == 1 ]]
 printf 'remote drill command, script digest and weekly interval fixtures passed\n'
 REMOTE_DRILL
+
+bash <<'WEEKLY_CADENCE'
+set -euo pipefail
+source "$ROOT/user_script/backup_vault_remote.sh"
+last=$(TZ=Asia/Singapore date -d '2026-11-24 11:34:56' +%s)
+next=$(TZ=Asia/Singapore date -d '2026-12-01 07:30:00' +%s)
+vault_restore_drill_due "$last" "$next" 604800
+same_week=$(TZ=Asia/Singapore date -d '2026-11-28 07:30:00' +%s)
+if vault_restore_drill_due "$last" "$same_week" 604800;then exit 1;else [[ $? == 1 ]];fi
+if vault_restore_drill_due "$next" "$last" 604800;then exit 1;else [[ $? == 2 ]];fi
+if vault_restore_drill_due "$last" "$same_week" 1209600;then exit 1;else [[ $? == 1 ]];fi
+printf 'Earlier completion in the following Singapore week remains due; same-week/future/custom interval guards preserved\n'
+WEEKLY_CADENCE

@@ -433,7 +433,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.22.1"
+readonly SCRIPT_VERSION="1.22.2"
 
 ###############################################################################
 # CONFIGURATION
@@ -1179,6 +1179,21 @@ vault_appdata_manifest() {
     done <"$manifest.files"
 }
 
+# Default weekly drills use Singapore calendar weeks, preventing small backup
+# duration changes from skipping the same weekday's next opportunity on ISS.
+# Non-weekly custom intervals retain elapsed-time semantics. No wake is added.
+vault_restore_drill_due() {
+    local last="$1" now="$2" interval="$3" previous_week current_week
+    [[ "$last" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ && "$interval" =~ ^[1-9][0-9]*$ ]] || return 2
+    ((last<=now)) || return 2
+    ((last>0)) || return 0
+    if ((interval==604800));then
+        previous_week=$(TZ=Asia/Singapore date -d "@$last" +%G-%V) || return 2
+        current_week=$(TZ=Asia/Singapore date -d "@$now" +%G-%V) || return 2
+        [[ "$previous_week" != "$current_week" ]]
+    else ((now-last>=interval));fi
+}
+
 vault_remote_restore_drill() {
     [[ "$RUN_REMOTE_RESTORE_DRILL" == true ]] || { RESTORE_DRILL_RESULT=disabled; return 0; }
     local root="$REMOTE_VERSION_ROOT/restore_drill" last digest remote_script output rc=0
@@ -1188,9 +1203,10 @@ vault_remote_restore_drill() {
     last=$(ssh_exec "if test -f $(shell_quote "$root/status/backup_restore_drill.json"); then jq -r 'if .status==\"OK\" or .status==\"WARNING\" then .epoch else 0 end' $(shell_quote "$root/status/backup_restore_drill.json"); else printf 0; fi") || return 1
     [[ "$last" =~ ^[0-9]+$ ]] || return 1
     RESTORE_DRILL_EPOCH=$last
-    if (( last <= $(date +%s) && $(date +%s)-last < RESTORE_DRILL_INTERVAL_SECONDS )); then
-        RESTORE_DRILL_SUMMARY="Weekly ISS restore drill not due; last completed epoch=$last"; return 0
-    fi
+    local due_rc=0
+    vault_restore_drill_due "$last" "$(date +%s)" "$RESTORE_DRILL_INTERVAL_SECONDS" || due_rc=$?
+    if ((due_rc==1));then RESTORE_DRILL_SUMMARY="ISS restore drill already completed in the current Singapore week/interval; last completed epoch=$last";return 0
+    elif ((due_rc!=0));then RESTORE_DRILL_SUMMARY='ISS restore-drill timestamp/cadence invalid; existing backup retained';return 1;fi
     backup_phase restore-drill
     remote_script="$REMOTE_VERSION_ROOT/.hubble-restore-drill.sh"
     digest=$(sha256sum "$RESTORE_DRILL_SCRIPT" | awk '{print $1}') || return 1
