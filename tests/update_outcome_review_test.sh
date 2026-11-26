@@ -31,3 +31,20 @@ event normal 'Update verification recovered' 'metafusion: verified after earlier
 flush_notifications
 [[ $(jq '.outbox|length' "$STATE_FILE") == 0 ]]
 printf 'Mount-order equivalence, real drift refusal, resolved history, urgent/daily separation and recovery delivery passed\n'
+# Completing an install retires the matching cached candidate, not a newer one.
+jq -n '{schema:1,items:{"docker:sonarr":{kind:"docker",name:"sonarr",identity:"repo:develop",candidate:"approved",available:true,checkStatus:"VERIFIED"}},jobs:{done:{item:"docker:sonarr",kind:"docker",name:"sonarr",identity:"repo:develop",candidate:"approved",verifiedAt:200,status:"COMPLETED"}},outbox:[],delivered:{}}' >"$STATE_FILE"
+record_verified_installation done
+jq -e '.items["docker:sonarr"].available==false and .items["docker:sonarr"].refreshAfterInstall==true' "$STATE_FILE" >/dev/null
+mutate '.items["docker:sonarr"].candidate="newer"|.items["docker:sonarr"].available=true'
+record_verified_installation done
+jq -e '.items["docker:sonarr"].available==true and .items["docker:sonarr"].candidate=="newer"' "$STATE_FILE" >/dev/null
+mutate '.items["docker:qbittorrent"]={kind:"docker",name:"qbittorrent",identity:"repo",candidate:"next",available:true,checkStatus:"VERIFIED"}|.jobs.bazarr={item:"docker:bazarr",name:"bazarr",status:"ATTENTION"}'
+summary=$(update_queue_summary)
+[[ "$summary" == *sonarr* && "$summary" == *qbittorrent* && "$summary" == *bazarr* ]]
+printf 'Verified installs clear only matching candidates; newer candidates and full multi-app queue remain visible\n'
+log(){ printf '%s\n' "$*" >>"$TMP_DIR/queue-log"; }
+log_update_queue_changes;count=$(wc -l <"$TMP_DIR/queue-log")
+log_update_queue_changes
+[[ $(wc -l <"$TMP_DIR/queue-log") == "$count" ]]
+grep -q docker:sonarr "$TMP_DIR/queue-log";grep -q docker:qbittorrent "$TMP_DIR/queue-log"
+printf 'Changed per-app holds are logged once without hiding other queued applications\n'

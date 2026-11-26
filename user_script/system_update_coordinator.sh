@@ -476,7 +476,7 @@ US_CRON_VERIFY
 # END EMBEDDED USER SCRIPTS CATALOG
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="1.9.0"
+readonly SCRIPT_VERSION="1.10.0"
 # Keep configured per-item holds when approving the same installed identity.
 # Daily rolling tags need a shorter hold to avoid perpetually chasing rebuilds.
 readonly APPROVAL_JQ='def approval($old;$identity;$allow;$kind;$epoch):
@@ -868,11 +868,11 @@ check_updates() {
       [[ "$kind" != plugin || "$name" == unRAIDServer.plg ]] || fingerprint="$candidate:$(jq -r .candidate.sha256 "$TMP_DIR/check.json")"
       mutate --arg fingerprint "$fingerprint" --arg key "$key" --arg candidate "$candidate" --argjson available "$available" --argjson now "$now" --slurpfile data "$TMP_DIR/check.json" '
         .items[$key] |= (.candidateSeenAt=(if .candidateFingerprint==$fingerprint then (.candidateSeenAt // $now) else $now end) |
-          .candidateFingerprint=$fingerprint | .candidate=$candidate | .available=$available | .checkedAt=$now | .checkFailures=0 | .checkStatus="VERIFIED" | .candidateStatus=(if $available then "CANDIDATE" else "UP_TO_DATE" end) | .evidence=$data[0])' || return 1
+          .candidateFingerprint=$fingerprint | .candidate=$candidate | .available=$available | .checkedAt=$now | .checkFailures=0 | .checkStatus="VERIFIED" | .candidateStatus=(if $available then "CANDIDATE" else "UP_TO_DATE" end) | .refreshAfterInstall=false | .evidence=$data[0])' || return 1
       if ((previous_failures>=3));then event normal 'Update checks restored' "$kind/$name: fresh native update evidence obtained after repeated check failures; normal approval and installation guards remain in force." "check-restored:$key:$((now/(7*86400)))" || return 1;fi
       log INFO "$kind/$name: update check completed; available=$available; no installation performed by check"
-    done < <(jq -r --argjson now "$now" --argjson interval "$CHECK_INTERVAL_SECONDS" '.items|to_entries|sort_by(.value.checkedAt // 0)|.[]|
-      select(.value.missingScans==0 and $now-(.value.checkedAt // 0)>=(if (.value.checkFailures // 0)>0 then ([1800 * pow(2;([.value.checkFailures,3]|min)),21600]|min) else $interval end))|
+    done < <(jq -r --argjson now "$now" --argjson interval "$CHECK_INTERVAL_SECONDS" '.items|to_entries|sort_by(if .value.refreshAfterInstall==true then 0 else (.value.checkedAt // 0) end)|.[]|
+      select(.value.missingScans==0 and ((.value.refreshAfterInstall==true and (.value.checkFailures // 0)==0) or $now-(.value.checkedAt // 0)>=(if (.value.checkFailures // 0)>0 then ([1800 * pow(2;([.value.checkFailures,3]|min)),21600]|min) else $interval end)))|
       [.key,.value.kind,.value.name,.value.identity]|@tsv' "$STATE_FILE")
 }
 
@@ -972,7 +972,12 @@ pending_update_guard() {
       fi
       other=$(application_group "$(jq -r .name <<<"$row")" "$(jq -r '.identity // ""' <<<"$row")")
       if [[ "$kind" == plugin || "$other" == "$group" ]];then
-        SUMMARY="$name waits: $(jq -r .name <<<"$row") outcome pending in $other; independent Docker groups remain eligible";return 1
+        if [[ "$name" == $(jq -r .name <<<"$row") ]];then
+          SUMMARY="$name: installed update verification pending ($(jq -r .status <<<"$row")); no reinstall while outcome is unresolved"
+        else
+          SUMMARY="$name waits for $(jq -r .name <<<"$row") update verification ($(jq -r .status <<<"$row")); dependency group=$other; independent Docker groups remain eligible"
+        fi
+        return 1
       fi
     done < <(jq -c '.jobs[]|select(.status=="INTENT" or .status=="VERIFYING" or .status=="ATTENTION")' "$STATE_FILE")
 }
@@ -1215,6 +1220,20 @@ release_pre_dispatch() {
     release_operation_locks
 }
 
+# A verified installation retires only its own observed candidate, never a
+# newer registry candidate seen while startup verification was in progress.
+record_verified_installation() {
+    job_update "$1" '.jobs[$id] as $job |
+      if .items[$job.item]!=null and .items[$job.item].identity==$job.identity then
+        .items[$job.item].lastVerifiedInstall={jobId:$id,candidate:$job.candidate,at:$job.verifiedAt} |
+        .items[$job.item].refreshAfterInstall=true |
+        if .items[$job.item].candidate==$job.candidate then
+          .items[$job.item].available=false | .items[$job.item].candidateStatus="UP_TO_DATE" |
+          del(.items[$job.item].holds,.items[$job.item].decision,.items[$job.item].scheduling)
+        else . end
+      else . end'
+}
+
 reconcile_jobs() {
     local id name count prior_status
     while read -r id;do
@@ -1236,6 +1255,7 @@ reconcile_jobs() {
           local evidence='Expected image digest, retained configuration and application readiness verified on two observations'
           [[ $(jq -r --arg id "$id" '.jobs[$id].kind' "$STATE_FILE") != plugin ]] || evidence='Exact installed plugin version/source/manifest and finished native plugin task verified on two observations; plugin feature behavior was not independently certified'
           job_update "$id" '.jobs[$id].status="COMPLETED" | .jobs[$id].verifiedAt=$now' --argjson now "$(date +%s)" || return 1
+          record_verified_installation "$id" || return 1
           local subject='Update verified' event_key="verified:$id" recovery_note=''
           if [[ "$prior_status" == ATTENTION ]];then subject='Update verification recovered';event_key="recovered:$id";recovery_note='Earlier verification warning is now resolved by fresh read-back; no reinstall, configuration change or rollback was performed. ';fi
           event normal "$subject" "$name: $recovery_note$evidence. Recovery evidence retained at $(jq -r --arg id "$id" '.jobs[$id].recoveryPath' "$STATE_FILE"); no automatic restore or database rollback was performed." "$event_key" || return 1
@@ -1574,6 +1594,32 @@ collect_update_holds() {
     SUMMARY="$saved_summary"
 }
 
+# The final line describes the complete queue, not the last candidate visited.
+update_queue_summary() {
+    jq -r '
+      def names: if length==0 then "none" else sort|join(", ") end;
+      ([.jobs[]|select(.status=="INTENT" or .status=="VERIFYING" or .status=="ATTENTION")]) as $pending |
+      ([.items[]|select((.missingScans // 0)==0 and .available==true)|. as $i|select(all($pending[];.item!=($i.kind+":"+$i.name)))|.name]) as $available |
+      "Available update candidates: "+($available|names)+"; verification pending: "+([$pending[].name]|unique|names)+
+      "; unverified checks: "+([.items[]|select((.missingScans // 0)==0 and .checkStatus=="UNVERIFIED")]|length|tostring)+
+      ". Per-item holds are retained in --candidates and the grouped report"' "$STATE_FILE"
+}
+log_update_queue_changes() {
+    local row key signature previous reason
+    while IFS= read -r row;do
+      key=$(jq -r .key <<<"$row")
+      signature=$(jq -Sc '{candidate,status,reason}' <<<"$row"|sha256sum|cut -d ' ' -f1)
+      previous=$(jq -r --arg key "$key" '.items[$key].lastQueueLoggedSignature // ""' "$STATE_FILE")
+      [[ "$signature" != "$previous" ]] || continue
+      reason=$(jq -r '.reason' <<<"$row")
+      log INFO "Update queue $key: $(jq -r .status <<<"$row"); $reason"
+      mutate --arg key "$key" --arg signature "$signature" '.items[$key].lastQueueLoggedSignature=$signature' || return 1
+    done < <(jq -c '. as $s|.items|to_entries[]|select(.value.available==true)|.key as $key|.value as $i|
+      ([$s.jobs[]|select(.item==$key and (.status=="INTENT" or .status=="VERIFYING" or .status=="ATTENTION"))]|sort_by(.startedAt)|last) as $j|
+      {key:$key,candidate:$i.candidate,status:(if $j!=null then "VERIFICATION_PENDING" elif $i.checkStatus!="VERIFIED" then "EVIDENCE_UNVERIFIED" else ($i.scheduling.state // "CANDIDATE") end),
+       reason:(if $j!=null then ($j.reason // "Installed update outcome awaits native image/settings/readiness verification") else ([($i.holds.reasons // [])[]|.reason]|if length>0 then join("; ") else "Queued for the next eligible maintenance slot" end) end)}' "$STATE_FILE")
+}
+
 render_update_report() {
     local now day start
     now=$(date +%s);day=$(TZ=Asia/Singapore date +%F);start=$(TZ=Asia/Singapore date -d "$day 00:00:00" +%s)
@@ -1842,6 +1888,8 @@ main() {
     clean_recovery_sets || log WARNING 'Recovery-set retention deferred; existing evidence retained'
     collect_update_holds || log WARNING 'Update hold assessment incomplete; existing observations retained'
     warn_starved_updates || return 1
+    log_update_queue_changes || return 1
+    SUMMARY=$(update_queue_summary) || return 1
     daily_update_report || return 1
     flush_notifications || { RESULT=ATTENTION;SUMMARY='Notification delivery failed; report retained for retry'; }
     mutate --arg mode "$MODE" --argjson now "$(date +%s)" '.lastCompletedAt=$now | (if $mode=="automatic" then .lastAutomaticRunAt=$now else . end) | .jobs |= with_entries(select(.value.status=="INTENT" or .value.status=="VERIFYING" or .value.status=="ATTENTION" or (.value.startedAt // 0)>=$now-90*86400 or ((.value.recoveryPath // "")!="" and (.value.recoveryPrunedAt // 0)==0)))'

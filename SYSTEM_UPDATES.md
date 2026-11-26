@@ -246,3 +246,20 @@ This inspects existing jobs and delivers eligible events; it never starts an
 installer, refreshes update candidates or prunes recovery evidence. Allow the next
 scheduled reconciliation to supply the second observation. Do not delete an
 uncertain job or retry its installer to silence a verification warning.
+
+The final operational line lists all available candidates and every unfinished
+verification, rather than only the last app examined. Changed per-app holds also
+appear in the local log; unchanged holds are not logged repeatedly. `media_pipeline`
+is an internal dependency group for Arr, download and subtitle services, not a
+Docker network or an indication that a media scan is running. A verified finished
+installer with an unresolved app outcome holds its group; an unfinished installer
+or uncertain plugin outcome holds all installations. Discovery continues through
+these holds.
+
+After verified installation, only the matching cached candidate is marked current
+and prioritized for another native registry check. A newer candidate observed
+during startup verification remains queued. Normal registry checks are bounded
+and staggered with a six-hour per-item interval; a newer Docker-tab result can
+therefore precede the next normal coordinator check. `--check-only --refresh`
+requests a bounded full refresh without installation or resetting the observation
+age of unchanged candidate digests.
