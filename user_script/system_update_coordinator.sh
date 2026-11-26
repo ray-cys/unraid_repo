@@ -476,7 +476,7 @@ US_CRON_VERIFY
 # END EMBEDDED USER SCRIPTS CATALOG
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="1.8.0"
+readonly SCRIPT_VERSION="1.9.0"
 # Keep configured per-item holds when approving the same installed identity.
 # Daily rolling tags need a shorter hold to avoid perpetually chasing rebuilds.
 readonly APPROVAL_JQ='def approval($old;$identity;$allow;$kind;$epoch):
@@ -551,11 +551,11 @@ policy_update(){ jq "$@" "$POLICY_FILE" >"$TMP_DIR/policy.next" && policy_valid 
 event(){
  local importance="$1" subject="$2" detail="$3" key="$4" id
  id=$(printf '%s' "$key"|sha256sum|cut -d' ' -f1)
- jq -n --arg detail "$detail" --arg subject "$subject" --arg id "$id" --arg importance "$importance" --argjson now "$(date +%s)" '
+ jq -n --arg eventKey "$key" --arg detail "$detail" --arg subject "$subject" --arg id "$id" --arg importance "$importance" --argjson now "$(date +%s)" '
    def pieces: if utf8bytelength>10000 then [range(0;length;2000) as $i | .[$i:$i+2000]] else [.] end;
    ($detail|split("\n")|map(pieces)|add) as $lines |
    (reduce $lines[] as $line ([""]; if ((.[-1]+"\n"+$line)|utf8bytelength)>11000 then .+[$line] else .[-1]+=(if .[-1]=="" then "" else "\n" end)+$line end)) as $pages |
-   [range(0;$pages|length) as $i|{id:($id+(if ($pages|length)>1 then ":"+($i|tostring) else "" end)),importance:$importance,subject:($subject+(if ($pages|length)>1 then " (part "+(($i+1)|tostring)+"/"+($pages|length|tostring)+")" else "" end)),detail:$pages[$i],at:$now}]' >"$TMP_DIR/events.next" || return 1
+   [range(0;$pages|length) as $i|{eventKey:$eventKey,jobId:(if ($eventKey|test("^(installed|startup|attention|verified|recovered):")) then ($eventKey|sub("^[^:]+:";"")) else null end),deliverImmediately:($eventKey|startswith("recovered:")),id:($id+(if ($pages|length)>1 then ":"+($i|tostring) else "" end)),importance:$importance,subject:($subject+(if ($pages|length)>1 then " (part "+(($i+1)|tostring)+"/"+($pages|length|tostring)+")" else "" end)),detail:$pages[$i],at:$now}]' >"$TMP_DIR/events.next" || return 1
  mutate --slurpfile events "$TMP_DIR/events.next" --argjson now "$(date +%s)" '
    reduce $events[0][] as $e (.;if any(.outbox[];.id==$e.id) or (.delivered[$e.id] // 0)>$now-86400 then . else .outbox+=[$e] end)' || return 1
  EVENTS=$((EVENTS+1))
@@ -1143,28 +1143,48 @@ prepare_recovery_set() {
     printf '%s\n' "$target" >"$TMP_DIR/recovery-path"
 }
 
+# Raw snapshots are retained. Bind-array ordering is not configuration drift;
+# compare exact mapping strings as a multiset, retaining options/duplicates.
+update_definition_preserved() {
+    jq -e --slurpfile old "$1" '
+      def canonical: if (.host.Binds|type)=="array" then .host.Binds|=sort else . end;
+      (.definition|type)=="object" and ($old[0].definition|type)=="object" and
+      (.definition|canonical)==($old[0].definition|canonical)' "$2" >/dev/null
+}
+verification_failed() { VERIFY_REASON="$1";VERIFY_DETAIL="$2";return 1; }
+record_job_verification() {
+    job_update "$1" '.jobs[$id].lastVerification={at:$now,gate:$gate,detail:$detail} |
+      if $gate=="verified" then del(.jobs[$id].reason) else .jobs[$id].reason=$detail end' \
+      --argjson now "$(date +%s)" --arg gate "${VERIFY_REASON:-unverified}" --arg detail "${VERIFY_DETAIL:-Read-back evidence incomplete}"
+}
 job_verified() {
-    local id="$1" kind name expected identity current current_id
-    VERIFY_REASON=unverified
+    local id="$1" kind name expected identity current before
+    VERIFY_REASON=unverified;VERIFY_DETAIL='Read-back evidence incomplete'
     kind=$(jq -r --arg id "$id" '.jobs[$id].kind' "$STATE_FILE");name=$(jq -r --arg id "$id" '.jobs[$id].name' "$STATE_FILE");expected=$(jq -r --arg id "$id" '.jobs[$id].candidate' "$STATE_FILE")
     if [[ "$kind" == docker ]];then
-      adapter definition "$name" >"$TMP_DIR/definition-after.json" || return 1
+      adapter definition "$name" >"$TMP_DIR/definition-after.json" || { verification_failed definition 'Native container/template read-back failed';return 1; }
       identity=$(jq -r --arg id "$id" '.jobs[$id].identity' "$STATE_FILE")
-      same_repository "$(jq -r .runtimeImage "$TMP_DIR/definition-after.json")" "$identity" || return 1
-      current=$(adapter docker-local "$identity" "$name" "$STATE_FILE") || return 1
-      # Require installed digest exactly equal to the approved observed candidate.
-      [[ $(jq -r .local <<<"$current") == "$expected" ]] || return 1
-      [[ $(jq -r .id "$TMP_DIR/definition-after.json") != "$(jq -r --arg id "$id" '.jobs[$id].oldId' "$STATE_FILE")" ]] || return 1
-      jq -e --slurpfile old "$(jq -r --arg id "$id" '.jobs[$id].recoveryPath' "$STATE_FILE")/definition-before.json" '.running==true and .definition==$old[0].definition and .templateHash==$old[0].templateHash' "$TMP_DIR/definition-after.json" >/dev/null || return 1
-      if readiness "$name" --readiness;then return 0;else VERIFY_REASON=readiness;return 1;fi
+      same_repository "$(jq -r .runtimeImage "$TMP_DIR/definition-after.json")" "$identity" || { verification_failed repository 'Running image repository differs from the approved identity';return 1; }
+      current=$(adapter docker-local "$identity" "$name" "$STATE_FILE") || { verification_failed digest_readback 'Installed image digest could not be read';return 1; }
+      [[ $(jq -r .local <<<"$current") == "$expected" ]] || { verification_failed digest_mismatch "Installed digest differs from approved candidate: expected=$expected; observed=$(jq -r .local <<<"$current")";return 1; }
+      [[ $(jq -r .id "$TMP_DIR/definition-after.json") != "$(jq -r --arg id "$id" '.jobs[$id].oldId' "$STATE_FILE")" ]] || { verification_failed recreation 'Container recreation could not be confirmed';return 1; }
+      before="$(jq -r --arg id "$id" '.jobs[$id].recoveryPath' "$STATE_FILE")/definition-before.json"
+      [[ -f "$before" && ! -L "$before" ]] || { verification_failed recovery_definition 'Pre-update configuration evidence missing or unsafe';return 1; }
+      jq -e --slurpfile old "$before" '.templateHash==$old[0].templateHash' "$TMP_DIR/definition-after.json" >/dev/null || { verification_failed template 'Unraid template checksum changed; review explicit user settings';return 1; }
+      update_definition_preserved "$before" "$TMP_DIR/definition-after.json" || { verification_failed configuration 'Effective container settings changed; bind-list ordering alone is ignored, exact mappings/options and all other saved fields remain required';return 1; }
+      jq -e '.running==true' "$TMP_DIR/definition-after.json" >/dev/null || { verification_failed container_state 'Updated container is not running';return 1; }
+      if ! readiness "$name" --readiness;then
+        verification_failed readiness "Application readiness not yet confirmed: $(jq -r '.detail // "native readiness probe unavailable"' "$TMP_DIR/readiness.json" 2>/dev/null || printf 'probe unavailable')";return 1
+      fi
     else
-      adapter plugin-check "$name" >"$TMP_DIR/plugin-after.json" || return 1
-      jq -e '.busy==false' "$TMP_DIR/plugin-after.json" >/dev/null || return 1
-      enforce_single_installer && plugin_service_guard "$name" after || return 1
-      adapter inventory >"$TMP_DIR/recheck-inventory.json" || return 1
+      adapter plugin-check "$name" >"$TMP_DIR/plugin-after.json" || { verification_failed plugin_readback 'Native installed plugin definition could not be checked';return 1; }
+      jq -e '.busy==false' "$TMP_DIR/plugin-after.json" >/dev/null || { verification_failed installer_busy 'Native plugin task is still active';return 1; }
+      enforce_single_installer && plugin_service_guard "$name" after || { verification_failed plugin_dependency 'Native installer completion or affected host service readiness remains unverified';return 1; }
+      adapter inventory >"$TMP_DIR/recheck-inventory.json" || { verification_failed inventory 'Complete installed inventory could not be read';return 1; }
       identity=$(jq -r --arg id "$id" '.jobs[$id].identity' "$STATE_FILE")
-      jq -e --arg name "$name" --arg version "$expected" --arg identity "$identity" --arg hash "$(jq -r --arg id "$id" '.jobs[$id].candidateHash' "$STATE_FILE")" '.complete==true and .plugins[$name].installed.version==$version and .plugins[$name].installed.url==$identity and .plugins[$name].installed.sha256==$hash' "$TMP_DIR/recheck-inventory.json" >/dev/null
+      jq -e --arg name "$name" --arg version "$expected" --arg identity "$identity" --arg hash "$(jq -r --arg id "$id" '.jobs[$id].candidateHash' "$STATE_FILE")" '.complete==true and .plugins[$name].installed.version==$version and .plugins[$name].installed.url==$identity and .plugins[$name].installed.sha256==$hash' "$TMP_DIR/recheck-inventory.json" >/dev/null || { verification_failed plugin_identity 'Installed plugin version/source/manifest differs from approved candidate';return 1; }
     fi
+    VERIFY_REASON=verified;VERIFY_DETAIL='Approved installed identity, retained configuration and application readiness verified';return 0
 }
 
 recover_preparation() {
@@ -1196,7 +1216,7 @@ release_pre_dispatch() {
 }
 
 reconcile_jobs() {
-    local id name count
+    local id name count prior_status
     while read -r id;do
       within_budget 60 || return 1
       name=$(jq -r --arg id "$id" '.jobs[$id].name' "$STATE_FILE")
@@ -1205,7 +1225,9 @@ reconcile_jobs() {
         event normal 'Removed application retired' "$name: removed on two complete inventory observations; update follow-up retired without claiming successful recovery or recreating the application." "retired:$id" || return 1
         continue
       fi
+      prior_status=$(jq -r --arg id "$id" '.jobs[$id].status' "$STATE_FILE")
       if job_verified "$id";then
+        record_job_verification "$id" || return 1
         clear_update_request "$APP_UPDATE_REQUEST_DIR/$name.json" || return 1
         if native_installer_idle;then job_update "$id" '.jobs[$id].installerFinishedVerified=true' || return 1;fi
         count=$(jq -r --arg id "$id" '.jobs[$id].verifiedScans // 0' "$STATE_FILE");count=$((count+1))
@@ -1214,16 +1236,19 @@ reconcile_jobs() {
           local evidence='Expected image digest, retained configuration and application readiness verified on two observations'
           [[ $(jq -r --arg id "$id" '.jobs[$id].kind' "$STATE_FILE") != plugin ]] || evidence='Exact installed plugin version/source/manifest and finished native plugin task verified on two observations; plugin feature behavior was not independently certified'
           job_update "$id" '.jobs[$id].status="COMPLETED" | .jobs[$id].verifiedAt=$now' --argjson now "$(date +%s)" || return 1
-          event normal 'Update verified' "$name: $evidence. Recovery evidence retained at $(jq -r --arg id "$id" '.jobs[$id].recoveryPath' "$STATE_FILE"); no automatic restore or database rollback was performed." "verified:$id" || return 1
+          local subject='Update verified' event_key="verified:$id" recovery_note=''
+          if [[ "$prior_status" == ATTENTION ]];then subject='Update verification recovered';event_key="recovered:$id";recovery_note='Earlier verification warning is now resolved by fresh read-back; no reinstall, configuration change or rollback was performed. ';fi
+          event normal "$subject" "$name: $recovery_note$evidence. Recovery evidence retained at $(jq -r --arg id "$id" '.jobs[$id].recoveryPath' "$STATE_FILE"); no automatic restore or database rollback was performed." "$event_key" || return 1
         fi
       else
+        record_job_verification "$id" || return 1
         if [[ "${VERIFY_REASON:-}" == readiness ]] && (( $(date +%s)-$(jq -r --arg id "$id" '.jobs[$id].dispatchedAt // 0' "$STATE_FILE")<1200 ));then
           job_update "$id" '.jobs[$id].verifiedScans=0 | .jobs[$id].status="VERIFYING"' || return 1
           log INFO "$name: expected image/config verified; application startup readiness pending within 20-minute grace"
           continue
         fi
         job_update "$id" '.jobs[$id].verifiedScans=0 | .jobs[$id].status="ATTENTION"' || return 1
-        event warning 'Update requires review' "$name: native update outcome or application readiness remains unverified. Affected application/dependency updates remain held; independent Docker apps may continue only after installer completion is verified. Existing recovery evidence retained; no blind installer replay or database rollback was attempted. Recovery set: $(jq -r --arg id "$id" '.jobs[$id].recoveryPath' "$STATE_FILE")" "attention:$id" || return 1
+        event warning 'Update requires review' "$name: verification gate=${VERIFY_REASON:-unverified}; ${VERIFY_DETAIL:-read-back evidence incomplete}. Affected application/dependency updates remain held; independent Docker apps may continue only after installer completion is verified. Existing recovery evidence retained; no blind installer replay or database rollback was attempted. Recovery set: $(jq -r --arg id "$id" '.jobs[$id].recoveryPath' "$STATE_FILE")" "attention:$id" || return 1
       fi
     done < <(jq -r '.jobs|to_entries[]|select(.value.status=="INTENT" or .value.status=="VERIFYING" or .value.status=="ATTENTION")|.key' "$STATE_FILE")
 }
@@ -1351,20 +1376,23 @@ install_one() {
       # not the exit code or an HTML completion banner, establishes completion.
       job_update "$job_id" '.jobs[$id].status="VERIFYING" | .jobs[$id].nativeExit=$exit | .jobs[$id].postInstallGuardFailed=$guard' --argjson guard "$post_guard_failed" --argjson exit "$native_rc" || return 1
       if job_verified "$job_id";then
+        record_job_verification "$job_id" || return 1
         job_update "$job_id" '.jobs[$id].verifiedScans=1' || return 1
         local first_evidence='expected image digest, retained settings and initial readiness verified'
         [[ "$kind" != plugin ]] || first_evidence='expected plugin version/source/manifest and completed native task verified'
         event normal 'Update installed; follow-up verification pending' "$name: native installer completed; $first_evidence. A second scheduled observation will confirm stability. Recovery set: $recovery_path. No image channel or application settings were changed by this coordinator." "installed:$job_id" || return 1
       elif [[ "${VERIFY_REASON:-}" == readiness ]];then
+        record_job_verification "$job_id" || return 1
         REQUEST_KEEP=true
         if [[ -n "$CURRENT_REQUEST" && -f "$CURRENT_REQUEST" ]];then
           jq --argjson expires "$(( $(date +%s)+1200 ))" '.expires=$expires | .phase="startup_grace"' "$CURRENT_REQUEST" >"$TMP_DIR/request-startup" && mv "$TMP_DIR/request-startup" "$CURRENT_REQUEST" || return 1
         fi
         event normal 'Update installed; startup verification pending' "$name: expected image digest and retained configuration verified; application readiness is still pending within the 20-minute startup grace. Affected dependency installations and watchdog restarts remain held while scheduled reconciliation checks readiness; independent Docker apps may continue only after installer completion is verified. Recovery set: $recovery_path." "startup:$job_id" || return 1
       else
+        record_job_verification "$job_id" || return 1
         RESULT=ATTENTION
         job_update "$job_id" '.jobs[$id].status="ATTENTION"' || return 1
-        event alert 'Update outcome requires attention' "$name: native installer exit=$native_rc; expected version/digest, configuration or readiness could not be confirmed. Affected application/dependency updates are held; uncertain installer completion or plugin outcomes still hold all updates. Previous-image/configuration or plugin-definition recovery evidence and the backup reference are retained at $recovery_path. No blind replay or database rollback was attempted." "attention:$job_id" || return 1
+        event alert 'Update outcome requires attention' "$name: native installer exit=$native_rc; verification gate=${VERIFY_REASON:-unverified}; ${VERIFY_DETAIL:-read-back evidence incomplete}. Affected application/dependency updates are held; uncertain installer completion or plugin outcomes still hold all updates. Previous-image/configuration or plugin-definition recovery evidence and the backup reference are retained at $recovery_path. No blind replay or database rollback was attempted." "attention:$job_id" || return 1
       fi
       return 0
     done < <(jq -r --slurpfile policy "$POLICY_FILE" --argjson now "$now" '
@@ -1619,18 +1647,30 @@ daily_update_report() {
     event normal 'Daily update summary' "$report" "daily-update-report:$day" && mutate --arg day "$day" '.lastDailyReportDay=$day | .normalDeliveryIds=[.outbox[]|select(.importance=="normal")|.id]'
 }
 
+annotate_notification_context() {
+    local selected="$1" next="$TMP_DIR/notify-context.json"
+    jq --slurpfile state "$STATE_FILE" 'map(. as $e |
+      ($state[0].jobs[($e.jobId // "")] // ([$state[0].jobs[]?|. as $j|select(($e.detail|startswith($j.name+": ")) and $j.startedAt<=$e.at)]|sort_by(.startedAt)|last)) as $job |
+      if $job!=null and $job.status=="COMPLETED" and (.subject|test("startup verification pending|follow-up verification pending|requires attention|requires review";"i")) then
+        .subject="Historical update condition; now verified"|.importance="normal"|
+        .detail=("Current outcome: "+$job.name+" update verified at "+($job.verifiedAt|strflocaltime("%Y-%m-%d %H:%M:%S %Z"))+".\nEarlier event (retained history): "+$e.subject+"\n"+$e.detail)
+      elif .eventKey!=null and (.eventKey|startswith("retired-update:")) then .detail+="\nThis records an earlier inventory removal; it is not an update failure or a new removal at delivery time."
+      else . end)' "$selected" >"$next" && mv "$next" "$selected"
+}
+
 flush_notifications() {
     local body count importance rc=0 urgent=false total
-    jq -e 'any(.outbox[];.importance!="normal")' "$STATE_FILE" >/dev/null && urgent=true
+    jq -e 'any(.outbox[];.importance!="normal" or .deliverImmediately==true)' "$STATE_FILE" >/dev/null && urgent=true
     jq -e '.outbox|length>0' "$STATE_FILE" >/dev/null || return 0
     # Whole bounded events only. Any remainder is retained for a later run.
     jq --argjson urgent "$urgent" '
       (.normalDeliveryIds // []) as $batch |
-      reduce ((.outbox|sort_by(if .importance=="alert" then 0 elif .importance=="warning" then 1 else 2 end))[]|. as $event|select($urgent or ($batch|index($event.id))!=null)) as $e ({bytes:0,items:[]};
+      reduce ((.outbox|sort_by(if .importance=="alert" then 0 elif .importance=="warning" then 1 else 2 end))[]|. as $event|select((if $urgent then .importance!="normal" or .deliverImmediately==true else ($batch|index($event.id))!=null end))) as $e ({bytes:0,items:[]};
         (($e.subject+"\nObserved: "+($e.at|tostring)+"\n"+$e.detail+"\n")|utf8bytelength) as $n |
-        if .bytes+$n+300<19000 then .bytes+=($n+300)|.items+=[$e] else . end)|.items' "$STATE_FILE" >"$TMP_DIR/notify-selected.json" || return 1
+        if .bytes+$n+800<19000 then .bytes+=($n+800)|.items+=[$e] else . end)|.items' "$STATE_FILE" >"$TMP_DIR/notify-selected.json" || return 1
     count=$(jq length "$TMP_DIR/notify-selected.json");((count>0)) || { log INFO "Routine update events retained for the daily report cutoff; urgent attention bypasses batching";return 0; }
     total=$(jq '.outbox|length' "$STATE_FILE")
+    annotate_notification_context "$TMP_DIR/notify-selected.json" || return 1
     body=$(jq -r '.[]|"["+.importance+"] "+.subject+"\nObserved: "+(.at|strflocaltime("%Y-%m-%d %H:%M:%S"))+"\n"+.detail+"\n"' "$TMP_DIR/notify-selected.json") || return 1
     body+=$'\n'"Delivery: $count of $total queued event(s); any remainder is retained for the next scheduled delivery."
     importance=$(jq -r 'if any(.[];.importance=="alert") then "alert" elif any(.[];.importance=="warning") then "warning" else "normal" end' "$TMP_DIR/notify-selected.json")
@@ -1680,6 +1720,8 @@ No command: automatic policy evaluation, bounded checks, approved installation i
 13:15-15:30 Singapore, reconciliation and grouped reporting. Schedule: */15 * * * *.
 --status                       Saved policy and update status; no registry/install.
 --check-only [--refresh]       Refresh due/all bounded evidence; no installation.
+--reconcile-only               Recheck existing update jobs and deliver eligible outcomes;
+                               no installer, registry refresh or recovery pruning.
 --candidates                   Show verified/held available update candidates and next attempts.
 --allow docker NAME             Approve exact installed image repository/channel.
 --allow plugin NAME.plg         Approve exact installed plugin source (OS excluded).
@@ -1742,6 +1784,10 @@ main() {
     trap finish EXIT
     trap 'SUMMARY="Update coordinator interrupted; durable intent retained";exit 143' INT TERM HUP
     case "${1:-}" in
+      --reconcile-only) [[ $# == 1 ]] || return 2;reconcile_jobs || return 1
+        if jq -e 'any(.jobs[];.status=="ATTENTION" or .status=="INTENT")' "$STATE_FILE" >/dev/null;then RESULT=ATTENTION;fi
+        SUMMARY='Existing update outcomes reconciled from native image/configuration/readiness evidence; no installation or recovery pruning'
+        flush_notifications;return $?;;
       --candidates) QUIET_FINISH=true;jq '[.items|to_entries[]|select(.value.available==true)|{kind:.value.kind,name:.value.name,status:"CANDIDATE",candidate:.value.candidate,verified:(.value.checkStatus=="VERIFIED"),firstObservedAt:.value.candidateSeenAt,checkedAt:.value.checkedAt,scheduling:.value.scheduling,nextAttemptAt:.value.holds.nextAttemptAt,holds:(.value.holds.reasons // []),readiness:.value.readinessAssessment}]' "$STATE_FILE";return $?;;
       --status) QUIET_FINISH=true;jq -n --slurpfile p "$POLICY_FILE" --slurpfile s "$STATE_FILE" '{policy:$p[0],items:$s[0].items,jobs:$s[0].jobs,pendingNotifications:($s[0].outbox|length)}';return 0;;
       --pause|--resume) local enabled=false;[[ "$1" != --resume ]] || enabled=true;policy_update --argjson enabled "$enabled" '.enabled=$enabled';return $?;;

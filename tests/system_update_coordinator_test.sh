@@ -124,6 +124,10 @@ if flush_notifications;then exit 1;fi
 [[ $(jq '.outbox|length' "$STATE_FILE") == "$count" ]]
 printf '#!/bin/bash\nexit 0\n' >"$NOTIFY_BIN"
 flush_notifications
+# Urgent delivery must not drag unrelated routine history out of daily batching.
+jq -e 'all(.outbox[];.importance=="normal" and .deliverImmediately!=true)' "$STATE_FILE" >/dev/null
+mutate '.normalDeliveryIds=[.outbox[].id]'
+flush_notifications
 [[ $(jq '.outbox|length' "$STATE_FILE") == 0 ]]
 printf 'Durable grouped update notifications retain exact actions until accepted\n'
 CORE

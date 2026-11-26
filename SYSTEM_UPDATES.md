@@ -220,3 +220,29 @@ compatibility boundary, not a guarantee that future Unraid or application versio
 will never require maintenance. `tools/system_update_native.php` is the reviewed
 read-only adapter; `python3 tools/sync_update_adapter.py` embeds its exact contents
 into the standalone script. No Python installation is needed on Hubble.
+
+
+Update-outcome verification treats Docker's bind-mount list as an unordered
+multiset of exact mappings. Reordering does not change configuration; changed
+paths, read/write options, duplicate counts, template checksums, environment,
+network, memory and all other saved settings remain strictly checked. Original
+snapshots are retained. Each job records the failed verification gate and a
+specific operational reason instead of one generic outcome warning.
+
+An earlier `ATTENTION` clears only after the approved installed digest, recreated
+container, retained settings and readiness pass the existing two observations.
+Recovery is reported explicitly; no reinstall or database rollback is performed.
+Startup/attention events delivered after verification are labelled historical,
+with the current verified time. Urgent delivery includes only attention/recovery
+items; unrelated routine retirement/startup records retain normal daily delivery.
+
+For a deliberate outcome-only recheck, run:
+
+```bash
+/bin/bash /boot/config/plugins/user.scripts/scripts/system_update_coordinator/script --reconcile-only
+```
+
+This inspects existing jobs and delivers eligible events; it never starts an
+installer, refreshes update candidates or prunes recovery evidence. Allow the next
+scheduled reconciliation to supply the second observation. Do not delete an
+uncertain job or retry its installer to silence a verification warning.

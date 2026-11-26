@@ -44,7 +44,8 @@ flush_notifications
 [[ $(jq '.outbox|length' "$STATE_FILE") == 1 ]]
 event alert 'Failed native result' 'Outcome unverified; further updates held' urgent
 flush_notifications
-[[ $(jq '.outbox|length' "$STATE_FILE") == 0 ]]
+# Urgency must not pull unrelated normal receipts into an immediate email.
+jq -e '(.outbox|length)==1 and all(.outbox[];.importance=="normal")' "$STATE_FILE" >/dev/null
 grep -q 'Failed native result' "$fixture/mail"
 # A normal receipt after today's already sealed/sent summary must not make
 # another routine email; tomorrow's daily batch will include it.
