@@ -1,12 +1,18 @@
 #!/bin/bash
 clearLog=true
 arrayStarted=true
-# Media Cleanup v1.6.1 -- personal Hubble operations
+# Media Cleanup v1.7.0 -- personal Hubble operations
 #
 # PURPOSE: One daily job coordinates Arr deletion/unmonitoring/90-day retirement,
 # proven SAB completed-payload cleanup, and metadata-bin retention. Modules run
 # sequentially: arr -> sab -> quarantine. Each retains its own proof, retry,
 # mount/Mover, recovery-hold, confirmation, retention and action-budget checks.
+# Performance: per-run exact-ID indexes, per-series RAM observation shards,
+# two read-only fetches maximum and a shared planning-GET budget. Fresh episode/
+# movie snapshots still run daily. Settled sidecar manifests reuse metadata
+# evidence; changes/pending work bypass reuse. Rotate 50 full inventories/app/run,
+# with a seven-day maximum reuse age. Final quarantine always rehashes files.
+# API mutation intents and read-back remain immediate durable checkpoints.
 # Runtime is cooperatively bounded to 45 minutes. Before new work, transport
 # circuits and per-app write/retirement budgets are checked. Issued changes still
 # complete their read-back/checkpoint; leftovers retry on the next scheduled run.
@@ -252,7 +258,7 @@ fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
 umask 077
-MC_VERSION="1.6.1"
+MC_VERSION="1.7.0"
 # One execution switch across every module. Conflicting/unused flags fail before work.
 # In preview, quarantine purge becomes audit; restore requires an explicit execute flag.
 MC_DRY_RUN=false
@@ -280,6 +286,7 @@ MC_LOCK_WAIT_SECONDS=20
 # its read-back. Limits reset each invocation; no manual reset is required.
 MC_MAX_RUNTIME_SECONDS=2700
 MC_ARR_CONSECUTIVE_FAILURES=3
+MC_ARR_MAX_READ_REQUESTS=4096       # Shared planning GET budget; action read-back is exempt.
 MC_ARR_MAX_MUTATIONS=50            # Attempted mutation requests per application.
 MC_ARR_MAX_RETIREMENTS=10          # DELETE requests per application.
 MC_RADARR_MAX_TAG_MOVIES=100       # Bound a bulk editor payload; remainder retries.
@@ -614,7 +621,7 @@ mc_main() {
     MC_DRY_RUN="$MC_EFFECTIVE_DRY"
     mc_state_ready || { mc_preflight_failure;return 1; }
     exec {fd}>"$MC_LOCK";flock -n "$fd" || { printf 'Media cleanup already active; no duplicate actions.\n';return 0; }
-    for self in MC_MAX_RUNTIME_SECONDS MC_ARR_CONSECUTIVE_FAILURES MC_ARR_MAX_MUTATIONS MC_ARR_MAX_RETIREMENTS MC_RADARR_MAX_TAG_MOVIES;do
+    for self in MC_ARR_MAX_READ_REQUESTS MC_MAX_RUNTIME_SECONDS MC_ARR_CONSECUTIVE_FAILURES MC_ARR_MAX_MUTATIONS MC_ARR_MAX_RETIREMENTS MC_RADARR_MAX_TAG_MOVIES;do
       [[ "${!self}" =~ ^[1-9][0-9]*$ ]] || { printf 'Invalid positive limit: %s\n' "$self" >&2;return 2; }
     done
     MC_STARTED=$(date +%s);MC_DEADLINE=$((MC_STARTED+MC_MAX_RUNTIME_SECONDS));MC_GUARDS_ACTIVE=true;MC_RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
@@ -953,7 +960,7 @@ mc_arr_write_reserve() {
     local method="$1" endpoint="$2" file count=0 retired=0
     [[ "${MC_GUARDS_ACTIVE:-false}" == true && "$method" != GET ]] || return 0
     file="$MC_TMP/arr-${APP_CONTEXT}.writes"
-    [[ ! -f "$file" ]] || read -r count retired <"$file"
+    [[ ! -f "$file" ]] || IFS=' ' read -r count retired <"$file"
     if ((count>=MC_ARR_MAX_MUTATIONS)) || { [[ "$method" == DELETE ]] && ((retired>=MC_ARR_MAX_RETIREMENTS)); };then
         mc_defer_work "$APP_CONTEXT" "Arr write budget reached ($count requests, $retired retirements); unapplied candidates remain eligible next run"
         return 1
@@ -963,14 +970,21 @@ mc_arr_write_reserve() {
 }
 
 mc_arr_request() {
+    local fd MC_ARR_TRANSPORT_FILE
     local rc=0 transport=0 http=200 failures=0 file scope="${APP_CONTEXT:-UNKNOWN}"
     mc_work_allowed "$scope" || return 75
     mc_arr_write_reserve "$@" || return 75
+    if [[ "$1" == GET ]];then mc_read_reserve || return 75
+    elif [[ -d "${MC_READ_CACHE:-}" ]];then find "$MC_READ_CACHE" -maxdepth 1 -type f -name '*.json' -delete || return 1;fi
     file="${MC_TMP:-}/arr-$scope.transport"
     [[ "${MC_GUARDS_ACTIVE:-false}" != true ]] || rm -f -- "$file"
+    MC_ARR_TRANSPORT_FILE="$file.$BASHPID.$RANDOM"
     mc_timed_call api arr_api_request_core "$@" || rc=$?
+    [[ ! -f "$MC_ARR_TRANSPORT_FILE" ]] || file="$MC_ARR_TRANSPORT_FILE"
     if [[ "${MC_GUARDS_ACTIVE:-false}" == true && -f "$file" ]];then
-        read -r transport http <"$file"
+        exec {fd}>"$MC_TMP/arr-$scope.circuit.lock" || return 1
+        flock -w 2 "$fd" || { exec {fd}>&-;return 1; }
+        IFS=' ' read -r transport http <"$file"
         [[ ! -f "$MC_TMP/arr-$scope.failures" ]] || read -r failures <"$MC_TMP/arr-$scope.failures"
         if [[ "$http" == 401 || "$http" == 403 ]];then failures="$MC_ARR_CONSECUTIVE_FAILURES"
         elif ((transport!=0)) || [[ "$http" == 408 || "$http" == 425 || "$http" == 429 || "$http" == 5?? ]];then failures=$((failures+1));else failures=0;fi
@@ -979,6 +993,8 @@ mc_arr_request() {
             mc_defer_work "$scope" "Arr circuit breaker opened after $failures consecutive authentication/transport/rate-limit/server failures; no further requests sent to this application"
         fi
     fi
+    [[ -z "${fd:-}" ]] || exec {fd}>&-
+    rm -f -- "$MC_ARR_TRANSPORT_FILE"
     return "$rc"
 }
 
@@ -1014,6 +1030,179 @@ mc_module_metrics() {
   esac
 }
 
+# All caches are job-owned RAM hints. Fresh Arr snapshots and final filesystem
+# identity/hash checks remain the only authority for destructive decisions.
+mc_read_reserve() {
+    [[ "${MC_GUARDS_ACTIVE:-false}" == true ]] || return 0
+    local fd count=0 file="$MC_TMP/arr-$APP_CONTEXT.read-count"
+    exec {fd}>"$file.lock" || return 1
+    flock -w 2 "$fd" || { exec {fd}>&-;return 1; }
+    [[ ! -f "$file" ]] || read -r count <"$file"
+    if ((count>=${MC_ARR_MAX_READ_REQUESTS:-4096}));then
+        mc_defer_work "$APP_CONTEXT" 'Planning read budget reached; issued actions retain independent completion read-back';exec {fd}>&-;return 75
+    fi
+    printf '%s\n' "$((count+1))" >"$file";exec {fd}>&-
+}
+
+mc_get_cache_path() {
+    [[ -d "${MC_READ_CACHE:-}" ]] || return 1
+    printf '%s/%s.json\n' "$MC_READ_CACHE" "$(printf %s "$1"|sha256sum|cut -d ' ' -f1)"
+}
+
+mc_stop_reader() {
+    local pid="$1" child
+    # Only descendants of this still-unreaped worker are signalled. Never use
+    # application/container names or remove another producer's lock.
+    kill -0 "$pid" 2>/dev/null || return 0
+    while read -r child;do [[ "$child" =~ ^[1-9][0-9]*$ ]] && mc_stop_reader "$child";done < <(pgrep -P "$pid" 2>/dev/null)
+    kill -TERM "$pid" 2>/dev/null || true
+}
+
+mc_prefetch_pair() {
+    # No caller may reconcile/mutate until both readers have been reaped.
+    [[ -d "${MC_READ_CACHE:-}" ]] || return 0
+    (( $#<=2 )) || return 2
+    local endpoint out temp pid done_all now index=0
+    local -a pids=() temps=() outputs=()
+    for endpoint in "$@";do
+        ((index<2)) || return 2
+        [[ -n "$endpoint" ]] || continue
+        out=$(mc_get_cache_path "$endpoint") || return 1
+        [[ ! -f "$out" ]] || continue
+        mc_work_allowed "$APP_CONTEXT" || break
+        temp=$(mktemp "$MC_READ_CACHE/.prefetch.XXXXXX") || return 1
+        (trap - EXIT INT TERM; api_get_json_uncached "$endpoint" >"$temp") & pid=$!
+        pids+=("$pid");temps+=("$temp");outputs+=("$out");index=$((index+1))
+    done
+    while :;do
+        done_all=true
+        for pid in "${pids[@]}";do kill -0 "$pid" 2>/dev/null && done_all=false;done
+        [[ "$done_all" != true ]] || break
+        now=$(date +%s)
+        if [[ "${MC_GUARDS_ACTIVE:-false}" == true ]] && ((now>=MC_DEADLINE));then
+            for pid in "${pids[@]}";do mc_stop_reader "$pid";done
+            mc_defer_work "$APP_CONTEXT" 'Read-only discovery cancelled at runtime deadline; incomplete responses discarded'
+            break
+        fi
+        sleep .05
+    done
+    for index in "${!pids[@]}";do
+        if wait "${pids[$index]}" && mc_work_allowed "$APP_CONTEXT" && jq -e 'type=="array" and all(.[];type=="object" and (.id|type)=="number" and .id>0)' "${temps[$index]}" >/dev/null;then
+            mv "${temps[$index]}" "${outputs[$index]}" || return 1
+        else rm -f -- "${temps[$index]}";fi
+    done
+}
+
+mc_index_snapshot() {
+    local source="$1" output="$2" tmp="$2.tmp"
+    jq -ce 'if type!="array" or (all(.[];(.id|type)=="number" and .id>0 and .id==(.id|floor))|not) or ((map(.id)|unique|length)!=length) then error("Incomplete/ambiguous entity IDs") else . end |
+      {records:.,byId:INDEX(.[];.id|tostring),byFileId:(reduce .[] as $r ({};($r.episodeFileId // $r.movieFileId // 0) as $id|if $id>0 then .[$id|tostring]=((.[$id|tostring] // [])+[$r.id]) else . end)),byDownloadId:(reduce .[] as $r ({};($r.downloadId // ""|ascii_downcase) as $id|if $id!="" then .[$id]=((.[$id] // [])+[$r.id]) else . end))}' "$source" >"$tmp" && mv "$tmp" "$output"
+}
+
+mc_sidecar_fingerprint() {
+    local path="$1" media="$2" manifest="$3" output="$4" dirs="$4.dirs" records="$4.records" rel
+    [[ -d "$path" && ! -L "$path" && $(realpath -m "$path") == "$path" ]] || return 1
+    # Directory changes discover additions/removals; recorded-file stat changes
+    # discover in-place edits. Hashing bytes remains mandatory before quarantine.
+    find "$path" -type d -printf '%D:%i:%T@:%C@:%p\0' >"$dirs" || return 1
+    jq -e '(.files|type)=="array" and all(.files[];(.relativePath|type)=="string" and (.size|type)=="number" and .size>=0 and (.sha256|test("^[a-f0-9]{64}$")))' "$manifest" >/dev/null || return 1
+    jq -j '.files[].relativePath+"\u0000"' "$manifest" >"$records.paths" || return 1
+    : >"$records" || return 1
+    while IFS= read -r -d '' rel;do
+        valid_relative_path "$rel" || return 1
+        [[ -f "$path/$rel" && ! -L "$path/$rel" ]] || return 1
+        stat --printf='%d:%i:%s:%y:%z:%n\0' -- "$path/$rel" >>"$records" || return 1
+    done <"$records.paths"
+    { printf '%s\0%s\0' "${MC_POLICY_FINGERPRINT:-unknown}|${MC_SIDECAR_EVIDENCE:-unknown}" "$media";sort -z "$dirs";sort -z "$records"; }|sha256sum|cut -d ' ' -f1 >"$output"
+}
+
+mc_capture_sidecars() {
+    local app="$1" path="$2" root="$3" media="$4" key="$5" out="$6" previous current now last pending=false before after temp read_state="$WORK_STATE"
+    if [[ -d "${MC_SIDECAR_STATE_DIR:-}" ]];then
+      read_state="$MC_SIDECAR_STATE_DIR/$key.json"
+      [[ -f "$read_state" ]] || printf '{}\n' >"$read_state"
+    fi
+    current=$(mktemp "$VERIFY_RUNTIME_DIR/.sidecar-signature.XXXXXX") || return 1
+    previous=$(mktemp "$VERIFY_RUNTIME_DIR/.sidecar-previous.XXXXXX") || return 1
+    now=$(date +%s)
+    jq -c --arg key "$key" '.sidecarManifests[$key] // null' "$read_state" >"$previous" || return 1
+    last=$(jq -r --arg key "$key" '.performance.entities[$key].fullAt // 0' "$read_state")
+    # Pending deletion/retirement/folder work never uses the settled fast path.
+    jq -e --arg key "$key" --argjson id "$key" '(.performance.pending[$key]!=null) or (.sidecarManifests[$key].cleanupPending // false) or (.seriesRetirements[$key]!=null) or (.movieRetirements[$key]!=null) or any((.episodes // {})[]; .seriesId==$id and (.missingRuns // 0)>0) or ((.movies[$key].missingRuns // 0)>0)' "$read_state" >/dev/null && pending=true
+    before=''
+    if jq -e 'type=="object" and (.files|type)=="array"' "$previous" >/dev/null && mc_timed_call filesystem mc_sidecar_fingerprint "$path" "$media" "$previous" "$current";then before=$(cat "$current");fi
+    if [[ -n "$before" && "$pending" == false && -f "${MC_ROTATING_IDS:-/nonexistent}" ]] && ! grep -Fxq -- "$key" "$MC_ROTATING_IDS" && ((now>=last && now-last<7*86400)) && jq -e --arg key "$key" --arg fingerprint "$before" '.performance.entities[$key].fingerprint==$fingerprint' "$read_state" >/dev/null;then
+        : >"$out" # Empty slurp preserves the original captured manifest verbatim.
+        printf 'reused\n' >>"$VERIFY_RUNTIME_DIR/$APP_CONTEXT.sidecar-work"
+        rm -f "$current" "$current.dirs" "$current.records" "$current.records.paths" "$current.changed" "$current.started" "$previous";return 0
+    fi
+    touch "$current.started" || return 1
+    capture_kodi_sidecars "$app" "$path" "$root" "$media" >"$out" || return 1
+    # Only stable captures become reusable. A concurrent change invalidates the
+    # hint; existing quarantine still requires its own before/after file proof.
+    temp=$(mktemp "$VERIFY_RUNTIME_DIR/.sidecar-new.XXXXXX") || return 1
+    jq -n --slurpfile files "$out" '{files:$files[0]}' >"$temp" || return 1
+    after='';mc_timed_call filesystem mc_sidecar_fingerprint "$path" "$media" "$temp" "$current" && after=$(cat "$current")
+    if ! find "$path" \( -type f -o -type d \) -cnewer "$current.started" -print -quit >"$current.changed" || [[ -s "$current.changed" ]];then after='';fi
+    jq -nc --arg key "$key" --arg fingerprint "$after" --argjson at "$now" '{key:$key,value:{fingerprint:$fingerprint,fullAt:$at}}' >>"$VERIFY_RUNTIME_DIR/$APP_CONTEXT.sidecar-hints.jsonl" || return 1
+    printf 'captured\n' >>"$VERIFY_RUNTIME_DIR/$APP_CONTEXT.sidecar-work"
+    rm -f "$current" "$current.dirs" "$current.records" "$current.records.paths" "$current.changed" "$current.started" "$previous"
+}
+
+mc_rotation_plan() {
+    local ids="$1" out="$2" cursor
+    cursor=$(jq -r '.performance.cursor // 0' "$WORK_STATE")
+    jq -r --argjson cursor "$cursor" '[.[]|.id]|sort|unique|. as $ids|length as $n|if $n==0 then empty else range(0;([$n,50]|min))|$ids[(($cursor+.)%$n)] end' "$ids" >"$out" || return 1
+    MC_NEXT_CURSOR=$(jq -r --argjson cursor "$cursor" 'length as $n|if $n==0 then 0 else ($cursor+50)%$n end' "$ids")
+}
+
+mc_radarr_sidecar_views() {
+    MC_SIDECAR_STATE_DIR="$VERIFY_RUNTIME_DIR/movie-sidecar-state";mkdir "$MC_SIDECAR_STATE_DIR" || return 1
+    local data="$MC_SIDECAR_STATE_DIR/index" key row
+    jq -j '. as $s|(.sidecarManifests // {}|keys[]) as $key|
+      {sidecarManifests:{($key):$s.sidecarManifests[$key]},performance:{pending:{($key):$s.performance.pending[$key]},entities:{($key):$s.performance.entities[$key]}},movies:{($key):$s.movies[$key]},movieRetirements:{($key):$s.movieRetirements[$key]}}|$key+"\u0000"+(tojson)+"\u0000"' "$WORK_STATE" >"$data" || return 1
+    while IFS= read -r -d '' key && IFS= read -r -d '' row;do [[ "$key" =~ ^[1-9][0-9]*$ ]] || return 1;printf '%s\n' "$row" >"$MC_SIDECAR_STATE_DIR/$key.json" || return 1;done <"$data"
+}
+
+mc_sonarr_shards_begin() {
+    MC_SONARR_GLOBAL="$WORK_STATE";MC_SONARR_SHARDS="$VERIFY_RUNTIME_DIR/series-shards";mkdir "$MC_SONARR_SHARDS" || return 1
+    # One index pass, rather than re-reading the complete episode map per series.
+    jq -j '. as $s|((.episodes // {}|to_entries|group_by(.value.seriesId))|map({key:(.[0].value.seriesId|tostring),value:from_entries})|from_entries) as $episodes |
+      ([($episodes|keys[]),((.sidecarManifests // {})|keys[]),((.sidecarCleanupActions // {})|keys[]),((.seriesRetirements // {})|keys[]),((.seriesActions // {})|keys[]),((.seasonActions // {})[]|.seriesId|tostring),((.performance.entities // {})|keys[])]|unique)[] as $key |
+      {key:$key,state:{episodes:($episodes[$key] // {}),sidecarManifests:((.sidecarManifests // {})|with_entries(select(.key==$key))),sidecarCleanupActions:((.sidecarCleanupActions // {})|with_entries(select(.key==$key))),seriesRetirements:((.seriesRetirements // {})|with_entries(select(.key==$key))),seriesActions:((.seriesActions // {})|with_entries(select(.key==$key))),seasonActions:((.seasonActions // {})|with_entries(select((.value.seriesId|tostring)==$key))),performance:{pending:((.performance.pending // {})|with_entries(select(.key==$key))),entities:((.performance.entities // {})|with_entries(select(.key==$key)))}}} | .key+"\u0000"+(.state|tojson)+"\u0000"' "$WORK_STATE" >"$MC_SONARR_SHARDS/index.jsonl" || return 1
+    local row key
+    while IFS= read -r -d '' key && IFS= read -r -d '' row;do [[ "$key" =~ ^[1-9][0-9]*$ ]] || return 1;printf '%s\n' "$row" >"$MC_SONARR_SHARDS/$key.json" || return 1;done <"$MC_SONARR_SHARDS/index.jsonl"
+    : >"$MC_SONARR_SHARDS/touched"
+}
+
+mc_entity_timing_end() {
+    [[ -z "${MC_ENTITY_STARTED:-}" ]] || printf 'reconciliation %s\n' "$(( ($(date +%s%N)-MC_ENTITY_STARTED)/1000000 ))" >>"$MC_TMP/arr-$APP_CONTEXT.timings"
+    MC_ENTITY_STARTED=''
+}
+
+mc_sonarr_select_shard() {
+    local key="$1"
+    mc_entity_timing_end
+    WORK_STATE="$MC_SONARR_SHARDS/$key.json"
+    [[ -f "$WORK_STATE" ]] || printf '{"episodes":{},"performance":{"entities":{}}}\n' >"$WORK_STATE"
+    printf '%s\n' "$key" >>"$MC_SONARR_SHARDS/touched"
+}
+
+mc_sonarr_shards_finish() {
+    mc_entity_timing_end
+    local key fragments="$MC_SONARR_SHARDS/updates.jsonl" next="$MC_SONARR_GLOBAL.next"
+    : >"$fragments"
+    while read -r key;do jq -c --arg key "$key" '{key:$key,state:.}' "$MC_SONARR_SHARDS/$key.json" >>"$fragments" || return 1;done < <(sort -u "$MC_SONARR_SHARDS/touched")
+    jq -c --slurpfile updates "$fragments" '($updates|map(.key)|INDEX(.)) as $keys |
+      .episodes|=with_entries(select($keys[(.value.seriesId|tostring)]==null)) |
+      reduce ["sidecarManifests","sidecarCleanupActions","seriesRetirements","seriesActions"][] as $field (.;.[$field]=((.[$field] // {})|with_entries(select($keys[.key]==null)))) |
+      .seasonActions=((.seasonActions // {})|with_entries(select($keys[(.value.seriesId|tostring)]==null))) |
+      .performance.entities=((.performance.entities // {})|with_entries(select($keys[.key]==null))) |
+      reduce $updates[] as $u (.; .episodes += $u.state.episodes | .performance.entities += ($u.state.performance.entities // {}) |
+        reduce ["sidecarManifests","sidecarCleanupActions","seriesRetirements","seriesActions","seasonActions"][] as $field (.;.[$field] += ($u.state[$field] // {})))' "$MC_SONARR_GLOBAL" >"$next" && mv "$next" "$MC_SONARR_GLOBAL" || return 1
+    WORK_STATE="$MC_SONARR_GLOBAL"
+}
+
 mc_timed_call() {
     local kind="$1" function="$2" start rc=0 end;shift 2
     if [[ -z "${MC_TMP:-}" || ! -d "$MC_TMP" ]]; then "$function" "$@";return $?;fi
@@ -1029,13 +1218,20 @@ mc_arr_metrics() {
     local inventory_complete=false
     [[ "${MC_COMPONENT_COMPLETED:-false}" != true || -f "$MC_TMP/deferred-$APP_CONTEXT" ]] || inventory_complete=true
     (($((${API_FAILURES:-0}+${HISTORY_FAILURES:-0}+${SIDECAR_FAILURES:-0}))==0)) || inventory_complete=false
+    local discovery=0 history=0 reconciliation=0 state=0 publication=0 filesystem=0 reused=0 captured=0 requests=0
     local api=0 hashing=0 total=$(( $(date +%s)-${MC_COMPONENT_STARTED:-$(date +%s)} )) other
     if [[ -f "$MC_TMP/arr-$APP_CONTEXT.timings" ]]; then
       IFS=' ' read -r api hashing < <(awk '$1=="api"{a+=$2}$1=="hash"{h+=$2}END{printf "%.0f %.0f\n",a,h}' "$MC_TMP/arr-$APP_CONTEXT.timings")
     fi
+    if [[ -f "$MC_TMP/arr-$APP_CONTEXT.timings" ]];then
+      IFS=' ' read -r discovery history reconciliation state publication filesystem < <(awk '{v[$1]+=$2}END{printf "%.0f %.0f %.0f %.0f %.0f %.0f\n",v["discovery"],v["history"],v["reconciliation"],v["state"],v["publication"],v["filesystem"]}' "$MC_TMP/arr-$APP_CONTEXT.timings")
+    fi
+    if [[ -f "${VERIFY_RUNTIME_DIR:-}/$APP_CONTEXT.sidecar-work" ]];then reused=$(grep -c '^reused$' "$VERIFY_RUNTIME_DIR/$APP_CONTEXT.sidecar-work" || true);captured=$(grep -c '^captured$' "$VERIFY_RUNTIME_DIR/$APP_CONTEXT.sidecar-work" || true);fi
+    [[ ! -f "$MC_TMP/arr-$APP_CONTEXT.read-count" ]] || read -r requests <"$MC_TMP/arr-$APP_CONTEXT.read-count"
+    log INFO "PERFORMANCE | discovery=${discovery}ms history=${history}ms reconciliation=${reconciliation}ms state=${state}ms publication=${publication}ms filesystem=${filesystem}ms planning-reads=$requests sidecar-reused=$reused sidecar-captured=$captured | nested timings may overlap"
     other=$((total*1000-api-hashing)); ((other>=0)) || other=0
     log INFO "TIMING | total=${total}s api=${api}ms sidecar-capture=${hashing}ms planning-state-other=${other}ms"
-    jq -n --arg app "$APP_CONTEXT" --argjson inventoryComplete "$inventory_complete" --argjson api "$api" --argjson hashing "$hashing" --argjson other "$other" \
+    jq -n --argjson discovery "$discovery" --argjson history "$history" --argjson reconciliation "$reconciliation" --argjson state "$state" --argjson publication "$publication" --argjson filesystem "$filesystem" --argjson reused "$reused" --argjson captured "$captured" --argjson requests "$requests" --arg app "$APP_CONTEXT" --argjson inventoryComplete "$inventory_complete" --argjson api "$api" --argjson hashing "$hashing" --argjson other "$other" \
       --argjson scanned "$((${SERIES_SCANNED:-0}+${MOVIES_SCANNED:-0}))" --argjson present "${FILES_PRESENT:-0}" \
       --argjson sidecars "${SIDECARS_CAPTURED:-0}" --argjson moved "${SIDECARS_QUARANTINED:-0}" --argjson folders "${FOLDERS_REMOVED:-0}" \
       --argjson retired "${ARR_REMOVALS:-0}" --argjson episodeActions "${EPISODE_ACTIONS:-0}" --argjson seasonActions "${SEASON_ACTIONS:-0}" \
@@ -1043,7 +1239,7 @@ mc_arr_metrics() {
       --argjson confirmed "$((${EPISODES_CONFIRMED:-0}+${MOVIES_CONFIRMED:-0}))" --argjson pending "${FOLDER_CLEANUP_PENDING:-0}" --argjson mover "${MOVER_DEFERRALS:-0}" \
       --argjson errors "$((${API_FAILURES:-0}+${HISTORY_FAILURES:-0}+${SIDECAR_FAILURES:-0}))" \
       '{application:$app,inventoryComplete:$inventoryComplete,confirmedCandidates:$confirmed,episodeActions:$episodeActions,seasonActions:$seasonActions,seriesActions:$seriesActions,tagActions:$tagActions,scanned:$scanned,filesPresent:$present,sidecarsCaptured:$sidecars,sidecarsQuarantined:$moved,foldersRemoved:$folders,
-        retired:$retired,pendingFolderCleanup:$pending,moverDeferrals:$mover,errors:$errors,timingMs:{api:$api,sidecarCapture:$hashing,planningStateOther:$other}}' >"$MC_TMP/arr-$APP_CONTEXT.metrics.json" || return 1
+        retired:$retired,pendingFolderCleanup:$pending,moverDeferrals:$mover,errors:$errors,planningReads:$requests,sidecarInventoriesReused:$reused,sidecarInventoriesCaptured:$captured,timingMs:{discovery:$discovery,history:$history,reconciliation:$reconciliation,state:$state,publication:$publication,filesystem:$filesystem,api:$api,sidecarCapture:$hashing,planningStateOther:$other}}' >"$MC_TMP/arr-$APP_CONTEXT.metrics.json" || return 1
     if (( ${MOVER_DEFERRALS:-0}>0 || ${FOLDER_CLEANUP_PENDING:-0}>0 )); then
       jq -n --arg reason "Mover deferrals=${MOVER_DEFERRALS:-0}; pending folders=${FOLDER_CLEANUP_PENDING:-0}; completed actions retained" \
         '{module:"arr",status:"WARNING",reason:$reason,exit:0}' >"$MC_TMP/arr.result.json" || return 1
@@ -1064,7 +1260,8 @@ ops_flush_file() {
 }
 
 
-ops_publish_checkpoint() {
+ops_publish_checkpoint() { mc_timed_call publication ops_publish_checkpoint_core "$@"; }
+ops_publish_checkpoint_core() {
     local temporary="$1" destination="$2"
     ops_flush_file "$temporary" || return 1
     mv -f -- "$temporary" "$destination" || return 1
@@ -1343,7 +1540,7 @@ umask 077
 # Release version for logs, notifications, and the HTTP User-Agent. State-file
 # version fields below are independent schema versions and must not be changed
 # merely when this release version changes.
-readonly SCRIPT_VERSION="2.10.1"
+readonly SCRIPT_VERSION="2.11.0"
 
 ###############################################################################
 # CONFIGURATION
@@ -2828,7 +3025,8 @@ mark_sidecar_folder_cleanup_pending() {
 # sidecars confirmed by two cleanup runs. Missing files are treated as already
 # handled by Arr's native Recycling Bin path. A changed, symlinked, or unsafe
 # file is never moved and keeps the manifest pending.
-quarantine_recorded_sidecars() {
+quarantine_recorded_sidecars() { mc_timed_call filesystem quarantine_recorded_sidecars_core "$@"; }
+quarantine_recorded_sidecars_core() {
     local app_name="$1"
     local bucket="$2"
     local media_root="$3"
@@ -3182,6 +3380,10 @@ arr_verification_get() {
       --request GET --header "X-Api-Key: $ARR_API_KEY" --header 'Accept: application/json' \
       --output "$output" --write-out '%{http_code}' "$ARR_URL$endpoint") || { ARR_VERIFY_HTTP="${http:-000}"; return 1; }
     ARR_VERIFY_HTTP="$http"
+    if [[ "$http" == 200 && -d "${MC_READ_CACHE:-}" ]];then
+        local fresh="$MC_READ_CACHE/verified-$(printf %s "$endpoint"|sha256sum|cut -d ' ' -f1).json"
+        jq -c 'if type=="array" then . elif type=="object" and (.id|type)=="number" then [.] else [] end' "$output" >"$fresh.source" && mc_index_snapshot "$fresh.source" "$fresh" || return 1
+    fi
     [[ "$http" == 200 || "$http" == 404 ]]
 }
 
@@ -3394,7 +3596,7 @@ arr_api_request_core() {
         )"
     fi
     curl_status=$?
-    if [[ "${MC_GUARDS_ACTIVE:-false}" == true ]];then printf '%s %s\n' "$curl_status" "${http_status:-000}" >"$MC_TMP/arr-$APP_CONTEXT.transport";fi
+    if [[ "${MC_GUARDS_ACTIVE:-false}" == true ]];then printf '%s %s\n' "$curl_status" "${http_status:-000}" >"${MC_ARR_TRANSPORT_FILE:-$MC_TMP/arr-$APP_CONTEXT.transport}";fi
 
     if (( curl_status != 0 )) || ! [[ "$http_status" =~ ^2[0-9][0-9]$ ]]; then
         message="$({ tr '\r\n' ' ' < "$err"; tr '\r\n' ' ' < "$body"; } | cut -c1-500)"
@@ -3429,6 +3631,13 @@ arr_api_request_core() {
 }
 
 api_get_json() {
+    local cache
+    cache=$(mc_get_cache_path "$1") || cache=''
+    if [[ -n "$cache" && -f "$cache" ]];then cat "$cache";return $?;fi
+    api_get_json_uncached "$@"
+}
+
+api_get_json_uncached() {
     local endpoint="$1"
     local json
     json="$(api_request GET "$endpoint" "")" || return 1
@@ -3470,7 +3679,8 @@ age_at_least_days() {
 }
 
 load_arr_queue() {
-    local kind="$1" page=1 loaded=0 total=0 count queue endpoint merged
+    local kind="$1" page=1 loaded=0 total=0 expected_total=-1 count queue endpoint merged
+    [[ ! -d "${VERIFY_RUNTIME_DIR:-}" ]] || rm -f -- "$VERIFY_RUNTIME_DIR/$kind-queue-index.json"
     if [[ "$kind" == sonarr ]]; then SONARR_QUEUE_AVAILABLE=false; else RADARR_QUEUE_AVAILABLE=false; fi
     local pages_file="$RUNTIME_DIR/.${ARR_TEMP_PREFIX}-queue-pages.$$"
     : >"$pages_file" || return 1
@@ -3484,14 +3694,21 @@ load_arr_queue() {
         if ! jq -e 'type=="object" and (.records|type)=="array" and (.totalRecords|type)=="number"' <<<"$queue" >/dev/null; then
             rm -f -- "$pages_file"; log ERROR "Incomplete or invalid $ARR_NAME queue response; destructive actions are prohibited."; return 1
         fi
+        ((expected_total>=0)) || expected_total=$(jq '.totalRecords' <<<"$queue")
+        [[ $(jq '.totalRecords' <<<"$queue") == "$expected_total" ]] || { rm -f -- "$pages_file";log ERROR 'Queue changed across pages; no complete absence proof';return 1; }
         count=$(jq '.records|length' <<<"$queue"); total=$(jq '.totalRecords' <<<"$queue")
         printf '%s\n' "$queue" >>"$pages_file" || return 1
         loaded=$((loaded+count))
-        (( loaded>=total )) && break
+        (( loaded<=total )) || { rm -f -- "$pages_file";return 1; }
+        (( loaded==total )) && break
         if (( count==0 || page>=1000 )); then rm -f -- "$pages_file"; log ERROR "Truncated $ARR_NAME queue: $loaded/$total"; return 1; fi
         page=$((page+1))
     done
     merged=$(jq -sc '.[0] as $first | . as $pages | $first | .records=[$pages[].records[]]' "$pages_file") || return 1
+    jq -e --argjson total "$total" '(.records|length)==$total and ([.records[].id]|unique|length)==$total and all(.records[];(.id|type)=="number" and .id>0)' <<<"$merged" >/dev/null || { rm -f -- "$pages_file";return 1; }
+    if [[ -d "${VERIFY_RUNTIME_DIR:-}" ]];then
+      jq -c --arg kind "$kind" '{parents:([.records[]|if $kind=="sonarr" then (.seriesId // .episode.seriesId // .series.id // 0) else (.movieId // .movie.id // 0) end|select(.>0)|tostring]|INDEX(.)),downloads:([.records[]|select((.downloadId // "")!="")]|INDEX(.downloadId|ascii_downcase))}' <<<"$merged" >"$VERIFY_RUNTIME_DIR/$kind-queue-index.json" || return 1
+    fi
     rm -f -- "$pages_file"
     if [[ "$kind" == sonarr ]]; then SONARR_QUEUE_JSON="$merged"; SONARR_QUEUE_AVAILABLE=true
     else RADARR_QUEUE_JSON="$merged"; RADARR_QUEUE_AVAILABLE=true; fi
@@ -3499,6 +3716,7 @@ load_arr_queue() {
 
 sonarr_queue_has_series() {
     local series_id="$1"
+    if [[ "${SONARR_QUEUE_AVAILABLE:-false}" == true && -s "${VERIFY_RUNTIME_DIR:-}/sonarr-queue-index.json" ]];then jq -e --arg key "$series_id" '.parents[$key]!=null' "$VERIFY_RUNTIME_DIR/sonarr-queue-index.json" >/dev/null;return $?;fi
     jq -e --argjson series_id "$series_id" '
         any(.records[]?;
             (.seriesId // .episode.seriesId // .series.id // 0) == $series_id
@@ -3508,6 +3726,7 @@ sonarr_queue_has_series() {
 
 radarr_queue_has_movie() {
     local movie_id="$1"
+    if [[ "${RADARR_QUEUE_AVAILABLE:-false}" == true && -s "${VERIFY_RUNTIME_DIR:-}/radarr-queue-index.json" ]];then jq -e --arg key "$movie_id" '.parents[$key]!=null' "$VERIFY_RUNTIME_DIR/radarr-queue-index.json" >/dev/null;return $?;fi
     jq -e --argjson movie_id "$movie_id" '
         any(.records[]?;
             (.movieId // .movie.id // 0) == $movie_id
@@ -3818,7 +4037,7 @@ sonarr_log_new_candidates() {
 sonarr_series_delete_history() {
     local series_id="$1"
     local history
-    history="$(api_get_json "/api/v3/history/series?seriesId=${series_id}&eventType=episodeFileDeleted")" ||
+    history="$(mc_timed_call history api_get_json "/api/v3/history/series?seriesId=${series_id}&eventType=episodeFileDeleted")" ||
         return 1
     if ! jq -e 'type == "array"' >/dev/null 2>&1 <<< "$history"; then
         log ERROR "Sonarr History for series $series_id did not return an array."
@@ -3838,6 +4057,25 @@ sonarr_series_delete_history() {
         ]
         | sort_by(.date // "")
     ' <<< "$history"
+}
+
+sonarr_record_history_batch() {
+    local ids="$1" history="$2" temp
+    temp=$(mktemp "$VERIFY_RUNTIME_DIR/.history-batch.XXXXXX") || return 1
+    jq -c --argjson ids "$ids" --slurpfile history <(printf '%s' "$history") --arg now "$RUN_AT" '
+      ($history[0]|sort_by(.date // "")|group_by(.episodeId)|map({key:(.[0].episodeId|tostring),value:last})|from_entries) as $index |
+      reduce $ids[] as $id (.;.episodes[$id|tostring] += {lastHistoryInspectionAt:$now,latestEpisodeFileDeletedHistory:($index[$id|tostring] // null)})' "$WORK_STATE" >"$temp" && mv "$temp" "$WORK_STATE"
+}
+
+mc_performance_finish() {
+    local temp
+    temp=$(mktemp "$VERIFY_RUNTIME_DIR/.performance.XXXXXX") || return 1
+    local hints="$VERIFY_RUNTIME_DIR/$APP_CONTEXT.sidecar-hints.jsonl"
+    [[ -f "$hints" ]] || : >"$hints"
+    jq -c --slurpfile hints "$hints" --argjson cursor "${MC_NEXT_CURSOR:-0}" '.performance.cursor=$cursor |
+      .performance.entities=((.performance.entities // {})+($hints|from_entries)) |
+      .performance.pending=(([(.episodes // {})[]|select((.missingRuns // 0)>0)|{key:(.seriesId|tostring),value:"missing episodes"}]+[(.movies // {})|to_entries[]|select((.value.missingRuns // 0)>0)|{key:.key,value:"missing movie"}]+[(.sidecarManifests // {})|to_entries[]|select(.value.cleanupPending==true)|{key:.key,value:"folder cleanup"}]+[(.seriesRetirements // {}),(.movieRetirements // {})|keys[]|{key:.,value:"retirement"}])|from_entries) |
+      . as $state | .performance.entities=((.performance.entities // {})|with_entries(select(.key as $key|($state.sidecarManifests[$key] // null)!=null)))' "$WORK_STATE" >"$temp" && mv "$temp" "$WORK_STATE"
 }
 
 sonarr_record_history_evidence() {
@@ -3862,10 +4100,11 @@ sonarr_record_history_evidence() {
 sonarr_ids_with_history() {
     local ids="$1"
     local history="$2"
-    jq -c --argjson ids "$ids" --argjson history "$history" '
-        [
+    jq -c --argjson ids "$ids" --slurpfile history_source <(printf '%s' "$history") '
+        ($history_source[0]|INDEX(.episodeId|tostring)) as $byEpisode
+        | [
             $ids[] as $id
-            | select(any($history[]; .episodeId == $id))
+            | select($byEpisode[$id|tostring] != null)
             | $id
         ]
         | unique
@@ -3875,18 +4114,28 @@ sonarr_ids_with_history() {
 # A season is eligible only if every historically downloaded episode in that
 # season is currently present in Sonarr, fileless, and confirmed missing. It
 # must also have no current monitored episodes after this run's episode action.
+mc_episode_index() {
+    local source="$1" signature target="$VERIFY_RUNTIME_DIR/episode-index.json"
+    signature=$(stat -c '%d:%i:%s:%y:%z' "$source") || return 1
+    if [[ ! -s "$target" || $(cat "$target.identity" 2>/dev/null) != "$signature" ]];then
+      mc_index_snapshot "$source" "$target" || return 1
+      printf %s "$signature" >"$target.identity" || return 1
+    fi
+}
+
 sonarr_candidate_seasons() {
     sonarr_prepare_read_state || return 1
     local series_id="$1"
     local episodes_file="$2"
     local effective_episode_actions="$3"
 
-    jq -c --argjson series_id "$series_id" \
+    mc_episode_index "$episodes_file" || return 1
+    jq -c --slurpfile index "$VERIFY_RUNTIME_DIR/episode-index.json" --argjson series_id "$series_id" \
         --slurpfile source "$episodes_file" \
         --argjson effective "$effective_episode_actions" \
         --argjson needed "$CONFIRMATION_RUNS" '($source[0] // []) as $episodes
         | .episodes as $state
-        | ($episodes | map({key: (.id | tostring), value: .}) | from_entries) as $current
+        | ($index[0].byId) as $current
         | ($episodes | map(select((.seasonNumber // 0) > 0) | .seasonNumber) | unique) as $seasons
         | [
             $seasons[]
@@ -3931,7 +4180,8 @@ sonarr_candidate_series() {
     local episodes_file="$2"
     local effective_episode_actions="$3"
 
-    jq -c --argjson series_id "$series_id" \
+    mc_episode_index "$episodes_file" || return 1
+    jq -c --slurpfile index "$VERIFY_RUNTIME_DIR/episode-index.json" --argjson series_id "$series_id" \
         --slurpfile source "$episodes_file" \
         --argjson effective "$effective_episode_actions" \
         --argjson needed "$CONFIRMATION_RUNS" '($source[0] // []) as $episodes
@@ -3940,7 +4190,7 @@ sonarr_candidate_series() {
             $state | to_entries[]
             | select(.value.seriesId == $series_id and .value.everHadFile == true)
           ] as $historical
-        | ($episodes | map({key: (.id | tostring), value: .}) | from_entries) as $current
+        | ($index[0].byId) as $current
         | (
             (($historical | length) > 0)
             and all(
@@ -4408,6 +4658,8 @@ STATE_FILE="$SONARR_STATE_FILE"
 STATE_BACKUP="$SONARR_STATE_BACKUP"
 RUN_AT="$(date '+%Y-%m-%dT%H:%M:%S%z')"
 WORK_STATE=""
+MC_READ_CACHE="$VERIFY_RUNTIME_DIR/$APP_CONTEXT-read-cache";mkdir -p "$MC_READ_CACHE" || return 1
+MC_POLICY_FINGERPRINT=$(printf '%s\0' "$MC_VERSION" "$MAX_SIDECAR_SIZE_MB" "$EXTRA_SIDECAR_EXTENSIONS" "$AUTO_RECOGNIZE_KNOWN_AUXILIARY" "$CAPTURE_LATE_KODI_SIDECARS" "$QUARANTINE_KODI_SIDECARS" "$(stat -c '%d:%i:%s:%y:%z' "${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}" 2>/dev/null || printf missing)"|sha256sum|cut -d ' ' -f1)
 CURRENT_SNAPSHOT_FILE=""
 SIDECAR_BATCH_FILE=""
 SIDECAR_ENTRY_FILE=""
@@ -4533,6 +4785,15 @@ SERIES="$(api_get_json "/api/v3/series")" || {
 jq -e 'type == "array"' >/dev/null <<< "$SERIES" ||
     die "Sonarr /series did not return an array."
 SERIES_LISTED="$(jq length <<< "$SERIES")"
+MC_SERIES_SOURCE="$VERIFY_RUNTIME_DIR/series-catalog.json";printf '%s' "$SERIES" >"$MC_SERIES_SOURCE"
+mc_timed_call discovery mc_index_snapshot "$MC_SERIES_SOURCE" "$VERIFY_RUNTIME_DIR/series-index.json" || die 'Incomplete Sonarr catalogue; no absence inferred.'
+MC_ROTATING_IDS="$VERIFY_RUNTIME_DIR/sonarr-rotation.ids";mc_rotation_plan "$MC_SERIES_SOURCE" "$MC_ROTATING_IDS" || die 'Cannot plan rotating sidecar discovery.'
+MC_SERIES_IDS="$VERIFY_RUNTIME_DIR/series-scan.ids"
+{ jq -r '.[]|select(.monitored==true)|.id' "$MC_SERIES_SOURCE";jq -r '.episodes[]?|select((.missingRuns // 0)>0)|.seriesId' "$WORK_STATE"; }|sort -nu >"$MC_SERIES_IDS"
+mapfile -t MC_SCAN_ORDER <"$MC_SERIES_IDS"
+mc_timed_call state mc_sonarr_shards_begin || die 'Cannot index Sonarr working state.'
+MC_SCAN_POSITION=0
+
 jq -e 'all(.[]; (.id|type)=="number" and .id>0 and .id==(.id|floor))' <<<"$SERIES" >/dev/null || die "Invalid Sonarr catalog IDs; state preserved."
 declare -A SONARR_CATALOG_INDEX=()
 while IFS=$'\t' read -r catalog_id catalog_item; do
@@ -4560,7 +4821,13 @@ while IFS= read -r SERIES_ID; do
     [[ -n "$SERIES_ID" ]] || continue
     mc_work_allowed SONARR || break
     [[ "$SERIES_ID" =~ ^[1-9][0-9]*$ ]] || die "Invalid stored Sonarr series ID; state preserved."
+    MC_SCAN_POSITION=$((MC_SCAN_POSITION+1))
     if media_recovery_app_held Sonarr "$SERIES_ID"; then log INFO "Series $SERIES_ID deletion/retirement deferred: integrity recovery holds its exact media; state preserved";continue;fi
+    mc_sonarr_select_shard "$SERIES_ID" || die 'Cannot select per-series observation state.'
+    if ((MC_SCAN_POSITION%2==1));then
+        NEXT_ID="${MC_SCAN_ORDER[$MC_SCAN_POSITION]:-}"
+        mc_timed_call discovery mc_prefetch_pair "/api/v3/episode?seriesId=$SERIES_ID&includeEpisodeFile=true" "${NEXT_ID:+/api/v3/episode?seriesId=$NEXT_ID&includeEpisodeFile=true}" || die 'Cannot stage bounded episode readers.'
+    fi
     SERIES_ITEM="${SONARR_CATALOG_INDEX[$SERIES_ID]:-}"
     SERIES_TITLE="$(jq -r '.title // empty' <<< "$SERIES_ITEM")"
     SERIES_API_PATH="$(jq -r '.path // empty' <<< "$SERIES_ITEM")"
@@ -4589,18 +4856,22 @@ while IFS= read -r SERIES_ID; do
         log ERROR "Skipping $SERIES_TITLE; its state was not advanced."
         continue
     fi
-    jq -e 'type == "array"' "$CURRENT_SNAPSHOT_FILE" >/dev/null || {
+    jq -e --argjson series "$SERIES_ID" 'type == "array" and all(.[];.seriesId==$series)' "$CURRENT_SNAPSHOT_FILE" >/dev/null || {
         ((API_FAILURES += 1))
         log ERROR "Skipping $SERIES_TITLE; Sonarr returned a non-array episode response."
         continue
     }
 
+    mc_timed_call discovery mc_index_snapshot "$CURRENT_SNAPSHOT_FILE" "$VERIFY_RUNTIME_DIR/episode-index.json" || { ((API_FAILURES+=1));log ERROR 'Incomplete/ambiguous episode snapshot; series observations preserved';continue; }
+    MC_ENTITY_STARTED=$(date +%s%N)
     ((SERIES_SCANNED += 1))
     IFS=$'\t' read -r COUNT PRESENT < <(jq -r '[length,([.[] | select(.hasFile == true)]|length)]|@tsv' "$CURRENT_SNAPSHOT_FILE")
     [[ "$COUNT" =~ ^[0-9]+$ && "$PRESENT" =~ ^[0-9]+$ ]] || die "Could not count Sonarr episode snapshot."
     ((EPISODES_SCANNED += COUNT))
     ((FILES_PRESENT += PRESENT))
 
+    MC_SIDECAR_EVIDENCE=$(jq -c '[.[]|{id,episodeFileId,monitored,hasFile}]|sort_by(.id)' "$CURRENT_SNAPSHOT_FILE"|sha256sum|cut -d ' ' -f1)
+    MC_SIDECAR_EVIDENCE+="|$(jq -c '{id,monitored,path,tags,seasons:[.seasons[]?|{seasonNumber,monitored}]}' <<<"$SERIES_ITEM")"
     [[ -n "$SIDECAR_ENTRY_FILE" ]] && rm -f -- "$SIDECAR_ENTRY_FILE"
     SIDECAR_ENTRY_FILE="$(mktemp "${VERIFY_RUNTIME_DIR:-$STATE_DIR}/.sidecars.entry.XXXXXX")" ||
         die "Cannot create temporary Sonarr sidecar manifest."
@@ -4613,9 +4884,9 @@ while IFS= read -r SERIES_ID; do
         if [[ -z "$SERIES_PATH" || "$(jq length <<< "$MEDIA_RELATIVE_PATHS")" == 0 ]]; then
             ((SIDECAR_FAILURES += 1))
             log ERROR "Could not capture Kodi sidecars for $SERIES_TITLE because Sonarr omitted its media path."
-        elif capture_kodi_sidecars sonarr "$SERIES_PATH" "$SERIES_ROOT" \
-            "$MEDIA_RELATIVE_PATHS" > "$SIDECAR_ENTRY_FILE"; then
-            CAPTURED="$(jq length "$SIDECAR_ENTRY_FILE")"
+        elif mc_capture_sidecars sonarr "$SERIES_PATH" "$SERIES_ROOT" \
+            "$MEDIA_RELATIVE_PATHS" "$SERIES_ID" "$SIDECAR_ENTRY_FILE"; then
+            CAPTURED="$(jq -s 'if length==0 then 0 else .[0]|length end' "$SIDECAR_ENTRY_FILE")"
             ((SIDECARS_CAPTURED += CAPTURED))
         else
             : > "$SIDECAR_ENTRY_FILE"
@@ -4624,7 +4895,7 @@ while IFS= read -r SERIES_ID; do
         fi
     fi
 
-    sonarr_apply_snapshot "$SERIES_ID" "$SERIES_TITLE" "$CURRENT_SNAPSHOT_FILE" \
+    mc_timed_call state sonarr_apply_snapshot "$SERIES_ID" "$SERIES_TITLE" "$CURRENT_SNAPSHOT_FILE" \
         "$SERIES_PATH" "$SIDECAR_ENTRY_FILE" ||
         die "Could not update temporary state for $SERIES_TITLE."
     rm -f -- "$SIDECAR_ENTRY_FILE"
@@ -4650,17 +4921,8 @@ while IFS= read -r SERIES_ID; do
                 IDS_WITH_HISTORY_COUNT="$(jq length <<< "$IDS_WITH_HISTORY")"
                 ((HISTORY_DELETE_EVENTS += IDS_WITH_HISTORY_COUNT))
 
-                while IFS= read -r EPISODE_ID; do
-                    [[ -n "$EPISODE_ID" ]] || continue
-                    EVIDENCE="$(jq -c --argjson episode_id "$EPISODE_ID" '
-                        [ .[] | select(.episodeId == $episode_id) ]
-                        | sort_by(.date // "")
-                        | last // null
-                    ' <<< "$HISTORY")" ||
-                        die "Could not select Sonarr History evidence for episode $EPISODE_ID."
-                    sonarr_record_history_evidence "$EPISODE_ID" "$EVIDENCE" ||
-                        die "Could not record Sonarr History evidence for episode $EPISODE_ID."
-                done < <(jq -r '.[]' <<< "$IDS")
+                mc_timed_call history sonarr_record_history_batch "$IDS" "$HISTORY" || die "Could not record series History evidence."
+
 
                 if [[ "$REQUIRE_DELETE_HISTORY_EVENT" == true ]]; then
                     ACTION_IDS="$IDS_WITH_HISTORY"
@@ -4943,12 +5205,9 @@ while IFS= read -r SERIES_ID; do
             "$SERIES_TITLE season or series update failed" \
             "The monitoring and tag update will be retried during the next daily run."
     fi
-done < <(
-    {
-        jq -r '.[] | select(.monitored == true) | .id' <<< "$SERIES"
-        jq -r '.episodes | to_entries[]? | select((.value.missingRuns // 0) > 0) | .value.seriesId' "$WORK_STATE"
-    } | sort -nu
-)
+done <"$MC_SERIES_IDS"
+mc_timed_call state mc_sonarr_shards_finish || die 'Cannot merge per-series observations; durable action journals retained.'
+mc_performance_finish || die 'Cannot retain pending-work/discovery index.'
 
 sonarr_prune_state "$SERIES" || die "Could not prune stale Sonarr state safely."
 sonarr_commit_state || { [[ ! -d "${MC_TMP:-}" ]] || printf 'Sonarr state commit failed\n' >>"$MC_TMP/failed-arr";die "Could not atomically save state."; }
@@ -5471,7 +5730,7 @@ radarr_history_delete_event() {
     local movie_id="$1"
     local history
 
-    history="$(api_get_json "/api/v3/history/movie?movieId=$movie_id&eventType=movieFileDeleted")" || return 1
+    history="$(mc_timed_call history api_get_json "/api/v3/history/movie?movieId=$movie_id&eventType=movieFileDeleted")" || return 1
     if ! jq -e 'type == "array"' >/dev/null 2>&1 <<< "$history"; then
         log ERROR "Radarr History for movie $movie_id did not return an array."
         return 1
@@ -5921,6 +6180,8 @@ STATE_FILE="$RADARR_STATE_FILE"
 STATE_BACKUP="$RADARR_STATE_BACKUP"
 RUN_AT="$(date '+%Y-%m-%dT%H:%M:%S%z')"
 WORK_STATE=""
+MC_READ_CACHE="$VERIFY_RUNTIME_DIR/$APP_CONTEXT-read-cache";mkdir -p "$MC_READ_CACHE" || return 1
+MC_POLICY_FINGERPRINT=$(printf '%s\0' "$MC_VERSION" "$MAX_SIDECAR_SIZE_MB" "$EXTRA_SIDECAR_EXTENSIONS" "$AUTO_RECOGNIZE_KNOWN_AUXILIARY" "$CAPTURE_LATE_KODI_SIDECARS" "$QUARANTINE_KODI_SIDECARS" "$(stat -c '%d:%i:%s:%y:%z' "${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}" 2>/dev/null || printf missing)"|sha256sum|cut -d ' ' -f1)
 CURRENT_SNAPSHOT_FILE=""
 SIDECAR_BATCH_FILE=""
 SIDECAR_ENTRY_FILE=""
@@ -6008,6 +6269,7 @@ if ! jq -e '.appName == "Radarr"' >/dev/null 2>&1 <<< "$SYSTEM"; then
 fi
 log DEBUG "Connected to Radarr $(jq -r '.version // "unknown"' <<< "$SYSTEM")."
 
+mc_timed_call discovery mc_prefetch_pair /api/v3/tag /api/v3/movie || die 'Cannot stage bounded Radarr discovery.'
 load_tag_catalog || {
     ((API_FAILURES += 1))
     die "Could not load Radarr tags; state was not changed."
@@ -6039,6 +6301,9 @@ jq -e 'type == "array"' "$CURRENT_SNAPSHOT_FILE" >/dev/null ||
     die "Radarr /movie did not return an array."
 
 MOVIES_LISTED="$(jq length "$CURRENT_SNAPSHOT_FILE")"
+mc_timed_call discovery mc_index_snapshot "$CURRENT_SNAPSHOT_FILE" "$VERIFY_RUNTIME_DIR/movie-index.json" || die 'Incomplete Radarr catalogue; no absence inferred.'
+MC_ROTATING_IDS="$VERIFY_RUNTIME_DIR/radarr-rotation.ids";mc_rotation_plan "$CURRENT_SNAPSHOT_FILE" "$MC_ROTATING_IDS" || die 'Cannot plan rotating sidecar discovery.'
+
 RADARR_ACTION_SNAPSHOT_FILE=$(mktemp "$VERIFY_RUNTIME_DIR/.radarr-action-snapshot.XXXXXX") || die 'Cannot prepare Radarr action snapshot.'
 RADARR_HOLD_IDS_FILE=$(mktemp "$VERIFY_RUNTIME_DIR/.radarr-recovery-holds.XXXXXX") || die 'Cannot prepare movie hold IDs.'
 radarr_action_snapshot "$CURRENT_SNAPSHOT_FILE" "$RADARR_ACTION_SNAPSHOT_FILE" "$RADARR_HOLD_IDS_FILE" || die 'Cannot validate/filter exact movie recovery holds.'
@@ -6048,6 +6313,7 @@ MOVIES_SCANNED=$(jq length "$RADARR_ACTION_SNAPSHOT_FILE")
 
 FILES_PRESENT="$(jq '[.[] | select(.hasFile == true)] | length' "$CURRENT_SNAPSHOT_FILE")"
 
+mc_timed_call state mc_radarr_sidecar_views || die 'Cannot index Radarr sidecar state.'
 SIDECAR_BATCH_FILE="$(mktemp "${VERIFY_RUNTIME_DIR:-$STATE_DIR}/.sidecars.batch.XXXXXX")" ||
     die "Cannot create temporary Radarr sidecar manifest batch."
 if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( FILES_PRESENT > 0 )); then
@@ -6060,6 +6326,7 @@ if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( FILES_PRESENT > 0 )); then
         if (( RADARR_CAPTURE_SCANNED==1 || RADARR_CAPTURE_SCANNED%PROGRESS_LOG_EVERY==0 )); then
             log INFO "Sidecar inventory progress: inspected $RADARR_CAPTURE_SCANNED movie(s); current movie ID=$MOVIE_ID."
         fi
+        MC_SIDECAR_EVIDENCE=$(jq -c '{id,movieFileId,monitored,hasFile,path,tags}' <<<"$MOVIE_WITH_FILE")
         MOVIE_API_PATH="$(jq -r '.path // empty' <<< "$MOVIE_WITH_FILE")"
         MOVIE_PATH="$(map_arr_media_path "$MOVIE_API_PATH" "$RADARR_API_MOVIES_ROOT" "$MOVIES_ROOT" || true)"
         MOVIE_RELATIVE_PATH="$(jq -r '.movieFile.relativePath // empty' <<< "$MOVIE_WITH_FILE")"
@@ -6072,11 +6339,11 @@ if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( FILES_PRESENT > 0 )); then
         [[ -n "$SIDECAR_ENTRY_FILE" ]] && rm -f -- "$SIDECAR_ENTRY_FILE"
         SIDECAR_ENTRY_FILE="$(mktemp "${VERIFY_RUNTIME_DIR:-$STATE_DIR}/.sidecars.entry.XXXXXX")" ||
             die "Cannot create temporary Radarr sidecar manifest."
-        if capture_kodi_sidecars radarr "$MOVIE_PATH" "$MOVIES_ROOT" \
-            "$MEDIA_RELATIVE_PATHS" > "$SIDECAR_ENTRY_FILE"; then
-            CAPTURED="$(jq length "$SIDECAR_ENTRY_FILE")"
+        if mc_capture_sidecars radarr "$MOVIE_PATH" "$MOVIES_ROOT" \
+            "$MEDIA_RELATIVE_PATHS" "$MOVIE_ID" "$SIDECAR_ENTRY_FILE"; then
+            CAPTURED="$(jq -s 'if length==0 then 0 else .[0]|length end' "$SIDECAR_ENTRY_FILE")"
             ((SIDECARS_CAPTURED += CAPTURED))
-            if ! jq -n --arg key "$MOVIE_ID" \
+            if [[ -s "$SIDECAR_ENTRY_FILE" ]] && ! jq -n --arg key "$MOVIE_ID" \
                 --arg media_path "$MOVIE_PATH" \
                 --arg media_root "$MOVIES_ROOT" \
                 --arg now "$RUN_AT" \
@@ -6102,7 +6369,7 @@ if [[ "$QUARANTINE_KODI_SIDECARS" == true ]] && (( FILES_PRESENT > 0 )); then
     done < <(jq -c '.[] | select(.hasFile == true)' "$RADARR_ACTION_SNAPSHOT_FILE")
 fi
 
-radarr_apply_snapshot "$RADARR_ACTION_SNAPSHOT_FILE" "$SIDECAR_BATCH_FILE" ||
+mc_timed_call state radarr_apply_snapshot "$RADARR_ACTION_SNAPSHOT_FILE" "$SIDECAR_BATCH_FILE" ||
     die "Could not update temporary state."
 rm -f -- "$SIDECAR_BATCH_FILE"
 SIDECAR_BATCH_FILE=""
@@ -6129,6 +6396,7 @@ radarr_process_monitored_fileless_watchdog "$RADARR_ACTION_SNAPSHOT_FILE" || {
         "The main workflow continues, but watchdog state could not be evaluated."
 }
 
+MC_RADARR_RECON_STARTED=$(date +%s%N)
 FIRST_MISSING="$(radarr_new_candidate_count)"
 (( FIRST_MISSING == 0 )) || radarr_log_new_candidates
 
@@ -6320,6 +6588,8 @@ radarr_process_retirements "$RADARR_ACTION_SNAPSHOT_FILE" || {
     queue_attention_notification ERROR Radarr "Radarr retirement processing failed" \
         "No unsafe removal was attempted; unfinished retirement work will be retried next run."
 }
+mc_performance_finish || die 'Cannot retain pending-work/discovery index.'
+printf 'reconciliation %s\n' "$(( ($(date +%s%N)-MC_RADARR_RECON_STARTED)/1000000 ))" >>"$MC_TMP/arr-$APP_CONTEXT.timings"
 radarr_prune_state "$CURRENT_SNAPSHOT_FILE" || die "Could not prune stale Radarr state safely."
 radarr_commit_state || { [[ ! -d "${MC_TMP:-}" ]] || printf 'Radarr state commit failed\n' >>"$MC_TMP/failed-arr";die "Could not atomically save state."; }
 WORK_STATE=""
@@ -6348,6 +6618,7 @@ log DEBUG "Completed successfully."
 # identity, including nanosecond modification/change times and replacement inode.
 sonarr_prepare_read_state() {
     SONARR_READ_STATE="$WORK_STATE"
+    [[ -z "${MC_SONARR_SHARDS:-}" || "$WORK_STATE" == "${MC_SONARR_GLOBAL:-}" ]] || return 0
     local series="${SERIES_ID:-}" signature cache marker temp current=""
     [[ "$series" =~ ^[1-9][0-9]*$ && -d "${VERIFY_RUNTIME_DIR:-}" ]] || return 0
     cache="$VERIFY_RUNTIME_DIR/sonarr-planner-view.json"

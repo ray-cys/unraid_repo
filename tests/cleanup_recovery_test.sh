@@ -92,8 +92,8 @@ initialize_grouped_notifications
 ARR_TEMP_PREFIX=sonarr ARR_NAME=Sonarr
 api_get_json() {
   case "$1" in
-    *page=1\&*) printf '{"records":[{"downloadId":"one"}],"totalRecords":2}\n';;
-    *page=2\&*) if [[ "${truncated:-false}" == true ]]; then printf '{"records":[],"totalRecords":2}\n'; else printf '{"records":[{"downloadId":"two"}],"totalRecords":2}\n'; fi;;
+    *page=1\&*) printf '{"records":[{"id":1,"downloadId":"one"}],"totalRecords":2}\n';;
+    *page=2\&*) if [[ "${truncated:-false}" == true ]]; then printf '{"records":[],"totalRecords":2}\n'; else printf '{"records":[{"id":2,"downloadId":"two"}],"totalRecords":2}\n'; fi;;
   esac
 }
 load_arr_queue sonarr
