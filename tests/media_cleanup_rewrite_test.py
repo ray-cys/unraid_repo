@@ -116,6 +116,16 @@ with tempfile.TemporaryDirectory(prefix='cleanup-rewrite.') as folder:
  before=int((t/'bench-old-bytes').read_text());after=int((t/'bench-new-bytes').read_text())
  assert after<before/4
  print(f'Equivalent 10-series observations: working JSON processed {before:,} -> {after:,} bytes ({100*(1-after/before):.1f}% less)',flush=True)
+ run(r'''
+ source "$1"
+ mkdir "$2/stat-batches"
+ for n in {1..70};do printf x >"$2/stat-batches/$n.nfo";done
+ jq -n '[range(1;71)|{relativePath:((tostring)+".nfo"),size:1,sha256:("0"*64)}]|{files:.}' >"$2/stat-manifest"
+ # Bind the counter path explicitly rather than inheriting a utility argument.
+ eval 'stat(){ printf "stat\n" >>"'"$2"'/stat-count";command stat "$@"; }'
+ mc_sidecar_fingerprint "$2/stat-batches" '[]' "$2/stat-manifest" "$2/stat-signature"
+ [[ $(wc -l <"$2/stat-count") == 2 ]]
+ ''')
  # Actual complete Sonarr workflow against fixed API evidence, baseline vs rewrite.
  workflow=r'''
  source "$1"

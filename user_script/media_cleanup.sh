@@ -1,7 +1,7 @@
 #!/bin/bash
 clearLog=true
 arrayStarted=true
-# Media Cleanup v1.7.0 -- personal Hubble operations
+# Media Cleanup v1.7.1 -- personal Hubble operations
 #
 # PURPOSE: One daily job coordinates Arr deletion/unmonitoring/90-day retirement,
 # proven SAB completed-payload cleanup, and metadata-bin retention. Modules run
@@ -258,7 +258,7 @@ fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
 umask 077
-MC_VERSION="1.7.0"
+MC_VERSION="1.7.1"
 # One execution switch across every module. Conflicting/unused flags fail before work.
 # In preview, quarantine purge becomes audit; restore requires an explicit execute flag.
 MC_DRY_RUN=false
@@ -1100,7 +1100,9 @@ mc_index_snapshot() {
 }
 
 mc_sidecar_fingerprint() {
-    local path="$1" media="$2" manifest="$3" output="$4" dirs="$4.dirs" records="$4.records" rel
+    local path="$1" media="$2" manifest="$3" output="$4" dirs="$4.dirs" records="$4.records" rel bytes=0
+    local LC_ALL=C
+    local -a batch=()
     [[ -d "$path" && ! -L "$path" && $(realpath -m "$path") == "$path" ]] || return 1
     # Directory changes discover additions/removals; recorded-file stat changes
     # discover in-place edits. Hashing bytes remains mandatory before quarantine.
@@ -1111,8 +1113,13 @@ mc_sidecar_fingerprint() {
     while IFS= read -r -d '' rel;do
         valid_relative_path "$rel" || return 1
         [[ -f "$path/$rel" && ! -L "$path/$rel" ]] || return 1
-        stat --printf='%d:%i:%s:%y:%z:%n\0' -- "$path/$rel" >>"$records" || return 1
+        batch+=("$path/$rel");bytes=$((bytes+${#path}+${#rel}+2))
+        if (( ${#batch[@]}>=64 || bytes>=32768 ));then
+            stat --printf='%d:%i:%s:%y:%z:%n\0' -- "${batch[@]}" >>"$records" || return 1
+            batch=();bytes=0
+        fi
     done <"$records.paths"
+    if (( ${#batch[@]}>0 ));then stat --printf='%d:%i:%s:%y:%z:%n\0' -- "${batch[@]}" >>"$records" || return 1;fi
     { printf '%s\0%s\0' "${MC_POLICY_FINGERPRINT:-unknown}|${MC_SIDECAR_EVIDENCE:-unknown}" "$media";sort -z "$dirs";sort -z "$records"; }|sha256sum|cut -d ' ' -f1 >"$output"
 }
 
