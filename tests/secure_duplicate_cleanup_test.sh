@@ -24,6 +24,9 @@ file_put_contents($keep,'stable media');$cache=[];$one=verifiedHash($keep,$root,
 blocked(fn()=>applyVerifiedPair(['keep'=>$keep,'remove'=>$keep],$one,$one,$root),'keeper never deleted');
 // A nonempty duplicate folder keeps unrelated sidecars; the library root stays.
 file_put_contents($extra,'stable media');file_put_contents(dirname($extra).'/poster.jpg','poster');$d=proof($extra,$root);applyVerifiedPair(['keep'=>$keep,'remove'=>$extra],$one,$d,$root);check(file_exists(dirname($extra).'/poster.jpg'),'sidecar retained');
+// Verify the exact ERE used by the native process guard without creating fake
+// mover processes that could interfere with production monitors.
+$processes=$root.'/processes.txt';file_put_contents($processes,"/usr/local/sbin/mover.old --test\n");[$rc]=runCommand(['grep','-Eq',MOVER_PATTERN,$processes]);check($rc===0,'legacy Mover ERE');file_put_contents($processes,"/usr/local/sbin/mover --test\n");[$rc]=runCommand(['grep','-Eq',MOVER_PATTERN,$processes]);check($rc===0,'current Mover ERE');
 $receipt=$root.'/receipt.json';saveReceipt($receipt,['status'=>'TEST_ONLY']);check(json_decode(file_get_contents($receipt),true)['status']==='TEST_ONLY','atomic receipt');
 echo "Exact-copy deletion, exclusion, changed-file/hash/symlink/traversal protection, native hash reuse and nonempty-directory retention passed\n";
 PHP

@@ -1,5 +1,5 @@
 #!/bin/bash
-# secure_duplicate_cleanup.sh 1.0.0
+# secure_duplicate_cleanup.sh 1.0.1
 # One-time Hubble JAV duplicate removal; never install a cron/User Scripts job.
 # Removes only explicit manifest paths with an unchanged, byte-identical keeper.
 # ポルノコレクション is a hard exclusion. Different encodes and multipart media
@@ -33,6 +33,7 @@ for argument in "$@";do
 done
 exec php /dev/stdin "$@" <<'PHP'
 <?php
+const MOVER_PATTERN = '(^|/)(mover|mover\.old)([[:space:]]|$)';
 function note(string $s):void {
     echo date('Y-m-d H:i:s')." | $s\n";
     flush();
@@ -236,7 +237,7 @@ if(isset($opt['evidence']))foreach(file($opt['evidence'],FILE_IGNORE_NEW_LINES|F
 if(is_file($reportPath)&&!is_link($reportPath)){
     foreach(json_decode(file_get_contents($reportPath),true)['evidence']??[] as $f)$cache[$f['path']]=$f;
 }
-$report=['schema'=>1,'version'=>'1.0.0','startedAt'=>time(),'status'=>'VERIFYING','excludedRoot'=>$manifest['excludedRoot'],'manifestSha256'=>hash_file('sha256',$opt['manifest']),'plexInventorySummary'=>$manifest['plexInventorySummary']??[],'retainedPlexReviews'=>$manifest['retainedPlexReviews']??[],'selectedPairs'=>count($pairs),'actions'=>[],'evidence'=>[],'deletedFiles'=>0,'deletedBytes'=>0,'scanRequests'=>[]];
+$report=['schema'=>1,'version'=>'1.0.1','startedAt'=>time(),'status'=>'VERIFYING','excludedRoot'=>$manifest['excludedRoot'],'manifestSha256'=>hash_file('sha256',$opt['manifest']),'plexInventorySummary'=>$manifest['plexInventorySummary']??[],'retainedPlexReviews'=>$manifest['retainedPlexReviews']??[],'selectedPairs'=>count($pairs),'actions'=>[],'evidence'=>[],'deletedFiles'=>0,'deletedBytes'=>0,'scanRequests'=>[]];
 saveReceipt($reportPath,$report);
 $ready=[];
 // Small unverified pairs first; previously completed proof is reused unchanged.
@@ -284,7 +285,7 @@ $sections=[];
 foreach($ready as [$pair,$k,$d]){
     $id=(string)$pair['id'];
     try{
-        [$rc]=runCommand(['pgrep','-f','(^|/)(mover|mover\\.old)([[:space:]]|$)']);
+        [$rc]=runCommand(['pgrep','-f',MOVER_PATTERN]);
         if($rc!==1)throw new RuntimeException('MOVER_OR_PROCESS_CHECK_UNCERTAIN');
         $km=plexMember($pair['keep'],$pair['keepPlex']);
         $dm=plexMember($pair['remove'],$pair['removePlex']);
