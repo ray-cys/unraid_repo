@@ -488,7 +488,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.23.0"
+readonly SCRIPT_VERSION="1.24.0"
 
 ###############################################################################
 # CONFIGURATION
@@ -798,8 +798,38 @@ backup_phase() {
     BACKUP_PHASE="$1"; BACKUP_PHASE_STARTED="$now"
 }
 BACKUP_PHASE_STARTED=$BACKUP_STARTED
+# Profiling observes existing work only: no additional hash pass or transfer.
+VAULT_PROFILE_MANIFEST_MS=0
+VAULT_PROFILE_TRANSFER_MS=0
+VAULT_PROFILE_VERIFY_MS=0
+vault_profile_record() {
+    local label="$1" attempt="$2" stage="$3" started="$4" rc="$5" source_bytes="${6:-0}" output="${7:-}" elapsed changed=null sent=null mode=not_applicable
+    elapsed=$(( $(usr_ops_now_ms)-started ));((elapsed>=0)) || elapsed=0
+    case "$stage" in
+      source_manifest) VAULT_PROFILE_MANIFEST_MS=$((VAULT_PROFILE_MANIFEST_MS+elapsed));mode=source_sha256;[[ "$label" != appdata ]] || mode=producer_manifest_validation;;
+      rsync_transfer) VAULT_PROFILE_TRANSFER_MS=$((VAULT_PROFILE_TRANSFER_MS+elapsed))
+        if [[ -f "$output" ]];then
+          changed=$(awk -F': ' '/^Total transferred file size:/{gsub(/[^0-9]/,"",$2);v=$2}END{print (v==""?"null":v)}' "$output")
+          sent=$(awk -F': ' '/^Total bytes sent:/{gsub(/[^0-9]/,"",$2);v=$2}END{print (v==""?"null":v)}' "$output")
+        fi;;
+      destination_sha256) VAULT_PROFILE_VERIFY_MS=$((VAULT_PROFILE_VERIFY_MS+elapsed));mode=remote_sha256_readback;;
+    esac
+    log INFO "Profile $label attempt=$attempt stage=$stage elapsed=${elapsed}ms exit=$rc source-bytes=$source_bytes transferred-file-bytes=$changed rsync-sent-bytes=$sent"
+    [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]] || return 0
+    jq -nc --arg label "$label" --arg stage "$stage" --arg mode "$mode" --argjson attempt "$attempt" --argjson elapsed "$elapsed" --argjson rc "$rc" --argjson source "$source_bytes" --argjson changed "$changed" --argjson sent "$sent" \
+      '{label:$label,attempt:$attempt,stage:$stage,hashMode:$mode,durationMs:$elapsed,exitCode:$rc,sourceBytes:$source,transferredFileBytes:$changed,rsyncSentBytes:$sent,
+        effectiveChangedMiBPerSecond:(if $stage=="rsync_transfer" and $rc==0 and $elapsed>0 and $changed!=null then (($changed/1048576)/($elapsed/1000)) else null end)}' >>"$TMP_DIR/vault-profile.jsonl" || log WARNING 'Profiling record unavailable; backup verification remains independent'
+}
+vault_profile_json() {
+    local file="${TMP_DIR:-}/vault-profile.jsonl"
+    if [[ -f "$file" ]];then
+      jq -sc --argjson manifest "$VAULT_PROFILE_MANIFEST_MS" --argjson transfer "$VAULT_PROFILE_TRANSFER_MS" --argjson verify "$VAULT_PROFILE_VERIFY_MS" \
+        '{schema:1,totals:{sourceManifestMs:$manifest,rsyncTransferMs:$transfer,destinationSha256Ms:$verify},attemptStages:.[-128:],scope:"Wall time including retries; source manifests include inventory/stability checks. Appdata validates its producer manifest, other sources read payload SHA256. Rsync sent bytes exclude SSH overhead; changed-file rate is not LAN link speed. No extra verification pass was performed."}' "$file"
+    else printf '{"schema":1,"attemptStages":[],"scope":"No transfer profiling stages recorded"}';fi
+}
 backup_finish() {
-    local rc=$? status=OK temp summary
+    local rc=$? status=OK temp summary profiling
+    profiling=$(vault_profile_json) || profiling='{"schema":1,"error":"Profiling summary unavailable"}'
     trap - EXIT INT TERM PIPE
     (( rc == 0 )) || status=FAILED
     [[ "$BACKUP_RESULT" != OK || "$status" != FAILED ]] || status=WARNING
@@ -823,8 +853,8 @@ Log: $LOG_FILE"
     if mountpoint -q /mnt/vault && command -v jq >/dev/null; then
         mkdir -p -- "$STATUS_DIR"
         temp=$(mktemp "$STATUS_DIR/.${SCRIPT_ID}.XXXXXX") &&
-            jq -n --argjson drillEpoch "$RESTORE_DRILL_EPOCH" --arg drill "$RESTORE_DRILL_RESULT" --arg drillSummary "$RESTORE_DRILL_SUMMARY" --arg name "$SCRIPT_ID" --arg status "$status" --arg summary "$summary" --arg phase "$BACKUP_PHASE" --arg copy "$BACKUP_RESULT" --arg verification "$VERIFICATION_RESULT" --arg retention "$RETENTION_RESULT" --arg notification "$NOTIFICATION_RESULT" --arg shutdown "$SHUTDOWN_RESULT" --arg shutdown_reason "${REMOTE_SHUTDOWN_SKIPPED_REASON:-}" --arg version "$SCRIPT_VERSION" --arg log "$LOG_FILE" --argjson duration "$(( $(date +%s)-BACKUP_STARTED ))" --argjson epoch "$(date +%s)" \
-            '{restoreDrillEpoch:$drillEpoch,restoreDrill:$drill,restoreDrillSummary:$drillSummary,name:$name,status:$status,summary:$summary,phase:$phase,copy:$copy,verification:$verification,retention:$retention,notification:$notification,shutdown:$shutdown,shutdown_reason:$shutdown_reason,scriptVersion:$version,duration_seconds:$duration,log:$log,epoch:$epoch}' >"$temp" && mv -f -- "$temp" "$STATUS_DIR/$SCRIPT_ID.json"
+            jq -n --argjson drillEpoch "$RESTORE_DRILL_EPOCH" --arg drill "$RESTORE_DRILL_RESULT" --arg drillSummary "$RESTORE_DRILL_SUMMARY" --arg name "$SCRIPT_ID" --arg status "$status" --arg summary "$summary" --arg phase "$BACKUP_PHASE" --arg copy "$BACKUP_RESULT" --arg verification "$VERIFICATION_RESULT" --arg retention "$RETENTION_RESULT" --arg notification "$NOTIFICATION_RESULT" --arg shutdown "$SHUTDOWN_RESULT" --arg shutdown_reason "${REMOTE_SHUTDOWN_SKIPPED_REASON:-}" --arg version "$SCRIPT_VERSION" --arg log "$LOG_FILE" --argjson profiling "$profiling" --argjson duration "$(( $(date +%s)-BACKUP_STARTED ))" --argjson epoch "$(date +%s)" \
+            '{profiling:$profiling,restoreDrillEpoch:$drillEpoch,restoreDrill:$drill,restoreDrillSummary:$drillSummary,name:$name,status:$status,summary:$summary,phase:$phase,copy:$copy,verification:$verification,retention:$retention,notification:$notification,shutdown:$shutdown,shutdown_reason:$shutdown_reason,scriptVersion:$version,duration_seconds:$duration,log:$log,epoch:$epoch}' >"$temp" && mv -f -- "$temp" "$STATUS_DIR/$SCRIPT_ID.json"
     fi
     [[ -z "$LEASE_INPUT" ]] || exec {LEASE_INPUT}>&-
     [[ -z "$LEASE_PID" ]] || { kill "$LEASE_PID" 2>/dev/null || true; wait "$LEASE_PID" 2>/dev/null || true; }
@@ -1664,21 +1694,25 @@ PREPARE
 }
 
 transfer_job() {
-    local label="$1" source="$2" manifest="$3" attempt rc output before after elapsed started force_checksum=false
+    local label="$1" source="$2" manifest="$3" attempt rc output before after elapsed started profile_started profile_rc force_checksum=false
     local destination="$REMOTE_PARTIAL/$label" manifest_remote="$REMOTE_PARTIAL/manifests/$label.sha256"
     local -a args=()
     output="$TMP_DIR/$label.rsync"
     for ((attempt=1; attempt<=VAULT_MAX_ATTEMPTS; attempt++)); do
         backup_lease_alive && backup_source_ready "$source" || return 1
         # Rebuild after an interruption/source change, never verify against a stale manifest.
-        build_manifest "$label" "$source" "$manifest" || { (( attempt < VAULT_MAX_ATTEMPTS )) && { sleep 5; continue; }; return 1; }
+        profile_started=$(usr_ops_now_ms);profile_rc=0
+        build_manifest "$label" "$source" "$manifest" || profile_rc=$?
+        vault_profile_record "$label" "$attempt" source_manifest "$profile_started" "$profile_rc" "${MANIFEST_BYTES[$label]:-0}"
+        if ((profile_rc!=0));then (( attempt < VAULT_MAX_ATTEMPTS )) && { sleep 5;continue; };return 1;fi
         before=${SOURCE_FINGERPRINT[$label]}
         if [[ "$DRY_RUN" == true ]]; then log INFO "[DRY RUN] Would transfer ${MANIFEST_FILES[$label]} files from $source"; return 0; fi
         backup_phase "transfer-$label"
-        started=$(date +%s); args=("${RSYNC_ARGS[@]}")
+        profile_started=$(usr_ops_now_ms);started=$(date +%s); args=("${RSYNC_ARGS[@]}")
         [[ "$force_checksum" != true ]] || args+=(--checksum)
         "${PRIORITY_PREFIX[@]}" rsync "${args[@]}" "$source/" "$REMOTE:$destination/" 2>&1 | tail --bytes="$MAX_RAW_LOG_BYTES" >"$output"
         rc=${PIPESTATUS[0]}; elapsed=$(( $(date +%s)-started ))
+        vault_profile_record "$label" "$attempt" rsync_transfer "$profile_started" "$rc" "${MANIFEST_BYTES[$label]}" "$output"
         tail -n 30 -- "$output" >>"$LOG_FILE"
         log INFO "$label attempt=$attempt duration=${elapsed}s rsync_exit=$rc"
         if (( rc == 0 )); then
@@ -1689,7 +1723,10 @@ transfer_job() {
                 ssh_exec "find $(shell_quote "$destination") -type d -name .rsync-partial -prune -exec rm -rf -- {} +" || return 1
                 rsync -a --checksum --protect-args "--timeout=$RSYNC_IO_TIMEOUT" "$manifest" "$REMOTE:$manifest_remote" || return 1
                 backup_phase "verify-$label"
-                if ssh_exec "cd $(shell_quote "$destination") && sha256sum -c -- $(shell_quote "$manifest_remote") >/dev/null"; then
+                profile_started=$(usr_ops_now_ms);profile_rc=0
+                ssh_exec "cd $(shell_quote "$destination") && sha256sum -c -- $(shell_quote "$manifest_remote") >/dev/null" || profile_rc=$?
+                vault_profile_record "$label" "$attempt" destination_sha256 "$profile_started" "$profile_rc" "${MANIFEST_BYTES[$label]}"
+                if ((profile_rc==0));then
                     FILES_VERIFIED=$((FILES_VERIFIED+MANIFEST_FILES[$label]))
                     BYTES_TRANSFERRED=$((BYTES_TRANSFERRED+MANIFEST_BYTES[$label]))
                     return 0
@@ -2009,7 +2046,7 @@ main() {
         [[ -n "$RESTORE_DRILL_SUMMARY" ]] || RESTORE_DRILL_SUMMARY="ISS restore drill unavailable; verified backup retained. Review remote drill prerequisites/logs."
     fi
 
-    RESULT_SUMMARY="Verified ${GENERATION_NAME}: ${FILES_VERIFIED} files, $(human_bytes "$BYTES_TRANSFERRED")"
+    RESULT_SUMMARY="Verified ${GENERATION_NAME}: ${FILES_VERIFIED} files, $(human_bytes "$BYTES_TRANSFERRED"). Profiling: source manifests=${VAULT_PROFILE_MANIFEST_MS}ms; rsync=${VAULT_PROFILE_TRANSFER_MS}ms; ISS SHA256=${VAULT_PROFILE_VERIFY_MS}ms (including attempts)."
     log INFO "$RESULT_SUMMARY"
     backup_phase shutdown
     shutdown_remote || true

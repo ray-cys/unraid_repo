@@ -6,11 +6,11 @@ clearLog=true
 
 # Read-only version lookup must return before state, API or automation setup.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]];then
-    printf 'media_health_monitor.sh 3.25.0\n';exit 0
+    printf 'media_health_monitor.sh 3.26.0\n';exit 0
 fi
 
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.25.0
+# ARR Health / Download / Import Monitor v3.26.0
 #
 # PURPOSE
 # -------
@@ -4300,11 +4300,11 @@ classification_reason() {
         ARR_IMPORT_STALLED)
             echo "Completed download remains tracked by Arr but has not progressed to import"
             ;;
-        
+
         ACTIVITY_FLOW_ANOMALY)
             echo "Recent SAB completions were observed but the corresponding Arr application recorded no successful imports during the activity-flow window"
             ;;
-            
+
         *)
             echo "Unknown"
             ;;
@@ -7387,7 +7387,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'Media Health Monitor v3.25.0 lifecycle commands' \
+        'Media Health Monitor v3.26.0 lifecycle commands' \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -8950,6 +8950,40 @@ build_cf_group_detail() {
 # PROCESS ARR QUEUE
 ###############################################################################
 
+# Presentation only: group native queue evidence by download ID. A pack hint
+# never supplies episode identity or authorizes rejection/import/deletion.
+arr_queue_presentation() {
+    local app="$1" item="$2" queue="$3" input="$TMP_DIR/queue-presentation-item.json" actions="${AUTOMATION_STATE_FILE:-$STATE_DIR/automation-actions.json}" empty="$TMP_DIR/queue-presentation-empty.json"
+    printf '%s' "$item" >"$input" || return 1
+    [[ -f "$actions" && ! -L "$actions" ]] || { printf '{"actions":{}}' >"$empty";actions="$empty"; }
+    jq -r --arg app "$app" --argjson maximum "$AUTOMATION_IMPORT_RETRY_MAX_ATTEMPTS" --slurpfile item "$input" --slurpfile automation "$actions" '
+      $item[0] as $i | (($i.downloadId // "")|ascii_downcase) as $id |
+      [.records[]?|select(if $id!="" then ((.downloadId // "")|ascii_downcase)==$id else .id==$i.id end)] as $rows |
+      ([$rows[]|.episodeId?,.episode.id?,.episodeIds[]?]|map(select(type=="number" and .>0))|unique) as $episodes |
+      ([$rows[]|.movieId?]|map(select(type=="number" and .>0))|unique) as $movies |
+      (($episodes|length)>1 or ($movies|length)>1 or ($rows|length)>1) as $multi |
+      (($i.title // "")|test("([Ss][0-9]{1,3}[Ee][0-9]{1,3}([Ee-][0-9]|.*[Ss][0-9]{1,3}[Ee][0-9])|complete|season[ ._-]*[0-9]|[Ss][0-9]{1,3}([ ._-]|$))";"i")) as $hint |
+      ([$automation[0].actions[]?|select(.app==$app and .kind=="import-retry" and ((.downloadId // "")|ascii_downcase)==$id)]|sort_by(.startedAt)) as $retries |
+      ([$i.statusMessages[]?.messages[]?]) as $reasons |
+      (($reasons|length)>0 and all($reasons[];test("being used by another process|sharing violation|resource (temporarily unavailable|busy)|temporarily locked";"i"))) as $transient |
+      ["Download ID: "+(if $id!="" then $id else "not supplied; queue row "+($i.id|tostring) end),
+       "Queue scope: "+($rows|length|tostring)+" related row(s); native episode IDs="+($episodes|length|tostring)+"; native movie IDs="+($movies|length|tostring)+".",
+       (if $multi then "Pack/multi-target evidence: grouped queue rows/IDs; rejection automation remains blocked. Related rows may be duplicate tracking; no title-based identity is inferred."
+        elif $app=="Sonarr" and $hint then "Possible pack: release-name hint only; exact episode coverage is unproven. Rejection automation remains blocked."
+        else "Pack evidence: none established; ordinary exact-target safeguards still apply." end),
+       (if $app=="Sonarr" and ($episodes|length)>0 then "Native episode IDs (up to 20): "+($episodes[:20]|map(tostring)|join(", ")) else empty end),
+       "Import retries: "+($retries|length|tostring)+"/"+($maximum|tostring)+" recorded attempt(s) for this exact download.",
+       (if ($retries|length)>0 then $retries[-1] as $last |
+          "Last retry: "+($last.startedAt|strflocaltime("%Y-%m-%d %H:%M:%S %Z"))+"; command="+($last.commandId // "unverified"|tostring)+"; checkpoint="+($last.status // "unknown")+"; import outcome="+($last.outcome // "pending")+"."
+        else empty end),
+       (if ($retries|length)>=$maximum then "Retry limit reached: further automatic import retries are prohibited for this download."
+        elif any($retries[];.status=="intent") then "Retry held: previous command outcome is uncertain; no request is replayed."
+        elif ($retries|length)>0 then "Next retry spacing: not before "+(($retries[-1].startedAt+14400)|strflocaltime("%Y-%m-%d %H:%M:%S %Z"))+"; four-hour action windows and fresh safety checks still apply."
+        elif $transient then "Retry not submitted: native Auto import is eligible only after six-hour grace, stable exact evidence, budget and a four-hour action window."
+        else "Automatic retry not eligible for the reported reasons; policy, identity, storage and unknown failures are preserved for their specific workflow." end),
+       "Completed scan/search commands do not prove import. Payload and library media remain unchanged by this report."]|join("\n")' "$queue"
+}
+
 process_queue() {
 
     local app="$1"
@@ -9379,6 +9413,9 @@ process_queue() {
             detail+="Release: ${release}"
             detail+=$'\n'
             detail+="Queue: status=${status}, tracked=${tracked_status}/${tracked_state}"
+            local queue_presentation
+            queue_presentation=$(arr_queue_presentation "$app" "$item" "$queue_file") || queue_presentation='Queue/retry presentation unavailable; no action or resolution inferred.'
+            detail+=$'\n'"$queue_presentation"
 
             if [ "$sab_status" != "Unknown" ]; then
                 detail+=$'\n'
@@ -16703,6 +16740,9 @@ automation_report() {
         if [ "$(jq -r '.kind' "$file")" = import-retry ]; then
             detail+="Download ID: $(jq -r '.downloadId' "$file"); path: $(jq -r '.command.path' "$file")."$'\n'
             detail+="Original warning: $(jq -r '.reason|join("; ")' "$file")."$'\n'
+            local retry_count
+            retry_count=$(jq --arg app "$app" --arg download "$(jq -r .downloadId "$file")" '[.actions[]|select(.app==$app and .kind=="import-retry" and .downloadId==$download)]|length' "$AUTOMATION_STATE_FILE")
+            detail+="Import retry usage: $retry_count/$AUTOMATION_IMPORT_RETRY_MAX_ATTEMPTS for this exact download; six-hour initial grace and four-hour spacing/action windows apply. Native Auto mode retains Arr import policy."$'\n'
         else
             detail+="Monitored missing target passed queue/history/deletion/hold checks. Pre-existing missing backlog entries were preserved."$'\n'
         fi
@@ -17490,7 +17530,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | Media Health Monitor v3.25.0"
+    "START | Media Health Monitor v3.26.0"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -17503,7 +17543,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting Media Health Monitor v3.25.0"
+debug_log "Starting Media Health Monitor v3.26.0"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -18150,7 +18190,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "Media Health Monitor v3.25.0 completed"
+log "Media Health Monitor v3.26.0 completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""
