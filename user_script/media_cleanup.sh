@@ -4,7 +4,15 @@
 # identities, remaining inventory, active work, Mover and restore holds recheck.
 clearLog=true
 arrayStarted=true
-# Media Cleanup v1.8.0 -- personal Hubble operations
+# Media Cleanup v1.11.0 -- personal Hubble operations
+#
+# TAG LIFECYCLE: confirmed deletion -> plex-deleted (movie) or plex-deleted-
+# series/season (Sonarr). Eligible whole-item hold -> retirement-pending only.
+# At 30 days, guarded removal deletes the native Arr record with deleteFiles=false
+# and requests an import-list exclusion. Partial seasons never retire a series
+# while other media remains. Restores clear obsolete markers; cancelled holds
+# restore the deletion marker only while media remains missing. Native tag
+# definitions and unrelated assignments are retained; existing timers persist.
 #
 # PURPOSE: One daily job coordinates Arr deletion/unmonitoring/30-day retirement,
 # proven SAB completed-payload cleanup, and metadata-bin retention. Modules run
@@ -285,7 +293,7 @@ fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
 umask 077
-MC_VERSION="1.10.0"
+MC_VERSION="1.11.0"
 # One execution switch across every module. Conflicting/unused flags fail before work.
 # In preview, quarantine purge becomes audit; restore requires an explicit execute flag.
 MC_DRY_RUN=false
@@ -1674,7 +1682,7 @@ umask 077
 # Release version for logs, notifications, and the HTTP User-Agent. State-file
 # version fields below are independent schema versions and must not be changed
 # merely when this release version changes.
-readonly SCRIPT_VERSION="2.11.0"
+readonly SCRIPT_VERSION="2.12.0"
 
 ###############################################################################
 # CONFIGURATION
@@ -4393,10 +4401,10 @@ sonarr_mark_series_action() {
     next="$(mktemp "${VERIFY_RUNTIME_DIR:-$STATE_DIR}/.state-series.XXXXXX")" || return 1
     if ! jq -c --arg now "$RUN_AT" --argjson series_id "$series_id" '
         .seriesActions //= {}
-        | .seriesActions[($series_id | tostring)] = {
+        | .seriesActions[($series_id | tostring)] = ((.seriesActions[($series_id | tostring)] // {}) + {
             seriesId: $series_id,
             lastUnmonitoredAt: $now
-        }
+        })
     ' "$WORK_STATE" > "$next"; then
         rm -f -- "$next"
         return 1
@@ -4460,6 +4468,82 @@ sonarr_touch_retirement() {
     mv -f -- "$next" "$WORK_STATE"
 }
 
+# Visible tags describe the current stage; historical deletion evidence stays in
+# state. Only reserved lifecycle labels on state-proven script workflows qualify.
+arr_record_lifecycle_tags() {
+    local kind="$1" id="$2" labels="$3" reason="$4" field=movies retirement=movieRetirements next
+    [[ "$DRY_RUN" != true ]] || return 0
+    [[ "$kind" != series ]] || { field=seriesActions;retirement=seriesRetirements; }
+    jq -e --arg field "$field" --arg id "$id" --argjson labels "$labels" '.[$field][$id].lifecycleTags.labels==$labels' "$WORK_STATE" >/dev/null && return 0
+    next=$(mktemp "${VERIFY_RUNTIME_DIR:-$STATE_DIR}/.lifecycle-tags.XXXXXX") || return 1
+    jq --arg field "$field" --arg retirement "$retirement" --arg id "$id" --argjson labels "$labels" --arg reason "$reason" --arg at "$RUN_AT" '
+      .[$field][$id].lifecycleTags as $old |
+      {at:$at,labels:$labels,reason:$reason,retirementStartedAt:(.[$retirement][$id].startedAt // null)} as $event |
+      .[$field][$id].lifecycleTags={labels:$labels,at:$at,reason:$reason,history:((($old.history // [])+[$event])|.[-12:])}' "$WORK_STATE" >"$next" && mv "$next" "$WORK_STATE"
+}
+arr_sync_lifecycle_tags() {
+    local kind="$1" id="$2" desired="$3" managed="$4" reason="$5" detail payload label tag_id additions='[]' removals='[]' before after
+    [[ "$id" =~ ^[1-9][0-9]*$ ]] || return 1
+    # Preview must not create tags or send mutations.
+    if [[ "$DRY_RUN" == true ]];then log DEBUG "DRY RUN: lifecycle $kind ID=$id would show $desired; $reason";return 0;fi
+    detail=$(api_get_json_uncached "/api/v3/$kind/$id") || return 1
+    jq -e --argjson id "$id" '.id==$id and (.tags|type)=="array"' <<<"$detail" >/dev/null || return 1
+    while IFS= read -r label;do
+      tag_id='';ensure_tag_id "$label" tag_id || return 1
+      additions=$(jq -cn --argjson ids "$additions" --argjson id "$tag_id" '$ids+[$id]|unique') || return 1
+    done < <(jq -r '.[]' <<<"$desired")
+    while IFS= read -r label;do
+      tag_id=$(tag_id_by_label "$label")
+      [[ "$tag_id" =~ ^[1-9][0-9]*$ ]] || continue
+      removals=$(jq -cn --argjson ids "$removals" --argjson id "$tag_id" '$ids+[$id]|unique') || return 1
+    done < <(jq -r '.[]' <<<"$managed")
+    payload=$(jq -c --argjson remove "$removals" --argjson add "$additions" '.tags=((.tags-$remove+$add)|unique)' <<<"$detail") || return 1
+    before=$(jq -c '.tags|sort' <<<"$detail");after=$(jq -c '.tags|sort' <<<"$payload")
+    if [[ "$before" != "$after" ]];then
+      api_put_json "/api/v3/$kind/$id" "$payload" || return 1
+      queue_action_notification "$ARR_NAME" 'Lifecycle tags reconciled' "$(jq -r '.title // "Media"' <<<"$detail") ($kind ID=$id): current lifecycle tags=$desired. $reason Other tags and monitoring settings preserved; native read-back verified."
+    fi
+    arr_record_lifecycle_tags "$kind" "$id" "$desired" "$reason"
+}
+sonarr_reconcile_lifecycle_tags() {
+    local id="$1" episodes="$2" desired='[]' managed reason
+    sonarr_prepare_read_state || return 1
+    # No provenance: do not claim/remove a manually assigned matching label.
+    jq -e --arg id "$id" '(.seriesRetirements[$id]!=null) or (.seriesActions[$id]!=null) or any(.seasonActions[]?;(.seriesId|tostring)==$id) or any(.episodes[]?;(.seriesId|tostring)==$id and .everHadFile==true and (.missingRuns // 0)>0)' "$SONARR_READ_STATE" >/dev/null || return 0
+    jq -e --arg id "$id" '(.seriesRetirements[$id].removedFromArrAt // "")!=""' "$SONARR_READ_STATE" >/dev/null && return 0
+    managed=$(jq -cn --arg a "$PLEX_DELETED_SERIES_TAG" --arg b "$PLEX_DELETED_SEASON_TAG" --arg p "$SONARR_RETIREMENT_PENDING_TAG" '[$a,$b,$p]|unique')
+    if jq -e --arg id "$id" '(.seriesRetirements[$id].startedAt // "")!=""' "$SONARR_READ_STATE" >/dev/null;then
+      desired=$(jq -cn --arg p "$SONARR_RETIREMENT_PENDING_TAG" '[$p]');reason="${ARR_RETIREMENT_DAYS}-day Arr removal hold active; deletion history retained in state."
+    elif [[ $(sonarr_series_cleanup_eligible "$id" "$episodes") == true ]];then
+      desired=$(jq -cn --arg label "$PLEX_DELETED_SERIES_TAG" '[$label]');reason='Confirmed whole-series media deletion; automatic removal hold is not active.'
+    else
+      # Keep a season marker only while a previously acted-on season remains
+      # completely fileless with exact current IDs and confirmed missing history.
+      if jq -e --argjson id "$id" --argjson needed "$CONFIRMATION_RUNS" --argjson require "$REQUIRE_DELETE_HISTORY_EVENT" --slurpfile source "$episodes" '
+        . as $state|($source[0]|INDEX(.id|tostring)) as $current|
+        any(.seasonActions[]?|select(.seriesId==$id);.seasonNumber as $season|
+          [$state.episodes|to_entries[]|select(.value.seriesId==$id and .value.seasonNumber==$season and .value.everHadFile==true)] as $past|
+          ($past|length)>0 and all($source[0][]|select(.seasonNumber==$season);.hasFile!=true) and
+          all($past[];$current[.key]!=null and $current[.key].hasFile!=true and (.value.missingRuns // 0)>=$needed and (($require|not) or .value.latestEpisodeFileDeletedHistory!=null)))' "$SONARR_READ_STATE" >/dev/null;then
+        desired=$(jq -cn --arg label "$PLEX_DELETED_SEASON_TAG" '[$label]')
+      fi
+      reason='Current episode evidence reconciled; restored media clears obsolete whole-series/season markers. Partial season deletion preserves the series.'
+    fi
+    arr_sync_lifecycle_tags series "$id" "$desired" "$managed" "$reason"
+}
+radarr_reconcile_lifecycle_tags() {
+    local id="$1" has_file="$2" monitored="$3" exempt="$4" desired='[]' managed reason
+    jq -e --arg id "$id" '(.movieRetirements[$id]!=null) or (.movies[$id].lastPlexDeletedTagAppliedAt!=null) or (.movies[$id].lifecycleTags!=null)' "$WORK_STATE" >/dev/null || return 0
+    managed=$(jq -cn --arg d "$PLEX_DELETED_MOVIE_TAG" --arg p "$RADARR_RETIREMENT_PENDING_TAG" '[$d,$p]|unique')
+    if [[ "$has_file" == true ]];then reason='Movie media returned; deletion and retirement markers cleared.'
+    elif [[ "$monitored" != true && "$exempt" != true ]] && jq -e --arg id "$id" '(.movieRetirements[$id].startedAt // "")!=""' "$WORK_STATE" >/dev/null;then
+      desired=$(jq -cn --arg p "$RADARR_RETIREMENT_PENDING_TAG" '[$p]');reason="${ARR_RETIREMENT_DAYS}-day Arr removal hold active; deletion history retained in state."
+    else
+      desired=$(jq -cn --arg d "$PLEX_DELETED_MOVIE_TAG" '[$d]');reason='Previously confirmed media deletion remains; no automatic Arr removal hold is active.'
+    fi
+    arr_sync_lifecycle_tags movie "$id" "$desired" "$managed" "$reason"
+}
+
 # Pending is a hold marker, not a permanent deletion tag. Remove only this
 # assignment, with an uncached exact resource fetch and journalled read-back.
 arr_clear_pending_tag() {
@@ -4484,6 +4568,8 @@ sonarr_cancel_retirement() {
     next="$(mktemp "${VERIFY_RUNTIME_DIR:-$STATE_DIR}/.state-retirement-cancel.XXXXXX")" || return 1
     if ! jq -c --arg key "$series_id" --arg now "$RUN_AT" --arg reason "$reason" '
         .seriesRetirements //= {}
+        | .seriesActions[$key].retirementHistory=(((.seriesActions[$key].retirementHistory // [])+
+            [{startedAt:.seriesRetirements[$key].startedAt,endedAt:$now,outcome:"cancelled",reason:$reason}])|.[-12:])
         | .seriesRetirements[$key] = ((.seriesRetirements[$key] // {}) + {
             startedAt: null,
             lastValidatedAt: $now,
@@ -4505,7 +4591,10 @@ sonarr_clear_retirement() {
 
     arr_clear_pending_tag series "$series_id" "$SONARR_RETIREMENT_PENDING_TAG" || return 1
     next="$(mktemp "${VERIFY_RUNTIME_DIR:-$STATE_DIR}/.state-retirement-clear.XXXXXX")" || return 1
-    if ! jq -c --arg key "$series_id" 'del(.seriesRetirements[$key])' \
+    if ! jq -c --arg key "$series_id" --arg now "$RUN_AT" '
+        .seriesActions[$key].retirementHistory=(((.seriesActions[$key].retirementHistory // [])+
+          [{startedAt:.seriesRetirements[$key].startedAt,endedAt:$now,outcome:"media-returned"}])|.[-12:]) |
+        del(.seriesRetirements[$key])' \
         "$WORK_STATE" > "$next"; then
         rm -f -- "$next"
         return 1
@@ -4687,16 +4776,17 @@ sonarr_process_full_retirement() {
         payload="$(jq -cn --argjson ids "$episode_ids" '{episodeIds:$ids,monitored:false}')" || return 1
         api_put_json '/api/v3/episode/monitor' "$payload" || return 1
     fi
-    detail="$(api_get_json "/api/v3/series/$series_id")" || return 1
-    ensure_tag_id "$PLEX_DELETED_SERIES_TAG" deleted_id || return 1
+    detail="$(api_get_json_uncached "/api/v3/series/$series_id")" || return 1
+    jq -e --argjson id "$series_id" '.id==$id and (.tags|type)=="array"' <<<"$detail" >/dev/null || return 1
     ensure_tag_id "$SONARR_RETIREMENT_PENDING_TAG" pending_id || return 1
-    tag_ids="$(jq -cn --argjson deleted "$deleted_id" --argjson pending "$pending_id" \
-        '[$deleted,$pending]')" || return 1
-    payload="$(jq -c --argjson tags "$tag_ids" '
+    tag_ids="$(jq -cn --argjson pending "$pending_id" '[$pending]')" || return 1
+    local deletion_tags
+    deletion_tags=$(jq -c --arg a "$PLEX_DELETED_SERIES_TAG" --arg b "$PLEX_DELETED_SEASON_TAG" '[.[]|select(.label==$a or .label==$b)|.id]' <<<"$TAG_CATALOG") || return 1
+    payload="$(jq -c --argjson tags "$tag_ids" --argjson remove "$deletion_tags" '
         .monitored = false
         | .seasons |= map(.monitored = false)
         | .tags //= []
-        | .tags |= ((. + $tags) | unique)
+        | .tags |= ((. - $remove + $tags) | unique)
     ' <<< "$detail")" || return 1
     api_put_json "/api/v3/series/$series_id" "$payload" || return 1
     sonarr_mark_retirement_started "$series_id" "$series_title" "$status" || return 1
@@ -4943,9 +5033,9 @@ MC_SERIES_SOURCE="$VERIFY_RUNTIME_DIR/series-catalog.json";printf '%s' "$SERIES"
 mc_timed_call discovery mc_index_snapshot "$MC_SERIES_SOURCE" "$VERIFY_RUNTIME_DIR/series-index.json" || die 'Incomplete Sonarr catalogue; no absence inferred.'
 MC_ROTATING_IDS="$VERIFY_RUNTIME_DIR/sonarr-rotation.ids";mc_rotation_plan "$MC_SERIES_SOURCE" "$MC_ROTATING_IDS" || die 'Cannot plan rotating sidecar discovery.'
 MC_SERIES_IDS="$VERIFY_RUNTIME_DIR/series-scan.ids"
-jq -nr --slurpfile catalog "$MC_SERIES_SOURCE" --slurpfile state "$WORK_STATE" --arg pending "$(tag_id_by_label "$SONARR_RETIREMENT_PENDING_TAG")" '
+jq -nr --slurpfile catalog "$MC_SERIES_SOURCE" --slurpfile state "$WORK_STATE" --arg pending "$(tag_id_by_label "$SONARR_RETIREMENT_PENDING_TAG")" --arg deleted "$(tag_id_by_label "$PLEX_DELETED_SERIES_TAG")" --arg season "$(tag_id_by_label "$PLEX_DELETED_SEASON_TAG")" '
   ($catalog[0]|INDEX(.id|tostring)) as $present |
-  ([ $catalog[0][]|select(.monitored==true or any(.tags[]?;tostring==$pending))|.id ]+
+  ([ $catalog[0][]|select(.monitored==true or any(.tags[]?;tostring==$pending or tostring==$deleted or tostring==$season))|.id ]+
    [$state[0].episodes[]?|select((.missingRuns // 0)>0)|.seriesId]+
    [($state[0].seriesRetirements // {})|keys[]|tonumber])|unique|.[]|select($present[tostring]!=null)' >"$MC_SERIES_IDS" || die 'Cannot plan complete-catalogue series work.'
 MC_ABSENT_SERIES=$(jq -nr --slurpfile catalog "$MC_SERIES_SOURCE" --slurpfile state "$WORK_STATE" '($catalog[0]|INDEX(.id|tostring)) as $present|[$state[0].episodes[]?.seriesId|select($present[tostring]==null)]|unique|length')
@@ -5198,6 +5288,9 @@ while IFS= read -r SERIES_ID; do
     RETIREMENT_RC=0
     sonarr_process_full_retirement "$SERIES_ID" "$SERIES_TITLE" \
         "$SERIES_ITEM" "$CURRENT_SNAPSHOT_FILE" || RETIREMENT_RC=$?
+    if [[ "$RETIREMENT_RC" == 0 || "$RETIREMENT_RC" == 10 ]];then
+        sonarr_reconcile_lifecycle_tags "$SERIES_ID" "$CURRENT_SNAPSHOT_FILE" || RETIREMENT_RC=1
+    fi
     case "$RETIREMENT_RC" in
         0) ;;
         10) continue ;;
@@ -5854,16 +5947,10 @@ radarr_confirmed_movies() {
 }
 
 radarr_movies_missing_tag() {
-    local candidates="$1"
-    local tag_id="$2"
-
-    if [[ "$tag_id" =~ ^[0-9]+$ ]]; then
-        jq -c --argjson tag_id "$tag_id" '
-            [ .[] | select(((.tags // []) | index($tag_id)) == null) ]
-        ' <<< "$candidates"
-    else
-        printf '%s' "$candidates"
-    fi
+    local candidates="$1" tag_id="$2"
+    jq -c --slurpfile state "$WORK_STATE" --arg tag "$tag_id" '
+      [.[]|select(($state[0].movieRetirements[(.id|tostring)].startedAt // "")=="")|
+       select(($tag=="") or (([.tags[]?|tostring]|index($tag))==null))]' <<<"$candidates"
 }
 
 radarr_record_history_evidence() {
@@ -6066,6 +6153,8 @@ radarr_cancel_retirement() {
     next="$(mktemp "${VERIFY_RUNTIME_DIR:-$STATE_DIR}/.state-retirement-cancel.XXXXXX")" || return 1
     if ! jq -c --arg key "$movie_id" --arg now "$RUN_AT" --arg reason "$reason" '
         .movieRetirements //= {}
+        | .movies[$key].retirementHistory=(((.movies[$key].retirementHistory // [])+
+            [{startedAt:.movieRetirements[$key].startedAt,endedAt:$now,outcome:"cancelled",reason:$reason}])|.[-12:])
         | .movieRetirements[$key] = ((.movieRetirements[$key] // {}) + {
             startedAt: null,
             lastValidatedAt: $now,
@@ -6086,7 +6175,10 @@ radarr_clear_retirement() {
     local next
     arr_clear_pending_tag movie "$movie_id" "$RADARR_RETIREMENT_PENDING_TAG" || return 1
     next="$(mktemp "${VERIFY_RUNTIME_DIR:-$STATE_DIR}/.state-retirement-clear.XXXXXX")" || return 1
-    if ! jq -c --arg key "$movie_id" 'del(.movieRetirements[$key])' \
+    if ! jq -c --arg key "$movie_id" --arg now "$RUN_AT" '
+        .movies[$key].retirementHistory=(((.movies[$key].retirementHistory // [])+
+          [{startedAt:.movieRetirements[$key].startedAt,endedAt:$now,outcome:"media-returned"}])|.[-12:]) |
+        del(.movieRetirements[$key])' \
         "$WORK_STATE" > "$next"; then
         rm -f -- "$next"
         return 1
@@ -6121,8 +6213,8 @@ radarr_process_retirements() {
     # retirement branch. Select the work once, keeping ALL existing timers so
     # returned media, restored monitoring and exemptions still cancel holds.
     pending_id=$(tag_id_by_label "$RADARR_RETIREMENT_PENDING_TAG")
-    jq -c --arg pending "$pending_id" --slurpfile state "$WORK_STATE" '
-      .[] | select((any(.tags[]?; tostring==$pending)) or
+    jq -c --arg pending "$pending_id" --arg deleted "$(tag_id_by_label "$PLEX_DELETED_MOVIE_TAG")" --slurpfile state "$WORK_STATE" '
+      .[] | select((any(.tags[]?; tostring==$pending or tostring==$deleted)) or
         (($state[0].movieRetirements[(.id|tostring)].startedAt // "") != "")
         or (.hasFile != true and .monitored != true))' "$movies_file" >"$retirement_candidates" || return 1
     while IFS= read -r movie; do
@@ -6153,6 +6245,7 @@ radarr_process_retirements() {
             tagged=true
         fi
 
+        radarr_reconcile_lifecycle_tags "$movie_id" "$has_file" "$monitored" "$has_exempt" || return 1
         if [[ -z "$started_at" && ( "$suppressed" == true || "$has_exempt" == true || "$monitored" == true || "$has_file" == true ) ]];then
             arr_clear_pending_tag movie "$movie_id" "$RADARR_RETIREMENT_PENDING_TAG" || return 1
         fi
@@ -6236,10 +6329,14 @@ radarr_process_retirements() {
             continue
         fi
         ensure_tag_id "$RADARR_RETIREMENT_PENDING_TAG" pending_id || return 1
-        payload="$(jq -cn --argjson movie_id "$movie_id" --argjson tag_id "$pending_id" \
-            '{movieIds:[$movie_id],tags:[$tag_id],applyTags:"add"}')" || return 1
-        api_put_json '/api/v3/movie/editor' "$payload" || return 1
+        local detail remove
+        detail=$(api_get_json_uncached "/api/v3/movie/$movie_id") || return 1
+        jq -e --argjson id "$movie_id" '.id==$id and .hasFile!=true and .monitored!=true' <<<"$detail" >/dev/null || return 1
+        remove=$(jq -c --arg label "$PLEX_DELETED_MOVIE_TAG" '[.[]|select(.label==$label)|.id]' <<<"$TAG_CATALOG") || return 1
+        payload=$(jq -c --argjson tag "$pending_id" --argjson remove "$remove" '.tags=((.tags-$remove+[$tag])|unique)' <<<"$detail") || return 1
+        api_put_json "/api/v3/movie/$movie_id" "$payload" || return 1
         radarr_mark_retirement_started "$movie_id" "$title" "$year" || return 1
+        arr_record_lifecycle_tags movie "$movie_id" "$(jq -cn --arg p "$RADARR_RETIREMENT_PENDING_TAG" '[$p]')" "${ARR_RETIREMENT_DAYS}-day Arr removal hold started; deletion history retained in state." || return 1
         queue_action_notification Radarr "$title retirement hold started" \
             "The confirmed deleted movie is unmonitored and clean; the ${ARR_RETIREMENT_DAYS}-day removal hold has started."
         log INFO "Started movie retirement for $title; removal hold is ${ARR_RETIREMENT_DAYS} days."

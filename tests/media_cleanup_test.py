@@ -100,7 +100,8 @@ jq -n '[range(1;10)|. as $id|{id:$id,title:("Fixture "+($id|tostring)),year:2026
  hasFile:([1,2]|index($id)!=null),monitored:([1,2,3,5]|index($id)!=null),
  tags:(if $id==7 then [1,2] else [1] end)}]' >"$2/movies.json"
 radarr_process_retirements "$2/movies.json"
-jq -cS . "$WORK_STATE"
+# Compare retirement decisions; the merged script also keeps bounded audit history.
+jq -cS '(.movies // {})|=(with_entries(.value|=del(.retirementHistory,.lifecycleTags))|with_entries(select(.value!={})))' "$WORK_STATE"
 sort "$events"
 printf 'cancelled=%s; removed=%s; started=%s\n' "$RETIREMENTS_CANCELLED" "$ARR_REMOVALS" "$RETIREMENTS_STARTED"
 '''
