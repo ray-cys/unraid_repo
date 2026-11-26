@@ -1,10 +1,12 @@
 #!/bin/bash
+# Release version: shared by --version, operational completion logs and receipts.
+readonly SCRIPT_VERSION="1.10.1"
 # CRON VERIFICATION: before new installations, normalized live launcher timing
 # must match installed enabled dynamic schedules. Drift is reported; discovery
 # continues, but no extra timer is created and no launcher shell text is executed.
 clearLog=true
 arrayStarted=true
-# System Update Coordinator v1.8.0 -- personal Hubble maintenance.
+# System Update Coordinator -- personal Hubble maintenance.
 # PURPOSE: Detect Docker/plugin/Unraid OS updates; automatically install only
 # explicitly approved, still-installed items during a bounded maintenance window.
 # Existing producers finish; expiring requests make new conflicting work yield.
@@ -44,6 +46,29 @@ arrayStarted=true
 # unexpected digest and holds further updates rather than claiming verification.
 # Unknown OS majors/interfaces stop installation; read-only status remains usable.
 # CLI: --help documents policy management without editing this standalone script.
+# RELEASE HISTORY (runtime versions verified against Git history)
+# 1.10.1 2026-11-26  Make the version visible at the top and in completion logs;
+#                     document previous releases; remove the stale v1.8.0 title.
+# 1.10.0 2026-11-26  Complete queue visibility; retire verified installed candidates
+#                     without losing newer candidates; refresh after installation.
+# 1.9.0  2026-11-26  Ignore bind-list ordering only; record verification gates;
+#                     reconcile-only CLI and accurate historical/recovery reports.
+# 1.8.0  2026-11-26  Reliability review, cron verification and recovery evidence.
+# 1.7.0  2026-11-26  Stronger backup evidence, backend probes and freshness checks.
+# 1.6.1  2026-11-26  Completion/notification contracts, restore hardening and
+#                     supervisor signal-race follow-up (two code commits).
+# 1.6.0  2026-11-26  Dynamic User Scripts schedules and removed-app reconciliation.
+# 1.5.0  2026-11-26  Second maintenance window and fixed-job schedule protection.
+# 1.4.0  2026-11-26  Batched Arr/download activity rules and independent groups.
+# 1.3.0  2026-11-25  Bounded producer handoffs and Plex transcoding protection.
+# 1.2.0  2026-11-24  Separate Docker/plugin caps; suppress up-to-date entries.
+# 1.1.1  2026-11-24  Preserve late outcomes for the next grouped daily report.
+# 1.1.0  2026-11-24  Approved installed-app/plugin updates and daily outcomes.
+# 1.0.1  2026-11-24  Stop installation when the installed digest is unavailable.
+# 1.0.0  2026-11-24  Initial approved native updates and retired-service handling.
+# Version policy: patch for fixes/documentation, minor for added capabilities;
+# major for incompatible contracts. Update this history with each local release.
+# Live User Scripts descriptions remain user-owned and carry no release notes.
 # BEGIN EMBEDDED OPERATIONS CONTRACT
 OPS_SCRIPT_ID="system_update_coordinator"
 # shellcheck shell=bash
@@ -476,7 +501,6 @@ US_CRON_VERIFY
 # END EMBEDDED USER SCRIPTS CATALOG
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="1.10.0"
 # Keep configured per-item holds when approving the same installed identity.
 # Daily rolling tags need a shorter hold to avoid perpetually chasing rebuilds.
 readonly APPROVAL_JQ='def approval($old;$identity;$allow;$kind;$epoch):
@@ -1753,7 +1777,7 @@ finish() {
        '{mode:$mode,lastAutomaticRunAt:$automatic,schema:1,name:"system_update_coordinator",status:$status,summary:$summary,scriptVersion:$version,runId:$run,epoch:$epoch,durationSeconds:($epoch-$started)}' >"$temp" && publish "$temp" "$STATUS_DIR/system_update_coordinator.json" || true
       if [[ "${QUIET_FINISH:-false}" == true ]];then
         usr_ops_append_log "$LOG_FILE" "$(usr_ops_log_line INFO policy 'Saved update policy/status inspected; no installer started')" || true
-      else log INFO "Completed run; status=$RESULT; ${SUMMARY:-pending work retained for its next eligible window}" || true;fi
+      else log INFO "Completed run; version=$SCRIPT_VERSION; status=$RESULT; ${SUMMARY:-pending work retained for its next eligible window}" || true;fi
       rm -rf -- "$TMP_DIR"
     fi
     exit "$rc"
