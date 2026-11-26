@@ -1,8 +1,8 @@
-# Completed torrent transfer policy (v3.1)
+# Completed torrent transfer policy (v3.7)
 
 `media_torrent_management.sh` is installed as Unraid User Script
 `media_torrent_management`. It retains its existing two-hour schedule,
-console-only output, filename cleanup, unwanted-file rules, duplicate handling,
+console-only output, filename cleanup, unwanted-file rules, incoming-file replacement,
 Mover/maintenance guards, and recovery checkpoint. No Docker configuration or
 qBittorrent seeding/removal setting is changed.
 
@@ -30,10 +30,15 @@ Live qBittorrent already has its temporary path enabled at
 `/data/torrent/complete`. This native separation is the appropriate handoff for
 the immediate policy and was not changed.
 
-Names are normalized and unwanted files cleaned only inside an eligible payload.
-Standalone files receive the same cleanup/normalization policy. Identical files
-are deduplicated by size and hash; different destination collisions survive as
-`.dupN`. Interrupted transfers still stop at their existing checkpoint for review;
+Unwanted files are removed first and names are normalized second, only inside an
+eligible payload and before transfer. Standalone files use the normalized name
+as their rsync destination. Incoming same-name regular files replace existing
+files with `--ignore-times`, including equal-size/equal-mtime content; there is
+no media hashing, duplicate suffix generation or original-file copy. Rsync uses
+its normal temporary-file replacement, not `--inplace`. Source rename collisions
+follow the same incoming-file-wins policy; source directories merge using moves.
+Links and directory/file type conflicts defer processing rather than being
+followed or deleted. Interrupted transfers still stop at their checkpoint for review;
 no ambiguous automatic mutation replay was added. VueTorrent retains its existing
 weekly refresh logic; validation does not invoke it.
 
@@ -81,6 +86,12 @@ and https://docs.pi-hole.net/main/pihole-command/.
 
 Hubble's secure Plex libraries currently select `com.plexapp.agents.jav18`. The installed agent searches using Plex's release name, so completed payloads now normalize a clear leading catalogue ID into `PREFIX-NUMBER`, retaining numeric studio prefixes and leading zeroes. Examples: `pppd528.mp4` becomes `PPPD-528.mp4`; `259luxu_1922.mp4` becomes `259LUXU-1922.mp4`; an advertising domain followed by `@` is discarded when the remaining name identifies a release. Existing literal cleanup remains the fallback. Files retain their video extension. Explicit part/CD numbers become Plex's ` - cdN` suffix. Scene excerpts, multiple conflicting codes, attached variant letters, unsupported ID families and title-only names are not guessed. Non-video assets receive only the existing literal cleanup, not release-ID extraction.
 
-Only the configured completed-download categories are processed on scheduled runs; source completion/API guards, rsync movement, unwanted-file removal, deduplication, ownership, Mover coordination and console-only output remain. No metadata website, additional dependency, rename journal, original-file copy or additional schedule is introduced. Existing transfer checkpoints remain. Different file collisions retain their video extension (`NAME.dup1.mp4`); those preserved collision names are not repeatedly canonicalized. Legacy `NAME.mp4.dup1` names are repaired to `NAME.dup1.mp4`. The script does not perform recurring library-wide renames.
+Only the configured completed-download categories are processed on scheduled runs; source completion/API guards, rsync movement, unwanted-file removal, ownership, Mover coordination and console-only output remain. No metadata website, additional dependency, rename journal, original-file copy or additional schedule is introduced. Existing transfer checkpoints remain. Incoming same-name files replace their targets; no new `.dupN` names are generated. Legacy duplicate suffixes on incoming payloads are stripped to restore the original filename; existing destination libraries are not rescanned to delete older duplicates. The script does not perform recurring library-wide renames.
 
-VueTorrent retains its weekly cadence and configured GitHub branch. A bounded `git ls-remote` compares the upstream revision with the installed checkout before downloading. Matching revisions with an existing `index.html` skip replacement. GitHub failure retains the installed WebUI; changed revisions retain the existing staged clone/activation/recovery workflow. Docker images, settings, Plex agent code and library configuration are not modified.
+VueTorrent retains its weekly cadence and configured GitHub branch. A bounded `git ls-remote` compares the upstream revision with the installed checkout before downloading. Matching revisions with valid HTML and referenced local JavaScript/CSS skip replacement. Both `index.html` and `public/index.html` layouts are supported. GitHub failure retains the installed WebUI; changed revisions retain the existing staged clone/activation/recovery workflow. Docker images, settings, Plex agent code and library configuration are not modified.
+
+# Mover checks and console summary
+
+Mover is checked at startup, before each eligible payload and immediately before each rsync invocation. A new Mover run defers remaining work; a payload already cleaned/renamed but not transferred records `category_deferred` and is eligible again at the next scheduled run. This state never overrides an uncertain or interrupted rsync checkpoint. An already-running rsync is not killed, and these checks do not lock Mover out or guarantee that `/mnt/user` files are still on NVMe.
+
+The final console summary lists completed-payload file/byte totals, file/directory renames, unwanted-file removals, source/destination same-name replacements, observed retained payloads and VueTorrent outcome. Partial failed transfers are excluded from completed totals. Startup/completion messages use the actual script version. No email, new report files, additional cron, Docker configuration change or library-wide rename is introduced. The active qBittorrent `/app/qBittorrent/webui/VueTorrent` path was verified to resolve to the same `/config/webui/VueTorrent` checkout; its existing setting remains correct.

@@ -30,12 +30,61 @@ mkdir -p "$COMPLETE_DIR/phase2/new-folder"
 printf 'fresh' >"$COMPLETE_DIR/phase2/new-folder/video.mkv"
 process_private_categories
 [[ -f "$PRIVATE_DEST_ROOT/phase2/new-folder/video.mkv" ]]
-# Flat files normalize directly at destination; different collisions survive.
+# Flat files replace same-name destinations, even with equal size/mtime.
 mkdir -p "$COMPLETE_DIR/flat" "$DEST_DIR/flat"
 printf 'old' >"$DEST_DIR/flat/video.mkv"
 printf 'new' >"$COMPLETE_DIR/flat/hhd800.com@video.mkv"
+touch -r "$DEST_DIR/flat/video.mkv" "$COMPLETE_DIR/flat/hhd800.com@video.mkv"
 process_category flat "$DEST_DIR/flat"
-[[ $(cat "$DEST_DIR/flat/video.mkv") == old && $(cat "$DEST_DIR/flat/video.dup1.mkv") == new ]]
+[[ $(cat "$DEST_DIR/flat/video.mkv") == new && ! -e "$DEST_DIR/flat/video.dup1.mkv" ]]
+# Folder payloads also replace equal-size/equal-time targets without .dup names.
+mkdir -p "$COMPLETE_DIR/folder/item" "$DEST_DIR/folder/item"
+printf old >"$DEST_DIR/folder/item/movie.mp4";printf new >"$COMPLETE_DIR/folder/item/movie.mp4"
+touch -r "$DEST_DIR/folder/item/movie.mp4" "$COMPLETE_DIR/folder/item/movie.mp4"
+process_category folder "$DEST_DIR/folder"
+[[ $(cat "$DEST_DIR/folder/item/movie.mp4") == new ]]
+[[ -z $(find "$DEST_DIR" -name '*.dup*' -print -quit) ]]
+# Unwanted exact names must be removed before they can normalize over real media.
+saved_unwanted=("${UNWANTED_NAMES[@]}");UNWANTED_NAMES=(ABC-123-extra.mp4)
+mkdir -p "$COMPLETE_DIR/prune/item"
+printf good >"$COMPLETE_DIR/prune/item/ABC-123.mp4"
+printf bad >"$COMPLETE_DIR/prune/item/ABC-123-extra.mp4"
+process_category prune "$DEST_DIR/prune"
+[[ $(cat "$DEST_DIR/prune/item/ABC-123.mp4") == good ]]
+UNWANTED_NAMES=("${saved_unwanted[@]}")
+# Mover appearing after source preparation defers rsync and leaves a resumable
+# category_deferred checkpoint. No partial destination video is published.
+mover_checks=0
+mover_clear(){ mover_checks=$((mover_checks+1));((mover_checks<2)) || return 75; }
+mkdir -p "$COMPLETE_DIR/mover/item";printf held >"$COMPLETE_DIR/mover/item/movie.mp4"
+rc=0;process_category mover "$DEST_DIR/mover" || rc=$?
+[[ "$rc" == 75 && -f "$COMPLETE_DIR/mover/item/movie.mp4" && ! -f "$DEST_DIR/mover/item/movie.mp4" ]]
+jq -e '.phase=="category_deferred"' "$TRANSFER_STATE_DIR/state.json" >/dev/null
+mover_clear(){ return 0; }
+process_category mover "$DEST_DIR/mover"
+[[ $(cat "$DEST_DIR/mover/item/movie.mp4") == held ]]
+# Private categories preserve the same Mover deferral code.
+PRIVATE_CATEGORIES=(private-mover);mkdir -p "$COMPLETE_DIR/private-mover/item"
+printf held >"$COMPLETE_DIR/private-mover/item/movie.mp4"
+mover_clear(){ return 75; }
+rc=0;process_private_categories || rc=$?
+[[ "$rc" == 75 && -f "$COMPLETE_DIR/private-mover/item/movie.mp4" ]]
+mover_clear(){ return 0; }
+# A failed transfer retains the source and old destination without counting a
+# successful replacement.
+rsync(){ return 23; }
+mkdir -p "$COMPLETE_DIR/failed/item" "$DEST_DIR/failed/item"
+printf old >"$DEST_DIR/failed/item/movie.mp4";printf incoming >"$COMPLETE_DIR/failed/item/movie.mp4"
+prior_transferred=$RUN_TRANSFERRED_FILES
+if process_category failed "$DEST_DIR/failed";then exit 1;fi
+[[ $(cat "$DEST_DIR/failed/item/movie.mp4") == old && -f "$COMPLETE_DIR/failed/item/movie.mp4" && "$RUN_TRANSFERRED_FILES" == "$prior_transferred" ]]
+unset -f rsync
+# A symlink destination is never followed or overwritten.
+mkdir -p "$COMPLETE_DIR/linkdest/item" "$DEST_DIR/linkdest/item"
+printf untouched >"$tmp/protected";ln -s "$tmp/protected" "$DEST_DIR/linkdest/item/movie.mp4"
+printf incoming >"$COMPLETE_DIR/linkdest/item/movie.mp4"
+if process_category linkdest "$DEST_DIR/linkdest";then exit 1;fi
+[[ $(cat "$tmp/protected") == untouched && -f "$COMPLETE_DIR/linkdest/item/movie.mp4" ]]
 # API outages/malformed JSON are not treated as empty torrent lists.
 printf 'held' >"$COMPLETE_DIR/flat/held.mkv"
 api_fail=true; process_category flat "$DEST_DIR/flat"
@@ -56,4 +105,4 @@ done
 # Matching complete stopped torrent remains eligible under the existing policy.
 jq -n '[{hash:"hash",content_path:"/data/torrent/complete/flat/held.mkv",state:"stoppedUP",progress:1,amount_left:0}]' >"$jobs"
 payload_completion_proven "$COMPLETE_DIR/flat/held.mkv"
-printf 'Immediate phase-1/phase-2, active overlap, normalization, collision, API failure and partial-file tests passed\n'
+printf 'Immediate phase-1/phase-2, active overlap, normalization, overwrite, prune-first, Mover deferral/resume, symlink, API failure and partial-file tests passed\n'

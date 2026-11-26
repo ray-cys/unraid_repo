@@ -2,7 +2,7 @@
 clearLog=true
 
 ###############################################################################
-# Data Management v3.6.1
+# Data Management v3.7.0
 #
 # PURPOSE
 # -------
@@ -25,12 +25,14 @@ clearLog=true
 # Processing:
 #
 #   1. Validate completed-download category layout.
-#   2. Normalize clear JAV release codes for Jav18; clean remaining known clutter.
-#   3. Remove unwanted files.
+#   2. Remove unwanted files at the completed-download source.
+#   3. Normalize clear JAV release codes for Jav18 before rsync.
 #   4. Move ポルノ content to its destination.
 #   5. Move private performer categories to their individual destinations.
 #   6. Refresh VueTorrent on its separate weekly cadence.
 #
+# v3.7 uses incoming-file replacement, source cleanup before renaming, per-payload
+# Mover checks, validated WebUI staging and a console-only run summary.
 # v3.6 recognizes leading release codes, numeric studio prefixes and multipart
 # names locally. No metadata scraping, original-name archive or extra schedule.
 # Uncertain codes, mixed IDs and excerpts retain their names; non-video assets
@@ -44,13 +46,13 @@ clearLog=true
 # - The incomplete directory is never scanned or modified.
 # - Only explicitly configured qBittorrent categories are processed.
 # - Unknown non-empty categories stop the script before anything is moved.
-# - Existing destination files are never silently overwritten.
+# - Incoming same-name files replace destination files through rsync.
 # - A healthy API is required. Empty torrent lists permit immediate orphan transfer.
 # - Active/incomplete/seeding payload units are retained without blocking siblings.
 # - Completed-folder location is trusted for unregistered payloads in both phases.
 # - No age/stability wait applies; this cannot prove an orphan file is complete.
-# - Identical duplicates are removed from the source.
-# - Different files with the same destination name are preserved as .dupN.
+# - No duplicate suffixes, original-file copies or media hashing are used.
+# - Same-name replacements use rsync temporary files, not in-place writes.
 # - VueTorrent is updated only after successful data processing.
 #
 #
@@ -266,7 +268,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
-readonly SCRIPT_VERSION="3.6.1"
+readonly SCRIPT_VERSION="3.7.0"
 
 umask 0002
 
@@ -448,6 +450,16 @@ LOG_MIN_LEVEL="info"
 START_TS=$(date +%s)
 
 RENAME_SED_ARGS=()
+RUN_TRANSFERRED_FILES=0
+RUN_TRANSFERRED_BYTES=0
+RUN_RENAMED_FILES=0
+RUN_RENAMED_DIRS=0
+RUN_REMOVED_FILES=0
+RUN_REMOVED_BYTES=0
+RUN_SOURCE_REPLACEMENTS=0
+RUN_DEST_REPLACEMENTS=0
+RUN_RETAINED_PAYLOADS=0
+RUN_WEBUI_RESULT="not checked"
 
 
 ###############################################################################
@@ -556,6 +568,7 @@ finish() {
         log error "$message (Runtime: $runtime)"
     fi
 
+    log info "SUMMARY: transferred=$RUN_TRANSFERRED_FILES file(s)/$(human_readable "$RUN_TRANSFERRED_BYTES"); renamed=$RUN_RENAMED_FILES file(s)/$RUN_RENAMED_DIRS directory(s); removed=$RUN_REMOVED_FILES unwanted file(s)/$(human_readable "$RUN_REMOVED_BYTES"); same-name replacements: source=$RUN_SOURCE_REPLACEMENTS destination=$RUN_DEST_REPLACEMENTS; observed retained payloads=$RUN_RETAINED_PAYLOADS; VueTorrent=$RUN_WEBUI_RESULT. Transfer totals cover completed payloads; partial failed transfers are not counted."
     exit "$code"
 }
 
@@ -688,53 +701,6 @@ human_readable() {
         --suffix=B \
         --format='%.1f' \
         "$bytes"
-}
-
-
-tree_bytes() {
-    local dir="$1"
-
-    local total=0
-    local file
-    local size
-
-    [[ -d "$dir" ]] || {
-        echo 0
-        return 0
-    }
-
-    while IFS= read -r -d '' file; do
-        size=$(filesize "$file")
-        total=$((total + size))
-    done < <(
-        find "$dir" -type f -print0 2>/dev/null
-    )
-
-    echo "$total"
-}
-
-
-is_same_file() {
-    local file_a="$1"
-    local file_b="$2"
-
-    local size_a
-    local size_b
-    local hash_a
-    local hash_b
-
-    [[ -f "$file_a" ]] || return 1
-    [[ -f "$file_b" ]] || return 1
-
-    size_a=$(filesize "$file_a")
-    size_b=$(filesize "$file_b")
-
-    [[ "$size_a" == "$size_b" ]] || return 1
-
-    hash_a=$(sha256sum -- "$file_a" | awk '{print $1}')
-    hash_b=$(sha256sum -- "$file_b" | awk '{print $1}')
-
-    [[ "$hash_a" == "$hash_b" ]]
 }
 
 
@@ -945,194 +911,71 @@ jav_release_name() {
 clean_name() {
     local value="$1" mode="${2:-directory}" cleaned
     cleaned=$(printf '%s' "$value" | sed -E "${RENAME_SED_ARGS[@]}") || return 1
-    # Repair the previous collision layout without discarding the variant.
-    if [[ "$mode" == file && "$cleaned" =~ ^(.+)\.(mp4|mkv|avi|wmv|m4v|mov|ts)\.dup([1-9][0-9]*)$ ]];then
-        printf '%s.dup%s.%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[2]}"
-        return 0
+    # Old duplicate suffixes on incoming payloads return to the original name;
+    # rsync then applies the same incoming-file replacement policy.
+    if [[ "$mode" == file && "$cleaned" =~ ^(.+)\.(mp4|mkv|avi|wmv|m4v|mov|ts)\.dup[1-9][0-9]*$ ]];then
+        cleaned="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+    elif [[ "$mode" == file && "$cleaned" =~ ^(.+)\.dup[1-9][0-9]*\.(mp4|mkv|avi|wmv|m4v|mov|ts)$ ]];then
+        cleaned="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
     fi
     jav_release_name "$cleaned" "$mode" || printf '%s' "$cleaned"
 }
 
 
-resolve_collision() {
-    local base="$1"
-
-    local candidate="$base" stem="$base" extension=""
-    local i=1
-    # Preserve the video extension so a different colliding file stays visible
-    # to Plex rather than becoming an unrecognized .mp4.dup1 file.
-    if [[ -f "$base" ]];then
-        case "${base##*.}" in mp4|mkv|avi|wmv|m4v|mov|ts|MP4|MKV|AVI|WMV|M4V|MOV|TS) stem="${base%.*}";extension=".${base##*.}";;esac
-    fi
-    while [[ -e "$candidate" || -L "$candidate" ]]; do
-        candidate="${stem}.dup${i}${extension}"
-        ((i++))
-    done
-
-    printf '%s' "$candidate"
+# Merge colliding source directories using moves, without copying their media.
+# Incoming regular files win; directory/file conflicts and links are retained.
+merge_rename_directory() {
+    local src="$1" dest="$2" entry target
+    [[ -d "$src" && -d "$dest" && ! -L "$src" && ! -L "$dest" ]] || return 1
+    while IFS= read -r -d '' entry;do
+        target="$dest/${entry##*/}"
+        [[ ! -L "$entry" && ! -L "$target" ]] || return 1
+        if [[ -d "$entry" && -d "$target" ]];then
+            merge_rename_directory "$entry" "$target" || return 1
+        elif [[ -d "$entry" ]];then
+            [[ ! -e "$target" ]] || return 1
+            mv -T -- "$entry" "$target" || return 1
+        elif [[ -f "$entry" ]];then
+            [[ ! -e "$target" || -f "$target" ]] || return 1
+            [[ ! -f "$target" ]] || RUN_SOURCE_REPLACEMENTS=$((RUN_SOURCE_REPLACEMENTS+1))
+            mv -fT -- "$entry" "$target" || return 1
+        else return 1
+        fi
+    done < <(find "$src" -mindepth 1 -maxdepth 1 -print0)
+    rmdir -- "$src"
 }
 
-
 normalize_names() {
-    local root="$1"
-
-    local entry
-    local parent
-    local old_name
-    local new_name
-    local new_path
-
-    local had_error=0
-    local renamed_dirs=0
-    local renamed_files=0
-    local removed_duplicates=0
-
+    local root="$1" entry old_name new_name new_path renamed_files=0 renamed_dirs=0
     [[ -d "$root" ]] || return 0
-
-    log info "REN: normalizing names under '$root'"
-
-    ###########################################################################
-    # Pass 1 - directories
-    #
-    # Directories are processed depth-first so children are renamed before
-    # their parents.
-    ###########################################################################
-
-    while IFS= read -r -d '' entry; do
-
+    log info "REN: normalizing names at source '$root'"
+    while IFS= read -r -d '' entry;do
+        [[ -f "$entry" && ! -L "$entry" ]] || return 1
+        old_name="${entry##*/}";new_name=$(clean_name "$old_name" file) || return 1
+        [[ "$new_name" != "$old_name" ]] || continue
+        [[ -n "$new_name" && "$new_name" != . && "$new_name" != .. && "$new_name" != */* ]] || return 1
+        new_path="${entry%/*}/$new_name"
+        [[ ! -L "$new_path" && ( ! -e "$new_path" || -f "$new_path" ) ]] || return 1
+        [[ ! -f "$new_path" ]] || RUN_SOURCE_REPLACEMENTS=$((RUN_SOURCE_REPLACEMENTS+1))
+        mv -fT -- "$entry" "$new_path" || return 1
+        renamed_files=$((renamed_files+1));RUN_RENAMED_FILES=$((RUN_RENAMED_FILES+1))
+        log info "REN: file '$old_name' -> '$new_name'"
+    done < <(find "$root" -type f -print0)
+    # Children first; merging a parent never invalidates an unprocessed child.
+    while IFS= read -r -d '' entry;do
         [[ -d "$entry" ]] || continue
-
-        parent=$(dirname -- "$entry")
-        old_name=$(basename -- "$entry")
-        new_name=$(clean_name "$old_name" directory)
-
+        [[ ! -L "$entry" ]] || return 1
+        old_name="${entry##*/}";new_name=$(clean_name "$old_name" directory) || return 1
         [[ "$new_name" != "$old_name" ]] || continue
-
-        if [[ -z "$new_name" ]]; then
-
-            log warn \
-                "REN: cleanup would create an empty directory name; skipping '$entry'"
-
-            had_error=1
-            continue
+        [[ -n "$new_name" && "$new_name" != . && "$new_name" != .. && "$new_name" != */* ]] || return 1
+        new_path="${entry%/*}/$new_name";[[ ! -L "$new_path" ]] || return 1
+        if [[ -d "$new_path" ]];then merge_rename_directory "$entry" "$new_path" || return 1
+        else [[ ! -e "$new_path" ]] && mv -T -- "$entry" "$new_path" || return 1
         fi
-
-        new_path="$parent/$new_name"
-
-        if [[ -e "$new_path" ]]; then
-            new_path=$(resolve_collision "$new_path")
-        fi
-
-        if mv -n -- "$entry" "$new_path"; then
-
-            log info \
-                "REN: directory '$old_name' -> '$(basename -- "$new_path")'"
-
-            ((renamed_dirs++))
-
-        else
-
-            log error \
-                "REN: failed directory rename '$entry' -> '$new_path'"
-
-            had_error=1
-        fi
-
-    done < <(
-        find "$root" \
-            -depth \
-            -mindepth 1 \
-            -type d \
-            -print0 2>/dev/null
-    )
-
-
-    ###########################################################################
-    # Pass 2 - files
-    #
-    # This is a single filesystem scan regardless of the number of configured
-    # rename patterns.
-    ###########################################################################
-
-    while IFS= read -r -d '' entry; do
-
-        [[ -f "$entry" ]] || continue
-
-        parent=$(dirname -- "$entry")
-        old_name=$(basename -- "$entry")
-        new_name=$(clean_name "$old_name" file)
-
-        [[ "$new_name" != "$old_name" ]] || continue
-
-        if [[ -z "$new_name" ]]; then
-
-            log warn \
-                "REN: cleanup would create an empty filename; skipping '$entry'"
-
-            had_error=1
-            continue
-        fi
-
-        new_path="$parent/$new_name"
-
-
-        #######################################################################
-        # Renamed destination already exists
-        #######################################################################
-
-        if [[ -e "$new_path" ]]; then
-
-            if [[ -f "$new_path" ]] &&
-               is_same_file "$entry" "$new_path"
-            then
-
-                log info \
-                    "REN: identical renamed file already exists; removing duplicate '$entry'"
-
-                if rm -f -- "$entry"; then
-                    ((removed_duplicates++))
-                else
-                    log error \
-                        "REN: failed removing duplicate '$entry'"
-                    had_error=1
-                fi
-
-                continue
-            fi
-
-            new_path=$(resolve_collision "$new_path")
-        fi
-
-
-        #######################################################################
-        # Rename
-        #######################################################################
-
-        if mv -n -- "$entry" "$new_path"; then
-
-            log info \
-                "REN: file '$old_name' -> '$(basename -- "$new_path")'"
-
-            ((renamed_files++))
-
-        else
-
-            log error \
-                "REN: failed file rename '$entry' -> '$new_path'"
-
-            had_error=1
-        fi
-
-    done < <(
-        find "$root" \
-            -type f \
-            -print0 2>/dev/null
-    )
-
-    log info \
-        "REN: completed dirs=$renamed_dirs files=$renamed_files duplicates_removed=$removed_duplicates"
-
-    (( had_error == 0 ))
+        renamed_dirs=$((renamed_dirs+1));RUN_RENAMED_DIRS=$((RUN_RENAMED_DIRS+1))
+        log info "REN: directory '$old_name' -> '$new_name'"
+    done < <(find "$root" -depth -mindepth 1 -type d -print0)
+    log info "REN: completed dirs=$renamed_dirs files=$renamed_files; incoming files replace same-name source targets"
 }
 
 
@@ -1207,8 +1050,10 @@ remove_unwanted_content() {
 
         if rm -f -- "$file"; then
 
-            ((removed_count++))
+            removed_count=$((removed_count+1))
             removed_bytes=$((removed_bytes + size))
+            RUN_REMOVED_FILES=$((RUN_REMOVED_FILES+1))
+            RUN_REMOVED_BYTES=$((RUN_REMOVED_BYTES+size))
 
         else
 
@@ -1237,259 +1082,71 @@ remove_unwanted_content() {
 # MOVE / COLLISION HANDLING
 ###############################################################################
 
-prepare_move_collisions() {
-    local src="$1"
-    local dest="$2"
-
-    local src_file
-    local relative_path
-    local dest_file
-
-    local collision_src
-    local collision_dest
-
-    local i
-
-    while IFS= read -r -d '' src_file; do
-
-        relative_path="${src_file#"$src"/}"
-        dest_file="$dest/$relative_path"
-
-
-        #######################################################################
-        # Destination does not exist
-        #######################################################################
-
-        [[ -e "$dest_file" ]] || continue
-
-
-        #######################################################################
-        # Existing destination is identical
-        #######################################################################
-
-        if [[ -f "$dest_file" ]] &&
-           is_same_file "$src_file" "$dest_file"
-        then
-
-            log info \
-                "MV: identical destination exists; removing source duplicate '$src_file'"
-
-            if ! rm -f -- "$src_file"; then
-                log error \
-                    "MV: failed removing duplicate source '$src_file'"
-                return 1
-            fi
-
-            continue
-        fi
-
-
-        #######################################################################
-        # Destination exists but differs.
-        #
-        # Never overwrite it.
-        #
-        # Rename the source to:
-        #
-        #   filename.ext.dup1
-        #   filename.ext.dup2
-        #   ...
-        #######################################################################
-
-        i=1
-
-        while :; do
-
-            collision_src="${src_file}.dup${i}"
-            collision_dest="${dest_file}.dup${i}"
-
-            if [[ ! -e "$collision_src" &&
-                  ! -e "$collision_dest" ]]
-            then
-                break
-            fi
-
-            ((i++))
+# No media hashes or duplicate names: rsync replaces same-name regular files.
+# This pass validates destination types and collects one set of transfer totals.
+prepare_transfer_targets() {
+    local src="$1" dest="$2" file relative target parent
+    TRANSFER_FILES=0;TRANSFER_BYTES=0;TRANSFER_REPLACEMENTS=0
+    [[ ! -L "$dest" && ( ! -e "$dest" || -d "$dest" ) ]] || return 1
+    while IFS= read -r -d '' file;do
+        relative="${file#"$src"/}";target="$dest/$relative";parent="${target%/*}"
+        while [[ "$parent" != "$dest" ]];do
+            [[ ! -L "$parent" && ( ! -e "$parent" || -d "$parent" ) ]] || return 1
+            parent="${parent%/*}"
         done
-
-        log warn \
-            "MV: destination collision '$dest_file'; preserving incoming file as '$(basename -- "$collision_dest")'"
-
-        if ! mv -n -- "$src_file" "$collision_src"; then
-
-            log error \
-                "MV: failed preparing collision file '$src_file'"
-
-            return 1
-        fi
-
-    done < <(
-        find "$src" \
-            -type f \
-            -print0 2>/dev/null
-    )
-
-    return 0
+        [[ ! -L "$target" && ( ! -e "$target" || -f "$target" ) ]] || {
+            log error "MV: destination is a symlink or non-file; retained source '$file'";return 1;
+        }
+        [[ ! -f "$target" ]] || TRANSFER_REPLACEMENTS=$((TRANSFER_REPLACEMENTS+1))
+        TRANSFER_FILES=$((TRANSFER_FILES+1));TRANSFER_BYTES=$((TRANSFER_BYTES+$(filesize "$file")))
+    done < <(find "$src" -type f -print0)
 }
 
+mover_clear() {
+    if pgrep -f '(^|/)(mover|mover\.old)([[:space:]]|$)' >/dev/null;then
+        log info 'Mover active; remaining payloads retained for the next scheduled run'
+        return 75
+    fi
+}
 
 safe_move() {
-    local src="$1"
-    local dest="$2"
-
-    local transfer_bytes
-
-    if [[ ! -d "$src" ]]; then
-        log debug "MV: source category missing '$src'"
-        return 0
-    fi
-
-    if ! has_files "$src"; then
-
-        log info \
-            "MV: source category empty '$src'"
-
-        remove_empty_dirs "$src"
-
-        return 0
-    fi
-
-
-    ###########################################################################
-    # Handle destination collisions before rsync
-    ###########################################################################
-
-    prepare_move_collisions "$src" "$dest" || return 1
-
-
-    ###########################################################################
-    # Duplicate cleanup may have removed all files
-    ###########################################################################
-
-    if ! has_files "$src"; then
-
-        log info \
-            "MV: no files remain after duplicate cleanup '$src'"
-
-        remove_empty_dirs "$src"
-
-        return 0
-    fi
-
-
-    ###########################################################################
-    # Calculate transfer size after duplicate cleanup / collision handling
-    ###########################################################################
-
-    transfer_bytes=$(tree_bytes "$src")
-
-
-    ###########################################################################
-    # Ensure category destination exists
-    #
-    # Only the destination used by this run is touched. There is no recursive
-    # permission sweep across the existing Plex library.
-    ###########################################################################
-
-    if ! mkdir -p -- "$dest"; then
-
-        log error \
-            "MV: unable to create destination '$dest'"
-
-        return 1
-    fi
-
-    if ! chown "$OWN_USER:$OWN_GROUP" "$dest"; then
-
-        log error \
-            "MV: unable to set ownership on '$dest'"
-
-        return 1
-    fi
-
-    if ! chmod "$DIR_MODE" "$dest"; then
-
-        log error \
-            "MV: unable to set permissions on '$dest'"
-
-        return 1
-    fi
-
-
-    ###########################################################################
-    # Transfer complete tree
-    #
-    # rsync itself applies ownership and permissions to transferred content.
-    #
-    # No --progress:
-    #   avoids noisy scheduled-script logs.
-    #
-    # No --checksum:
-    #   duplicate comparison was already performed above.
-    #
-    # No --inplace / --partial:
-    #   avoids leaving a destination file looking valid after an interrupted
-    #   partial transfer.
-    ###########################################################################
-
-    log info \
-        "MV: transferring '$src' -> '$dest' size=$(human_readable "$transfer_bytes")"
-
-    if ! rsync \
-        -a \
-        --remove-source-files \
-        --chown="${OWN_USER}:${OWN_GROUP}" \
-        --chmod="D${DIR_MODE},F${FILE_MODE}" \
-        -- \
-        "$src/" \
-        "$dest/"
-    then
-
-        log error \
-            "MV: rsync failed '$src' -> '$dest'"
-
-        return 1
-    fi
-
-
-    ###########################################################################
-    # rsync --remove-source-files removes files, not directories
-    ###########################################################################
-
+    local src="$1" dest="$2"
+    [[ -d "$src" ]] || return 0
+    prepare_transfer_targets "$src" "$dest" || return 1
+    if ((TRANSFER_FILES==0));then remove_empty_dirs "$src";return 0;fi
+    mkdir -p -- "$dest" && chown "$OWN_USER:$OWN_GROUP" "$dest" && chmod "$DIR_MODE" "$dest" || return 1
+    mover_clear || return $?
+    log info "MV: transferring '$src' -> '$dest'; files=$TRANSFER_FILES bytes=$TRANSFER_BYTES same-name replacements=$TRANSFER_REPLACEMENTS"
+    # --ignore-times ensures incoming content wins even with equal size/mtime.
+    # Default rsync temporary-file replacement retains the old file on failure.
+    rsync -a --ignore-times --remove-source-files --chown="$OWN_USER:$OWN_GROUP" \
+        --chmod="D${DIR_MODE},F${FILE_MODE}" -- "$src/" "$dest/" || return 1
+    RUN_TRANSFERRED_FILES=$((RUN_TRANSFERRED_FILES+TRANSFER_FILES))
+    RUN_TRANSFERRED_BYTES=$((RUN_TRANSFERRED_BYTES+TRANSFER_BYTES))
+    RUN_DEST_REPLACEMENTS=$((RUN_DEST_REPLACEMENTS+TRANSFER_REPLACEMENTS))
     remove_empty_dirs "$src"
-
-    log info \
-        "MV: completed '$src' transferred=$(human_readable "$transfer_bytes")"
-
-    return 0
+    log info "MV: completed '$src'; incoming same-name files replaced their destination"
 }
-
-
-###############################################################################
-# CATEGORY PROCESSING
-###############################################################################
 
 process_payload_file() {
-    local source="$1" destination="$2" name target
+    local source="$1" destination="$2" name target bytes replaced=0
     name=$(clean_name "${source##*/}" file) || return 1
     [[ -n "$name" && "$name" != . && "$name" != .. && "$name" != */* ]] || return 1
-    mkdir -p -- "$destination" || return 1
-    [[ ! -L "$destination" ]] || return 1
-    chown "$OWN_USER:$OWN_GROUP" "$destination" && chmod "$DIR_MODE" "$destination" || return 1
+    [[ ! -L "$destination" && ( ! -e "$destination" || -d "$destination" ) ]] || return 1
+    mkdir -p -- "$destination" && chown "$OWN_USER:$OWN_GROUP" "$destination" && chmod "$DIR_MODE" "$destination" || return 1
     target="$destination/$name"
-    if [[ -e "$target" || -L "$target" ]]; then
-        if [[ ! -L "$target" && -f "$target" ]] && is_same_file "$source" "$target"; then
-            log info "MV: identical destination verified; removing source duplicate '$source'"
-            rm -f -- "$source"
-            return $?
-        fi
-        target=$(resolve_collision "$target") || return 1
-        log warn "MV: destination collision; incoming file preserved as '$target'"
-    fi
-    log info "MV: transferring file '$source' -> '$target'"
-    rsync -a --remove-source-files --chown="$OWN_USER:$OWN_GROUP" \
-        --chmod="D${DIR_MODE},F${FILE_MODE}" -- "$source" "$target"
+    [[ ! -L "$target" && ( ! -e "$target" || -f "$target" ) ]] || return 1
+    [[ ! -f "$target" ]] || replaced=1
+    bytes=$(filesize "$source")
+    mover_clear || return $?
+    log info "MV: transferring '$source' -> '$target'; same-name replacement=$replaced"
+    rsync -a --ignore-times --remove-source-files --chown="$OWN_USER:$OWN_GROUP" \
+        --chmod="D${DIR_MODE},F${FILE_MODE}" -- "$source" "$target" || return 1
+    RUN_TRANSFERRED_FILES=$((RUN_TRANSFERRED_FILES+1));RUN_TRANSFERRED_BYTES=$((RUN_TRANSFERRED_BYTES+bytes))
+    RUN_DEST_REPLACEMENTS=$((RUN_DEST_REPLACEMENTS+replaced))
+    [[ "${source##*/}" == "$name" ]] || RUN_RENAMED_FILES=$((RUN_RENAMED_FILES+1))
 }
+
 
 process_category() {
     local category_started=$(usr_ops_now_ms)
@@ -1507,10 +1164,12 @@ process_category() {
     find "$source" -mindepth 1 -maxdepth 1 -print0 >"$listing" || return 1
     while IFS= read -r -d '' unit; do
         [[ -e "$unit" || -L "$unit" ]] || continue
+        mover_clear || { RUN_RETAINED_PAYLOADS=$((RUN_RETAINED_PAYLOADS+1));return 75; }
         rc=0
         payload_completion_proven "$unit" || rc=$?
         if (( rc!=0 )); then
             ((deferred++)) || true
+            RUN_RETAINED_PAYLOADS=$((RUN_RETAINED_PAYLOADS+1))
             continue
         fi
         if [[ -d "$unit" ]];then name=$(clean_name "${unit##*/}" directory);else name=$(clean_name "${unit##*/}" file);fi || return 1
@@ -1519,18 +1178,23 @@ process_category() {
         [[ ! -L "$target" ]] || { log error "MV: symlink destination retained: $target"; return 1; }
         transfer_checkpoint category_intent "$unit" "$target" || return 1
         category_bytes=$((category_bytes+${QBIT_PROVEN_BYTES:-0}));category_files=$((category_files+${QBIT_PROVEN_FILES:-0}))
-        if [[ -d "$unit" ]]; then
-            normalize_names "$unit" || return 1
-        fi
+        # Exact unwanted names are checked before normalization changes them.
         remove_unwanted_content "$unit" || return 1
-        if [[ -d "$unit" ]]; then
+        if [[ -d "$unit" ]];then normalize_names "$unit" || return 1;fi
+        rc=0
+        if [[ -d "$unit" ]];then
             transfer_checkpoint moving "$unit" "$target" || return 1
-            safe_move "$unit" "$target" || return 1
-            rmdir -- "$unit" 2>/dev/null || true
-        elif [[ -f "$unit" ]]; then
+            safe_move "$unit" "$target" || rc=$?
+            ((rc!=0)) || rmdir -- "$unit" 2>/dev/null || true
+        elif [[ -f "$unit" ]];then
             transfer_checkpoint moving "$unit" "$target" || return 1
-            process_payload_file "$unit" "$destination" || return 1
+            process_payload_file "$unit" "$destination" || rc=$?
         fi
+        if ((rc==75));then
+            transfer_checkpoint category_deferred "$unit" "$target" || return 1
+            RUN_RETAINED_PAYLOADS=$((RUN_RETAINED_PAYLOADS+1));return 75
+        fi
+        ((rc==0)) || return "$rc"
         transfer_checkpoint category_complete "$unit" "$target" || return 1
         ((moved++)) || true
     done <"$listing"
@@ -1548,7 +1212,7 @@ process_private_categories() {
         process_category \
             "$category" \
             "${PRIVATE_DEST_ROOT}/${category}" ||
-            return 1
+            return $?
 
     done
 
@@ -1559,6 +1223,27 @@ process_private_categories() {
 ###############################################################################
 # VUETORRENT UPDATE
 ###############################################################################
+
+# qBittorrent releases may contain public/index.html or a flat index.html.
+# Validate referenced local JS/CSS before replacing the working checkout.
+vuetorrent_valid() {
+    local root="$1" web="$1" refs ref lower js=0
+    local pattern="(src|href)[[:space:]]*=[[:space:]]*[\"'][^\"']+[\"']"
+    [[ -d "$root" && ! -L "$root" ]] || return 1
+    if [[ ! -s "$web/index.html" ]];then web="$root/public";fi
+    [[ -s "$web/index.html" && ! -L "$web/index.html" && ! -L "$web" ]] || return 1
+    grep -Eiq '<(!doctype|html)([[:space:]>])' "$web/index.html" || return 1
+    refs=$(grep -Eio "$pattern" "$web/index.html" | sed -E "s/^[^=]*=[[:space:]]*[\"']//;s/[\"']$//") || return 1
+    while IFS= read -r ref;do
+        lower="${ref,,}";case "$lower" in http:*|https:*|//*|data:*) continue;;esac
+        ref="${ref%%[?#]*}";ref="${ref#/}";ref="${ref#./}";lower="${ref,,}"
+        case "$lower" in *.js|*.css)
+            [[ "$ref" != ../* && "$ref" != */../* && "$ref" != *\\* && -s "$web/$ref" && ! -L "$web/$ref" ]] || return 1
+            [[ "$lower" != *.js ]] || js=$((js+1))
+        esac
+    done <<<"$refs"
+    ((js>0))
+}
 
 update_vuetorrent() {
     local target="${VUETORRENT_DIR}/VueTorrent"
@@ -1600,7 +1285,8 @@ update_vuetorrent() {
     remote_commit="${remote_commit%%[[:space:]]*}"
     [[ "$remote_commit" =~ ^([a-f0-9]{40}|[a-f0-9]{64})$ ]] || return 1
     current_commit=$(git -C "$target" rev-parse --verify HEAD 2>/dev/null) || current_commit=""
-    if [[ "$current_commit" == "$remote_commit" && -f "$target/index.html" ]];then
+    if [[ "$current_commit" == "$remote_commit" ]] && vuetorrent_valid "$target";then
+        RUN_WEBUI_RESULT="current (${current_commit:0:12})"
         log info "VUETORRENT: already current at $current_commit; no download or replacement"
         return 0
     fi
@@ -1626,6 +1312,12 @@ update_vuetorrent() {
         return 1
     fi
 
+
+    if ! vuetorrent_valid "$new_target";then
+        rm -rf -- "$new_target"
+        log error 'VUETORRENT: staged HTML/JavaScript/CSS validation failed; working WebUI retained'
+        return 1
+    fi
 
     ###########################################################################
     # Move existing installation aside only after successful clone
@@ -1653,6 +1345,7 @@ update_vuetorrent() {
 
         rm -rf -- "$old_target"
 
+        RUN_WEBUI_RESULT="updated; HTML and referenced JS/CSS validated"
         log info \
             "VUETORRENT: update completed successfully"
 
@@ -1768,7 +1461,7 @@ payload_completion_proven() {
 
 torrent_storage_ready() {
     mountpoint -q /mnt/user && mountpoint -q /mnt/vault || { log error 'Required user/vault storage unavailable; no changes performed.'; return 1; }
-    if pgrep -f '(^|/)(mover|mover\.old)([[:space:]]|$)' >/dev/null; then log info 'Mover active; transfer and Web UI update deferred.'; return 75; fi
+    mover_clear || return $?
     [[ ! -L "$TRANSFER_STATE_DIR" ]] || return 1
     mkdir -p "$TRANSFER_STATE_DIR" || return 1
     chmod 700 "$TRANSFER_STATE_DIR" || return 1
@@ -1776,7 +1469,7 @@ torrent_storage_ready() {
         jq -e '.schema==1 and (.phase|type)=="string"' "$TRANSFER_STATE_DIR/state.json" >/dev/null || return 1
         local phase
         phase=$(jq -r .phase "$TRANSFER_STATE_DIR/state.json")
-        if [[ "$phase" != complete && "$phase" != webui_failed && "$phase" != category_complete ]]; then
+        if [[ "$phase" != complete && "$phase" != webui_failed && "$phase" != category_complete && "$phase" != category_deferred ]]; then
             log error "Previous transfer checkpoint=$phase is unfinished. Files preserved; inspect exact recorded source/destination before retrying. No automatic ambiguous replay."
             return 1
         fi
@@ -1790,8 +1483,8 @@ refresh_vuetorrent_if_due() {
     [[ ! -f "$TRANSFER_STATE_DIR/webui-updated-at" ]] || read -r last <"$TRANSFER_STATE_DIR/webui-updated-at"
     [[ "$last" =~ ^[0-9]+$ ]] || return 1
     now=$(date +%s)
-    if (( now>=last && now-last<604800 )); then log info 'VueTorrent refresh not due; data processing outcome remains independent.'; return 0; fi
-    update_vuetorrent || return 1
+    if (( now>=last && now-last<604800 )); then RUN_WEBUI_RESULT='not due';log info 'VueTorrent refresh not due; data processing outcome remains independent.'; return 0; fi
+    update_vuetorrent || { RUN_WEBUI_RESULT="check/update failed; current WebUI retained";return 1; }
     printf '%s\n' "$now" >"$TRANSFER_STATE_DIR/.webui-updated-at" && mv "$TRANSFER_STATE_DIR/.webui-updated-at" "$TRANSFER_STATE_DIR/webui-updated-at"
 }
 
@@ -1831,7 +1524,7 @@ acquire_operation_coordination() {
 main() {
     case "${1:-}" in
         --version) printf 'media_torrent_management.sh %s\n' "$SCRIPT_VERSION"; return 0;;
-        --help|-h) printf '%s\n' 'Usage: bash script [--help|--version]' 'Normal run: console-only processing of configured categories, one top-level download/file at a time.' 'Unregistered completed-folder payloads move immediately at the schedule; no age or repeat-scan delay in either phase.' 'Active/incomplete/checking/seeding torrents, symlinks and partial markers are preserved. API failure defers transfers.' 'Unfinished checkpoints require review before retry. VueTorrent refresh is weekly and independent of transfers.'; return 0;;
+        --help|-h) printf '%s\n' 'Usage: bash script [--help|--version]' 'Normal run: console-only processing of configured categories, one top-level download/file at a time.' 'Unregistered completed-folder payloads move immediately at the schedule; no age or repeat-scan delay in either phase.' 'Active/incomplete/checking/seeding torrents, symlinks and partial markers are preserved. API failure defers transfers. Same-name destination files are replaced; no .dup copies are created. Unwanted files are removed before source renaming and rsync.' 'Unfinished checkpoints require review before retry. VueTorrent refresh is weekly and independent of transfers.'; return 0;;
         "") ;;
         *) printf 'Unknown option: %s; use --help.\n' "$1" >&2; return 2;;
     esac
@@ -1864,6 +1557,7 @@ main() {
         chown \
         chmod \
         dirname \
+        rmdir \
         basename ||
         finish 1 "Required command validation failed"
 
@@ -1902,7 +1596,7 @@ main() {
     ###########################################################################
 
     log info "============================================================"
-    log info "Data Management v3.1 started"
+    log info "Data Management v$SCRIPT_VERSION started"
     log info "Completed dir : $COMPLETE_DIR"
     log info "Destination   : $DEST_DIR"
     log info "============================================================"
@@ -1939,11 +1633,10 @@ main() {
 
     log info "PHASE 1: processing '$PORN_CATEGORY'"
 
-    process_category \
-        "$PORN_CATEGORY" \
-        "$PORN_DEST" ||
-        finish 1 \
-            "Processing failed for '$PORN_CATEGORY'; VueTorrent update skipped"
+    local transfer_rc=0
+    process_category "$PORN_CATEGORY" "$PORN_DEST" || transfer_rc=$?
+    ((transfer_rc!=75)) || finish 0 'Mover detected; remaining downloads retained; VueTorrent check deferred'
+    ((transfer_rc==0)) || finish 1 "Processing failed for '$PORN_CATEGORY'; VueTorrent update skipped"
 
 
     ###########################################################################
@@ -1952,9 +1645,9 @@ main() {
 
     log info "PHASE 2: processing private performer categories"
 
-    process_private_categories ||
-        finish 1 \
-            "Private-category processing failed; VueTorrent update skipped"
+    transfer_rc=0;process_private_categories || transfer_rc=$?
+    ((transfer_rc!=75)) || finish 0 'Mover detected; remaining downloads retained; VueTorrent check deferred'
+    ((transfer_rc==0)) || finish 1 'Private-category processing failed; VueTorrent update skipped'
 
 
     ###########################################################################
@@ -1963,7 +1656,8 @@ main() {
     # This point is reached only if all data-processing phases succeeded.
     ###########################################################################
 
-    log info "PHASE 3: updating VueTorrent"
+    log info "PHASE 3: checking VueTorrent"
+    mover_clear || finish 0 'Mover detected; VueTorrent check deferred'
 
     if ! refresh_vuetorrent_if_due; then
         transfer_checkpoint webui_failed || return 1
@@ -1977,7 +1671,7 @@ main() {
     ###########################################################################
 
     finish 0 \
-        "Data Management v3.1 completed successfully"
+        "Data Management v$SCRIPT_VERSION completed successfully"
 }
 
 
