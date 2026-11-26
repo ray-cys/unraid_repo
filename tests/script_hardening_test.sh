@@ -24,10 +24,12 @@ source "$ROOT/tools/operations_contract.sh"
 OPS_SCRIPT_ID=fixture
 if [[ "${USR_OPS_SUPERVISED:-}" != fixture ]];then usr_ops_supervise "$0";exit $?;fi
 trap 'printf reconciled >"$fixture/interrupted";exit 143' TERM
+touch "$fixture/worker-ready"
 for ((i=0;i<100;i++));do sleep 0.05;done
 SIGNAL
 bash "$fixture/worker" & parent=$!
-for ((i=0;i<30;i++));do [[ -s "$USR_OPS_EXECUTION_ROOT/fixture.json" ]] && jq -e '.executionStatus=="RUNNING"' "$USR_OPS_EXECUTION_ROOT/fixture.json" >/dev/null && break;sleep 0.05;done
+for ((i=0;i<30;i++));do [[ -f "$fixture/worker-ready" && -s "$USR_OPS_EXECUTION_ROOT/fixture.json" ]] && jq -e '.executionStatus=="RUNNING"' "$USR_OPS_EXECUTION_ROOT/fixture.json" >/dev/null && break;sleep 0.05;done
+[[ -f "$fixture/worker-ready" ]]
 kill -TERM "$parent"
 if wait "$parent";then exit 1;else [[ $? == 143 ]];fi
 [[ $(cat "$fixture/interrupted") == reconciled ]]
@@ -115,3 +117,47 @@ jq -e '.archives["plex-media-server"].scope=="databases_and_preferences"' "$LOG_
 [[ "${SELECTIVE_CHECKED[*]}" == plex-media-server ]]
 printf 'Legacy unknown-size Plex archive receives bounded critical-file restore, not full Media extraction\n'
 RESTORE
+bash <<'MAINTENANCE_PROBES'
+set -euo pipefail
+source <(awk '/^monitor_maintenance_availability\(\) \{/{on=1} on && /^ARR_BACKUP_GATE=/{exit} on{print}' "$ROOT/user_script/media_health_monitor.sh")
+STATE_DIR="$fixture/probes";DOCKER_MAINTENANCE_DIR="$fixture/leases";mkdir -p "$STATE_DIR" "$DOCKER_MAINTENANCE_DIR" "$fixture/bin"
+SONARR_URL=http://fixture:8989;RADARR_URL=http://fixture:7878;SAB_URL=http://fixture:8080;SAB_API_KEY=fixture_key
+cat >"$fixture/bin/docker" <<'MOCK'
+#!/bin/bash
+printf '2020-01-01T00:00:00Z\n'
+MOCK
+chmod +x "$fixture/bin/docker";PATH="$fixture/bin:$PATH"
+curl(){
+    printf 'probe\n' >>"$fixture/probes-called"
+    if [[ "$*" == *--config* ]];then
+        input=$(cat);[[ "$input" == *mode=version* && "$input" != *mode=queue* ]] || return 1
+        printf '{"version":"fixture"}'
+    elif [[ "${FAIL_SONARR:-0}" == 1 && "$*" == *8989/ping* ]];then return 1
+    else [[ "$*" == */ping* ]] || return 1;printf '{"status":"OK"}';fi
+}
+monitor_maintenance_availability
+jq -e '(.services|length)==3 and all(.services[];.ready and (.expectedMaintenance|not))' "$STATE_DIR/maintenance-availability.json" >/dev/null
+[[ $(wc -l <"$fixture/probes-called") == 3 ]]
+boot=$(cat /proc/sys/kernel/random/boot_id);start=$(sed 's/.*) //' "/proc/$$/stat"|awk '{print $20}')
+jq -n --arg boot "$boot" --arg start "$start" --argjson pid "$$" --argjson expires "$(($(date +%s)+60))" '{boot:$boot,pid:$pid,processStart:$start,expires:$expires}' >"$DOCKER_MAINTENANCE_DIR/sonarr.appdata.json"
+FAIL_SONARR=1
+monitor_maintenance_availability
+jq -e '.services[0].ready==false and .services[0].expectedMaintenance==true and .services[1].ready==true and .services[1].expectedMaintenance==false' "$STATE_DIR/maintenance-availability.json" >/dev/null
+printf 'Maintenance checks use three bounded read-only probes and protect only the exact live application lease\n'
+MAINTENANCE_PROBES
+
+bash <<'EXECUTION_OVERRUN'
+set -euo pipefail
+source "$ROOT/user_script/backup_health_audit.sh"
+STATE_DIR="$fixture/audit";STATUS_DIR="$fixture/audit-status";mkdir -p "$STATE_DIR" "$STATUS_DIR"
+export USR_OPS_EXECUTION_ROOT="$fixture/hung" USR_OPS_DELIVERY_ROOT="$fixture/empty-outbox" USR_OPS_DELIVERY_RAM_ROOT="$fixture/empty-ram-outbox";mkdir "$USR_OPS_EXECUTION_ROOT"
+MEDIA_HEALTH_STATE_DIR="$fixture/no-media"
+AUDIT_CATALOG_FILE="$fixture/catalog.json"
+printf '{"valid":true,"jobs":{"job":{"name":"docker_service_watchdog","role":"docker_service_watchdog","present":true,"enabled":true,"event":false,"cron":"*/5 * * * *"}}}' >"$AUDIT_CATALOG_FILE"
+boot=$(cat /proc/sys/kernel/random/boot_id);start=$(sed 's/.*) //' "/proc/$$/stat"|awk '{print $20}')
+jq -n --arg boot "$boot" --arg start "$start" --argjson pid "$$" --argjson begun "$((NOW-7200))" '{schema:1,executionStatus:"RUNNING",boot:$boot,pid:$pid,processStart:$start,startedAt:$begun}' >"$USR_OPS_EXECUTION_ROOT/docker_service_watchdog.json"
+audit_script_executions
+[[ "${FINDINGS[*]}" == *"beyond its 30-minute allowance"* ]]
+kill -0 "$$"
+printf 'An alive but stalled execution raises attention without termination or replay\n'
+EXECUTION_OVERRUN

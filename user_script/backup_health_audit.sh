@@ -153,7 +153,7 @@ usr_ops_execution_record() (
 )
 
 usr_ops_supervise() {
-    local script="$1" started pid rc=0 receipt_fd record_owner=false
+    local script="$1" started pid='' interrupted='' rc=0 receipt_fd record_owner=false
     # Repository/fixture executions must never publish production evidence.
     # Explicit test roots opt into supervision for isolated regression checks.
     case "$script" in
@@ -165,15 +165,19 @@ usr_ops_supervise() {
         exec {receipt_fd}>"$execution_root/$OPS_SCRIPT_ID.lock"
         flock -n "$receipt_fd" && record_owner=true
     fi
+    # Register forwarding before launch or receipt I/O. Background Bash may
+    # inherit ignored SIGINT, so interactive cancellation uses its TERM cleanup.
+    trap 'interrupted=TERM;[[ -z "$pid" ]] || kill -TERM "$pid" 2>/dev/null || true' TERM HUP
+    trap 'interrupted=INT;[[ -z "$pid" ]] || kill -TERM "$pid" 2>/dev/null || true' INT
     started=$(date +%s)
     USR_OPS_SUPERVISED="$OPS_SCRIPT_ID" OPS_RUN_ID="${OPS_RUN_ID:-${started}_$$}" /bin/bash "$script" &
     pid=$!
+    [[ -z "$interrupted" ]] || kill -TERM "$pid" 2>/dev/null || true
     [[ "$record_owner" != true ]] || usr_ops_execution_record start "$started" "$pid" || printf 'Execution receipt unavailable for %s; workflow continues.\n' "$OPS_SCRIPT_ID" >&2
-    trap 'kill -TERM "$pid" 2>/dev/null || true' TERM HUP
-    trap 'kill -INT "$pid" 2>/dev/null || true' INT
     wait "$pid" || rc=$?
     # A signal can interrupt wait while the producer is still restoring state.
     if kill -0 "$pid" 2>/dev/null;then wait "$pid" || rc=$?;fi
+    if [[ "$interrupted" == INT ]];then rc=130;elif [[ "$interrupted" == TERM ]];then rc=143;fi
     [[ "$record_owner" != true ]] || usr_ops_execution_record finish "$started" "$pid" "$rc" || printf 'Completion receipt unavailable for %s (exit=%s).\n' "$OPS_SCRIPT_ID" "$rc" >&2
     trap - TERM HUP INT
     return "$rc"
@@ -383,7 +387,7 @@ usr_scripts_schedule_evidence() {
 }
 # END EMBEDDED USER SCRIPTS CATALOG
 set -uo pipefail
-readonly SCRIPT_VERSION="1.12.1"
+readonly SCRIPT_VERSION="1.12.2"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/backup_health_audit}"
 APPDATA_ROOT="${APPDATA_ROOT:-/mnt/vault/backup/cache}"
@@ -571,7 +575,7 @@ execution_finding() {
 
 audit_script_executions() {
     [[ -s "${AUDIT_CATALOG_FILE:-}" ]] || return 0
-    local name role record epoch window cutoff now="$NOW" pid boot status first grace native_summary inventory="$STATE_DIR/execution-inventory.json" tmp
+    local name role record epoch window cutoff now="$NOW" pid boot status first grace max_active native_summary inventory="$STATE_DIR/execution-inventory.json" tmp
     [[ -f "$inventory" ]] || printf '{"schema":1,"scripts":{}}' >"$inventory"
     tmp=$(mktemp "$STATE_DIR/.execution-inventory.XXXXXX") || return 1
     jq --slurpfile catalog "$AUDIT_CATALOG_FILE" --argjson now "$NOW" '.scripts as $old | .scripts=([$catalog[0].jobs[]|select(.present and .enabled)|{key:.name,value:($old[.name] // {firstSeen:$now})}]|from_entries)' "$inventory" >"$tmp" && mv "$tmp" "$inventory" || return 1
@@ -599,14 +603,17 @@ audit_script_executions() {
         if [[ "$status" == RUNNING ]];then
             pid=$(jq -r .pid "$record")
             if [[ $(jq -r .boot "$record") != "$boot" ]] || ! kill -0 "$pid" 2>/dev/null || [[ $(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null|awk '{print $20}') != $(jq -r '.processStart // ""' "$record") ]];then execution_finding "$role" "$name: recorded execution ended without a completion receipt; review interruption evidence";fi
-            # Live work may legitimately take longer than its nominal schedule.
+            # Report overruns without terminating active backup/database work.
+            max_active=$((grace*2));((max_active>=1800)) || max_active=1800
+            case "$role" in backup_cache_appdata) max_active=21600;;backup_boot_disk) max_active=14400;;backup_media_remote|backup_vault_remote) max_active=86400;;media_plex_dbrepair) max_active=43200;;esac
+            if ((NOW-$(jq -r .startedAt "$record")>max_active));then execution_finding "$role" "$name: execution remains active beyond its $((max_active/60))-minute allowance; no termination or replay was attempted";fi
             continue
         fi
         ((first>=cutoff || epoch>=cutoff)) || execution_finding "$role" "$name: no completed invocation within its current schedule allowance"
     done < <(jq -r '.jobs[]|select(.present and .enabled)|[.name,.role]|@tsv' "$AUDIT_CATALOG_FILE")
     local pending count
     pending="${USR_OPS_DELIVERY_ROOT:-$STATUS_DIR/notification-outbox}"
-    count=$(find "$pending" "${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}" -maxdepth 1 -type f -name '*.json' 2>/dev/null|wc -l)
+    count=$({ find "$pending" "${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}" -maxdepth 1 -type f -name '*.json' 2>/dev/null || true; }|wc -l)
     ((count==0)) || finding "Notifications: $count producer report(s) remain pending delivery; hourly bounded retries preserve exact details"
     local availability="${MEDIA_HEALTH_STATE_DIR:-/mnt/vault/cloud/logs/script/media_health_monitor}/maintenance-availability.json" row
     if [[ -f "$availability" ]] && jq -e --argjson now "$NOW" '.epoch>$now-600' "$availability" >/dev/null;then

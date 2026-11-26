@@ -51,12 +51,14 @@ export ARR_BACKUP_DEFERRED_AT="$TEST_ROOT/deferred"
 export START_TIME; START_TIME=$(date +%s)
 export -f fail
 log() { printf '%s\n' "$*"; }; export -f log
+monitor_maintenance_availability(){ touch "$TEST_ROOT/read-only-probe-called"; };export -f monitor_maintenance_availability
 flock -x "$ARR_BACKUP_GATE" sh -c 'touch "$TEST_ROOT/held"; sleep 2' &
 holder=$!
 while [[ ! -f "$TEST_ROOT/held" ]]; do sleep .05; done
 bash "$TEST_ROOT/gate.sh"
 [[ ! -f "$TEST_ROOT/api-called" ]] || fail 'API reached during backup'
 [[ -f "$TEST_ROOT/deferred" ]] || fail 'missing deferred heartbeat'
+[[ -f "$TEST_ROOT/read-only-probe-called" ]] || fail 'read-only maintenance evidence not collected'
 wait "$holder"
 printf '%s\n' "$((START_TIME+120))" >"$ARR_BACKUP_GRACE"
 bash "$TEST_ROOT/gate.sh"

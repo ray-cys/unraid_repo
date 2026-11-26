@@ -142,7 +142,7 @@ usr_ops_execution_record() (
 )
 
 usr_ops_supervise() {
-    local script="$1" started pid rc=0 receipt_fd record_owner=false
+    local script="$1" started pid='' interrupted='' rc=0 receipt_fd record_owner=false
     # Repository/fixture executions must never publish production evidence.
     # Explicit test roots opt into supervision for isolated regression checks.
     case "$script" in
@@ -154,15 +154,19 @@ usr_ops_supervise() {
         exec {receipt_fd}>"$execution_root/$OPS_SCRIPT_ID.lock"
         flock -n "$receipt_fd" && record_owner=true
     fi
+    # Register forwarding before launch or receipt I/O. Background Bash may
+    # inherit ignored SIGINT, so interactive cancellation uses its TERM cleanup.
+    trap 'interrupted=TERM;[[ -z "$pid" ]] || kill -TERM "$pid" 2>/dev/null || true' TERM HUP
+    trap 'interrupted=INT;[[ -z "$pid" ]] || kill -TERM "$pid" 2>/dev/null || true' INT
     started=$(date +%s)
     USR_OPS_SUPERVISED="$OPS_SCRIPT_ID" OPS_RUN_ID="${OPS_RUN_ID:-${started}_$$}" /bin/bash "$script" &
     pid=$!
+    [[ -z "$interrupted" ]] || kill -TERM "$pid" 2>/dev/null || true
     [[ "$record_owner" != true ]] || usr_ops_execution_record start "$started" "$pid" || printf 'Execution receipt unavailable for %s; workflow continues.\n' "$OPS_SCRIPT_ID" >&2
-    trap 'kill -TERM "$pid" 2>/dev/null || true' TERM HUP
-    trap 'kill -INT "$pid" 2>/dev/null || true' INT
     wait "$pid" || rc=$?
     # A signal can interrupt wait while the producer is still restoring state.
     if kill -0 "$pid" 2>/dev/null;then wait "$pid" || rc=$?;fi
+    if [[ "$interrupted" == INT ]];then rc=130;elif [[ "$interrupted" == TERM ]];then rc=143;fi
     [[ "$record_owner" != true ]] || usr_ops_execution_record finish "$started" "$pid" "$rc" || printf 'Completion receipt unavailable for %s (exit=%s).\n' "$OPS_SCRIPT_ID" "$rc" >&2
     trap - TERM HUP INT
     return "$rc"
