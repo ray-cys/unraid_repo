@@ -21,9 +21,14 @@ usr_ops_arr_reserve() (
       # when the shared contract is first installed. Known local non-dispatch is excluded.
       printf '{"schema":1,"actions":{}}\n' >"$temp"
       local source prefix seed
-      for source in "$root/automation-actions.json" "$root/policy-actions.json" "${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}";do
+      for source in "$root/automation-actions.json" "$root/policy-actions.json" "$root/pack-actions.json" "${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}";do
         [[ -f "$source" && ! -L "$source" ]] || continue
         prefix="${source##*/}";seed="$temp.seed"
+        if [[ "$prefix" == pack-actions.json ]];then
+          jq --slurpfile old "$source" --argjson since "$((now-86400))" '
+            reduce ($old[0].jobs[]?|select((.queueIntentAt // 0)>=$since)) as $j (.;.actions[("pack-queue:"+$j.downloadId)]={at:$j.queueIntentAt,run:"pre-contract",owner:"pack-actions.json",app:"Sonarr",target:([$j.disposalPlan.targets[].id]|min)})' "$temp" >"$seed" && mv "$seed" "$temp" || return 1
+          continue
+        fi
         jq --slurpfile old "$source" --arg prefix "$prefix" --argjson since "$((now-86400))" '
           reduce (($old[0].actions // {})|to_entries[]|select((.value.startedAt // .value.grabSentAt // 0)>=$since and .value.outcome!="not_dispatched" and
            (if $prefix=="recovery.json" then (.value.grabSentAt // 0)>0 else true end))) as $r

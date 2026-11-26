@@ -488,7 +488,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.24.1"
+readonly SCRIPT_VERSION="1.24.2"
 
 ###############################################################################
 # CONFIGURATION
@@ -1532,7 +1532,7 @@ vault_export_operations_state() {
                 deployments.json|.deployment-enrolled) [[ "$name" == deployment ]] || continue;;
                 incidents.json) [[ "$name" == syslog_watchdog ]] || continue;;
                 policy.json) [[ "$name" == system_update_coordinator ]] || continue;;
-                policy-cleanup.json|source-removals.json|state.json|notification-state.json|import-receipts.json|automation-actions.json|policy-actions.json|sonarr-state.json|radarr-state.json|pending-actions.json|pending-operations.json|action-receipts.jsonl|pending-notifications.jsonl|operation-recovery.jsonl|quarantine-index.tsv|transfer-manifest.tsv) ;;
+                pack-actions.json|pack-cleanup.json|policy-cleanup.json|source-removals.json|state.json|notification-state.json|import-receipts.json|automation-actions.json|policy-actions.json|sonarr-state.json|radarr-state.json|pending-actions.json|pending-operations.json|action-receipts.jsonl|pending-notifications.jsonl|operation-recovery.jsonl|quarantine-index.tsv|transfer-manifest.tsv) ;;
                 *) continue;;
             esac
             fi
