@@ -76,3 +76,11 @@ its `||mullvad.net^` rule. qBittorrent resolves through Tailscale's
 These steps are instructions for the owner; this change does not edit DNS policy.
 Pi-hole references: https://docs.pi-hole.net/guides/misc/allowlist-denylist/
 and https://docs.pi-hole.net/main/pihole-command/.
+
+# Jav18 filename normalization (v3.6)
+
+Hubble's secure Plex libraries currently select `com.plexapp.agents.jav18`. The installed agent searches using Plex's release name, so completed payloads now normalize a clear leading catalogue ID into `PREFIX-NUMBER`, retaining numeric studio prefixes and leading zeroes. Examples: `pppd528.mp4` becomes `PPPD-528.mp4`; `259luxu_1922.mp4` becomes `259LUXU-1922.mp4`; an advertising domain followed by `@` is discarded when the remaining name identifies a release. Existing literal cleanup remains the fallback. Files retain their video extension. Explicit part/CD numbers become Plex's ` - cdN` suffix. Scene excerpts, multiple conflicting codes, attached variant letters, unsupported ID families and title-only names are not guessed. Non-video assets receive only the existing literal cleanup, not release-ID extraction.
+
+Only the configured completed-download categories are processed on scheduled runs; source completion/API guards, rsync movement, unwanted-file removal, deduplication, ownership, Mover coordination and console-only output remain. No metadata website, additional dependency, rename journal, original-file copy or additional schedule is introduced. Existing transfer checkpoints remain. Different file collisions retain their video extension (`NAME.dup1.mp4`); those preserved collision names are not repeatedly canonicalized. Legacy `NAME.mp4.dup1` names are repaired to `NAME.dup1.mp4`. The script does not perform recurring library-wide renames.
+
+VueTorrent retains its weekly cadence and configured GitHub branch. A bounded `git ls-remote` compares the upstream revision with the installed checkout before downloading. Matching revisions with an existing `index.html` skip replacement. GitHub failure retains the installed WebUI; changed revisions retain the existing staged clone/activation/recovery workflow. Docker images, settings, Plex agent code and library configuration are not modified.

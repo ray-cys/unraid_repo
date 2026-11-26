@@ -2,7 +2,7 @@
 clearLog=true
 
 ###############################################################################
-# Data Management v3.4
+# Data Management v3.6
 #
 # PURPOSE
 # -------
@@ -25,12 +25,16 @@ clearLog=true
 # Processing:
 #
 #   1. Validate completed-download category layout.
-#   2. Clean configured strings from file/directory names.
+#   2. Normalize clear JAV release codes for Jav18; clean remaining known clutter.
 #   3. Remove unwanted files.
 #   4. Move ポルノ content to its destination.
 #   5. Move private performer categories to their individual destinations.
 #   6. Refresh VueTorrent on its separate weekly cadence.
 #
+# v3.6 recognizes leading release codes, numeric studio prefixes and multipart
+# names locally. No metadata scraping, original-name archive or extra schedule.
+# Uncertain codes, mixed IDs and excerpts retain their names; non-video assets
+# keep the existing literal cleanup rules.
 # v3.1 applies the same immediate, per-payload policy to both category phases.
 # Run with --help for console-only usage; no notification emails are sent.
 #
@@ -262,7 +266,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
-readonly SCRIPT_VERSION="3.5.0"
+readonly SCRIPT_VERSION="3.6.0"
 
 umask 0002
 
@@ -898,22 +902,67 @@ build_rename_rules() {
 }
 
 
-clean_name() {
-    local value="$1"
+# The installed Jav18 agent searches a release ID derived from Plex's name.
+# Normalize only a clear leading ID; never infer identity from a title alone.
+# Used for completed payloads, not a recurring walk of existing libraries.
+jav_release_name() {
+    local value="$1" mode="${2:-directory}" stem="$1" extension="" prefix number tail upper part=""
+    local code='^([0-9]{0,3}[A-Za-z]{2,8}|[Tt]38)[ ._+-]*([0-9]{2,5})([^0-9]|$)'
+    local head='^([0-9]{0,3}[A-Za-z]{2,8}|[Tt]38)[ ._+-]*[0-9]{2,5}'
+    local other='(^|[^A-Za-z0-9])([0-9]{0,3}[A-Za-z]{2,8}|[Tt]38)[ ._+-]*[0-9]{2,5}([^0-9]|$)'
+    if [[ "$mode" == file ]];then
+        extension="${value##*.}";extension="${extension,,}"
+        case "$extension" in mp4|mkv|avi|wmv|m4v|mov|ts) stem="${value%.*}";;*) return 1;;esac
+        extension=".$extension"
+    fi
+    # Common advertiser wrappers are recognized structurally, without adding
+    # every new domain to the keyword list. Other embedded text is untouched.
+    if [[ "$stem" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}@(.+)$ ]];then stem="${BASH_REMATCH[1]}";fi
+    [[ "$stem" =~ $code ]] || return 1
+    prefix="${BASH_REMATCH[1]^^}";number="${BASH_REMATCH[2]}"
+    case "$prefix" in SCENE|PART|DISC|DISK|VIDEO|MOVIE|SAMPLE|TRAILER|CLIP|JAVWITHSUBS|FC|HDR|HEVC|XVID) return 1;;esac
+    # Keep leading zeroes: they can be part of the actual catalogue ID.
+    if [[ "$stem" =~ $head ]];then tail="${stem:${#BASH_REMATCH[0]}}";else return 1;fi
+    upper="${tail^^}"
+    [[ ! "$upper" =~ \.DUP[0-9]+ ]] || return 1
+    # Multiple releases and scene excerpts cannot become one full-release ID.
+    [[ ! "$upper" =~ (^|[^A-Z])SCENE[[:space:]_.+-]*[0-9]+ ]] || return 1
+    # An attached letter may identify a different edition/part. Keep it rather
+    # than guessing. The established ch suffix remains ordinary junk cleanup.
+    [[ ! "$tail" =~ ^[A-Za-z] ]] || return 1
+    if [[ "$upper" =~ (^|[^A-Z])(CD|DISC|DISK|PART|PT)[[:space:]_.-]*([0-9]{1,2})([^0-9]|$) ]];then
+        part=$((10#${BASH_REMATCH[3]}));((part>0)) || return 1
+        upper="${upper/"${BASH_REMATCH[0]}"/ }"
+        part=" - cd$part"
+    fi
+    [[ ! "$upper" =~ $other ]] || return 1
+    printf '%s-%s%s%s' "$prefix" "$number" "$part" "$extension"
+}
 
-    printf '%s' "$value" |
-        sed -E "${RENAME_SED_ARGS[@]}"
+clean_name() {
+    local value="$1" mode="${2:-directory}" cleaned
+    cleaned=$(printf '%s' "$value" | sed -E "${RENAME_SED_ARGS[@]}") || return 1
+    # Repair the previous collision layout without discarding the variant.
+    if [[ "$mode" == file && "$cleaned" =~ ^(.+)\.(mp4|mkv|avi|wmv|m4v|mov|ts)\.dup([1-9][0-9]*)$ ]];then
+        printf '%s.dup%s.%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[2]}"
+        return 0
+    fi
+    jav_release_name "$cleaned" "$mode" || printf '%s' "$cleaned"
 }
 
 
 resolve_collision() {
     local base="$1"
 
-    local candidate="$base"
+    local candidate="$base" stem="$base" extension=""
     local i=1
-
+    # Preserve the video extension so a different colliding file stays visible
+    # to Plex rather than becoming an unrecognized .mp4.dup1 file.
+    if [[ -f "$base" ]];then
+        case "${base##*.}" in mp4|mkv|avi|wmv|m4v|mov|ts|MP4|MKV|AVI|WMV|M4V|MOV|TS) stem="${base%.*}";extension=".${base##*.}";;esac
+    fi
     while [[ -e "$candidate" || -L "$candidate" ]]; do
-        candidate="${base}.dup${i}"
+        candidate="${stem}.dup${i}${extension}"
         ((i++))
     done
 
@@ -952,7 +1001,7 @@ normalize_names() {
 
         parent=$(dirname -- "$entry")
         old_name=$(basename -- "$entry")
-        new_name=$(clean_name "$old_name")
+        new_name=$(clean_name "$old_name" directory)
 
         [[ "$new_name" != "$old_name" ]] || continue
 
@@ -1008,7 +1057,7 @@ normalize_names() {
 
         parent=$(dirname -- "$entry")
         old_name=$(basename -- "$entry")
-        new_name=$(clean_name "$old_name")
+        new_name=$(clean_name "$old_name" file)
 
         [[ "$new_name" != "$old_name" ]] || continue
 
@@ -1419,7 +1468,7 @@ safe_move() {
 
 process_payload_file() {
     local source="$1" destination="$2" name target
-    name=$(clean_name "${source##*/}") || return 1
+    name=$(clean_name "${source##*/}" file) || return 1
     [[ -n "$name" && "$name" != . && "$name" != .. && "$name" != */* ]] || return 1
     mkdir -p -- "$destination" || return 1
     [[ ! -L "$destination" ]] || return 1
@@ -1461,7 +1510,7 @@ process_category() {
             ((deferred++)) || true
             continue
         fi
-        name=$(clean_name "${unit##*/}") || return 1
+        if [[ -d "$unit" ]];then name=$(clean_name "${unit##*/}" directory);else name=$(clean_name "${unit##*/}" file);fi || return 1
         [[ -n "$name" && "$name" != . && "$name" != .. && "$name" != */* ]] || return 1
         target="$destination/$name"
         [[ ! -L "$target" ]] || { log error "MV: symlink destination retained: $target"; return 1; }
@@ -1512,6 +1561,7 @@ update_vuetorrent() {
     local target="${VUETORRENT_DIR}/VueTorrent"
     local new_target="${VUETORRENT_DIR}/VueTorrent.new.$$"
     local old_target="${VUETORRENT_DIR}/VueTorrent.old.$$"
+    local remote_commit current_commit
 
     log info "------------------------------------------------------------"
     log info "VUETORRENT: updating WebUI"
@@ -1540,6 +1590,17 @@ update_vuetorrent() {
     ###########################################################################
 
     export GIT_TERMINAL_PROMPT=0
+    remote_commit=$(timeout "$VUETORRENT_CLONE_TIMEOUT" git ls-remote --exit-code --heads "$VUETORRENT_REPO" "refs/heads/$VUETORRENT_BRANCH") || {
+        log error 'VUETORRENT: GitHub revision check failed; current WebUI retained'
+        return 1
+    }
+    remote_commit="${remote_commit%%[[:space:]]*}"
+    [[ "$remote_commit" =~ ^([a-f0-9]{40}|[a-f0-9]{64})$ ]] || return 1
+    current_commit=$(git -C "$target" rev-parse --verify HEAD 2>/dev/null) || current_commit=""
+    if [[ "$current_commit" == "$remote_commit" && -f "$target/index.html" ]];then
+        log info "VUETORRENT: already current at $current_commit; no download or replacement"
+        return 0
+    fi
 
     log info \
         "VUETORRENT: cloning '$VUETORRENT_BRANCH' branch"

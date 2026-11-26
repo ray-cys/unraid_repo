@@ -35,7 +35,7 @@ mkdir -p "$COMPLETE_DIR/flat" "$DEST_DIR/flat"
 printf 'old' >"$DEST_DIR/flat/video.mkv"
 printf 'new' >"$COMPLETE_DIR/flat/hhd800.com@video.mkv"
 process_category flat "$DEST_DIR/flat"
-[[ $(cat "$DEST_DIR/flat/video.mkv") == old && $(cat "$DEST_DIR/flat/video.mkv.dup1") == new ]]
+[[ $(cat "$DEST_DIR/flat/video.mkv") == old && $(cat "$DEST_DIR/flat/video.dup1.mkv") == new ]]
 # API outages/malformed JSON are not treated as empty torrent lists.
 printf 'held' >"$COMPLETE_DIR/flat/held.mkv"
 api_fail=true; process_category flat "$DEST_DIR/flat"
