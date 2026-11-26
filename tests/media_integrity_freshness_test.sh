@@ -21,3 +21,10 @@ printf 'Twice-weekly schedule receipt applies a five-day completion grace\n'
 jq --argjson now "$NOW" '.lastProgressScanAt=($now-2*86400)' "$fixture/media_integrity_audit.json" >"$fixture/next";mv "$fixture/next" "$fixture/media_integrity_audit.json"
 FINDINGS=();audit_media_integrity_monitor;[[ ${#FINDINGS[@]} == 0 ]]
 printf 'Guarded partial runs count only via saved successful progress, without fake completions\n'
+
+# Recovery/validation polls cannot borrow legacy completion timestamps after schema 2.
+jq --argjson now "$NOW" '.evidenceSchema=2|.lastRealScanAt=($now-6*86400)|.lastDecodeProgressAt=0|.lastCompletedScanAt=$now|.lastProgressScanAt=$now' "$fixture/media_integrity_audit.json" >"$fixture/next";mv "$fixture/next" "$fixture/media_integrity_audit.json"
+FINDINGS=();audit_media_integrity_monitor;[[ ${#FINDINGS[@]} == 1 ]]
+jq --argjson now "$NOW" '.lastDecodeProgressAt=($now-86400)' "$fixture/media_integrity_audit.json" >"$fixture/next";mv "$fixture/next" "$fixture/media_integrity_audit.json"
+FINDINGS=();audit_media_integrity_monitor;[[ ${#FINDINGS[@]} == 0 ]]
+printf 'Schema-2 API/validation timestamps cannot conceal stale real scan evidence\n'

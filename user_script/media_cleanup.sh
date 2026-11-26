@@ -1,9 +1,9 @@
 #!/bin/bash
 clearLog=true
 arrayStarted=true
-# Media Cleanup v1.7.1 -- personal Hubble operations
+# Media Cleanup v1.8.0 -- personal Hubble operations
 #
-# PURPOSE: One daily job coordinates Arr deletion/unmonitoring/90-day retirement,
+# PURPOSE: One daily job coordinates Arr deletion/unmonitoring/30-day retirement,
 # proven SAB completed-payload cleanup, and metadata-bin retention. Modules run
 # sequentially: arr -> sab -> quarantine. Each retains its own proof, retry,
 # mount/Mover, recovery-hold, confirmation, retention and action-budget checks.
@@ -79,6 +79,13 @@ arrayStarted=true
 OPS_SCRIPT_ID="media_cleanup"
 # shellcheck shell=bash
 # Embedded operations contract v2; generated into standalone User Scripts.
+# Millisecond timing without spawning date on supported Bash; GNU fallback.
+usr_ops_now_ms() {
+    local stamp="${EPOCHREALTIME:-}"
+    if [[ "$stamp" =~ ^[0-9]+\.[0-9]{6}$ ]];then stamp=${stamp/./};printf '%s\n' "${stamp:0:${#stamp}-3}"
+    else stamp=$(date +%s%N) || return 1;printf '%s\n' "${stamp:0:${#stamp}-6}";fi
+}
+
 usr_ops_log_line() {
     local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
     case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
@@ -210,7 +217,8 @@ usr_ops_execution_record() (
     tmp=$(mktemp "$root/.execution.XXXXXX") || return 1;trap 'rm -f -- "$tmp"' EXIT
     jq -n --argjson old "$old" --arg processStart "$process_start" --arg name "$OPS_SCRIPT_ID" --arg boot "$boot" --arg status "$status" --argjson started "$started" --argjson at "$now" --argjson pid "$pid" --argjson rc "$rc" \
       '$old+{schema:1,name:$name,boot:$boot,executionStatus:$status,startedAt:$started,observedAt:$at,pid:$pid,processStart:$processStart,lastExitCode:$rc} |
-       if $status!="RUNNING" then .finishedAt=$at|.durationSeconds=($at-$started)|.lastCompletedAt=$at|if $rc==0 then .lastSuccessAt=$at else . end else . end' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
+       if $status!="RUNNING" then .finishedAt=$at|.durationSeconds=($at-$started)|.lastCompletedAt=$at|if $rc==0 then .lastSuccessAt=$at else . end
+       else .previousRun={startedAt:$old.startedAt,finishedAt:$old.finishedAt,status:$old.executionStatus,exitCode:$old.lastExitCode,durationSeconds:$old.durationSeconds}|.finishedAt=null|.durationSeconds=null|.lastExitCode=null end' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
     local persistent="${USR_OPS_EXECUTION_PERSISTENT_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/execution}" fd export_fd
     mountpoint -q "${USR_OPS_VAULT_MOUNT:-/mnt/vault}" || return 0
     [[ ! -L "$persistent" && $(realpath -m "$persistent") == "$persistent" ]] || return 1
@@ -250,6 +258,22 @@ usr_ops_supervise() {
     trap - TERM HUP INT
     return "$rc"
 }
+
+# Network observation after an accepted shutdown, never a power-state claim.
+# No WOL or second poweroff is issued. Native maintenance checks remain upstream.
+usr_ops_observe_shutdown() {
+    local BACKUP_SSH_COMMAND_TIMEOUT=6
+    local host="${REMOTE#*@}" deadline=$(( $(date +%s)+${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90} )) misses=0
+    [[ "${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90}" != 0 ]] || { SHUTDOWN_RESULT=requested_observation_disabled;return 0; }
+    while (( $(date +%s)<deadline ));do
+        if timeout --kill-after=1 5 ping -c 1 -W 2 "$host" >/dev/null 2>&1 || backup_ssh true >/dev/null 2>&1;then misses=0
+        else misses=$((misses+1));fi
+        if ((misses>=3));then SHUTDOWN_RESULT=offline_observed;return 0;fi
+        sleep 5
+    done
+    SHUTDOWN_RESULT=requested_still_reachable;REMOTE_SHUTDOWN_FAILED=1
+    return 1
+}
 # END EMBEDDED OPERATIONS CONTRACT
 # BEGIN SCHEDULED EXECUTION SUPERVISOR
 if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$OPS_SCRIPT_ID" ]];then
@@ -258,7 +282,7 @@ fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
 umask 077
-MC_VERSION="1.7.1"
+MC_VERSION="1.8.0"
 # One execution switch across every module. Conflicting/unused flags fail before work.
 # In preview, quarantine purge becomes audit; restore requires an explicit execute flag.
 MC_DRY_RUN=false
@@ -477,15 +501,15 @@ mc_flush() (
         ($c|[.]|implode) as $v | ($v|utf8bytelength) as $n |
         if .full or .n+$n>$b then .full=true else .s+=$v | .n+=$n end) | .s;
       . as $state | .events |= map(. as $e | if ($e.topic // "")!="" and $state.topics[$e.topic].status=="healthy" then
-        .importance="normal" | .description+="; current condition resolved" else . end) |
+        .importance="normal" | .description+="; historical report, current condition resolved (body describes the original event)" else . end) |
       reduce (.events|sort_by([if .importance=="alert" then 0 elif .importance=="warning" then 1 else 2 end,.epoch])[]) as $e
-        ({items:[],bytes:0}; ("["+$e.module+"] "+$e.subject+"\nReported: "+($e.epoch|strflocaltime("%Y-%m-%d %H:%M:%S %Z"))+"\n"+$e.description+"\n") as $h |
+        ({items:[],bytes:0}; ("["+$e.module+"] "+$e.subject+"\nCollected for delivery: "+($e.epoch|strflocaltime("%Y-%m-%d %H:%M:%S %Z"))+"\n"+$e.description+"\n") as $h |
          ($budget-.bytes-($h|utf8bytelength)-4) as $remaining |
          if $remaining<256 then . else prefix($e.message;$remaining) as $p |
            .items += [$e+{message:$p,consumed:($p|length)}] | .bytes += (($h+$p)|utf8bytelength)+4 end)
       | .items' "$MC_ROOT/notification-outbox.json" >"$selected" || return 1
     count=$(jq length "$selected"); (( count>0 )) || return 1
-    jq -r '.[] | ("["+.module+"] "+.subject+"\nReported: "+(.epoch|strflocaltime("%Y-%m-%d %H:%M:%S %Z"))+"\n"+.description+"\n"+.message+"\n")
+    jq -r '.[] | ("["+.module+"] "+.subject+"\nCollected for delivery: "+(.epoch|strflocaltime("%Y-%m-%d %H:%M:%S %Z"))+"\n"+.description+"\n"+.message+"\n")
       | explode | map(select(.!=8205 and .!=8419 and .!=65039 and (. < 9728 or . > 10175) and (. < 126976 or . > 129791))) | implode' "$selected" >"$body" || return 1
     printf '\nCurrent run outcomes: %s\nReports retain their original observation time. Pending detail is retained for subsequent daily delivery.\n' "${MC_OUTCOMES:-notification retry only}" >>"$body"
     mc_backlog_metrics >"$selected.backlog" || return 1
@@ -1183,7 +1207,7 @@ mc_sonarr_shards_begin() {
 }
 
 mc_entity_timing_end() {
-    [[ -z "${MC_ENTITY_STARTED:-}" ]] || printf 'reconciliation %s\n' "$(( ($(date +%s%N)-MC_ENTITY_STARTED)/1000000 ))" >>"$MC_TMP/arr-$APP_CONTEXT.timings"
+    [[ -z "${MC_ENTITY_STARTED:-}" ]] || printf 'reconciliation %s\n' "$(( ($(usr_ops_now_ms)-MC_ENTITY_STARTED) ))" >>"$MC_TMP/arr-$APP_CONTEXT.timings"
     MC_ENTITY_STARTED=''
 }
 
@@ -1213,10 +1237,10 @@ mc_sonarr_shards_finish() {
 mc_timed_call() {
     local kind="$1" function="$2" start rc=0 end;shift 2
     if [[ -z "${MC_TMP:-}" || ! -d "$MC_TMP" ]]; then "$function" "$@";return $?;fi
-    start=$(date +%s%N)
+    start=$(usr_ops_now_ms)
     "$function" "$@" || rc=$?
-    end=$(date +%s%N)
-    printf '%s %s\n' "$kind" "$(((end-start)/1000000))" >>"$MC_TMP/arr-${APP_CONTEXT:-unknown}.timings"
+    end=$(usr_ops_now_ms)
+    printf '%s %s\n' "$kind" "$((end-start))" >>"$MC_TMP/arr-${APP_CONTEXT:-unknown}.timings"
     return "$rc"
 }
 
@@ -1642,9 +1666,9 @@ RADARR_RETIRE_FULLY_DELETED_MOVIES=true
 RADARR_RETIREMENT_EXEMPT_TAG="keep-in-arr"
 RADARR_RETIREMENT_PENDING_TAG="retirement-pending"
 
-# Shared retirement and state-retention policy. Ninety days comfortably
-# outlives the current 45-day quarantine lifecycle.
-ARR_RETIREMENT_DAYS=90
+# Retirement holds are 30 days; absent-ID state retention remains independent.
+# Existing hold start dates are retained, with fresh safety checks before removal.
+ARR_RETIREMENT_DAYS=30
 ARR_RETIREMENT_WARNING_DAYS=7
 STATE_PRUNE_ABSENT_DAYS=90
 
@@ -4333,11 +4357,27 @@ sonarr_touch_retirement() {
     mv -f -- "$next" "$WORK_STATE"
 }
 
+# Pending is a hold marker, not a permanent deletion tag. Remove only this
+# assignment, with an uncached exact resource fetch and journalled read-back.
+arr_clear_pending_tag() {
+    local kind="$1" id="$2" label="$3" tag detail payload
+    tag=$(tag_id_by_label "$label")
+    [[ "$tag" =~ ^[1-9][0-9]*$ ]] || return 0
+    detail=$(api_get_json "/api/v3/$kind/$id") || return 1
+    jq -e --argjson id "$id" '.id==$id and (.tags|type)=="array"' <<<"$detail" >/dev/null || return 1
+    jq -e --argjson tag "$tag" '.tags|index($tag)!=null' <<<"$detail" >/dev/null || return 0
+    if [[ "$DRY_RUN" == true ]];then log INFO "DRY RUN: would remove '$label' from $ARR_NAME $id after retirement cancellation";return 0;fi
+    payload=$(jq -c --argjson tag "$tag" '.tags|=map(select(.!=$tag))' <<<"$detail") || return 1
+    api_put_json "/api/v3/$kind/$id" "$payload" || return 1
+    queue_action_notification "$ARR_NAME" 'Retirement pending tag cleared' "Exact $kind ID=$id: retirement was cancelled/cleared; '$label' removed and read-back verified. Other tags and monitoring settings preserved."
+}
+
 sonarr_cancel_retirement() {
     local series_id="$1"
     local reason="$2"
     local next
 
+    arr_clear_pending_tag series "$series_id" "$SONARR_RETIREMENT_PENDING_TAG" || return 1
     next="$(mktemp "${VERIFY_RUNTIME_DIR:-$STATE_DIR}/.state-retirement-cancel.XXXXXX")" || return 1
     if ! jq -c --arg key "$series_id" --arg now "$RUN_AT" --arg reason "$reason" '
         .seriesRetirements //= {}
@@ -4360,6 +4400,7 @@ sonarr_clear_retirement() {
     local series_id="$1"
     local next
 
+    arr_clear_pending_tag series "$series_id" "$SONARR_RETIREMENT_PENDING_TAG" || return 1
     next="$(mktemp "${VERIFY_RUNTIME_DIR:-$STATE_DIR}/.state-retirement-clear.XXXXXX")" || return 1
     if ! jq -c --arg key "$series_id" 'del(.seriesRetirements[$key])' \
         "$WORK_STATE" > "$next"; then
@@ -4427,6 +4468,9 @@ sonarr_process_full_retirement() {
     monitored_season_count="$(jq '[.seasons[]? | select(.monitored == true)] | length' <<< "$series_item")" || return 1
     series_monitored="$(jq -r '.monitored == true' <<< "$series_item")"
 
+    if [[ -z "$started_at" && ( "$suppressed" == true || "$has_exempt" == true || "$series_monitored" == true || "$current_file_count" != 0 ) ]];then
+        arr_clear_pending_tag series "$series_id" "$SONARR_RETIREMENT_PENDING_TAG" || return 1
+    fi
     if [[ -n "$started_at" ]]; then
         if (( current_file_count > 0 )); then
             sonarr_clear_retirement "$series_id" || return 1
@@ -4495,7 +4539,7 @@ sonarr_process_full_retirement() {
             queue_stateful_resolution_notification Sonarr \
                 "retirement:sonarr:${series_id}:upcoming" \
                 "$series_title retirement hold completed" \
-                "The 90-day hold completed and the series was removed from Sonarr."
+                "The ${ARR_RETIREMENT_DAYS}-day hold completed and the series was removed from Sonarr."
             queue_action_notification Sonarr "$series_title removed from Sonarr" \
                 "The fully deleted series completed its ${ARR_RETIREMENT_DAYS}-day hold; files were not deleted and an import-list exclusion was added."
             log INFO "Removed retired series $series_title from Sonarr and added an import-list exclusion."
@@ -4796,7 +4840,14 @@ MC_SERIES_SOURCE="$VERIFY_RUNTIME_DIR/series-catalog.json";printf '%s' "$SERIES"
 mc_timed_call discovery mc_index_snapshot "$MC_SERIES_SOURCE" "$VERIFY_RUNTIME_DIR/series-index.json" || die 'Incomplete Sonarr catalogue; no absence inferred.'
 MC_ROTATING_IDS="$VERIFY_RUNTIME_DIR/sonarr-rotation.ids";mc_rotation_plan "$MC_SERIES_SOURCE" "$MC_ROTATING_IDS" || die 'Cannot plan rotating sidecar discovery.'
 MC_SERIES_IDS="$VERIFY_RUNTIME_DIR/series-scan.ids"
-{ jq -r '.[]|select(.monitored==true)|.id' "$MC_SERIES_SOURCE";jq -r '.episodes[]?|select((.missingRuns // 0)>0)|.seriesId' "$WORK_STATE"; }|sort -nu >"$MC_SERIES_IDS"
+jq -nr --slurpfile catalog "$MC_SERIES_SOURCE" --slurpfile state "$WORK_STATE" --arg pending "$(tag_id_by_label "$SONARR_RETIREMENT_PENDING_TAG")" '
+  ($catalog[0]|INDEX(.id|tostring)) as $present |
+  ([ $catalog[0][]|select(.monitored==true or any(.tags[]?;tostring==$pending))|.id ]+
+   [$state[0].episodes[]?|select((.missingRuns // 0)>0)|.seriesId]+
+   [($state[0].seriesRetirements // {})|keys[]|tonumber])|unique|.[]|select($present[tostring]!=null)' >"$MC_SERIES_IDS" || die 'Cannot plan complete-catalogue series work.'
+MC_ABSENT_SERIES=$(jq -nr --slurpfile catalog "$MC_SERIES_SOURCE" --slurpfile state "$WORK_STATE" '($catalog[0]|INDEX(.id|tostring)) as $present|[$state[0].episodes[]?.seriesId|select($present[tostring]==null)]|unique|length')
+((MC_ABSENT_SERIES==0)) || log INFO "State retention: $MC_ABSENT_SERIES series IDs absent from the complete Sonarr catalogue; no episode requests or media actions; ${STATE_PRUNE_ABSENT_DAYS}-day state-pruning safeguards apply."
+
 mapfile -t MC_SCAN_ORDER <"$MC_SERIES_IDS"
 mc_timed_call state mc_sonarr_shards_begin || die 'Cannot index Sonarr working state.'
 MC_SCAN_POSITION=0
@@ -4870,7 +4921,7 @@ while IFS= read -r SERIES_ID; do
     }
 
     mc_timed_call discovery mc_index_snapshot "$CURRENT_SNAPSHOT_FILE" "$VERIFY_RUNTIME_DIR/episode-index.json" || { ((API_FAILURES+=1));log ERROR 'Incomplete/ambiguous episode snapshot; series observations preserved';continue; }
-    MC_ENTITY_STARTED=$(date +%s%N)
+    MC_ENTITY_STARTED=$(usr_ops_now_ms)
     ((SERIES_SCANNED += 1))
     IFS=$'\t' read -r COUNT PRESENT < <(jq -r '[length,([.[] | select(.hasFile == true)]|length)]|@tsv' "$CURRENT_SNAPSHOT_FILE")
     [[ "$COUNT" =~ ^[0-9]+$ && "$PRESENT" =~ ^[0-9]+$ ]] || die "Could not count Sonarr episode snapshot."
@@ -5908,6 +5959,7 @@ radarr_cancel_retirement() {
     local movie_id="$1"
     local reason="$2"
     local next
+    arr_clear_pending_tag movie "$movie_id" "$RADARR_RETIREMENT_PENDING_TAG" || return 1
     next="$(mktemp "${VERIFY_RUNTIME_DIR:-$STATE_DIR}/.state-retirement-cancel.XXXXXX")" || return 1
     if ! jq -c --arg key "$movie_id" --arg now "$RUN_AT" --arg reason "$reason" '
         .movieRetirements //= {}
@@ -5929,6 +5981,7 @@ radarr_cancel_retirement() {
 radarr_clear_retirement() {
     local movie_id="$1"
     local next
+    arr_clear_pending_tag movie "$movie_id" "$RADARR_RETIREMENT_PENDING_TAG" || return 1
     next="$(mktemp "${VERIFY_RUNTIME_DIR:-$STATE_DIR}/.state-retirement-clear.XXXXXX")" || return 1
     if ! jq -c --arg key "$movie_id" 'del(.movieRetirements[$key])' \
         "$WORK_STATE" > "$next"; then
@@ -5964,8 +6017,9 @@ radarr_process_retirements() {
     # Healthy/monitored movies with no existing retirement cannot enter any
     # retirement branch. Select the work once, keeping ALL existing timers so
     # returned media, restored monitoring and exemptions still cancel holds.
-    jq -c --slurpfile state "$WORK_STATE" '
-      .[] | select(
+    pending_id=$(tag_id_by_label "$RADARR_RETIREMENT_PENDING_TAG")
+    jq -c --arg pending "$pending_id" --slurpfile state "$WORK_STATE" '
+      .[] | select((any(.tags[]?; tostring==$pending)) or
         (($state[0].movieRetirements[(.id|tostring)].startedAt // "") != "")
         or (.hasFile != true and .monitored != true))' "$movies_file" >"$retirement_candidates" || return 1
     while IFS= read -r movie; do
@@ -5996,6 +6050,9 @@ radarr_process_retirements() {
             tagged=true
         fi
 
+        if [[ -z "$started_at" && ( "$suppressed" == true || "$has_exempt" == true || "$monitored" == true || "$has_file" == true ) ]];then
+            arr_clear_pending_tag movie "$movie_id" "$RADARR_RETIREMENT_PENDING_TAG" || return 1
+        fi
         if [[ -n "$started_at" ]]; then
             if [[ "$has_file" == true ]]; then
                 radarr_clear_retirement "$movie_id" || return 1
@@ -6045,7 +6102,7 @@ radarr_process_retirements() {
                 queue_stateful_resolution_notification Radarr \
                     "retirement:radarr:${movie_id}:upcoming" \
                     "$title retirement hold completed" \
-                    "The 90-day hold completed and the movie was removed from Radarr."
+                    "The ${ARR_RETIREMENT_DAYS}-day hold completed and the movie was removed from Radarr."
                 queue_action_notification Radarr "$title removed from Radarr" \
                     "The fully deleted movie completed its ${ARR_RETIREMENT_DAYS}-day hold; files were not deleted and an import exclusion was added."
                 log INFO "Removed retired movie $title from Radarr and added an import exclusion."
@@ -6403,7 +6460,7 @@ radarr_process_monitored_fileless_watchdog "$RADARR_ACTION_SNAPSHOT_FILE" || {
         "The main workflow continues, but watchdog state could not be evaluated."
 }
 
-MC_RADARR_RECON_STARTED=$(date +%s%N)
+MC_RADARR_RECON_STARTED=$(usr_ops_now_ms)
 FIRST_MISSING="$(radarr_new_candidate_count)"
 (( FIRST_MISSING == 0 )) || radarr_log_new_candidates
 
@@ -6596,7 +6653,7 @@ radarr_process_retirements "$RADARR_ACTION_SNAPSHOT_FILE" || {
         "No unsafe removal was attempted; unfinished retirement work will be retried next run."
 }
 mc_performance_finish || die 'Cannot retain pending-work/discovery index.'
-printf 'reconciliation %s\n' "$(( ($(date +%s%N)-MC_RADARR_RECON_STARTED)/1000000 ))" >>"$MC_TMP/arr-$APP_CONTEXT.timings"
+printf 'reconciliation %s\n' "$(( ($(usr_ops_now_ms)-MC_RADARR_RECON_STARTED) ))" >>"$MC_TMP/arr-$APP_CONTEXT.timings"
 radarr_prune_state "$CURRENT_SNAPSHOT_FILE" || die "Could not prune stale Radarr state safely."
 radarr_commit_state || { [[ ! -d "${MC_TMP:-}" ]] || printf 'Radarr state commit failed\n' >>"$MC_TMP/failed-arr";die "Could not atomically save state."; }
 WORK_STATE=""
@@ -6834,9 +6891,9 @@ QUARANTINE_DIR_REAL=""
 SAB_BACKUP_DIR_REAL=""
 NZB_BACKUP_DIR_REAL=""
 
-BACKUP_CLEANUP_STATUS="DISABLED"
-STRANDED_CLEANUP_STATUS="DISABLED"
-QUARANTINE_PURGE_STATUS="DISABLED"
+BACKUP_CLEANUP_STATUS="NOT_RUN"
+STRANDED_CLEANUP_STATUS="NOT_RUN"
+QUARANTINE_PURGE_STATUS="NOT_RUN"
 
 NZB_BACKUPS_ELIGIBLE=0
 APP_BACKUPS_ELIGIBLE=0
@@ -8582,6 +8639,17 @@ proof_paths_still_valid() {
 # QUARANTINE / PURGE
 ###############################################################################
 
+record_sab_source_removal() {
+    local source="$1" destination="$2" manifest="$3" root="$LOG_DIR" path temp
+    root="${root:-$LOG_DIR}";path="$root/source-removals.json"
+    [[ ! -e "$source" && ! -L "$source" ]] || return 1
+    [[ -f "$path" ]] || printf '{"schema":1,"records":{}}' >"$path"
+    temp=$(mktemp "$root/.source-removal.XXXXXX") || return 1
+    jq --arg source "$source" --arg destination "$destination" --slurpfile manifest "$manifest" --argjson at "$(date +%s)" '
+      .records[$source]={originalPath:$source,destination:$destination,at:$at,sourceAbsent:true,downloadId:$manifest[0].downloadId,action:"quarantined",proofKind:($manifest[0].importProof.proofKind // "verified-cleanup")} |
+      .records|=with_entries(select(.value.at>=$at-90*86400)) | .records|=(to_entries|sort_by(.value.at)|reverse|.[:10000]|from_entries)' "$path" >"$temp" && ops_publish_checkpoint "$temp" "$path"
+}
+
 quarantine_payload() {
   local owner="$1"
   local category="$2"
@@ -8660,6 +8728,7 @@ quarantine_payload() {
   jq --argjson now "$(date +%s)" '.state="committed" | .quarantinedEpoch=$now' "$manifest" >"$committed" &&
     ops_publish_checkpoint "$committed" "$manifest" || return 1
   normalize_quarantine_permissions "$manifest" || return 1
+  record_sab_source_removal "$source_path" "$wrapper/payload" "$manifest" || return 1
 
   return 0
 }
@@ -8749,6 +8818,7 @@ recover_quarantine_preparations() {
       normalize_quarantine_permissions "$wrapper" || return 1
       tmp="$wrapper/.manifest-recovered.$$"
       jq --argjson now "$(date +%s)" '.state="committed" | .quarantinedEpoch=$now | .recovered=true' "$manifest" >"$tmp" && mv -f -- "$tmp" "$manifest" || return 1
+      record_sab_source_removal "$source" "$wrapper/payload" "$manifest" || return 1
       normalize_quarantine_permissions "$manifest" || return 1
       ((RECOVERED++)) || true
       RECOVERY_DETAILS+=("Recovered interrupted move: $source -> $wrapper/payload; manifest committed; retention restarted conservatively.")
@@ -9459,6 +9529,13 @@ main() {
     (( coordination_rc==0 )) || return 1
 
   initialize || return 1
+  if [[ -n "$CLI_OPERATION" ]];then
+    BACKUP_CLEANUP_STATUS=NOT_RUN_RECOVERY_ONLY;STRANDED_CLEANUP_STATUS=NOT_RUN_RECOVERY_ONLY;QUARANTINE_PURGE_STATUS=NOT_RUN_RECOVERY_ONLY
+  else
+    is_true "$CLEAN_BACKUPS" || BACKUP_CLEANUP_STATUS=DISABLED_BY_CONFIGURATION
+    is_true "$CLEAN_STRANDED_DOWNLOADS" || STRANDED_CLEANUP_STATUS=DISABLED_BY_CONFIGURATION
+    is_true "$PURGE_QUARANTINE" || QUARANTINE_PURGE_STATUS=DISABLED_BY_CONFIGURATION
+  fi
   if [[ "$CLI_OPERATION" == recover-orphan ]]; then recover_sab_orphan "$CLI_WRAPPER"; return $?; fi
   if [[ "$CLI_OPERATION" == resolve ]]; then
     ops_resolve_operation "$CLI_OPERATION_ID" "$CLI_OPERATION_NOTE" || return $?

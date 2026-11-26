@@ -134,6 +134,7 @@ with tempfile.TemporaryDirectory(prefix='cleanup-rewrite.') as folder:
  MC_SONARR_API_KEY=fixture;SONARR_API_KEY=fixture
  SONARR_STATE_FILE="$RUNTIME_DIR/state.json";SONARR_STATE_BACKUP="$RUNTIME_DIR/backup.json"
  QUARANTINE_KODI_SIDECARS=false;DRY_RUN=true;INSPECT_DELETE_HISTORY=true
+ ARR_RETIREMENT_DAYS=90 # Compare workflow parity under the frozen baseline policy.
  NOTIFICATION_BATCH="$RUNTIME_DIR/notifications";: >"$NOTIFICATION_BATCH"
  MC_BRIDGE_ACTIVE=false;LOG_READY=false;NOTIFICATION_STATE_FILE="$RUNTIME_DIR/notify-state"
  printf '{"episodes":{"11":{"seriesId":1,"everHadFile":true,"missingRuns":1},"21":{"seriesId":2,"everHadFile":true,"missingRuns":1}},"sidecarManifests":{},"unknown":{"keep":true}}' >"$SONARR_STATE_FILE"

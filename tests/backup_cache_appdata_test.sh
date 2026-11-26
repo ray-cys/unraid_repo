@@ -112,6 +112,7 @@ run_backup() {
 
     env \
         PATH="$root/bin:$PATH" \
+        USR_OPS_SUPERVISED=backup_cache_appdata \
         SRC_DIR="$root/source" \
         DEST_DIR="$root/destination" \
         LOG_DIR="$root/logs" \

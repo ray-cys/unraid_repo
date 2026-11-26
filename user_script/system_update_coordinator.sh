@@ -4,7 +4,7 @@
 # continues, but no extra timer is created and no launcher shell text is executed.
 clearLog=true
 arrayStarted=true
-# System Update Coordinator v1.7.0 -- personal Hubble maintenance.
+# System Update Coordinator v1.8.0 -- personal Hubble maintenance.
 # PURPOSE: Detect Docker/plugin/Unraid OS updates; automatically install only
 # explicitly approved, still-installed items during a bounded maintenance window.
 # Existing producers finish; expiring requests make new conflicting work yield.
@@ -48,6 +48,13 @@ arrayStarted=true
 OPS_SCRIPT_ID="system_update_coordinator"
 # shellcheck shell=bash
 # Embedded operations contract v2; generated into standalone User Scripts.
+# Millisecond timing without spawning date on supported Bash; GNU fallback.
+usr_ops_now_ms() {
+    local stamp="${EPOCHREALTIME:-}"
+    if [[ "$stamp" =~ ^[0-9]+\.[0-9]{6}$ ]];then stamp=${stamp/./};printf '%s\n' "${stamp:0:${#stamp}-3}"
+    else stamp=$(date +%s%N) || return 1;printf '%s\n' "${stamp:0:${#stamp}-6}";fi
+}
+
 usr_ops_log_line() {
     local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
     case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
@@ -179,7 +186,8 @@ usr_ops_execution_record() (
     tmp=$(mktemp "$root/.execution.XXXXXX") || return 1;trap 'rm -f -- "$tmp"' EXIT
     jq -n --argjson old "$old" --arg processStart "$process_start" --arg name "$OPS_SCRIPT_ID" --arg boot "$boot" --arg status "$status" --argjson started "$started" --argjson at "$now" --argjson pid "$pid" --argjson rc "$rc" \
       '$old+{schema:1,name:$name,boot:$boot,executionStatus:$status,startedAt:$started,observedAt:$at,pid:$pid,processStart:$processStart,lastExitCode:$rc} |
-       if $status!="RUNNING" then .finishedAt=$at|.durationSeconds=($at-$started)|.lastCompletedAt=$at|if $rc==0 then .lastSuccessAt=$at else . end else . end' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
+       if $status!="RUNNING" then .finishedAt=$at|.durationSeconds=($at-$started)|.lastCompletedAt=$at|if $rc==0 then .lastSuccessAt=$at else . end
+       else .previousRun={startedAt:$old.startedAt,finishedAt:$old.finishedAt,status:$old.executionStatus,exitCode:$old.lastExitCode,durationSeconds:$old.durationSeconds}|.finishedAt=null|.durationSeconds=null|.lastExitCode=null end' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
     local persistent="${USR_OPS_EXECUTION_PERSISTENT_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/execution}" fd export_fd
     mountpoint -q "${USR_OPS_VAULT_MOUNT:-/mnt/vault}" || return 0
     [[ ! -L "$persistent" && $(realpath -m "$persistent") == "$persistent" ]] || return 1
@@ -218,6 +226,22 @@ usr_ops_supervise() {
     [[ "$record_owner" != true ]] || usr_ops_execution_record finish "$started" "$pid" "$rc" || printf 'Completion receipt unavailable for %s (exit=%s).\n' "$OPS_SCRIPT_ID" "$rc" >&2
     trap - TERM HUP INT
     return "$rc"
+}
+
+# Network observation after an accepted shutdown, never a power-state claim.
+# No WOL or second poweroff is issued. Native maintenance checks remain upstream.
+usr_ops_observe_shutdown() {
+    local BACKUP_SSH_COMMAND_TIMEOUT=6
+    local host="${REMOTE#*@}" deadline=$(( $(date +%s)+${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90} )) misses=0
+    [[ "${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90}" != 0 ]] || { SHUTDOWN_RESULT=requested_observation_disabled;return 0; }
+    while (( $(date +%s)<deadline ));do
+        if timeout --kill-after=1 5 ping -c 1 -W 2 "$host" >/dev/null 2>&1 || backup_ssh true >/dev/null 2>&1;then misses=0
+        else misses=$((misses+1));fi
+        if ((misses>=3));then SHUTDOWN_RESULT=offline_observed;return 0;fi
+        sleep 5
+    done
+    SHUTDOWN_RESULT=requested_still_reachable;REMOTE_SHUTDOWN_FAILED=1
+    return 1
 }
 # END EMBEDDED OPERATIONS CONTRACT
 # BEGIN SCHEDULED EXECUTION SUPERVISOR
@@ -452,7 +476,7 @@ US_CRON_VERIFY
 # END EMBEDDED USER SCRIPTS CATALOG
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="1.7.0"
+readonly SCRIPT_VERSION="1.8.0"
 # Keep configured per-item holds when approving the same installed identity.
 # Daily rolling tags need a shorter hold to avoid perpetually chasing rebuilds.
 readonly APPROVAL_JQ='def approval($old;$identity;$allow;$kind;$epoch):
@@ -1065,6 +1089,30 @@ start_container_lease() {
 
 job_update() { local id="$1" expression="$2";shift 2;mutate --arg id "$id" "$@" "$expression"; }
 
+capture_plugin_cache() {
+    local installed="$1" target="$2" list="$TMP_DIR/plugin-cache.paths" source total=0 count=0 size before after rows="$TMP_DIR/plugin-cache.jsonl"
+    php -r '$x=simplexml_load_file($argv[1],"SimpleXMLElement",LIBXML_NONET);if(!$x)exit(1);foreach($x->FILE as $f){$n=(string)$f["Name"];if(str_starts_with($n,"/boot/config/plugins/")&&preg_match("/\\.(txz|tgz|tbz2|zip|tar\\.(xz|gz|bz2))$/D",$n))echo $n,"\0";}' "$installed" >"$list" || return 1
+    : >"$rows";: >"$TMP_DIR/plugin-cache.include"
+    while IFS= read -r -d '' source;do
+      [[ -f "$source" && ! -L "$source" && $(realpath -e "$source") == "$source" ]] || continue
+      size=$(stat -c %s "$source") || return 1;total=$((total+size));count=$((count+1))
+      ((total<=268435456 && count<=64)) || { RECOVERY_REASON='Available plugin cache exceeds 256 MiB/64-file recovery budget';return 1; }
+      before=$(sha256sum "$source"|cut -d ' ' -f1)
+      jq -nc --arg path "$source" --arg hash "$before" --argjson bytes "$size" '{path:$path,sha256:$hash,bytes:$bytes}' >>"$rows" || return 1
+      printf '%s\0' "${source#/}" >>"$TMP_DIR/plugin-cache.include"
+    done <"$list"
+    if ((count>0));then
+      bounded 90 tar -czf "$target/plugin-packages.tar.gz" -C / --null --verbatim-files-from -T "$TMP_DIR/plugin-cache.include" || return 1
+      bounded 30 gzip -t "$target/plugin-packages.tar.gz" || return 1
+      sha256sum "$target/plugin-packages.tar.gz" >"$target/plugin-packages.sha256" || return 1
+      while IFS= read -r source;do
+        after=$(sha256sum "$(jq -r .path <<<"$source")"|cut -d ' ' -f1)
+        [[ "$after" == $(jq -r .sha256 <<<"$source") ]] || return 1
+      done <"$rows"
+    fi
+    jq -s --argjson bytes "$total" '{schema:1,files:.,bytes:$bytes,scope:"Available installed-definition package cache only; vendor downloads, runtime files and database rollback are not guaranteed"}' "$rows" >"$target/plugin-cache.json"
+}
+
 prepare_recovery_set() {
     local kind="$1" name="$2" id="$3" old_image="${4:-}" old_size free target max_bytes
     RECOVERY_REASON="Previous-image export, configuration copy or archive validation did not complete"
@@ -1090,6 +1138,7 @@ prepare_recovery_set() {
       sha256sum "$target/image.tar.gz" >"$target/image.sha256";sync -f "$target/image.tar.gz" || return 1
     else
       cp "/var/log/plugins/$name" "$target/installed.plg" && cp "/tmp/plugins/$name" "$target/candidate.plg" || return 1
+      capture_plugin_cache "$target/installed.plg" "$target" || return 1
     fi
     printf '%s\n' "$target" >"$TMP_DIR/recovery-path"
 }
@@ -1187,7 +1236,7 @@ cleanup_unissued_set() {
     fi
     [[ -d "$path" && ! -L "$path" && $(cat "$path/.owner" 2>/dev/null) == "$id" ]] || return 1
     [[ -z $(find "$path" -mindepth 1 ! -type f -print -quit) ]] || return 1
-    rm -f -- "$path/backup-evidence.json" "$path/definition-before.json" "$path/template.xml" "$path/image.tar.gz" "$path/image.tar.gz.partial" "$path/image.sha256" "$path/installed.plg" "$path/candidate.plg" "$path/native-install.log" "$path/.owner"
+    rm -f -- "$path/backup-evidence.json" "$path/definition-before.json" "$path/template.xml" "$path/image.tar.gz" "$path/image.tar.gz.partial" "$path/image.sha256" "$path/plugin-packages.tar.gz" "$path/plugin-packages.sha256" "$path/plugin-cache.json" "$path/installed.plg" "$path/candidate.plg" "$path/native-install.log" "$path/.owner"
     rmdir "$path" && job_update "$id" '.jobs[$id].recoveryPrunedAt=$now' --argjson now "$(date +%s)"
 }
 
@@ -1200,7 +1249,7 @@ clean_recovery_sets() {
       [[ "$path" == "$ROLLBACK_ROOT/$id" && -d "$path" && ! -L "$path" && -f "$path/.owner" && $(cat "$path/.owner") == "$id" ]] || continue
       [[ -z $(find "$path" -mindepth 1 ! -type f -print -quit) ]] || continue
       # Only a known completed job's small fixed recovery set; no appdata paths.
-      rm -f -- "$path/backup-evidence.json" "$path/definition-before.json" "$path/template.xml" "$path/image.tar.gz" "$path/image.sha256" "$path/installed.plg" "$path/candidate.plg" "$path/native-install.log" "$path/.owner"
+      rm -f -- "$path/backup-evidence.json" "$path/definition-before.json" "$path/template.xml" "$path/image.tar.gz" "$path/image.sha256" "$path/plugin-packages.tar.gz" "$path/plugin-packages.sha256" "$path/plugin-cache.json" "$path/installed.plg" "$path/candidate.plg" "$path/native-install.log" "$path/.owner"
       rmdir "$path" || continue
       job_update "$id" '.jobs[$id].recoveryPrunedAt=$now' --argjson now "$(date +%s)" || return 1
     done < <(jq -r '.jobs|to_entries|sort_by(-(.value.verifiedAt // .value.closedAt // 0))|.[]|select(.value.status=="COMPLETED" or .value.status=="RETIRED" or .value.status=="CLOSED_BY_OPERATOR")|.key' "$STATE_FILE")

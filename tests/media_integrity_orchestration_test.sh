@@ -47,4 +47,12 @@ else
  jq -e '.status=="OK" and .lastCompletedScanAt>0 and .notification=="suppressed"' "$STATUS_DIR/media_integrity_audit.json" >/dev/null
  [[ -f "$STATE_FILE" && ! -e "$STATE_DIR/pending-notification.json" ]]
  printf 'Whole host launch, streaming checkpoint, worker exit, final receipt and quiet healthy completion passed\n'
+ original_scan_hash=$(sha256sum "$STATUS_DIR/media_integrity_audit.json"|cut -d ' ' -f1)
+ AUTO_RECOVERY_ENABLED=true;WORKER_FINISHED=false
+ recovery_process(){ printf 'API reconciliation\n' >"$fixture/api-tick"; }
+ workload_guard(){ printf 'Unexpected media guard\n' >&2;return 1; }
+ main --recovery-tick
+ [[ -f "$fixture/api-tick" && "$original_scan_hash" == $(sha256sum "$STATUS_DIR/media_integrity_audit.json"|cut -d ' ' -f1) ]]
+ jq -e '.status=="OK" and .stats.mode=="recovery_tick"' "$STATUS_DIR/media_integrity_recovery.json" >/dev/null
+ printf 'API-only recovery tick preserves scan receipt and avoids media/Bazarr guard/decode\n'
 fi

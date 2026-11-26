@@ -24,6 +24,13 @@ clearLog=true
 OPS_SCRIPT_ID="backup_restore_drill"
 # shellcheck shell=bash
 # Embedded operations contract v2; generated into standalone User Scripts.
+# Millisecond timing without spawning date on supported Bash; GNU fallback.
+usr_ops_now_ms() {
+    local stamp="${EPOCHREALTIME:-}"
+    if [[ "$stamp" =~ ^[0-9]+\.[0-9]{6}$ ]];then stamp=${stamp/./};printf '%s\n' "${stamp:0:${#stamp}-3}"
+    else stamp=$(date +%s%N) || return 1;printf '%s\n' "${stamp:0:${#stamp}-6}";fi
+}
+
 usr_ops_log_line() {
     local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
     case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
@@ -155,7 +162,8 @@ usr_ops_execution_record() (
     tmp=$(mktemp "$root/.execution.XXXXXX") || return 1;trap 'rm -f -- "$tmp"' EXIT
     jq -n --argjson old "$old" --arg processStart "$process_start" --arg name "$OPS_SCRIPT_ID" --arg boot "$boot" --arg status "$status" --argjson started "$started" --argjson at "$now" --argjson pid "$pid" --argjson rc "$rc" \
       '$old+{schema:1,name:$name,boot:$boot,executionStatus:$status,startedAt:$started,observedAt:$at,pid:$pid,processStart:$processStart,lastExitCode:$rc} |
-       if $status!="RUNNING" then .finishedAt=$at|.durationSeconds=($at-$started)|.lastCompletedAt=$at|if $rc==0 then .lastSuccessAt=$at else . end else . end' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
+       if $status!="RUNNING" then .finishedAt=$at|.durationSeconds=($at-$started)|.lastCompletedAt=$at|if $rc==0 then .lastSuccessAt=$at else . end
+       else .previousRun={startedAt:$old.startedAt,finishedAt:$old.finishedAt,status:$old.executionStatus,exitCode:$old.lastExitCode,durationSeconds:$old.durationSeconds}|.finishedAt=null|.durationSeconds=null|.lastExitCode=null end' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
     local persistent="${USR_OPS_EXECUTION_PERSISTENT_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/execution}" fd export_fd
     mountpoint -q "${USR_OPS_VAULT_MOUNT:-/mnt/vault}" || return 0
     [[ ! -L "$persistent" && $(realpath -m "$persistent") == "$persistent" ]] || return 1
@@ -194,6 +202,22 @@ usr_ops_supervise() {
     [[ "$record_owner" != true ]] || usr_ops_execution_record finish "$started" "$pid" "$rc" || printf 'Completion receipt unavailable for %s (exit=%s).\n' "$OPS_SCRIPT_ID" "$rc" >&2
     trap - TERM HUP INT
     return "$rc"
+}
+
+# Network observation after an accepted shutdown, never a power-state claim.
+# No WOL or second poweroff is issued. Native maintenance checks remain upstream.
+usr_ops_observe_shutdown() {
+    local BACKUP_SSH_COMMAND_TIMEOUT=6
+    local host="${REMOTE#*@}" deadline=$(( $(date +%s)+${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90} )) misses=0
+    [[ "${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90}" != 0 ]] || { SHUTDOWN_RESULT=requested_observation_disabled;return 0; }
+    while (( $(date +%s)<deadline ));do
+        if timeout --kill-after=1 5 ping -c 1 -W 2 "$host" >/dev/null 2>&1 || backup_ssh true >/dev/null 2>&1;then misses=0
+        else misses=$((misses+1));fi
+        if ((misses>=3));then SHUTDOWN_RESULT=offline_observed;return 0;fi
+        sleep 5
+    done
+    SHUTDOWN_RESULT=requested_still_reachable;REMOTE_SHUTDOWN_FAILED=1
+    return 1
 }
 # END EMBEDDED OPERATIONS CONTRACT
 # BEGIN SCHEDULED EXECUTION SUPERVISOR
@@ -429,7 +453,7 @@ US_CRON_VERIFY
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.5.1"
+readonly SCRIPT_VERSION="1.6.0"
 
 ###############################################################################
 # CONFIGURATION
@@ -444,7 +468,7 @@ DRILL_ROOT="${DRILL_ROOT:-/mnt/vault/restore_drill}"
 # Otherwise use archive base names without .tar.gz.
 APPDATA_ARCHIVE_ALLOWLIST=()
 
-MAX_APPDATA_ARCHIVES="${MAX_APPDATA_ARCHIVES:-2}"
+MAX_APPDATA_ARCHIVES="${MAX_APPDATA_ARCHIVES:-3}"
 MAX_EXTRACT_BYTES="${MAX_EXTRACT_BYTES:-$((64 * 1024 * 1024 * 1024))}"
 CHECK_SQLITE_DATABASES="${CHECK_SQLITE_DATABASES:-true}"
 SQLITE_MAX_FILES="${SQLITE_MAX_FILES:-200}"
@@ -786,9 +810,19 @@ select_appdata_archives() {
     done <"$APPDATA_BACKUP/backup_manifest.tsv"
     count=${#names[@]}
     (( count == expected )) || return 1
-    start=$(( ($(date +%s) / 604800 * 2) % count ))
+    # Evidence-based ordering survives missed weeks and changing app inventories.
+    local ordering="$LOG_DIR/.archive-order.$$" coverage="$LOG_DIR/restore-coverage.json" rows="$LOG_DIR/.archive-rows.$$" rank
+    [[ -f "$coverage" ]] || printf '{"schema":1,"archives":{}}' >"$coverage"
+    : >"$rows"
+    for ((i=0;i<count;i++));do jq -nc --arg name "${names[$i]}" --arg hash "${hashes[$i]}" --argjson index "$i" '{name:$name,hash:$hash,index:$index}' >>"$rows";done
+    jq -sr --slurpfile coverage "$coverage" --argjson now "$(date +%s)" '
+      sort_by(. as $r|($coverage[0].archives[$r.name] // {}) as $old |
+        (if (["sonarr","radarr","pihole","plex-media","plex-media-server"]|index($r.name))!=null then 21 else 90 end) as $days |
+        [if ($old.verifiedAt // 0)==0 then 0 else 1 end, -(($now-($old.verifiedAt // 0))/($days*86400)), if $old.sha256!=$r.hash then 0 else 1 end,.name])|.[].index' "$rows" >"$ordering" || return 1
+    local -a priority=();mapfile -t priority <"$ordering";rm -f "$rows" "$ordering"
+    start=0
     for ((j=0; j<count; j++)); do
-        i=$(( (start+j) % count ))
+        i=${priority[$j]}
         selected_archive "${names[$i]}" || continue
         if (( ${raws[$i]} > MAX_EXTRACT_BYTES || ${sizes[$i]} > MAX_EXTRACT_BYTES )) || { (( ${raws[$i]}==0 )) && [[ "${names[$i]}" == plex-media-server || "${names[$i]}" == plex-media ]]; }; then
             if [[ "${names[$i]}" == plex-media-server || "${names[$i]}" == plex-media ]];then
@@ -1123,7 +1157,7 @@ promote_drill() {
 
 main() {
     case "${1:-}" in
-        --help) printf 'Usage: bash script [--generation-root /mnt/user/backup/vault_versions/hubble-STAMP]\nRun on the host holding the backup. Default rotates two archives; MAX_APPDATA_ARCHIVES=0 selects all within MAX_EXTRACT_BYTES. Restored payload is removed; only evidence retained.\n'; return 0;;
+        --help) printf 'Usage: bash script [--generation-root /mnt/user/backup/vault_versions/hubble-STAMP]\nRun on the host holding the backup. Default checks three oldest/changed archives within the extraction budget; MAX_APPDATA_ARCHIVES=0 selects all within MAX_EXTRACT_BYTES. Restored payload is removed; only evidence retained.\n'; return 0;;
         --generation-root) [[ $# == 2 ]] || return 2; GENERATION_ROOT="$2";;
         "") ;;
         *) return 2;;

@@ -11,6 +11,13 @@ arrayStarted=true
 OPS_SCRIPT_ID="backup_health_audit"
 # shellcheck shell=bash
 # Embedded operations contract v2; generated into standalone User Scripts.
+# Millisecond timing without spawning date on supported Bash; GNU fallback.
+usr_ops_now_ms() {
+    local stamp="${EPOCHREALTIME:-}"
+    if [[ "$stamp" =~ ^[0-9]+\.[0-9]{6}$ ]];then stamp=${stamp/./};printf '%s\n' "${stamp:0:${#stamp}-3}"
+    else stamp=$(date +%s%N) || return 1;printf '%s\n' "${stamp:0:${#stamp}-6}";fi
+}
+
 usr_ops_log_line() {
     local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
     case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
@@ -142,7 +149,8 @@ usr_ops_execution_record() (
     tmp=$(mktemp "$root/.execution.XXXXXX") || return 1;trap 'rm -f -- "$tmp"' EXIT
     jq -n --argjson old "$old" --arg processStart "$process_start" --arg name "$OPS_SCRIPT_ID" --arg boot "$boot" --arg status "$status" --argjson started "$started" --argjson at "$now" --argjson pid "$pid" --argjson rc "$rc" \
       '$old+{schema:1,name:$name,boot:$boot,executionStatus:$status,startedAt:$started,observedAt:$at,pid:$pid,processStart:$processStart,lastExitCode:$rc} |
-       if $status!="RUNNING" then .finishedAt=$at|.durationSeconds=($at-$started)|.lastCompletedAt=$at|if $rc==0 then .lastSuccessAt=$at else . end else . end' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
+       if $status!="RUNNING" then .finishedAt=$at|.durationSeconds=($at-$started)|.lastCompletedAt=$at|if $rc==0 then .lastSuccessAt=$at else . end
+       else .previousRun={startedAt:$old.startedAt,finishedAt:$old.finishedAt,status:$old.executionStatus,exitCode:$old.lastExitCode,durationSeconds:$old.durationSeconds}|.finishedAt=null|.durationSeconds=null|.lastExitCode=null end' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
     local persistent="${USR_OPS_EXECUTION_PERSISTENT_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/execution}" fd export_fd
     mountpoint -q "${USR_OPS_VAULT_MOUNT:-/mnt/vault}" || return 0
     [[ ! -L "$persistent" && $(realpath -m "$persistent") == "$persistent" ]] || return 1
@@ -181,6 +189,22 @@ usr_ops_supervise() {
     [[ "$record_owner" != true ]] || usr_ops_execution_record finish "$started" "$pid" "$rc" || printf 'Completion receipt unavailable for %s (exit=%s).\n' "$OPS_SCRIPT_ID" "$rc" >&2
     trap - TERM HUP INT
     return "$rc"
+}
+
+# Network observation after an accepted shutdown, never a power-state claim.
+# No WOL or second poweroff is issued. Native maintenance checks remain upstream.
+usr_ops_observe_shutdown() {
+    local BACKUP_SSH_COMMAND_TIMEOUT=6
+    local host="${REMOTE#*@}" deadline=$(( $(date +%s)+${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90} )) misses=0
+    [[ "${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90}" != 0 ]] || { SHUTDOWN_RESULT=requested_observation_disabled;return 0; }
+    while (( $(date +%s)<deadline ));do
+        if timeout --kill-after=1 5 ping -c 1 -W 2 "$host" >/dev/null 2>&1 || backup_ssh true >/dev/null 2>&1;then misses=0
+        else misses=$((misses+1));fi
+        if ((misses>=3));then SHUTDOWN_RESULT=offline_observed;return 0;fi
+        sleep 5
+    done
+    SHUTDOWN_RESULT=requested_still_reachable;REMOTE_SHUTDOWN_FAILED=1
+    return 1
 }
 # END EMBEDDED OPERATIONS CONTRACT
 # BEGIN SCHEDULED EXECUTION SUPERVISOR
@@ -414,7 +438,7 @@ US_CRON_VERIFY
 }
 # END EMBEDDED USER SCRIPTS CATALOG
 set -uo pipefail
-readonly SCRIPT_VERSION="1.13.0"
+readonly SCRIPT_VERSION="1.14.0"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/backup_health_audit}"
 APPDATA_ROOT="${APPDATA_ROOT:-/mnt/vault/backup/cache}"
@@ -478,8 +502,8 @@ audit_media_integrity_monitor() {
     if ! jq -e '.schema==1 and (.lastCompletedScanAt|type)=="number" and (.firstScheduledAt|type)=="number"' "$receipt" >/dev/null 2>&1; then
         finding 'Media integrity audit: completion/schedule receipt missing or invalid';return
     fi
-    completed=$(jq -r .lastCompletedScanAt "$receipt");first=$(jq -r .firstScheduledAt "$receipt")
-    progress=$(jq -r --argjson now "$NOW" '.lastProgressScanAt as $p | if ($p|type)=="number" and $p>0 and $p<=$now+300 then $p else 0 end' "$receipt")
+    completed=$(jq -r 'if .evidenceSchema==2 then (.lastRealScanAt // 0) else .lastCompletedScanAt end' "$receipt");first=$(jq -r .firstScheduledAt "$receipt")
+    progress=$(jq -r --argjson now "$NOW" '(if .evidenceSchema==2 then .lastDecodeProgressAt else .lastProgressScanAt end) as $p | if ($p|type)=="number" and $p>0 and $p<=$now+300 then $p else 0 end' "$receipt")
     ((progress<=completed)) || completed="$progress"
     max_gap=$(jq -r '.schedule.maxGapSeconds // 691200' "$receipt")
     [[ "$max_gap" =~ ^[1-9][0-9]*$ ]] && ((max_gap>=86400 && max_gap<=1382400)) || max_gap=691200
@@ -671,6 +695,50 @@ audit_script_executions() {
     fi
 }
 
+audit_deployed_code() {
+    local registry="$STATUS_DIR/deployments.json" name role path expected actual
+    if [[ ! -f "$registry" ]];then
+      [[ ! -e "$STATUS_DIR/.deployment-enrolled" ]] || finding 'Deployment registry missing after enrollment; code provenance needs review'
+      return 0
+    fi
+    jq -e '.schema==1 and (.scripts|type)=="object"' "$registry" >/dev/null || { finding 'Deployment registry invalid; no scripts were changed';return; }
+    while IFS=$'\t' read -r name role path;do
+      expected=$(jq -r --arg role "$role" '.scripts[$role].sha256 // ""' "$registry")
+      if [[ -z "$expected" ]];then finding "Deployment: installed script $name is not enrolled; record its reviewed code before trusting drift checks";continue;fi
+      actual=$(sha256sum "$path"|cut -d ' ' -f1)
+      [[ "$actual" == "$expected" ]] || finding "Deployment: $name differs from its reviewed live-script checksum; inspect code/private setting edits. No overwrite or execution was attempted"
+    done < <(jq -r '.jobs[]|select(.present)|[.name,.role,.physicalPath]|@tsv' "$AUDIT_CATALOG_FILE")
+}
+
+audit_restore_coverage() {
+    local file="${RESTORE_COVERAGE_FILE:-/mnt/vault/cloud/logs/script/backup_restore_drill/restore-coverage.json}" name at scope
+    [[ -f "$file" ]] || return 0
+    while IFS=$'\t' read -r name at scope;do
+      ((at>0)) || continue
+      local allowance=$((90*86400));case "$name" in sonarr|radarr|pihole|plex-media|plex-media-server) allowance=$((21*86400));;esac
+      ((NOW-at<=allowance)) || finding "Restore coverage: $name last successful $scope restore is older than $((allowance/86400)) days; oldest-first bounded drill will prioritize it"
+    done < <(jq -r '.archives|to_entries[]|[.key,.value.verifiedAt,.value.scope]|@tsv' "$file")
+}
+
+audit_ram_archive_payloads() {
+    audit_script_active ram_logs_watchdog || return 0
+    local root="${RAMLOG_ARCHIVE_ROOT:-/mnt/vault/cloud/logs/ram_logs_watchdog_archives}" dir mark="$STATE_DIR/ram-payload-verification.json" previous=0 signature='' now_sig
+    if [[ -f "$mark" ]];then previous=$(jq -r '.at // 0' "$mark");signature=$(jq -r '.signature // ""' "$mark");fi
+    now_sig=$(find "$root" -mindepth 2 -maxdepth 2 -name SHA256SUMS -type f -exec sha256sum {} + 2>/dev/null|sort|sha256sum|cut -d ' ' -f1)
+    # Avoid rehashing rolling payloads every hour; verify at most once weekly.
+    ((NOW-previous>=604800)) || return 0
+    local success=true checked=0
+    while IFS= read -r -d '' dir;do
+      [[ -d "$dir" && ! -L "$dir" && -f "$dir/.owner" && $(cat "$dir/.owner") == ramlog_archive && -f "$dir/SHA256SUMS" ]] || continue
+      # Only two bounded managed generations; reject extra paths in manifests.
+      if ! awk 'NF!=2 || ($2!="payload.tar.gz" && $2!="manifest.json"){bad=1}END{exit bad}' "$dir/SHA256SUMS" || ! (cd "$dir" && timeout --kill-after=2 180 sha256sum -c SHA256SUMS >/dev/null) || ! timeout --kill-after=2 60 gzip -t "$dir/payload.tar.gz";then
+        success=false;finding "RAM logs: retained payload checksum/CRC failed for ${dir##*/}; archive preserved for review"
+      fi
+      checked=$((checked+1));((checked<2)) || break
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -name 'ramlogs_*' -print0 2>/dev/null)
+    if [[ "$success" == true && "$checked" != 0 ]];then jq -n --argjson at "$NOW" --arg signature "$now_sig" '{at:$at,signature:$signature}' >"$mark.tmp" && mv "$mark.tmp" "$mark";fi
+}
+
 audit_backups() {
     local latest path created epoch=0 request delivered requested source manifest old_digest new_digest log copy_epoch=0
     latest=$(latest_path "$APPDATA_ROOT" d 'backup_[0-9]*_[0-9]*')
@@ -744,7 +812,7 @@ main() {
     flock -s -n "$export_fd" || return 0
     trap '[[ -z "${AUDIT_CATALOG_FILE:-}" ]] || rm -f -- "$AUDIT_CATALOG_FILE"' EXIT
     local previous='' last=0 fingerprint temp status=OK importance=normal body
-    audit_runtime; usr_ops_retry_deliveries || true; audit_script_executions; audit_backups; audit_recovery_inventory; audit_disk_health_monitor; audit_media_integrity_monitor; audit_media_coordination; audit_update_coordinator
+    audit_runtime; audit_deployed_code; audit_restore_coverage; audit_ram_archive_payloads; usr_ops_retry_deliveries || true; audit_script_executions; audit_backups; audit_recovery_inventory; audit_disk_health_monitor; audit_media_integrity_monitor; audit_media_coordination; audit_update_coordinator
     fingerprint=$(printf '%s\n' "${FINDINGS[@]}" | sort | sha256sum | awk '{print $1}')
     if [[ -f "$STATE_DIR/state.json" ]]; then
         jq -e '.fingerprint|type=="string"' "$STATE_DIR/state.json" >/dev/null || { printf 'Invalid audit state preserved.\n' >&2; return 1; }

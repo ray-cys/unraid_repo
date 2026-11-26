@@ -78,6 +78,7 @@ fi
     retirement = r'''
 source "$1"
 RUNTIME_DIR="$2";STATE_DIR="$2";VERIFY_RUNTIME_DIR="$2";WORK_STATE="$2/state.json"
+ARR_RETIREMENT_DAYS=90 # Compare unchanged retirement decisions under identical policy; 30-day policy is tested separately.
 RUN_AT='2026-11-24T00:00:00+0800';DRY_RUN=true;RETIREMENTS_CANCELLED=0;ARR_REMOVALS=0;RETIREMENTS_STARTED=0
 RADARR_QUEUE_AVAILABLE=true
 TAG_CATALOG='[{"id":1,"label":"plex-deleted"},{"id":2,"label":"keep-in-arr"}]'

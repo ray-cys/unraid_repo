@@ -91,6 +91,13 @@ arrayStarted=true
 OPS_SCRIPT_ID="media_integrity_audit"
 # shellcheck shell=bash
 # Embedded operations contract v2; generated into standalone User Scripts.
+# Millisecond timing without spawning date on supported Bash; GNU fallback.
+usr_ops_now_ms() {
+    local stamp="${EPOCHREALTIME:-}"
+    if [[ "$stamp" =~ ^[0-9]+\.[0-9]{6}$ ]];then stamp=${stamp/./};printf '%s\n' "${stamp:0:${#stamp}-3}"
+    else stamp=$(date +%s%N) || return 1;printf '%s\n' "${stamp:0:${#stamp}-6}";fi
+}
+
 usr_ops_log_line() {
     local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
     case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
@@ -222,7 +229,8 @@ usr_ops_execution_record() (
     tmp=$(mktemp "$root/.execution.XXXXXX") || return 1;trap 'rm -f -- "$tmp"' EXIT
     jq -n --argjson old "$old" --arg processStart "$process_start" --arg name "$OPS_SCRIPT_ID" --arg boot "$boot" --arg status "$status" --argjson started "$started" --argjson at "$now" --argjson pid "$pid" --argjson rc "$rc" \
       '$old+{schema:1,name:$name,boot:$boot,executionStatus:$status,startedAt:$started,observedAt:$at,pid:$pid,processStart:$processStart,lastExitCode:$rc} |
-       if $status!="RUNNING" then .finishedAt=$at|.durationSeconds=($at-$started)|.lastCompletedAt=$at|if $rc==0 then .lastSuccessAt=$at else . end else . end' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
+       if $status!="RUNNING" then .finishedAt=$at|.durationSeconds=($at-$started)|.lastCompletedAt=$at|if $rc==0 then .lastSuccessAt=$at else . end
+       else .previousRun={startedAt:$old.startedAt,finishedAt:$old.finishedAt,status:$old.executionStatus,exitCode:$old.lastExitCode,durationSeconds:$old.durationSeconds}|.finishedAt=null|.durationSeconds=null|.lastExitCode=null end' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
     local persistent="${USR_OPS_EXECUTION_PERSISTENT_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/execution}" fd export_fd
     mountpoint -q "${USR_OPS_VAULT_MOUNT:-/mnt/vault}" || return 0
     [[ ! -L "$persistent" && $(realpath -m "$persistent") == "$persistent" ]] || return 1
@@ -261,6 +269,22 @@ usr_ops_supervise() {
     [[ "$record_owner" != true ]] || usr_ops_execution_record finish "$started" "$pid" "$rc" || printf 'Completion receipt unavailable for %s (exit=%s).\n' "$OPS_SCRIPT_ID" "$rc" >&2
     trap - TERM HUP INT
     return "$rc"
+}
+
+# Network observation after an accepted shutdown, never a power-state claim.
+# No WOL or second poweroff is issued. Native maintenance checks remain upstream.
+usr_ops_observe_shutdown() {
+    local BACKUP_SSH_COMMAND_TIMEOUT=6
+    local host="${REMOTE#*@}" deadline=$(( $(date +%s)+${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90} )) misses=0
+    [[ "${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90}" != 0 ]] || { SHUTDOWN_RESULT=requested_observation_disabled;return 0; }
+    while (( $(date +%s)<deadline ));do
+        if timeout --kill-after=1 5 ping -c 1 -W 2 "$host" >/dev/null 2>&1 || backup_ssh true >/dev/null 2>&1;then misses=0
+        else misses=$((misses+1));fi
+        if ((misses>=3));then SHUTDOWN_RESULT=offline_observed;return 0;fi
+        sleep 5
+    done
+    SHUTDOWN_RESULT=requested_still_reachable;REMOTE_SHUTDOWN_FAILED=1
+    return 1
 }
 # END EMBEDDED OPERATIONS CONTRACT
 # BEGIN EMBEDDED USER SCRIPTS CATALOG
@@ -555,7 +579,7 @@ umask 077
 # stay unverified. Completed ranges prove decoder acceptance, not perfect visual
 # playback. Legacy probe-only incidents are re-evaluated without replacing media.
 # Worker transport failures preserve the last checkpoint and never accuse media.
-readonly SCRIPT_VERSION="2.6.4"
+readonly SCRIPT_VERSION="2.7.0"
 BAZARR_CONTAINER="bazarr"
 MEDIA_HOST_ROOT="/mnt/user/media"
 MEDIA_CONTAINER_ROOT="/data"
@@ -803,6 +827,9 @@ integrity_notify() {
 }
 
 write_report() {
+    if [[ "$STATUS_DIR" == /mnt/vault/cloud/logs/script/user_scripts_status ]];then
+      case "${BASH_SOURCE[0]}" in /boot/config/plugins/user.scripts/scripts/*/script|/tmp/user.scripts/tmpScripts/*/script) ;; *) printf 'Production integrity reporting requires the installed User Script; use private fixture roots for validation.\n' >&2;return 1;;esac
+    fi
     local rc=0
     exec {INTEGRITY_REPORT_EXPORT_FD}>"$STATE_EXPORT_LOCK" || return 1
     if ! flock -s -w 30 "$INTEGRITY_REPORT_EXPORT_FD";then exec {INTEGRITY_REPORT_EXPORT_FD}>&-;return 1;fi
@@ -956,7 +983,7 @@ render_report() {
     if [[ -f "$STATUS_DIR/media_integrity_audit.json" ]];then
         completed=$(jq -r '.lastCompletedScanAt // 0' "$STATUS_DIR/media_integrity_audit.json");installed=$(jq -r '.installedAt // .epoch' "$STATUS_DIR/media_integrity_audit.json");first=$(jq -r '.firstScheduledAt // .epoch' "$STATUS_DIR/media_integrity_audit.json")
     fi
-    if [[ "$MODE" == scan && "$WORKER_FINISHED" == true && "$status" != FAILED && "$status" != DEFERRED ]] && jq -e '.inventoryComplete==true' "$TMP_DIR/stats.json" >/dev/null;then completed="$now";fi
+    if [[ "$MODE" == scan && "$WORKER_FINISHED" == true && "$status" != FAILED && "$status" != DEFERRED ]] && jq -e '.inventoryComplete==true and (.validationOnly // false)==false' "$TMP_DIR/stats.json" >/dev/null;then completed="$now";fi
     local progress_completed=0
     [[ ! -f "$STATUS_DIR/media_integrity_audit.json" ]] || progress_completed=$(jq -r '.lastProgressScanAt // 0' "$STATUS_DIR/media_integrity_audit.json")
     if [[ "$MODE" == scan && "$WORKER_FINISHED" == true && "$status" != FAILED ]] && jq -e '.inventoryComplete==true and ((.segmentsPassed // 0)>0 or (.quickPassed // 0)>0)' "$TMP_DIR/stats.json" >/dev/null;then progress_completed="$now";fi
@@ -969,7 +996,18 @@ render_report() {
     local delivery=suppressed;((sent==0)) || delivery=sent;[[ ! -f "$STATE_DIR/pending-notification.json" ]] || delivery=failed
     local current_schedule
     current_schedule=$(usr_scripts_schedule_evidence media_integrity_audit) || current_schedule='{"verified":false}'
-    jq --argjson schedule "$current_schedule" --arg notification "$delivery" --arg version "$SCRIPT_VERSION" --argjson progress "$progress_completed" --argjson completed "$completed" --argjson installed "$installed" --argjson first "$first" '.+{notification:$notification,scriptVersion:$version,schedule:$schedule,lastCompletedScanAt:$completed,lastProgressScanAt:$progress,installedAt:$installed,firstScheduledAt:$first}' "$temp" >"$STATUS_DIR/.media-integrity-audit.new" && mv "$STATUS_DIR/.media-integrity-audit.new" "$STATUS_DIR/media_integrity_audit.json" || return 1
+    local destination="$STATUS_DIR/media_integrity_audit.json" real_scan=0 decode_progress=0 inventory_at=0
+    if [[ -f "$destination" ]];then
+      real_scan=$(jq -r '.lastRealScanAt // 0' "$destination");decode_progress=$(jq -r '.lastDecodeProgressAt // 0' "$destination");inventory_at=$(jq -r '.lastInventoryCompletedAt // 0' "$destination")
+    fi
+    if [[ "$MODE" == scan && "$WORKER_FINISHED" == true && "$status" != FAILED && "$status" != DEFERRED ]] && jq -e '(.validationOnly // false)==false' "$TMP_DIR/stats.json" >/dev/null;then
+      real_scan="$now"
+      jq -e '.inventoryComplete==true' "$TMP_DIR/stats.json" >/dev/null && inventory_at="$now"
+      jq -e '(.mediaSecondsDecoded // 0)>0 or (.segmentsPassed // 0)>0' "$TMP_DIR/stats.json" >/dev/null && decode_progress="$now"
+    fi
+    [[ "$MODE" != tick ]] || destination="$STATUS_DIR/media_integrity_recovery.json"
+    jq --argjson real "$real_scan" --argjson decoded "$decode_progress" --argjson inventory "$inventory_at" --argjson schedule "$current_schedule" --arg notification "$delivery" --arg version "$SCRIPT_VERSION" --argjson progress "$progress_completed" --argjson completed "$completed" --argjson installed "$installed" --argjson first "$first" '.+{evidenceSchema:2,lastRealScanAt:$real,lastDecodeProgressAt:$decoded,lastInventoryCompletedAt:$inventory,notification:$notification,scriptVersion:$version,schedule:$schedule,lastCompletedScanAt:$completed,lastProgressScanAt:$progress,installedAt:$installed,firstScheduledAt:$first}' "$temp" >"$destination.new" && mv "$destination.new" "$destination" || return 1
+
     RUN_REPORT_WRITTEN=true;log INFO "$(jq -r .summary "$temp")";rm -f "$temp"
 }
 
@@ -2168,6 +2206,7 @@ main() {
         'Missing mounts, maintenance, active parity/Mover/backups or Plex transcoding defer/stop work.' \
         '--status reads only saved receipts. --inventory-only stats library paths and saves inventory; no decoding or normal email.' \
         'AUTO_RECOVERY_ENABLED=false: observe for several weeks before changing it. No CLI option bypasses the switch.' \
+        '--recovery-tick performs bounded API follow-up only; no media decoding and no scan-freshness advance.' \
         '--recovery-status reads the journal only. --recover-only handles bounded Arr recovery; the existing Arr monitor invokes it in four-hour action windows.' \
         'When enabled: two distinct confirming audit runs, exact monitored Arr file/target IDs, no active work, original retained in place, durable intents, one exact release grab, full replacement verification.' \
         'Originals remain in their library locations until Arr replaces/recycles them. No repair_hold, file deletion or forced import. Required/blocked/completed replacement updates are grouped.' \
@@ -2175,6 +2214,7 @@ main() {
       --status) [[ ! -f "$STATUS_DIR/media_integrity_audit.json" ]] || jq . "$STATUS_DIR/media_integrity_audit.json";return 0;;
       --inventory-only) MODE=inventory;;
       --recovery-status) recovery_valid || return 1; jq '{schema,workflow,actions:[.actions|to_entries[]|{id:.key,app:.value.app,path:.value.path,status:.value.status,reason:.value.reason,parentId:.value.parentId,fileId:.value.fileId,targets:.value.targets,selected:.value.selected.title,downloadId:.value.downloadId,replacementFiles:.value.replacementFiles,replacementVerifiedAt:.value.replacementVerifiedAt,events:.value.events}]}' "$RECOVERY_FILE";return 0;;
+      --recovery-tick) MAX_RUNTIME_SECONDS=60;RECOVERY_MAX_SECONDS=20;[[ "$AUTO_RECOVERY_ENABLED" == true ]] || { printf 'Automatic recovery disabled; no API action.\n';return 0; };MODE=tick;;
       --recover-only) MAX_RUNTIME_SECONDS=210;[[ "$AUTO_RECOVERY_ENABLED" == true ]] || { printf 'Automatic media recovery disabled; observation only.\n'; return 0; };MODE=recover;;
       '') ;;
       *) printf 'Unknown option; use --help.\n' >&2;return 2;;
@@ -2212,15 +2252,21 @@ main() {
     log INFO "Media Integrity Audit v$SCRIPT_VERSION started; mode=$MODE; scope=${LIBRARY_SUBDIRS[*]}; budget=${MAX_RUNTIME_SECONDS}s"
     if ! load_state; then write_report FAILED 'State invalid/unrecoverable; original state preserved and no scan started';return 1;fi
     if app_update_requested integrity;then write_report DEFERRED "Bazarr or coordinated Arr update requested; existing coverage and recovery state retained";return 0;fi
-    if ! workload_guard; then
+    if [[ "$MODE" != tick ]] && ! workload_guard; then
         status=DEFERRED
         case "$GUARD_REASON" in *unavailable*|*unverified*|*stopped*|*symlinked*) status=FAILED;; esac
         write_report "$status" "$GUARD_REASON";[[ "$status" != FAILED ]];return $?
     fi
     if ! recovery_valid; then write_report FAILED 'Invalid/symlinked recovery journal; no scan or mutation started; recovery holds preserved';return 1;fi
     if [[ "$MODE" == recover ]]; then trap 'exit 143' INT TERM HUP;fi
+    local recovery_tick_status=OK
     if [[ "$MODE" != inventory ]]; then
-        if ! recovery_process; then RECOVERY_NOTE='Native recovery follow-up incomplete; original/library state remains Arr-managed. Exact job/checkpoints retained; no uncertain request replayed';fi
+        if ! recovery_process; then recovery_tick_status=DEFERRED;RECOVERY_NOTE='Native recovery follow-up incomplete; original/library state remains Arr-managed. Exact job/checkpoints retained; no uncertain request replayed';fi
+    fi
+    if [[ "$MODE" == tick ]];then
+        printf '{"mode":"recovery_tick","inventoryComplete":false,"reason":"API-only recovery reconciliation; no inventory or decode was performed"}' >"$TMP_DIR/stats.json"
+        if [[ "$recovery_tick_status" == OK ]];then write_report OK 'API-only recovery follow-up completed; heavy verification remains in the scheduled audit'
+        else write_report DEFERRED "$RECOVERY_NOTE";fi;return $?
     fi
     recovery_schedule || return 1
     if [[ "$MODE" == recover ]] && ! jq -e '.paths|length>0' "$TMP_DIR/recovery-schedule.json" >/dev/null;then

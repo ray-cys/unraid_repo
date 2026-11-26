@@ -60,6 +60,13 @@ clearLog=true
 OPS_SCRIPT_ID="media_torrent_management"
 # shellcheck shell=bash
 # Embedded operations contract v2; generated into standalone User Scripts.
+# Millisecond timing without spawning date on supported Bash; GNU fallback.
+usr_ops_now_ms() {
+    local stamp="${EPOCHREALTIME:-}"
+    if [[ "$stamp" =~ ^[0-9]+\.[0-9]{6}$ ]];then stamp=${stamp/./};printf '%s\n' "${stamp:0:${#stamp}-3}"
+    else stamp=$(date +%s%N) || return 1;printf '%s\n' "${stamp:0:${#stamp}-6}";fi
+}
+
 usr_ops_log_line() {
     local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
     case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
@@ -191,7 +198,8 @@ usr_ops_execution_record() (
     tmp=$(mktemp "$root/.execution.XXXXXX") || return 1;trap 'rm -f -- "$tmp"' EXIT
     jq -n --argjson old "$old" --arg processStart "$process_start" --arg name "$OPS_SCRIPT_ID" --arg boot "$boot" --arg status "$status" --argjson started "$started" --argjson at "$now" --argjson pid "$pid" --argjson rc "$rc" \
       '$old+{schema:1,name:$name,boot:$boot,executionStatus:$status,startedAt:$started,observedAt:$at,pid:$pid,processStart:$processStart,lastExitCode:$rc} |
-       if $status!="RUNNING" then .finishedAt=$at|.durationSeconds=($at-$started)|.lastCompletedAt=$at|if $rc==0 then .lastSuccessAt=$at else . end else . end' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
+       if $status!="RUNNING" then .finishedAt=$at|.durationSeconds=($at-$started)|.lastCompletedAt=$at|if $rc==0 then .lastSuccessAt=$at else . end
+       else .previousRun={startedAt:$old.startedAt,finishedAt:$old.finishedAt,status:$old.executionStatus,exitCode:$old.lastExitCode,durationSeconds:$old.durationSeconds}|.finishedAt=null|.durationSeconds=null|.lastExitCode=null end' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
     local persistent="${USR_OPS_EXECUTION_PERSISTENT_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/execution}" fd export_fd
     mountpoint -q "${USR_OPS_VAULT_MOUNT:-/mnt/vault}" || return 0
     [[ ! -L "$persistent" && $(realpath -m "$persistent") == "$persistent" ]] || return 1
@@ -231,6 +239,22 @@ usr_ops_supervise() {
     trap - TERM HUP INT
     return "$rc"
 }
+
+# Network observation after an accepted shutdown, never a power-state claim.
+# No WOL or second poweroff is issued. Native maintenance checks remain upstream.
+usr_ops_observe_shutdown() {
+    local BACKUP_SSH_COMMAND_TIMEOUT=6
+    local host="${REMOTE#*@}" deadline=$(( $(date +%s)+${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90} )) misses=0
+    [[ "${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90}" != 0 ]] || { SHUTDOWN_RESULT=requested_observation_disabled;return 0; }
+    while (( $(date +%s)<deadline ));do
+        if timeout --kill-after=1 5 ping -c 1 -W 2 "$host" >/dev/null 2>&1 || backup_ssh true >/dev/null 2>&1;then misses=0
+        else misses=$((misses+1));fi
+        if ((misses>=3));then SHUTDOWN_RESULT=offline_observed;return 0;fi
+        sleep 5
+    done
+    SHUTDOWN_RESULT=requested_still_reachable;REMOTE_SHUTDOWN_FAILED=1
+    return 1
+}
 # END EMBEDDED OPERATIONS CONTRACT
 # BEGIN SCHEDULED EXECUTION SUPERVISOR
 if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$OPS_SCRIPT_ID" ]];then
@@ -238,7 +262,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
-readonly SCRIPT_VERSION="3.4.1"
+readonly SCRIPT_VERSION="3.5.0"
 
 umask 0002
 
@@ -1416,6 +1440,8 @@ process_payload_file() {
 }
 
 process_category() {
+    local category_started=$(usr_ops_now_ms)
+    local category_bytes=0 category_files=0
     local category="$1" destination="$2" source="${COMPLETE_DIR}/$1"
     local unit name target rc listing moved=0 deferred=0
     if ! has_files "$source"; then
@@ -1440,6 +1466,7 @@ process_category() {
         target="$destination/$name"
         [[ ! -L "$target" ]] || { log error "MV: symlink destination retained: $target"; return 1; }
         transfer_checkpoint category_intent "$unit" "$target" || return 1
+        category_bytes=$((category_bytes+${QBIT_PROVEN_BYTES:-0}));category_files=$((category_files+${QBIT_PROVEN_FILES:-0}))
         if [[ -d "$unit" ]]; then
             normalize_names "$unit" || return 1
         fi
@@ -1456,6 +1483,7 @@ process_category() {
         ((moved++)) || true
     done <"$listing"
     rm -f -- "$listing"
+    log info "CATEGORY TIMING: '$category' elapsed=$(( $(usr_ops_now_ms)-category_started ))ms candidate-files=$category_files candidate-bytes=$category_bytes processed-units=$moved retained-units=$deferred; bytes are source observations, not measured network traffic"
     log info "CATEGORY: '$category' processed=$moved retained=$deferred; unregistered completed-folder payloads require no age or repeat observation"
 }
 
@@ -1656,7 +1684,8 @@ payload_completion_proven() {
     # Never move symlinks or obvious qBittorrent partial payloads, even if the
     # corresponding record has disappeared. No timers/stability counters used.
     markers=$(mktemp "$QBIT_RUNTIME/payload-markers.XXXXXX") || return 1
-    if ! find "$source" \( -type l -o -name '*.\!qB' \) -print0 >"$markers"; then
+    : >"$markers.stats"
+    if ! find "$source" \( -type l -o -name '*.\!qB' \) -print0 -o -type f -fprintf "$markers.stats" '%s\n' >"$markers"; then
         rm -f -- "$markers"; return 1
     fi
     if [[ -s "$markers" || ( ! -f "$source" && ! -d "$source" ) ]]; then
@@ -1664,7 +1693,8 @@ payload_completion_proven() {
         log warn "RETAIN: payload contains a symlink, partial-download marker, or unsupported entry: $source"
         return 1
     fi
-    rm -f -- "$markers"
+    IFS=' ' read -r QBIT_PROVEN_FILES QBIT_PROVEN_BYTES < <(awk '{n++;b+=$1}END{printf "%.0f %.0f\n",n,b}' "$markers.stats")
+    rm -f -- "$markers" "$markers.stats"
     if [[ "$matched" == true ]]; then
         log info "ELIGIBLE: exact registered torrent is complete and stopped: $source"
     else

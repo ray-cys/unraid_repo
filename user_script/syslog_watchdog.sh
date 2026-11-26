@@ -48,6 +48,13 @@ clearLog=true
 OPS_SCRIPT_ID="syslog_watchdog"
 # shellcheck shell=bash
 # Embedded operations contract v2; generated into standalone User Scripts.
+# Millisecond timing without spawning date on supported Bash; GNU fallback.
+usr_ops_now_ms() {
+    local stamp="${EPOCHREALTIME:-}"
+    if [[ "$stamp" =~ ^[0-9]+\.[0-9]{6}$ ]];then stamp=${stamp/./};printf '%s\n' "${stamp:0:${#stamp}-3}"
+    else stamp=$(date +%s%N) || return 1;printf '%s\n' "${stamp:0:${#stamp}-6}";fi
+}
+
 usr_ops_log_line() {
     local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
     case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
@@ -179,7 +186,8 @@ usr_ops_execution_record() (
     tmp=$(mktemp "$root/.execution.XXXXXX") || return 1;trap 'rm -f -- "$tmp"' EXIT
     jq -n --argjson old "$old" --arg processStart "$process_start" --arg name "$OPS_SCRIPT_ID" --arg boot "$boot" --arg status "$status" --argjson started "$started" --argjson at "$now" --argjson pid "$pid" --argjson rc "$rc" \
       '$old+{schema:1,name:$name,boot:$boot,executionStatus:$status,startedAt:$started,observedAt:$at,pid:$pid,processStart:$processStart,lastExitCode:$rc} |
-       if $status!="RUNNING" then .finishedAt=$at|.durationSeconds=($at-$started)|.lastCompletedAt=$at|if $rc==0 then .lastSuccessAt=$at else . end else . end' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
+       if $status!="RUNNING" then .finishedAt=$at|.durationSeconds=($at-$started)|.lastCompletedAt=$at|if $rc==0 then .lastSuccessAt=$at else . end
+       else .previousRun={startedAt:$old.startedAt,finishedAt:$old.finishedAt,status:$old.executionStatus,exitCode:$old.lastExitCode,durationSeconds:$old.durationSeconds}|.finishedAt=null|.durationSeconds=null|.lastExitCode=null end' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
     local persistent="${USR_OPS_EXECUTION_PERSISTENT_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/execution}" fd export_fd
     mountpoint -q "${USR_OPS_VAULT_MOUNT:-/mnt/vault}" || return 0
     [[ ! -L "$persistent" && $(realpath -m "$persistent") == "$persistent" ]] || return 1
@@ -219,6 +227,22 @@ usr_ops_supervise() {
     trap - TERM HUP INT
     return "$rc"
 }
+
+# Network observation after an accepted shutdown, never a power-state claim.
+# No WOL or second poweroff is issued. Native maintenance checks remain upstream.
+usr_ops_observe_shutdown() {
+    local BACKUP_SSH_COMMAND_TIMEOUT=6
+    local host="${REMOTE#*@}" deadline=$(( $(date +%s)+${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90} )) misses=0
+    [[ "${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90}" != 0 ]] || { SHUTDOWN_RESULT=requested_observation_disabled;return 0; }
+    while (( $(date +%s)<deadline ));do
+        if timeout --kill-after=1 5 ping -c 1 -W 2 "$host" >/dev/null 2>&1 || backup_ssh true >/dev/null 2>&1;then misses=0
+        else misses=$((misses+1));fi
+        if ((misses>=3));then SHUTDOWN_RESULT=offline_observed;return 0;fi
+        sleep 5
+    done
+    SHUTDOWN_RESULT=requested_still_reachable;REMOTE_SHUTDOWN_FAILED=1
+    return 1
+}
 # END EMBEDDED OPERATIONS CONTRACT
 # BEGIN SCHEDULED EXECUTION SUPERVISOR
 if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$OPS_SCRIPT_ID" ]];then
@@ -226,7 +250,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
-readonly SCRIPT_VERSION="1.5.0"
+readonly SCRIPT_VERSION="1.6.0"
 
 
 ###############################################################################
@@ -335,6 +359,13 @@ NOTIFY_SUBJECT="Syslog Watchdog"
 # excessively large Unraid notification.
 #
 MAX_NOTIFY_LINES=20
+SYSLOG_BATCH_MAX_LINES=500
+SYSLOG_BATCH_MAX_BYTES=1048576
+SYSLOG_FILTER_BUDGET_SECONDS=30
+CRITICAL_REGEX='out of memory|oom-kill|killed process|kernel panic|BUG:|soft lockup|hard lockup|blocked for more than|corrupt|I/O error|input/output error|read-only file system|XFS.*(shutdown|error)|BTRFS.*(error|critical)|EXT4-fs error|nvme.*(timeout|reset controller)|Syslog coverage error'
+# Observed incidents are dynamic; detection/ignore rules are never auto-edited.
+# JSON is bounded to 2,000 incidents / 90 days; repeats use observations, not
+# an invented count of distinct kernel events. A quiet log does not prove repair.
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +684,7 @@ write_cursor() {
 get_rotated_syslog() {
     local generation="$1"
 
-    local plain="/var/log/syslog.${generation}"
+    local plain="${SYSLOG_FILE}.${generation}"
     local compressed="${plain}.gz"
 
     if [ -f "$plain" ]; then
@@ -714,149 +745,132 @@ find_previous_cursor_log() {
 # BUILD NEW SYSLOG CHUNK
 ###############################################################################
 
+# Read bounded chronological slices. The cursor always names the last consumed
+# source/line, including rotated files; unread bytes are never acknowledged.
+syslog_append_segment() {
+    local source="$1" start="$2" output="$3" remain_lines remain_bytes meta="$STATE_DIR/slice.meta" slice="$STATE_DIR/slice.data" rc=0 count full source_id
+    source_id=$(get_file_id "$source") || return 1
+    remain_lines=$((SYSLOG_BATCH_MAX_LINES-$(wc -l <"$output")))
+    remain_bytes=$((SYSLOG_BATCH_MAX_BYTES-$(stat -c %s "$output")))
+    ((remain_lines>0 && remain_bytes>0)) || { SYSLOG_BACKLOG=true;return 10; }
+    # A partial final line is not acknowledged; the captured newline boundary
+    # also prevents concurrent writers advancing this batch beyond its snapshot.
+    if [[ "$source" == "$SYSLOG_FILE" && ${SYSLOG_CAPTURED_ACTIVE_LINES:-} =~ ^[0-9]+$ ]];then
+        local captured_remaining=$((SYSLOG_CAPTURED_ACTIVE_LINES-start+1))
+        ((captured_remaining>0)) || return 0
+        ((remain_lines<=captured_remaining)) || remain_lines=$captured_remaining
+    fi
+    read_log_from_line "$source" "$start" | awk -v lines="$remain_lines" -v bytes="$remain_bytes" -v meta="$meta" '
+      NR>lines || used+length($0)+1>bytes {full=1;exit} {print;used+=length($0)+1;n++}
+      END{print n+0,full+0 >meta}' >"$slice"
+    local -a codes=("${PIPESTATUS[@]}")
+    ((codes[1]==0 && (codes[0]==0 || codes[0]==141))) || return 1
+    [[ $(get_file_id "$source") == "$source_id" ]] || { log SYSLOG WARNING "Syslog rotated during bounded read; cursor retained for retry";return 1; }
+    IFS=' ' read -r count full <"$meta"
+    if ((count==0 && full==1));then
+        notify_unraid alert 'Syslog processing requires attention' "A syslog record exceeds the $SYSLOG_BATCH_MAX_BYTES-byte batch limit. Cursor retained; inspect $source at line $start. No log was deleted or acknowledged." || true
+        return 1
+    fi
+    if ((count>0));then
+        printf '%s\t%s\t%s\t%s\t%s\n' "$(( $(wc -l <"$output")+1 ))" "$count" "$start" "$source" "$source_id" >>"$STATE_DIR/slice-map.tsv" || return 1
+        cat "$slice" >>"$output" || return 1
+        CURRENT_FILE_ID="$source_id"
+        CURRENT_LINE_COUNT=$((start+count-1))
+        CURRENT_LAST_LINE_HASH=$(hash_log_line "$slice" "$count") || return 1
+    fi
+    ((full==0)) || { SYSLOG_BACKLOG=true;return 10; }
+}
+
+syslog_cursor_after_processed() {
+    local processed="$1" first count start source source_id found=false
+    while IFS=$'\t' read -r first count start source source_id;do
+        ((processed>=first)) || break
+        local consumed=$((processed-first+1));((consumed<=count)) || consumed=$count
+        CURRENT_FILE_ID="$source_id"
+        CURRENT_LINE_COUNT=$((start+consumed-1))
+        CURRENT_LAST_LINE_HASH=$(hash_log_line "$SYSLOG_CURRENT_CHUNK" "$((first+consumed-1))") || return 1
+        found=true
+    done <"$STATE_DIR/slice-map.tsv"
+    [[ "$found" == true ]] || { CURRENT_FILE_ID="$SAVED_FILE_ID";CURRENT_LINE_COUNT="$SAVED_LINE_COUNT";CURRENT_LAST_LINE_HASH="$SAVED_LAST_LINE_HASH"; }
+}
+
 build_new_syslog_chunk() {
-    local output_file="$1"
-
-    local start_line=1
-    local previous=""
-    local previous_generation=0
-    local previous_file=""
-    local generation=0
-    local rotated_file=""
-
-    : >"$output_file"
-
-    # -----------------------------------------------------------------------
-    # First execution
-    # -----------------------------------------------------------------------
-
-    if ! load_cursor; then
-        if [ "$CURRENT_LINE_COUNT" -gt "$STARTUP_LOOKBACK_LINES" ]; then
-            start_line=$(( CURRENT_LINE_COUNT - STARTUP_LOOKBACK_LINES + 1 ))
-        else
-            start_line=1
-        fi
-
-        log "STATE" "INFO" \
-            "No existing cursor; scanning last ${STARTUP_LOOKBACK_LINES} syslog line(s)"
-
-        read_log_from_line \
-            "$SYSLOG_FILE" \
-            "$start_line" \
-            >>"$output_file"
-
-        return 0
+    local output="$1" active_id="$CURRENT_FILE_ID" active_count="$CURRENT_LINE_COUNT" active_hash="$CURRENT_LAST_LINE_HASH" previous generation file start=1 rc
+    SYSLOG_CURRENT_CHUNK="$output"
+    SYSLOG_CAPTURED_ACTIVE_LINES="$active_count"
+    : >"$output";: >"$STATE_DIR/slice-map.tsv";SYSLOG_BACKLOG=false
+    if ! load_cursor;then
+        start=$((active_count-STARTUP_LOOKBACK_LINES+1));((start>0)) || start=1
+        rc=0;syslog_append_segment "$SYSLOG_FILE" "$start" "$output" || rc=$?;((rc==0 || rc==10));return
     fi
-
-
-    # -----------------------------------------------------------------------
-    # Same active syslog file
-    # -----------------------------------------------------------------------
-
-    if [ "$SAVED_FILE_ID" = "$CURRENT_FILE_ID" ]; then
-        if [ "$SAVED_LINE_COUNT" -le "$CURRENT_LINE_COUNT" ] &&
-           { (( SAVED_LINE_COUNT == 0 )) ||
-             [[ -n "$SAVED_LAST_LINE_HASH" &&
-                "$(hash_log_line "$SYSLOG_FILE" "$SAVED_LINE_COUNT")" == "$SAVED_LAST_LINE_HASH" ]]; }; then
-            start_line=$((SAVED_LINE_COUNT + 1))
-
-            if [ "$start_line" -le "$CURRENT_LINE_COUNT" ]; then
-                read_log_from_line \
-                    "$SYSLOG_FILE" \
-                    "$start_line" \
-                    >>"$output_file"
-            fi
-
-            return 0
-        fi
-
-        # Same inode but file became shorter: likely truncation.
-        log "STATE" "WARN" \
-            "Syslog appears to have been truncated; scanning current file from beginning"
-        printf '%s\n' 'Syslog coverage error: active log was rewritten; unread older lines may be lost.' >>"$output_file"
-
-        read_log_all \
-            "$SYSLOG_FILE" \
-            >>"$output_file"
-
-        return 0
+    if [[ "$SAVED_FILE_ID" == "$active_id" ]] && ((SAVED_LINE_COUNT<=active_count)) && { ((SAVED_LINE_COUNT==0)) || [[ $(hash_log_line "$SYSLOG_FILE" "$SAVED_LINE_COUNT") == "$SAVED_LAST_LINE_HASH" ]]; };then
+        rc=0;syslog_append_segment "$SYSLOG_FILE" "$((SAVED_LINE_COUNT+1))" "$output" || rc=$?;((rc==0 || rc==10));return
     fi
-
-
-    # -----------------------------------------------------------------------
-    # Syslog rotation detected
-    # -----------------------------------------------------------------------
-
-    log "STATE" "INFO" \
-        "Syslog rotation detected; attempting cursor recovery"
-
-    previous="$(
-        find_previous_cursor_log ||
-        true
-    )"
-
-    if [ -n "$previous" ]; then
-        IFS='|' read -r \
-            previous_generation \
-            previous_file \
-            <<<"$previous"
-
-        log "STATE" "INFO" \
-            "Recovered previous cursor in ${previous_file}"
-
-        # Finish unread portion of the old active syslog.
-        read_log_from_line \
-            "$previous_file" \
-            "$((SAVED_LINE_COUNT + 1))" \
-            >>"$output_file"
-
-        # If more than one rotation occurred, append every newer rotated log
-        # in chronological order.
-        for ((generation = previous_generation - 1; generation >= 1; generation--)); do
-            rotated_file="$(
-                get_rotated_syslog "$generation" ||
-                true
-            )"
-
-            if [ -z "$rotated_file" ]; then
-                printf '%s\n' "Syslog coverage error: missing rotated generation $generation." >>"$output_file"
-                continue
-            fi
-
-            read_log_all \
-                "$rotated_file" \
-                >>"$output_file"
+    previous=$(find_previous_cursor_log || true)
+    if [[ -n "$previous" ]];then
+        IFS='|' read -r generation file <<<"$previous"
+        rc=0;syslog_append_segment "$file" "$((SAVED_LINE_COUNT+1))" "$output" || rc=$?
+        ((rc!=10)) || return 0;((rc==0)) || return 1
+        for ((generation--;generation>=1;generation--));do
+            file=$(get_rotated_syslog "$generation" || true)
+            if [[ -z "$file" ]];then printf 'Syslog coverage error: missing rotated generation %s.\n' "$generation" >>"$output";continue;fi
+            rc=0;syslog_append_segment "$file" 1 "$output" || rc=$?;((rc!=10)) || return 0;((rc==0)) || return 1
         done
-
-        # Finally append the current active syslog.
-        read_log_all \
-            "$SYSLOG_FILE" \
-            >>"$output_file"
-
-        return 0
+        rc=0;syslog_append_segment "$SYSLOG_FILE" 1 "$output" || rc=$?;((rc==0 || rc==10));return
     fi
+    printf '%s\n' 'Syslog coverage error: previous cursor was rewritten/unavailable; bounded lookback follows.' >>"$output"
+    start=$((active_count-STARTUP_LOOKBACK_LINES+1));((start>0)) || start=1
+    rc=0;syslog_append_segment "$SYSLOG_FILE" "$start" "$output" || rc=$?;((rc==0 || rc==10))
+}
 
+syslog_incident_severity() {
+    if grep -Eiq "$CRITICAL_REGEX" <<<"$1";then printf CRITICAL;else printf WARNING;fi
+}
 
-    # -----------------------------------------------------------------------
-    # Rotation recovery failed
-    # -----------------------------------------------------------------------
+syslog_record_incidents() {
+    local rows="$STATE_DIR/incident-observations.jsonl" root="$STATE_DIR" target temp now
+    [[ -s "$rows" ]] || return 0
+    if mountpoint -q "${SYSLOG_VAULT_MOUNT:-/mnt/vault}";then root="${SYSLOG_INCIDENT_ROOT:-/mnt/vault/cloud/logs/script/syslog_watchdog}";fi
+    [[ ! -L "$root" && $(realpath -m "$root") == "$root" ]] || return 1
+    mkdir -p "$root" || return 1
+    target="$root/incidents.json";[[ ! -L "$target" ]] || return 1
+    [[ -f "$target" ]] || printf '{"schema":1,"incidents":{}}' >"$target"
+    jq -e '.schema==1 and (.incidents|type)=="object"' "$target" >/dev/null || return 1
+    # Merge a RAM spool after the vault returns. Remove it only after the
+    # persistent atomic commit, so an interrupted migration retains evidence.
+    local spool="$STATE_DIR/incidents.json" merge="$STATE_DIR/incidents.merge.json"
+    if [[ "$target" != "$spool" && -f "$spool" && ! -L "$spool" ]];then
+        jq -e '.schema==1 and (.incidents|type)=="object"' "$spool" >/dev/null || return 1
+        jq -s '.[0] as $a | .[1] as $b | $a | .incidents=($a.incidents as $x | reduce ($b.incidents|to_entries[]) as $e ($x; .[$e.key]=(
+          if .[$e.key]==null then $e.value else .[$e.key] as $old |
+          (if $old.lastSeen>$e.value.lastSeen then $old else $e.value end)+
+          {firstSeen:([$old.firstSeen,$e.value.firstSeen]|min),observations:([$old.observations,$e.value.observations]|max)} end)))' "$target" "$spool" >"$merge" || return 1
+    else cp "$target" "$merge" || return 1;fi
+    temp=$(mktemp "$root/.incidents.XXXXXX") || return 1;now=$(date +%s)
+    jq --slurpfile rows "$rows" --argjson now "$now" --argjson max "$INCIDENT_MAX_ENTRIES" '
+      reduce $rows[] as $r (.;.incidents[$r.id]=((.incidents[$r.id] // {firstSeen:$r.at,observations:0})+
+        {lastSeen:$r.at,severity:$r.severity,example:$r.example,source:"Unraid syslog",observations:((.incidents[$r.id].observations // 0)+1),requiresAttention:($r.severity=="CRITICAL")})) |
+      .updatedAt=$now|.incidents|=with_entries(select(.value.lastSeen>=$now-90*86400)) |
+      .incidents|=(to_entries|sort_by(.value.lastSeen)|reverse|.[:$max]|from_entries)' "$merge" >"$temp" && chmod 600 "$temp" && mv "$temp" "$target" || return 1
+    if [[ "$target" != "$spool" ]];then rm -f -- "$spool";fi
+    rm -f -- "$merge"
+}
 
-    log "STATE" "WARN" \
-        "Previous cursor could not be located in rotated logs; using startup lookback"
-    printf '%s\n' "Syslog coverage error: previous cursor log is unavailable; using bounded lookback." >>"$output_file"
-
-    if [ "$CURRENT_LINE_COUNT" -gt "$STARTUP_LOOKBACK_LINES" ]; then
-        start_line=$(( CURRENT_LINE_COUNT - STARTUP_LOOKBACK_LINES + 1 ))
-    else
-        start_line=1
-    fi
-
-    read_log_from_line \
-        "$SYSLOG_FILE" \
-        "$start_line" \
-        >>"$output_file"
-
-    return 0
+# Independent bounded tail check prevents a large ordinary backlog delaying
+# attention for a current kernel/storage/OOM event. It never advances the cursor.
+syslog_critical_tail() {
+    [[ "${SYSLOG_BACKLOG:-false}" == true ]] || return 0
+    local chunk="$STATE_DIR/critical-tail.chunk" matches="$STATE_DIR/critical-tail.matches" bounded="$STATE_DIR/critical-tail.ledger"
+    tail -n 2000 -- "$SYSLOG_FILE"|grep -Ei "$CRITICAL_REGEX"|tail -n "$MAX_NOTIFY_LINES" -- - >"$chunk" || true
+    [[ -s "$chunk" ]] || return 0
+    filter_matching_errors "$chunk" "$matches" || return 1
+    [[ -s "$matches" ]] || return 0
+    if notify_unraid alert 'Critical Unraid syslog events require attention' "Critical kernel/storage/system events detected beyond the chronological scan slice. No automatic repair, log deletion or service restart was attempted.
+$(cat "$matches")
+Incident JSON: ${SYSLOG_INCIDENT_ROOT:-/mnt/vault/cloud/logs/script/syslog_watchdog}/incidents.json
+Repeated identical incidents retain the normal daily reminder limit; unread normal backlog is preserved.";then
+        awk -F '\t' '{seen[$1]=$2}END{for(key in seen)print key "\t" seen[key]}' "$INCIDENT_NEXT"|sort -k2,2n|tail -n "$INCIDENT_MAX_ENTRIES" -- - >"$bounded" && mv "$bounded" "$STATE_DIR/incidents.tsv" || return 1
+    else return 1;fi
 }
 
 
@@ -929,7 +943,9 @@ filter_matching_errors() {
     local chunk_file="$1"
     local match_file="$2"
 
-    local line="" scrubbed key now previous xfs_source xfs_opened
+    local line="" scrubbed key now previous xfs_source xfs_opened severity raw_number
+    local deadline=$(( $(date +%s)+SYSLOG_FILTER_BUDGET_SECONDS ))
+    : >"$STATE_DIR/incident-observations.jsonl"
     now=$(date +%s)
     INCIDENT_NEXT="${STATE_DIR}/incidents.pending"
     local history="${STATE_DIR}/incidents.tsv"
@@ -940,6 +956,8 @@ filter_matching_errors() {
     : >"$match_file"
 
     while IFS= read -r line; do
+        raw_number=${line%%:*};line=${line#*:}
+        if (( $(date +%s)>=deadline ));then SYSLOG_BACKLOG=true;if [[ "$chunk_file" == "${SYSLOG_CURRENT_CHUNK:-}" ]];then syslog_cursor_after_processed "$((raw_number-1))" || return 1;fi;break;fi
         [ -n "$line" ] || continue
 
         # Remove only explicit zero-valued counters, then re-evaluate. An OOM
@@ -953,7 +971,7 @@ filter_matching_errors() {
             [[ "$xfs_opened" =~ ^[1-9][0-9]{0,11}$ ]] || return 1
             key="xfs:$xfs_source:$xfs_opened"
         else
-            printf '%s\n' "$scrubbed" | grep -Eiq "$ERROR_REGEX" || continue
+            printf '%s\n' "$scrubbed" | grep -Eiq "($ERROR_REGEX|$CRITICAL_REGEX)" || continue
             # Daily health owns link-instability trends, but not actual I/O failures.
             if [[ "$line" =~ kernel:[[:space:]]+ata[0-9]+ ]] &&
                [[ "${line,,}" =~ hard\ resetting\ link|link\ is\ slow\ to\ respond|exception\ emask ]] &&
@@ -962,7 +980,8 @@ filter_matching_errors() {
             fi
             key=""
         fi
-        if [[ -z "$xfs_source" ]] && is_ignored_line "$line"; then
+        severity=$(syslog_incident_severity "$scrubbed")
+        if [[ -z "$xfs_source" && "$severity" != CRITICAL ]] && is_ignored_line "$line"; then
             if [ "$LOG_IGNORED_LINES" = "true" ]; then
                 log "SYSLOG" "INFO" \
                     "Ignored matching line: $line"
@@ -973,6 +992,8 @@ filter_matching_errors() {
 
         [[ -n "$key" ]] || key=$(printf '%s\n' "$line" | sed -E \
           's/^[A-Z][a-z]{2} +[0-9]+ [0-9:]+ [^ ]+ //; s/^[0-9]{4}-[0-9T:.+-]+ [^ ]+ //; s/\[[0-9]+\]/[PID]/g; s/Killed process [0-9]+/Killed process PID/g; s/task [^ ]+:[0-9]+/task PROCESS:PID/g' | sha256sum | awk '{print $1}')
+        key="$severity:$key"
+        jq -nc --arg id "$key" --arg severity "$severity" --arg example "${line:0:2048}" --argjson at "$now" '{id:$id,at:$at,severity:$severity,example:$example}' >>"$STATE_DIR/incident-observations.jsonl" || return 1
         previous=$(awk -F '\t' -v key="$key" '$1==key {v=$2} END {print v+0}' "$INCIDENT_NEXT")
         if (( previous>0 && now-previous<INCIDENT_REMINDER_SECONDS )); then continue; fi
         printf '%s\t%s\n' "$key" "$now" >>"$INCIDENT_NEXT"
@@ -980,12 +1001,13 @@ filter_matching_errors() {
 
     done < <(
         grep \
-            -Ei \
-            "(${ERROR_REGEX}|${STORAGE_MATCH_REGEX})" \
+            -nEi \
+            "(${ERROR_REGEX}|${STORAGE_MATCH_REGEX}|${CRITICAL_REGEX})" \
             "$chunk_file" \
             2>/dev/null ||
             true
     )
+    syslog_record_incidents || return 1
 }
 
 
@@ -1070,8 +1092,9 @@ check_syslog_errors() {
 
     done <"$match_file"
 
-    critical=$(grep -Eic "out of memory|oom-kill|killed process|blocked for more than|soft lockup|hard lockup|corrupt|${STORAGE_MATCH_REGEX}" "$match_file" || true)
+    critical=$(grep -Eic "${CRITICAL_REGEX}|${STORAGE_MATCH_REGEX}" "$match_file" || true)
     (( critical==0 )) || importance=alert
+    body+="Incident JSON: ${SYSLOG_INCIDENT_ROOT:-/mnt/vault/cloud/logs/script/syslog_watchdog}/incidents.json (new matches recorded automatically; critical incidents require review)"$'\n'
     body+="Host events: ${match_count}; critical matches: ${critical}"$'\n'
     body+="Action: new syslog events detected and grouped; no process, container or network settings were changed."$'\n'
     body+="Repeated identical events are limited to one reminder per 24 hours. Absence of new log entries does not establish recovery."$'\n'
@@ -1320,6 +1343,7 @@ main() {
     # This deliberately runs even if a syslog error notification was sent.
     # -----------------------------------------------------------------------
 
+    if ! syslog_critical_tail;then final_exit=1;fi
     if ! check_log_usage; then
         final_exit=1
     fi
@@ -1335,6 +1359,7 @@ main() {
         receipt=$(mktemp "$receipt_root/.syslog-watchdog.XXXXXX") || return 1
         jq -n --arg boot "$(cat /proc/sys/kernel/random/boot_id)" --argjson at "$(date +%s)" '{schema:1,name:"syslog_watchdog",bootId:$boot,lastSuccessfulScanAt:$at,epoch:$at,status:"OK",scope:"New syslog entries and log filesystem utilization checked; notification delivery completed"}' >"$receipt" && chmod 600 "$receipt" && mv "$receipt" "$receipt_root/syslog_watchdog.json" || return 1
     fi
+    [[ "${SYSLOG_BACKLOG:-false}" != true ]] || log SYSLOG INFO 'Bounded scan completed with unread backlog; next scheduled pass resumes from the last consumed line'
     return "$final_exit"
 }
 
