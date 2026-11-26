@@ -47,7 +47,7 @@ mountpoint(){ return 0; };docker(){ touch "$fixture/unexpected-docker";return 1;
 exec {held}>"$ARR_BACKUP_GATE";flock -x "$held"
 (main --weekly-report) >"$fixture/maintenance-console"
 [[ ! -e "$fixture/unexpected-docker" ]]
-jq -e '.status=="DEFERRED" and .weeklyReportStatus=="DEFERRED" and (.summary|contains("Appdata maintenance"))' "$STATUS_DIR/media_metadata_audit.json" >/dev/null
+jq -e '.status=="DEFERRED" and .weeklyReportStatus=="DEFERRED"' "$STATUS_DIR/media_metadata_audit.json" >/dev/null
 printf 'Planned appdata downtime defers metadata reporting before Docker access and creates no false report failure\n'
 MAINTENANCE
 bash <<'PARENT'

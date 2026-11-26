@@ -13,7 +13,8 @@ clearLog=true
 
 # BEGIN EMBEDDED OPERATIONS CONTRACT
 OPS_SCRIPT_ID="media_plex_dbrepair"
-# Embedded operations contract v1; generated into standalone User Scripts.
+# shellcheck shell=bash
+# Embedded operations contract v2; generated into standalone User Scripts.
 usr_ops_log_line() {
     local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
     case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
@@ -44,7 +45,10 @@ usr_ops_notify() {
     if [[ "${args[0]##*/}" == timeout ]];then
         if [[ " ${args[*]} " != *' --kill-after'* ]];then args=("${args[0]}" --kill-after=5 "${args[@]:1}");fi
     else args=(timeout --signal=TERM --kill-after=5 30 "${args[@]}");fi
-    "${args[@]}"
+    local delivery_rc=0
+    "${args[@]}" || delivery_rc=$?
+    usr_ops_delivery_record "$delivery_rc" "$importance" "$summary" "$message" "${args[@]}" || printf 'Notification delivery evidence could not be queued; producer failure remains active.\n' >&2
+    return "$delivery_rc"
 }
 
 # Bounded local history for scripts previously dependent on the plugin console.
@@ -58,10 +62,135 @@ usr_ops_append_log() {
     fi
     printf '%s\n' "$line" >>"$file"
 }
+
+
+# Durable failed-delivery evidence for producers without their own outbox.
+# Existing media/DNS/watchdog outboxes keep ownership of their delivery policy.
+usr_ops_delivery_record() (
+    local rc="$1" importance="$2" summary="$3" message="$4" subject='' i key root fd tmp
+    shift 4
+    case "${OPS_SCRIPT_ID:-}" in backup_boot_disk|backup_cache_appdata|backup_media_remote|backup_vault_remote|backup_restore_drill|media_plex_dbrepair) ;; *) return 0;; esac
+    local -a original=("$@")
+    local native_delivery=false arg export_fd ram="${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}"
+    for arg in "${original[@]}";do [[ "$arg" != /usr/local/emhttp/webGui/scripts/notify ]] || native_delivery=true;done
+    [[ "$native_delivery" == true || -n "${USR_OPS_DELIVERY_ROOT:-}" ]] || return 0
+    for ((i=0;i<${#original[@]};i++));do [[ "${original[$i]}" != -s ]] || subject="${original[$((i+1))]:-}";done
+    root="${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}"
+    exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}"
+    if ! mountpoint -q "${USR_OPS_VAULT_MOUNT:-/mnt/vault}" || ! flock -s -n "$export_fd";then root="$ram";fi
+    [[ ! -L "$root" && $(realpath -m "$root") == "$root" ]] || return 1
+    mkdir -p "$root" || return 1;chmod 700 "$root" || return 1
+    exec {fd}>"${USR_OPS_DELIVERY_LOCK:-/run/user-script-delivery.lock}";flock -w 3 "$fd" || return 1
+    key=$(printf '%s\0' "$OPS_SCRIPT_ID" "$importance" "$subject" "$summary" "$message"|sha256sum|cut -d ' ' -f1)
+    if ((rc==0));then
+        if [[ "$OPS_SCRIPT_ID" == backup_vault_remote && -n "${USR_OPS_DELIVERY_CONTEXT:-}" ]];then
+            mkdir -p "$root/.delivery-receipts" || return 1
+            tmp=$(mktemp "$root/.delivery-receipts/.accepted.XXXXXX") || return 1
+            jq -n --arg context "$USR_OPS_DELIVERY_CONTEXT" --argjson at "$(date +%s)" '{schema:1,context:$context,acceptedAt:$at}' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$root/.delivery-receipts/backup_vault_remote.json" || return 1
+        fi
+        rm -f -- "$root/$OPS_SCRIPT_ID.$key.json" "$ram/$OPS_SCRIPT_ID.$key.json";return
+    fi
+    (( $(find "$root" -maxdepth 1 -type f -name '*.json'|wc -l)<100 )) || [[ -f "$root/$OPS_SCRIPT_ID.$key.json" ]] || return 1
+    tmp=$(mktemp "$root/.delivery.XXXXXX") || return 1
+    trap 'rm -f -- "$tmp"' EXIT
+    jq -n --arg context "${USR_OPS_DELIVERY_CONTEXT:-}" --arg id "$key" --arg script "$OPS_SCRIPT_ID" --arg importance "$importance" --arg subject "$subject" --arg summary "$summary" --arg message "$message" --argjson at "$(date +%s)" \
+      '{schema:1,context:$context,id:$id,script:$script,importance:$importance,subject:$subject,summary:$summary,message:$message,queuedAt:$at}' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$root/$OPS_SCRIPT_ID.$key.json"
+)
+
+usr_ops_vault_delivery_seen() {
+    local context="$1" cutoff="${2:-0}" root file
+    [[ -n "$context" ]] || return 1
+    for root in "${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}" "${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}";do
+        file="$root/.delivery-receipts/backup_vault_remote.json"
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        jq -e --arg context "$context" --argjson cutoff "$cutoff" --argjson now "$(date +%s)" '.schema==1 and .context==$context and .acceptedAt>=$cutoff and .acceptedAt<=$now+300' "$file" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+usr_ops_retry_deliveries() {
+    local root="${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}" file count=0 subject summary message importance owner old_owner="${OPS_SCRIPT_ID:-}" rc=0
+    local ram="${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}" digest old_context="${USR_OPS_DELIVERY_CONTEXT:-}" context
+    [[ ! -L "$root" && ! -L "$ram" ]] || return 1
+    [[ -d "$root" || -d "$ram" ]] || return 0
+    while IFS= read -r -d '' file;do
+        ((count<3)) || break
+        jq -e '(.schema==1) and (.script|test("^(backup_(boot_disk|cache_appdata|media_remote|vault_remote|restore_drill)|media_plex_dbrepair)$")) and (.importance|IN("normal","warning","alert")) and all(.subject,.summary,.message;type=="string")' "$file" >/dev/null 2>&1 || continue
+        owner=$(jq -r .script "$file");subject=$(jq -r .subject "$file");summary=$(jq -r .summary "$file");message=$(jq -r .message "$file");importance=$(jq -r .importance "$file")
+        context=$(jq -r '.context // ""' "$file")
+        if [[ "$owner" == backup_vault_remote ]] && usr_ops_vault_delivery_seen "$context" "$(jq -r .queuedAt "$file")";then rm -f -- "$file";continue;fi
+        USR_OPS_DELIVERY_CONTEXT="$context"
+        digest=$(sha256sum "$file"|cut -d ' ' -f1)
+        OPS_SCRIPT_ID="$owner";count=$((count+1))
+        if usr_ops_notify "${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}" -i "$importance" -s "$subject" -d "$summary" -m "$message";then
+            if [[ -f "$file" && $(sha256sum "$file"|cut -d ' ' -f1) == "$digest" ]];then rm -f -- "$file";fi
+        else rc=1;fi
+        OPS_SCRIPT_ID="$old_owner";USR_OPS_DELIVERY_CONTEXT="$old_context"
+    done < <(find "$root" "$ram" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null|sort -zu)
+    return "$rc"
+}
+
+# Scheduled executions have an independent parent recording the final exit,
+# after producer EXIT traps. CLI operations and sourced libraries are unchanged.
+usr_ops_execution_record() (
+    local phase="$1" started="$2" pid="$3" rc="${4:-0}" process_start root="${USR_OPS_EXECUTION_ROOT:-/run/user-script-execution}" file tmp now boot old='{}' status
+    [[ "${OPS_SCRIPT_ID:-}" =~ ^[a-z0-9_]+$ && ! -L "$root" ]] || return 1
+    mkdir -p "$root" || return 1;file="$root/$OPS_SCRIPT_ID.json"
+    [[ ! -L "$file" ]] || return 1
+    if [[ -f "$file" ]];then old=$(jq -c 'select(.schema==1)' "$file") || old='{}';fi
+    [[ -n "$old" ]] || old='{}'
+    now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf unknown)
+    process_start=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')
+    [[ "$phase" != finish ]] || process_start=$(jq -r '.processStart // ""' <<<"$old")
+    status=RUNNING;[[ "$phase" != finish ]] || { status=COMPLETED;((rc==0)) || status=FAILED; }
+    tmp=$(mktemp "$root/.execution.XXXXXX") || return 1;trap 'rm -f -- "$tmp"' EXIT
+    jq -n --argjson old "$old" --arg processStart "$process_start" --arg name "$OPS_SCRIPT_ID" --arg boot "$boot" --arg status "$status" --argjson started "$started" --argjson at "$now" --argjson pid "$pid" --argjson rc "$rc" \
+      '$old+{schema:1,name:$name,boot:$boot,executionStatus:$status,startedAt:$started,observedAt:$at,pid:$pid,processStart:$processStart,lastExitCode:$rc} |
+       if $status!="RUNNING" then .finishedAt=$at|.durationSeconds=($at-$started)|.lastCompletedAt=$at|if $rc==0 then .lastSuccessAt=$at else . end else . end' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
+    local persistent="${USR_OPS_EXECUTION_PERSISTENT_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/execution}" fd export_fd
+    mountpoint -q "${USR_OPS_VAULT_MOUNT:-/mnt/vault}" || return 0
+    [[ ! -L "$persistent" && $(realpath -m "$persistent") == "$persistent" ]] || return 1
+    exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}";flock -s -n "$export_fd" || return 0
+    mkdir -p "$persistent" || return 1
+    tmp=$(mktemp "$persistent/.execution.XXXXXX") || return 1
+    cp "$file" "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$persistent/$OPS_SCRIPT_ID.json"
+)
+
+usr_ops_supervise() {
+    local script="$1" started pid rc=0 receipt_fd record_owner=false
+    # Repository/fixture executions must never publish production evidence.
+    # Explicit test roots opt into supervision for isolated regression checks.
+    case "$script" in
+      /boot/config/plugins/user.scripts/scripts/*/script|/tmp/user.scripts/tmpScripts/*/script) ;;
+      *) if [[ -z "${USR_OPS_EXECUTION_ROOT:-}" ]];then USR_OPS_SUPERVISED="$OPS_SCRIPT_ID" /bin/bash "$script";return $?;fi;;
+    esac
+    local execution_root="${USR_OPS_EXECUTION_ROOT:-/run/user-script-execution}"
+    if [[ ! -L "$execution_root" ]] && mkdir -p "$execution_root";then
+        exec {receipt_fd}>"$execution_root/$OPS_SCRIPT_ID.lock"
+        flock -n "$receipt_fd" && record_owner=true
+    fi
+    started=$(date +%s)
+    USR_OPS_SUPERVISED="$OPS_SCRIPT_ID" OPS_RUN_ID="${OPS_RUN_ID:-${started}_$$}" /bin/bash "$script" &
+    pid=$!
+    [[ "$record_owner" != true ]] || usr_ops_execution_record start "$started" "$pid" || printf 'Execution receipt unavailable for %s; workflow continues.\n' "$OPS_SCRIPT_ID" >&2
+    trap 'kill -TERM "$pid" 2>/dev/null || true' TERM HUP
+    trap 'kill -INT "$pid" 2>/dev/null || true' INT
+    wait "$pid" || rc=$?
+    # A signal can interrupt wait while the producer is still restoring state.
+    if kill -0 "$pid" 2>/dev/null;then wait "$pid" || rc=$?;fi
+    [[ "$record_owner" != true ]] || usr_ops_execution_record finish "$started" "$pid" "$rc" || printf 'Completion receipt unavailable for %s (exit=%s).\n' "$OPS_SCRIPT_ID" "$rc" >&2
+    trap - TERM HUP INT
+    return "$rc"
+}
 # END EMBEDDED OPERATIONS CONTRACT
+# BEGIN SCHEDULED EXECUTION SUPERVISOR
+if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$OPS_SCRIPT_ID" ]];then
+    usr_ops_supervise "$0";exit $?
+fi
+# END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
 
-readonly VERSION="3.6"
+readonly VERSION="3.6.1"
 
 ###############################################################################
 # CONFIGURATION
@@ -831,6 +960,10 @@ plex_maintenance_begin() {
 
 process_container() {
     local container="$1" rc
+    if [[ -e "$LOG_DIR/active-operation.json" ]];then
+        error "[$container] Earlier native database outcome is unresolved; additional maintenance skipped"
+        CONTAINERS_FAILED=$((CONTAINERS_FAILED+1));RUN_HAS_ISSUE=1;raise_severity alert;return 1
+    fi
     if ! plex_maintenance_begin "$container"; then
         RESULT_ORDER+=("$container")
         RESULT_CLASS["$container"]=FAILED
@@ -914,9 +1047,16 @@ process_container_impl() {
     output_file="${RUNTIME_DIR}/${safe_container}.output.log"
     : >"$output_file"
     log INFO "[$container] Running DBRepair ${RESULT_VERSION[$container]}: ${DBREPAIR_ARGS[*]}"
+    local operation="$LOG_DIR/active-operation.json" operation_tmp
+    operation_tmp=$(mktemp "$LOG_DIR/.operation.XXXXXX") || return 1
+    jq -n --arg container "$container" --argjson running "$originally_running" --argjson pid "$$" --argjson at "$(date +%s)" '{schema:1,container:$container,originallyRunning:$running,pid:$pid,startedAt:$at,phase:"native_dbrepair"}' >"$operation_tmp" && mv "$operation_tmp" "$operation" || return 1
     execute_dbrepair "$container" "$output_file"
     rc=$?
     classify_container_output "$container" "$output_file" "$rc"
+    if ((rc>=128));then
+        error "[$container] Native execution interrupted (exit=$rc); operation journal retained, no uncertain restart attempted"
+        CONTAINERS_FAILED=$((CONTAINERS_FAILED+1));RUN_HAS_ISSUE=1;raise_severity alert;return 1
+    fi
     if (( rc == 124 )); then
         warn "[$container] DBRepair timed out; restarting the Docker container to terminate the maintenance process safely"
         if docker restart -t 30 "$container" >/dev/null 2>&1 &&
@@ -927,7 +1067,9 @@ process_container_impl() {
             RESULT_ACTION["$container"]+=" Post-timeout container restart failed."
         fi
     fi
-    restore_container_state "$container" "$originally_running" || true
+    if restore_container_state "$container" "$originally_running";then rm -f -- "$operation";else
+        error "[$container] Final state unresolved; active operation retained for review"
+    fi
 
     case "${RESULT_CLASS[$container]}" in
         FAILED|UNRECOVERABLE)
@@ -1071,7 +1213,7 @@ update_notifications() {
     [[ -n "$previous_signature" ]] && previous_active=1
 
     if [[ -n "$signature" ]]; then
-        if [[ "$signature" != "$previous_signature" ||
+        if ((last_notified==0)) || [[ "$signature" != "$previous_signature" ||
               "$RUN_HIGHEST_SEVERITY" != "$previous_severity" ]] ||
            (( now - last_notified >= NOTIFICATION_REMINDER_DAYS * 86400 )) ||
            (( RUN_HAS_REPAIR == 1 )); then
@@ -1083,7 +1225,10 @@ update_notifications() {
                 *) description="DBRepair WARNING - diagnostic review required" ;;
             esac
             body="$(build_summary_text true)"
-            notify_unraid "$RUN_HIGHEST_SEVERITY" "$description" "$body" || true
+            if ! notify_unraid "$RUN_HIGHEST_SEVERITY" "$description" "$body";then
+                save_attention_state "$signature" "$RUN_HIGHEST_SEVERITY" "$last_notified" || true
+                return 1
+            fi
             if ! save_attention_state "$signature" "$RUN_HIGHEST_SEVERITY" "$now"; then
                 error "DBRepair notification state could not be saved"
                 NOTIFICATION_FAILED=1
@@ -1100,10 +1245,10 @@ update_notifications() {
 
     if (( RUN_HAS_REPAIR == 1 )); then
         body="$(build_summary_text true)"
-        notify_unraid normal "DBRepair REPAIRED - database activation verified" "$body" || true
+        notify_unraid normal "DBRepair REPAIRED - database activation verified" "$body" || return 1
     elif (( previous_active == 1 )); then
         body="Recovery: Previously reported DBRepair conditions are no longer detected."$'\n\n'"$(build_summary_text true)"
-        notify_unraid normal "DBRepair RESOLVED - no active conditions detected" "$body" || true
+        notify_unraid normal "DBRepair RESOLVED - no active conditions detected" "$body" || return 1
     else
         log INFO "All Plex databases were healthy; routine notification suppressed"
     fi
@@ -1166,6 +1311,11 @@ main() {
         return 1
     }
 
+    if [[ -e "$LOG_DIR/active-operation.json" ]];then
+        notify_unraid alert 'DBRepair INTERRUPTED - outcome requires reconciliation' 'An earlier database operation did not record verified final service state. No new repair or restart was attempted. The operation journal, original container state and prior report are retained. Inspect the native DBRepair process/log and validate both databases before clearing the journal.' || true
+        write_status_receipt FAILED 'Interrupted DBRepair operation retained; no uncertain maintenance replayed'
+        return 1
+    fi
     log INFO "===== Plex DBRepair Scheduler START v${VERSION} ====="
     log INFO "Configured containers: ${CONTAINERS[*]}"
     prepare_latest_release || release_fallback "Unexpected release preparation failure"

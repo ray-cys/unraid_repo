@@ -3,6 +3,7 @@
 # readers also verify the live/restored script file. No schedule is executed.
 usr_scripts_catalog() {
     local file="$1" root="${2:-$(dirname "$1")/scripts}" mode="${3:-live}" mapping='{}' native default_cron
+    command -v php >/dev/null || { printf '{"schema":1,"valid":false,"detail":"Native PHP runtime unavailable"}\n';return 1; }
     if [[ "$mode" == live ]];then
         native=$(timeout --kill-after=2 8 crontab -c /etc/cron.d -l 2>/dev/null) || native=''
         default_cron=$(timeout --kill-after=2 8 crontab -l 2>/dev/null) || default_cron=''
@@ -180,4 +181,16 @@ usr_scripts_registry_ack() {
     tmp=$(mktemp "$(dirname "$state")/.schedule-registry.XXXXXX") || { exec {fd}>&-;return 1; }
     jq --argjson ids "$ids" --argjson reload "$reload" '.events|=map(select(.id as $id|($ids|index($id))==null)) | if $reload then .cronReloadPending=false else . end' "$state" >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$state" || rc=$?
     rm -f -- "$tmp";exec {fd}>&-;return "$rc"
+}
+
+# A producer's receipt describes its current native schedule, not a copied cron.
+usr_scripts_schedule_evidence() {
+    local role="$1" file="${USER_SCRIPTS_SCHEDULE_FILE:-/boot/config/plugins/user.scripts/schedule.json}" tmp window
+    tmp=$(mktemp /tmp/user-script-schedule.XXXXXX) || return 1
+    if usr_scripts_catalog "$file" "${USER_SCRIPTS_PHYSICAL_ROOT:-$(dirname "$file")/scripts}" >"$tmp";then
+        window=$(usr_scripts_due_window "$tmp" "$role" "$(date +%s)" 0 288000) || window='{}'
+        jq -c --arg role "$role" --argjson window "$window" '[.jobs[]|select((.role==$role or .name==$role) and .present and .enabled)] |
+          if length==1 then .[0]|{verified:true,cron,frequency,event,timezone:"Asia/Singapore",intervalSeconds:(if ($window.lastDue|type)=="number" and ($window.cutoff|type)=="number" then $window.lastDue-$window.cutoff else null end)} else {verified:false,reason:"Enabled schedule missing or ambiguous"} end' "$tmp"
+    else printf '{"verified":false,"reason":"Native schedule inventory unavailable"}\n';fi
+    rm -f -- "$tmp"
 }

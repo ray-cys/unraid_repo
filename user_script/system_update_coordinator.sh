@@ -43,7 +43,8 @@ arrayStarted=true
 # CLI: --help documents policy management without editing this standalone script.
 # BEGIN EMBEDDED OPERATIONS CONTRACT
 OPS_SCRIPT_ID="system_update_coordinator"
-# Embedded operations contract v1; generated into standalone User Scripts.
+# shellcheck shell=bash
+# Embedded operations contract v2; generated into standalone User Scripts.
 usr_ops_log_line() {
     local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
     case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
@@ -74,7 +75,10 @@ usr_ops_notify() {
     if [[ "${args[0]##*/}" == timeout ]];then
         if [[ " ${args[*]} " != *' --kill-after'* ]];then args=("${args[0]}" --kill-after=5 "${args[@]:1}");fi
     else args=(timeout --signal=TERM --kill-after=5 30 "${args[@]}");fi
-    "${args[@]}"
+    local delivery_rc=0
+    "${args[@]}" || delivery_rc=$?
+    usr_ops_delivery_record "$delivery_rc" "$importance" "$summary" "$message" "${args[@]}" || printf 'Notification delivery evidence could not be queued; producer failure remains active.\n' >&2
+    return "$delivery_rc"
 }
 
 # Bounded local history for scripts previously dependent on the plugin console.
@@ -88,13 +92,139 @@ usr_ops_append_log() {
     fi
     printf '%s\n' "$line" >>"$file"
 }
+
+
+# Durable failed-delivery evidence for producers without their own outbox.
+# Existing media/DNS/watchdog outboxes keep ownership of their delivery policy.
+usr_ops_delivery_record() (
+    local rc="$1" importance="$2" summary="$3" message="$4" subject='' i key root fd tmp
+    shift 4
+    case "${OPS_SCRIPT_ID:-}" in backup_boot_disk|backup_cache_appdata|backup_media_remote|backup_vault_remote|backup_restore_drill|media_plex_dbrepair) ;; *) return 0;; esac
+    local -a original=("$@")
+    local native_delivery=false arg export_fd ram="${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}"
+    for arg in "${original[@]}";do [[ "$arg" != /usr/local/emhttp/webGui/scripts/notify ]] || native_delivery=true;done
+    [[ "$native_delivery" == true || -n "${USR_OPS_DELIVERY_ROOT:-}" ]] || return 0
+    for ((i=0;i<${#original[@]};i++));do [[ "${original[$i]}" != -s ]] || subject="${original[$((i+1))]:-}";done
+    root="${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}"
+    exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}"
+    if ! mountpoint -q "${USR_OPS_VAULT_MOUNT:-/mnt/vault}" || ! flock -s -n "$export_fd";then root="$ram";fi
+    [[ ! -L "$root" && $(realpath -m "$root") == "$root" ]] || return 1
+    mkdir -p "$root" || return 1;chmod 700 "$root" || return 1
+    exec {fd}>"${USR_OPS_DELIVERY_LOCK:-/run/user-script-delivery.lock}";flock -w 3 "$fd" || return 1
+    key=$(printf '%s\0' "$OPS_SCRIPT_ID" "$importance" "$subject" "$summary" "$message"|sha256sum|cut -d ' ' -f1)
+    if ((rc==0));then
+        if [[ "$OPS_SCRIPT_ID" == backup_vault_remote && -n "${USR_OPS_DELIVERY_CONTEXT:-}" ]];then
+            mkdir -p "$root/.delivery-receipts" || return 1
+            tmp=$(mktemp "$root/.delivery-receipts/.accepted.XXXXXX") || return 1
+            jq -n --arg context "$USR_OPS_DELIVERY_CONTEXT" --argjson at "$(date +%s)" '{schema:1,context:$context,acceptedAt:$at}' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$root/.delivery-receipts/backup_vault_remote.json" || return 1
+        fi
+        rm -f -- "$root/$OPS_SCRIPT_ID.$key.json" "$ram/$OPS_SCRIPT_ID.$key.json";return
+    fi
+    (( $(find "$root" -maxdepth 1 -type f -name '*.json'|wc -l)<100 )) || [[ -f "$root/$OPS_SCRIPT_ID.$key.json" ]] || return 1
+    tmp=$(mktemp "$root/.delivery.XXXXXX") || return 1
+    trap 'rm -f -- "$tmp"' EXIT
+    jq -n --arg context "${USR_OPS_DELIVERY_CONTEXT:-}" --arg id "$key" --arg script "$OPS_SCRIPT_ID" --arg importance "$importance" --arg subject "$subject" --arg summary "$summary" --arg message "$message" --argjson at "$(date +%s)" \
+      '{schema:1,context:$context,id:$id,script:$script,importance:$importance,subject:$subject,summary:$summary,message:$message,queuedAt:$at}' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$root/$OPS_SCRIPT_ID.$key.json"
+)
+
+usr_ops_vault_delivery_seen() {
+    local context="$1" cutoff="${2:-0}" root file
+    [[ -n "$context" ]] || return 1
+    for root in "${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}" "${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}";do
+        file="$root/.delivery-receipts/backup_vault_remote.json"
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        jq -e --arg context "$context" --argjson cutoff "$cutoff" --argjson now "$(date +%s)" '.schema==1 and .context==$context and .acceptedAt>=$cutoff and .acceptedAt<=$now+300' "$file" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+usr_ops_retry_deliveries() {
+    local root="${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}" file count=0 subject summary message importance owner old_owner="${OPS_SCRIPT_ID:-}" rc=0
+    local ram="${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}" digest old_context="${USR_OPS_DELIVERY_CONTEXT:-}" context
+    [[ ! -L "$root" && ! -L "$ram" ]] || return 1
+    [[ -d "$root" || -d "$ram" ]] || return 0
+    while IFS= read -r -d '' file;do
+        ((count<3)) || break
+        jq -e '(.schema==1) and (.script|test("^(backup_(boot_disk|cache_appdata|media_remote|vault_remote|restore_drill)|media_plex_dbrepair)$")) and (.importance|IN("normal","warning","alert")) and all(.subject,.summary,.message;type=="string")' "$file" >/dev/null 2>&1 || continue
+        owner=$(jq -r .script "$file");subject=$(jq -r .subject "$file");summary=$(jq -r .summary "$file");message=$(jq -r .message "$file");importance=$(jq -r .importance "$file")
+        context=$(jq -r '.context // ""' "$file")
+        if [[ "$owner" == backup_vault_remote ]] && usr_ops_vault_delivery_seen "$context" "$(jq -r .queuedAt "$file")";then rm -f -- "$file";continue;fi
+        USR_OPS_DELIVERY_CONTEXT="$context"
+        digest=$(sha256sum "$file"|cut -d ' ' -f1)
+        OPS_SCRIPT_ID="$owner";count=$((count+1))
+        if usr_ops_notify "${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}" -i "$importance" -s "$subject" -d "$summary" -m "$message";then
+            if [[ -f "$file" && $(sha256sum "$file"|cut -d ' ' -f1) == "$digest" ]];then rm -f -- "$file";fi
+        else rc=1;fi
+        OPS_SCRIPT_ID="$old_owner";USR_OPS_DELIVERY_CONTEXT="$old_context"
+    done < <(find "$root" "$ram" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null|sort -zu)
+    return "$rc"
+}
+
+# Scheduled executions have an independent parent recording the final exit,
+# after producer EXIT traps. CLI operations and sourced libraries are unchanged.
+usr_ops_execution_record() (
+    local phase="$1" started="$2" pid="$3" rc="${4:-0}" process_start root="${USR_OPS_EXECUTION_ROOT:-/run/user-script-execution}" file tmp now boot old='{}' status
+    [[ "${OPS_SCRIPT_ID:-}" =~ ^[a-z0-9_]+$ && ! -L "$root" ]] || return 1
+    mkdir -p "$root" || return 1;file="$root/$OPS_SCRIPT_ID.json"
+    [[ ! -L "$file" ]] || return 1
+    if [[ -f "$file" ]];then old=$(jq -c 'select(.schema==1)' "$file") || old='{}';fi
+    [[ -n "$old" ]] || old='{}'
+    now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf unknown)
+    process_start=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')
+    [[ "$phase" != finish ]] || process_start=$(jq -r '.processStart // ""' <<<"$old")
+    status=RUNNING;[[ "$phase" != finish ]] || { status=COMPLETED;((rc==0)) || status=FAILED; }
+    tmp=$(mktemp "$root/.execution.XXXXXX") || return 1;trap 'rm -f -- "$tmp"' EXIT
+    jq -n --argjson old "$old" --arg processStart "$process_start" --arg name "$OPS_SCRIPT_ID" --arg boot "$boot" --arg status "$status" --argjson started "$started" --argjson at "$now" --argjson pid "$pid" --argjson rc "$rc" \
+      '$old+{schema:1,name:$name,boot:$boot,executionStatus:$status,startedAt:$started,observedAt:$at,pid:$pid,processStart:$processStart,lastExitCode:$rc} |
+       if $status!="RUNNING" then .finishedAt=$at|.durationSeconds=($at-$started)|.lastCompletedAt=$at|if $rc==0 then .lastSuccessAt=$at else . end else . end' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file" || return 1
+    local persistent="${USR_OPS_EXECUTION_PERSISTENT_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/execution}" fd export_fd
+    mountpoint -q "${USR_OPS_VAULT_MOUNT:-/mnt/vault}" || return 0
+    [[ ! -L "$persistent" && $(realpath -m "$persistent") == "$persistent" ]] || return 1
+    exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}";flock -s -n "$export_fd" || return 0
+    mkdir -p "$persistent" || return 1
+    tmp=$(mktemp "$persistent/.execution.XXXXXX") || return 1
+    cp "$file" "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$persistent/$OPS_SCRIPT_ID.json"
+)
+
+usr_ops_supervise() {
+    local script="$1" started pid rc=0 receipt_fd record_owner=false
+    # Repository/fixture executions must never publish production evidence.
+    # Explicit test roots opt into supervision for isolated regression checks.
+    case "$script" in
+      /boot/config/plugins/user.scripts/scripts/*/script|/tmp/user.scripts/tmpScripts/*/script) ;;
+      *) if [[ -z "${USR_OPS_EXECUTION_ROOT:-}" ]];then USR_OPS_SUPERVISED="$OPS_SCRIPT_ID" /bin/bash "$script";return $?;fi;;
+    esac
+    local execution_root="${USR_OPS_EXECUTION_ROOT:-/run/user-script-execution}"
+    if [[ ! -L "$execution_root" ]] && mkdir -p "$execution_root";then
+        exec {receipt_fd}>"$execution_root/$OPS_SCRIPT_ID.lock"
+        flock -n "$receipt_fd" && record_owner=true
+    fi
+    started=$(date +%s)
+    USR_OPS_SUPERVISED="$OPS_SCRIPT_ID" OPS_RUN_ID="${OPS_RUN_ID:-${started}_$$}" /bin/bash "$script" &
+    pid=$!
+    [[ "$record_owner" != true ]] || usr_ops_execution_record start "$started" "$pid" || printf 'Execution receipt unavailable for %s; workflow continues.\n' "$OPS_SCRIPT_ID" >&2
+    trap 'kill -TERM "$pid" 2>/dev/null || true' TERM HUP
+    trap 'kill -INT "$pid" 2>/dev/null || true' INT
+    wait "$pid" || rc=$?
+    # A signal can interrupt wait while the producer is still restoring state.
+    if kill -0 "$pid" 2>/dev/null;then wait "$pid" || rc=$?;fi
+    [[ "$record_owner" != true ]] || usr_ops_execution_record finish "$started" "$pid" "$rc" || printf 'Completion receipt unavailable for %s (exit=%s).\n' "$OPS_SCRIPT_ID" "$rc" >&2
+    trap - TERM HUP INT
+    return "$rc"
+}
 # END EMBEDDED OPERATIONS CONTRACT
+# BEGIN SCHEDULED EXECUTION SUPERVISOR
+if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$OPS_SCRIPT_ID" ]];then
+    usr_ops_supervise "$0";exit $?
+fi
+# END SCHEDULED EXECUTION SUPERVISOR
 # BEGIN EMBEDDED USER SCRIPTS CATALOG
 # shellcheck shell=bash
 # Shared User Scripts catalogue v1. Native schedule.json stays authoritative;
 # readers also verify the live/restored script file. No schedule is executed.
 usr_scripts_catalog() {
     local file="$1" root="${2:-$(dirname "$1")/scripts}" mode="${3:-live}" mapping='{}' native default_cron
+    command -v php >/dev/null || { printf '{"schema":1,"valid":false,"detail":"Native PHP runtime unavailable"}\n';return 1; }
     if [[ "$mode" == live ]];then
         native=$(timeout --kill-after=2 8 crontab -c /etc/cron.d -l 2>/dev/null) || native=''
         default_cron=$(timeout --kill-after=2 8 crontab -l 2>/dev/null) || default_cron=''
@@ -273,10 +403,22 @@ usr_scripts_registry_ack() {
     jq --argjson ids "$ids" --argjson reload "$reload" '.events|=map(select(.id as $id|($ids|index($id))==null)) | if $reload then .cronReloadPending=false else . end' "$state" >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$state" || rc=$?
     rm -f -- "$tmp";exec {fd}>&-;return "$rc"
 }
+
+# A producer's receipt describes its current native schedule, not a copied cron.
+usr_scripts_schedule_evidence() {
+    local role="$1" file="${USER_SCRIPTS_SCHEDULE_FILE:-/boot/config/plugins/user.scripts/schedule.json}" tmp window
+    tmp=$(mktemp /tmp/user-script-schedule.XXXXXX) || return 1
+    if usr_scripts_catalog "$file" "${USER_SCRIPTS_PHYSICAL_ROOT:-$(dirname "$file")/scripts}" >"$tmp";then
+        window=$(usr_scripts_due_window "$tmp" "$role" "$(date +%s)" 0 288000) || window='{}'
+        jq -c --arg role "$role" --argjson window "$window" '[.jobs[]|select((.role==$role or .name==$role) and .present and .enabled)] |
+          if length==1 then .[0]|{verified:true,cron,frequency,event,timezone:"Asia/Singapore",intervalSeconds:(if ($window.lastDue|type)=="number" and ($window.cutoff|type)=="number" then $window.lastDue-$window.cutoff else null end)} else {verified:false,reason:"Enabled schedule missing or ambiguous"} end' "$tmp"
+    else printf '{"verified":false,"reason":"Native schedule inventory unavailable"}\n';fi
+    rm -f -- "$tmp"
+}
 # END EMBEDDED USER SCRIPTS CATALOG
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="1.6.0"
+readonly SCRIPT_VERSION="1.6.1"
 # Keep configured per-item holds when approving the same installed identity.
 # Daily rolling tags need a shorter hold to avoid perpetually chasing rebuilds.
 readonly APPROVAL_JQ='def approval($old;$identity;$allow;$kind;$epoch):
@@ -653,7 +795,7 @@ check_updates() {
       [[ "$kind" != plugin || "$name" == unRAIDServer.plg ]] || fingerprint="$candidate:$(jq -r .candidate.sha256 "$TMP_DIR/check.json")"
       mutate --arg fingerprint "$fingerprint" --arg key "$key" --arg candidate "$candidate" --argjson available "$available" --argjson now "$now" --slurpfile data "$TMP_DIR/check.json" '
         .items[$key] |= (.candidateSeenAt=(if .candidateFingerprint==$fingerprint then (.candidateSeenAt // $now) else $now end) |
-          .candidateFingerprint=$fingerprint | .candidate=$candidate | .available=$available | .checkedAt=$now | .checkFailures=0 | .checkStatus="VERIFIED" | .evidence=$data[0])' || return 1
+          .candidateFingerprint=$fingerprint | .candidate=$candidate | .available=$available | .checkedAt=$now | .checkFailures=0 | .checkStatus="VERIFIED" | .candidateStatus=(if $available then "CANDIDATE" else "UP_TO_DATE" end) | .evidence=$data[0])' || return 1
       if ((previous_failures>=3));then event normal 'Update checks restored' "$kind/$name: fresh native update evidence obtained after repeated check failures; normal approval and installation guards remain in force." "check-restored:$key:$((now/(7*86400)))" || return 1;fi
       log INFO "$kind/$name: update check completed; available=$available; no installation performed by check"
     done < <(jq -r --argjson now "$now" --argjson interval "$CHECK_INTERVAL_SECONDS" '.items|to_entries|sort_by(.value.checkedAt // 0)|.[]|
@@ -1271,10 +1413,12 @@ collect_update_holds() {
       done
       target_coordination "$kind" "$name" "$identity"
       mode=-s;[[ "$COORD_EXCLUSIVE" != true ]] || mode=-x
-      [[ ! -e "$ARR_BACKUP_GATE" ]] || flock "$mode" -n "$ARR_BACKUP_GATE" -c true || add_hold coordination 'Existing application/backup script must finish; bounded handoff will be retried'
-      for lock in "${COORD_LOCKS[@]}";do
-        [[ ! -e "$lock" ]] || flock -s -n "$lock" -c true || add_hold producer "Existing ${lock##*/} producer must finish"
-      done
+      if window_open;then
+        [[ ! -e "$ARR_BACKUP_GATE" ]] || flock "$mode" -n "$ARR_BACKUP_GATE" -c true || add_hold coordination 'Short application operation active; dispatch waits for its verified completion and retries within the window'
+        for lock in "${COORD_LOCKS[@]}";do
+          [[ ! -e "$lock" ]] || flock -s -n "$lock" -c true || add_hold producer "Existing ${lock##*/} producer must finish"
+        done
+      fi
       # Keep same-candidate suppression visible alongside other independent holds.
       jq -e --arg key "$key" --arg c "$candidate" --argjson now "$now" 'any(.jobs[];.item==$key and .candidate==$c and (.status!="DEFERRED" or (.retryAt // (.startedAt+21600))>$now))' "$STATE_FILE" >/dev/null && add_hold journal 'Candidate already handled or unresolved; no blind reinstall'
       cached=$(jq -c '.readinessAssessment // {}' <<<"$row")
@@ -1298,7 +1442,7 @@ collect_update_holds() {
       fi
       retry=$(next_update_attempt "$retry") || return 1
       jq -s 'unique_by(.code,.reason)' "$TMP_DIR/holds.ndjson" >"$TMP_DIR/holds.json" || return 1
-      mutate --arg key "$key" --arg c "$candidate" --argjson now "$now" --argjson retry "$retry" --slurpfile holds "$TMP_DIR/holds.json" '.items[$key].holds={at:$now,candidate:$c,nextAttemptAt:$retry,reasons:$holds[0]}' || return 1
+      mutate --arg key "$key" --arg c "$candidate" --argjson now "$now" --argjson retry "$retry" --slurpfile holds "$TMP_DIR/holds.json" '.items[$key].holds={at:$now,candidate:$c,nextAttemptAt:$retry,reasons:$holds[0]} | .items[$key].candidateStatus="CANDIDATE" | .items[$key].scheduling={state:(if any($holds[0][];.code!="window") then "WAITING_CHECKS" elif any($holds[0][];.code=="window") then "WAITING_WINDOW" else "READY_FOR_SLOT" end),nextAttemptAt:$retry,assessedAt:$now}' || return 1
     done < <(jq -r '.items|to_entries|sort_by(.value.readinessAssessment.at // 0)|.[]|select(.value.available==true)|[.key,.value.kind,.value.name,.value.identity,.value.candidate]|@tsv' "$STATE_FILE")
     SUMMARY="$saved_summary"
 }
@@ -1346,7 +1490,7 @@ render_update_report() {
       ([$s.jobs[]|select(.status|IN("INTENT","VERIFYING","ATTENTION"))] as $pending |
         if ($pending|length)==0 then "- None."
         else $pending[]|"- "+.kind+"/"+.name+": "+.status+"; candidate "+(.candidate|short)+". "+(.reason // "Digest/version, retained configuration and readiness require confirmation")+". Recovery: "+(.recoveryPath // "not recorded") end),
-      "", "AVAILABLE UPDATES / DEFERRED OR UNVERIFIED:",
+      "", "UPDATE CANDIDATES / WAITING OR UNVERIFIED:",
       ($s.items|to_entries|sort_by(.key)|.[]|
         .key as $key|.value as $i|
         if ($i.checkStatus=="VERIFIED" and $i.available!=true and ($i.missingScans // 0)==0) then empty
@@ -1436,7 +1580,8 @@ Usage: /bin/bash /boot/config/plugins/user.scripts/scripts/system_update_coordin
 No command: automatic policy evaluation, bounded checks, approved installation in
 13:15-15:30 Singapore, reconciliation and grouped reporting. Schedule: */15 * * * *.
 --status                       Saved policy and update status; no registry/install.
---check-only                   Refresh due evidence; no installation.
+--check-only [--refresh]       Refresh due/all bounded evidence; no installation.
+--candidates                   Show verified/held available update candidates and next attempts.
 --allow docker NAME             Approve exact installed image repository/channel.
 --allow plugin NAME.plg         Approve exact installed plugin source (OS excluded).
 --allow-installed              Approve current installed identities; OS stays manual.
@@ -1498,6 +1643,7 @@ main() {
     trap finish EXIT
     trap 'SUMMARY="Update coordinator interrupted; durable intent retained";exit 143' INT TERM HUP
     case "${1:-}" in
+      --candidates) QUIET_FINISH=true;jq '[.items|to_entries[]|select(.value.available==true)|{kind:.value.kind,name:.value.name,status:"CANDIDATE",candidate:.value.candidate,verified:(.value.checkStatus=="VERIFIED"),firstObservedAt:.value.candidateSeenAt,checkedAt:.value.checkedAt,scheduling:.value.scheduling,nextAttemptAt:.value.holds.nextAttemptAt,holds:(.value.holds.reasons // []),readiness:.value.readinessAssessment}]' "$STATE_FILE";return $?;;
       --status) QUIET_FINISH=true;jq -n --slurpfile p "$POLICY_FILE" --slurpfile s "$STATE_FILE" '{policy:$p[0],items:$s[0].items,jobs:$s[0].jobs,pendingNotifications:($s[0].outbox|length)}';return 0;;
       --pause|--resume) local enabled=false;[[ "$1" != --resume ]] || enabled=true;policy_update --argjson enabled "$enabled" '.enabled=$enabled';return $?;;
       --limits) [[ $# == 4 && "$2" =~ ^([1-9]|1[0-2])$ && "$3" =~ ^[0-4]$ && "$4" =~ ^[0-9]+$ ]] && ((10#$4>=1 && 10#$4<=168)) || return 2;policy_update --argjson docker "$2" --argjson plugins "$3" --argjson hold "$((10#$4))" '.limits += {dailyDocker:$docker,dailyPlugins:$plugins,dailyTotal:($docker+$plugins),candidateHoldHours:$hold}';return $?;;
@@ -1533,7 +1679,9 @@ main() {
         else identity=$(jq -er --arg name "$3" '.plugins[$name].installed.url|select(startswith("https://"))' "$TMP_DIR/inventory.json") || return 2;fi
         policy_update --arg kind "$2" --arg name "$3" --arg identity "$identity" --argjson allow "$allow" --argjson now "$(date +%s)" \
           "$APPROVAL_JQ"'if $kind=="docker" then .docker[$name]=approval((.docker[$name] // {});$identity;$allow;$kind;$now) else .plugins[$name]=approval((.plugins[$name] // {});$identity;$allow;$kind;$now) end';return $?;;
-      ''|--check-only) ;;
+      ''|--check-only)
+        [[ $# -le 2 && ( $# -lt 2 || "$2" == --refresh ) ]] || return 2
+        if [[ "${2:-}" == --refresh ]];then CHECK_INTERVAL_SECONDS=0;MAX_CHECKS_PER_RUN=32;fi;;
       *) return 2;;
     esac
     reconcile_script_schedules || { SUMMARY="Schedule reconciliation deferred: ${SUMMARY:-inventory unverified}";return 1; }
