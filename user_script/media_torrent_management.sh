@@ -2,7 +2,7 @@
 clearLog=true
 
 ###############################################################################
-# Data Management v3.6
+# Data Management v3.6.1
 #
 # PURPOSE
 # -------
@@ -266,7 +266,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
-readonly SCRIPT_VERSION="3.6.0"
+readonly SCRIPT_VERSION="3.6.1"
 
 umask 0002
 
@@ -891,12 +891,13 @@ build_rename_rules() {
     #
     #   12345ch       -> 12345
     #   ABC-123ch     -> ABC-123
-    #   123ch1080p    -> 1231080p
+    #   123ch1080p    -> 123-1080p
     #
     # Normal words containing "ch" remain untouched.
     ###########################################################################
 
     RENAME_SED_ARGS+=(
+        -e 's/([0-9])ch([0-9])/\1-\2/g'
         -e 's/([0-9])ch/\1/g'
     )
 }
@@ -930,6 +931,8 @@ jav_release_name() {
     # An attached letter may identify a different edition/part. Keep it rather
     # than guessing. The established ch suffix remains ordinary junk cleanup.
     [[ ! "$tail" =~ ^[A-Za-z] ]] || return 1
+    # Bare part/edition suffixes are ambiguous; do not erase their identity.
+    [[ ! "$upper" =~ ^[[:space:]_.+-]+([ABD]|[0-9]{1,2})($|[[:space:]_.+-]) ]] || return 1
     if [[ "$upper" =~ (^|[^A-Z])(CD|DISC|DISK|PART|PT)[[:space:]_.-]*([0-9]{1,2})([^0-9]|$) ]];then
         part=$((10#${BASH_REMATCH[3]}));((part>0)) || return 1
         upper="${upper/"${BASH_REMATCH[0]}"/ }"
