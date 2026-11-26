@@ -64,7 +64,7 @@ pack_snapshot() {
           automation_document_valid "$STATE_DIR/import-receipts.json" receipts || return 1
           jq -e --argjson id "$target" 'all(.receipts[]|select(.app=="Sonarr");all(.targets[];.targetId!=$id))' "$STATE_DIR/import-receipts.json" >/dev/null || return 1
         fi
-        jq -e --argjson id "$target" 'all(.downloadLedger[]?|select(.app=="Sonarr" and ((.arrImportedAt // 0)>0 or (.manuallyDismissedAt // 0)>0));all(.targets[]?;(.episodeId // 0)!=$id))' "$STATE_FILE" >/dev/null || return 1
+        jq -e --argjson id "$target" 'all(.downloadLedger[]?|select(.app=="Sonarr" and ((.arrImportedAt // 0)>0 or (.manuallyDismissedAt // 0)>0 or .reconciliationKind=="target-satisfied"));all(.targets[]?;(.episodeId // 0)!=$id))' "$STATE_FILE" >/dev/null || return 1
       else return 1;fi
       jq -nc --slurpfile e "$ep" --slurpfile f "$file" --slurpfile p "$profile" --slurpfile h "$history" '
         $e[0] as $e|$f[0] as $f|{key:($e.id|tostring),value:{id:$e.id,seriesId:$e.seriesId,seasonNumber:$e.seasonNumber,episodeNumber:$e.episodeNumber,monitored:$e.monitored,hasFile:$e.hasFile,fileId:($e.episodeFileId // 0),filePath:($f.path // ""),fileDateAdded:($f.dateAdded // ""),
@@ -108,7 +108,7 @@ pack_missing_guard() {
       automation_document_valid "$STATE_DIR/import-receipts.json" receipts || return 1
       jq -e --argjson target "$target" 'all(.receipts[]|select(.app=="Sonarr");all(.targets[];.targetId!=$target))' "$STATE_DIR/import-receipts.json" >/dev/null || return 1
     fi
-    jq -e --argjson target "$target" 'all(.downloadLedger[]?|select(.app=="Sonarr" and ((.arrImportedAt // 0)>0 or (.manuallyDismissedAt // 0)>0));all(.targets[]?;(.episodeId // 0)!=$target))' "$STATE_FILE" >/dev/null || return 1
+    jq -e --argjson target "$target" 'all(.downloadLedger[]?|select(.app=="Sonarr" and ((.arrImportedAt // 0)>0 or (.manuallyDismissedAt // 0)>0 or .reconciliationKind=="target-satisfied"));all(.targets[]?;(.episodeId // 0)!=$target))' "$STATE_FILE" >/dev/null || return 1
     api_get "$root/qualityprofile" "$key" "$profile" && api_get "$root/customformat" "$key" "$formats" || return 1
     [[ $(pack_profile_signature "$profile" "$formats") == $(jq -r .disposalPlan.profileSignature "$job") ]]
 }
