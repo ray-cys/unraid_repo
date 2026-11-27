@@ -87,6 +87,12 @@ class ObserverTests(unittest.TestCase):
   try:w['collect'](c,self.now)
   finally:w['run_command']=old
   self.assertIn('-n',seen[0]);self.assertIn('/dev/null',seen[0])
+ def test_busy_cli_never_claims_test_email_sent(self):
+  import unittest.mock as mock
+  with tempfile.TemporaryDirectory() as d:
+   c={'lockFile':str(Path(d)/'lock'),'stateDirectory':d}
+   with mock.patch.dict(w,{'load_config':lambda p:c}),mock.patch.object(w['fcntl'],'flock',side_effect=BlockingIOError),mock.patch.object(w['time'],'monotonic',side_effect=[0,11]):
+    self.assertEqual(w['main'](['--test-email']),75)
  def test_stale_wrong_boot_receipt(self):
   import json
   value={'schema':1,'name':'Hubble','bootId':'12345678-1234-1234-1234-123456789abc','epoch':self.now,'uptimeSeconds':20000,'fastWatchdog':{'status':'COMPLETE','bootId':'old','observedAt':self.now}}

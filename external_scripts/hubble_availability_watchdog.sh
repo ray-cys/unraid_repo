@@ -1,5 +1,5 @@
 #!/bin/bash
-# Hubble Availability Watchdog v1.0.1 — runs on the independent Raspberry Pi.
+# Hubble Availability Watchdog v1.0.2 — runs on the independent Raspberry Pi.
 # Purpose: report Hubble outages, stalled monitoring, web-interface failures and
 # observed reboots without depending on Hubble to send email. No host restart,
 # repair, wake, container action or configuration replay is performed.
@@ -19,7 +19,7 @@ exec /usr/bin/python3 - "$@" <<'PY'
 # BEGIN EXTERNAL WATCHDOG PYTHON
 import argparse, copy, datetime, email.message, email.utils, fcntl, hashlib, json
 import os, pathlib, re, stat, subprocess, sys, tempfile, time
-VERSION = '1.0.1'
+VERSION = '1.0.2'
 ACTIVE_CONFIG = None
 
 
@@ -236,8 +236,17 @@ def main(argv=None):
     c=load_config(args.config);ACTIVE_CONFIG=c;secure_file(c['lockFile'],True)
     fd=os.open(c['lockFile'],os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
     try:
-        try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError:return 0
+        explicit=args.status or args.test_email or args.maintenance is not None or args.clear_maintenance
+        deadline=time.monotonic()+(10 if explicit else 0)
+        while True:
+            try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);break
+            except BlockingIOError:
+                if time.monotonic()>=deadline:
+                    if explicit:
+                        print('Observer is busy; requested CLI action was not performed. Retry after the running scan finishes.',file=sys.stderr)
+                        return 75
+                    return 0
+                time.sleep(0.1)
         path=pathlib.Path(c['stateDirectory'])/'state.json';secure_file(path,True)
         state=json.loads(path.read_text()) if path.exists() else initial_state()
         if state.get('schema')!=1 or not all(isinstance(state.get(k),dict) for k in ['conditions','pending','delivery','maintenance']) or not isinstance(state.get('history'),list):
