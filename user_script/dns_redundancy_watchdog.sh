@@ -1,4 +1,11 @@
 #!/bin/bash
+# Release version: bump for every deployed code change; descriptions stay user-owned.
+readonly SCRIPT_VERSION="1.4.1"
+# Version lookup exits before logging, locks, state, Docker or network activity.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
+    printf 'dns_redundancy_watchdog.sh %s\n' "$SCRIPT_VERSION"
+    exit 0
+fi
 clearLog=true
 
 ###############################################################################
@@ -219,7 +226,6 @@ fi
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.4.0"
 
 ###############################################################################
 # CONFIGURATION

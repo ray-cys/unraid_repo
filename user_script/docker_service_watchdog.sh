@@ -1,9 +1,16 @@
 #!/bin/bash
+# Release version: bump for every deployed code change; descriptions stay user-owned.
+readonly SCRIPT_VERSION="3.18.1"
+# Version lookup exits before logging, locks, state, Docker or network activity.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
+    printf 'docker_service_watchdog.sh %s\n' "$SCRIPT_VERSION"
+    exit 0
+fi
 # UI-only profiles use bounded native backend APIs for SABnzbd, Bazarr, Tautulli
 # and PhotoPrism. Credentials stay inside containers; no configuration is changed.
 # Unverified/disabled API authentication never authorizes an automatic restart.
 clearLog=true
-# Docker Service Watchdog v3.13 -- Unraid service availability and bounded recovery.
+# Docker Service Watchdog v3.18.1 -- Unraid service availability and bounded recovery.
 # Optional schedule: every five minutes. Pi-hole and application-specific health
 # remain owned by the DNS and Arr monitors. Recovery follows Hubble's existing
 # per-service permissions; VPN/configuration findings never request restarts.
@@ -439,7 +446,6 @@ US_CRON_VERIFY
 # END EMBEDDED USER SCRIPTS CATALOG
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.18.0"
 
 ###############################################################################
 # CONFIGURATION

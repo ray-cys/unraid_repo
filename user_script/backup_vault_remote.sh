@@ -1,4 +1,11 @@
 #!/bin/bash
+# Release version: bump for every deployed code change; descriptions stay user-owned.
+readonly SCRIPT_VERSION="1.24.5"
+# Version lookup exits before logging, locks, state, Docker or network activity.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
+    printf 'backup_vault_remote.sh %s\n' "$SCRIPT_VERSION"
+    exit 0
+fi
 clearLog=true
 
 ###############################################################################
@@ -488,7 +495,6 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.24.4"
 
 ###############################################################################
 # CONFIGURATION

@@ -1,8 +1,15 @@
 #!/bin/bash
+# Release version: bump for every deployed code change; descriptions stay user-owned.
+readonly SCRIPT_VERSION="3.4.1"
+# Version lookup exits before logging, locks, state, Docker or network activity.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
+    printf 'media_metadata_audit.sh %s\n' "$SCRIPT_VERSION"
+    exit 0
+fi
 # shellcheck disable=SC2034
 clearLog=true
 arrayStarted=true
-# MetaFusion/Kometa/Recyclarr/ImageMaid weekly findings and guarded reconciliation v3.4. Schedule 55 3,7,11,15,19,23 * * *.
+# MetaFusion/Kometa/Recyclarr/ImageMaid weekly findings and guarded reconciliation v3.4.1. Schedule 55 3,7,11,15,19,23 * * *.
 # Run after MetaFusion and before the four-hour Kometa boundaries. MetaFusion
 # owns generated metadata; this wrapper only maintains personal overlay and
 # collection templates, under the MetaFusion/wrapper write lock.
@@ -213,7 +220,6 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
-readonly SCRIPT_VERSION="3.4.0"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/media_metadata_audit}"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 NOTIFY_BIN="${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}"

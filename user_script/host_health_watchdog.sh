@@ -1,4 +1,11 @@
 #!/bin/bash
+# Release version: bump for every deployed code change; descriptions stay user-owned.
+readonly SCRIPT_VERSION="1.9.2"
+# Version lookup exits before logging, locks, state, Docker or network activity.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
+    printf 'host_health_watchdog.sh %s\n' "$SCRIPT_VERSION"
+    exit 0
+fi
 # FRESHNESS: successful scan/delivery publishes a current-boot receipt to the
 # central status directory. The hourly backup audit checks enabled dynamic cadence;
 # a failed invocation cannot advance that successful-scan timestamp.
@@ -254,7 +261,6 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
-readonly SCRIPT_VERSION="1.9.1"
 
 
 ###############################################################################

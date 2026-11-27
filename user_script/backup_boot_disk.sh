@@ -1,8 +1,15 @@
 #!/bin/bash
+# Release version: bump for every deployed code change; descriptions stay user-owned.
+readonly SCRIPT_VERSION="3.3.3"
+# Version lookup exits before logging, locks, state, Docker or network activity.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
+    printf 'backup_boot_disk.sh %s\n' "$SCRIPT_VERSION"
+    exit 0
+fi
 clearLog=true
 
 ###############################################################################
-# Unraid Boot Device Backup v3.3
+# Unraid Boot Device Backup v3.3.3
 #
 # Designed for Unraid 7.4+ while remaining resilient to future changes in the
 # private WebGUI backup helper.
@@ -228,7 +235,6 @@ fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
 
-readonly SCRIPT_VERSION="3.3.2"
 
 ###############################################################################
 # CONFIGURATION

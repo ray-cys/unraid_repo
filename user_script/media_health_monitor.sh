@@ -1,16 +1,18 @@
 #!/bin/bash
+# Release version: bump for every deployed code change; descriptions stay user-owned.
+readonly SCRIPT_VERSION="3.29.1"
+# Version lookup exits before logging, locks, state, Docker or network activity.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
+    printf 'media_health_monitor.sh %s\n' "$SCRIPT_VERSION"
+    exit 0
+fi
 # PRESENTATION: health-presentation.json separates current workflow errors from
 # retained historical events. Maintenance availability/resume receipts describe
 # backup deferrals without clearing issues or permitting pipeline mutations.
 clearLog=true
 
-# Read-only version lookup must return before state, API or automation setup.
-if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]];then
-    printf 'media_health_monitor.sh 3.29.0\n';exit 0
-fi
-
 ###############################################################################
-# ARR Health / Download / Import Monitor v3.29.0
+# ARR Health / Download / Import Monitor v3.29.1
 #
 # PURPOSE
 # -------
@@ -7417,7 +7419,7 @@ list_active_issues() {
 print_lifecycle_command_help() {
 
     printf '%s\n' \
-        'Media Health Monitor v3.29.0 lifecycle commands' \
+        "Media Health Monitor v$SCRIPT_VERSION lifecycle commands" \
         'Historical vanished/never-arrived attempts become REVIEW_REQUIRED warnings' \
         'after 12 hours and successful Arr/SAB checks; no import/cancellation is inferred.' \
         'Review warnings notify once per unchanged issue and remain in --list-active.' \
@@ -18331,7 +18333,7 @@ prune_persistent_logs_by_age
 
 persistent_log \
     "DEBUG" \
-    "START | Media Health Monitor v3.29.0"
+    "START | Media Health Monitor v$SCRIPT_VERSION"
 
 if [ "$ACTIVITY_AUDIT_ENABLED" = true ]; then
 
@@ -18344,7 +18346,7 @@ fi
 # START
 ###############################################################################
 
-debug_log "Starting Media Health Monitor v3.29.0"
+debug_log "Starting Media Health Monitor v$SCRIPT_VERSION"
 debug_log "Recommended schedule: every five minutes"
 debug_log "Notifications enabled: $SEND_NOTIFICATIONS"
 debug_log "Grouped notification maximum items: $GROUP_NOTIFICATION_MAX_ITEMS"
@@ -19007,7 +19009,7 @@ RUNTIME=$(runtime)
 if [ "$DETAILED_SUMMARY_DUE" = true ]; then
 
 log "============================================================"
-log "Media Health Monitor v3.29.0 completed"
+log "Media Health Monitor v$SCRIPT_VERSION completed"
 log "Detailed summary reason: $DETAILED_SUMMARY_REASON"
 
 log ""

@@ -1,4 +1,11 @@
 #!/bin/bash
+# Release version: bump for every deployed code change; descriptions stay user-owned.
+readonly SCRIPT_VERSION="1.6.1"
+# Version lookup exits before logging, locks, state, Docker or network activity.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
+    printf 'backup_restore_drill.sh %s\n' "$SCRIPT_VERSION"
+    exit 0
+fi
 clearLog=true
 
 ###############################################################################
@@ -453,7 +460,6 @@ US_CRON_VERIFY
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="1.6.0"
 
 ###############################################################################
 # CONFIGURATION

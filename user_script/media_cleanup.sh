@@ -1,10 +1,17 @@
 #!/bin/bash
+# Release version: bump for every deployed code change; descriptions stay user-owned.
+MC_VERSION="1.11.1"
+# Version lookup exits before logging, locks, state, Docker or network activity.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
+    printf 'media_cleanup.sh %s\n' "$MC_VERSION"
+    exit 0
+fi
 # Pack cleanup consumes frozen exact-ID plans from media_health_monitor. Only
 # verified redundant/rejected source videos enter per-file quarantine; native
 # identities, remaining inventory, active work, Mover and restore holds recheck.
 clearLog=true
 arrayStarted=true
-# Media Cleanup v1.11.0 -- personal Hubble operations
+# Media Cleanup v1.11.1 -- personal Hubble operations
 #
 # TAG LIFECYCLE: confirmed deletion -> plex-deleted (movie) or plex-deleted-
 # series/season (Sonarr). Eligible whole-item hold -> retirement-pending only.
@@ -293,7 +300,6 @@ fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
 umask 077
-MC_VERSION="1.11.0"
 # One execution switch across every module. Conflicting/unused flags fail before work.
 # In preview, quarantine purge becomes audit; restore requires an explicit execute flag.
 MC_DRY_RUN=false

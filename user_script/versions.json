@@ -1,0 +1,77 @@
+{
+  "schema": 1,
+  "scripts": {
+    "backup_boot_disk": {
+      "version": "3.3.3",
+      "sha256": "95c99006f1efb8028c6032ab480ab5ea2b27d8ca3839e1365cecfb9065dffbd8"
+    },
+    "backup_cache_appdata": {
+      "version": "3.11.1",
+      "sha256": "3e6dbff06b6f4f43f666ad301a03a7b4b4bb8d8c1c23f8e8c37f81e69a90bff9"
+    },
+    "backup_health_audit": {
+      "version": "1.14.4",
+      "sha256": "65229c1aa12f168daf6d91e280db3fd10f513423275a016ab56f55411d259141"
+    },
+    "backup_media_remote": {
+      "version": "2.9.1",
+      "sha256": "adec4b0ced55de43d4b215604c8e32b2ea9daad82d805947a2b027201f3ce6ba"
+    },
+    "backup_restore_drill": {
+      "version": "1.6.1",
+      "sha256": "a335681a0d833f5ad5f298009010943d188a3cd644175d5768ffb96e9bf4c500"
+    },
+    "backup_vault_remote": {
+      "version": "1.24.5",
+      "sha256": "b57f71f1dd1421a73428eb7fee4cec99c0ca736143b08f06a10167c24bcd5e8b"
+    },
+    "dns_redundancy_watchdog": {
+      "version": "1.4.1",
+      "sha256": "d4ecc5fb42a7e367ff6bc6ca305c9608bb3bafd460327054ae018750ff6a8419"
+    },
+    "docker_service_watchdog": {
+      "version": "3.18.1",
+      "sha256": "0df61dafed451fc335d7cdb629e9f7e357d8d9052e94f470b4e06577a1ed9df2"
+    },
+    "host_health_monitor": {
+      "version": "3.4.1",
+      "sha256": "c6457382188e0fea1c1991e3608b1dc8883daa76237ea9aa3140479a890f2d16"
+    },
+    "host_health_watchdog": {
+      "version": "1.9.2",
+      "sha256": "b85062425c348f5bebd19bfd61bf43c55c868959dfda6f94ac7d87ac9568f388"
+    },
+    "media_cleanup": {
+      "version": "1.11.1",
+      "sha256": "31374aa53d938e3e01dd180940d273a650f0311037338809d76277c949e223c3"
+    },
+    "media_health_monitor": {
+      "version": "3.29.1",
+      "sha256": "f36dd3e7d97ea32bcb36c8cf2a82a13ab62831e112fe1a05132c6a3b787b0106"
+    },
+    "media_integrity_audit": {
+      "version": "2.7.2",
+      "sha256": "db84286830c9185dac18575f3e0696b3b9d8b5fbbe4e01bbc68c4bb532b3f7ec"
+    },
+    "media_metadata_audit": {
+      "version": "3.4.1",
+      "sha256": "76739b46e9de4fd8f7b69c8fa1e4f8b72764603da55586f39b37b30af7cf5449"
+    },
+    "media_plex_dbrepair": {
+      "version": "3.6.3",
+      "sha256": "e7f67a12e6ebc7cd7983bfaa23e4cff7048abd64f7e91b2b26f0bab914b34d7f"
+    },
+    "media_torrent_management": {
+      "version": "3.7.1",
+      "sha256": "b70a01dbc7d813f305bd597948db72cbfbdf60167d48a8e72413c3a2cd8be87e"
+    },
+    "ram_logs_watchdog": {
+      "version": "3.3.2",
+      "sha256": "a44b5b506ad08cf7c265ff7b49b7d076b9863a8f9018037448c4386b0ed0dc90"
+    },
+    "system_update_coordinator": {
+      "version": "1.10.2",
+      "sha256": "259ebd03a2f0797410e0cbc45c979b5b3632eb8841e5ca84e7ac30d8158af9d9"
+    }
+  }
+}

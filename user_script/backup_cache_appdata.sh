@@ -1,8 +1,15 @@
 #!/bin/bash
+# Release version: bump for every deployed code change; descriptions stay user-owned.
+readonly SCRIPT_VERSION="3.11.1"
+# Version lookup exits before logging, locks, state, Docker or network activity.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
+    printf 'backup_cache_appdata.sh %s\n' "$SCRIPT_VERSION"
+    exit 0
+fi
 clearLog=true
 
 ###############################################################################
-# Appdata + Optional Shares Backup v3.10
+# Appdata + Optional Shares Backup v3.11.1
 #
 # PURPOSE
 # -------
@@ -265,7 +272,6 @@ fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
 
-readonly SCRIPT_VERSION="3.11.0"
 
 
 ###############################################################################

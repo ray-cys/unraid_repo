@@ -1,4 +1,11 @@
 #!/bin/bash
+# Release version: bump for every deployed code change; descriptions stay user-owned.
+readonly SCRIPT_VERSION="2.9.1"
+# Version lookup exits before logging, locks, state, Docker or network activity.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
+    printf 'backup_media_remote.sh %s\n' "$SCRIPT_VERSION"
+    exit 0
+fi
 # COMPLETION EVIDENCE: schema-2 last-success and last-attempt receipts retain per-job
 # outcomes/policy identity. Success is published before shutdown/mail; unchanged
 # files use rsync size/mtime selection, not a full mirror rehash. --evidence-status
@@ -6,7 +13,7 @@
 clearLog=true
 
 ###############################################################################
-# Media Remote Backup v2.8
+# Media Remote Backup v2.9.1
 #
 # PURPOSE
 # -------
@@ -511,7 +518,6 @@ LOCK_FILE="/tmp/backup_media_remote.lock"
 
 
 readonly SCRIPT_ID="backup_media_remote"
-readonly SCRIPT_VERSION="2.9.0"
 
 ###############################################################################
 # SHARED ISS COORDINATION AND TRANSPORT (embedded; standalone User Script)

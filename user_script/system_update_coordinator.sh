@@ -1,6 +1,11 @@
 #!/bin/bash
-# Release version: shared by --version, operational completion logs and receipts.
-readonly SCRIPT_VERSION="1.10.1"
+# Release version: bump for every deployed code change; descriptions stay user-owned.
+readonly SCRIPT_VERSION="1.10.2"
+# Version lookup exits before logging, locks, state, Docker or network activity.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
+    printf 'system_update_coordinator.sh %s\n' "$SCRIPT_VERSION"
+    exit 0
+fi
 # CRON VERIFICATION: before new installations, normalized live launcher timing
 # must match installed enabled dynamic schedules. Drift is reported; discovery
 # continues, but no extra timer is created and no launcher shell text is executed.

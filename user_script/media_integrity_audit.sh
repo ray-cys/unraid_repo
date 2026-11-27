@@ -1,9 +1,16 @@
 #!/bin/bash
+# Release version: bump for every deployed code change; descriptions stay user-owned.
+readonly SCRIPT_VERSION="2.7.2"
+# Version lookup exits before logging, locks, state, Docker or network activity.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
+    printf 'media_integrity_audit.sh %s\n' "$SCRIPT_VERSION"
+    exit 0
+fi
 # shellcheck disable=SC2034
 clearLog=true
 arrayStarted=true
 ###############################################################################
-# Media Integrity Audit v2.6.3 -- personal Unraid User Script
+# Media Integrity Audit v2.7.2 -- personal Unraid User Script
 #
 # PURPOSE / USE CASE
 # ------------------
@@ -584,7 +591,6 @@ umask 077
 # stay unverified. Completed ranges prove decoder acceptance, not perfect visual
 # playback. Legacy probe-only incidents are re-evaluated without replacing media.
 # Worker transport failures preserve the last checkpoint and never accuse media.
-readonly SCRIPT_VERSION="2.7.1"
 BAZARR_CONTAINER="bazarr"
 MEDIA_HOST_ROOT="/mnt/user/media"
 MEDIA_CONTAINER_ROOT="/data"

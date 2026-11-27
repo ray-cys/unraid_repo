@@ -1,9 +1,16 @@
 #!/bin/bash
+# Release version: bump for every deployed code change; descriptions stay user-owned.
+readonly SCRIPT_VERSION="3.3.2"
+# Version lookup exits before logging, locks, state, Docker or network activity.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
+    printf 'ram_logs_watchdog.sh %s\n' "$SCRIPT_VERSION"
+    exit 0
+fi
 # CHECKPOINT EVIDENCE: records current-boot archive metadata after read-back;
 # backup_health_audit independently detects staleness without a new timer.
 # Unchanged archives stay valid; empty sources require independent empty read-back.
 clearLog=true
-# RAM-log readiness and lifecycle monitor v3.3 (Unraid User Scripts).
+# RAM-log readiness and lifecycle monitor v3.3.2 (Unraid User Scripts).
 # Schedule: */10 * * * * (unchanged). Normal runs check RAM-log health and save
 # changed logs to vault at most once per interval. Application logs are never
 # deleted/truncated/rotated. --prepare is the existing PRE-DOCKER boot hook;
@@ -229,7 +236,6 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
-readonly SCRIPT_VERSION="3.3.1"
 RAMLOG_PATH="${RAMLOG_PATH:-/mnt/ramlogs}"
 RAMLOG_SIZE="${RAMLOG_SIZE:-2G}"
 RAMLOG_APPS=(sonarr radarr prowlarr bazarr tautulli recyclarr sabnzbd qbittorrent imagemaid seerr lumunarr)

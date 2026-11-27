@@ -1,10 +1,17 @@
 #!/bin/bash
+# Release version: bump for every deployed code change; descriptions stay user-owned.
+readonly SCRIPT_VERSION="1.14.4"
+# Version lookup exits before logging, locks, state, Docker or network activity.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
+    printf 'backup_health_audit.sh %s\n' "$SCRIPT_VERSION"
+    exit 0
+fi
 # Execution audit: consistent receipt snapshots and bounded completion read-back
 # avoid false interruption alerts when a worker exits during the audit.
 # shellcheck disable=SC2034
 clearLog=true
 arrayStarted=true
-# Backup freshness, delivery and runtime-compatibility audit v1.14.1.
+# Backup freshness, delivery and runtime-compatibility audit v1.14.4.
 # Schedule: 20 * * * *. Reads local receipts/manifests only: no WOL, remote
 # connection, media hashing, container actions or cleanup. One lifecycle email
 # for changed findings, recovery, or a 24-hour reminder. Failed delivery retries.
@@ -440,7 +447,6 @@ US_CRON_VERIFY
 }
 # END EMBEDDED USER SCRIPTS CATALOG
 set -uo pipefail
-readonly SCRIPT_VERSION="1.14.3"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/backup_health_audit}"
 APPDATA_ROOT="${APPDATA_ROOT:-/mnt/vault/backup/cache}"

@@ -1,8 +1,15 @@
 #!/bin/bash
+# Release version: bump for every deployed code change; descriptions stay user-owned.
+readonly VERSION="3.6.3"
+# Version lookup exits before logging, locks, state, Docker or network activity.
+if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
+    printf 'media_plex_dbrepair.sh %s\n' "$VERSION"
+    exit 0
+fi
 clearLog=true
 
 ###############################################################################
-# Plex DBRepair Scheduler Wrapper v3.6
+# Plex DBRepair Scheduler Wrapper v3.6.3
 #
 # Unraid 7.4-focused scheduler for the current standalone DBRepair executable.
 # It verifies the official GitHub release, stages updates safely inside each
@@ -218,7 +225,6 @@ fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
 
-readonly VERSION="3.6.2"
 
 ###############################################################################
 # CONFIGURATION
