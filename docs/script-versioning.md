@@ -1,5 +1,7 @@
 # User Script release versions
 
+The [complete CLI reference](user-scripts-cli.md) lists commands for all 18 scripts.
+
 Each of the 18 live scripts declares its release version immediately below the
 interpreter line. `--version` returns before logging, locking, state access,
 Docker calls or network activity. Run the installed User Script through Bash:

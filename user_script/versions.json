@@ -38,8 +38,8 @@
       "sha256": "c6457382188e0fea1c1991e3608b1dc8883daa76237ea9aa3140479a890f2d16"
     },
     "host_health_watchdog": {
-      "version": "1.9.2",
-      "sha256": "b85062425c348f5bebd19bfd61bf43c55c868959dfda6f94ac7d87ac9568f388"
+      "version": "1.9.3",
+      "sha256": "7f0256c4a4a16d307f6a1956c6427be40aa81220a7103f319d099b649c962bea"
     },
     "media_cleanup": {
       "version": "1.11.1",

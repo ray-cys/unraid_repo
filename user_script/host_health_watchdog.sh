@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="1.9.2"
+readonly SCRIPT_VERSION="1.9.3"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'host_health_watchdog.sh %s\n' "$SCRIPT_VERSION"
@@ -1589,6 +1589,48 @@ hh_prepare() {
     hh_collect && hh_lifecycle && hh_save || return 1
     HH_PREPARED=1
 }
+# Console presentation only: consume this scan's saved observations, never
+# re-probe hardware, change confirmation state or enqueue an email here.
+hh_log_observations() {
+    local category level message id observed title detail active bad good pending required summary
+    while IFS=$'\t' read -r id observed title detail active bad good pending required;do
+        [[ -n "$id" ]] || continue
+        category=HOST
+        case "$id" in
+          mount:*|monitor:mount-inventory) category=MOUNTS;;
+          space:*) category=CAPACITY;; inodes:*) category=INODES;;
+          memory) category=MEMORY;; cpu:*) category=CPU;; network:*) category=LAN;;
+          btrfs:*) category=BTRFS;; monitor:external-observer) category=OBSERVER;;
+          monitor:disk-state) category=DISK_STATE;;
+        esac
+        case "$observed" in
+          ok) level=INFO;; warning) level=WARNING;; critical) level=CRITICAL;;
+          unknown) level=WARNING;; *) level=INFO;;
+        esac
+        message="$title: observed=${observed^^}; $detail"
+        if [[ "$active" == true ]];then
+            message+=" Active incident retained"
+            [[ "$observed" != ok ]] || message+="; recovery confirmation $good/2"
+            message+="."
+        elif [[ "$observed" == warning || "$observed" == critical ]];then
+            message+=" Confirmation pending $bad/$required; no confirmed incident yet."
+        fi
+        [[ "$pending" == none ]] || message+=" Lifecycle event=$pending."
+        log "$category" "$level" "$message"
+    done < <(jq -r --argjson state "$HH_STATE" '.[] | . as $o | ($state.conditions[$o.id] // {}) as $c |
+      [$o.id,$o.severity,$o.title,$o.detail,($c.active // false),($c.bad // 0),($c.good // 0),($c.pending // "" | if .=="" then "none" else . end),
+       (if $o.severity=="critical" then $o.confirmations else 3 end)] |
+      map(tostring|gsub("[\\t\\r\\n]";" ")) | @tsv' <<< "$HH_OBSERVATIONS")
+    if ! jq -e 'any(.[]; .id|startswith("network:"))' <<< "$HH_OBSERVATIONS" >/dev/null;then
+        log LAN INFO 'LAN coverage: not collected; no eligible active physical default-route interface was observed. No healthy link result inferred.'
+    fi
+    if ! jq -e 'any(.[]; .id|startswith("btrfs:"))' <<< "$HH_OBSERVATIONS" >/dev/null;then
+        log BTRFS INFO 'Btrfs pressure coverage: not collected; only mounted, verified all-SSD Btrfs pools are eligible. Rotating array disks remain excluded.'
+    fi
+    summary=$(jq -nr --argjson observations "$HH_OBSERVATIONS" --argjson state "$HH_STATE" '
+      "Host probes completed: observations=\($observations|length); OK=\([$observations[]|select(.severity=="ok")]|length); warning=\([$observations[]|select(.severity=="warning")]|length); critical=\([$observations[]|select(.severity=="critical")]|length); unverified=\([$observations[]|select(.severity=="unknown")]|length); unsupported=\([$observations[]|select(.severity=="unsupported")]|length); active incidents=\([$state.conditions[]|select(.active==true)]|length). RAM receipt saved; notifications follow the existing lifecycle policy."') || return 1
+    log HOST INFO "$summary"
+}
 hh_delivered() {
     HH_STATE=$(jq -c --argjson now "$HH_NOW" '[.conditions|to_entries[]|select((.value.pending//"")!="")|.key][0:24] as $ids | reduce $ids[] as $id (. ; .conditions[$id].pending=""|.conditions[$id].notifiedAt=$now)' <<< "$HH_STATE") || return 1
     HH_PENDING_BODY='';HH_DIRTY=1;hh_save
@@ -1618,12 +1660,17 @@ main() {
     local final_exit=0
     case "${1:-}" in
       --version) printf 'host_health_watchdog.sh %s\n' "$SCRIPT_VERSION"; return 0 ;;
+      --help|-h) printf '%s\n' 'Usage: /bin/bash SCRIPT [--version|--help|--external-status|--open-xfs|--ack-xfs SOURCE]' \
+        'No arguments: collect host probes, print each observation and scan summary, process new syslog and log capacity, then deliver existing lifecycle notifications when due.' \
+        '--external-status reads native/RAM freshness for the external observer; no scan, state update or notification.' \
+        '--open-xfs lists retained XFS incidents. --ack-xfs SOURCE removes one reviewed incident marker; it does not repair a filesystem.' \
+        'Console output includes healthy, unverified and unsupported probes without changing email policy. See docs/user-scripts-cli.md in GitHub for all 18 scripts.';return 0;;
       --external-status) [[ $# == 1 ]] || return 2; host_external_status;return ;;
       ''|--open-xfs|--ack-xfs) ;;
       *) return 2 ;;
     esac
     exec 9>"$LOCK_FILE" || return 1
-    flock -n 9 || { printf 'Another syslog monitor is running; scan deferred.\n'; return 0; }
+    flock -n 9 || { printf 'Another host health watchdog run is active; scan deferred.\n'; return 0; }
 
     # -----------------------------------------------------------------------
     # State initialization
@@ -1648,6 +1695,7 @@ main() {
         log HOST ERROR 'Fast host checks or their RAM receipt failed; scan freshness will not advance'
         return 1
     fi
+    hh_log_observations || return 1
 
     # -----------------------------------------------------------------------
     # Syslog validation
