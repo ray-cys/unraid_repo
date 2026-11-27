@@ -208,7 +208,7 @@ fi
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="3.2.0"
+readonly SCRIPT_VERSION="3.2.1"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -2482,6 +2482,18 @@ initialize_runtime() {
             log "STATE" "WARN" "Unable to initialize state file: $state_file"
             return 1
         }
+    done
+
+    # JSON state must be valid even before the first scheduled maintenance action.
+    # A blank file represents no prior receipt, never a successful operation.
+    local json_state initial_json
+    for json_state in "$SMART_TEST_TRACKING_FILE" "$ENDURANCE_INVENTORY_FILE" "$DOCKER_SCRUB_TRACKING_FILE"; do
+        [[ ! -s "$json_state" ]] || continue
+        case "$json_state" in
+            "$DOCKER_SCRUB_TRACKING_FILE") initial_json='{"schema":1,"status":"not_requested","uuid":"","pending":false,"requests":0,"requestedEpoch":0,"requestMonth":"","lastSuccessEpoch":0,"lastSuccessfulStartEpoch":0}' ;;
+            *) initial_json='{"schema":1,"observedAt":0,"devices":{}}' ;;
+        esac
+        atomic_write_text "$json_state" "$initial_json"$'\n' || return 1
     done
 
     log "INIT" "INFO" "Runtime initialized (state: $STATE_DIR)"
