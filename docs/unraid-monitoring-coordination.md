@@ -85,10 +85,10 @@ active live policy. Arr API credentials remain private deployment values and are
 not published in GitHub. Deployment compares the executable logic after restoring
 only those existing API-key lines.
 
-## Daily storage and fast host ownership (health 3.3.0 / syslog watchdog 1.7.0)
+## Daily storage and fast host ownership (health 3.3.1 / host watchdog 1.8.0)
 
 The User Scripts schedule remains the sole scheduler: `health_monitoring` runs
-at **06:30 daily**, and `syslog_watchdog` at **five-minute intervals**. No new cron
+at **06:30 daily**, and `host_health_watchdog` at **five-minute intervals**. No new cron
 entry, daemon, package or User Script is required.
 
 Daily health retains SMART/NVMe wear, temperatures, tests, disk/pool capacity,
@@ -117,9 +117,9 @@ where possible; otherwise one grouped host notification is sent. A failed delive
 leaves events pending. Healthy scans do not email. Up to 24 host events fit one
 message; excess events remain pending for another scheduled invocation.
 
-Fast state is consolidated in `/run/syslog-host-state.json`, with a same-boot
-coverage receipt at `/run/syslog-host-health.json`. One durable
-`syslog_watchdog/host-health.json` mirror is refreshed hourly or on pending-event
+Fast state is consolidated in `/run/host-health-state.json`, with a same-boot
+coverage receipt at `/run/host-health-receipt.json`. One durable
+`host_health_watchdog/host-health.json` mirror is refreshed hourly or on pending-event
 changes/delivery. Reboot invalidates network deltas and consecutive-sample counters;
 retained incidents are not falsely declared recovered. Removed hardware is retired
 after seven days without a misleading recovery claim. The central syslog receipt
@@ -145,3 +145,23 @@ The standalone scripts embed modules from `tools/host_health_common.sh`,
 `python3 tools/sync_host_health.py`. Isolated native fixtures cover state guards,
 lifecycle/delivery, scheduling, allocation, CPU and network behaviour; the separate
 integration fixture intercepts mail and uses temporary state on Hubble.
+
+
+## Host watchdog naming and preserved state
+
+The expanded host/syslog owner is `host_health_watchdog`, with the existing
+five-minute User Scripts schedule and Unraid category. UI descriptions are
+preserved during the rename. Its persistent incident ledger and host lifecycle
+mirror live in `logs/script/host_health_watchdog/`; runtime cursor/incident delivery
+state is `/tmp/host_health_watchdog_state`. The current-boot probe receipt and
+baseline state are `/run/host-health-receipt.json` and `/run/host-health-state.json`.
+Central completion and execution receipts use the same operational identity.
+
+Daily disk fallback, hourly backup freshness, deployment hashes, recovery-state
+exports, native schedule copies/cron and category metadata refer to that identity.
+The existing incident IDs, notification cooldowns, XFS acknowledgements, cursor,
+network counters and host condition evidence are moved intact. No second watchdog,
+empty baseline or compatibility cron is left active. Completed backup snapshots,
+checksum manifests and original historical log messages retain their recorded
+provenance; the next normal recovery export includes the renamed ledger and host
+lifecycle mirror. Existing archives are not rewritten.

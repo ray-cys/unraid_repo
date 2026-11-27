@@ -440,7 +440,7 @@ US_CRON_VERIFY
 }
 # END EMBEDDED USER SCRIPTS CATALOG
 set -uo pipefail
-readonly SCRIPT_VERSION="1.14.1"
+readonly SCRIPT_VERSION="1.14.2"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/backup_health_audit}"
 APPDATA_ROOT="${APPDATA_ROOT:-/mnt/vault/backup/cache}"
@@ -721,13 +721,13 @@ audit_script_executions() {
         finding 'RAM logs: current-boot checkpoint is stale or its archive read-back does not match; previous archives retained, crash-log coverage requires attention'
       fi
     fi
-    if audit_script_active syslog_watchdog && (( $(cut -d . -f1 /proc/uptime)>=1800 ));then
-      receipt="$STATUS_DIR/syslog_watchdog.json"
+    if audit_script_active host_health_watchdog && (( $(cut -d . -f1 /proc/uptime)>=1800 ));then
+      receipt="$STATUS_DIR/host_health_watchdog.json"
       # Dynamic schedule owns the allowance; disabled/retired scripts are excluded.
       local freshness cutoff
-      freshness=$(usr_scripts_due_window "$AUDIT_CATALOG_FILE" syslog_watchdog "$NOW" 600 900) || freshness='{"cutoff":0}'
+      freshness=$(usr_scripts_due_window "$AUDIT_CATALOG_FILE" host_health_watchdog "$NOW" 600 900) || freshness='{"cutoff":0}'
       cutoff=$(jq -r '.cutoff // 0' <<<"$freshness")
-      jq -e --arg boot "$boot_now" --argjson now "$NOW" --argjson cutoff "$cutoff" '.schema==1 and .bootId==$boot and .lastSuccessfulScanAt<=$now+60 and .lastSuccessfulScanAt>=$cutoff and $cutoff>0' "$receipt" >/dev/null 2>&1 || finding 'Syslog watchdog: no recent successful scan and delivery receipt within the current schedule allowance; execution alone does not prove monitoring coverage'
+      jq -e --arg boot "$boot_now" --argjson now "$NOW" --argjson cutoff "$cutoff" '.schema==1 and .bootId==$boot and .lastSuccessfulScanAt<=$now+60 and .lastSuccessfulScanAt>=$cutoff and $cutoff>0' "$receipt" >/dev/null 2>&1 || finding 'Host health watchdog: no recent successful scan and delivery receipt within the current schedule allowance; execution alone does not prove monitoring coverage'
     fi
 }
 

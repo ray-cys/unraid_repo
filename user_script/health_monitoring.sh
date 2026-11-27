@@ -208,7 +208,7 @@ fi
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="3.3.0"
+readonly SCRIPT_VERSION="3.3.1"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -295,7 +295,7 @@ IO_ERROR_CRIT_THRESHOLD=20                      # Unique error events >= critica
 SYSLOG_CURSOR_STARTUP_LOOKBACK_LINES=100         # First cursor run: inspect only the most recent N lines
 SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES=2000       # Recovery scan when the previous rotated file cannot be found
 SYSLOG_FAST_STORAGE_OWNER=1                      # Hubble's five-minute syslog watcher owns individual urgent events
-SYSLOG_FAST_HEARTBEAT="/tmp/syslog_watchdog_state/storage-watch.epoch"
+SYSLOG_FAST_HEARTBEAT="/tmp/host_health_watchdog_state/storage-watch.epoch"
 
 # === Trends & Alerts: Toggles ===
 NVME_WEAR_REGRESSION_WARN=1                     # Flag any NVMe Percentage Used regression (0=disable)
@@ -6761,7 +6761,7 @@ scan_syslog_disk_errors() {
         if [[ ! "$heartbeat" =~ ^[1-9][0-9]{0,11}$ ]] || (( heartbeat > now || now-heartbeat > 1200 )); then
             record_finding warning io io.kernel "" "Fast storage watcher not current" \
                 "No successful fast syslog scan in the last 20 minutes." \
-                "Check the syslog_watchdog User Script and its five-minute schedule." syslog_fast_watcher_stale
+                "Check the host_health_watchdog User Script and its five-minute schedule." syslog_fast_watcher_stale
         fi
     else
         map_xfs_syslog_sources || return 1
@@ -6770,7 +6770,7 @@ scan_syslog_disk_errors() {
     if (( SYSLOG_FAST_STORAGE_OWNER == 1 )) && [[ "$heartbeat" =~ ^[1-9][0-9]{0,11}$ ]] &&
        (( heartbeat <= now && now-heartbeat <= 1200 )) &&
        ! grep -Eq '^finding.*(disk_i_o_alert|disk_io_burst|xfs_kernel_error)' "$NOTIFICATION_JOURNAL_FILE" 2>/dev/null; then
-        log "IO" "INFO" "Current syslog_watchdog owns storage-error notifications; duplicate daily parsing skipped"
+        log "IO" "INFO" "Current host_health_watchdog owns storage-error notifications; duplicate daily parsing skipped"
         return 0
     fi
     # Primary watcher unavailable: activate the existing bounded cursor-based fallback,
@@ -9528,7 +9528,7 @@ echo '{"valid":true,"dueEpoch":0}';
 PHP
 }
 hh_fast_receipt_owns() {
-    local id="$1" now="$2" file="${HH_FAST_RECEIPT:-/run/syslog-host-health.json}" boot
+    local id="$1" now="$2" file="${HH_FAST_RECEIPT:-/run/host-health-receipt.json}" boot
     [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file" 2>/dev/null) == "$EUID" && $(stat -c %h "$file" 2>/dev/null) == 1 ]] || return 1
     boot=$(cat /proc/sys/kernel/random/boot_id)
     jq -e --arg id "$id" --arg boot "$boot" --argjson now "$now" '.schema==1 and .status=="COMPLETE" and .bootId==$boot and .observedAt<=$now+60 and .observedAt>=$now-900 and any(.observations[]; .id==$id and (.severity|IN("ok","warning","critical")))' "$file" >/dev/null 2>&1

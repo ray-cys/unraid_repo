@@ -30,7 +30,7 @@ trap 'rm -rf -- "$tmp"' EXIT
  : >"$findings"; mock_dns=0.0.0.0; check_vpn_egress qbittorrent; grep -q vpn-canary-dns "$findings"
 )
 (
- source "$repo/user_script/syslog_watchdog.sh"
+ source "$repo/user_script/host_health_watchdog.sh"
  STATE_DIR="$tmp/syslog"; mkdir -p "$STATE_DIR"
  cat >"$tmp/syslog.input" <<'LINES'
 Nov 23 10:00:01 Hubble kernel: Out of memory: Killed process 1234 (kometa)

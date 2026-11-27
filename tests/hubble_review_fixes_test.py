@@ -30,7 +30,7 @@ with tempfile.TemporaryDirectory(prefix='hubble-review-fixes.') as d:
  [[ ! -f "$TEST_PAYLOAD" ]]
  ''')
  run(r'''
- source "$1/user_script/syslog_watchdog.sh"
+ source "$1/user_script/host_health_watchdog.sh"
  STATE_DIR="$2/syslog";mkdir "$STATE_DIR";CURSOR_FILE="$STATE_DIR/cursor";SYSLOG_FILE="$STATE_DIR/syslog"
  SYSLOG_BATCH_MAX_LINES=3;SYSLOG_BATCH_MAX_BYTES=1024;STARTUP_LOOKBACK_LINES=100;log(){ :; }
  mountpoint(){ return 1; };notify_unraid(){ printf '%s\n' "$*" >>"$STATE_DIR/notifications"; }

@@ -5,13 +5,13 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d /tmp/syslog-host-test.XXXXXX) || exit 1
 trap 'rm -rf "$work"' EXIT
 HH_RAM_ROOT=$work;HH_MIRROR="$work/mirror.json"
-source "$ROOT/user_script/syslog_watchdog.sh"
+source "$ROOT/user_script/host_health_watchdog.sh"
 log(){ :; }
 # The only delivery function is intercepted before any notification can occur.
 NOTIFY_BIN=/bin/true;FAIL_NOTIFY=0
 usr_ops_notify(){ printf '%s\n' "$*" >> "$work/delivery";return "$FAIL_NOTIFY"; }
 hh_prepare || exit 1
-jq -e '.activeConditions==0 and any(.observations[];.id=="memory" and .severity=="ok") and any(.observations[];(.id|startswith("network:link:")) and .severity=="ok")' "$work/syslog-host-health.json" >/dev/null || exit 1
+jq -e '.activeConditions==0 and any(.observations[];.id=="memory" and .severity=="ok") and any(.observations[];(.id|startswith("network:link:")) and .severity=="ok")' "$work/host-health-receipt.json" >/dev/null || exit 1
 printf '[PASS] Native fast probes are healthy with isolated state\n'
 hh_flush || exit 1
 [[ ! -f "$work/delivery" ]] || exit 1

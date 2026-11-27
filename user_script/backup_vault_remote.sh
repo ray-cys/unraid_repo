@@ -488,7 +488,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.24.2"
+readonly SCRIPT_VERSION="1.24.3"
 
 ###############################################################################
 # CONFIGURATION
@@ -1466,7 +1466,7 @@ vault_export_operations_state() {
     local -a sources=(
         "execution|$STATUS_DIR/execution"
         "deployment|$STATUS_DIR"
-        "syslog_watchdog|$scripts/syslog_watchdog"
+        "host_health_watchdog|$scripts/host_health_watchdog"
         "notification-outbox|$STATUS_DIR/notification-outbox"
         "backup_restore_drill|$scripts/backup_restore_drill"
         "backup_vault_remote|$scripts/backup_vault_remote"
@@ -1530,7 +1530,10 @@ vault_export_operations_state() {
                 notification-outbox.json|latest-run.json)
                     [[ "$name" == media_cleanup || "$name" == media_cleanup/quarantine ]] || continue;;
                 deployments.json|.deployment-enrolled) [[ "$name" == deployment ]] || continue;;
-                incidents.json) [[ "$name" == syslog_watchdog ]] || continue;;
+                incidents.json) [[ "$name" == host_health_watchdog ]] || continue;;
+                host-health.json)
+                    [[ "$name" == host_health_watchdog ]] || continue
+                    jq -e '.schema==1 and (.conditions|type)=="object" and (.baselines.network|type)=="object"' "$file" >/dev/null || { log ERROR 'Host watchdog state invalid; control-plane export stopped';exec {fd}>&-;return 1; };;
                 policy.json) [[ "$name" == system_update_coordinator ]] || continue;;
                 pack-actions.json|pack-cleanup.json|policy-cleanup.json|source-removals.json|state.json|notification-state.json|import-receipts.json|automation-actions.json|policy-actions.json|sonarr-state.json|radarr-state.json|pending-actions.json|pending-operations.json|action-receipts.jsonl|pending-notifications.jsonl|operation-recovery.jsonl|quarantine-index.tsv|transfer-manifest.tsv) ;;
                 *) continue;;

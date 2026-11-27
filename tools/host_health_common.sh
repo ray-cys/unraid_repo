@@ -62,7 +62,7 @@ echo '{"valid":true,"dueEpoch":0}';
 PHP
 }
 hh_fast_receipt_owns() {
-    local id="$1" now="$2" file="${HH_FAST_RECEIPT:-/run/syslog-host-health.json}" boot
+    local id="$1" now="$2" file="${HH_FAST_RECEIPT:-/run/host-health-receipt.json}" boot
     [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file" 2>/dev/null) == "$EUID" && $(stat -c %h "$file" 2>/dev/null) == 1 ]] || return 1
     boot=$(cat /proc/sys/kernel/random/boot_id)
     jq -e --arg id "$id" --arg boot "$boot" --argjson now "$now" '.schema==1 and .status=="COMPLETE" and .bootId==$boot and .observedAt<=$now+60 and .observedAt>=$now-900 and any(.observations[]; .id==$id and (.severity|IN("ok","warning","critical")))' "$file" >/dev/null 2>&1

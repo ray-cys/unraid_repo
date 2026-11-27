@@ -5,7 +5,7 @@
 clearLog=true
 
 ###############################################################################
-# Syslog Notification Monitor
+# Host Health Watchdog
 #
 # PURPOSE
 # -------
@@ -49,7 +49,7 @@ clearLog=true
 ###############################################################################
 
 # BEGIN EMBEDDED OPERATIONS CONTRACT
-OPS_SCRIPT_ID="syslog_watchdog"
+OPS_SCRIPT_ID="host_health_watchdog"
 # shellcheck shell=bash
 # Embedded operations contract v2; generated into standalone User Scripts.
 # Millisecond timing without spawning date on supported Bash; GNU fallback.
@@ -254,7 +254,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
-readonly SCRIPT_VERSION="1.7.0"
+readonly SCRIPT_VERSION="1.8.0"
 
 
 ###############################################################################
@@ -278,7 +278,7 @@ SYSLOG_FILE="/var/log/syslog"
 ERROR_REGEX="corrupt|error|fail|tainted|out of memory|oom-kill|invoked oom-killer|killed process|blocked for more than|soft lockup|hard lockup|NETDEV WATCHDOG|transmit queue.*timed out|reset adapter|resetting (chip|adapter)"
 STORAGE_MATCH_REGEX='XFS.*(shutdown|shut down|shutting down)'
 # Use the deployed User Scripts directory, not the generated execution copy.
-XFS_INCIDENT_FILE="/boot/config/plugins/user.scripts/scripts/syslog_watchdog/xfs_faults.tsv"
+XFS_INCIDENT_FILE="/boot/config/plugins/user.scripts/scripts/host_health_watchdog/xfs_faults.tsv"
 # Event deduplication; repeats after this interval are reminders, not new faults.
 # Silence is not proof of recovery from an OOM or hardware fault.
 INCIDENT_REMINDER_SECONDS=86400
@@ -355,7 +355,7 @@ ROTATION_SCAN_DEPTH=5
 # ---------------------------------------------------------------------------
 
 NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
-NOTIFY_SUBJECT="Syslog Watchdog"
+NOTIFY_SUBJECT="Host Health Watchdog"
 
 # Maximum number of matching syslog lines included in one notification.
 #
@@ -396,7 +396,7 @@ SYSLOG_USAGE_TOP_ENTRIES=10
 # Runtime state
 # ---------------------------------------------------------------------------
 
-STATE_DIR="/tmp/syslog_watchdog_state"
+STATE_DIR="/tmp/host_health_watchdog_state"
 
 CURSOR_FILE="${STATE_DIR}/cursor"
 USAGE_ALERT_FILE="${STATE_DIR}/usage_alerted"
@@ -406,7 +406,7 @@ USAGE_ALERT_FILE="${STATE_DIR}/usage_alerted"
 # Lock
 # ---------------------------------------------------------------------------
 
-LOCK_FILE="/tmp/syslog_watchdog.lock"
+LOCK_FILE="/tmp/host_health_watchdog.lock"
 
 
 ###############################################################################
@@ -841,7 +841,7 @@ syslog_incident_severity() {
 syslog_record_incidents() {
     local rows="$STATE_DIR/incident-observations.jsonl" root="$STATE_DIR" target temp now
     [[ -s "$rows" ]] || return 0
-    if mountpoint -q "${SYSLOG_VAULT_MOUNT:-/mnt/vault}";then root="${SYSLOG_INCIDENT_ROOT:-/mnt/vault/cloud/logs/script/syslog_watchdog}";fi
+    if mountpoint -q "${SYSLOG_VAULT_MOUNT:-/mnt/vault}";then root="${SYSLOG_INCIDENT_ROOT:-/mnt/vault/cloud/logs/script/host_health_watchdog}";fi
     [[ ! -L "$root" && $(realpath -m "$root") == "$root" ]] || return 1
     mkdir -p "$root" || return 1
     target="$root/incidents.json";[[ ! -L "$target" ]] || return 1
@@ -878,7 +878,7 @@ syslog_critical_tail() {
     [[ -s "$matches" ]] || return 0
     if notify_unraid alert 'Critical Unraid syslog events require attention' "Critical kernel/storage/system events detected beyond the chronological scan slice. No automatic repair, log deletion or service restart was attempted.
 $(cat "$matches")
-Incident JSON: ${SYSLOG_INCIDENT_ROOT:-/mnt/vault/cloud/logs/script/syslog_watchdog}/incidents.json
+Incident JSON: ${SYSLOG_INCIDENT_ROOT:-/mnt/vault/cloud/logs/script/host_health_watchdog}/incidents.json
 Repeated identical incidents retain the normal daily reminder limit; unread normal backlog is preserved.";then
         awk -F '\t' '{seen[$1]=$2}END{for(key in seen)print key "\t" seen[key]}' "$INCIDENT_NEXT"|sort -k2,2n|tail -n "$INCIDENT_MAX_ENTRIES" -- - >"$bounded" && mv "$bounded" "$STATE_DIR/incidents.tsv" || return 1
     else return 1;fi
@@ -1037,11 +1037,11 @@ check_syslog_errors() {
     local body="" importance=warning critical=0
 
     chunk_file="$(
-        mktemp /tmp/syslog_watchdog_chunk.XXXXXX
+        mktemp /tmp/host_health_watchdog_chunk.XXXXXX
     )"
 
     match_file="$(
-        mktemp /tmp/syslog_watchdog_matches.XXXXXX
+        mktemp /tmp/host_health_watchdog_matches.XXXXXX
     )"
 
     TEMP_FILES+=(
@@ -1105,7 +1105,7 @@ check_syslog_errors() {
 
     critical=$(grep -Eic "${CRITICAL_REGEX}|${STORAGE_MATCH_REGEX}" "$match_file" || true)
     (( critical==0 )) || importance=alert
-    body+="Incident JSON: ${SYSLOG_INCIDENT_ROOT:-/mnt/vault/cloud/logs/script/syslog_watchdog}/incidents.json (new matches recorded automatically; critical incidents require review)"$'\n'
+    body+="Incident JSON: ${SYSLOG_INCIDENT_ROOT:-/mnt/vault/cloud/logs/script/host_health_watchdog}/incidents.json (new matches recorded automatically; critical incidents require review)"$'\n'
     body+="Host events: ${match_count}; critical matches: ${critical}"$'\n'
     body+="Action: new syslog events detected and grouped; no process, container or network settings were changed."$'\n'
     body+="Repeated identical events are limited to one reminder per 24 hours. Absence of new log entries does not establish recovery."$'\n'
@@ -1342,7 +1342,7 @@ echo '{"valid":true,"dueEpoch":0}';
 PHP
 }
 hh_fast_receipt_owns() {
-    local id="$1" now="$2" file="${HH_FAST_RECEIPT:-/run/syslog-host-health.json}" boot
+    local id="$1" now="$2" file="${HH_FAST_RECEIPT:-/run/host-health-receipt.json}" boot
     [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file" 2>/dev/null) == "$EUID" && $(stat -c %h "$file" 2>/dev/null) == 1 ]] || return 1
     boot=$(cat /proc/sys/kernel/random/boot_id)
     jq -e --arg id "$id" --arg boot "$boot" --argjson now "$now" '.schema==1 and .status=="COMPLETE" and .bootId==$boot and .observedAt<=$now+60 and .observedAt>=$now-900 and any(.observations[]; .id==$id and (.severity|IN("ok","warning","critical")))' "$file" >/dev/null 2>&1
@@ -1358,7 +1358,7 @@ hh_fast_receipt_owns() {
 HH_RAM_ROOT="${HH_RAM_ROOT:-/run}"
 HH_PROC_ROOT="${HH_PROC_ROOT:-/proc}"
 HH_SYS_ROOT="${HH_SYS_ROOT:-/sys}"
-HH_MIRROR="${HH_MIRROR:-/mnt/vault/cloud/logs/script/syslog_watchdog/host-health.json}"
+HH_MIRROR="${HH_MIRROR:-/mnt/vault/cloud/logs/script/host_health_watchdog/host-health.json}"
 HH_PENDING_BODY='' HH_PENDING_IMPORTANCE=normal HH_PREPARED=0 HH_DIRTY=0
 hh_atomic() {
     local target="$1" value="$2" temp
@@ -1537,9 +1537,9 @@ hh_lifecycle() {
 }
 hh_save() {
     local receipt info mirror_at
-    hh_atomic "$HH_RAM_ROOT/syslog-host-state.json" "$HH_STATE" || return 1
+    hh_atomic "$HH_RAM_ROOT/host-health-state.json" "$HH_STATE" || return 1
     receipt=$(jq -nc --arg boot "$HH_BOOT" --argjson now "$HH_NOW" --argjson observations "$HH_OBSERVATIONS" --argjson state "$HH_STATE" '{schema:1,bootId:$boot,observedAt:$now,status:"COMPLETE",activeConditions:([$state.conditions[]|select(.active)]|length),observations:$observations}')
-    hh_atomic "$HH_RAM_ROOT/syslog-host-health.json" "$receipt" || return 1
+    hh_atomic "$HH_RAM_ROOT/host-health-receipt.json" "$receipt" || return 1
     info=$(hh_mount_info /mnt/vault)
     if jq -e '.mounted and (.readOnly|not)' <<< "$info" >/dev/null;then
         mirror_at=$(jq -r '.lastSampleAt//0' "$HH_MIRROR" 2>/dev/null) || mirror_at=0
@@ -1552,7 +1552,7 @@ hh_save() {
 hh_prepare() {
     HH_NOW=${HH_NOW:-$(date +%s)};HH_BOOT=${HH_BOOT:-$(cat "$HH_PROC_ROOT/sys/kernel/random/boot_id")};HH_STATE='{}'
     local source
-    for source in "$HH_RAM_ROOT/syslog-host-state.json" "$HH_MIRROR";do
+    for source in "$HH_RAM_ROOT/host-health-state.json" "$HH_MIRROR";do
         [[ -f "$source" && ! -L "$source" && $(stat -c %u "$source") == "$EUID" ]] || continue
         if jq -e '.schema==1 and (.conditions|type)=="object" and (.baselines.network|type)=="object"' "$source" >/dev/null 2>&1;then HH_STATE=$(cat "$source");break;fi
     done
@@ -1573,7 +1573,7 @@ hh_flush() {
 main() {
     local final_exit=0
     case "${1:-}" in
-      --version) printf 'syslog_watchdog.sh %s\n' "$SCRIPT_VERSION"; return 0 ;;
+      --version) printf 'host_health_watchdog.sh %s\n' "$SCRIPT_VERSION"; return 0 ;;
       ''|--open-xfs|--ack-xfs) ;;
       *) return 2 ;;
     esac
@@ -1667,7 +1667,7 @@ main() {
         local receipt_root="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}" receipt
         mkdir -p "$receipt_root" || return 1
         receipt=$(mktemp "$receipt_root/.syslog-watchdog.XXXXXX") || return 1
-        jq -n --arg boot "$(cat /proc/sys/kernel/random/boot_id)" --argjson at "$(date +%s)" --argjson host "$(jq '[.conditions[]|select(.active)]|length' <<< "$HH_STATE")" '{schema:1,name:"syslog_watchdog",activeHostConditions:$host,bootId:$boot,lastSuccessfulScanAt:$at,epoch:$at,status:"OK",scope:"Syslog, log capacity and fast host conditions checked; condition state is separate from successful scan freshness"}' >"$receipt" && chmod 600 "$receipt" && mv "$receipt" "$receipt_root/syslog_watchdog.json" || return 1
+        jq -n --arg boot "$(cat /proc/sys/kernel/random/boot_id)" --argjson at "$(date +%s)" --argjson host "$(jq '[.conditions[]|select(.active)]|length' <<< "$HH_STATE")" '{schema:1,name:"host_health_watchdog",activeHostConditions:$host,bootId:$boot,lastSuccessfulScanAt:$at,epoch:$at,status:"OK",scope:"Syslog, log capacity and fast host conditions checked; condition state is separate from successful scan freshness"}' >"$receipt" && chmod 600 "$receipt" && mv "$receipt" "$receipt_root/host_health_watchdog.json" || return 1
     fi
     [[ "${SYSLOG_BACKLOG:-false}" != true ]] || log SYSLOG INFO 'Bounded scan completed with unread backlog; next scheduled pass resumes from the last consumed line'
     return "$final_exit"

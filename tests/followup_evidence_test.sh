@@ -5,7 +5,7 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d);trap 'rm -rf "$tmp"' EXIT
 source "$repo/tools/user_scripts_catalog.sh"
 mkdir -p "$tmp/scripts/job"
-printf 'OPS_SCRIPT_ID="syslog_watchdog"\n' >"$tmp/scripts/job/script"
+printf 'OPS_SCRIPT_ID="host_health_watchdog"\n' >"$tmp/scripts/job/script"
 printf '{"job":{"script":"/boot/config/plugins/user.scripts/scripts/job/script","frequency":"custom","custom":"*/15 * * * SUN"}}' >"$tmp/schedule"
 usr_scripts_catalog "$tmp/schedule" "$tmp/scripts" >"$tmp/catalog"
 printf '0,15,30,45 * * * 7 /usr/local/emhttp/plugins/user.scripts/startCustom.php /boot/config/plugins/user.scripts/scripts/job/script > /dev/null 2>&1\n' >"$tmp/cron"
@@ -61,7 +61,7 @@ printf 'Backend readiness, authentication/configuration distinction and failed-b
  hash=$(sha256sum "$RAMLOG_ARCHIVE_ROOT/ramlogs_fixture/manifest.json"|cut -d ' ' -f1)
  bytes=$(stat -c %s "$RAMLOG_ARCHIVE_ROOT/ramlogs_fixture/payload.tar.gz")
  jq -n --arg boot "$boot" --arg path "$RAMLOG_ARCHIVE_ROOT/ramlogs_fixture" --arg hash "$hash" --argjson bytes "$bytes" --argjson now "$NOW" '{checkpoint:{bootId:$boot,path:$path,manifestSha256:$hash,payloadBytes:$bytes,checkedAt:$now}}' >"$STATUS_DIR/ram_logs_watchdog.json"
- jq -n --arg boot "$boot" --argjson now "$NOW" '{schema:1,bootId:$boot,lastSuccessfulScanAt:$now}' >"$STATUS_DIR/syslog_watchdog.json"
+ jq -n --arg boot "$boot" --argjson now "$NOW" '{schema:1,bootId:$boot,lastSuccessfulScanAt:$now}' >"$STATUS_DIR/host_health_watchdog.json"
  AUDIT_CATALOG_FILE="$tmp/audit-catalog";printf '{"valid":true,"jobs":{}}' >"$AUDIT_CATALOG_FILE"
  USR_OPS_DELIVERY_ROOT="$tmp/outbox";USR_OPS_DELIVERY_RAM_ROOT="$tmp/ram-outbox";MEDIA_HEALTH_STATE_DIR="$tmp/media"
  audit_script_active(){ return 0; }
@@ -74,7 +74,7 @@ printf 'Backend readiness, authentication/configuration distinction and failed-b
  jq --argjson now "$NOW" '.checkpoint.checkedAt=$now' "$STATUS_DIR/ram_logs_watchdog.json" >"$tmp/next";mv "$tmp/next" "$STATUS_DIR/ram_logs_watchdog.json"
  printf changed >>"$RAMLOG_ARCHIVE_ROOT/ramlogs_fixture/payload.tar.gz"
  FINDINGS=();audit_script_executions;[[ ${FINDINGS[*]} == *'read-back does not match'* ]]
- jq '.lastSuccessfulScanAt-=7200' "$STATUS_DIR/syslog_watchdog.json" >"$tmp/next";mv "$tmp/next" "$STATUS_DIR/syslog_watchdog.json"
+ jq '.lastSuccessfulScanAt-=7200' "$STATUS_DIR/host_health_watchdog.json" >"$tmp/next";mv "$tmp/next" "$STATUS_DIR/host_health_watchdog.json"
  FINDINGS=();audit_script_executions;[[ ${FINDINGS[*]} == *'no recent successful scan'* ]]
  audit_script_active(){ return 1; }
  FINDINGS=();audit_script_executions;[[ ${#FINDINGS[@]} == 0 ]]

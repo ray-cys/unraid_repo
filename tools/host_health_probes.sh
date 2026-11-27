@@ -6,7 +6,7 @@
 HH_RAM_ROOT="${HH_RAM_ROOT:-/run}"
 HH_PROC_ROOT="${HH_PROC_ROOT:-/proc}"
 HH_SYS_ROOT="${HH_SYS_ROOT:-/sys}"
-HH_MIRROR="${HH_MIRROR:-/mnt/vault/cloud/logs/script/syslog_watchdog/host-health.json}"
+HH_MIRROR="${HH_MIRROR:-/mnt/vault/cloud/logs/script/host_health_watchdog/host-health.json}"
 HH_PENDING_BODY='' HH_PENDING_IMPORTANCE=normal HH_PREPARED=0 HH_DIRTY=0
 hh_atomic() {
     local target="$1" value="$2" temp
@@ -185,9 +185,9 @@ hh_lifecycle() {
 }
 hh_save() {
     local receipt info mirror_at
-    hh_atomic "$HH_RAM_ROOT/syslog-host-state.json" "$HH_STATE" || return 1
+    hh_atomic "$HH_RAM_ROOT/host-health-state.json" "$HH_STATE" || return 1
     receipt=$(jq -nc --arg boot "$HH_BOOT" --argjson now "$HH_NOW" --argjson observations "$HH_OBSERVATIONS" --argjson state "$HH_STATE" '{schema:1,bootId:$boot,observedAt:$now,status:"COMPLETE",activeConditions:([$state.conditions[]|select(.active)]|length),observations:$observations}')
-    hh_atomic "$HH_RAM_ROOT/syslog-host-health.json" "$receipt" || return 1
+    hh_atomic "$HH_RAM_ROOT/host-health-receipt.json" "$receipt" || return 1
     info=$(hh_mount_info /mnt/vault)
     if jq -e '.mounted and (.readOnly|not)' <<< "$info" >/dev/null;then
         mirror_at=$(jq -r '.lastSampleAt//0' "$HH_MIRROR" 2>/dev/null) || mirror_at=0
@@ -200,7 +200,7 @@ hh_save() {
 hh_prepare() {
     HH_NOW=${HH_NOW:-$(date +%s)};HH_BOOT=${HH_BOOT:-$(cat "$HH_PROC_ROOT/sys/kernel/random/boot_id")};HH_STATE='{}'
     local source
-    for source in "$HH_RAM_ROOT/syslog-host-state.json" "$HH_MIRROR";do
+    for source in "$HH_RAM_ROOT/host-health-state.json" "$HH_MIRROR";do
         [[ -f "$source" && ! -L "$source" && $(stat -c %u "$source") == "$EUID" ]] || continue
         if jq -e '.schema==1 and (.conditions|type)=="object" and (.baselines.network|type)=="object"' "$source" >/dev/null 2>&1;then HH_STATE=$(cat "$source");break;fi
     done
