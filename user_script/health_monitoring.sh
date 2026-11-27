@@ -208,7 +208,7 @@ fi
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="3.1.0"
+readonly SCRIPT_VERSION="3.2.0"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -246,6 +246,14 @@ fi
 # per stable identity when unit revision changes; physical fault counters are kept.
 # Legacy analytic files are left for rollback but no longer written or recreated.
 # Use --help for supported read-only diagnostics and state administration commands.
+# v3.2: standard ATA page-7/NVMe wear discovery, current-hardware endurance
+# inventory, and backed-up state layout migration. Unknown published TBW ratings
+# remain unknown; native wear/error monitoring continues for replacement models.
+# State folders: devices/, filesystems/, notifications/, history/, runtime/.
+# Root receipt/config/schema paths are stable for other scripts. Two state
+# migration/rollback snapshots are retained after successful normal runs.
+# Wear-used and published TBW consumption are different metrics; neither is
+# a guarantee of remaining service life. Unsupported wear/rating data is unknown.
 # No Docker image, startup or application configuration is modified.
 
 load_builtin_defaults() {
@@ -428,11 +436,8 @@ TBW_CONSUMED_CRIT=95                             # Consumed percent of model TBW
 #  - action: for quirks (e.g., invert_mwi_small)
 # TBW endurance per TB overrides (model + optional capacity window)
 TBW_MODEL_RULES='\
-regex:MX500;per_tb:350
-regex:WD[[:space:]]+Red.*SA500|WDS500G1R0A;cap_min:0.45;cap_max:0.55;per_tb:700
-regex:WD[[:space:]]+Red.*SA500;cap_min:0.95;cap_max:1.05;per_tb:600
-regex:Crucial[[:space:]]*T500|CT1000T500SSD[58];cap_min:0.95;cap_max:1.05;per_tb:600
-regex:Crucial[[:space:]]*P5(\\+|[[:space:]]*Plus|P5P)|CT1000P5PSSD8;cap_min:0.95;cap_max:1.05;per_tb:600
+regex:^(WDC[[:space:]]+)?WDS500G1R0A(-[A-Za-z0-9]+)?$;cap_min:0.49;cap_max:0.51;per_tb:700
+regex:^(CT1000T500SSD[58]|CT1000P5PSSD8)$;cap_min:0.99;cap_max:1.01;per_tb:600
 '
 # POH threshold overrides by device type and model
 # Parsing/compatibility quirks (e.g., vendor-reported life remaining anomalies)
@@ -682,10 +687,11 @@ STATE_BACKUP_SNAPSHOT_RESULT=""
 # === Logs Paths ===
 STATE_DIR="${LOG_DIR:-}/state"
 MONITOR_RECEIPT_FILE="$STATE_DIR/monitor_receipt.json"
-SMART_COVERAGE_FILE="$STATE_DIR/smart_coverage.tsv"
-SMART_TEST_TRACKING_FILE="$STATE_DIR/smart_test_schedule.json"
-DOCKER_SCRUB_TRACKING_FILE="$STATE_DIR/docker_scrub_schedule.json"
-SMART_BASELINES_FILE="$STATE_DIR/smart_baselines.json"
+SMART_COVERAGE_FILE="$STATE_DIR/devices/smart_coverage.tsv"
+SMART_TEST_TRACKING_FILE="$STATE_DIR/devices/smart_test_schedule.json"
+DOCKER_SCRUB_TRACKING_FILE="$STATE_DIR/filesystems/docker_scrub.json"
+SMART_BASELINES_FILE="$STATE_DIR/devices/smart_baselines.json"
+ENDURANCE_INVENTORY_FILE="$STATE_DIR/devices/endurance.json"
 EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
 LEGACY_EXTERNAL_CONFIG_FILE="$LOG_DIR/health_monitoring.conf"
 STATE_BACKUP_DIR="$STATE_DIR/backups"
@@ -721,35 +727,34 @@ log_xfs()   { log "XFS"    "INFO" "$*"; }
 
 # === State Files ===
 # --- Alerting & Runtime (immediate health evaluation, deltas, cooldowns, recent events) ---
-SMART_LONG_STATE_FILE="$STATE_DIR/smart_long_processed.log"         # Long SMART test last run time per disk (scheduling)
-SMART_LONG_LAST_POH_FILE="$STATE_DIR/smart_long_last.log"           # Long SMART test last POH snapshot per disk (delta vetting)
-SMART_LAST="$STATE_DIR/smart_last_test.log"                         # Last SMART test type/time per disk (summary)
-SMART_SELFTEST_DIR="$STATE_DIR/smart_selftest"                      # Per-disk SMART self-test logs (lifecycle events)
-NVME_STATE_FILE="$STATE_DIR/counters_last.log"                      # NVMe counters last snapshot (delta alerts)
-PREV_ATTR_FILE="$STATE_DIR/smart_prev_attrs.log"                    # Previous SMART/NVMe attribute raw values (delta calculations)
-ALERT_NEW_SEEN_FILE="$STATE_DIR/new_alerts_seen.log"                # Newly seen alert/device tracking (de-dup noise)
-CMD_TIMEOUT_LAST_FILE="$STATE_DIR/cmd_timeout_last.log"             # Previous command timeout counts (delta alerting)
-CMD_TIMEOUT_STATE_DIR="$STATE_DIR/cmd_timeout"                      # Per-disk command timeout cooldown files
-UNSAFE_SDWN_STATE_DIR="$STATE_DIR/unsafe_shutdown"                  # Per-NVMe unsafe shutdown cooldown files
-BTRFS_SCRUB_STATE_DIR="$STATE_DIR/btrfs_scrub_status"               # Per-pool scrub status (in-progress vs last)
-BTRFS_DEV_PREV_FILE="$STATE_DIR/btrfs_device_stats.prev"            # Previous Btrfs per-device counters and capture metadata
-SYSLOG_CURSOR_STATE_FILE="$STATE_DIR/syslog_cursor.state"            # Persistent inode/line cursor for incremental syslog reads
-DEVICE_ID_MAP_FILE="$STATE_DIR/device_identity_map.log"             # Stable ID to current /dev path inventory
-DEVICE_ID_SCHEMA_FILE="$STATE_DIR/device_identity_schema.version"   # One-time /dev history migration marker
+SMART_LONG_STATE_FILE="$STATE_DIR/devices/smart_long_processed.log"         # Long SMART test last run time per disk (scheduling)
+SMART_LONG_LAST_POH_FILE="$STATE_DIR/devices/smart_long_last.log"           # Long SMART test last POH snapshot per disk (delta vetting)
+SMART_LAST="$STATE_DIR/devices/smart_last_test.log"                         # Last SMART test type/time per disk (summary)
+SMART_SELFTEST_DIR="$STATE_DIR/devices/selftests"                      # Per-disk SMART self-test logs (lifecycle events)
+NVME_STATE_FILE="$STATE_DIR/devices/legacy_nvme_counters.log"                      # NVMe counters last snapshot (delta alerts)
+PREV_ATTR_FILE="$STATE_DIR/devices/legacy_smart_attributes.log"                    # Previous SMART/NVMe attribute raw values (delta calculations)
+ALERT_NEW_SEEN_FILE="$STATE_DIR/notifications/seen.tsv"                # Newly seen alert/device tracking (de-dup noise)
+CMD_TIMEOUT_LAST_FILE="$STATE_DIR/devices/legacy_command_timeouts.log"             # Previous command timeout counts (delta alerting)
+CMD_TIMEOUT_STATE_DIR="$STATE_DIR/devices/cooldowns/command_timeouts"                      # Per-disk command timeout cooldown files
+UNSAFE_SDWN_STATE_DIR="$STATE_DIR/devices/cooldowns/unsafe_shutdowns"                  # Per-NVMe unsafe shutdown cooldown files
+BTRFS_SCRUB_STATE_DIR="$STATE_DIR/filesystems/scrubs"               # Per-pool scrub status (in-progress vs last)
+BTRFS_DEV_PREV_FILE="$STATE_DIR/filesystems/btrfs_counters.tsv"            # Previous Btrfs per-device counters and capture metadata
+SYSLOG_CURSOR_STATE_FILE="$STATE_DIR/runtime/syslog_cursor.state"            # Persistent inode/line cursor for incremental syslog reads
+DEVICE_ID_MAP_FILE="$STATE_DIR/devices/identity.tsv"             # Stable ID to current /dev path inventory
+DEVICE_ID_SCHEMA_FILE="$STATE_DIR/devices/identity.version"   # One-time /dev history migration marker
 STATE_SCHEMA_MANIFEST_FILE="$STATE_DIR/state_schema.manifest"       # Coordinated persisted-format versions
-REPLACEMENT_EVENTS_FILE="$STATE_DIR/replacement_events.log"         # Drive replacement lifecycle events (alerts context)
-SATA_LINK_HISTORY_FILE="$STATE_DIR/sata_link_downshift_history.log" # SATA link instability events (alert context)
-NOTIFICATION_JOURNAL_FILE="$STATE_DIR/notification_lifecycle.state" # Last successfully delivered canonical finding set
-NOTIFICATION_RECOVERY_STATE_FILE="$STATE_DIR/notification_recovery.state" # Consecutive safe-run recovery candidates
+SATA_LINK_HISTORY_FILE="$STATE_DIR/history/sata_links.tsv" # SATA link instability events (alert context)
+NOTIFICATION_JOURNAL_FILE="$STATE_DIR/notifications/lifecycle.tsv" # Last successfully delivered canonical finding set
+NOTIFICATION_RECOVERY_STATE_FILE="$STATE_DIR/notifications/recovery.tsv" # Consecutive safe-run recovery candidates
 # --- Trend / Historical Analytics (longer-term forecasting, prioritization, trajectory) ---
-IO_ERROR_HISTORY_FILE="$STATE_DIR/io_error_history.log"             # I/O error frequency timeline (acceleration)
-BTRFS_DEV_HIST_FILE="$STATE_DIR/btrfs_device_stats_history.log"     # Btrfs per-device error deltas over time
-TBW_HISTORY_FILE="$STATE_DIR/tbw_history.log"                       # Total bytes written progression (wear modeling)
-SMART_ATTR_HISTORY_FILE="$STATE_DIR/smart_attr_history.log"         # Attribute growth time-series (trend alerts)
-TEMP_HISTORY_FILE="$STATE_DIR/temp_history.log"                     # Temperature samples (rate & exposure)
+IO_ERROR_HISTORY_FILE="$STATE_DIR/history/kernel_errors.tsv"             # I/O error frequency timeline (acceleration)
+BTRFS_DEV_HIST_FILE="$STATE_DIR/history/btrfs_errors.tsv"     # Btrfs per-device error deltas over time
+TBW_HISTORY_FILE="$STATE_DIR/history/host_writes.tsv"                       # Total bytes written progression (wear modeling)
+SMART_ATTR_HISTORY_FILE="$STATE_DIR/history/wear.tsv"         # Attribute growth time-series (trend alerts)
+TEMP_HISTORY_FILE="$STATE_DIR/history/temperatures.tsv"                     # Temperature samples (rate & exposure)
 STATE_FILES_ALERT_RUNTIME=(
-    "$MONITOR_RECEIPT_FILE" "$SMART_COVERAGE_FILE" "$SMART_TEST_TRACKING_FILE" "$DOCKER_SCRUB_TRACKING_FILE"
-    "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$ALERT_NEW_SEEN_FILE"   "$BTRFS_DEV_PREV_FILE" "$SYSLOG_CURSOR_STATE_FILE"  "$REPLACEMENT_EVENTS_FILE" "$SATA_LINK_HISTORY_FILE" "$NOTIFICATION_JOURNAL_FILE" "$NOTIFICATION_RECOVERY_STATE_FILE"
+    "$MONITOR_RECEIPT_FILE" "$SMART_COVERAGE_FILE" "$SMART_TEST_TRACKING_FILE" "$DOCKER_SCRUB_TRACKING_FILE" "$ENDURANCE_INVENTORY_FILE"
+    "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$ALERT_NEW_SEEN_FILE"   "$BTRFS_DEV_PREV_FILE" "$SYSLOG_CURSOR_STATE_FILE"   "$SATA_LINK_HISTORY_FILE" "$NOTIFICATION_JOURNAL_FILE" "$NOTIFICATION_RECOVERY_STATE_FILE"
 )
 STATE_FILES_TREND_HISTORY=(
     "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE"  "$TBW_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$TEMP_HISTORY_FILE"
@@ -1035,7 +1040,8 @@ secure_create_file() {
 validate_managed_state_paths() {
     local path
     local -a directories=(
-        "$STATE_DIR" "$SMART_SELFTEST_DIR" "$UNSAFE_SDWN_STATE_DIR"
+        "$STATE_DIR" "$STATE_DIR/devices" "$STATE_DIR/devices/cooldowns" "$STATE_DIR/filesystems"
+        "$STATE_DIR/history" "$STATE_DIR/notifications" "$STATE_DIR/runtime" "$SMART_SELFTEST_DIR" "$UNSAFE_SDWN_STATE_DIR"
         "$BTRFS_SCRUB_STATE_DIR" "$CMD_TIMEOUT_STATE_DIR" "$STATE_BACKUP_DIR"
     )
     local -a files=(
@@ -1409,7 +1415,7 @@ write_state_schema_manifest() {
     [[ "$identity_schema" =~ ^[0-9]+$ ]] || identity_schema=0
     (( updated_epoch > 0 )) || updated_epoch=$(date +%s)
     printf -v content \
-        'format=%s\nstate_schema=%s\nhistory_schema=%s\nidentity_schema=%s\nwriter_version=%s\nupdated_epoch=%s\n' \
+        'format=%s\nstate_schema=%s\nhistory_schema=%s\nidentity_schema=%s\nwriter_version=%s\nupdated_epoch=%s\nlayout_schema=1\n' \
         "$STATE_SCHEMA_FORMAT" \
         "$STATE_SCHEMA_VERSION" \
         "$HISTORY_SCHEMA_VERSION" \
@@ -1743,6 +1749,101 @@ migrate_state_schema() {
     log "STATE" "INFO" \
         "Migrated state schema v$from_state to v$STATE_SCHEMA_VERSION (rollback backup: $backup_id)"
     return 0
+}
+
+# Structured state layout v1. Public receipt/config/schema paths stay stable.
+# Every relocation is backed up first; interrupted moves are safely resumable.
+ensure_state_layout() {
+    local layout=0 rc=0 from_state=0 from_history="$HISTORY_SCHEMA_VERSION" from_identity=0
+    local old new pair directory
+    if [[ -e "$STATE_SCHEMA_MANIFEST_FILE" ]]; then
+        inspect_state_schema_manifest || rc=$?
+        case "$rc" in 0|10|40) ;; *) return 1 ;; esac
+        layout=$(state_manifest_value "$STATE_SCHEMA_MANIFEST_FILE" layout_schema 2>/dev/null || printf 0)
+    fi
+    [[ "$layout" =~ ^[0-9]+$ ]] && (( layout <= 1 )) || {
+        log STATE ERROR 'Unsupported state layout; existing files preserved'; return 1;
+    }
+    if (( layout == 1 )); then return 0; fi
+    if state_directory_has_payload; then
+        from_state=$(state_manifest_value "$STATE_SCHEMA_MANIFEST_FILE" state_schema 2>/dev/null || printf 0)
+        from_identity=$(state_manifest_value "$STATE_SCHEMA_MANIFEST_FILE" identity_schema 2>/dev/null || printf 0)
+        create_state_backup layout-v1 "$from_state" "$from_history" "$from_identity" || return 1
+    fi
+    for directory in devices devices/cooldowns filesystems history notifications runtime; do
+        ensure_private_dir "$STATE_DIR/$directory" || return 1
+    done
+    local -a relocations=(
+        "smart_baselines.json|$SMART_BASELINES_FILE"
+        "smart_coverage.tsv|$SMART_COVERAGE_FILE"
+        "smart_test_schedule.json|$SMART_TEST_TRACKING_FILE"
+        "docker_scrub_schedule.json|$DOCKER_SCRUB_TRACKING_FILE"
+        "smart_long_processed.log|$SMART_LONG_STATE_FILE"
+        "smart_long_last.log|$SMART_LONG_LAST_POH_FILE"
+        "smart_last_test.log|$SMART_LAST"
+        "smart_selftest|$SMART_SELFTEST_DIR"
+        "counters_last.log|$NVME_STATE_FILE"
+        "smart_prev_attrs.log|$PREV_ATTR_FILE"
+        "cmd_timeout_last.log|$CMD_TIMEOUT_LAST_FILE"
+        "new_alerts_seen.log|$ALERT_NEW_SEEN_FILE"
+        "cmd_timeout|$CMD_TIMEOUT_STATE_DIR"
+        "unsafe_shutdown|$UNSAFE_SDWN_STATE_DIR"
+        "btrfs_scrub_status|$BTRFS_SCRUB_STATE_DIR"
+        "btrfs_device_stats.prev|$BTRFS_DEV_PREV_FILE"
+        "syslog_cursor.state|$SYSLOG_CURSOR_STATE_FILE"
+        "device_identity_map.log|$DEVICE_ID_MAP_FILE"
+        "device_identity_schema.version|$DEVICE_ID_SCHEMA_FILE"
+        "notification_lifecycle.state|$NOTIFICATION_JOURNAL_FILE"
+        "notification_recovery.state|$NOTIFICATION_RECOVERY_STATE_FILE"
+        "sata_link_downshift_history.log|$SATA_LINK_HISTORY_FILE"
+        "io_error_history.log|$IO_ERROR_HISTORY_FILE"
+        "btrfs_device_stats_history.log|$BTRFS_DEV_HIST_FILE"
+        "tbw_history.log|$TBW_HISTORY_FILE"
+        "smart_attr_history.log|$SMART_ATTR_HISTORY_FILE"
+        "temp_history.log|$TEMP_HISTORY_FILE"
+    )
+    for pair in "${relocations[@]}"; do
+        old="$STATE_DIR/${pair%%|*}"; new="${pair#*|}"
+        [[ -e "$old" || -L "$old" ]] || continue
+        validate_symlink_free_path "$old" && validate_symlink_free_path "$new" || return 1
+        [[ "$old" != "$new" ]] || continue
+        if [[ -e "$new" ]]; then
+            if [[ -f "$old" && -f "$new" ]] && cmp -s -- "$old" "$new"; then rm -- "$old"
+            elif [[ -d "$old" && -d "$new" ]] && ! find "$new" -mindepth 1 -print -quit | grep -q .; then rmdir -- "$new"; mv -- "$old" "$new"
+            else log STATE ERROR "Conflicting layout sources: $old and $new; neither overwritten"; return 1; fi
+        else mv -- "$old" "$new" || return 1; fi
+    done
+    # Only confirmed retired producers are removed, after the complete backup.
+    for old in risk_prev.log risk_spikes.log soak_runs.tsv xfs_proc_stats_history.log xfs_proc_stats_prev.log smart_selftest_history.log replacement_events.log; do
+        [[ ! -e "$STATE_DIR/$old" ]] || rm -- "$STATE_DIR/$old" || return 1
+    done
+    # Old path-keyed USB-boot snapshot; current drive snapshots use stable IDs.
+    if [[ -f "$SMART_SELFTEST_DIR/sdl.snapshot" && ! -L "$SMART_SELFTEST_DIR/sdl.snapshot" ]]; then
+        rm -- "$SMART_SELFTEST_DIR/sdl.snapshot" || return 1
+    fi
+    write_state_schema_manifest "$(current_identity_schema)" || return 1
+    log STATE INFO 'State layout migrated: devices, filesystems, notifications, history and runtime; receipt/config paths preserved'
+}
+
+prune_state_backups() {
+    local path id metadata created count=0
+    [[ -d "$STATE_BACKUP_DIR" ]] || return 0
+    local rows="$RUN_DIR/state-backup-retention.tsv"
+    : > "$rows" || return 1
+    while IFS= read -r -d '' path; do
+        id="${path##*/}"; validate_state_backup_id "$id" || continue
+        metadata="$path/backup.meta"
+        [[ "$(backup_metadata_value "$metadata" format 2>/dev/null)" == health-monitoring-state-backup ]] || continue
+        created=$(backup_metadata_value "$metadata" created_epoch 2>/dev/null || true)
+        [[ "$created" =~ ^[0-9]+$ ]] || continue
+        printf '%s\t%s\n' "$created" "$id" >> "$rows"
+    done < <(find "$STATE_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
+    while IFS=$'\t' read -r created id; do
+        count=$((count+1)); (( count > 2 )) || continue
+        validate_state_backup_contents "$id" || return 1
+        rm -rf -- "$STATE_BACKUP_DIR/$id" || return 1
+        log STATE INFO "Removed superseded state backup $id; latest two retained"
+    done < <(sort -nr "$rows")
 }
 
 ensure_state_schema_manifest() {
@@ -2335,10 +2436,13 @@ initialize_runtime() {
 
     ensure_dir "$LOG_DIR" || return 1
     ensure_private_dir "$STATE_DIR" || return 1
+    # Inspect the root manifest before creating/rearranging structured state.
+    # New child paths do not exist yet when migrating a legacy flat layout.
+    local schema_rc=0
+    inspect_state_schema_manifest || schema_rc=$?
+    case "$schema_rc" in 0|10|40) ;; *) return 1 ;; esac
+    ensure_state_layout || return 1
     validate_managed_state_paths || return 1
-    # Inspect/adopt the manifest before changing existing state permissions or
-    # creating state subdirectories. Future or malformed schemas therefore
-    # fail without partially initializing this version's layout.
     ensure_state_schema_manifest || return 1
 
     ensure_private_dir "$STATE_DIR" || return 1
@@ -2488,7 +2592,7 @@ prune_history_files() {
         cutoff_epoch=$(date -d "$cutoff 00:00:00" +%s 2>/dev/null || echo 0)
     fi
     local files=(
-        "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE"  "$SMART_ATTR_HISTORY_FILE" "$TEMP_HISTORY_FILE" "$TBW_HISTORY_FILE" "$SATA_LINK_HISTORY_FILE" "$REPLACEMENT_EVENTS_FILE"
+        "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE"  "$SMART_ATTR_HISTORY_FILE" "$TEMP_HISTORY_FILE" "$TBW_HISTORY_FILE" "$SATA_LINK_HISTORY_FILE"
     )
     local f retain_days file_cutoff file_epoch
     for f in "${files[@]}"; do
@@ -3951,7 +4055,7 @@ migrate_device_identity_histories() {
     local -a files=(
         "$TEMP_HISTORY_FILE"
         "$SATA_LINK_HISTORY_FILE"
-        "$REPLACEMENT_EVENTS_FILE"
+
         "$SMART_ATTR_HISTORY_FILE"
         "$TBW_HISTORY_FILE"
         "$BTRFS_DEV_HIST_FILE"
@@ -4632,8 +4736,8 @@ evaluate_scsi_smart() {
 ata_host_counter_bytes() {
     local text="$1" direction="$2" name value multiplier
     case "$direction" in
-        writes) name='Host_Writes_GiB|Host_Writes_32MiB|Total_LBAs_Written' ;;
-        reads) name='Host_Reads_GiB|Host_Reads_32MiB|Total_LBAs_Read' ;;
+        writes) name='Host_Writes_GiB|Host_Writes_32MiB' ;;
+        reads) name='Host_Reads_GiB|Host_Reads_32MiB' ;;
         *) return 1 ;;
     esac
     local row
@@ -4643,7 +4747,6 @@ ata_host_counter_bytes() {
     case "$name" in
         *_GiB) multiplier=1073741824 ;;
         *_32MiB) multiplier=33554432 ;;
-        Total_LBAs_*) multiplier=512 ;;
         *) return 1 ;;
     esac
     # Exact integer text, avoiding signed shell arithmetic overflow.
@@ -4655,13 +4758,88 @@ ata_host_counter_bytes() {
 rebaseline_ata_host_writes() {
     local disk="$1" key tmp
     CUR_ATTR["$disk|host_write_units_revision"]=2
-    [[ "${PREV_ATTR["$disk|host_write_units_revision"]:-0}" == 2 ]] && return 0
+    if [[ "${PREV_ATTR["$disk|host_write_units_revision"]:-0}" == 2 &&
+          "${PREV_ATTR["$disk|host_write_source"]:-ata_named_units}" == "${CUR_ATTR["$disk|host_write_source"]:-ata_named_units}" ]]; then return 0; fi
     key=$(persistent_device_key "$disk") || return 1
     tmp=$(state_temp_file "$TBW_HISTORY_FILE") || return 1
     awk -v key="$key" -v disk="$disk" '$2 != key && $2 != disk' "$TBW_HISTORY_FILE" > "$tmp" || return 1
     collector_atomic_commit "$tmp" "$TBW_HISTORY_FILE" || return 1
     unset 'PREV_ATTR["$disk|tbw_bytes"]'
     log "SMART" "INFO" "$disk: host-write units corrected; write-rate history rebaselined; fault counters retained"
+}
+
+# ATA Device Statistics page 7, offset 0x008, is vendor-independent wear-used
+# telemetry. Do not infer units/direction from an arbitrary SMART attribute ID.
+ata_device_stat_value() {
+    local text="$1" wanted="$2"
+    awk -v wanted="$wanted" '
+      $1 ~ /^0x[0-9A-Fa-f]+$/ && $2 ~ /^0x[0-9A-Fa-f]+$/ && $4 ~ /^[0-9]+$/ {
+        description=""; for(i=6;i<=NF;i++) description=description (i==6?"":" ") $i
+        if(description==wanted && (wanted!="Percentage Used Endurance Indicator" || ($1=="0x07" && $2=="0x008" && $3=="1")) && !seen++) printf "%.0f\n",$4
+      }' <<< "$text"
+}
+
+apply_standard_ssd_wear() {
+    local disk="$1" used="$2" source="$3" in_state="$4" previous remaining
+    SSD_WEAR_EVAL_STATE="$in_state"
+    [[ "$used" =~ ^[0-9]{1,3}$ ]] || return 1
+    used=$((10#$used))
+    (( used <= 255 )) || return 1
+    remaining=$((used < 100 ? 100-used : 0))
+    CUR_ATTR["$disk|ssd_percent_used"]="$used"
+    CUR_ATTR["$disk|wear_remaining"]="$remaining"
+    CUR_ATTR["$disk|wear_source"]="$source"
+    CUR_ATTR["$disk|wear_verified"]=1
+    previous="${PREV_ATTR["$disk|ssd_percent_used"]:-}"
+    if [[ "$previous" =~ ^[0-9]+$ && "${PREV_ATTR["$disk|wear_source"]:-}" == "$source" ]] && (( used < previous )); then
+        record_finding warning endurance lifecycle.regression "$disk" 'SSD wear counter regression'             "Standardized wear-used decreased ($previous% -> $used%); source=$source; identity retained."             'Review firmware or counter resets; this is not proof of a replacement drive.' ssd_wear_regression
+    fi
+    if (( used >= NVME_PERCENT_USED_CRIT )); then
+        SSD_WEAR_EVAL_STATE=CRITICAL
+        record_finding critical endurance endurance.wear "$disk" 'SSD endurance used'             "Firmware-estimated endurance used=$used%; source=$source."             'Review backups and replacement planning; this is a wear estimate, not a failure-date prediction.' ssd_wear_used
+    elif (( used >= NVME_PERCENT_USED_WARN )); then
+        [[ "$in_state" != OK ]] || SSD_WEAR_EVAL_STATE=WARNING
+        record_finding warning endurance endurance.wear "$disk" 'SSD endurance used'             "Firmware-estimated endurance used=$used%; source=$source."             'Monitor endurance consumption and replacement planning.' ssd_wear_used
+    fi
+    log SMART INFO "$disk: endurance used=$used%; estimated remaining=$remaining%; source=$source; standardized firmware telemetry, not a failure-date prediction"
+}
+
+persist_endurance_inventory() {
+    local disk id model firmware protocol capacity rating source wear remaining writes fresh row identity_source
+    local rows="$RUN_DIR/endurance.ndjson" json
+    : > "$rows" || return 1
+    for disk in "${DISCOVERED_DISKS[@]}"; do
+        [[ "$disk" == /dev/nvme* || "$(lsblk_rota_cached "$disk" 2>/dev/null)" == 0 ]] || continue
+        id=$(persistent_device_key "$disk") || return 1
+        fresh=false; [[ -z "${FRESH_SMART[$disk]:-}" ]] || fresh=true
+        model=""; firmware=""; rating=""; source=unavailable
+        if [[ "$fresh" == true ]]; then
+            model=$(get_device_model "$disk" 2>/dev/null || true)
+            if [[ "$disk" == /dev/nvme* ]]; then
+                firmware=$(smartctl_cached -i -d nvme "$disk" 2>/dev/null | sed -nE 's/^Firmware Version:[[:space:]]*//p')
+            else firmware=$(smartctl_cached -i "$disk" 2>/dev/null | sed -nE 's/^Firmware Version:[[:space:]]*//p'); fi
+            capacity=$(get_device_capacity_tb "$disk")
+            rating=$(tbw_threshold_tb_for_device "$model" "$capacity")
+        fi
+        capacity=$(lsblk_size_cached "$disk" 2>/dev/null || true)
+        [[ "$capacity" =~ ^[0-9]+$ ]] || capacity=0
+        protocol=sata; [[ "$disk" != /dev/nvme* ]] || protocol=nvme
+        wear="${CUR_ATTR["$disk|ssd_percent_used"]:-}"
+        remaining="${CUR_ATTR["$disk|wear_remaining"]:-}"
+        source="${CUR_ATTR["$disk|wear_source"]:-unavailable}"
+        writes="${CUR_ATTR["$disk|tbw_bytes"]:-}"
+        if [[ "$fresh" != true ]]; then wear=""; remaining=""; source=unavailable; writes=""; fi
+        identity_source="${DEVICE_ID_SOURCE[$id]:-unverified}"
+        row=$(jq -nc --arg id "$id" --arg path "$disk" --arg model "$model" --arg firmware "$firmware" --arg protocol "$protocol" --arg identity "$identity_source" \
+            --arg source "$source" --arg wear "$wear" --arg remaining "$remaining" --arg rating "$rating" --arg writes "$writes" --argjson capacity "$capacity" --argjson fresh "$fresh" \
+            'def num: if test("^[0-9]+$") then tonumber else null end;
+             {id:$id,path:$path,model:$model,firmware:$firmware,protocol:$protocol,identitySource:$identity,capacityBytes:$capacity,fresh:$fresh,
+              wear:{source:$source,usedPercent:($wear|num),remainingPercent:($remaining|num),verification:(if $source=="unavailable" then "unavailable" else "standardized_firmware_estimate" end)},
+              hostWritesBytes:($writes|num),ratedTbwTB:($rating|num),ratingSource:(if $rating=="" then "unavailable" else "documented_model_capacity_profile" end)}') || return 1
+        printf '%s\n' "$row" >> "$rows" || return 1
+    done
+    json=$(jq -s --argjson at "$RUN_EPOCH" '{schema:1,observedAt:$at,devices:(map({key:.id,value:del(.id)})|from_entries)}' "$rows") || return 1
+    atomic_write_text "$ENDURANCE_INVENTORY_FILE" "$json"$'\n'
 }
 
 evaluate_smart() {
@@ -4908,6 +5086,11 @@ evaluate_smart() {
         fi
         # Persist parsed NVMe attributes for downstream consumers
         CUR_ATTR["$disk|nvme_percent_used"]="$percent_used"
+        # Preserve standard NVMe wear independently of any manufacturer TBW profile.
+        CUR_ATTR["$disk|ssd_percent_used"]="$percent_used"
+        CUR_ATTR["$disk|wear_remaining"]="$((percent_used < 100 ? 100-percent_used : 0))"
+        CUR_ATTR["$disk|wear_source"]=nvme_smart_health
+        CUR_ATTR["$disk|wear_verified"]=1
         CUR_ATTR["$disk|poh"]="$poh"
         CUR_ATTR["$disk|unsafe_shutdowns"]="$unsafe_shutdowns"
         CUR_ATTR["$disk|media_errors"]="$media_errors"
@@ -5117,13 +5300,21 @@ evaluate_smart() {
         if [[ "$lcc" =~ ^(0|[1-9][0-9]*)$ ]] && (( lcc >= LOAD_CYCLE_WARN )); then
             log "SMART" "INFO" "$disk load-cycle count $lcc (review thresholds: $LOAD_CYCLE_WARN / $LOAD_CYCLE_CRIT)."
         fi
-        # Vendor MWI encodings are not interchangeable percentages. Keep the raw
-        # normalized value for review; native SMART failure and rated TBW remain active.
-        local mwi_norm
+        # ATA Device Statistics is preferred to ambiguous vendor SMART attributes.
+        local mwi_norm devstat_text="" used_endurance="" logical_written logical_read logical_sector
         mwi_norm=$(ata_smart_attribute_value "$attr" "Media_Wearout_Indicator" normalized)
-        if [[ -n "$mwi_norm" ]]; then
-            messages+=("Vendor wear value=$mwi_norm (remaining-life percentage unverified)")
-            CUR_ATTR["$disk|vendor_mwi"]="$mwi_norm"
+        [[ -z "$mwi_norm" ]] || CUR_ATTR["$disk|vendor_mwi"]="$mwi_norm"
+        if [[ "$rota" == 0 ]]; then
+            devstat_text=$(smartctl_bounded_optional -l devstat "$disk" 2>/dev/null || true)
+            used_endurance=$(ata_device_stat_value "$devstat_text" 'Percentage Used Endurance Indicator')
+            if apply_standard_ssd_wear "$disk" "$used_endurance" ata_device_statistics_page7 "$state"; then
+                state="$SSD_WEAR_EVAL_STATE"
+                messages+=("Endurance used=${used_endurance}% (standard ATA Device Statistics)")
+            else
+                CUR_ATTR["$disk|wear_source"]=unavailable
+                CUR_ATTR["$disk|wear_verified"]=0
+                messages+=("Standard wear percentage unavailable; vendor value ${mwi_norm:-unavailable} is not interpreted")
+            fi
         fi
         # Retain hours for device history and replacement planning.
         poh=$(ata_smart_attribute_value "$attr" "Power_On_Hours|Power_On_Hours_and_Msec")
@@ -5180,6 +5371,22 @@ evaluate_smart() {
         local tbw_bytes="" tbw_hr reads_bytes="" reads_hr
         tbw_bytes=$(ata_host_counter_bytes "$attr" writes || true)
         reads_bytes=$(ata_host_counter_bytes "$attr" reads || true)
+        CUR_ATTR["$disk|host_write_source"]=ata_named_units
+        # Unknown future SATA models can expose standardized logical-sector counters.
+        logical_sector=$(lsblk -bdn -o LOG-SEC "$disk" 2>/dev/null | awk 'NF==1 {print $1;exit}' || true)
+        if [[ "$logical_sector" =~ ^(512|4096|8192)$ ]]; then
+            if [[ -z "$tbw_bytes" ]]; then
+                logical_written=$(ata_device_stat_value "$devstat_text" 'Logical Sectors Written')
+                if [[ "$logical_written" =~ ^[0-9]+$ ]]; then
+                    tbw_bytes=$(awk -v n="$logical_written" -v size="$logical_sector" 'BEGIN {printf "%.0f",n*size}')
+                    CUR_ATTR["$disk|host_write_source"]=ata_logical_sectors
+                fi
+            fi
+            if [[ -z "$reads_bytes" ]]; then
+                logical_read=$(ata_device_stat_value "$devstat_text" 'Logical Sectors Read')
+                [[ ! "$logical_read" =~ ^[0-9]+$ ]] || reads_bytes=$(awk -v n="$logical_read" -v size="$logical_sector" 'BEGIN {printf "%.0f",n*size}')
+            fi
+        fi
         if [[ -n "$tbw_bytes" ]]; then
             rebaseline_ata_host_writes "$disk" || return 1
         fi
@@ -6263,6 +6470,7 @@ collect_smart_health() {
     report_test_freshness "${disks[@]}"
     persist_test_tracking || { record_collector_event FAILED "SMART test tracking" "write failed"; return 1; }
     update_smart_coverage "${disks[@]}" || return 1
+    persist_endurance_inventory || { record_collector_event FAILED "Endurance inventory" "atomic write failed"; return 1; }
     log_smart "SMART collection and test scheduling completed; pending tests are not declared complete"
     augment_messages_with_deltas
 
@@ -7109,6 +7317,8 @@ finding_has_fresh_recovery_evidence() {
                     [[ -n "${DEVICE_ID_BY_PATH[$device]:-}" &&
                        "$SYSLOG_CURSOR_MODE" =~ ^(cursor_continuation|rotation_recovery)$ ]] &&
                         collector_status_is_safe syslog_io ;;
+                ssd_wear_used|ssd_wear_regression)
+                    [[ -n "${FRESH_SMART[$device]:-}" && "${CUR_ATTR["$device|wear_verified"]:-0}" == 1 ]] ;;
                 smart_short_test_overdue|smart_long_test_overdue|smart_test_result_overdue)
                     [[ -n "${FRESH_SMART[$device]:-}" && "${SMART_OPERATION[$device]:-unknown}" == idle ]] ;;
                 endurance_forecast) return 1 ;; # Retired policy; not physical recovery evidence.
@@ -8281,7 +8491,7 @@ persist_current_attrs() {
         for key in \
             realloc pending offunc reported_uncorr cmd_timeout realloc_events \
             udma lcc end2end soft_read_err temp poh vendor_mwi host_write_units_revision tbw_bytes \
-            tbw_consumed_pct nvme_percent_used unsafe_shutdowns media_errors \
+            tbw_consumed_pct nvme_percent_used ssd_percent_used wear_remaining wear_source wear_verified host_write_source unsafe_shutdowns media_errors \
             err_logs avail_spare pcie_corr pcie_unc therm_t1 therm_t2 \
             warn_temp_time crit_temp_time selftest_status
         do
@@ -9386,6 +9596,7 @@ main() {
     prune_old_run_logs
 
     if (( exit_code == 0 )) && all_collectors_state_safe; then
+        prune_state_backups || return 1
         RUN_COMPLETION_READY=1
     else
         exit_code=1

@@ -7,7 +7,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../user_script/health_monitoring.sh
 source "$REPO_ROOT/user_script/health_monitoring.sh"
 
-readonly REGRESSION_FIXTURE_COUNT=118
+readonly REGRESSION_FIXTURE_COUNT=129
 
 self_test_result() {
     local passed="$1" name="$2" detail="${3:-}"
@@ -35,6 +35,31 @@ run_regression_tests() (
         return 1
     }
     trap '[[ -z "$fixture_dir" || "$fixture_dir" != /tmp/health_monitoring.selftest.* ]] || rm -rf -- "$fixture_dir"' EXIT
+
+    # Rebase EVERY derived default path before the first fixture. Changing only
+    # STATE_DIR leaves STATE_BACKUP_DIR and other precomputed paths on the host.
+    local -r production_log_root="$LOG_DIR"
+    local variable declaration value index
+    for variable in $(compgen -v); do
+        declaration=$(declare -p "$variable" 2>/dev/null) || continue
+        [[ "$declaration" == 'declare -- '* ]] || continue
+        value="${!variable}"
+        [[ "$value" == "$production_log_root" || "$value" == "$production_log_root/"* ]] || continue
+        printf -v "$variable" '%s' "$fixture_dir/root${value#"$production_log_root"}"
+    done
+    for index in "${!STATE_FILES_ALERT_RUNTIME[@]}"; do
+        value="${STATE_FILES_ALERT_RUNTIME[$index]}"
+        STATE_FILES_ALERT_RUNTIME[$index]="$fixture_dir/root${value#"$production_log_root"}"
+    done
+    for index in "${!STATE_FILES_TREND_HISTORY[@]}"; do
+        value="${STATE_FILES_TREND_HISTORY[$index]}"
+        STATE_FILES_TREND_HISTORY[$index]="$fixture_dir/root${value#"$production_log_root"}"
+    done
+    LOCK_FILE="$fixture_dir/monitor.lock"
+    NOTIFY_BIN="$fixture_dir/forbidden-notification"
+    smartctl() { printf 'Unmocked native SMART access prohibited in fixtures\n' >&2; return 99; }
+    hdparm() { printf 'Unmocked native drive access prohibited in fixtures\n' >&2; return 99; }
+    mkdir -p "$STATE_DIR"
 
     printf 'Disk Health Monitor for Unraid v%s - isolated regression tests\n' \
         "$SCRIPT_VERSION"
@@ -2000,6 +2025,282 @@ run_regression_tests() (
         [[ "$(test_track_get "$id" shortObserved)" == "$RUN_EPOCH" && "$(test_track_get "$id" unverified)" == 1 ]]
     ); then self_test_result 1 "Unrelated short success cannot clear an unverified long test"
     else self_test_result 0 "Unrelated short success cannot clear an unverified long test"; fi
+
+    if [[ "$STATE_BACKUP_DIR" == "$fixture_dir/"* && "$SMART_BASELINES_FILE" == "$fixture_dir/"* && "$NOTIFY_BIN" == "$fixture_dir/"* ]]; then
+        self_test_result 1 "All fixture default state, backup and notification paths are isolated"
+    else self_test_result 0 "All fixture default state, backup and notification paths are isolated"; fi
+
+    if (
+        local stats=$'0x07 0x008 1 12 N-- Percentage Used Endurance Indicator\n0x01 0x018 6 139150262127 --- Logical Sectors Written'
+        [[ "$(ata_device_stat_value "$stats" 'Percentage Used Endurance Indicator')" == 12 &&
+           "$(ata_device_stat_value "$stats" 'Logical Sectors Written')" == 139150262127 &&
+           -z "$(ata_device_stat_value '0x06 0x008 1 99 N-- Percentage Used Endurance Indicator' 'Percentage Used Endurance Indicator')" &&
+           -z "$(ata_device_stat_value '230 Media_Wearout_Indicator 12' 'Percentage Used Endurance Indicator')" ]]
+    ); then self_test_result 1 "ATA standard wear is read from the exact device-statistics page and field"
+    else self_test_result 0 "ATA standard wear is read from the exact device-statistics page and field"; fi
+
+    if (
+        local disk=/dev/sdz SSD_WEAR_EVAL_STATE=OK
+        CUR_ATTR=(); PREV_ATTR=()
+        apply_standard_ssd_wear "$disk" 12 ata_device_statistics_page7 OK &&
+        [[ "${CUR_ATTR["$disk|wear_remaining"]}" == 88 && "$SSD_WEAR_EVAL_STATE" == OK ]] &&
+        apply_standard_ssd_wear "$disk" 4 ata_device_statistics_page7 OK &&
+        [[ "${CUR_ATTR["$disk|wear_remaining"]}" == 96 ]] &&
+        ! apply_standard_ssd_wear "$disk" garbage ata_device_statistics_page7 OK &&
+        ! apply_standard_ssd_wear "$disk" 999 ata_device_statistics_page7 OK
+    ); then self_test_result 1 "WD standard values produce 88/96 percent estimates without vendor inversion guesses"
+    else self_test_result 0 "WD standard values produce 88/96 percent estimates without vendor inversion guesses"; fi
+
+    if (
+        local disk=/dev/sdz observed=''
+        record_finding() { observed="$*"; }
+        CUR_ATTR=(); PREV_ATTR=()
+        apply_standard_ssd_wear "$disk" 105 ata_device_statistics_page7 OK &&
+        [[ "${CUR_ATTR["$disk|wear_remaining"]}" == 0 && "$SSD_WEAR_EVAL_STATE" == CRITICAL && "$observed" == critical* ]]
+    ); then self_test_result 1 "Wear can exceed 100 percent without negative remaining life or lost alerts"
+    else self_test_result 0 "Wear can exceed 100 percent without negative remaining life or lost alerts"; fi
+
+    if (
+        [[ -z "$(tbw_threshold_tb_for_device CompletelyNewSSD 2.000)" ]] &&
+        apply_standard_ssd_wear /dev/sdz 7 ata_device_statistics_page7 OK &&
+        [[ "${CUR_ATTR['/dev/sdz|ssd_percent_used']}" == 7 ]]
+    ); then self_test_result 1 "Unknown replacement models retain standard wear monitoring without invented TBW ratings"
+    else self_test_result 0 "Unknown replacement models retain standard wear monitoring without invented TBW ratings"; fi
+
+    if (
+        local RUN_DIR="$fixture_dir/replacement" SMART_BASELINES_FILE="$fixture_dir/replacement/baselines.json"
+        mkdir -m 700 "$RUN_DIR"
+        printf '{"schema":1,"nvme":{},"smart":{"old_device":{"state":"CRITICAL","ssd_percent_used":"99"}},"command_timeout":{}}' > "$SMART_BASELINES_FILE"
+        DEVICE_ID_BY_PATH=([/dev/sdz]=new_device); DEVICE_PATH_BY_ID=([new_device]=/dev/sdz)
+        PREV_ATTR=()
+        load_persistent_state && [[ -z "${PREV_ATTR['/dev/sdz|ssd_percent_used']:-}" ]]
+    ); then self_test_result 1 "A new stable identity on the old device path does not inherit wear history"
+    else self_test_result 0 "A new stable identity on the old device path does not inherit wear history"; fi
+
+    if (
+        local STATE_DIR="$fixture_dir/layout-migrate" RUN_DIR="$fixture_dir/layout-migrate-run"
+        local MONITOR_RECEIPT_FILE="$STATE_DIR/monitor_receipt.json"
+        local SMART_COVERAGE_FILE="$STATE_DIR/devices/smart_coverage.tsv"
+        local SMART_TEST_TRACKING_FILE="$STATE_DIR/devices/smart_test_schedule.json"
+        local DOCKER_SCRUB_TRACKING_FILE="$STATE_DIR/filesystems/docker_scrub.json"
+        local SMART_BASELINES_FILE="$STATE_DIR/devices/smart_baselines.json"
+        local ENDURANCE_INVENTORY_FILE="$STATE_DIR/devices/endurance.json"
+        local EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+        local STATE_BACKUP_DIR="$STATE_DIR/backups"
+        local SMART_LONG_STATE_FILE="$STATE_DIR/devices/smart_long_processed.log"
+        local SMART_LONG_LAST_POH_FILE="$STATE_DIR/devices/smart_long_last.log"
+        local SMART_LAST="$STATE_DIR/devices/smart_last_test.log"
+        local SMART_SELFTEST_DIR="$STATE_DIR/devices/selftests"
+        local NVME_STATE_FILE="$STATE_DIR/devices/legacy_nvme_counters.log"
+        local PREV_ATTR_FILE="$STATE_DIR/devices/legacy_smart_attributes.log"
+        local ALERT_NEW_SEEN_FILE="$STATE_DIR/notifications/seen.tsv"
+        local CMD_TIMEOUT_LAST_FILE="$STATE_DIR/devices/legacy_command_timeouts.log"
+        local CMD_TIMEOUT_STATE_DIR="$STATE_DIR/devices/cooldowns/command_timeouts"
+        local UNSAFE_SDWN_STATE_DIR="$STATE_DIR/devices/cooldowns/unsafe_shutdowns"
+        local BTRFS_SCRUB_STATE_DIR="$STATE_DIR/filesystems/scrubs"
+        local BTRFS_DEV_PREV_FILE="$STATE_DIR/filesystems/btrfs_counters.tsv"
+        local SYSLOG_CURSOR_STATE_FILE="$STATE_DIR/runtime/syslog_cursor.state"
+        local DEVICE_ID_MAP_FILE="$STATE_DIR/devices/identity.tsv"
+        local DEVICE_ID_SCHEMA_FILE="$STATE_DIR/devices/identity.version"
+        local STATE_SCHEMA_MANIFEST_FILE="$STATE_DIR/state_schema.manifest"
+        local SATA_LINK_HISTORY_FILE="$STATE_DIR/history/sata_links.tsv"
+        local NOTIFICATION_JOURNAL_FILE="$STATE_DIR/notifications/lifecycle.tsv"
+        local NOTIFICATION_RECOVERY_STATE_FILE="$STATE_DIR/notifications/recovery.tsv"
+        local IO_ERROR_HISTORY_FILE="$STATE_DIR/history/kernel_errors.tsv"
+        local BTRFS_DEV_HIST_FILE="$STATE_DIR/history/btrfs_errors.tsv"
+        local TBW_HISTORY_FILE="$STATE_DIR/history/host_writes.tsv"
+        local SMART_ATTR_HISTORY_FILE="$STATE_DIR/history/wear.tsv"
+        local TEMP_HISTORY_FILE="$STATE_DIR/history/temperatures.tsv"
+        local -a STATE_FILES_ALERT_RUNTIME=(
+    "$MONITOR_RECEIPT_FILE" "$SMART_COVERAGE_FILE" "$SMART_TEST_TRACKING_FILE" "$DOCKER_SCRUB_TRACKING_FILE" "$ENDURANCE_INVENTORY_FILE"
+    "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$ALERT_NEW_SEEN_FILE"   "$BTRFS_DEV_PREV_FILE" "$SYSLOG_CURSOR_STATE_FILE"   "$SATA_LINK_HISTORY_FILE" "$NOTIFICATION_JOURNAL_FILE" "$NOTIFICATION_RECOVERY_STATE_FILE"
+)
+        local -a STATE_FILES_TREND_HISTORY=(
+    "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE"  "$TBW_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$TEMP_HISTORY_FILE"
+)
+        mkdir -m 700 "$STATE_DIR" "$RUN_DIR"
+        printf 'format=health-monitoring-state\nstate_schema=2\nhistory_schema=3\nidentity_schema=2\nwriter_version=3.1.0\nupdated_epoch=1\n' > "$STATE_SCHEMA_MANIFEST_FILE"
+        printf '2\n' > "$STATE_DIR/device_identity_schema.version"
+        printf 'coverage-preserved
+' > "$STATE_DIR/smart_coverage.tsv"
+        printf 'notification-preserved
+' > "$STATE_DIR/notification_lifecycle.state"
+        printf 'receipt-preserved
+' > "$MONITOR_RECEIPT_FILE"
+        printf 'obsolete
+' > "$STATE_DIR/risk_prev.log"
+        printf 'custom-preserved
+' > "$STATE_DIR/custom.notes"
+        mkdir -m 700 "$STATE_DIR/smart_selftest"
+        printf 'native-result
+' > "$STATE_DIR/smart_selftest/stable_id.snapshot"
+        ensure_state_layout &&
+        [[ "$(<"$SMART_COVERAGE_FILE")" == coverage-preserved && "$(<"$NOTIFICATION_JOURNAL_FILE")" == notification-preserved &&
+           "$(<"$MONITOR_RECEIPT_FILE")" == receipt-preserved && "$(<"$SMART_SELFTEST_DIR/stable_id.snapshot")" == native-result &&
+           ! -e "$STATE_DIR/risk_prev.log" && ! -e "$STATE_DIR/smart_coverage.tsv" && -f "$STATE_DIR/custom.notes" &&
+           "$(state_manifest_value "$STATE_SCHEMA_MANIFEST_FILE" layout_schema)" == 1 ]] || exit 1
+        ensure_state_layout && [[ "$(find "$STATE_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)" == 1 ]]
+    ); then self_test_result 1 "Backed-up layout migration preserves counters, receipts and alerts, removes only retired files, and is idempotent"
+    else self_test_result 0 "Backed-up layout migration preserves counters, receipts and alerts, removes only retired files, and is idempotent"; fi
+
+    if (
+        local STATE_DIR="$fixture_dir/layout-conflict" RUN_DIR="$fixture_dir/layout-conflict-run"
+        local MONITOR_RECEIPT_FILE="$STATE_DIR/monitor_receipt.json"
+        local SMART_COVERAGE_FILE="$STATE_DIR/devices/smart_coverage.tsv"
+        local SMART_TEST_TRACKING_FILE="$STATE_DIR/devices/smart_test_schedule.json"
+        local DOCKER_SCRUB_TRACKING_FILE="$STATE_DIR/filesystems/docker_scrub.json"
+        local SMART_BASELINES_FILE="$STATE_DIR/devices/smart_baselines.json"
+        local ENDURANCE_INVENTORY_FILE="$STATE_DIR/devices/endurance.json"
+        local EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+        local STATE_BACKUP_DIR="$STATE_DIR/backups"
+        local SMART_LONG_STATE_FILE="$STATE_DIR/devices/smart_long_processed.log"
+        local SMART_LONG_LAST_POH_FILE="$STATE_DIR/devices/smart_long_last.log"
+        local SMART_LAST="$STATE_DIR/devices/smart_last_test.log"
+        local SMART_SELFTEST_DIR="$STATE_DIR/devices/selftests"
+        local NVME_STATE_FILE="$STATE_DIR/devices/legacy_nvme_counters.log"
+        local PREV_ATTR_FILE="$STATE_DIR/devices/legacy_smart_attributes.log"
+        local ALERT_NEW_SEEN_FILE="$STATE_DIR/notifications/seen.tsv"
+        local CMD_TIMEOUT_LAST_FILE="$STATE_DIR/devices/legacy_command_timeouts.log"
+        local CMD_TIMEOUT_STATE_DIR="$STATE_DIR/devices/cooldowns/command_timeouts"
+        local UNSAFE_SDWN_STATE_DIR="$STATE_DIR/devices/cooldowns/unsafe_shutdowns"
+        local BTRFS_SCRUB_STATE_DIR="$STATE_DIR/filesystems/scrubs"
+        local BTRFS_DEV_PREV_FILE="$STATE_DIR/filesystems/btrfs_counters.tsv"
+        local SYSLOG_CURSOR_STATE_FILE="$STATE_DIR/runtime/syslog_cursor.state"
+        local DEVICE_ID_MAP_FILE="$STATE_DIR/devices/identity.tsv"
+        local DEVICE_ID_SCHEMA_FILE="$STATE_DIR/devices/identity.version"
+        local STATE_SCHEMA_MANIFEST_FILE="$STATE_DIR/state_schema.manifest"
+        local SATA_LINK_HISTORY_FILE="$STATE_DIR/history/sata_links.tsv"
+        local NOTIFICATION_JOURNAL_FILE="$STATE_DIR/notifications/lifecycle.tsv"
+        local NOTIFICATION_RECOVERY_STATE_FILE="$STATE_DIR/notifications/recovery.tsv"
+        local IO_ERROR_HISTORY_FILE="$STATE_DIR/history/kernel_errors.tsv"
+        local BTRFS_DEV_HIST_FILE="$STATE_DIR/history/btrfs_errors.tsv"
+        local TBW_HISTORY_FILE="$STATE_DIR/history/host_writes.tsv"
+        local SMART_ATTR_HISTORY_FILE="$STATE_DIR/history/wear.tsv"
+        local TEMP_HISTORY_FILE="$STATE_DIR/history/temperatures.tsv"
+        local -a STATE_FILES_ALERT_RUNTIME=(
+    "$MONITOR_RECEIPT_FILE" "$SMART_COVERAGE_FILE" "$SMART_TEST_TRACKING_FILE" "$DOCKER_SCRUB_TRACKING_FILE" "$ENDURANCE_INVENTORY_FILE"
+    "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$ALERT_NEW_SEEN_FILE"   "$BTRFS_DEV_PREV_FILE" "$SYSLOG_CURSOR_STATE_FILE"   "$SATA_LINK_HISTORY_FILE" "$NOTIFICATION_JOURNAL_FILE" "$NOTIFICATION_RECOVERY_STATE_FILE"
+)
+        local -a STATE_FILES_TREND_HISTORY=(
+    "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE"  "$TBW_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$TEMP_HISTORY_FILE"
+)
+        mkdir -m 700 "$STATE_DIR" "$RUN_DIR"
+        printf 'format=health-monitoring-state\nstate_schema=2\nhistory_schema=3\nidentity_schema=2\nwriter_version=3.1.0\nupdated_epoch=1\n' > "$STATE_SCHEMA_MANIFEST_FILE"
+        printf '2\n' > "$STATE_DIR/device_identity_schema.version"
+        mkdir -m 700 "$STATE_DIR/devices"
+        printf old > "$STATE_DIR/smart_coverage.tsv"
+        printf new > "$SMART_COVERAGE_FILE"
+        ! ensure_state_layout && [[ "$(<"$STATE_DIR/smart_coverage.tsv")" == old && "$(<"$SMART_COVERAGE_FILE")" == new ]]
+    ); then self_test_result 1 "Conflicting migration copies are preserved instead of overwritten"
+    else self_test_result 0 "Conflicting migration copies are preserved instead of overwritten"; fi
+
+    if (
+        local STATE_DIR="$fixture_dir/layout-future" RUN_DIR="$fixture_dir/layout-future-run"
+        local MONITOR_RECEIPT_FILE="$STATE_DIR/monitor_receipt.json"
+        local SMART_COVERAGE_FILE="$STATE_DIR/devices/smart_coverage.tsv"
+        local SMART_TEST_TRACKING_FILE="$STATE_DIR/devices/smart_test_schedule.json"
+        local DOCKER_SCRUB_TRACKING_FILE="$STATE_DIR/filesystems/docker_scrub.json"
+        local SMART_BASELINES_FILE="$STATE_DIR/devices/smart_baselines.json"
+        local ENDURANCE_INVENTORY_FILE="$STATE_DIR/devices/endurance.json"
+        local EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+        local STATE_BACKUP_DIR="$STATE_DIR/backups"
+        local SMART_LONG_STATE_FILE="$STATE_DIR/devices/smart_long_processed.log"
+        local SMART_LONG_LAST_POH_FILE="$STATE_DIR/devices/smart_long_last.log"
+        local SMART_LAST="$STATE_DIR/devices/smart_last_test.log"
+        local SMART_SELFTEST_DIR="$STATE_DIR/devices/selftests"
+        local NVME_STATE_FILE="$STATE_DIR/devices/legacy_nvme_counters.log"
+        local PREV_ATTR_FILE="$STATE_DIR/devices/legacy_smart_attributes.log"
+        local ALERT_NEW_SEEN_FILE="$STATE_DIR/notifications/seen.tsv"
+        local CMD_TIMEOUT_LAST_FILE="$STATE_DIR/devices/legacy_command_timeouts.log"
+        local CMD_TIMEOUT_STATE_DIR="$STATE_DIR/devices/cooldowns/command_timeouts"
+        local UNSAFE_SDWN_STATE_DIR="$STATE_DIR/devices/cooldowns/unsafe_shutdowns"
+        local BTRFS_SCRUB_STATE_DIR="$STATE_DIR/filesystems/scrubs"
+        local BTRFS_DEV_PREV_FILE="$STATE_DIR/filesystems/btrfs_counters.tsv"
+        local SYSLOG_CURSOR_STATE_FILE="$STATE_DIR/runtime/syslog_cursor.state"
+        local DEVICE_ID_MAP_FILE="$STATE_DIR/devices/identity.tsv"
+        local DEVICE_ID_SCHEMA_FILE="$STATE_DIR/devices/identity.version"
+        local STATE_SCHEMA_MANIFEST_FILE="$STATE_DIR/state_schema.manifest"
+        local SATA_LINK_HISTORY_FILE="$STATE_DIR/history/sata_links.tsv"
+        local NOTIFICATION_JOURNAL_FILE="$STATE_DIR/notifications/lifecycle.tsv"
+        local NOTIFICATION_RECOVERY_STATE_FILE="$STATE_DIR/notifications/recovery.tsv"
+        local IO_ERROR_HISTORY_FILE="$STATE_DIR/history/kernel_errors.tsv"
+        local BTRFS_DEV_HIST_FILE="$STATE_DIR/history/btrfs_errors.tsv"
+        local TBW_HISTORY_FILE="$STATE_DIR/history/host_writes.tsv"
+        local SMART_ATTR_HISTORY_FILE="$STATE_DIR/history/wear.tsv"
+        local TEMP_HISTORY_FILE="$STATE_DIR/history/temperatures.tsv"
+        local -a STATE_FILES_ALERT_RUNTIME=(
+    "$MONITOR_RECEIPT_FILE" "$SMART_COVERAGE_FILE" "$SMART_TEST_TRACKING_FILE" "$DOCKER_SCRUB_TRACKING_FILE" "$ENDURANCE_INVENTORY_FILE"
+    "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$ALERT_NEW_SEEN_FILE"   "$BTRFS_DEV_PREV_FILE" "$SYSLOG_CURSOR_STATE_FILE"   "$SATA_LINK_HISTORY_FILE" "$NOTIFICATION_JOURNAL_FILE" "$NOTIFICATION_RECOVERY_STATE_FILE"
+)
+        local -a STATE_FILES_TREND_HISTORY=(
+    "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE"  "$TBW_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$TEMP_HISTORY_FILE"
+)
+        mkdir -m 700 "$STATE_DIR" "$RUN_DIR"
+        printf 'format=health-monitoring-state\nstate_schema=2\nhistory_schema=3\nidentity_schema=2\nwriter_version=3.1.0\nupdated_epoch=1\n' > "$STATE_SCHEMA_MANIFEST_FILE"
+        printf '2\n' > "$STATE_DIR/device_identity_schema.version"
+        printf 'layout_schema=99
+' >> "$STATE_SCHEMA_MANIFEST_FILE"
+        printf retain > "$STATE_DIR/risk_prev.log"
+        ! ensure_state_layout && [[ "$(<"$STATE_DIR/risk_prev.log")" == retain && ! -d "$STATE_DIR/devices" ]]
+    ); then self_test_result 1 "Future layouts fail before relocating or deleting state"
+    else self_test_result 0 "Future layouts fail before relocating or deleting state"; fi
+
+    if (
+        local STATE_DIR="$fixture_dir/layout-retain" RUN_DIR="$fixture_dir/layout-retain-run"
+        local MONITOR_RECEIPT_FILE="$STATE_DIR/monitor_receipt.json"
+        local SMART_COVERAGE_FILE="$STATE_DIR/devices/smart_coverage.tsv"
+        local SMART_TEST_TRACKING_FILE="$STATE_DIR/devices/smart_test_schedule.json"
+        local DOCKER_SCRUB_TRACKING_FILE="$STATE_DIR/filesystems/docker_scrub.json"
+        local SMART_BASELINES_FILE="$STATE_DIR/devices/smart_baselines.json"
+        local ENDURANCE_INVENTORY_FILE="$STATE_DIR/devices/endurance.json"
+        local EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+        local STATE_BACKUP_DIR="$STATE_DIR/backups"
+        local SMART_LONG_STATE_FILE="$STATE_DIR/devices/smart_long_processed.log"
+        local SMART_LONG_LAST_POH_FILE="$STATE_DIR/devices/smart_long_last.log"
+        local SMART_LAST="$STATE_DIR/devices/smart_last_test.log"
+        local SMART_SELFTEST_DIR="$STATE_DIR/devices/selftests"
+        local NVME_STATE_FILE="$STATE_DIR/devices/legacy_nvme_counters.log"
+        local PREV_ATTR_FILE="$STATE_DIR/devices/legacy_smart_attributes.log"
+        local ALERT_NEW_SEEN_FILE="$STATE_DIR/notifications/seen.tsv"
+        local CMD_TIMEOUT_LAST_FILE="$STATE_DIR/devices/legacy_command_timeouts.log"
+        local CMD_TIMEOUT_STATE_DIR="$STATE_DIR/devices/cooldowns/command_timeouts"
+        local UNSAFE_SDWN_STATE_DIR="$STATE_DIR/devices/cooldowns/unsafe_shutdowns"
+        local BTRFS_SCRUB_STATE_DIR="$STATE_DIR/filesystems/scrubs"
+        local BTRFS_DEV_PREV_FILE="$STATE_DIR/filesystems/btrfs_counters.tsv"
+        local SYSLOG_CURSOR_STATE_FILE="$STATE_DIR/runtime/syslog_cursor.state"
+        local DEVICE_ID_MAP_FILE="$STATE_DIR/devices/identity.tsv"
+        local DEVICE_ID_SCHEMA_FILE="$STATE_DIR/devices/identity.version"
+        local STATE_SCHEMA_MANIFEST_FILE="$STATE_DIR/state_schema.manifest"
+        local SATA_LINK_HISTORY_FILE="$STATE_DIR/history/sata_links.tsv"
+        local NOTIFICATION_JOURNAL_FILE="$STATE_DIR/notifications/lifecycle.tsv"
+        local NOTIFICATION_RECOVERY_STATE_FILE="$STATE_DIR/notifications/recovery.tsv"
+        local IO_ERROR_HISTORY_FILE="$STATE_DIR/history/kernel_errors.tsv"
+        local BTRFS_DEV_HIST_FILE="$STATE_DIR/history/btrfs_errors.tsv"
+        local TBW_HISTORY_FILE="$STATE_DIR/history/host_writes.tsv"
+        local SMART_ATTR_HISTORY_FILE="$STATE_DIR/history/wear.tsv"
+        local TEMP_HISTORY_FILE="$STATE_DIR/history/temperatures.tsv"
+        local -a STATE_FILES_ALERT_RUNTIME=(
+    "$MONITOR_RECEIPT_FILE" "$SMART_COVERAGE_FILE" "$SMART_TEST_TRACKING_FILE" "$DOCKER_SCRUB_TRACKING_FILE" "$ENDURANCE_INVENTORY_FILE"
+    "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$ALERT_NEW_SEEN_FILE"   "$BTRFS_DEV_PREV_FILE" "$SYSLOG_CURSOR_STATE_FILE"   "$SATA_LINK_HISTORY_FILE" "$NOTIFICATION_JOURNAL_FILE" "$NOTIFICATION_RECOVERY_STATE_FILE"
+)
+        local -a STATE_FILES_TREND_HISTORY=(
+    "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE"  "$TBW_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$TEMP_HISTORY_FILE"
+)
+        mkdir -m 700 "$STATE_DIR" "$RUN_DIR"
+        printf 'format=health-monitoring-state\nstate_schema=2\nhistory_schema=3\nidentity_schema=2\nwriter_version=3.1.0\nupdated_epoch=1\n' > "$STATE_SCHEMA_MANIFEST_FILE"
+        printf '2\n' > "$STATE_DIR/device_identity_schema.version"
+        for label in one two three four; do create_state_backup "$label" 2 3 2 || exit 1; done
+        prune_state_backups && [[ "$(find "$STATE_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)" == 2 ]]
+    ); then self_test_result 1 "State migration and rollback backups retain only the latest two after a successful run"
+    else self_test_result 0 "State migration and rollback backups retain only the latest two after a successful run"; fi
+
+    if (
+        ! ata_host_counter_bytes '241 Total_LBAs_Written 0x0032 100 100 000 Old_age Always - 100' writes &&
+        [[ "$(ata_device_stat_value '0x07 0x008 1 012 N-- Percentage Used Endurance Indicator' 'Percentage Used Endurance Indicator')" == 12 ]] &&
+        apply_standard_ssd_wear /dev/sdz 008 ata_device_statistics_page7 OK &&
+        [[ "${CUR_ATTR['/dev/sdz|ssd_percent_used']}" == 8 ]]
+    ); then self_test_result 1 "Ambiguous LBA units are withheld and standardized numbers are decimal-normalized"
+    else self_test_result 0 "Ambiguous LBA units are withheld and standardized numbers are decimal-normalized"; fi
 
     if (( SELF_TEST_TOTAL != REGRESSION_FIXTURE_COUNT )); then
         SELF_TEST_FAILED=$((SELF_TEST_FAILED + 1))
