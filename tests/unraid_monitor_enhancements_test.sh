@@ -32,6 +32,12 @@ trap 'rm -rf -- "$tmp"' EXIT
 (
  source "$repo/user_script/host_health_watchdog.sh"
  STATE_DIR="$tmp/syslog"; mkdir -p "$STATE_DIR"
+ # Every derived path must stay inside this fixture, including the incident
+ # ledger now that real Unraid can have a mounted vault during native tests.
+ SYSLOG_INCIDENT_ROOT="$tmp/syslog-incidents";SYSLOG_VAULT_MOUNT="$tmp/nonexistent-mount"
+ CURSOR_FILE="$STATE_DIR/cursor";USAGE_ALERT_FILE="$STATE_DIR/usage_alerted"
+ XFS_INCIDENT_FILE="$STATE_DIR/xfs_faults.tsv";LOCK_FILE="$tmp/host-watchdog.lock"
+ HH_RAM_ROOT="$tmp/host-runtime";HH_MIRROR="$tmp/host-mirror.json"
  cat >"$tmp/syslog.input" <<'LINES'
 Nov 23 10:00:01 Hubble kernel: Out of memory: Killed process 1234 (kometa)
 Nov 23 10:00:02 Hubble kernel: Out of memory: Killed process 9876 (kometa)
