@@ -208,7 +208,7 @@ fi
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="3.2.1"
+readonly SCRIPT_VERSION="3.3.0"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -752,7 +752,9 @@ BTRFS_DEV_HIST_FILE="$STATE_DIR/history/btrfs_errors.tsv"     # Btrfs per-device
 TBW_HISTORY_FILE="$STATE_DIR/history/host_writes.tsv"                       # Total bytes written progression (wear modeling)
 SMART_ATTR_HISTORY_FILE="$STATE_DIR/history/wear.tsv"         # Attribute growth time-series (trend alerts)
 TEMP_HISTORY_FILE="$STATE_DIR/history/temperatures.tsv"                     # Temperature samples (rate & exposure)
+POOL_HEALTH_FILE="$STATE_DIR/filesystems/pool_health.json"
 STATE_FILES_ALERT_RUNTIME=(
+    "$POOL_HEALTH_FILE"
     "$MONITOR_RECEIPT_FILE" "$SMART_COVERAGE_FILE" "$SMART_TEST_TRACKING_FILE" "$DOCKER_SCRUB_TRACKING_FILE" "$ENDURANCE_INVENTORY_FILE"
     "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$ALERT_NEW_SEEN_FILE"   "$BTRFS_DEV_PREV_FILE" "$SYSLOG_CURSOR_STATE_FILE"   "$SATA_LINK_HISTORY_FILE" "$NOTIFICATION_JOURNAL_FILE" "$NOTIFICATION_RECOVERY_STATE_FILE"
 )
@@ -2434,7 +2436,8 @@ write_monitor_receipt() {
 initialize_runtime() {
     local state_file
 
-    ensure_dir "$LOG_DIR" || return 1
+    hm_storage_guard || return 1
+    ensure_dir "$LOG_DIR" || { hm_emergency false 'Disk monitor log directory could not be initialized.'; return 1; }
     ensure_private_dir "$STATE_DIR" || return 1
     # Inspect the root manifest before creating/rearranging structured state.
     # New child paths do not exist yet when migrating a legacy flat layout.
@@ -6340,6 +6343,7 @@ monitor_btrfs() {
         else
             log_btrfs "$m: recorded scrub date unavailable; freshness is unverified"
         fi
+        hm_pool_health "$m" "$status" "$fresh" || return 1
         corrected=$(awk '{for(i=1;i<NF;i++) if ($i=="Corrected:" || ($i=="corrected" && $(i+1)=="errors:")) {print $(i+($i=="Corrected:"?1:2)); exit}}' <<< "$status")
         uncorrectable=$(awk '{for(i=1;i<NF;i++) if ($i=="Uncorrectable:" || ($i=="unrecoverable" && $(i+1)=="errors:")) {print $(i+($i=="Uncorrectable:"?1:2)); exit}}' <<< "$status")
         [[ "$corrected" =~ ^[0-9]+$ ]] || corrected=0
@@ -7340,6 +7344,9 @@ finding_has_fresh_recovery_evidence() {
             ;;
         mount:*)
             case "$code" in
+                native_scrub_overdue) [[ -n "${FRESH_FILESYSTEM["native_scrub:${scope#mount:}"]:-}" ]] ;;
+                btrfs_pool_health) [[ -n "${FRESH_FILESYSTEM["pool:${scope#mount:}"]:-}" ]] ;;
+                mount_access) [[ -n "${FRESH_FILESYSTEM["mount:${scope#mount:}"]:-}" ]] ;;
                 docker_scrub_errors|docker_scrub_unverified)
                     [[ -n "${FRESH_FILESYSTEM["scrub:${scope#mount:}"]:-}" ]] ;;
                 btrfs_scrub_alert) [[ -n "${FRESH_FILESYSTEM["scrub:${scope#mount:}"]:-}" ]] ;;
@@ -9456,6 +9463,193 @@ run_notification_test() {
     fi
 }
 
+# BEGIN HOST HEALTH COMMON
+# shellcheck shell=bash
+# Shared read-only host/storage parsers. Embedded in standalone User Scripts.
+HH_TIMEZONE="${HH_TIMEZONE:-Asia/Singapore}"
+hh_mount_info() {
+    local mount="$1" value fs options
+    value=$(timeout --kill-after=1 4 findmnt -rn -M "$mount" -o FSTYPE,OPTIONS 9>&- 2>/dev/null) || value=''
+    read -r fs options <<< "$value"
+    if [[ -z "$fs" ]];then printf '{"mounted":false,"readOnly":false,"type":""}\n';return;fi
+    jq -nc --arg fs "$fs" --arg options "$options" '{mounted:true,type:$fs,readOnly:($options|split(",")|index("ro")!=null)}'
+}
+hh_array_state() {
+    awk -F= 'tolower($1)=="mdstate" {gsub(/[" \r]/,"",$2);print tolower($2);exit}' "${HH_VAR_INI:-/var/local/emhttp/var.ini}" 2>/dev/null
+}
+hh_expected_mounts() {
+    printf '/boot\n'
+    [[ "$(hh_array_state)" == started ]] || return 0
+    awk -F= '
+      function emit(){if(slot ~ /^[A-Za-z0-9_.-]+$/ && (type=="Data" || type=="Cache") && fs!="" && (device!="" || identity!="" || assigned!="" || status=="DISK_DSBL" || status=="DISK_MISSING"))print "/mnt/"slot}
+      /^\[/{emit();slot=$0;gsub(/[\[\]"\r]/,"",slot);type=fs=device=status=identity=assigned="";next}
+      {v=$2;gsub(/["\r]/,"",v)} $1=="type"{type=v} $1=="fsType"{fs=v} $1=="device"{device=v} $1=="status"{status=v} $1=="id"{identity=v} $1=="idSb"{assigned=v} END{emit()}
+    ' "${HH_DISKS_INI:-/var/local/emhttp/disks.ini}" 2>/dev/null
+    if grep -Eqi '^DOCKER_ENABLED="?(yes|true|1)"?$' "${HH_DOCKER_CFG:-/boot/config/docker.cfg}" 2>/dev/null;then printf '/var/lib/docker\n';fi
+}
+hh_btrfs_metrics() {
+    local usage="$1" show="${2:-}" parsed missing=false
+    grep -qiE 'Some devices missing|path[[:space:]]+missing' <<< "$show" && missing=true
+    parsed=$(awk '
+      function number(s){gsub(/[^0-9]/,"",s);return s+0}
+      /^ *Device size:/{size=number($3);gotSize=1}
+      /^ *Device unallocated:/{unallocated=number($3);gotUnallocated=1}
+      /^ *Device missing:/{missing=number($3);gotMissing=1}
+      /^ *Free \(estimated\):/{free=number($3);gotFree=1}
+      /^ *Global reserve:/{reserve=number($5)}
+      /^Metadata,/{split($2,a,":");split($3,b,":");meta+=number(a[2]);used+=number(b[2]);gotMeta=1}
+      END{printf "{\"valid\":%s,\"deviceBytes\":%.0f,\"unallocatedBytes\":%.0f,\"missingBytes\":%.0f,\"estimatedFreeBytes\":%.0f,\"metadataBytes\":%.0f,\"metadataUsedBytes\":%.0f,\"reserveUsedBytes\":%.0f}",
+        (gotSize&&gotUnallocated&&gotMissing&&gotFree&&gotMeta&&meta>0?"true":"false"),size,unallocated,missing,free,meta,used,reserve}
+    ' <<< "$usage") || return 1
+    jq -c --argjson absent "$missing" '.+{missingMembers:$absent,metadataPercent:(if .metadataBytes>0 then 100*.metadataUsedBytes/.metadataBytes else null end)} |
+      .+{severity:(if (.missingBytes>0 or .missingMembers) then "critical"
+         elif .valid!=true then "unknown"
+         elif (.metadataPercent>=95 and .unallocatedBytes<([1073741824,2*.metadataBytes]|max)) then
+           (if .metadataPercent>=99 and .reserveUsedBytes>0 then "critical" else "warning" end)
+         else "ok" end)}' <<< "$parsed"
+}
+# A cron deadline is computed from the actual native schedule, using local time.
+# Supports lists, ranges, steps, Sunday 0/7 and standard DOM/DOW OR semantics.
+hh_cron_last_due() {
+    local expression="$1" now="$2"
+    php /dev/stdin "$expression" "$now" "$HH_TIMEZONE" <<'PHP'
+<?php
+function field($s,$min,$max,$dow=false){$out=[];foreach(explode(',',$s)as$p){$parts=explode('/',$p);if(count($parts)>2)return null;$step=$parts[1]??'1';if(!ctype_digit($step)||intval($step)<1)return null;$base=$parts[0];
+if($base==='*'){ $a=$min;$b=$max; }elseif(preg_match('/^(\d+)-(\d+)$/',$base,$m)){ $a=intval($m[1]);$b=intval($m[2]); }elseif(ctype_digit($base)){ $a=intval($base);$b=count($parts)>1?$max:$a; }else return null;
+if($a<$min||$b>$max||$a>$b)return null;for($i=$a;$i<=$b;$i+=intval($step))$out[$dow&&$i===7?0:$i]=true;}return $out;}
+$e=preg_split('/\s+/',trim($argv[1]));$now=intval($argv[2]);try{$tz=new DateTimeZone($argv[3]);}catch(Throwable $x){echo '{"valid":false}';exit;}
+if(count($e)!==5){echo '{"valid":false}';exit;}$bounds=[[0,59],[0,23],[1,31],[1,12],[0,7]];$f=[];foreach($e as$i=>$s){$v=field($s,$bounds[$i][0],$bounds[$i][1],$i===4);if($v===null){echo '{"valid":false}';exit;}$f[]=$v;}
+$base=(new DateTimeImmutable('@'.$now))->setTimezone($tz)->setTime(0,0);$hours=array_keys($f[1]);$minutes=array_keys($f[0]);rsort($hours);rsort($minutes);
+for($d=0;$d<=400;$d++){$day=$base->modify('-'.$d.' days');if(!isset($f[3][intval($day->format('n'))]))continue;
+$dom=isset($f[2][intval($day->format('j'))]);$dow=isset($f[4][intval($day->format('w'))]);$domStar=str_starts_with($e[2],'*');$dowStar=str_starts_with($e[4],'*');
+$match=$domStar&&$dowStar?($dom&&$dow):($domStar?$dow:($dowStar?$dom:($dom||$dow)));if(!$match)continue;
+foreach($hours as$h)foreach($minutes as$m){$t=$day->setTime($h,$m)->getTimestamp();if($t<=$now){echo json_encode(['valid'=>true,'dueEpoch'=>$t,'dueLocal'=>$day->setTime($h,$m)->format('Y-m-d H:i:s T')]);exit;}}}
+echo '{"valid":true,"dueEpoch":0}';
+PHP
+}
+hh_fast_receipt_owns() {
+    local id="$1" now="$2" file="${HH_FAST_RECEIPT:-/run/syslog-host-health.json}" boot
+    [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file" 2>/dev/null) == "$EUID" && $(stat -c %h "$file" 2>/dev/null) == 1 ]] || return 1
+    boot=$(cat /proc/sys/kernel/random/boot_id)
+    jq -e --arg id "$id" --arg boot "$boot" --argjson now "$now" '.schema==1 and .status=="COMPLETE" and .bootId==$boot and .observedAt<=$now+60 and .observedAt>=$now-900 and any(.observations[]; .id==$id and (.severity|IN("ok","warning","critical")))' "$file" >/dev/null 2>&1
+}
+# END HOST HEALTH COMMON
+
+# BEGIN DISK HOST HEALTH
+# shellcheck shell=bash
+# shellcheck disable=SC2034 # Shared collector freshness map is consumed by lifecycle code.
+# Daily state bootstrap: fail before configuration migration or state creation
+# when the persistent pool is absent/read-only. Emergency evidence stays in RAM.
+hm_emergency() {
+    local healthy="$1" detail="$2" root="${HM_RAM_ROOT:-/run}" value tmp old=0 now boot
+    now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id)
+    [[ -d "$root" && ! -L "$root/health-monitor-emergency.json" ]] || return 1
+    value=$(jq -nc --argjson healthy "$healthy" --arg detail "$detail" --arg boot "$boot" --argjson now "$now" '{schema:1,bootId:$boot,observedAt:$now,healthy:$healthy,detail:$detail}') || return 1
+    tmp=$(mktemp "$root/.health-state.XXXXXX") || return 1
+    printf '%s\n' "$value" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$root/health-monitor-emergency.json" || { rm -f "$tmp";return 1; }
+    if [[ "$healthy" == false ]] && ! hh_fast_receipt_owns mount:/mnt/vault "$now" && [[ "$(hh_array_state)" == started ]];then
+        [[ ! -f "$root/health-state-alert.epoch" || -L "$root/health-state-alert.epoch" ]] || read -r old < "$root/health-state-alert.epoch"
+        [[ "$old" =~ ^[0-9]+$ ]] || old=0
+        if ((now-old>=86400)) && [[ -x /usr/local/emhttp/webGui/scripts/notify ]];then
+            if timeout --kill-after=5 30 /usr/local/emhttp/webGui/scripts/notify -i alert -s 'Unraid disk health' -d 'Persistent health state unavailable' -m "Status: ATTENTION
+Summary: Daily disk monitoring deferred
+
+Actions and findings:
+$detail
+No persistent state, migration or disk maintenance was performed. RAM emergency evidence was recorded; restore the vault mount before retrying.";then
+                tmp=$(mktemp "$root/.health-alert.XXXXXX") || return 1
+                printf '%s\n' "$now" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$root/health-state-alert.epoch" || return 1
+            fi
+        fi
+    fi
+}
+hm_storage_guard() {
+    local info type probe
+    info=$(hh_mount_info /mnt/vault) || return 1;type=$(jq -r '.type' <<< "$info")
+    if [[ "$type" =~ ^(btrfs|xfs|zfs)$ ]] && jq -e '.mounted and (.readOnly|not)' <<< "$info" >/dev/null;then
+        # Existing parent permissions and symlinks are checked by the normal state
+        # validator. No directory is created to test a missing pool.
+        probe=$(mktemp /mnt/vault/.health-state-probe.XXXXXX) || {
+            hm_emergency false 'Mounted vault rejected a write probe; persistent monitoring state was not initialized.' || true
+            return 1
+        }
+        if ! printf 'health-state-write-probe\n' > "$probe" || ! rm -f -- "$probe";then
+            rm -f -- "$probe" 2>/dev/null || true
+            hm_emergency false 'Mounted vault write/delete probe failed; persistent state was left untouched.' || true
+            return 1
+        fi
+        hm_emergency true 'Vault is mounted read-write and accepted a write/delete probe; disk monitoring may initialize.' || return 1
+        return 0
+    fi
+    hm_emergency false "Vault state access deferred: $info. Existing state was left untouched." || true
+    printf '%s\n' 'Disk health deferred: vault must be mounted read-write; persistent state was not initialized.' >&2
+    return 1
+}
+hm_pool_health() {
+    local mount="$1" status="$2" fresh="$3" now="${RUN_EPOCH:-$(date +%s)}" usage show metrics severity
+    local cron_file expression due due_epoch start epoch=0 clean=false grace=259200 entry file tmp existing schedule_status=disabled
+    file="$POOL_HEALTH_FILE"
+    usage=$(timeout --kill-after=1 8 btrfs filesystem usage -b "$mount" 9>&- 2>/dev/null) || usage=''
+    show=$(timeout --kill-after=1 8 btrfs filesystem show "$mount" 9>&- 2>/dev/null) || show=''
+    metrics=$(hh_btrfs_metrics "$usage" "$show") || return 1
+    severity=$(jq -r '.severity' <<< "$metrics")
+    if [[ "$severity" == ok ]];then FRESH_FILESYSTEM["pool:$mount"]=1;fi
+    if ! hh_fast_receipt_owns "btrfs:$mount" "$now";then
+        case "$severity" in warning|critical)
+            record_finding "$severity" filesystem filesystem.btrfs '' 'Btrfs allocation or redundancy requires attention' "$mount: $metrics" 'Check pool capacity and device availability; no balance or repair was started.' btrfs_pool_health "mount:$mount";;
+            unknown) record_collector_event FAILED "Btrfs pool $mount" 'Allocation/redundancy evidence unavailable';;
+        esac
+    fi
+    # Native per-pool schedule only. Docker loop scrub retains its existing owner.
+    cron_file="${HH_SCRUB_CRON_ROOT:-/boot/config/plugins/dynamix}/scrub_${mount##*/}.cron"
+    expression='';due='{"valid":true,"dueEpoch":0}'
+    if [[ "$mount" == /mnt/* && -r "$cron_file" ]];then
+        expression=$(awk -v target="$mount" '!/^#/ && NF>=8 {found=0;for(i=6;i<=NF;i++)if($i==target)found=1;if(found)print $1" "$2" "$3" "$4" "$5}' "$cron_file")
+        if [[ -n "$expression" ]];then
+            due=$(hh_cron_last_due "$expression" "$now") || due='{"valid":false}'
+            schedule_status=scheduled
+            if ! jq -e '.valid and .dueEpoch>0' <<< "$due" >/dev/null;then
+                schedule_status=unverified
+                record_collector_event FAILED "Native scrub schedule $mount" 'Enabled native cron could not be interpreted; no schedule or scrub was changed'
+            fi
+        fi
+    fi
+    start=$(sed -nE 's/^[[:space:]]*Scrub started:[[:space:]]*//p;s/.*scrub started at[[:space:]]*//p' <<< "$status" | head -n1)
+    if [[ -n "$start" ]];then epoch=$(date -d "$start" +%s 2>/dev/null) || epoch=0;fi
+    [[ "$epoch" =~ ^[0-9]+$ ]] || epoch=0
+    if grep -qiE 'Status:[[:space:]]+finished|scrub finished' <<< "$status" && grep -qi 'no errors found' <<< "$status" && ! grep -qiE '(Corrected|Uncorrectable):[[:space:]]*[1-9]' <<< "$status" && ((epoch>0 && epoch<=now));then clean=true;fi
+    due_epoch=$(jq -r '.dueEpoch//0' <<< "$due")
+    if [[ "$schedule_status" == scheduled ]] && ((now>due_epoch+grace));then
+        if [[ "$clean" == true ]] && ((epoch>=due_epoch-300));then
+            FRESH_FILESYSTEM["native_scrub:$mount"]=1
+        else
+            record_finding warning monitoring monitoring.scrub '' 'Native pool scrub completion overdue' "$mount: due=$(jq -r '.dueLocal' <<< "$due"); grace=72h; latest recorded start=$start; clean=$clean; live status=$fresh." 'Review the native scrub history and schedule. This monitor does not start or abort pool scrubs.' native_scrub_overdue "mount:$mount"
+        fi
+    elif [[ "$schedule_status" == scheduled && "$clean" == true ]] && ((epoch>=due_epoch-300));then FRESH_FILESYSTEM["native_scrub:$mount"]=1;fi
+    log BTRFS INFO "$mount: schedule=$schedule_status; last due=$(jq -r '.dueLocal//"not applicable"' <<< "$due"); clean=$clean; start epoch=$epoch; grace=72h; allocation=$metrics"
+    entry=$(jq -nc --arg mount "$mount" --argjson at "$now" --argjson metrics "$metrics" --argjson due "$due" --argjson start "$epoch" --argjson clean "$clean" --arg schedule "$schedule_status" --argjson live "$fresh" '{mount:$mount,observedAt:$at,allocation:$metrics,nativeSchedule:$schedule,deadline:$due,lastRecordedStart:$start,recordedClean:$clean,liveStatus:($live==1)}') || return 1
+    existing='{"schema":1,"pools":{}}'
+    if [[ -s "$file" ]];then
+        [[ ! -L "$file" ]] && jq -e '.schema==1 and (.pools|type)=="object"' "$file" >/dev/null || return 1
+        existing=$(cat "$file")
+    fi
+    tmp=$(state_temp_file "$file") || return 1
+    jq -c --arg mount "$mount" --argjson entry "$entry" '.pools[$mount]=$entry' <<< "$existing" > "$tmp" && collector_atomic_commit "$tmp" "$file"
+}
+hm_mount_fallback() {
+    local mount info now="$RUN_EPOCH" severity=critical
+    while IFS= read -r mount;do
+        hh_fast_receipt_owns "mount:$mount" "$now" && continue
+        info=$(hh_mount_info "$mount")
+        if jq -e '.mounted and (.readOnly|not)' <<< "$info" >/dev/null;then
+            FRESH_FILESYSTEM["mount:$mount"]=1
+        else
+            record_finding "$severity" storage storage.availability '' 'Required mount unavailable or read-only' "$mount: $info; fast-owner evidence unavailable." 'Review native Unraid mount status before repair; no automatic remount was attempted.' mount_access "mount:$mount"
+        fi
+    done < <(hh_expected_mounts | sort -u)
+}
+# END DISK HOST HEALTH
+
 main() {
     local exit_code previous_complete
 
@@ -9492,6 +9686,7 @@ main() {
             return $?
             ;;
         rollback-state)
+            hm_storage_guard || return 1
             validate_runtime_dependencies state-admin || return 1
             acquire_lock || return 1
             rollback_state_backup "$ROLLBACK_BACKUP_ID"
@@ -9533,7 +9728,7 @@ main() {
     trap 'handle_signal INT' INT
     trap 'handle_signal TERM' TERM
 
-    initialize_runtime || return 1
+    initialize_runtime || { hm_emergency false 'Disk monitor state initialization failed; existing state retained for review.'; return 1; }
     # shellcheck disable=SC2031
     previous_complete=$(sed -nE 's/.*"lastCompleteEpoch":([0-9]{1,12}),.*/\1/p' "$MONITOR_RECEIPT_FILE")
     # shellcheck disable=SC2031
@@ -9561,6 +9756,7 @@ main() {
 
     log "CAPACITY" "INFO" "Collecting array, pool, and disk utilization"
     run_collector capacity "Capacity and parity" collect_capacity_phase
+    collector_step "Required mount access fallback" hm_mount_fallback
 
     log "BTRFS" "INFO" "Collecting non-destructive device statistics"
     run_collector btrfs_devices "Btrfs device counters" collector_step "Btrfs device counters" collect_btrfs_device_stats
@@ -9617,6 +9813,10 @@ main() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "${1:-}" in
+        --help|-h|--version|--diagnostics|--self-test|--check-config|--state-status|--state-backups|--test-notification) ;;
+        *) hm_storage_guard || exit 1 ;;
+    esac
     if harden_existing_external_config_path; then
         load_external_configuration || true
     else

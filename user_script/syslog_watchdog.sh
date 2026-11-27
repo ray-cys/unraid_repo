@@ -12,8 +12,12 @@ clearLog=true
 # Monitor new Unraid syslog entries for configured error keywords and notify
 # only when new, non-ignored matching entries are detected.
 #
-# The script also monitors /var/log filesystem utilization and sends a separate
-# alert if log usage becomes critically high.
+# The existing five-minute invocation also owns required mounts, root/boot/Docker
+# capacity, available memory, trusted CPU limits, SSD-pool Btrfs pressure and LAN
+# degradation. It groups condition transitions, recovery and daily reminders with
+# new syslog findings. Unknown evidence cannot resolve an incident. No repair or
+# restart is performed. Native disk tests and scrub freshness remain daily owners.
+# Host state is RAM-first, mirrored hourly/on pending alerts when vault is writable.
 #
 #
 # WORKFLOW
@@ -250,7 +254,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
-readonly SCRIPT_VERSION="1.6.0"
+readonly SCRIPT_VERSION="1.7.0"
 
 
 ###############################################################################
@@ -455,6 +459,12 @@ notify_unraid() {
     local description="$2"
     local message="$3"
 
+    local host_attached=0
+    if [[ "${HH_PREPARED:-0}" == 1 && -n "${HH_PENDING_BODY:-}" ]];then
+        message+=$'\n\nHost conditions:\n'"$HH_PENDING_BODY"
+        host_attached=1
+        case "$HH_PENDING_IMPORTANCE" in alert) importance=alert;; warning) [[ "$importance" == alert ]] || importance=warning;;esac
+    fi
     if [ ! -x "$NOTIFY_BIN" ]; then
         log "NOTIFY" "ERROR" \
             "Unraid notification helper unavailable: $NOTIFY_BIN"
@@ -475,6 +485,7 @@ notify_unraid() {
         return 1
     fi
 
+    if ((host_attached));then hh_delivered || return 1;fi
     return 0
 }
 
@@ -1266,6 +1277,299 @@ check_log_usage() {
 # MAIN
 ###############################################################################
 
+# BEGIN HOST HEALTH COMMON
+# shellcheck shell=bash
+# Shared read-only host/storage parsers. Embedded in standalone User Scripts.
+HH_TIMEZONE="${HH_TIMEZONE:-Asia/Singapore}"
+hh_mount_info() {
+    local mount="$1" value fs options
+    value=$(timeout --kill-after=1 4 findmnt -rn -M "$mount" -o FSTYPE,OPTIONS 9>&- 2>/dev/null) || value=''
+    read -r fs options <<< "$value"
+    if [[ -z "$fs" ]];then printf '{"mounted":false,"readOnly":false,"type":""}\n';return;fi
+    jq -nc --arg fs "$fs" --arg options "$options" '{mounted:true,type:$fs,readOnly:($options|split(",")|index("ro")!=null)}'
+}
+hh_array_state() {
+    awk -F= 'tolower($1)=="mdstate" {gsub(/[" \r]/,"",$2);print tolower($2);exit}' "${HH_VAR_INI:-/var/local/emhttp/var.ini}" 2>/dev/null
+}
+hh_expected_mounts() {
+    printf '/boot\n'
+    [[ "$(hh_array_state)" == started ]] || return 0
+    awk -F= '
+      function emit(){if(slot ~ /^[A-Za-z0-9_.-]+$/ && (type=="Data" || type=="Cache") && fs!="" && (device!="" || identity!="" || assigned!="" || status=="DISK_DSBL" || status=="DISK_MISSING"))print "/mnt/"slot}
+      /^\[/{emit();slot=$0;gsub(/[\[\]"\r]/,"",slot);type=fs=device=status=identity=assigned="";next}
+      {v=$2;gsub(/["\r]/,"",v)} $1=="type"{type=v} $1=="fsType"{fs=v} $1=="device"{device=v} $1=="status"{status=v} $1=="id"{identity=v} $1=="idSb"{assigned=v} END{emit()}
+    ' "${HH_DISKS_INI:-/var/local/emhttp/disks.ini}" 2>/dev/null
+    if grep -Eqi '^DOCKER_ENABLED="?(yes|true|1)"?$' "${HH_DOCKER_CFG:-/boot/config/docker.cfg}" 2>/dev/null;then printf '/var/lib/docker\n';fi
+}
+hh_btrfs_metrics() {
+    local usage="$1" show="${2:-}" parsed missing=false
+    grep -qiE 'Some devices missing|path[[:space:]]+missing' <<< "$show" && missing=true
+    parsed=$(awk '
+      function number(s){gsub(/[^0-9]/,"",s);return s+0}
+      /^ *Device size:/{size=number($3);gotSize=1}
+      /^ *Device unallocated:/{unallocated=number($3);gotUnallocated=1}
+      /^ *Device missing:/{missing=number($3);gotMissing=1}
+      /^ *Free \(estimated\):/{free=number($3);gotFree=1}
+      /^ *Global reserve:/{reserve=number($5)}
+      /^Metadata,/{split($2,a,":");split($3,b,":");meta+=number(a[2]);used+=number(b[2]);gotMeta=1}
+      END{printf "{\"valid\":%s,\"deviceBytes\":%.0f,\"unallocatedBytes\":%.0f,\"missingBytes\":%.0f,\"estimatedFreeBytes\":%.0f,\"metadataBytes\":%.0f,\"metadataUsedBytes\":%.0f,\"reserveUsedBytes\":%.0f}",
+        (gotSize&&gotUnallocated&&gotMissing&&gotFree&&gotMeta&&meta>0?"true":"false"),size,unallocated,missing,free,meta,used,reserve}
+    ' <<< "$usage") || return 1
+    jq -c --argjson absent "$missing" '.+{missingMembers:$absent,metadataPercent:(if .metadataBytes>0 then 100*.metadataUsedBytes/.metadataBytes else null end)} |
+      .+{severity:(if (.missingBytes>0 or .missingMembers) then "critical"
+         elif .valid!=true then "unknown"
+         elif (.metadataPercent>=95 and .unallocatedBytes<([1073741824,2*.metadataBytes]|max)) then
+           (if .metadataPercent>=99 and .reserveUsedBytes>0 then "critical" else "warning" end)
+         else "ok" end)}' <<< "$parsed"
+}
+# A cron deadline is computed from the actual native schedule, using local time.
+# Supports lists, ranges, steps, Sunday 0/7 and standard DOM/DOW OR semantics.
+hh_cron_last_due() {
+    local expression="$1" now="$2"
+    php /dev/stdin "$expression" "$now" "$HH_TIMEZONE" <<'PHP'
+<?php
+function field($s,$min,$max,$dow=false){$out=[];foreach(explode(',',$s)as$p){$parts=explode('/',$p);if(count($parts)>2)return null;$step=$parts[1]??'1';if(!ctype_digit($step)||intval($step)<1)return null;$base=$parts[0];
+if($base==='*'){ $a=$min;$b=$max; }elseif(preg_match('/^(\d+)-(\d+)$/',$base,$m)){ $a=intval($m[1]);$b=intval($m[2]); }elseif(ctype_digit($base)){ $a=intval($base);$b=count($parts)>1?$max:$a; }else return null;
+if($a<$min||$b>$max||$a>$b)return null;for($i=$a;$i<=$b;$i+=intval($step))$out[$dow&&$i===7?0:$i]=true;}return $out;}
+$e=preg_split('/\s+/',trim($argv[1]));$now=intval($argv[2]);try{$tz=new DateTimeZone($argv[3]);}catch(Throwable $x){echo '{"valid":false}';exit;}
+if(count($e)!==5){echo '{"valid":false}';exit;}$bounds=[[0,59],[0,23],[1,31],[1,12],[0,7]];$f=[];foreach($e as$i=>$s){$v=field($s,$bounds[$i][0],$bounds[$i][1],$i===4);if($v===null){echo '{"valid":false}';exit;}$f[]=$v;}
+$base=(new DateTimeImmutable('@'.$now))->setTimezone($tz)->setTime(0,0);$hours=array_keys($f[1]);$minutes=array_keys($f[0]);rsort($hours);rsort($minutes);
+for($d=0;$d<=400;$d++){$day=$base->modify('-'.$d.' days');if(!isset($f[3][intval($day->format('n'))]))continue;
+$dom=isset($f[2][intval($day->format('j'))]);$dow=isset($f[4][intval($day->format('w'))]);$domStar=str_starts_with($e[2],'*');$dowStar=str_starts_with($e[4],'*');
+$match=$domStar&&$dowStar?($dom&&$dow):($domStar?$dow:($dowStar?$dom:($dom||$dow)));if(!$match)continue;
+foreach($hours as$h)foreach($minutes as$m){$t=$day->setTime($h,$m)->getTimestamp();if($t<=$now){echo json_encode(['valid'=>true,'dueEpoch'=>$t,'dueLocal'=>$day->setTime($h,$m)->format('Y-m-d H:i:s T')]);exit;}}}
+echo '{"valid":true,"dueEpoch":0}';
+PHP
+}
+hh_fast_receipt_owns() {
+    local id="$1" now="$2" file="${HH_FAST_RECEIPT:-/run/syslog-host-health.json}" boot
+    [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file" 2>/dev/null) == "$EUID" && $(stat -c %h "$file" 2>/dev/null) == 1 ]] || return 1
+    boot=$(cat /proc/sys/kernel/random/boot_id)
+    jq -e --arg id "$id" --arg boot "$boot" --argjson now "$now" '.schema==1 and .status=="COMPLETE" and .bootId==$boot and .observedAt<=$now+60 and .observedAt>=$now-900 and any(.observations[]; .id==$id and (.severity|IN("ok","warning","critical")))' "$file" >/dev/null 2>&1
+}
+# END HOST HEALTH COMMON
+
+# BEGIN HOST HEALTH PROBES
+# shellcheck shell=bash
+# Fast host checks: read-only, every existing watchdog invocation. No disk tests,
+# network restarts, balancing, filesystem repair, or application changes.
+# Warning conditions require three samples; recoveries require two good samples.
+# Unknown/unsupported results never clear a known incident. Delivery is journaled.
+HH_RAM_ROOT="${HH_RAM_ROOT:-/run}"
+HH_PROC_ROOT="${HH_PROC_ROOT:-/proc}"
+HH_SYS_ROOT="${HH_SYS_ROOT:-/sys}"
+HH_MIRROR="${HH_MIRROR:-/mnt/vault/cloud/logs/script/syslog_watchdog/host-health.json}"
+HH_PENDING_BODY='' HH_PENDING_IMPORTANCE=normal HH_PREPARED=0 HH_DIRTY=0
+hh_atomic() {
+    local target="$1" value="$2" temp
+    [[ -d "${target%/*}" && ! -L "$target" ]] || return 1
+    if [[ -e "$target" ]];then [[ -f "$target" && $(stat -c %u "$target") == "$EUID" && $(stat -c %h "$target") == 1 ]] || return 1;fi
+    temp=$(mktemp "${target%/*}/.host-health.XXXXXX") || return 1
+    if printf '%s\n' "$value" > "$temp" && chmod 600 "$temp" && mv -f -- "$temp" "$target";then return 0;fi
+    rm -f -- "$temp";return 1
+}
+hh_observe() {
+    local id="$1" severity="$2" title="$3" detail="$4" confirmations="${5:-3}"
+    HH_OBSERVATIONS=$(jq -c --arg id "$id" --arg severity "$severity" --arg title "$title" --arg detail "$detail" --argjson confirmations "$confirmations" '.+[{id:$id,severity:$severity,title:$title,detail:$detail,confirmations:$confirmations}]' <<< "$HH_OBSERVATIONS")
+}
+hh_usage() {
+    local path="$1" numbers total avail inode_total inode_free used severity=ok
+    numbers=$(timeout --kill-after=1 4 stat -f -c '%b %a %c %d' "$path" 9>&- 2>/dev/null) || { hh_observe "space:$path" unknown "Capacity $path" 'Filesystem capacity could not be read';return; }
+    read -r total avail inode_total inode_free <<< "$numbers"
+    [[ "$total" =~ ^[0-9]+$ && "$avail" =~ ^[0-9]+$ && "$total" -gt 0 ]] || return
+    used=$((100*(total-avail)/total));((used>=90)) && severity=warning;((used>=97)) && severity=critical
+    # Capacity hysteresis: do not clear a previous finding until below 85%.
+    if ((used>=85 && used<90)) && jq -e --arg id "space:$path" '.conditions[$id].active==true' <<< "$HH_STATE" >/dev/null;then severity=warning;fi
+    hh_observe "space:$path" "$severity" "Capacity $path" "Used ${used}%; warning 90%, critical 97%, recovery below 85%." 2
+    if [[ "$inode_total" =~ ^[0-9]+$ && "$inode_total" -gt 0 && "$inode_free" =~ ^[0-9]+$ ]];then
+        used=$((100*(inode_total-inode_free)/inode_total));severity=ok
+        ((used>=90)) && severity=warning;((used>=97)) && severity=critical
+        hh_observe "inodes:$path" "$severity" "Inodes $path" "Allocated inode use ${used}%." 3
+    fi
+}
+hh_cpu() {
+    local sensor name input label current maximum critical severity id previous found=0
+    for sensor in "$HH_SYS_ROOT"/class/hwmon/hwmon*;do
+        [[ -r "$sensor/name" ]] || continue;read -r name < "$sensor/name"
+        case "$name" in coretemp|k10temp|zenpower) ;; *) continue;;esac
+        for input in "$sensor"/temp*_input;do
+            [[ -r "$input" ]] || continue;label=$(cat "${input%_input}_label" 2>/dev/null)
+            case "$label" in 'Package id '*|Tctl|Tdie) ;; *) continue;;esac
+            current=$(cat "$input");maximum=$(cat "${input%_input}_max" 2>/dev/null);critical=$(cat "${input%_input}_crit" 2>/dev/null)
+            [[ "$current" =~ ^[0-9]+$ && "$maximum" =~ ^[0-9]+$ && "$critical" =~ ^[0-9]+$ ]] || continue
+            ((maximum>0 && critical>=maximum && current<200000)) || continue
+            id="cpu:$name:$label";found=1;severity=ok
+            ((current>=maximum)) && severity=warning;((current>=critical)) && severity=critical
+            previous=$(jq -r --arg id "$id" '.conditions[$id].active//false' <<< "$HH_STATE")
+            if [[ "$severity" == ok && "$previous" == true ]] && ((current>maximum-5000));then severity=warning;fi
+            hh_observe "$id" "$severity" 'CPU temperature' "$label $((current/1000))C; driver limit $((maximum/1000))C, critical $((critical/1000))C." 1
+        done
+    done
+    ((found)) || hh_observe cpu:coverage unsupported 'CPU temperature coverage' 'No trusted package sensor with firmware limits; no guessed limit applied.'
+}
+hh_network() {
+    local iface base carrier speed supported max_speed expected mac old previous_at delta_e delta_p errors packets severity detail flags
+    # Only physical interfaces participating in an active default-route bridge,
+    # bond or direct route. Excludes Docker/veth/Tailscale and unused adapters.
+    local route interfaces=''
+    route=$(ip -o route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev")print $(i+1)}' | sort -u)
+    for iface in $route;do
+        if [[ -d "$HH_SYS_ROOT/class/net/$iface/device" ]];then interfaces+="$iface ";fi
+        for base in "$HH_SYS_ROOT/class/net/$iface/brif/"* "$HH_SYS_ROOT/class/net/$iface/lower_"*;do
+            [[ -e "$base" ]] || continue
+            local member;member=${base##*/};member=${member#lower_}
+            if [[ -d "$HH_SYS_ROOT/class/net/$member/device" ]];then interfaces+="$member ";fi
+            if [[ -r "$HH_SYS_ROOT/class/net/$member/bonding/slaves" ]];then interfaces+="$(cat "$HH_SYS_ROOT/class/net/$member/bonding/slaves") ";fi
+        done
+        [[ ! -r "$HH_SYS_ROOT/class/net/$iface/bonding/slaves" ]] || interfaces+="$(cat "$HH_SYS_ROOT/class/net/$iface/bonding/slaves") "
+    done
+    for iface in $(tr ' ' '\n' <<< "$interfaces" | sort -u);do
+        base="$HH_SYS_ROOT/class/net/$iface";[[ -d "$base/device" ]] || continue
+        flags=$(cat "$base/flags" 2>/dev/null);[[ "$flags" =~ ^0x[0-9a-fA-F]+$ ]] || continue
+        (( (flags&1)==1 )) || continue
+        carrier=$(cat "$base/carrier" 2>/dev/null);speed=$(cat "$base/speed" 2>/dev/null);mac=$(cat "$base/address")
+        old=$(jq -c --arg id "$iface:$mac" '.baselines.network[$id]//{}' <<< "$HH_STATE")
+        previous_at=$(jq -r '.at//0' <<< "$old");max_speed=$(jq -r '.maxSpeed//0' <<< "$old")
+        [[ "$speed" =~ ^[0-9]+$ ]] || speed=0
+        supported=$(timeout --kill-after=1 3 ethtool "$iface" 9>&- 2>/dev/null | sed -n '/Supported link modes:/,/Supported pause frame use:/p' | grep -oE '[0-9]+base' | sed 's/base//' | sort -nr | head -n1) || supported=''
+        if [[ "$supported" =~ ^[0-9]+$ ]];then expected=$((supported<2500?supported:2500));else expected=$max_speed;fi
+        severity=ok;detail="Link ${speed}Mb/s; expected at least ${expected}Mb/s."
+        if [[ "$carrier" == 0 ]];then severity=critical;detail='Active LAN carrier is down.'
+        elif [[ "$carrier" != 1 ]];then severity=unknown
+        elif ((expected>0 && speed<expected));then severity=warning;fi
+        hh_observe "network:link:$iface:$mac" "$severity" "LAN link $iface" "$detail" 2
+        errors=0;packets=0
+        local metric value valid=true
+        for metric in rx_errors tx_errors rx_packets tx_packets;do
+            value=$(cat "$base/statistics/$metric" 2>/dev/null)
+            [[ "$value" =~ ^[0-9]+$ ]] || { valid=false;break; }
+            case "$metric" in *_errors) errors=$((errors+value));; *) packets=$((packets+value));;esac
+        done
+        severity=unknown;detail='New baseline or sampling gap; lifetime counters are not treated as current errors.'
+        if [[ "$valid" == true ]] && ((previous_at>0 && HH_NOW>previous_at && HH_NOW-previous_at<=1200));then
+            delta_e=$((errors-$(jq -r '.errors//0' <<< "$old")));delta_p=$((packets-$(jq -r '.packets//0' <<< "$old")))
+            if ((delta_e>=0 && delta_p>=0));then
+                severity=ok;((delta_e>=5 && delta_e*1000>=delta_p)) && severity=warning
+                detail="New RX/TX errors=$delta_e; packets=$delta_p since previous sample. Drops alone are excluded."
+            fi
+        fi
+        hh_observe "network:errors:$iface:$mac" "$severity" "LAN errors $iface" "$detail" 3
+        if [[ "$valid" == true ]];then
+            ((speed>max_speed)) && max_speed=$speed
+            HH_STATE=$(jq -c --arg id "$iface:$mac" --argjson at "$HH_NOW" --argjson errors "$errors" --argjson packets "$packets" --argjson speed "$max_speed" '.baselines.network[$id]={at:$at,errors:$errors,packets:$packets,maxSpeed:$speed}' <<< "$HH_STATE")
+        fi
+    done
+}
+hh_collect() {
+    local path info severity type uptime available total percent emergency metrics usage show uuid member rotational all_ssd
+    HH_OBSERVATIONS='[]';uptime=${HH_UPTIME:-$(cut -d. -f1 "$HH_PROC_ROOT/uptime")}
+    local array_state
+    array_state=$(hh_array_state)
+    case "$array_state" in
+      started|stopped|stopping|starting) hh_observe monitor:mount-inventory ok 'Native mount inventory' "Unraid array state=$array_state; stopped storage is intentionally excluded.";; *)
+        hh_observe monitor:mount-inventory warning 'Native mount inventory unavailable' 'Unraid array state could not be read; assigned mount coverage is unverified.' 3;;esac
+    while IFS= read -r path;do
+        info=$(hh_mount_info "$path");severity=ok
+        if [[ $(jq -r '.mounted' <<< "$info") != true ]];then
+            severity=critical;((uptime<600)) && severity=unknown
+        elif [[ $(jq -r '.readOnly' <<< "$info") == true ]];then severity=critical;fi
+        hh_observe "mount:$path" "$severity" "Required mount $path" "Mount evidence: $info. No repair or remount attempted." 1
+        [[ "$severity" == ok ]] || continue
+        case "$path" in /boot|/var/lib/docker) hh_usage "$path";; /mnt/*)
+            # Never poll rotating array disks for capacity or Btrfs pressure.
+            [[ "$path" == /mnt/disk[0-9]* ]] && continue
+            type=$(jq -r '.type' <<< "$info");[[ "$type" == btrfs ]] || continue
+            uuid=$(findmnt -rn -M "$path" -o UUID);all_ssd=true
+            [[ -n "$uuid" && -d "$HH_SYS_ROOT/fs/btrfs/$uuid/devices" ]] || all_ssd=false
+            for member in "$HH_SYS_ROOT/fs/btrfs/$uuid/devices/"*;do
+                [[ -e "$member" ]] || { all_ssd=false;break; }
+                rotational=$(lsblk -ndo ROTA "/dev/${member##*/}" 2>/dev/null)
+                [[ "$rotational" == 0 ]] || all_ssd=false
+            done
+            [[ "$all_ssd" == true ]] || continue
+            usage=$(timeout --kill-after=1 5 btrfs filesystem usage -b "$path" 9>&- 2>/dev/null) || usage=''
+            show=$(timeout --kill-after=1 5 btrfs filesystem show "$path" 9>&- 2>/dev/null) || show=''
+            metrics=$(hh_btrfs_metrics "$usage" "$show")
+            hh_observe "btrfs:$path" "$(jq -r '.severity' <<< "$metrics")" "Btrfs pool $path" "$(jq -r '"Metadata use=\((.metadataPercent//0)*10|round|./10)%; unallocated=\(.unallocatedBytes/1073741824|floor)GiB; missing device bytes=\(.missingBytes); missing members=\(.missingMembers); reserve used=\(.reserveUsedBytes)B. Metadata pressure requires low unallocated headroom. No balance or repair was attempted."' <<< "$metrics")" 2
+            ;;
+        esac
+    done < <(hh_expected_mounts | sort -u)
+    hh_usage /
+    read -r total available < <(awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{print t+0,a+0}' "$HH_PROC_ROOT/meminfo")
+    if ((total>0));then
+        percent=$((100*available/total));severity=ok;((percent<10)) && severity=warning;((percent<3)) && severity=critical
+        hh_observe memory "$severity" 'Available memory' "MemAvailable=${percent}% (${available}KiB of ${total}KiB); reclaimable cache is included." 2
+    else hh_observe memory unknown 'Available memory' 'MemAvailable could not be read.';fi
+    hh_cpu;hh_network
+    emergency="$HH_RAM_ROOT/health-monitor-emergency.json"
+    if [[ -f "$emergency" && ! -L "$emergency" ]] && jq -e --arg boot "$HH_BOOT" '.bootId==$boot and (.healthy|type)=="boolean"' "$emergency" >/dev/null 2>&1;then
+        severity=$(jq -r 'if .healthy then "ok" else "critical" end' "$emergency")
+        hh_observe monitor:disk-state "$severity" 'Daily disk monitor state access' "$(jq -r '.detail' "$emergency")" 1
+    fi
+}
+hh_lifecycle() {
+    # Keep delivery state separate from observations. A failed notification never
+    # consumes an event. Consecutive samples must be close enough to be sustained.
+    HH_STATE=$(jq -c --argjson observations "$HH_OBSERVATIONS" --argjson now "$HH_NOW" '
+      .conditions //= {} | . as $root |
+      reduce $observations[] as $o (. ; .conditions[$o.id] as $previous |
+        ($previous//{active:false,bad:0,good:0,notifiedAt:0}) as $p |
+        ($p + {title:$o.title,detail:$o.detail,lastSeen:$now}) as $c |
+        (if (($p.lastSeen//0)<$now-1200) then $c+{bad:0,good:0} else $c end) as $c |
+        if ($o.severity=="warning" or $o.severity=="critical") then
+          ($c+{bad:($c.bad+1),good:0}) as $c |
+          (if $o.severity=="critical" then $o.confirmations else 3 end) as $required |
+          if $c.bad >= $required then
+            .conditions[$o.id]=($c+{active:true,severity:$o.severity} |
+              if ($p.active!=true or $p.severity!=$o.severity or ($now-($p.notifiedAt//0)>=86400 and ($p.pending//"")==""))
+              then .pending=(if $p.active!=true then "RAISED" elif $p.severity!=$o.severity then "SEVERITY CHANGED" else "REMINDER" end) else . end)
+          else .conditions[$o.id]=$c end
+        elif $o.severity=="ok" then
+          ($c+{bad:0,good:($c.good+1)}) as $c |
+          .conditions[$o.id]=(if $p.active==true and $c.good>=2 then $c+{active:false,pending:"RECOVERED"} else $c end)
+        else .conditions[$o.id]=($c+{bad:0,good:0}) end) |
+      # Removed hardware is retired, never described as a proven recovery.
+      .conditions |= with_entries(select(.value.lastSeen >= $now-604800)) |
+      .baselines.network |= with_entries(select(.value.at >= $now-604800)) |
+      .lastSampleAt=$now' <<< "$HH_STATE") || return 1
+    HH_PENDING_BODY=$(jq -r '.conditions|to_entries|map(select((.value.pending//"")!=""))|.[0:24][]|"- [\(.value.pending)] \(.value.title) [\(.value.severity//"info")]\n  \(.value.detail)"' <<< "$HH_STATE")
+    HH_PENDING_IMPORTANCE=$(jq -r 'if any(.conditions[];(.pending//"")!="" and .active==true and .severity=="critical") then "alert" elif any(.conditions[];(.pending//"")!="" and .active==true) then "warning" else "normal" end' <<< "$HH_STATE")
+}
+hh_save() {
+    local receipt info mirror_at
+    hh_atomic "$HH_RAM_ROOT/syslog-host-state.json" "$HH_STATE" || return 1
+    receipt=$(jq -nc --arg boot "$HH_BOOT" --argjson now "$HH_NOW" --argjson observations "$HH_OBSERVATIONS" --argjson state "$HH_STATE" '{schema:1,bootId:$boot,observedAt:$now,status:"COMPLETE",activeConditions:([$state.conditions[]|select(.active)]|length),observations:$observations}')
+    hh_atomic "$HH_RAM_ROOT/syslog-host-health.json" "$receipt" || return 1
+    info=$(hh_mount_info /mnt/vault)
+    if jq -e '.mounted and (.readOnly|not)' <<< "$info" >/dev/null;then
+        mirror_at=$(jq -r '.lastSampleAt//0' "$HH_MIRROR" 2>/dev/null) || mirror_at=0
+        if [[ "$mirror_at" =~ ^[0-9]+$ ]] && { ((HH_NOW-mirror_at>=3600)) || [[ -n "$HH_PENDING_BODY" || "${HH_DIRTY:-0}" == 1 ]]; };then
+            [[ -d "${HH_MIRROR%/*}" && ! -L "${HH_MIRROR%/*}" ]] || mkdir -p -- "${HH_MIRROR%/*}" || return 1
+            hh_atomic "$HH_MIRROR" "$HH_STATE" || return 1
+        fi
+    fi
+}
+hh_prepare() {
+    HH_NOW=${HH_NOW:-$(date +%s)};HH_BOOT=${HH_BOOT:-$(cat "$HH_PROC_ROOT/sys/kernel/random/boot_id")};HH_STATE='{}'
+    local source
+    for source in "$HH_RAM_ROOT/syslog-host-state.json" "$HH_MIRROR";do
+        [[ -f "$source" && ! -L "$source" && $(stat -c %u "$source") == "$EUID" ]] || continue
+        if jq -e '.schema==1 and (.conditions|type)=="object" and (.baselines.network|type)=="object"' "$source" >/dev/null 2>&1;then HH_STATE=$(cat "$source");break;fi
+    done
+    HH_STATE=$(jq -c --arg boot "$HH_BOOT" '.conditions //= {} | .baselines.network //= {} | if .bootId!=$boot then .baselines={network:{}}|.conditions|=with_entries(.value.bad=0|.value.good=0) else . end | .schema=1 | .bootId=$boot | .baselines.network //= {}' <<< "$HH_STATE") || return 1
+    hh_collect && hh_lifecycle && hh_save || return 1
+    HH_PREPARED=1
+}
+hh_delivered() {
+    HH_STATE=$(jq -c --argjson now "$HH_NOW" '[.conditions|to_entries[]|select((.value.pending//"")!="")|.key][0:24] as $ids | reduce $ids[] as $id (. ; .conditions[$id].pending=""|.conditions[$id].notifiedAt=$now)' <<< "$HH_STATE") || return 1
+    HH_PENDING_BODY='';HH_DIRTY=1;hh_save
+}
+hh_flush() {
+    [[ "$HH_PREPARED" == 1 && -n "$HH_PENDING_BODY" ]] || return 0
+    notify_unraid "$HH_PENDING_IMPORTANCE" 'Host health conditions changed' 'Read-only host checks; no repair, restart or configuration change was performed.'
+}
+# END HOST HEALTH PROBES
+
 main() {
     local final_exit=0
     case "${1:-}" in
@@ -1288,12 +1592,17 @@ main() {
         return 1
     fi
 
-    trap cleanup_temp_files EXIT
+    trap 'rc=$?; if ! hh_flush;then rc=1;fi; cleanup_temp_files; exit "$rc"' EXIT
     case "${1:-}" in
         --open-xfs) xfs_incident_state list; return ;;
         --ack-xfs) [[ $# == 2 ]] || return 2; xfs_incident_state ack "$2"; return ;;
     esac
 
+
+    if ! hh_prepare;then
+        log HOST ERROR 'Fast host checks or their RAM receipt failed; scan freshness will not advance'
+        return 1
+    fi
 
     # -----------------------------------------------------------------------
     # Syslog validation
@@ -1353,11 +1662,12 @@ main() {
     # Exit status
     # -----------------------------------------------------------------------
 
-    if ((final_exit==0)) && mountpoint -q /mnt/vault;then
+    hh_flush || final_exit=1
+    if ((final_exit==0)) && hh_mount_info /mnt/vault | jq -e '.mounted and (.readOnly|not)' >/dev/null;then
         local receipt_root="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}" receipt
         mkdir -p "$receipt_root" || return 1
         receipt=$(mktemp "$receipt_root/.syslog-watchdog.XXXXXX") || return 1
-        jq -n --arg boot "$(cat /proc/sys/kernel/random/boot_id)" --argjson at "$(date +%s)" '{schema:1,name:"syslog_watchdog",bootId:$boot,lastSuccessfulScanAt:$at,epoch:$at,status:"OK",scope:"New syslog entries and log filesystem utilization checked; notification delivery completed"}' >"$receipt" && chmod 600 "$receipt" && mv "$receipt" "$receipt_root/syslog_watchdog.json" || return 1
+        jq -n --arg boot "$(cat /proc/sys/kernel/random/boot_id)" --argjson at "$(date +%s)" --argjson host "$(jq '[.conditions[]|select(.active)]|length' <<< "$HH_STATE")" '{schema:1,name:"syslog_watchdog",activeHostConditions:$host,bootId:$boot,lastSuccessfulScanAt:$at,epoch:$at,status:"OK",scope:"Syslog, log capacity and fast host conditions checked; condition state is separate from successful scan freshness"}' >"$receipt" && chmod 600 "$receipt" && mv "$receipt" "$receipt_root/syslog_watchdog.json" || return 1
     fi
     [[ "${SYSLOG_BACKLOG:-false}" != true ]] || log SYSLOG INFO 'Bounded scan completed with unread backlog; next scheduled pass resumes from the last consumed line'
     return "$final_exit"

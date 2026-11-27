@@ -149,6 +149,7 @@ run_regression_tests() (
 
     if (
         local BTRFS_SCRUB_STATE_DIR="$fixture_dir/scrub-state"
+        hm_pool_health() { :; } # Allocation/deadline behaviour has separate native fixtures.
         local ENABLE_BTRFS_SCRUB=0 FIRST_RUN_FORCE=0
         mkdir "$BTRFS_SCRUB_STATE_DIR"
         mount() { printf '/dev/sda on /mnt/cache type btrfs (rw)\n'; }
