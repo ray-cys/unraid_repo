@@ -2,7 +2,7 @@
 
 The Docker watchdog remains the single native-log reader. Its native parser extends
 its existing incremental cursor with a redacted catalogue of configuration and
-processing findings. Media metadata audit v3.0 owns combined weekly presentation and delivery.
+processing findings. Media metadata audit owns combined weekly presentation and delivery.
 No Docker image, entrypoint, scheduler or application configuration is changed by
 the reporting module. Existing guarded personal-template edits remain separate.
 
@@ -22,7 +22,7 @@ Read-only reporting runs before configuration-edit idle/maintenance guards and
 does not obtain a writer lock or edit YAML. The report module's regular check is
 recorded in weekly-report-state.json. Failed notification leaves its deadline
 unchanged. Watchdog suppresses only routine Kometa job-errors/job-warnings emails
-while that heartbeat/deadline is healthy. It retains those observations and all
+while that heartbeat/deadline is healthy. Added scheduled-job producers use their own validated handoff as described below. It retains those observations and all
 urgent fatal, service-availability, overdue-job and recovery safeguards. If the
 handoff is absent/stale, immediate routine reporting resumes automatically.
 
@@ -40,7 +40,7 @@ Runtime severity counters keep their existing independent 32-reason caps. Large
 JSON is passed through files/stdin, avoiding operating-system argument limits.
 
 The email has up to 20 prioritized entries and a 24 KB budget. The latest full
-review overwrites weekly-report.txt in the existing preflight state directory;
+review uses weekly-report.txt, with weekly-report.previous.txt retaining its predecessor;
 there is no accumulating collection of full-log copies. Full reviews retain all
 catalogued messages and recommended actions, including entries omitted from email.
 Paths, signed URL queries and credential-shaped fields are redacted before storage
@@ -98,3 +98,56 @@ source cannot monopolize all 20 positions. It retains the 24-KB bound, explicit
 omission counts, one overwritten full report, redaction and failed-delivery retry.
 Missing coverage is reportable even if there are no findings. When both sources
 are fresh and have no findings/recoveries, no all-clear email is sent.
+
+## Recyclarr and ImageMaid weekly review (v3.4)
+
+The existing Sunday 11:55 Singapore-time deadline now covers MetaFusion, Kometa,
+Recyclarr and ImageMaid in one **Media Stack Weekly Review**. Script schedules,
+container images, entrypoints, native schedules and application settings stay as
+configured. Reporting never runs Recyclarr sync or ImageMaid cleanup.
+
+Docker Service Watchdog remains the only job-log reader. Recyclarr outcomes match
+native `/cron.sh` scheduler command/position/iteration, with errors/warnings from
+that run; per-Arr `Completed at` lines cannot establish whole-job success.
+ImageMaid uses full start/terminal/footer evidence and native severity records,
+including explicit completed-operation counters when present. No counter is
+invented when the producer does not record one. ImageMaid's weekly completion
+allowance is 192 hours (weekly schedule plus one-day grace), not five days.
+
+Compact producer catalogues live in the existing watchdog `state.json` beneath
+`.jobs[actualContainerName].weeklyReview`. Recent run receipts and resolved causes
+retain 14 days, capped at 128 runs and 256 causes per producer; unresolved causes
+remain until verified or the disclosed bound is reached. Recurrence retains
+recent recovery timestamps. Repeated/overlapping scans do not multiply events,
+and late historical errors cannot reopen a later proven clean outcome. A complete
+clean native job can resolve processing causes; deadline/evidence conditions
+require their own current valid watchdog recovery. Unknown, incomplete or capped
+capture cannot silently establish a clean history. Cached outcomes from before
+collection began are explicitly retained history, without invented reasons.
+
+The weekly email groups sources fairly within the existing 20-entry/24 KB budget.
+It includes native reasons, source paths when recorded, first/last observations,
+recorded recurrence/recovery and specific suggested checks. Healthy unchanged
+weeks are silent. Confirmed removed applications are retired from the report;
+missing/stale evidence for an installed producer is reported as unverified.
+The native report consumer receives actual discovered profile/container identities,
+so known application removal does not require executable edits.
+
+Only routine `job-errors`/`job-warnings` emails are delegated for a producer with
+current successful report/collector evidence. Lost/stale handoff restores ordinary
+watchdog reporting. Availability, fatal failures, missed deadlines and restart
+permissions remain independent. Optional catalogue failure preserves old evidence
+and reports the collection problem without stopping container availability checks.
+
+Only `weekly-report.txt` and `weekly-report.previous.txt` are retained. They rotate
+on a new weekly report, never on ordinary four-hour checks or repeated delivery of
+the same pending report. Undelivered report JSON is retry state, not another
+historical report; its exact reasons/recoveries are retained until delivery succeeds.
+`--report-preview` remains read-only; `--weekly-report` honours the existing due
+time and performs no configuration reconciliation.
+
+The standalone reducer is generated from `tools/job_weekly_review.php` with
+`tools/sync_job_weekly_review.py`; presentation comes from
+`tools/job_stack_report.py` with `tools/sync_job_stack_report.py`. No runtime helper
+installation or host Python package is required. PHP is native to Unraid and the
+existing Kometa/ImageMaid Python runtimes remain read-only reporting workers.

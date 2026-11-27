@@ -2,7 +2,7 @@
 # shellcheck disable=SC2034
 clearLog=true
 arrayStarted=true
-# MetaFusion/Kometa weekly findings audit and guarded configuration reconciliation v3.2. Schedule 55 3,7,11,15,19,23 * * *.
+# MetaFusion/Kometa/Recyclarr/ImageMaid weekly findings and guarded reconciliation v3.4. Schedule 55 3,7,11,15,19,23 * * *.
 # Run after MetaFusion and before the four-hour Kometa boundaries. MetaFusion
 # owns generated metadata; this wrapper only maintains personal overlay and
 # collection templates, under the MetaFusion/wrapper write lock.
@@ -213,13 +213,13 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
-readonly SCRIPT_VERSION="3.3.2"
+readonly SCRIPT_VERSION="3.4.0"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/media_metadata_audit}"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 NOTIFY_BIN="${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}"
 # Weekly reporting is read-only and runs before all configuration-edit guards.
 # No extra schedule: Sunday 11:55 Singapore time matches an existing invocation.
-# The watchdog retains the compact 21-day catalogue; full native logs are not
+# Watchdog retains Kometa scope history and bounded 14-day scheduled-job reviews; native logs are not
 # copied/reparsed here. Never infer a fix from a skipped collection or one clean run.
 KOMETA_CONTAINER="${KOMETA_CONTAINER:-kometa}"
 WATCHDOG_STATE_FILE="${WATCHDOG_STATE_FILE:-/mnt/vault/cloud/logs/script/docker_service_watchdog/state.json}"
@@ -293,7 +293,10 @@ weekly_media_report() {
     fi
     if ! jq --slurpfile saved "$saved" --slurpfile mf "$mf" --arg name "$KOMETA_CONTAINER" \
         '{saved:$saved[0],metafusion:$mf[0],catalogue:(.jobs[$name].runLog.maintenance // null),
-          gap:(.jobs[$name].runLog.gap // true),backlog:(.jobs[$name].runLog.backlog // true)}' "$watchdog" >"$input"; then
+          gap:(.jobs[$name].runLog.gap // false),backlog:(.jobs[$name].runLog.backlog // false),
+          jobProducers:(. as $root | [(.jobs // {}|to_entries[]) | select((.value.weeklyReview.profile // .key)|IN("recyclarr","imagemaid")) |
+            {name:.key,profile:(.value.weeklyReview.profile // .key),catalogue:.value.weeklyReview,result:.value.result,started:.value.started,finished:.value.finished,
+             error:(.value.weeklyReviewError // 0),retired:(($root.inventory[.key].retiredAt // 0)>0)}])}' "$watchdog" >"$input"; then
         rm -f "$input" "$result" "$saved" "$mf" "$watchdog"; return 1
     fi
     rm -f "$mf" "$watchdog"
@@ -551,7 +554,81 @@ def metafusion_review():
         mf_blocks.insert(0,warning); email_blocks.insert(0,warning)
     return mf_blocks,email_blocks,summaries,len(opened),len(fixed),bool(problem)
 
+# BEGIN SCHEDULED JOB WEEKLY REPORT
+# Read only the watchdog's compact producer catalogues. Missing/stale evidence
+# stays unverified, and confirmed removals are retired rather than called fixed.
+def scheduled_job_reviews(data, now, cutoff, saved, safe, stamp):
+    blocks=[];summaries=[];active=resolved=warnings=0;handoff={}
+    producers=data.get('jobProducers',[])
+    if not isinstance(producers,list):
+        producers=[{'name':'scheduled jobs','profile':'unknown','catalogue':None}]
+    for producer in producers:
+        name=producer.get('name','unknown');profile=producer.get('profile',name)
+        if producer.get('retired'):
+            continue
+        label='ImageMaid' if profile=='imagemaid' else 'Recyclarr'
+        cat=producer.get('catalogue');problem=None
+        try:
+            if not isinstance(cat,dict) or cat.get('schema')!=1 or not isinstance(cat.get('issues'),dict) or not isinstance(cat.get('runs'),dict):
+                raise ValueError('producer catalogue unavailable or unsupported')
+            scan=cat.get('lastScanAt',0);coverage=cat.get('coverage',{})
+            if not isinstance(scan,(int,float)) or not now-3600<=scan<=now+300:
+                raise ValueError('watchdog collection is stale; retained outcomes are historical')
+            if producer.get('error'):
+                raise ValueError('watchdog could not update this producer catalogue; retained state was preserved')
+            paused=coverage.get('paused') is True
+            if not coverage.get('valid') and not paused:
+                problem='Native run/evidence coverage is incomplete or unavailable; no clean result is inferred.'
+            if cat.get('droppedAt',0)>=cutoff:
+                problem='Capture limit reached within this period; some history/reasons are unavailable.'
+            runs=[r for r in cat['runs'].values() if isinstance(r,dict) and isinstance(r.get('finished'),(int,float)) and cutoff<=r['finished']<=now+300]
+            latest=max(runs,key=lambda r:r['finished'],default={})
+            summaries.append(f'{label} ({safe(name,80)}): {len(runs)} recorded run(s) this week; latest outcome={safe(latest.get("result",producer.get("result","not recorded")),40)}; finished={stamp(latest.get("finished",producer.get("finished",0)))}.')
+            if isinstance(producer.get('started'),(int,float)) and producer['started']>producer.get('finished',0):
+                summaries.append(label+': current native run is active since '+stamp(producer['started'])+'; the prior completion is not its outcome.')
+            if paused:
+                summaries.append(label+': planned maintenance deferred collection; previous findings remain retained.')
+            if cat.get('trackingSince',now)>cutoff:
+                summaries.append(label+': history collection began within this review period; earlier runs/reasons were not reconstructed.')
+            # Only current valid coverage can delegate routine warning/error mail.
+            handoff[name]=bool(not problem and (coverage.get('valid') or paused))
+            for issue in cat['issues'].values():
+                if not isinstance(issue,dict) or not isinstance(issue.get('message'),str) or not all(isinstance(issue.get(k),(int,float)) for k in ('firstSeen','lastSeen')):
+                    raise ValueError('invalid retained finding identity/timestamps')
+                fixed=issue.get('resolvedAt',0)
+                if fixed and fixed<max(cutoff,saved.get('lastReportAt',0)+1):continue
+                recoveries=[at for at in issue.get('recoveries',[]) if isinstance(at,(int,float)) and at>=max(cutoff,saved.get('lastReportAt',0)+1)]
+                resolved+=len(recoveries) or int(bool(fixed))
+                if not fixed:active+=1
+                message=issue['message'];lower=message.lower()
+                if profile=='recyclarr':
+                    if re.search(r'401|403|unauthori|forbidden|api.?key',lower):action='Check the affected Sonarr/Radarr URL, API key and permissions in Recyclarr configuration; credentials are redacted.'
+                    elif re.search(r'format|quality|profile|trash|yaml|config|invalid|unsupported',lower):action='Review the named Recyclarr YAML, instance, custom-format or quality-profile mapping against the installed Recyclarr release. Correct its source configuration before the next scheduled sync.'
+                    else:action='Inspect the named instance and native scheduler result; check Arr availability/connectivity and the complete Recyclarr sync log. Per-instance Completed messages alone do not prove whole-job success.'
+                elif re.search(r'restore|clear.before.move|move mode',lower):action='Review native ImageMaid move/clear-before-move settings and the restore destination. Confirm retained files are intentional before changing cleanup settings.'
+                elif re.search(r'permission|denied|read.only|path|directory|no such file',lower):action='Check the recorded ImageMaid/Plex container-visible paths, mount access and permissions; do not recursively change unrelated media ownership.'
+                else:action='Review the ImageMaid native run and Plex connectivity; correct the exact reported processing condition before its next scheduled run.'
+                blocks.append(['',f'[{label}] '+('RESOLVED' if fixed else 'REVIEW REQUIRED')+' | '+safe(issue.get('severity','WARNING'),20),
+                    'Container: '+safe(name,80)+'; finding ID: '+safe(issue.get('id','unknown'),80),
+                    'Message: '+safe(message,900),'Source: '+safe(issue.get('source','native scheduler/run log'),250),
+                    'Verified recoveries in this review: '+(', '.join(stamp(at) for at in recoveries) or 'none recorded')+(' (condition recurred afterward)' if recoveries and not fixed else ''),
+                    'First observed: '+stamp(issue['firstSeen'])+'; last observed: '+stamp(issue['lastSeen'])+'; affected recorded runs/conditions: '+str(issue.get('occurrences',len(issue.get('affectedRuns',[])))),
+                    ('Verified resolved: '+stamp(fixed)+'; '+safe(issue.get('resolution','Native recovery evidence recorded.'),500)) if fixed else 'Recommended action: '+action])
+            if latest.get('counts'):
+                summaries.append(label+' latest native summary/counts: '+safe(json.dumps(latest['counts'],ensure_ascii=False),1200)+'. No counts are inferred from a completion banner.')
+            elif profile=='imagemaid':
+                summaries.append('ImageMaid: move/delete/skip counts were not explicitly captured; this is not a claim of zero cleanup.')
+        except (ValueError,TypeError,KeyError) as exc:
+            problem=safe(str(exc),250);handoff[name]=False
+        if problem:
+            warnings+=1;handoff[name]=False
+            blocks.append(['',f'[{label}] COVERAGE UNVERIFIED','Container: '+safe(name,80)+'; '+problem,
+                           'Recommended action: inspect Docker watchdog job-evidence/collection status. Missing, skipped or truncated evidence does not resolve previous findings.'])
+    return blocks,summaries,active,resolved,warnings,handoff
+# END SCHEDULED JOB WEEKLY REPORT
+
 mf_blocks,mf_email_blocks,mf_summary,mf_active,mf_resolved,mf_partial=metafusion_review()
+job_blocks,job_summary,job_active,job_resolved,job_partial,job_handoff=scheduled_job_reviews(data,now,cutoff,saved,safe,stamp)
 
 issues = [dict(value) for value in catalogue.get("issues", {}).values()
           if not value.get("resolvedAt") or value.get("resolvedAt", 0) >= max(cutoff, saved.get("lastReportAt",0)+1)]
@@ -560,7 +637,7 @@ resolved = sum(bool(issue.get("resolvedAt")) for issue in issues)
 active = len(issues)-resolved
 runs = [run for run in catalogue.get("runs", []) if run.get("finished", 0) >= cutoff]
 partial = bool(data.get("gap") or data.get("backlog") or catalogue.get("dropped") or catalogue.get("trackingSince", now)>cutoff)
-lines = ["Media metadata weekly maintenance review", "Period: "+stamp(cutoff)+" to "+stamp(now)+" ("+str(zone)+")",
+lines = ["Media stack weekly maintenance review", "Period: "+stamp(cutoff)+" to "+stamp(now)+" ("+str(zone)+")",
          f"Kometa recorded normal runs: {len(runs)}; findings needing review: {active}; verified resolved: {resolved}.",
          "Tracking started: "+stamp(catalogue.get("trackingSince", 0))+"; last scan: "+stamp(scan)+"."]
 if partial:
@@ -569,7 +646,7 @@ if catalogue.get("dropped"):
     lines.append("Capture-limit events recorded: "+str(catalogue["dropped"])+"; the catalogue is bounded to 256 issues/128 distinct findings per run.")
 latest_run = max(runs, key=lambda run: run.get("finished", 0), default={})
 latest_start = latest_run.get("started", 0)
-lines += mf_summary
+lines += mf_summary + job_summary
 if kometa_problem:
     lines.append(kometa_problem)
 header = lines.copy()
@@ -596,21 +673,18 @@ for number, issue in enumerate(issues, 1):
     if not context.get("file") and context.get("library") in library_files:
         lines.append("Configured local sources (candidates, not proven origin): "+safe("; ".join(library_files[context["library"]][:5]),700))
     blocks.append(lines[block_start:])
-# Each producer gets space in the same bounded email; a large Kometa backlog
-# cannot crowd all native MetaFusion findings out of the weekly notification.
+# Round-robin producer sections share the existing item/byte budget.
 all_blocks=[]
-if kometa_problem:
-    all_blocks.append(["","[Kometa] COVERAGE UNVERIFIED",kometa_problem])
-for index in range(max(len(blocks),len(mf_blocks))):
-    if index<len(mf_blocks): all_blocks.append(mf_blocks[index])
-    if index<len(blocks): all_blocks.append(blocks[index])
-footer=["", "Reporting performed no YAML edits, restarts or corrective actions. Native verified recoveries above describe MetaFusion's actions. Urgent availability/job failures remain with Docker Service Watchdog."]
 email_candidates=[]
 if kometa_problem:
-    email_candidates.append(["","[Kometa] COVERAGE UNVERIFIED",kometa_problem])
-for index in range(max(len(blocks),len(mf_email_blocks))):
-    if index<len(mf_email_blocks): email_candidates.append(mf_email_blocks[index])
-    if index<len(blocks): email_candidates.append(blocks[index])
+    warning=["","[Kometa] COVERAGE UNVERIFIED",kometa_problem]
+    all_blocks.append(warning);email_candidates.append(warning)
+job_groups={label:[block for block in job_blocks if block[1].startswith("["+label+"]")] for label in ("Recyclarr","ImageMaid")}
+for groups,target in (([mf_blocks,blocks,*job_groups.values()],all_blocks),([mf_email_blocks,blocks,*job_groups.values()],email_candidates)):
+    for index in range(max((len(group) for group in groups),default=0)):
+        for group in groups:
+            if index<len(group):target.append(group[index])
+footer=["", "Reporting performed no YAML edits, cleanup, sync, restarts or corrective actions. Native verified recoveries describe the owning application's evidence. Urgent availability/fatal/deadline failures remain with Docker Service Watchdog."]
 email_lines=header.copy()
 shown=0
 # Preserve the first four priority entries; rotate overflow so persistent
@@ -625,7 +699,7 @@ for block in email_candidates[:maximum]:
         break
     email_lines.extend(block); shown+=1
 if shown<len(email_candidates):
-    email_lines += ["",f"Email includes {shown} of {len(email_candidates)} review entries/groups. {len(email_candidates)-shown} additional entries/groups are retained with details in weekly-report.txt. Both producers share the item/byte budget."]
+    email_lines += ["",f"Email includes {shown} of {len(email_candidates)} review entries/groups. {len(email_candidates)-shown} additional entries/groups are retained with details in weekly-report.txt. All installed producers share the item/byte budget."]
 if not all_blocks:
     footer.insert(0,"No actionable findings recorded. This does not certify unprocessed items or disabled operations.")
 full_body="\n".join(header+[line for block in all_blocks for line in block]+footer)
@@ -637,12 +711,12 @@ next_due = saved.get("nextDue", next_review()) if saved.get("scheduleKey")==sche
 due = now >= next_due
 new_state = {**saved, "schema":1, "scheduleKey":schedule_key, "lastCheckedAt":now, "nextDue":next_review() if due else next_due,
              "lastEvidenceAt":scan, "kometaEvidenceOk":not bool(kometa_problem),
-             "metafusionEvidenceOk":not mf_partial,"lastReportAt":saved.get("lastReportAt",0),"reviewOffset":int(saved.get("reviewOffset",0))+(max(1,maximum-4) if due else 0)}
+             "metafusionEvidenceOk":not mf_partial,"producerEvidenceOk":job_handoff,"reportCapabilities":["scheduled-job-review-v1"],"lastReportAt":saved.get("lastReportAt",0),"reviewOffset":int(saved.get("reviewOffset",0))+(max(1,maximum-4) if due else 0)}
 if due:
     new_state["lastReportAt"] = now
-print(json.dumps({"state":new_state,"due":due,"send":due and bool(all_blocks),"actionable":active+mf_active,"resolved":resolved+mf_resolved,
+print(json.dumps({"state":new_state,"due":due,"send":due and bool(all_blocks),"actionable":active+mf_active+job_active,"resolved":resolved+mf_resolved+job_resolved,
                   "metafusionOpen":mf_active,"metafusionResolved":mf_resolved,
-                  "coverageWarnings":int(bool(kometa_problem))+int(mf_partial),"partial":partial or mf_partial or bool(kometa_problem),"body":body,"fullBody":full_body,"preview":preview=="true"}))
+                  "coverageWarnings":int(bool(kometa_problem))+int(mf_partial)+job_partial,"partial":partial or mf_partial or bool(kometa_problem) or bool(job_partial),"body":body,"fullBody":full_body,"preview":preview=="true"}))
 PYWEEKLY
 )" || { rm -f "$input" "$result" "$saved"; return 1; }
     timeout --kill-after=3 25 docker exec -i "$KOMETA_CONTAINER" python3 -c "$program" "$epoch" "$WEEKLY_REPORT_TIMEZONE" "$WEEKLY_REPORT_WEEKDAY" "$WEEKLY_REPORT_HOUR" "$WEEKLY_REPORT_MINUTE" "$WEEKLY_REPORT_MAX_ITEMS" "$preview" <"$input" >"$result" || rc=$?
@@ -650,17 +724,31 @@ PYWEEKLY
         rm -f "$input" "$result" "$saved"; usr_ops_log_line ERROR reporting 'Weekly evidence collection failed; delivery deadline retained for retry; watchdog availability reporting remains active' >&2; return 1
     fi
     if [[ "$preview" == true ]]; then jq -r .fullBody "$result"; rm -f "$input" "$result" "$saved"; return 0; fi
-    local pending="$STATE_DIR/weekly-pending-notification.json"
+    local pending="$STATE_DIR/weekly-pending-notification.json" pending_temp previous_temp
     if [[ -e "$pending" ]];then
       [[ ! -L "$pending" ]] && jq -e '.state.schema==1 and .send==true and (.body|type)=="string"' "$pending" >/dev/null || { rm -f "$input" "$result" "$saved";return 1; }
       cp "$pending" "$result" || return 1
     fi
-    jq -r .fullBody "$result" >"$input" && mv -f "$input" "$STATE_DIR/weekly-report.txt" || { rm -f "$input" "$result" "$saved"; return 1; }
     if [[ $(jq -r .send "$result") == true ]]; then
-        cp "$result" "$pending.new" && sync -f "$pending.new" && mv "$pending.new" "$pending" || return 1
+        pending_temp=$(mktemp "$STATE_DIR/.weekly-pending.XXXXXX") || return 1
+        if ! cp "$result" "$pending_temp" || ! sync -f "$pending_temp" || ! mv "$pending_temp" "$pending";then rm -f "$pending_temp";return 1;fi
+    fi
+    # Two weekly reports only; ordinary four-hour checks do not rotate reports.
+    if [[ $(jq -r .due "$result") == true ]];then
+        [[ ! -L "$STATE_DIR/weekly-report.previous.txt" ]] || return 1
+        jq -r .fullBody "$result" >"$input" || return 1
+        if ! cmp -s "$input" "$STATE_DIR/weekly-report.txt";then
+            if [[ -f "$STATE_DIR/weekly-report.txt" ]];then
+                previous_temp=$(mktemp "$STATE_DIR/.weekly-report.previous.XXXXXX") || return 1
+                if ! cp "$STATE_DIR/weekly-report.txt" "$previous_temp" || ! mv "$previous_temp" "$STATE_DIR/weekly-report.previous.txt";then rm -f "$previous_temp";return 1;fi
+            fi
+            mv "$input" "$STATE_DIR/weekly-report.txt" || return 1
+        else rm -f "$input";fi
+    else rm -f "$input";fi
+    if [[ $(jq -r .send "$result") == true ]]; then
         local importance=warning
         if jq -e '.actionable==0 and .coverageWarnings==0' "$result" >/dev/null; then importance=normal; fi
-        if [[ ! -x "$NOTIFY_BIN" ]] || ! metadata_notify timeout 30 "$NOTIFY_BIN" -i "$importance" -s 'Media Metadata Weekly Review' -d "Weekly findings: $(jq -r .actionable "$result"); verified resolved: $(jq -r .resolved "$result"); coverage warnings: $(jq -r .coverageWarnings "$result")" -m "$(jq -r .body "$result")"; then
+        if [[ ! -x "$NOTIFY_BIN" ]] || ! metadata_notify timeout 30 "$NOTIFY_BIN" -i "$importance" -s 'Media Stack Weekly Review' -d "Weekly findings: $(jq -r .actionable "$result"); verified resolved: $(jq -r .resolved "$result"); coverage warnings: $(jq -r .coverageWarnings "$result")" -m "$(jq -r .body "$result")"; then
             rm -f "$result" "$saved"; usr_ops_log_line ERROR notification 'Notification delivery failed; exact report retained for retry; delivery deadline unchanged' >&2; return 1
         fi
         usr_ops_log_line INFO notification 'Completed weekly notification delivery'
@@ -689,7 +777,7 @@ app_update_requested() {
 main() {
     if [[ ${1:-} == --version ]]; then printf 'media_metadata_audit.sh %s\n' "$SCRIPT_VERSION"; return; fi
     if [[ ${1:-} == --help ]]; then
-        printf 'Usage: bash script [--version|--weekly-report|--report-preview]\nNormal schedule unchanged: collect/report weekly before edit guards, then existing reconciliation. --weekly-report checks the weekly deadline only; no YAML edits. --report-preview prints the current review without email, state updates or YAML edits. Native MetaFusion findings join the watchdog Kometa catalogue. Missing/stale exports are reported as unverified. Review defaults to Sunday 11:55 Asia/Singapore, first available invocation afterward.\n'; return
+        printf 'Usage: bash script [--version|--weekly-report|--report-preview]\nNormal schedule unchanged: collect/report weekly before edit guards, then existing reconciliation. --weekly-report checks the weekly deadline only; no YAML edits. --report-preview prints the current review without email, state updates or YAML edits. Native MetaFusion findings join watchdog Kometa, Recyclarr and ImageMaid catalogues; no second log scan. Only two weekly reports are retained. Healthy unchanged weeks are silent. Missing/stale exports are reported as unverified. Review defaults to Sunday 11:55 Asia/Singapore, first available invocation afterward.\n'; return
     fi
     case "${1:-}" in ''|--weekly-report|--report-preview) ;; *) return 2;; esac
     umask 077

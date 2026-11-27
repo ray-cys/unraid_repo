@@ -7,6 +7,7 @@ trap 'rm -rf -- "${TEST_ROOT:?}"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 # shellcheck disable=SC1091
 source "$ROOT/user_script/docker_service_watchdog.sh"
+DEFAULT_JOB_RULES=("${JOB_RULES[@]}")
 [[ "${SERVICE_SPECS[*]}" == *'lumunarr||always|0'* ]] || fail 'Lumunarr policy missing'
 DEFAULT_SERVICE_SPECS=("${SERVICE_SPECS[@]}")
 STATE_DIR="$TEST_ROOT/state"; mkdir -p "$STATE_DIR"
@@ -402,3 +403,10 @@ watchdog_schedule_inventory(){ return 0; }
 jq -e --arg version "$SCRIPT_VERSION" '.status == "OK" and .scriptVersion == $version' "$STATUS_DIR/docker_service_watchdog.json" >/dev/null || fail 'main receipt incorrect'
 jq -e '.phase == "completed" and .executionComplete == true and .failures == 0' "$HEARTBEAT_FILE" >/dev/null || fail 'main heartbeat not finalized'
 printf 'docker_service_watchdog fixture tests passed\n'
+(
+  text=$(redact_job_review_line 'token="multi word private value" https://user:password@example.net/?key=private-query')
+  [[ "$text" != *'private value'* && "$text" != *'user:password'* && "$text" != *'private-query'* ]] || fail 'new scheduler reason redaction leaked credentials'
+  rule=$(printf '%s\n' "${DEFAULT_JOB_RULES[@]}" | awk -F'|' '$1=="imagemaid"{print $2}')
+  ((rule>=168)) || fail 'weekly ImageMaid schedule has a shorter completion allowance'
+  printf 'Scheduler reason privacy and weekly ImageMaid allowance passed\n'
+)

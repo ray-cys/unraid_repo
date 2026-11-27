@@ -59,3 +59,37 @@ jq '.kometaEvidenceOk=false' "$KOMETA_WEEKLY_STATE" >"$TMP_DIR/invalid"; mv "$TM
 if kometa_weekly_delegate_ready; then echo 'Unverified Kometa evidence wrongly delegated' >&2; exit 1; fi
 printf 'Routine findings delegated only with a healthy handoff; fatal alerts retained; stale handoff restores immediate alerts without false recovery email\n'
 )
+(
+source "$repo/user_script/media_metadata_audit.sh"
+STATE_DIR="$fixture/retention";mkdir "$STATE_DIR"
+WATCHDOG_STATE_FILE="$fixture/watchdog.json";METAFUSION_FINDINGS_FILE="$fixture/findings.json";NOTIFY_BIN="$fixture/always-success"
+printf '#!/bin/sh\nexit 0\n' > "$NOTIFY_BIN";chmod 755 "$NOTIFY_BIN"
+now=$(date +%s)
+timeout() { [[ ${1:-} != --kill-after=* ]] || shift;shift;"$@"; }
+docker() { [[ "$1" == exec && "$2" == -i ]];shift 3;"$PYTHON_BIN" "${@:2}"; }
+for title in first second third;do
+ jq --arg title "$title" '.jobs.kometa.runLog.maintenance.issues.one.message=$title' "$WATCHDOG_STATE_FILE" >"$fixture/change";mv "$fixture/change" "$WATCHDOG_STATE_FILE"
+ jq -n --argjson now "$now" '{schema:1,scheduleKey:"Asia/Singapore/7/11/55",nextDue:($now-1),lastCheckedAt:($now-20)}' >"$STATE_DIR/weekly-report-state.json"
+ weekly_media_report false
+done
+grep -q 'third' "$STATE_DIR/weekly-report.txt";grep -q 'second' "$STATE_DIR/weekly-report.previous.txt"
+[[ $(find "$STATE_DIR" -maxdepth 1 -name 'weekly-report*.txt' | wc -l) == 2 ]]
+latest=$(sha256sum "$STATE_DIR/weekly-report.txt");previous=$(sha256sum "$STATE_DIR/weekly-report.previous.txt")
+weekly_media_report false
+[[ "$latest" == "$(sha256sum "$STATE_DIR/weekly-report.txt")" && "$previous" == "$(sha256sum "$STATE_DIR/weekly-report.previous.txt")" ]]
+printf 'Exactly two completed weekly reports retained; routine checks do not overwrite or rotate them\n'
+)
+(
+source "$repo/user_script/docker_service_watchdog.sh"
+TMP_DIR="$fixture/delegation";mkdir "$TMP_DIR";STATE_DIR="$TMP_DIR";STATE_WORK="$TMP_DIR/state.json";LOG_FILE="$TMP_DIR/log";NOW=$(date +%s)
+KOMETA_WEEKLY_STATE="$fixture/producer-handoff.json";NOTIFY_BIN="$fixture/watchdog-notify"
+jq -n --argjson now "$NOW" '{schema:1,lastCheckedAt:$now,nextDue:($now+86400),kometaEvidenceOk:true,reportCapabilities:["scheduled-job-review-v1"],producerEvidenceOk:{imagemaid:true,recyclarr:true}}' > "$KOMETA_WEEKLY_STATE"
+jq -n --argjson now "$NOW" '{version:2,jobs:{imagemaid:{weeklyReview:{profile:"imagemaid",lastScanAt:$now}}},observations:{"imagemaid:job-warnings":{active:true,severity:"WARNING",message:"review in weekly report",first:0,bad:2},"imagemaid:availability":{active:true,severity:"CRITICAL",message:"unhealthy",first:0,bad:2}},notification:{issues:{}}}' > "$STATE_WORK"
+: > "$fixture/watchdog-mails"
+notify_changes
+! grep -q 'imagemaid:job-warnings' "$fixture/watchdog-mails";grep -q 'imagemaid:availability' "$fixture/watchdog-mails"
+jq '.producerEvidenceOk.imagemaid=false' "$KOMETA_WEEKLY_STATE" > "$TMP_DIR/new";mv "$TMP_DIR/new" "$KOMETA_WEEKLY_STATE"
+notify_changes
+grep -q 'imagemaid:job-warnings' "$fixture/watchdog-mails"
+printf 'Per-producer weekly delegation retains health/restart alerts and falls back when that producer coverage fails\n'
+)

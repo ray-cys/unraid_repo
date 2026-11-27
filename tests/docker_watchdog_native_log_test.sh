@@ -179,10 +179,10 @@ cat >"$path" <<'LOG'
 [2026-11-22 07:02:52,479] [imagemaid.py:499]          [INFO]     | Total Runtime      | 0:02:01                                                                       |
 LOG
 read_log
-assert_json '.result == "success" and .incomplete == false and .finished > 0 and .reader.parserVersion == 3' 'Hubble idle ImageMaid log rejected'
+assert_json '.result == "success" and .incomplete == false and .finished > 0 and .reader.parserVersion == 4' 'Hubble idle ImageMaid log rejected'
 old="$(jq -c '{runLog:(.reader | del(.parserVersion, .active) | .gap=true | .completed={} | .successfulAt=0)}' "$result")"
 read_log
-assert_json '.result == "success" and .incomplete == false and .reader.parserVersion == 3' 'v3.4 EOF/gap state prevented idle-log repair'
+assert_json '.result == "success" and .incomplete == false and .reader.parserVersion == 4' 'v3.4 EOF/gap state prevented idle-log repair'
 
 # The running Kometa job has no normal whole-run footer yet. Collection names
 # containing "Run" must not count as completed scheduled work.
@@ -265,3 +265,18 @@ attempt_recovery kometa '' exited 1
 [[ "$(wc -l <"$TEST_ROOT/restarts")" -eq 2 ]] || fail 'permitted stopped-container recovery failed'
 jq -e '.observations["kometa:recovery-action"].message | contains("no Docker healthcheck")' "$STATE_WORK" >/dev/null || fail 'state-only recovery claimed application readiness'
 printf 'docker watchdog native-log tests passed\n'
+# Complete ImageMaid run receipts preserve exact reasons/counters for weekly
+# history, including failures that a later clean run resolves before Sunday.
+profile=imagemaid;path="$TEST_ROOT/imagemaid-weekly.log";old='{}'
+emit '2026-11-22 06:30:00' INFO 'Validating Options'
+emit '2026-11-22 06:30:01' ERROR 'Plex path permission denied token=hidden-native-secret'
+emit '2026-11-22 06:31:00' INFO 'ImageMaid Finished'
+emit '2026-11-22 06:31:01' INFO 'Total Runtime | 0:01:01'
+emit '2026-11-22 10:30:00' INFO 'Validating Options'
+emit '2026-11-22 10:31:00' INFO 'Files Removed | 12'
+emit '2026-11-22 10:31:01' INFO 'ImageMaid Finished'
+emit '2026-11-22 10:31:02' INFO 'Total Runtime | 0:01:02'
+read_log
+assert_json '(.reader.reviewRuns|length)==2 and .reader.reviewRuns[0].result=="completed-errors" and .reader.reviewRuns[1].result=="success" and .reader.reviewRuns[1].counts["Files Removed"]==12' 'weekly multi-run native evidence missing'
+! grep -q hidden-native-secret "$result" || fail 'weekly native evidence leaked token'
+printf 'ImageMaid weekly receipts preserve intermediate errors and explicit cleanup counters\n'

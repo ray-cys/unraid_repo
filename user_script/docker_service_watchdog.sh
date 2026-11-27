@@ -439,7 +439,7 @@ US_CRON_VERIFY
 # END EMBEDDED USER SCRIPTS CATALOG
 set -uo pipefail
 umask 077
-readonly SCRIPT_VERSION="3.17.1"
+readonly SCRIPT_VERSION="3.18.0"
 
 ###############################################################################
 # CONFIGURATION
@@ -478,7 +478,7 @@ DISCOVER_UNCLASSIFIED=true
 # native:/container/path (Metafusion); log:/container/path; a host JSON
 # receipt; or docker (one-shot containers only). Change log paths to your mounts.
 JOB_RULES=(
-    "imagemaid|120|24|runlog:/config/logs/imagemaid.log"
+    "imagemaid|192|24|runlog:/config/logs/imagemaid.log"
     "kometa|6|24|runlog:/config/logs/meta.log"
     "metafusion|6|24|native:/tmp/metafusion-status.json"
     "recyclarr|120|24|dockerlogs"
@@ -489,9 +489,10 @@ JOB_READ_MAX_BYTES=262144
 # catch-up without copying the log to vault or RAM. Backlogs resume next scan.
 JOB_LOG_SCAN_MAX_BYTES=$((128 * 1024 * 1024))
 REQUIRE_VERIFIED_JOB_SUCCESS=true
-# Preflight owns routine Kometa warnings/errors. Delegate emails only while its
-# weekly-report heartbeat/deadline is healthy; operational/fatal alerts stay here.
+# Weekly audit owns routine processing warnings/errors when its per-producer
+# evidence/deadline handoff is healthy. Availability/fatal/deadline alerts stay here.
 KOMETA_WEEKLY_REPORTING=true
+STACK_WEEKLY_REPORTING=true
 KOMETA_WEEKLY_STATE="/mnt/vault/cloud/logs/script/media_metadata_audit/weekly-report-state.json"
 RECYCLARR_JOB_COMMAND="/cron.sh"
 RECYCLARR_JOB_POSITION=0
@@ -852,18 +853,35 @@ record_job() {
     return "$rc"
 }
 
+# Redact before retaining native reasons or summaries. JSON is returned so the
+# bounded value can be passed directly to jq without shell evaluation.
+redact_job_review_line() {
+    printf '%s' "${1:0:4096}" | jq -Rsc '
+      gsub("(?is)[\"\\x27]?(api[_-]?key|token|password|secret|authorization)[\"\\x27]?\\s*[:=]\\s*([\"\\x27]).*?\\2";"[CREDENTIAL-REDACTED]") |
+      gsub("(?i)authorization[=: ]+(bearer[ ]+|basic[ ]+)?[^ ,;|]+";"authorization=[REDACTED]") |
+      gsub("(?i)(api[_-]?key|token|password|secret)[=: ]+[^ ,;|]+";"[REDACTED]") |
+      gsub("(?i)https?://[^ ?#|]+[?#][^ |]*";"[URL-QUERY-REDACTED]") |
+      gsub("(?i)https?://[^ /@]+@";"[URL-CREDENTIALS-REDACTED]@") | .[0:900]'
+}
+
 # Recyclarr's resident scheduler emits authoritative cron-process outcomes.
 # Match the configured command/position/iteration, never a per-library
 # "Completed at" line. Keep open-run/error context across polling windows.
 parse_recyclarr_log() {
     local file="$1" info="$2" old="$3" id context iteration="" start=0 failed=false seen=false open=false
-    local line stamp epoch event_iteration command_match=false position_match=false
+    local line stamp epoch event_iteration command_match=false position_match=false reasons='[]' review_runs='[]' summaries='[]' message severity complete record record_start record_reasons record_summaries review_file limited=false dropped=0
     id="$(jq -r '.[0].Id' <<<"$info")"
     context="$(jq -c --arg id "$id" '.logState // {} | select(.containerId == $id and (.start | type == "number") and
         (.iteration | type == "string" and test("^[0-9]+$")) and (.failed | type == "boolean") and (.seen | type == "boolean") and (.open | type == "boolean"))' <<<"$old")"
     if [[ -n "$context" ]]; then
         IFS=$'\t' read -r iteration start failed seen open < <(jq -r '[.iteration,.start,.failed,.seen,.open] | @tsv' <<<"$context")
     fi
+    [[ -n "$context" ]] || context='{}'
+    limited=$(jq -r '.captureLimited // false' <<< "$context") || return 1
+    dropped=$(jq -r '.reviewDroppedAt // 0' <<< "$context") || return 1
+    reasons=$(jq -c '.findings // []' <<< "$context") || return 1
+    summaries=$(jq -c '.summaries // []' <<< "$context") || return 1
+    review_runs=$(jq -c '.reviewRuns // []' <<< "$context") || return 1
     JOB_LOG_STARTED=0; JOB_LOG_FINISHED=0; JOB_LOG_SUCCESS=0; JOB_LOG_RESULT=unknown; JOB_LOG_HISTORY='[]'
     while IFS= read -r line; do
         stamp="${line%% *}"
@@ -877,7 +895,7 @@ parse_recyclarr_log() {
             event_iteration="${BASH_REMATCH[1]}"
             if [[ "$line" =~ msg=(\"starting\"|starting)[[:space:]] ]]; then
                 if (( epoch > start )) || { (( epoch == start )) && [[ "$iteration" != "$event_iteration" ]]; }; then
-                    start="$epoch"; iteration="$event_iteration"; failed=false; seen=true; open=true
+                    start="$epoch"; iteration="$event_iteration"; failed=false; seen=true; open=true; reasons='[]';summaries='[]';limited=false
                 fi
                 JOB_LOG_STARTED="$start"
             elif [[ "$line" == *'msg="job succeeded"'* || "$line" == *'msg="job failed"'* ]]; then
@@ -893,16 +911,35 @@ parse_recyclarr_log() {
                         JOB_LOG_HISTORY="$(jq -c --argjson epoch "$epoch" '. + [$epoch] | unique' <<<"$JOB_LOG_HISTORY")"
                     fi
                 else JOB_LOG_RESULT=completed-unverified; fi
+                complete=false
+                [[ "$seen" == true && "$event_iteration" == "$iteration" && "$limited" == false ]] && ((epoch>=start)) && complete=true
+                record_start=$start;record_reasons=$reasons;record_summaries=$summaries
+                if [[ "$seen" != true || "$event_iteration" != "$iteration" ]];then record_start=0;record_reasons='[]';record_summaries='[]';fi
+                record=$(jq -nc --arg id "$id:$event_iteration:$record_start:$epoch" --arg result "$JOB_LOG_RESULT" --argjson started "$record_start" --argjson finished "$epoch" --argjson complete "$complete" --argjson reasons "$record_reasons" --argjson summaries "$record_summaries" --argjson limited "$limited" '{captureLimited:$limited,id:$id,started:$started,finished:$finished,result:$result,complete:$complete,source:"Recyclarr scheduler /cron.sh",findings:$reasons,counts:{nativeSummary:$summaries}}') || return 1
+                if jq -e --arg id "$id:$event_iteration:$record_start:$epoch" --argjson cutoff "$((NOW-14*86400))" 'map(select(.finished>=$cutoff))| (length>=128 and all(.[];.id!=$id))' <<< "$review_runs" >/dev/null;then dropped=$NOW;fi
+                review_runs=$(jq -c --argjson record "$record" --argjson cutoff "$((NOW-14*86400))" 'map(select(.id!=$record.id and .finished>=$cutoff))+[$record]|.[-128:]' <<< "$review_runs") || return 1
                 open=false
             fi
-        elif [[ "$open" == true ]] && (( epoch >= start )) && [[ "$line" =~ \[(ERR|FTL)\]|level=(error|fatal) ]]; then
-            failed=true
+        elif [[ "$open" == true ]] && (( epoch >= start )); then
+            if [[ "$line" =~ \[(ERR|FTL|WRN)\]|level=(error|fatal|warning) ]];then
+                severity=WARNING
+                if [[ "$line" =~ \[(ERR|FTL)\]|level=(error|fatal) ]];then failed=true;severity=ERROR;fi
+                message=$(redact_job_review_line "${line#* }") || return 1
+                if jq -e --argjson message "$message" 'length>=32 and all(.[];.message!=$message)' <<< "$reasons" >/dev/null;then limited=true;fi
+                reasons=$(jq -c --argjson message "$message" --arg severity "$severity" '.+[{severity:$severity,message:$message}]|unique_by(.message)|.[0:32]' <<< "$reasons") || return 1
+            elif [[ "$line" =~ \[INF\].*(Updated|Skipped|synced|up.to.date) ]];then
+                # These native summaries distinguish no-op syncs from failures.
+                message=$(redact_job_review_line "${line#* }") || return 1
+                summaries=$(jq -c --argjson message "$message" '.+[$message]|unique|.[0:16]' <<< "$summaries") || return 1
+            fi
         fi
     done <"$file"
     if [[ "$open" == true ]]; then JOB_LOG_STARTED="$start"; fi
+    review_file="$file.review-runs.json"
+    printf '%s' "$review_runs" > "$review_file" || return 1
     JOB_LOG_STATE="$(jq -nc --arg id "$id" --arg iteration "$iteration" --argjson start "$start" \
-        --argjson failed "$failed" --argjson seen "$seen" --argjson open "$open" \
-        '{containerId:$id,iteration:$iteration,start:$start,failed:$failed,seen:$seen,open:$open}')"
+        --argjson failed "$failed" --argjson seen "$seen" --argjson open "$open" --argjson reasons "$reasons" --slurpfile records "$review_file" --argjson summaries "$summaries" --argjson limited "$limited" --argjson dropped "$dropped" \
+        '{captureLimited:$limited,reviewDroppedAt:$dropped,containerId:$id,iteration:$iteration,start:$start,failed:$failed,seen:$seen,open:$open,findings:$reasons,reviewRuns:$records[0],summaries:$summaries}')"
 }
 
 # The two Python applications already provide Python 3 in their images. Run
@@ -933,11 +970,12 @@ if not 1024 <= limit <= 512 * 1024 * 1024:
     raise ValueError("Invalid native log scan limit")
 saved = json.load(sys.stdin)
 state = saved if isinstance(saved, dict) and saved.get("version") == 1 and saved.get("source") == source else {}
-if state.get("containerId") != container or state.get("parserVersion") != 3:
+parser_version = 4 if profile == "imagemaid" else 3
+if state.get("containerId") != container or state.get("parserVersion") != parser_version:
     state.pop("cursor", None)
     state.pop("active", None)
     state["gap"] = False
-state.update(version=1, parserVersion=3, source=source, containerId=container)
+state.update(version=1, parserVersion=parser_version, source=source, containerId=container)
 state.setdefault("completed", {})
 state.setdefault("successfulAt", 0)
 state.setdefault("gap", False)
@@ -980,6 +1018,10 @@ def finding(run, level, message):
         bucket["keys"].append(key)
         if len(bucket["examples"]) < 3:
             bucket["examples"].append(redact(message))
+        if profile == "imagemaid":
+            bucket.setdefault("messages", {})[key] = redact(message, 900)
+    elif key not in bucket["keys"]:
+        bucket["truncated"] = True
 
 def outcome(run):
     flags = run["findings"]
@@ -1106,6 +1148,21 @@ def finish(run, epoch):
     maintenance_finish(run, epoch)
     state["completed"] = {"startedAt": run["startedAt"], "finishedAt": epoch,
                           "result": result, "findings": copy.deepcopy(run["findings"])}
+    if profile == "imagemaid":
+        reasons=[]
+        for bucket, severity in (("fatal","FATAL"),("errors","ERROR"),("warnings","WARNING")):
+            values=run["findings"].get(bucket,{})
+            for message in (values.get("messages",{}).values() or values.get("examples",[])):
+                reasons.append({"severity":severity,"message":message})
+        identity = container+":"+str(run["startedAt"])+":"+str(epoch)
+        receipt = {"id":identity,"started":run["startedAt"],"finished":epoch,"result":result,
+                   "complete":bool(run["full"] and run["mode"]=="normal" and not any(v.get("truncated") for v in run["findings"].values())),
+                   "source":source,"findings":reasons,"counts":run.get("counts",{}),
+                   "captureLimited":any(v.get("truncated") for v in run["findings"].values())}
+        records=[r for r in state.get("reviewRuns",[]) if r.get("id")!=identity and r.get("finished",0)>=now-14*86400]
+        records.append(receipt)
+        if len(records)>128:state["reviewDroppedAt"]=now
+        state["reviewRuns"]=records[-128:]
     if result == "success":
         state["successfulAt"] = epoch
     elif state["successfulAt"] == epoch:
@@ -1155,6 +1212,11 @@ def consume(raw):
         run["summary"] = False
     if level == "INFO":
         maintenance_context(run, banner)
+        if profile == "imagemaid" and run.get("full"):
+            count = re.fullmatch(r"(.{1,90}?)\s*\|\s*([0-9][0-9,]*)\s*", banner)
+            if count and re.search(r"\b(?:deleted|removed|moved|skipped|processed)\b", count[1], re.I):
+                if len(run.setdefault("counts",{}))<24:
+                    run["counts"][redact(count[1],90)] = int(count[2].replace(",",""))
     if level in ("WARNING", "WARN", "ERROR", "CRITICAL", "FATAL") and not run["summary"]:
         maintenance_finding(run, level, message, epoch)
         finding(run, level, message)
@@ -1410,12 +1472,14 @@ check_job() {
         (( success >= old_success )) || success="$old_success"
     fi
     printf '%s' "$run_log" >"$TMP_DIR/$name.reader.json" || return 1
+    printf '%s' "$log_state" >"$TMP_DIR/$name.log-state.json" || return 1
+    printf '%s' "$receipt_history" >"$TMP_DIR/$name.receipt-history.json" || return 1
     mutate --arg name "$name" --arg result "$result" --argjson first "$first" --argjson started "$started" \
-        --argjson finished "$finished" --argjson success "$success" --argjson scanned "$NOW" --argjson receipt_history "$receipt_history" --argjson log_state "$log_state" \
+        --argjson finished "$finished" --argjson success "$success" --argjson scanned "$NOW" --slurpfile receipt_history_file "$TMP_DIR/$name.receipt-history.json" --slurpfile log_state_file "$TMP_DIR/$name.log-state.json" \
         --slurpfile run_log_file "$TMP_DIR/$name.reader.json" --argjson retract "$retract_success" --arg evidence_source "$source" \
-        '$run_log_file[0] as $run_log | .jobs //= {} | (.jobs[$name].history // []) as $history |
-            .jobs[$name]={firstSeen:$first,started:$started,finished:$finished,success:$success,result:$result,scanned:$scanned,logState:$log_state,runLog:$run_log,evidenceSource:$evidence_source,
-                history:(($history + $receipt_history + (if $result == "success" and $success > 0 then [$success] else [] end)) | unique | map(select(. >= ($scanned - 28*86400) and (($retract | not) or . != $finished))))}' || return 1
+        '$run_log_file[0] as $run_log | .jobs //= {} | (.jobs[$name].history // []) as $history | (.jobs[$name].weeklyReview // null) as $review |
+            .jobs[$name]={firstSeen:$first,started:$started,finished:$finished,success:$success,result:$result,scanned:$scanned,logState:$log_state_file[0],runLog:$run_log,evidenceSource:$evidence_source,
+                weeklyReview:$review,history:(($history + $receipt_history_file[0] + (if $result == "success" and $success > 0 then [$success] else [] end)) | unique | map(select(. >= ($scanned - 28*86400) and (($retract | not) or . != $finished))))}' || return 1
     if [[ "$result" == failed ]]; then
         local error_detail=""
         if [[ "$source" == native:* ]]; then
@@ -1426,6 +1490,8 @@ check_job() {
                 gsub("[\\r\\n]"; " ") | .[0:500]' "$file")"
         elif [[ "$source" == runlog:* ]]; then
             error_detail="Native run logged a fatal failure. $detail; log=${source#runlog:}"
+        elif [[ "$profile" == recyclarr ]];then
+            error_detail=$(jq -r '[.findings[]?.message]|.[0:4]|join("; ")|.[0:500]' <<< "$log_state") || return 1
         fi
         observe "$name:job-failed" CRITICAL "Most recent scheduled job failed; finished_epoch=$finished; last_success_epoch=$success. ${error_detail:-Review the scheduled job log or completion record.} Container availability is checked separately" || return 1
     fi
@@ -1443,6 +1509,13 @@ check_job() {
     fi
     if [[ "$result" == completed-unverified && "$REQUIRE_VERIFIED_JOB_SUCCESS" == true ]]; then
         observe "$name:job-unverified" WARNING "Whole-run completion banner observed; success not established. Configure a producer receipt to verify outcome" || return 1
+    fi
+    if [[ "$profile" == recyclarr && "$result" == success && "$source" == dockerlogs ]];then
+        local native_warnings
+        native_warnings=$(jq -rc --argjson finished "$finished" '[.reviewRuns[]?|select(.finished==$finished)|.findings[]?|select(.severity=="WARNING")|.message]|unique' <<< "$log_state") || return 1
+        if jq -e 'length>0' <<< "$native_warnings" >/dev/null;then
+            observe "$name:job-warnings" WARNING "Recyclarr native scheduler completed with warnings: $(jq -r '.[0:4]|join("; ")' <<< "$native_warnings"); sync is not rerun by this monitor" || return 1
+        fi
     fi
     job_deadlines "$name" "$first" "$started" "$finished" "$max_age" "$runtime" || return 1
     for frequency in "${JOB_FREQUENCY_RULES[@]}"; do
@@ -2514,15 +2587,161 @@ kometa_weekly_delegate_ready() {
       .lastCheckedAt<=($now+300) and .lastCheckedAt>=($now-8*3600) and .nextDue>=($now-8*3600)' "$KOMETA_WEEKLY_STATE" >/dev/null 2>&1
 }
 
+# BEGIN WEEKLY JOB REVIEW REDUCER
+update_weekly_job_reviews() {
+    local spec name profile paused observations input output
+    for spec in "${EFFECTIVE_SPECS[@]}";do
+        name=${spec%%|*};profile="${PROFILE_BY_NAME[$name]:-$name}"
+        case "$profile" in recyclarr|imagemaid) ;; *) continue;;esac
+        paused=false;[[ -z "${FROZEN[$name]:-}" ]] || paused=true
+        observations=$(jq -c --arg prefix "$name:job-" '.observations|with_entries(select((.key|startswith($prefix)) and .value.active))' "$STATE_WORK") || return 1
+        input="$TMP_DIR/$name.weekly-input.json";output="$TMP_DIR/$name.weekly-review.json"
+        jq -n --slurpfile state "$STATE_WORK" --arg name "$name" --arg profile "$profile" --argjson now "$NOW" --argjson paused "$paused" --argjson observations "$observations" \
+          '{job:($state[0].jobs[$name]//{}),profile:$profile,now:$now,paused:$paused,observations:$observations}' > "$input" || return 1
+        if ! timeout --kill-after=2 12 php /dev/fd/3 3<<'JOB_REVIEW_PHP' < "$input" > "$output" 2>/dev/null
+<?php
+// Pure reducer for compact scheduler/run-log evidence. No files, APIs or actions.
+// One catalogue per installed producer; 14 days/128 runs/256 causes maximum.
+$input=json_decode(stream_get_contents(STDIN),true,512,JSON_THROW_ON_ERROR);
+$now=(int)$input['now'];$cutoff=$now-14*86400;$job=$input['job'];$profile=$input['profile'];
+$old=$job['weeklyReview']??['schema'=>1,'trackingSince'=>$now,'issues'=>[],'runs'=>[],'droppedAt'=>0];
+if(($old['schema']??0)!==1||!is_array($old['issues'])||!is_array($old['runs']))throw new RuntimeException('Invalid retained weekly job catalogue');
+function redactJob($text){
+ $s=(string)$text;
+ $s=preg_replace('~(?i)(https?://)[^/@\s]+@~','$1[REDACTED]@',$s);
+ $s=preg_replace('~(?i)(https?://[^\s?#|]+)[?#][^\s|]*~','$1?[REDACTED]',$s);
+ $s=preg_replace('~(?i)(["\x27]?(?:api[_-]?key|token|password|secret|authorization)["\x27]?\s*[:=]\s*)(["\x27]).*?\2~','$1[REDACTED]',$s);
+ $s=preg_replace('~(?i)(authorization[=: ]+(?:bearer\s+|basic\s+)?)[^\s,;|]+~','$1[REDACTED]',$s);
+ $s=preg_replace('~(?i)((?:api[_-]?key|token|password|secret)[=: ]+)[^\s,;|]+~','$1[REDACTED]',$s);
+ return substr(preg_replace('/\s+/',' ',trim($s)),0,900);
+}
+function resolveJobCause(&$row,$at,$reason){
+ $row['resolvedAt']=$at;$row['resolution']=$reason;
+ $history=$row['recoveries']??[];if(!in_array($at,$history,true))$history[]=$at;
+ $row['recoveries']=array_slice($history,-8);
+}
+function jobCause(&$cat,$key,$message,$severity,$at,$run,$source){
+ $prior=$cat['issues'][$key]??null;
+ $row=$prior??['id'=>$key,'firstSeen'=>$at,'lastSeen'=>$at,'affectedRuns'=>[],'resolvedAt'=>0,'occurrences'=>0];
+ if(!in_array($run,$row['affectedRuns'],true)){$row['affectedRuns'][]=$run;$row['occurrences']++;}
+ $row['affectedRuns']=array_slice($row['affectedRuns'],-128);
+ if($prior && ($at<$prior['lastSeen'] || ($prior['resolvedAt']??0)>=$at)){
+  $row['firstSeen']=min($row['firstSeen'],$at);$cat['issues'][$key]=$row;return;
+ }
+ if($prior && ($prior['resolvedAt']??0)>0)$row['firstSeen']=$at;
+ $row['lastSeen']=$at;$row['message']=redactJob($message);$row['severity']=$severity;$row['source']=$source;$row['resolvedAt']=0;
+ $cat['issues'][$key]=$row;
+}
+
+$cat=$old;$cat['lastScanAt']=$now;$paused=(bool)($input['paused']??false);
+$observations=$input['observations']??[];
+$invalid=false;foreach($observations as $key=>$o)if(preg_match('/:job-(evidence|unverified)$/',$key))$invalid=true;
+$valid=!$paused && !$invalid && ($job['scanned']??0)>=$now-600 && ($job['scanned']??0)<=$now+300;
+if($profile==='imagemaid')$valid=$valid && !($job['runLog']['gap']??true) && !($job['runLog']['backlog']??true);
+$valid=$valid && !in_array($job['result']??'unknown',['unknown','completed-unverified'],true);
+$cat['profile']=$profile;
+$cat['coverage']=['valid'=>$valid,'paused'=>$paused,'source'=>$job['evidenceSource']??'unknown','checkedAt'=>$now];
+if($paused){$cat['issues']=(object)$cat['issues'];$cat['runs']=(object)$cat['runs'];echo json_encode($cat,JSON_THROW_ON_ERROR);exit;}
+$records=$profile==='imagemaid'?($job['runLog']['reviewRuns']??[]):($job['logState']['reviewRuns']??[]);
+// A prior cached result has a date/outcome, but no reconstructed reason history.
+// It cannot prove clean coverage or resolve any newly tracked finding.
+if(!$records && ($job['finished']??0)>0)$records=[['id'=>'retained:'.($job['finished']), 'started'=>$job['started']??0,'finished'=>$job['finished'],'result'=>$job['result']??'unknown','complete'=>false,'findings'=>[],'source'=>$job['evidenceSource']??'unknown','retained'=>true]];
+$cat['droppedAt']=max($cat['droppedAt']??0,$job['runLog']['reviewDroppedAt']??0,$job['logState']['reviewDroppedAt']??0);
+foreach($records as $row)if(($row['captureLimited']??false) && ($row['finished']??0)>=$cutoff)$cat['droppedAt']=max($cat['droppedAt']??0,$row['finished']);
+usort($records,fn($a,$b)=>($a['finished']??0)<=>($b['finished']??0));
+$latestProcessed=(int)($cat['latestProcessed']??0);
+foreach($records as $record){
+ $at=$record['finished']??0;$id=$record['id']??'';
+ if(is_int($at)&&$at<$cutoff)continue;
+ if(!is_int($at)||$at>$now+300||!is_string($id)||$id===''||!is_array($record['findings']??[])){$cat['coverage']['valid']=false;continue;}
+ $revision=hash('sha256',json_encode($record,JSON_THROW_ON_ERROR));
+ $existing=$cat['runs'][$id]??null;
+ if($existing && ($existing['revision']??'')===$revision)continue;
+ $findings=$record['findings']??[];$counts=$record['counts']??[];$keys=[];$reasonsValid=true;
+ foreach($findings as $f){
+  if(!is_array($f)||!is_string($f['message']??null)){$reasonsValid=false;$cat['coverage']['valid']=false;continue;}
+  $message=redactJob($f['message']);$severity=strtoupper($f['severity']??'WARNING');
+  $key=substr(hash('sha256',$profile.'|'.$severity.'|'.$message),0,24);$keys[$key]=true;
+  jobCause($cat,$key,$message,$severity,$at,$id,$record['source']??($job['evidenceSource']??'unknown'));
+ }
+ if(in_array($record['result']??'',['failed','completed-errors','completed-warnings','completed-unverified'],true) && !$keys){
+  $message='Recorded job outcome: '.$record['result'].'; detailed reasons were not captured. Review the native run log.';
+  $key=substr(hash('sha256',$profile.'|'.$message),0,24);$keys[$key]=true;
+  jobCause($cat,$key,$message,'WARNING',$at,$id,$record['source']??'native job');
+ }
+ $complete=($record['complete']??false)===true && $reasonsValid && !($record['captureLimited']??false);
+ // Exact complete clean scheduler/run evidence resolves processing causes.
+ // Operational conditions (missed run/evidence) require their own recovery.
+ if($at>=$latestProcessed && $complete && ($record['result']??'')==='success' && !$keys){
+  foreach($cat['issues'] as &$issue)if(($issue['kind']??'processing')==='processing' && ($issue['lastSeen']??0)<$at && !($issue['resolvedAt']??0)){
+   resolveJobCause($issue,$at,'A subsequent complete native run finished without recorded errors or warnings.');
+  }unset($issue);
+ }
+ $cat['runs'][$id]=['id'=>$id,'started'=>$record['started']??0,'finished'=>$at,'result'=>$record['result']??'unknown','complete'=>$complete,'clean'=>($complete && ($record['result']??'')==='success' && !$keys),'counts'=>$counts,'revision'=>$revision,'retained'=>$record['retained']??false];
+ $latestProcessed=max($latestProcessed,$at);
+}
+$cat['latestProcessed']=$latestProcessed;
+// Late-arriving old failures remain in history without reopening a cause that
+// a later complete native run has already cleared.
+foreach($cat['issues'] as &$issue)if(($issue['kind']??'processing')==='processing' && !($issue['resolvedAt']??0)){
+ foreach($cat['runs'] as $r)if(($r['clean']??false) && $r['finished']>$issue['lastSeen']){
+  resolveJobCause($issue,$r['finished'],'A later complete clean native run already verified recovery when this older evidence arrived.');break;
+ }
+}unset($issue);
+
+$activeOps=[];
+foreach($observations as $key=>$o){
+ // Processing errors come from exact run records above; retain failures even
+ // if a later run succeeds before the weekly consumer runs.
+ if(!preg_match('/:job-(overdue|frequency|overrun|evidence|unverified)$/',$key))continue;
+ $id='operation:'.substr(hash('sha256',$key),0,24);$activeOps[$id]=true;
+ jobCause($cat,$id,$o['message']??$key,$o['severity']??'WARNING',$now,'condition:'.($o['first']??$now),$job['evidenceSource']??'watchdog');
+ $cat['issues'][$id]['kind']='operational';
+}
+if($valid)foreach($cat['issues'] as $id=>&$issue)if(($issue['kind']??'')==='operational' && !isset($activeOps[$id]) && !($issue['resolvedAt']??0)){
+ resolveJobCause($issue,$now,'Docker watchdog confirmed that the exact job-evidence/deadline condition cleared with current valid evidence.');
+}unset($issue);
+$cat['runs']=array_filter($cat['runs'],fn($r)=>$r['finished']>=$cutoff);
+uasort($cat['runs'],fn($a,$b)=>$a['finished']<=>$b['finished']);
+if(count($cat['runs'])>128){$cat['droppedAt']=$now;$cat['runs']=array_slice($cat['runs'],-128,null,true);}
+$cat['issues']=array_filter($cat['issues'],fn($r)=>!($r['resolvedAt']??0)||$r['resolvedAt']>=$cutoff);
+if(count($cat['issues'])>256){uasort($cat['issues'],fn($a,$b)=>$a['lastSeen']<=>$b['lastSeen']);$cat['issues']=array_slice($cat['issues'],-256,null,true);$cat['droppedAt']=$now;}
+if($cat['coverage']['valid'])$cat['lastEvidenceAt']=$now;
+$cat['issues']=(object)$cat['issues'];$cat['runs']=(object)$cat['runs'];
+echo json_encode($cat,JSON_THROW_ON_ERROR|JSON_UNESCAPED_SLASHES);
+
+JOB_REVIEW_PHP
+        then
+            observe "$name:weekly-review-evidence" WARNING 'Weekly job catalogue could not be updated; previous findings retained; availability monitoring continues' 1 || return 1
+            mutate --arg name "$name" --argjson now "$NOW" '.jobs[$name].weeklyReviewError=$now' || return 1
+            continue
+        fi
+        mutate --arg name "$name" --argjson now "$NOW" --slurpfile review "$output" '.jobs //= {} | .jobs[$name] //= {firstSeen:$now,started:0,finished:0,success:0,result:"unknown",scanned:0,logState:{},runLog:{},history:[]} | .jobs[$name].weeklyReview=($review[0]+{containerName:$name}) | .jobs[$name].weeklyReviewError=0' || return 1
+    done
+}
+# END WEEKLY JOB REVIEW REDUCER
+
+weekly_job_delegates() {
+    local base='[]' extra='[]'
+    kometa_weekly_delegate_ready && base='["kometa","lometa"]'
+    if [[ "$STACK_WEEKLY_REPORTING" == true && -f "$KOMETA_WEEKLY_STATE" && ! -L "$KOMETA_WEEKLY_STATE" ]] &&
+       jq -e --argjson now "$NOW" '.schema==1 and (.reportCapabilities|index("scheduled-job-review-v1")!=null) and (.producerEvidenceOk|type)=="object" and .lastCheckedAt<=$now+300 and .lastCheckedAt>=$now-8*3600 and .nextDue>=$now-8*3600' "$KOMETA_WEEKLY_STATE" >/dev/null 2>&1;then
+        extra=$(jq -c --slurpfile state "$STATE_WORK" --argjson now "$NOW" '[.producerEvidenceOk|to_entries[]|select(.value==true)|.key as $name|
+          select(($state[0].jobs[$name].weeklyReview.profile|IN("recyclarr","imagemaid")) and ($state[0].jobs[$name].weeklyReviewError//0)==0 and
+                 $state[0].jobs[$name].weeklyReview.lastScanAt>=$now-3600 and ($state[0].inventory[$name].retiredAt//0)==0)|$name]' "$KOMETA_WEEKLY_STATE") || return 1
+    fi
+    jq -nc --argjson base "$base" --argjson extra "$extra" '$base+$extra|unique'
+}
+
 notify_changes() {
-    local current previous body importance=normal description delegate=false
-    kometa_weekly_delegate_ready && delegate=true
-    current="$(jq -cS --argjson delegate "$delegate" '. as $state | .observations | with_entries(select(.value.active) |
-        select(($delegate and (.key|test("^(kometa|lometa):job-(errors|warnings)$")))|not) |
+    local current previous body importance=normal description delegates
+    delegates=$(weekly_job_delegates) || return 1
+    current="$(jq -cS --argjson delegates "$delegates" '. as $state | .observations | with_entries(select(.value.active) |
+        select(((.key|split(":")[0]) as $name|($delegates|index($name))!=null and (.key|test(":job-(errors|warnings)$")))|not) |
         select((.key | test(":(availability|missing)$") | not) or
             (($state.flapping[(.key | split(":")[0])].unstable // false | not) and
              ($state.observations["monitor:shared-dependency"].active // false | not)))) | map_values(.severity)' "$STATE_WORK")" || return 1
-    previous="$(jq -cS --argjson delegate "$delegate" '.notification.issues | with_entries(select(($delegate and (.key|test("^(kometa|lometa):job-(errors|warnings)$")))|not))' "$STATE_WORK")" || return 1
+    previous="$(jq -cS --argjson delegates "$delegates" '.notification.issues | with_entries(select(((.key|split(":")[0]) as $name|($delegates|index($name))!=null and (.key|test(":job-(errors|warnings)$")))|not))' "$STATE_WORK")" || return 1
     local retired_pending
     retired_pending=$(jq -r '(.inventoryOutbox // {})|length' "$STATE_WORK")
     if [[ "$current" == "$previous" && "$retired_pending" == 0 ]]; then mutate --argjson current "$current" '.notification.issues=$current'; return $?; fi
@@ -2654,6 +2873,7 @@ main() {
         for spec in "${SERVICE_SPECS[@]}"; do FROZEN["${spec%%|*}"]=1; done
     fi
     finish_observations || return 1
+    update_weekly_job_reviews || return 1
     apply_flapping && evaluate_shared_failure || return 1
     if [[ "$failed" != true ]]; then
         for spec in "${RECOVERY_CANDIDATES[@]}"; do
