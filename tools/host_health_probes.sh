@@ -120,7 +120,7 @@ hh_external_observer() {
     [[ $(jq -r '.enabled' "$config") == true ]] || return 0
     target=$(jq -r '.sshTarget' "$config");installed=$(jq -r '.installedAt//0' "$config")
     [[ "$target" =~ ^[a-zA-Z0-9_-]+@[0-9.]+$ && "$installed" =~ ^[0-9]+$ ]] || { hh_observe monitor:external-observer warning 'External observer enrollment' 'Enrollment target or timestamp is invalid.' 3;return; }
-    if ! raw=$(timeout --kill-after=1 8 ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o ConnectTimeout=4 -o ConnectionAttempts=1 "$target" 'sudo -n /bin/cat /var/lib/hubble_availability_watchdog/state.json' 9>&- 2>/dev/null | head -c 65537) ||
+    if ! raw=$(timeout --kill-after=1 8 ssh -n -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o ConnectTimeout=4 -o ConnectionAttempts=1 "$target" 'sudo -n /bin/cat /var/lib/hubble_availability_watchdog/state.json' 9>&- 2>/dev/null | head -c 65537) ||
        (( ${#raw}>65536 )) || ! jq -e '.schema==1 and (.lastRun.epoch|type)=="number" and (.delivery|type)=="object"' <<< "$raw" >/dev/null 2>&1;then
         severity=warning;detail='Pi observer state could not be read or validated; its execution/mail coverage is unverified. No Pi or DNS restart was attempted.'
         ((now-installed>=900)) || severity=unknown

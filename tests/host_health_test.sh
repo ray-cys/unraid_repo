@@ -146,7 +146,7 @@ assert '.[0].severity=="critical"' "$HH_OBSERVATIONS" 'Firmware CPU critical lim
 HH_EXTERNAL_OBSERVER_CONFIG="$work/external-observer.json"
 printf '{"schema":1,"enabled":true,"sshTarget":"admin@192.0.2.100","installedAt":1}' > "$HH_EXTERNAL_OBSERVER_CONFIG";chmod 600 "$HH_EXTERNAL_OBSERVER_CONFIG"
 OBSERVER_FIXTURE=$(jq -nc --argjson now "$HH_NOW" '{schema:1,lastRun:{epoch:$now},delivery:{failures:0}}')
-timeout(){ printf '%s\n' "$OBSERVER_FIXTURE"; }
+timeout(){ [[ " $* " == *' ssh -n -T '* ]] || return 1;printf '%s\n' "$OBSERVER_FIXTURE"; }
 HH_OBSERVATIONS='[]';hh_external_observer
 assert '.[0].severity=="ok"' "$HH_OBSERVATIONS" 'External observer scan and delivery freshness validated'
 OBSERVER_FIXTURE=$(jq -nc --argjson now "$((HH_NOW-1000))" '{schema:1,lastRun:{epoch:$now},delivery:{failures:0}}')

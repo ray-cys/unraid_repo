@@ -78,6 +78,15 @@ class ObserverTests(unittest.TestCase):
   try:o,host=w['collect'](c,self.now)
   finally:w['run_command']=old
   self.assertIsNone(host);self.assertEqual(o['availability']['result'],'ok');self.assertEqual(o['probe_access']['result'],'bad');self.assertEqual(o['monitor_heartbeat']['result'],'unknown')
+ def test_ssh_probe_never_consumes_caller_stdin(self):
+  seen=[];old=w['run_command']
+  def fake(args,*a):
+   seen.append(args);return (255,'','unreachable') if args[0]=='ssh' else (0,'302','')
+  w['run_command']=fake
+  c={'sshBinary':'ssh','curlBinary':'curl','knownHosts':'/none','sshIdentity':'/none','target':'root@192.0.2.1','webUrl':'http://192.0.2.1/','expectedHostname':'Hubble'}
+  try:w['collect'](c,self.now)
+  finally:w['run_command']=old
+  self.assertIn('-n',seen[0]);self.assertIn('/dev/null',seen[0])
  def test_stale_wrong_boot_receipt(self):
   import json
   value={'schema':1,'name':'Hubble','bootId':'12345678-1234-1234-1234-123456789abc','epoch':self.now,'uptimeSeconds':20000,'fastWatchdog':{'status':'COMPLETE','bootId':'old','observedAt':self.now}}

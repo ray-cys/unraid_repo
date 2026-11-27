@@ -1,5 +1,5 @@
 #!/bin/bash
-# Hubble Availability Watchdog v1.0.0 — runs on the independent Raspberry Pi.
+# Hubble Availability Watchdog v1.0.1 — runs on the independent Raspberry Pi.
 # Purpose: report Hubble outages, stalled monitoring, web-interface failures and
 # observed reboots without depending on Hubble to send email. No host restart,
 # repair, wake, container action or configuration replay is performed.
@@ -19,7 +19,7 @@ exec /usr/bin/python3 - "$@" <<'PY'
 # BEGIN EXTERNAL WATCHDOG PYTHON
 import argparse, copy, datetime, email.message, email.utils, fcntl, hashlib, json
 import os, pathlib, re, stat, subprocess, sys, tempfile, time
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 ACTIVE_CONFIG = None
 
 
@@ -86,7 +86,7 @@ def run_command(args, timeout, data=None):
 
 
 def collect(c, now):
-    ssh=[c['sshBinary'],'-F','/dev/null','-T','-o','ControlMaster=no','-o','ControlPath=none','-o','BatchMode=yes','-o','IdentitiesOnly=yes','-o','StrictHostKeyChecking=yes',
+    ssh=[c['sshBinary'],'-F','/dev/null','-n','-T','-o','ControlMaster=no','-o','ControlPath=none','-o','BatchMode=yes','-o','IdentitiesOnly=yes','-o','StrictHostKeyChecking=yes',
          '-o','UpdateHostKeys=no','-o','ConnectTimeout=5','-o','ConnectionAttempts=1',
          '-o','ServerAliveInterval=3','-o','ServerAliveCountMax=1','-o','UserKnownHostsFile='+c['knownHosts'],
          '-i',c['sshIdentity'],c['target'],'external-status']

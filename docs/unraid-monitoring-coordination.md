@@ -85,7 +85,7 @@ active live policy. Arr API credentials remain private deployment values and are
 not published in GitHub. Deployment compares the executable logic after restoring
 only those existing API-key lines.
 
-## Daily storage and fast host ownership (health 3.3.1 / host watchdog 1.8.0)
+## Daily storage and fast host ownership (daily host monitor 3.4.0 / host watchdog 1.9.1)
 
 The User Scripts schedule remains the sole scheduler: `host_health_monitor` runs
 at **06:30 daily**, and `host_health_watchdog` at **five-minute intervals**. No new cron
