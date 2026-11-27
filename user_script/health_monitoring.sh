@@ -208,7 +208,7 @@ fi
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="3.0.0"
+readonly SCRIPT_VERSION="3.0.1"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -1063,8 +1063,7 @@ harden_managed_state_permissions() {
 external_config_log() {
     local level="$1"
     shift
-    printf '%s [CONFIG][%s] %s\n' \
-        "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" >&2
+    log "CONFIG" "$level" "$*"
 }
 
 trim_external_config_field() {
@@ -9019,7 +9018,7 @@ main() {
     run_collector smart "SMART/NVMe health" collector_step "SMART/NVMe collection" collect_smart_health
 
     log "BTRFS" "INFO" "Assessing scrub status"
-    run_collector btrfs_filesystem "Btrfs scrub" collect_btrfs_filesystem_phase
+    run_collector btrfs_filesystem "Btrfs scrub status" collect_btrfs_filesystem_phase
 
     log "CAPACITY" "INFO" "Collecting array, pool, and disk utilization"
     run_collector capacity "Capacity and parity" collect_capacity_phase
