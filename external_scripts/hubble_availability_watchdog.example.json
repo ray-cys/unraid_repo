@@ -1,0 +1,12 @@
+{
+  "target": "root@192.168.50.4",
+  "expectedHostname": "Hubble",
+  "sshIdentity": "/var/lib/hubble_availability_watchdog/ssh/id_ed25519",
+  "knownHosts": "/var/lib/hubble_availability_watchdog/ssh/known_hosts",
+  "recipient": "alerts@example.net",
+  "sender": "sender@example.net",
+  "mailAccount": "default",
+  "stateDirectory": "/var/lib/hubble_availability_watchdog",
+  "logDirectory": "/var/log/hubble_availability_watchdog",
+  "lockFile": "/run/hubble_availability_watchdog.lock"
+}

@@ -488,7 +488,7 @@ set -uo pipefail
 export LC_ALL=C
 umask 077
 
-readonly SCRIPT_VERSION="1.24.3"
+readonly SCRIPT_VERSION="1.24.4"
 
 ###############################################################################
 # CONFIGURATION
@@ -1570,11 +1570,11 @@ vault_export_operations_state() {
     (( total>0 )) || { exec {fd}>&-; log ERROR 'No current operational state found; empty export refused'; return 1; }
     # Point 7 remains excluded: do not change disk-health scheduling/code. Its
     # private config is copied under its existing lock, independently of logs.
-    local health_source="$scripts/health_monitoring/state/health_monitoring.conf" health_fd
+    local health_source="$scripts/host_health_monitor/state/host_health_monitor.conf" health_fd
     if [[ -f "$health_source" && ! -L "$health_source" ]]; then
-        exec {health_fd}>/run/health_monitoring.lock || { exec {fd}>&-; return 1; }
+        exec {health_fd}>/run/host_health_monitor.lock || { exec {fd}>&-; return 1; }
         if ! flock -n "$health_fd"; then exec {health_fd}>&-; exec {fd}>&-; return 1; fi
-        mkdir "$temp/health_monitoring" && cp -p "$health_source" "$temp/health_monitoring/health_monitoring.conf" || { exec {health_fd}>&-; exec {fd}>&-; return 1; }
+        mkdir "$temp/host_health_monitor" && cp -p "$health_source" "$temp/host_health_monitor/host_health_monitor.conf" || { exec {health_fd}>&-; exec {fd}>&-; return 1; }
         exec {health_fd}>&-
     fi
     cat >"$temp/RESTORE.txt" <<'RESTORE'

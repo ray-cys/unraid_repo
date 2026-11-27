@@ -87,7 +87,7 @@ only those existing API-key lines.
 
 ## Daily storage and fast host ownership (health 3.3.1 / host watchdog 1.8.0)
 
-The User Scripts schedule remains the sole scheduler: `health_monitoring` runs
+The User Scripts schedule remains the sole scheduler: `host_health_monitor` runs
 at **06:30 daily**, and `host_health_watchdog` at **five-minute intervals**. No new cron
 entry, daemon, package or User Script is required.
 
@@ -165,3 +165,20 @@ empty baseline or compatibility cron is left active. Completed backup snapshots,
 checksum manifests and original historical log messages retain their recorded
 provenance; the next normal recovery export includes the renamed ledger and host
 lifecycle mirror. Existing archives are not rewritten.
+
+## Daily monitor name and external observer
+
+The daily SMART/filesystem owner is `host_health_monitor` (06:30 daily), distinct
+from the five-minute `host_health_watchdog`. Its log/state directory, private
+`host_health_monitor.conf`, runtime lock, execution identity, UI schedule/category,
+backup audit and operational recovery export all use that name. Device identities,
+maintenance coverage, lifecycle journals and historical findings are retained;
+completed old backups/log messages retain their original provenance. Stable state
+format identifiers are not renamed or reinterpreted as a schema migration.
+
+The external Pi observer is maintained under `external_scripts/`, outside Hubble's
+User Scripts list. Its restricted Hubble endpoint is read-only, does not take the
+producer lock and cannot acknowledge or mutate incidents. Hubble also checks the
+Pi observer's execution/mail state, using explicit private enrollment metadata.
+See `external_scripts/README.md` for its schedule, retention, delivery semantics
+and maintenance CLI.

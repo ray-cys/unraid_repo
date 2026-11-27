@@ -440,14 +440,14 @@ US_CRON_VERIFY
 }
 # END EMBEDDED USER SCRIPTS CATALOG
 set -uo pipefail
-readonly SCRIPT_VERSION="1.14.2"
+readonly SCRIPT_VERSION="1.14.3"
 STATUS_DIR="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}"
 STATE_DIR="${STATE_DIR:-/mnt/vault/cloud/logs/script/backup_health_audit}"
 APPDATA_ROOT="${APPDATA_ROOT:-/mnt/vault/backup/cache}"
 FLASH_ROOT="${FLASH_ROOT:-/mnt/vault/backup/flash}"
 REMOTE_LOG_ROOT="${REMOTE_LOG_ROOT:-/mnt/vault/cloud/logs/script/backup_media_remote}"
 UNRAID_VERSION_FILE="${UNRAID_VERSION_FILE:-/etc/unraid-version}"
-DISK_HEALTH_RECEIPT="${DISK_HEALTH_RECEIPT:-/mnt/vault/cloud/logs/script/health_monitoring/state/monitor_receipt.json}"
+DISK_HEALTH_RECEIPT="${DISK_HEALTH_RECEIPT:-/mnt/vault/cloud/logs/script/host_health_monitor/state/monitor_receipt.json}"
 DISK_HEALTH_MAX_AGE_SECONDS=$((30*3600))
 NOTIFY_BIN="${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}"
 APPDATA_MAX_AGE_SECONDS=$((80*3600))
@@ -490,10 +490,10 @@ audit_script_active() {
 }
 
 audit_disk_health_monitor() {
-    audit_script_active health_monitoring || { ACTIONS+=("Optional health_monitoring checks retired: script absent or disabled; prior receipts retained");return 0; }
+    audit_script_active host_health_monitor || { ACTIONS+=("Optional host_health_monitor checks retired: script absent or disabled; prior receipts retained");return 0; }
     local epoch
     epoch=$(jq -er 'select(.schema == 1) | .lastCompleteEpoch | numbers' "$DISK_HEALTH_RECEIPT" 2>/dev/null) || epoch=0
-    check_age 'Disk health monitor' "$epoch" "$DISK_HEALTH_MAX_AGE_SECONDS" health_monitoring 7200
+    check_age 'Disk health monitor' "$epoch" "$DISK_HEALTH_MAX_AGE_SECONDS" host_health_monitor 7200
     if jq -e '.schema == 1 and .notification == "failed"' "$DISK_HEALTH_RECEIPT" >/dev/null 2>&1; then
         finding 'Disk health monitor: the latest notification could not be delivered'
     fi
@@ -656,7 +656,7 @@ audit_script_executions() {
         [[ -f "$record" ]] || record="$STATUS_DIR/execution/$role.json"
         first=$(jq -r --arg name "$name" '.scripts[$name].firstSeen' "$inventory")
         grace=600
-        case "$role" in backup_cache_appdata|health_monitoring) grace=7200;;backup_media_remote|backup_vault_remote) grace=21600;;media_integrity_audit) grace=10800;;media_cleanup) grace=3600;;media_plex_dbrepair) grace=21600;;esac
+        case "$role" in backup_cache_appdata|host_health_monitor) grace=7200;;backup_media_remote|backup_vault_remote) grace=21600;;media_integrity_audit) grace=10800;;media_cleanup) grace=3600;;media_plex_dbrepair) grace=21600;;esac
         window=$(usr_scripts_due_window "$AUDIT_CATALOG_FILE" "$role" "$NOW" "$grace" 288000) || { execution_finding "$role" "$name: execution cadence could not be validated";continue; }
         cutoff=$(jq -r .cutoff <<<"$window")
         if [[ ! -f "$record" ]];then

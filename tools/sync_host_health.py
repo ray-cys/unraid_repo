@@ -2,7 +2,7 @@
 from pathlib import Path
 import re
 root=Path(__file__).resolve().parents[1]
-for name in ['health_monitoring','host_health_watchdog']:
+for name in ['host_health_monitor','host_health_watchdog']:
  p=root/'user_script'/f'{name}.sh';s=p.read_text()
  for label,file in [('HOST HEALTH COMMON','host_health_common.sh')]+([('HOST HEALTH PROBES','host_health_probes.sh')] if name=='host_health_watchdog' else [('DISK HOST HEALTH','disk_host_health.sh')]):
   block=f'# BEGIN {label}\n'+(root/'tools'/file).read_text()+f'# END {label}\n'

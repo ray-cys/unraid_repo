@@ -52,10 +52,10 @@ timeout(){ printf 'xfs ro,relatime\n'; }
 assert '.readOnly' "$(hh_mount_info /fixture)" 'Exact read-only mount option is detected'
 unset -f timeout
 # Guard rejects absent vault without creating any persistent state or notifying.
-source "$ROOT/user_script/health_monitoring.sh"
+source "$ROOT/user_script/host_health_monitor.sh"
 HM_RAM_ROOT=$work;hh_mount_info(){ printf '{"mounted":false,"readOnly":false,"type":""}\n'; };hh_array_state(){ printf stopped; }
 if hm_storage_guard;then exit 1;fi
-assert '.healthy==false' "$(cat "$work/health-monitor-emergency.json")" 'Absent vault records only RAM emergency evidence'
+assert '.healthy==false' "$(cat "$work/host-health-monitor-emergency.json")" 'Absent vault records only RAM emergency evidence'
 # No native tests, disks, network actions or Unraid notifications are executed.
 # Native empty slots retain fsType; assigned or disabled slots still need mounts.
 cat > "$work/disks.ini" <<'INI'
@@ -141,5 +141,22 @@ assert 'length==1 and .[0].severity=="warning"' "$HH_OBSERVATIONS" 'CPU uses tru
 printf '101000\n' > "$cpu/temp1_input";HH_OBSERVATIONS='[]';hh_cpu
 assert '.[0].severity=="critical"' "$HH_OBSERVATIONS" 'Firmware CPU critical limit is recognized'
 # No test sends a notification or touches native network configuration.
+
+# The enrolled Pi is checked without reading its SMTP credentials or changing DNS.
+HH_EXTERNAL_OBSERVER_CONFIG="$work/external-observer.json"
+printf '{"schema":1,"enabled":true,"sshTarget":"admin@192.0.2.100","installedAt":1}' > "$HH_EXTERNAL_OBSERVER_CONFIG";chmod 600 "$HH_EXTERNAL_OBSERVER_CONFIG"
+OBSERVER_FIXTURE=$(jq -nc --argjson now "$HH_NOW" '{schema:1,lastRun:{epoch:$now},delivery:{failures:0}}')
+timeout(){ printf '%s\n' "$OBSERVER_FIXTURE"; }
+HH_OBSERVATIONS='[]';hh_external_observer
+assert '.[0].severity=="ok"' "$HH_OBSERVATIONS" 'External observer scan and delivery freshness validated'
+OBSERVER_FIXTURE=$(jq -nc --argjson now "$((HH_NOW-1000))" '{schema:1,lastRun:{epoch:$now},delivery:{failures:0}}')
+HH_OBSERVATIONS='[]';hh_external_observer
+assert '.[0].severity=="warning"' "$HH_OBSERVATIONS" 'Stopped Pi cron cannot remain silently healthy'
+OBSERVER_FIXTURE=$(jq -nc --argjson now "$HH_NOW" '{schema:1,lastRun:{epoch:$now},delivery:{failures:2}}')
+HH_OBSERVATIONS='[]';hh_external_observer
+assert '.[0].severity=="warning" and (.[0].detail|contains("SMTP"))' "$HH_OBSERVATIONS" 'Pi mail submission failure is visible from Hubble'
+printf '{"schema":1,"enabled":false}' > "$HH_EXTERNAL_OBSERVER_CONFIG"
+HH_OBSERVATIONS='[]';hh_external_observer
+assert 'length==0' "$HH_OBSERVATIONS" 'Explicitly retired external observer requires no code edit'
 
 printf '%s native host-health fixtures passed.\n' "$count"

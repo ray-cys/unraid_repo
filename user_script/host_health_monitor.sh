@@ -2,7 +2,7 @@
 #clearLog=true
 # shellcheck disable=SC2034,SC2155
 # BEGIN EMBEDDED OPERATIONS CONTRACT
-OPS_SCRIPT_ID="health_monitoring"
+OPS_SCRIPT_ID="host_health_monitor"
 # shellcheck shell=bash
 # Embedded operations contract v2; generated into standalone User Scripts.
 # Millisecond timing without spawning date on supported Bash; GNU fallback.
@@ -208,13 +208,13 @@ fi
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="3.3.1"
+readonly SCRIPT_VERSION="3.4.0"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
 
 if (( BASH_VERSINFO[0] < 4 )); then
-    printf 'health_monitoring.sh requires Bash 4 or newer (found %s).\n' \
+    printf 'host_health_monitor.sh requires Bash 4 or newer (found %s).\n' \
         "${BASH_VERSION:-unknown}" >&2
     exit 2
 fi
@@ -356,8 +356,8 @@ COLLECTOR_FAILURE_NOTIFICATIONS=1               # Add a warning finding when a c
 # === Phase 15 Soak Evidence ===
 
 # === Paths / Integration ===
-LOG_DIR="/mnt/vault/cloud/logs/script/health_monitoring" # Deployed run logs and persistent state
-LOCK_FILE="/run/health_monitoring.lock"          # Root-controlled non-blocking single-instance lock
+LOG_DIR="/mnt/vault/cloud/logs/script/host_health_monitor" # Deployed run logs and persistent state
+LOCK_FILE="/run/host_health_monitor.lock"          # Root-controlled non-blocking single-instance lock
 NOTIFY_BIN="/usr/local/emhttp/webGui/scripts/notify"
 
 # === Temperature Trend / Rate Thresholds (Global) ===
@@ -692,8 +692,8 @@ SMART_TEST_TRACKING_FILE="$STATE_DIR/devices/smart_test_schedule.json"
 DOCKER_SCRUB_TRACKING_FILE="$STATE_DIR/filesystems/docker_scrub.json"
 SMART_BASELINES_FILE="$STATE_DIR/devices/smart_baselines.json"
 ENDURANCE_INVENTORY_FILE="$STATE_DIR/devices/endurance.json"
-EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
-LEGACY_EXTERNAL_CONFIG_FILE="$LOG_DIR/health_monitoring.conf"
+EXTERNAL_CONFIG_FILE="$STATE_DIR/host_health_monitor.conf"
+LEGACY_EXTERNAL_CONFIG_FILE="$LOG_DIR/host_health_monitor.conf"
 STATE_BACKUP_DIR="$STATE_DIR/backups"
 
 # === Categorized Timestamp Logging ===
@@ -929,7 +929,7 @@ validate_managed_file_target() {
 # only this exact directory and regular, single-link configuration file before
 # parsing. Symbolic links, hard links, and unexpected path layouts still fail.
 harden_existing_external_config_path() {
-    local expected="$STATE_DIR/health_monitoring.conf"
+    local expected="$STATE_DIR/host_health_monitor.conf"
 
     if [[ "$EXTERNAL_CONFIG_FILE" != "$expected" ]]; then
         PATH_VALIDATION_REASON="external configuration is outside the managed state directory"
@@ -2412,7 +2412,7 @@ acquire_lock() {
         lock_rc=$?
     fi
     if (( lock_rc == 75 )); then
-        printf '%s [LOCK][INFO] Another health_monitoring.sh run is active; exiting (lock: %s)\n' \
+        printf '%s [LOCK][INFO] Another host_health_monitor.sh run is active; exiting (lock: %s)\n' \
             "$(date '+%Y-%m-%d %H:%M:%S')" \
             "$LOCK_FILE" >&2
         return 75
@@ -2462,7 +2462,7 @@ initialize_runtime() {
     MASTER_LOG="$LOG_DIR/disk_health_${RUN_STAMP}_$$.log"
     secure_create_file "$MASTER_LOG" || return 1
 
-    RUN_DIR="$(mktemp -d /tmp/health_monitoring.XXXXXX)" || {
+    RUN_DIR="$(mktemp -d /tmp/host_health_monitor.XXXXXX)" || {
         log "INIT" "ERROR" "Unable to create run workspace"
         return 1
     }
@@ -9131,20 +9131,20 @@ print_usage() {
     printf 'Disk Health Monitor for Unraid v%s\n\n' "$SCRIPT_VERSION"
     cat <<'USAGE'
 Usage:
-  health_monitoring.sh                 Run normal monitoring
-  health_monitoring.sh --check-config  Validate configuration only
-  health_monitoring.sh --state-status  Inspect state-schema compatibility
-  health_monitoring.sh --state-backups List migration and rollback backups
-  health_monitoring.sh --rollback-state BACKUP_ID
+  host_health_monitor.sh                 Run normal monitoring
+  host_health_monitor.sh --check-config  Validate configuration only
+  host_health_monitor.sh --state-status  Inspect state-schema compatibility
+  host_health_monitor.sh --state-backups List migration and rollback backups
+  host_health_monitor.sh --rollback-state BACKUP_ID
                                        Restore one explicit state backup and exit
-  health_monitoring.sh --diagnostics   Run read-only environment diagnostics
-  health_monitoring.sh --self-test     Run tests/health_monitoring_test.sh from a full checkout
-  health_monitoring.sh --test-notification
+  host_health_monitor.sh --diagnostics   Run read-only environment diagnostics
+  host_health_monitor.sh --self-test     Run tests/host_health_monitor_test.sh from a full checkout
+  host_health_monitor.sh --test-notification
                                        Send one notification without monitoring or state changes
-  health_monitoring.sh --notification-dry-run
+  host_health_monitor.sh --notification-dry-run
                                        Run monitoring but skip delivery and notification-journal changes
-  health_monitoring.sh --version       Print the script version
-  health_monitoring.sh --help          Show this help
+  host_health_monitor.sh --version       Print the script version
+  host_health_monitor.sh --help          Show this help
 
 The configuration, state-status, state-backups, diagnostics and self-test
 modes do not run SMART commands against disks, start tests or scrubs, write monitoring state,
@@ -9163,7 +9163,7 @@ for backups, database repair, parity, Mover and running scrubs/tests as applicab
 Starts are journaled before dispatch; success requires a changed native result.
 Historical results are not assigned fabricated completion dates. Healthy runs
 remain quiet. Schedule and policy defaults are documented in the script header
-and load_builtin_defaults(); supported overrides use STATE_DIR/health_monitoring.conf.
+and load_builtin_defaults(); supported overrides use STATE_DIR/host_health_monitor.conf.
 USAGE
 }
 
@@ -9274,7 +9274,7 @@ run_diagnostics() {
     diagnostic_result INFO "Kernel" "$(uname -sr 2>/dev/null || printf 'unknown')"
     diagnostic_result INFO "Command deadlines" \
         "SMART=${SMARTCTL_TIMEOUT_SECONDS}s Btrfs=${BTRFS_COMMAND_TIMEOUT_SECONDS}s System=${SYSTEM_COMMAND_TIMEOUT_SECONDS}s Notify=${NOTIFICATION_TIMEOUT_SECONDS}s"
-    diagnostic_result INFO "Regression fixtures" "run tests/health_monitoring_test.sh from the repository"
+    diagnostic_result INFO "Regression fixtures" "run tests/host_health_monitor_test.sh from the repository"
 
     if inspect_state_schema_manifest; then
         diagnostic_result PASS "State schema" "$STATE_SCHEMA_DETAIL"
@@ -9543,12 +9543,12 @@ hh_fast_receipt_owns() {
 hm_emergency() {
     local healthy="$1" detail="$2" root="${HM_RAM_ROOT:-/run}" value tmp old=0 now boot
     now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id)
-    [[ -d "$root" && ! -L "$root/health-monitor-emergency.json" ]] || return 1
+    [[ -d "$root" && ! -L "$root/host-health-monitor-emergency.json" ]] || return 1
     value=$(jq -nc --argjson healthy "$healthy" --arg detail "$detail" --arg boot "$boot" --argjson now "$now" '{schema:1,bootId:$boot,observedAt:$now,healthy:$healthy,detail:$detail}') || return 1
     tmp=$(mktemp "$root/.health-state.XXXXXX") || return 1
-    printf '%s\n' "$value" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$root/health-monitor-emergency.json" || { rm -f "$tmp";return 1; }
+    printf '%s\n' "$value" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$root/host-health-monitor-emergency.json" || { rm -f "$tmp";return 1; }
     if [[ "$healthy" == false ]] && ! hh_fast_receipt_owns mount:/mnt/vault "$now" && [[ "$(hh_array_state)" == started ]];then
-        [[ ! -f "$root/health-state-alert.epoch" || -L "$root/health-state-alert.epoch" ]] || read -r old < "$root/health-state-alert.epoch"
+        [[ ! -f "$root/host-health-monitor-alert.epoch" || -L "$root/host-health-monitor-alert.epoch" ]] || read -r old < "$root/host-health-monitor-alert.epoch"
         [[ "$old" =~ ^[0-9]+$ ]] || old=0
         if ((now-old>=86400)) && [[ -x /usr/local/emhttp/webGui/scripts/notify ]];then
             if timeout --kill-after=5 30 /usr/local/emhttp/webGui/scripts/notify -i alert -s 'Unraid disk health' -d 'Persistent health state unavailable' -m "Status: ATTENTION
@@ -9558,7 +9558,7 @@ Actions and findings:
 $detail
 No persistent state, migration or disk maintenance was performed. RAM emergency evidence was recorded; restore the vault mount before retrying.";then
                 tmp=$(mktemp "$root/.health-alert.XXXXXX") || return 1
-                printf '%s\n' "$now" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$root/health-state-alert.epoch" || return 1
+                printf '%s\n' "$now" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$root/host-health-monitor-alert.epoch" || return 1
             fi
         fi
     fi
@@ -9698,9 +9698,9 @@ main() {
             ;;
         self-test)
             local test_suite
-            test_suite="$(dirname -- "${BASH_SOURCE[0]}")/../tests/health_monitoring_test.sh"
-            if [[ "${BASH_SOURCE[0]##*/}" != health_monitoring.sh || ! -f "$test_suite" ]]; then
-                printf '%s\n' 'Regression fixtures are packaged in the repository. Run bash tests/health_monitoring_test.sh from a checkout; use --diagnostics for the installed monitor.' >&2
+            test_suite="$(dirname -- "${BASH_SOURCE[0]}")/../tests/host_health_monitor_test.sh"
+            if [[ "${BASH_SOURCE[0]##*/}" != host_health_monitor.sh || ! -f "$test_suite" ]]; then
+                printf '%s\n' 'Regression fixtures are packaged in the repository. Run bash tests/host_health_monitor_test.sh from a checkout; use --diagnostics for the installed monitor.' >&2
                 return 2
             fi
             bash "$test_suite"

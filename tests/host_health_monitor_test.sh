@@ -4,8 +4,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=../user_script/health_monitoring.sh
-source "$REPO_ROOT/user_script/health_monitoring.sh"
+# shellcheck source=../user_script/host_health_monitor.sh
+source "$REPO_ROOT/user_script/host_health_monitor.sh"
 
 readonly REGRESSION_FIXTURE_COUNT=129
 
@@ -30,11 +30,11 @@ run_regression_tests() (
     SELF_TEST_PASSED=0
     SELF_TEST_FAILED=0
 
-    fixture_dir=$(mktemp -d /tmp/health_monitoring.selftest.XXXXXX) || {
+    fixture_dir=$(mktemp -d /tmp/host_health_monitor.selftest.XXXXXX) || {
         printf '[FAIL] Unable to create self-test fixture directory\n'
         return 1
     }
-    trap '[[ -z "$fixture_dir" || "$fixture_dir" != /tmp/health_monitoring.selftest.* ]] || rm -rf -- "$fixture_dir"' EXIT
+    trap '[[ -z "$fixture_dir" || "$fixture_dir" != /tmp/host_health_monitor.selftest.* ]] || rm -rf -- "$fixture_dir"' EXIT
 
     # Rebase EVERY derived default path before the first fixture. Changing only
     # STATE_DIR leaves STATE_BACKUP_DIR and other precomputed paths on the host.
@@ -286,8 +286,8 @@ run_regression_tests() (
         self_test_result 0 "Built-in defaults and schema constants"
     fi
 
-    if [[ "$EXTERNAL_CONFIG_FILE" == "$STATE_DIR/health_monitoring.conf" &&
-          "$LEGACY_EXTERNAL_CONFIG_FILE" == "$LOG_DIR/health_monitoring.conf" &&
+    if [[ "$EXTERNAL_CONFIG_FILE" == "$STATE_DIR/host_health_monitor.conf" &&
+          "$LEGACY_EXTERNAL_CONFIG_FILE" == "$LOG_DIR/host_health_monitor.conf" &&
           "$EXTERNAL_CONFIG_FILE" != "$LEGACY_EXTERNAL_CONFIG_FILE" ]]
     then
         self_test_result 1 "External configuration uses private state directory"
@@ -454,10 +454,10 @@ run_regression_tests() (
     mkdir -p "$legacy_config_dir" "$private_config_dir"
     chmod 2775 "$legacy_config_dir"
     chmod 700 "$private_config_dir"
-    LEGACY_EXTERNAL_CONFIG_FILE="$legacy_config_dir/health_monitoring.conf"
+    LEGACY_EXTERNAL_CONFIG_FILE="$legacy_config_dir/host_health_monitor.conf"
     # These fixture-only mutations are isolated by run_regression_tests().
     # shellcheck disable=SC2030
-    EXTERNAL_CONFIG_FILE="$private_config_dir/health_monitoring.conf"
+    EXTERNAL_CONFIG_FILE="$private_config_dir/host_health_monitor.conf"
     printf 'SMART_ALLOW_SPINUP=1\n' > "$LEGACY_EXTERNAL_CONFIG_FILE"
     # shellcheck disable=SC2030
     SMART_ALLOW_SPINUP=0
@@ -477,7 +477,7 @@ run_regression_tests() (
     fixture_real=$(cd "$fixture_dir" && pwd -P)
     local config_repair_state="$fixture_real/config-repair-state"
     STATE_DIR="$config_repair_state"
-    EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+    EXTERNAL_CONFIG_FILE="$STATE_DIR/host_health_monitor.conf"
     mkdir -p "$STATE_DIR"
     printf 'SMART_ALLOW_SPINUP=0\n' > "$EXTERNAL_CONFIG_FILE"
     chmod 2775 "$STATE_DIR"
@@ -500,7 +500,7 @@ run_regression_tests() (
     mkdir -p "$config_link_real"
     ln -s "$config_link_real" "$config_link_state"
     STATE_DIR="$config_link_state"
-    EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+    EXTERNAL_CONFIG_FILE="$STATE_DIR/host_health_monitor.conf"
     if ! harden_existing_external_config_path &&
        [[ "$PATH_VALIDATION_REASON" == *"symbolic-link component"* ]]
     then
@@ -515,7 +515,7 @@ run_regression_tests() (
     chmod 700 "$config_fixture_dir"
     # These fixture-only mutations are isolated by run_regression_tests().
     # shellcheck disable=SC2030
-    EXTERNAL_CONFIG_FILE="$config_fixture_dir/health_monitoring.conf"
+    EXTERNAL_CONFIG_FILE="$config_fixture_dir/host_health_monitor.conf"
     printf '%s\n' \
         'SMART_ALLOW_SPINUP=1' \
         'WARN_THRESHOLD_PERCENT=95' \
@@ -611,7 +611,7 @@ run_regression_tests() (
     local lock_fixture_passed=0
     mkdir -p "$lock_fixture_dir"
     chmod 700 "$lock_fixture_dir"
-    LOCK_FILE="$lock_fixture_dir/health_monitoring.lock"
+    LOCK_FILE="$lock_fixture_dir/host_health_monitor.lock"
     if acquire_lock; then
         if ! flock -n "$LOCK_FILE" true 2>/dev/null; then
             lock_fixture_passed=1
@@ -631,7 +631,7 @@ run_regression_tests() (
     local migration_backup_id backup_output backup_count
     STATE_DIR="$migration_dir/state"
     STATE_BACKUP_DIR="$STATE_DIR/backups"
-    EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+    EXTERNAL_CONFIG_FILE="$STATE_DIR/host_health_monitor.conf"
     STATE_SCHEMA_MANIFEST_FILE="$STATE_DIR/state_schema.manifest"
     DEVICE_ID_SCHEMA_FILE="$STATE_DIR/device_identity_schema.version"
     mkdir -p "$STATE_BACKUP_DIR"
@@ -2086,7 +2086,7 @@ run_regression_tests() (
         local DOCKER_SCRUB_TRACKING_FILE="$STATE_DIR/filesystems/docker_scrub.json"
         local SMART_BASELINES_FILE="$STATE_DIR/devices/smart_baselines.json"
         local ENDURANCE_INVENTORY_FILE="$STATE_DIR/devices/endurance.json"
-        local EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+        local EXTERNAL_CONFIG_FILE="$STATE_DIR/host_health_monitor.conf"
         local STATE_BACKUP_DIR="$STATE_DIR/backups"
         local SMART_LONG_STATE_FILE="$STATE_DIR/devices/smart_long_processed.log"
         local SMART_LONG_LAST_POH_FILE="$STATE_DIR/devices/smart_long_last.log"
@@ -2152,7 +2152,7 @@ run_regression_tests() (
         local DOCKER_SCRUB_TRACKING_FILE="$STATE_DIR/filesystems/docker_scrub.json"
         local SMART_BASELINES_FILE="$STATE_DIR/devices/smart_baselines.json"
         local ENDURANCE_INVENTORY_FILE="$STATE_DIR/devices/endurance.json"
-        local EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+        local EXTERNAL_CONFIG_FILE="$STATE_DIR/host_health_monitor.conf"
         local STATE_BACKUP_DIR="$STATE_DIR/backups"
         local SMART_LONG_STATE_FILE="$STATE_DIR/devices/smart_long_processed.log"
         local SMART_LONG_LAST_POH_FILE="$STATE_DIR/devices/smart_long_last.log"
@@ -2203,7 +2203,7 @@ run_regression_tests() (
         local DOCKER_SCRUB_TRACKING_FILE="$STATE_DIR/filesystems/docker_scrub.json"
         local SMART_BASELINES_FILE="$STATE_DIR/devices/smart_baselines.json"
         local ENDURANCE_INVENTORY_FILE="$STATE_DIR/devices/endurance.json"
-        local EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+        local EXTERNAL_CONFIG_FILE="$STATE_DIR/host_health_monitor.conf"
         local STATE_BACKUP_DIR="$STATE_DIR/backups"
         local SMART_LONG_STATE_FILE="$STATE_DIR/devices/smart_long_processed.log"
         local SMART_LONG_LAST_POH_FILE="$STATE_DIR/devices/smart_long_last.log"
@@ -2254,7 +2254,7 @@ run_regression_tests() (
         local DOCKER_SCRUB_TRACKING_FILE="$STATE_DIR/filesystems/docker_scrub.json"
         local SMART_BASELINES_FILE="$STATE_DIR/devices/smart_baselines.json"
         local ENDURANCE_INVENTORY_FILE="$STATE_DIR/devices/endurance.json"
-        local EXTERNAL_CONFIG_FILE="$STATE_DIR/health_monitoring.conf"
+        local EXTERNAL_CONFIG_FILE="$STATE_DIR/host_health_monitor.conf"
         local STATE_BACKUP_DIR="$STATE_DIR/backups"
         local SMART_LONG_STATE_FILE="$STATE_DIR/devices/smart_long_processed.log"
         local SMART_LONG_LAST_POH_FILE="$STATE_DIR/devices/smart_long_last.log"

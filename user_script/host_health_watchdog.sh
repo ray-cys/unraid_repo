@@ -254,7 +254,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
 set -uo pipefail
-readonly SCRIPT_VERSION="1.8.0"
+readonly SCRIPT_VERSION="1.9.0"
 
 
 ###############################################################################
@@ -1460,6 +1460,29 @@ hh_network() {
         fi
     done
 }
+# Optional external-observer enrollment. Read the Pi's atomic runtime state with
+# the existing management SSH identity; never invoke a repair or expose mail keys.
+hh_external_observer() {
+    local config="${HH_EXTERNAL_OBSERVER_CONFIG:-/boot/config/plugins/user.scripts/scripts/host_health_watchdog/external-observer.json}" target installed raw now="$HH_NOW" severity=ok detail
+    [[ -e "$config" ]] || return 0
+    if [[ -L "$config" || $(stat -c %u "$config") != "$EUID" ]] ||
+       ! jq -e '.schema==1 and (.enabled|type)=="boolean"' "$config" >/dev/null 2>&1;then
+        hh_observe monitor:external-observer warning 'External observer enrollment' 'External observer configuration is unsafe or invalid; no remote command was attempted.' 3;return
+    fi
+    [[ $(jq -r '.enabled' "$config") == true ]] || return 0
+    target=$(jq -r '.sshTarget' "$config");installed=$(jq -r '.installedAt//0' "$config")
+    [[ "$target" =~ ^[a-zA-Z0-9_-]+@[0-9.]+$ && "$installed" =~ ^[0-9]+$ ]] || { hh_observe monitor:external-observer warning 'External observer enrollment' 'Enrollment target or timestamp is invalid.' 3;return; }
+    if ! raw=$(timeout --kill-after=1 8 ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o ConnectTimeout=4 -o ConnectionAttempts=1 "$target" 'sudo -n /bin/cat /var/lib/hubble_availability_watchdog/state.json' 9>&- 2>/dev/null | head -c 65537) ||
+       (( ${#raw}>65536 )) || ! jq -e '.schema==1 and (.lastRun.epoch|type)=="number" and (.delivery|type)=="object"' <<< "$raw" >/dev/null 2>&1;then
+        severity=warning;detail='Pi observer state could not be read or validated; its execution/mail coverage is unverified. No Pi or DNS restart was attempted.'
+        ((now-installed>=900)) || severity=unknown
+    elif ! jq -e --argjson now "$now" '.lastRun.epoch<=$now+300 and .lastRun.epoch>=$now-600' <<< "$raw" >/dev/null;then
+        severity=warning;detail='Pi observer execution is stale (over ten minutes) or its clock disagrees; inspect its cron/service. No stale result was declared current.'
+    elif jq -e '(.delivery.failures//0)>0' <<< "$raw" >/dev/null;then
+        severity=warning;detail='Pi observer is running but independent SMTP delivery is failing; pending outage/recovery events remain queued for retry.'
+    else detail='Pi observer has a recent completed scan; no outstanding SMTP delivery failure is recorded.';fi
+    hh_observe monitor:external-observer "$severity" 'External Hubble observer' "$detail" 3
+}
 hh_collect() {
     local path info severity type uptime available total percent emergency metrics usage show uuid member rotational all_ssd
     HH_OBSERVATIONS='[]';uptime=${HH_UPTIME:-$(cut -d. -f1 "$HH_PROC_ROOT/uptime")}
@@ -1500,8 +1523,8 @@ hh_collect() {
         percent=$((100*available/total));severity=ok;((percent<10)) && severity=warning;((percent<3)) && severity=critical
         hh_observe memory "$severity" 'Available memory' "MemAvailable=${percent}% (${available}KiB of ${total}KiB); reclaimable cache is included." 2
     else hh_observe memory unknown 'Available memory' 'MemAvailable could not be read.';fi
-    hh_cpu;hh_network
-    emergency="$HH_RAM_ROOT/health-monitor-emergency.json"
+    hh_cpu;hh_network;hh_external_observer
+    emergency="$HH_RAM_ROOT/host-health-monitor-emergency.json"
     if [[ -f "$emergency" && ! -L "$emergency" ]] && jq -e --arg boot "$HH_BOOT" '.bootId==$boot and (.healthy|type)=="boolean"' "$emergency" >/dev/null 2>&1;then
         severity=$(jq -r 'if .healthy then "ok" else "critical" end' "$emergency")
         hh_observe monitor:disk-state "$severity" 'Daily disk monitor state access' "$(jq -r '.detail' "$emergency")" 1
@@ -1570,10 +1593,26 @@ hh_flush() {
 }
 # END HOST HEALTH PROBES
 
+
+# Restricted SSH endpoint for the Pi. Reads only RAM/native status; does not
+# initialize state, take the producer lock, acknowledge incidents or notify.
+host_external_status() {
+    local now boot uptime receipt='{}' file="${HH_FAST_RECEIPT:-/run/host-health-receipt.json}"
+    now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id);uptime=$(cut -d. -f1 /proc/uptime)
+    if [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file") == "$EUID" && $(stat -c %h "$file") == 1 ]] &&
+       jq -e '.schema==1 and (.observedAt|type)=="number"' "$file" >/dev/null 2>&1;then
+        receipt=$(jq -c '{bootId,observedAt,status,activeConditions}' "$file") || receipt='{}'
+    fi
+    jq -nc --arg name "$(hostname)" --arg boot "$boot" --arg array "$(hh_array_state)" \
+        --arg version "$SCRIPT_VERSION" --argjson epoch "$now" --argjson uptime "$uptime" --argjson receipt "$receipt" \
+        '{schema:1,name:$name,bootId:$boot,epoch:$epoch,uptimeSeconds:$uptime,arrayState:$array,probeVersion:$version,fastWatchdog:$receipt}'
+}
+
 main() {
     local final_exit=0
     case "${1:-}" in
       --version) printf 'host_health_watchdog.sh %s\n' "$SCRIPT_VERSION"; return 0 ;;
+      --external-status) [[ $# == 1 ]] || return 2; host_external_status;return ;;
       ''|--open-xfs|--ack-xfs) ;;
       *) return 2 ;;
     esac

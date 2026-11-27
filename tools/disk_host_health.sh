@@ -5,12 +5,12 @@
 hm_emergency() {
     local healthy="$1" detail="$2" root="${HM_RAM_ROOT:-/run}" value tmp old=0 now boot
     now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id)
-    [[ -d "$root" && ! -L "$root/health-monitor-emergency.json" ]] || return 1
+    [[ -d "$root" && ! -L "$root/host-health-monitor-emergency.json" ]] || return 1
     value=$(jq -nc --argjson healthy "$healthy" --arg detail "$detail" --arg boot "$boot" --argjson now "$now" '{schema:1,bootId:$boot,observedAt:$now,healthy:$healthy,detail:$detail}') || return 1
     tmp=$(mktemp "$root/.health-state.XXXXXX") || return 1
-    printf '%s\n' "$value" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$root/health-monitor-emergency.json" || { rm -f "$tmp";return 1; }
+    printf '%s\n' "$value" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$root/host-health-monitor-emergency.json" || { rm -f "$tmp";return 1; }
     if [[ "$healthy" == false ]] && ! hh_fast_receipt_owns mount:/mnt/vault "$now" && [[ "$(hh_array_state)" == started ]];then
-        [[ ! -f "$root/health-state-alert.epoch" || -L "$root/health-state-alert.epoch" ]] || read -r old < "$root/health-state-alert.epoch"
+        [[ ! -f "$root/host-health-monitor-alert.epoch" || -L "$root/host-health-monitor-alert.epoch" ]] || read -r old < "$root/host-health-monitor-alert.epoch"
         [[ "$old" =~ ^[0-9]+$ ]] || old=0
         if ((now-old>=86400)) && [[ -x /usr/local/emhttp/webGui/scripts/notify ]];then
             if timeout --kill-after=5 30 /usr/local/emhttp/webGui/scripts/notify -i alert -s 'Unraid disk health' -d 'Persistent health state unavailable' -m "Status: ATTENTION
@@ -20,7 +20,7 @@ Actions and findings:
 $detail
 No persistent state, migration or disk maintenance was performed. RAM emergency evidence was recorded; restore the vault mount before retrying.";then
                 tmp=$(mktemp "$root/.health-alert.XXXXXX") || return 1
-                printf '%s\n' "$now" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$root/health-state-alert.epoch" || return 1
+                printf '%s\n' "$now" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$root/host-health-monitor-alert.epoch" || return 1
             fi
         fi
     fi

@@ -99,8 +99,8 @@ its failure is reported independently of completed data processing.
 | --- | --- | --- |
 | `backup_health_audit` | `20 * * * *` | Local freshness, pending ISS delivery, restore drills, runtime compatibility, and disk-monitor completion. Changed incidents/recovery and at most daily reminders. |
 
-Hubble's `health_monitoring` runs at 06:30 daily and writes
-`/mnt/vault/cloud/logs/script/health_monitoring/state/monitor_receipt.json`.
+Hubble's `host_health_monitor` runs at 06:30 daily and writes
+`/mnt/vault/cloud/logs/script/host_health_monitor/state/monitor_receipt.json`.
 The hourly audit alerts if the monitor has no completed run in 30 hours or if
 the latest notification failed. The receipt separates an attempted run from a
 completed check, so an early exit or stalled run cannot refresh the completion
@@ -108,9 +108,9 @@ timestamp. The audit uses the existing schedule and only watches while Hubble
 is online and its vault is mounted.
 
 Disk Health Monitor v2.18.0 keeps the regression fixtures in
-`tests/health_monitoring_test.sh`. Run that file with Bash from a checkout on
+`tests/host_health_monitor_test.sh`. Run that file with Bash from a checkout on
 Unraid or a Linux environment with the monitor's fixture dependencies. Only
-`user_script/health_monitoring.sh` is required for the installed User Script.
+`user_script/host_health_monitor.sh` is required for the installed User Script.
 Use `bash script --diagnostics` on the installed copy to inspect configuration,
 dependencies, and soak status without running SMART tests.
 

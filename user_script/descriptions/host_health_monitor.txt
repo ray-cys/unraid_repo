@@ -1,0 +1,1 @@
+Run SMART tests, parse SMART/NVMe attributes, track SSD endurance, capture filesystem health, evaluate capacity growth, detect firmware/regression events, surface I/O error frequency, and emit concise notifications<br>

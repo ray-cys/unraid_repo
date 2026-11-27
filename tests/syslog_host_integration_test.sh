@@ -5,6 +5,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d /tmp/syslog-host-test.XXXXXX) || exit 1
 trap 'rm -rf "$work"' EXIT
 HH_RAM_ROOT=$work;HH_MIRROR="$work/mirror.json"
+HH_EXTERNAL_OBSERVER_CONFIG="$work/no-enrolled-pi.json"
 source "$ROOT/user_script/host_health_watchdog.sh"
 log(){ :; }
 # The only delivery function is intercepted before any notification can occur.
@@ -29,4 +30,10 @@ jq -e '.conditions.fixture.pending==""' <<< "$HH_STATE" >/dev/null || exit 1
 hh_flush || exit 1
 [[ $(grep -c 'Host conditions:' "$work/delivery") == 2 ]] || exit 1
 printf '[PASS] Successful delivery groups host/syslog evidence once and consumes only delivered events\n'
-printf '4 host/syslog integration fixtures passed; no notifications sent.\n'
+HH_FAST_RECEIPT="$work/host-health-receipt.json"
+before=$(sha256sum "$HH_FAST_RECEIPT" | cut -d ' ' -f1)
+host_external_status > "$work/external-status.json" || exit 1
+jq -e '.schema==1 and (.bootId|type)=="string" and (.epoch|type)=="number" and (.uptimeSeconds|type)=="number"' "$work/external-status.json" >/dev/null || exit 1
+[[ $(sha256sum "$HH_FAST_RECEIPT"|cut -d ' ' -f1) == "$before" ]] || exit 1
+printf '[PASS] Restricted external status endpoint returns bounded identity/freshness without changing producer state\n'
+printf '5 host/syslog integration fixtures passed; no notifications sent.\n'
