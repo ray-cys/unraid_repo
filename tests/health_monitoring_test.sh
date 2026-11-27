@@ -7,7 +7,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../user_script/health_monitoring.sh
 source "$REPO_ROOT/user_script/health_monitoring.sh"
 
-readonly REGRESSION_FIXTURE_COUNT=105
+readonly REGRESSION_FIXTURE_COUNT=103
 
 self_test_result() {
     local passed="$1" name="$2" detail="${3:-}"
@@ -142,23 +142,6 @@ run_regression_tests() (
     fi
 
     if (
-        local disk=/dev/nvme9n1 WEAR_DAYS_LEFT_WARN=180 WEAR_DAYS_LEFT_CRIT=60
-        FRESH_SMART=([$disk]=1)
-        TBW_DAYS_LEFT=([$disk]=110.0)
-        TBW_STATUS_MAP=([$disk]=WARNING)
-        TBW_FORECAST_CONFIDENCE=([$disk]=HIGH)
-        NVME_WEAR_DAYS_LEFT=([$disk]=30)
-        NVME_WEAR_CONFIDENCE=([$disk]=MEDIUM)
-        record_endurance_forecasts &&
-            [[ "${#FINDING_IDS[@]}" == 1 && "${FINDING_SEVERITY["device:$disk|endurance_forecast"]}" == critical &&
-               "${FINDING_EVIDENCE["device:$disk|endurance_forecast"]}" == 'measured wear estimate: 30'*'write-volume estimate: 110.0'* ]]
-    ); then
-        self_test_result 1 "Two SSD forecasts produce one finding at the higher severity"
-    else
-        self_test_result 0 "Two SSD forecasts produce one finding at the higher severity"
-    fi
-
-    if (
         local retired state_file
         for retired in capacity_history.log disk_cap_history.log heavy_writer_history.log \
             parity_progress.state poh_history.log risk_scores_history.log risk_tier_history.log \
@@ -268,13 +251,9 @@ run_regression_tests() (
           "$HISTORY_SCHEMA_VERSION" == "3" &&
           "$DEVICE_ID_SCHEMA_VERSION" == "2" &&
           "$SMART_ALLOW_SPINUP" == "0" &&
-          "$HEAVY_WRITER_ALERTS_ENABLED" == "1" &&
-          "$ARRAY_WRITER_ALERTS_ENABLED" == "1" &&
-          "$POOL_WRITER_ALERTS_ENABLED" == "0" &&
           "$NOTIFICATION_OK_REMINDER_HOURS" == "0" &&
           "$NOTIFICATION_RECOVERY_CONFIRM_RUNS" == "2" &&
-          "$HEAVY_WRITER_RECENT_DAYS" == "3" &&
-          "$SOAK_TELEMETRY_ENABLED" == "1" ]]
+          "$HEAVY_WRITER_RECENT_DAYS" == "3" ]]
     then
         self_test_result 1 "Built-in defaults and schema constants"
     else
@@ -347,7 +326,7 @@ run_regression_tests() (
 
     SMART_DEFERRED=()
     DISCOVERED_DISKS=()
-    RISK_MAP=()
+    declare -A RISK_MAP=()
     if (( ${#SMART_DEFERRED[@]} == 0 &&
           ${#DISCOVERED_DISKS[@]} == 0 &&
           ${#RISK_MAP[@]} == 0 ))
@@ -430,10 +409,10 @@ run_regression_tests() (
     fi
 
     if [[ -n "${EXTERNAL_CONFIG_ALLOWED[SMART_ALLOW_SPINUP]+present}" &&
-          -n "${EXTERNAL_CONFIG_ALLOWED[SOAK_MIN_RUNS]+present}" &&
+          -n "${EXTERNAL_CONFIG_ALLOWED[HISTORY_WINDOW_DAYS]+present}" &&
           -z "${EXTERNAL_CONFIG_ALLOWED[TREND_NOTIFICATION_MODE]+present}" &&
           -z "${EXTERNAL_CONFIG_ALLOWED[TREND_NOTIFICATION_TOP_N]+present}" &&
-          -n "${EXTERNAL_CONFIG_ALLOWED[POOL_WRITER_POLICY]+present}" &&
+          -n "${EXTERNAL_CONFIG_ALLOWED[HEAVY_WRITER_RECENT_DAYS]+present}" &&
           -n "${EXTERNAL_CONFIG_ALLOWED[NOTIFICATION_RECOVERY_CONFIRM_RUNS]+present}" &&
           -n "${EXTERNAL_CONFIG_ALLOWED[POOL_EXCLUDES]+present}" &&
           -n "${EXTERNAL_CONFIG_ALLOWED[LOG_DIR]+present}" &&
@@ -514,29 +493,29 @@ run_regression_tests() (
     printf '%s\n' \
         'SMART_ALLOW_SPINUP=1' \
         'WARN_THRESHOLD_PERCENT=95' \
-        'SOAK_REQUIRE_PARITY=1' \
-        'SOAK_MIN_RUNS=20' \
+        'TEMP_RATE_ALERT_ENABLED=1' \
+        'HISTORY_WINDOW_DAYS=20' \
         'POOL_EXCLUDES=ramtmp, user0' > "$EXTERNAL_CONFIG_FILE"
     # This is deliberately inert parser input, not a command to expand here.
     # shellcheck disable=SC2016
     printf -v inert_config_value '$(touch %s/executed)' "$config_fixture_dir"
-    printf 'XFS_PROC_KEYS=%s\n' "$inert_config_value" >> "$EXTERNAL_CONFIG_FILE"
+    printf 'IO_ERROR_LOG_FILE=%s\n' "$inert_config_value" >> "$EXTERNAL_CONFIG_FILE"
     chmod 600 "$EXTERNAL_CONFIG_FILE"
     # shellcheck disable=SC2030
     SMART_ALLOW_SPINUP=0
     WARN_THRESHOLD_PERCENT=96
-    SOAK_REQUIRE_PARITY=0
-    SOAK_MIN_RUNS=14
+    TEMP_RATE_ALERT_ENABLED=0
+    HISTORY_WINDOW_DAYS=14
     POOL_EXCLUDES=(original)
     if load_external_configuration &&
        [[ "$EXTERNAL_CONFIG_STATUS" == "LOADED" &&
           "$EXTERNAL_CONFIG_OVERRIDE_COUNT" == "6" &&
           "$SMART_ALLOW_SPINUP" == "1" &&
           "$WARN_THRESHOLD_PERCENT" == "95" &&
-          "$SOAK_REQUIRE_PARITY" == "1" &&
-          "$SOAK_MIN_RUNS" == "20" &&
+          "$TEMP_RATE_ALERT_ENABLED" == "1" &&
+          "$HISTORY_WINDOW_DAYS" == "20" &&
           "${POOL_EXCLUDES[*]}" == "ramtmp user0" &&
-          "$XFS_PROC_KEYS" == "$inert_config_value" &&
+          "$IO_ERROR_LOG_FILE" == "$inert_config_value" &&
           ! -e "$config_fixture_dir/executed" ]]
     then
         self_test_result 1 "Transactional external configuration overrides"
@@ -579,10 +558,8 @@ run_regression_tests() (
        [[ -f "$EXTERNAL_CONFIG_FILE" && ! -L "$EXTERNAL_CONFIG_FILE" &&
           "$(stat -c '%a' "$EXTERNAL_CONFIG_FILE")" == "600" ]] &&
        grep -Fq 'parsed as data, not sourced' "$EXTERNAL_CONFIG_FILE" &&
-       grep -Fq '# SOAK_MIN_RUNS=14' "$EXTERNAL_CONFIG_FILE" &&
+       grep -Fq '# HISTORY_WINDOW_DAYS=14' "$EXTERNAL_CONFIG_FILE" &&
        ! grep -Eq '^# (TREND_NOTIFICATION_MODE|SHOW_STORAGE_DEVICE_DETAILS)=' "$EXTERNAL_CONFIG_FILE" &&
-       grep -Fq '# HEAVY_WRITER_ALERTS_ENABLED=1' "$EXTERNAL_CONFIG_FILE" &&
-       grep -Fq '# POOL_WRITER_POLICY=cache:100:350,data:500:1000' "$EXTERNAL_CONFIG_FILE" &&
        grep -Fq '# POOL_EXCLUDES=ramtmp,user0' "$EXTERNAL_CONFIG_FILE"
     then
         self_test_result 1 "Protected state-directory configuration template"
@@ -703,9 +680,9 @@ run_regression_tests() (
 
     SMART_ALLOW_SPINUP=0
     WARN_THRESHOLD_PERCENT=96
-    SOAK_REQUIRE_PARITY=0
+    TEMP_RATE_ALERT_ENABLED=0
     POOL_EXCLUDES=(ramtmp user0)
-    XFS_PROC_KEYS=""
+    IO_ERROR_LOG_FILE=""
     EXTERNAL_CONFIG_LOAD_FAILED=0
     # shellcheck disable=SC2030
     EXTERNAL_CONFIG_STATUS="ABSENT"
@@ -1014,15 +991,14 @@ run_regression_tests() (
         FINDING_IDS=()
         FINDING_SEEN=()
         evaluate_scsi_smart "$device" "$age_only_sas_fixture" &&
-            [[ "${SMART_STATE[$device]}" == OK && "${#FINDING_IDS[@]}" == 0 ]] &&
-            grep -Fq 'replacement-planning threshold' "$MASTER_LOG" || exit 1
+            [[ "${SMART_STATE[$device]}" == OK && "${#FINDING_IDS[@]}" == 0 ]] || exit 1
         evaluate_scsi_smart "$device" "${age_only_sas_fixture/34 C/70 C}" &&
             [[ "${SMART_STATE[$device]}" == CRITICAL &&
                "${FINDING_SEVERITY["device:$device|temp"]:-}" == critical ]]
     ); then
-        self_test_result 1 "Drive age is advisory while actual overheating stays critical"
+        self_test_result 1 "Drive age alone stays healthy while actual overheating stays critical"
     else
-        self_test_result 0 "Drive age is advisory while actual overheating stays critical"
+        self_test_result 0 "Drive age alone stays healthy while actual overheating stays critical"
     fi
 
     if (
@@ -1096,14 +1072,6 @@ run_regression_tests() (
         self_test_result 0 "Btrfs device-stat format and malformed-row fixtures" "found '$actual'"
     fi
 
-    local xfs_fixture
-    xfs_fixture=$'extent_alloc 17 2 3 4\ndir_lookup malformed\nxs_xstrat 23 0 0 0'
-    actual="$(xfs_stat_value_from_text "$xfs_fixture" extent_alloc)|$(xfs_stat_value_from_text "$xfs_fixture" dir_lookup)|$(xfs_stat_value_from_text "$xfs_fixture" xs_xstrat)"
-    if [[ "$actual" == "17||23" ]]; then
-        self_test_result 1 "XFS counter parser fixtures"
-    else
-        self_test_result 0 "XFS counter parser fixtures" "found '$actual'"
-    fi
 
     local io_fixture ignored_io_fixture
     io_fixture='Aug 16 12:00:00 kernel: blk_update_request: I/O error, dev sda, sector 8; nvme0n1 reset'
@@ -1189,60 +1157,6 @@ run_regression_tests() (
             "found '$actual' ready=$SYSLOG_CURSOR_READY mode=$SYSLOG_CURSOR_MODE"
     fi
 
-    FINDING_IDS=()
-    FINDING_SEEN=()
-    FINDING_SEVERITY=()
-    FINDING_CATEGORY=()
-    FINDING_SIGNAL=()
-    FINDING_DEVICE=()
-    FINDING_SCOPE=()
-    FINDING_TITLE=()
-    FINDING_EVIDENCE=()
-    FINDING_ACTION=()
-    RISK_SPIKE_TS=()
-    MOUNT_TO_DEV=([/mnt/disk1]="/dev/sda")
-    POOL_MEMBER_MAP=([/dev/nvme0n1]="cache" [/dev/nvme1n1]="data")
-    HEAVY_WRITER_ALERTS_ENABLED=1
-    ARRAY_WRITER_ALERTS_ENABLED=1
-    POOL_WRITER_ALERTS_ENABLED=0
-    record_writer_workload_alert /dev/nvme0n1 600 880000000000 RISING 25.0 3 2
-    record_writer_workload_alert /dev/sda 6 30000000000 RISING 40.0 3 2
-    local workload_gated_count=${#FINDING_IDS[@]}
-    record_writer_workload_alert /dev/sda 6 30000000000 RISING 60.0 3 2
-    local workload_finding_id="${FINDING_IDS[0]:-}"
-    set_writer_policy_for_device /dev/nvme0n1
-    classify_writer_tier 89.3 "$WRITER_POLICY_MODERATE_PCT" \
-        "$WRITER_POLICY_WARN_PCT" "$WRITER_POLICY_CRIT_PCT"
-    local cache_workload_tier="$WRITER_TIER_RESULT"
-    set_writer_policy_for_device /dev/nvme1n1
-    classify_writer_tier 617.7 "$WRITER_POLICY_MODERATE_PCT" \
-        "$WRITER_POLICY_WARN_PCT" "$WRITER_POLICY_CRIT_PCT"
-    local download_workload_tier="$WRITER_TIER_RESULT"
-    if (( workload_gated_count == 0 && ${#FINDING_IDS[@]} == 1 )) &&
-       [[ -n "$workload_finding_id" &&
-          "${FINDING_SEVERITY[$workload_finding_id]:-}" == "warning" &&
-          "${FINDING_SIGNAL[$workload_finding_id]:-}" == "workload.write_rate" &&
-          "$cache_workload_tier" == "M" && "$download_workload_tier" == "H" &&
-          -z "${RISK_SPIKE_TS[/dev/sda]:-}" ]]
-    then
-        self_test_result 1 "Role-aware workload policy and sustained array anomaly gates"
-    else
-        self_test_result 0 "Role-aware workload policy and sustained array anomaly gates" \
-            "gated_count=$workload_gated_count enabled_count=${#FINDING_IDS[@]} cache=$cache_workload_tier data=$download_workload_tier"
-    fi
-    HEAVY_WRITER_ALERTS_ENABLED=1
-    FINDING_IDS=()
-    FINDING_SEEN=()
-    FINDING_SEVERITY=()
-    FINDING_CATEGORY=()
-    FINDING_SIGNAL=()
-    FINDING_DEVICE=()
-    FINDING_SCOPE=()
-    FINDING_TITLE=()
-    FINDING_EVIDENCE=()
-    FINDING_ACTION=()
-    RISK_SPIKE_TS=()
-
     FINDING_IDS=(
         'device:/dev/sdb|capacity_warning'
         'device:/dev/sda|pending_sectors'
@@ -1258,7 +1172,7 @@ run_regression_tests() (
     FINDING_TITLE=()
     FINDING_EVIDENCE=()
     FINDING_ACTION=()
-    RISK_MAP=()
+    declare -A RISK_MAP=()
     MOUNT_TO_DEV=()
     POOL_MEMBER_MAP=()
 
@@ -1289,13 +1203,10 @@ run_regression_tests() (
     FINDING_TITLE['device:/dev/sda|command_timeout']='Command timeout'
     FINDING_ACTION['device:/dev/sda|pending_sectors']='Inspect now.'
     FINDING_ACTION['device:/dev/sda|command_timeout']='Inspect now.'
-    RISK_MAP['/dev/sda']=90
-    RISK_MAP['/dev/sdc']=40
-    RISK_MAP['/dev/sdb']=20
 
     local risk_sort_stderr="$fixture_dir/risk-sort.stderr"
     actual=$(emit_sorted_finding_ids 2> "$risk_sort_stderr" | awk '{printf "%s%s", separator, $0; separator="|"}')
-    if [[ "$actual" == 'device:/dev/sda|pending_sectors|device:/dev/sda|command_timeout|device:/dev/sdc|selftest_failed|device:/dev/sdb|capacity_warning|mount:/mnt/disk2|storage_warning' &&
+    if [[ "$actual" == 'device:/dev/sda|pending_sectors|device:/dev/sdc|selftest_failed|device:/dev/sda|command_timeout|device:/dev/sdb|capacity_warning|mount:/mnt/disk2|storage_warning' &&
           ! -s "$risk_sort_stderr" ]]
     then
         self_test_result 1 "Deterministic structured finding ordering"
@@ -1329,7 +1240,7 @@ run_regression_tests() (
     FINDING_TITLE=()
     FINDING_EVIDENCE=()
     FINDING_ACTION=()
-    RISK_MAP=()
+    declare -A RISK_MAP=()
     LOG_MIRROR_STDOUT=0
     record_finding warning monitoring monitoring.timeout "" \
         "Collector timeout" "Fixture collector exceeded deadline." \
@@ -1416,7 +1327,7 @@ run_regression_tests() (
     NOTIFICATION_RECOVERY_STATE_FILE="$notification_dir/recovery.state"
     COLLECTOR_ORDER=()
     COLLECTOR_STATUS=()
-    RISK_MAP=()
+    declare -A RISK_MAP=()
     NOTIFICATION_LIFECYCLE_ENABLED=1
     NOTIFICATION_WARNING_REMINDER_HOURS=24
     NOTIFICATION_CRITICAL_REMINDER_HOURS=6
@@ -1775,16 +1686,12 @@ run_regression_tests() (
 
     if (
         local MASTER_LOG="$fixture_dir/trend-render.log"
-        local -A TBW_DAYS_LEFT=([/dev/nvme0n1]=500)
-        local -A TBW_DAILY=([/dev/nvme0n1]=1000000000)
-        local -A TBW_FORECAST_CONFIDENCE=([/dev/nvme0n1]=HIGH)
-        local -A NVME_WEAR_DAYS_LEFT=([/dev/nvme2n1]=INF)
-        local -A NVME_WEAR_CONFIDENCE=([/dev/nvme2n1]=RESET)
-        local -A NVME_WEAR_RATE=([/dev/nvme2n1]=0)
+        local -A WRITER_DAILY=([/dev/nvme0n1]=1000000000)
+        local -A WRITER_DIRECTION=([/dev/nvme0n1]=COLLECTING)
         TREND_DIAGNOSTIC_ITEMS=()
         log_health_trends &&
-            grep -Fq 'Diagnostic TBW endurance: device=nvme0n1 bytes_per_day=1000000000 days_left=500 confidence=HIGH' "$MASTER_LOG" &&
-            grep -Fq 'Diagnostic NVMe wear: device=nvme2n1 days_left=INF rate_percent_per_day=0 confidence=RESET' "$MASTER_LOG"
+            grep -Fq 'phase=TREND | write workload: device=nvme0n1 bytes_per_day=1000000000' "$MASTER_LOG" &&
+            ! grep -Fq 'days_left=' "$MASTER_LOG"
     ); then
         self_test_result 1 "Raw trend diagnostics retained in run log"
     else
@@ -1812,175 +1719,99 @@ run_regression_tests() (
         self_test_result 0 "SATA link streak still raises an actionable finding"
     fi
 
-    if soak_record_is_valid \
-           v1 1780000000 1780000030 30 0 boot-a 12 0 0 0 0 30 0 0 \
-           SEND delivered 0 1 0 0 initial_lookback 5 disk_health_fixture.log 2.15 &&
-       ! soak_record_is_valid \
-           v1 1780000000 1780000030 30 0 boot-a 12 0 0 0 0 30 0 0 \
-           SEND delivered 0 1 2 0 initial_lookback 5 disk_health_fixture.log 2.15
-    then
-        self_test_result 1 "Soak evidence schema validation"
-    else
-        self_test_result 0 "Soak evidence schema validation"
-    fi
+    if (
+        local attrs=$'241 Host_Writes_GiB 0x0032 100 100 000 Old_age Always - 66351\n242 Host_Reads_GiB 0x0032 100 100 000 Old_age Always - 67905'
+        [[ "$(ata_host_counter_bytes "$attrs" writes)" == 71243843764224 &&
+           "$(ata_host_counter_bytes "$attrs" reads)" == 72912438558720 ]] &&
+        ! ata_host_counter_bytes '241 Unknown_Attribute 0x0032 100 100 000 Old_age Always - 66351' writes &&
+        ! ata_host_counter_bytes '233 NAND_GB_Written_TLC 0x0032 100 100 000 Old_age Always - 61796' writes
+    ); then self_test_result 1 "WD host GiB units and unknown/NAND counters remain distinct"
+    else self_test_result 0 "WD host GiB units and unknown/NAND counters remain distinct"; fi
 
-    # Emits one complete v1 fixture record to the requested file. It is local
-    # to the self-test subshell and never touches live monitoring state.
-    fixture_soak_record() {
-        local target="$1" start_epoch="$2" end_epoch="$3" exit_status="$4"
-        local boot_id="$5" outcome="$6" parity_active="$7" standby_count="$8"
-        local syslog_mode="$9" log_file="${10}"
-        local duration=$((end_epoch - start_epoch)) decision="SEND" rc=0 attempts=1
+    if (
+        [[ "$(tbw_threshold_tb_for_device 'WDC WDS500G1R0A-68A4W0' .500107862016)" == 350 &&
+           "$(tbw_threshold_tb_for_device CT1000T500SSD5 1.000204886)" == 600 &&
+           "$(tbw_threshold_tb_for_device CT1000T500SSD8 1.000204886)" == 600 &&
+           "$(tbw_threshold_tb_for_device CT1000P5PSSD8 1.000204886)" == 600 &&
+           -z "$(tbw_threshold_tb_for_device UnknownSSD 1)" ]]
+    ); then self_test_result 1 "Native WD and Crucial model numbers select rated TBW"
+    else self_test_result 0 "Native WD and Crucial model numbers select rated TBW"; fi
 
-        if [[ "$outcome" == "suppressed" ]]; then
-            decision="SUPPRESS"
-            attempts=0
-        elif [[ "$outcome" == "failed" ]]; then
-            rc=1
-        fi
-        printf 'v1\t%s\t%s\t%s\t%s\t%s\t12\t0\t0\t0\t0\t%s\t0\t0\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t5\t%s\t%s\n' \
-            "$start_epoch" "$end_epoch" "$duration" "$exit_status" "$boot_id" \
-            "$duration" "$decision" "$outcome" "$rc" "$attempts" \
-            "$parity_active" "$standby_count" "$syslog_mode" "$log_file" "${11:-$SCRIPT_VERSION}" \
-            >> "$target"
-    }
+    if (
+        local SHORT_TEST_INTERVAL_DAYS=7 disk=/dev/sdz
+        LAST_TEST_EPOCH[$disk]=$(date -d '7 days ago 23:59' +%s)
+        short_test_is_due "$disk" && [[ "$(short_test_next_date "$disk")" == "$(date +%F) 00:00" ]]
+    ); then self_test_result 1 "Weekly self-test eligibility tolerates daily start-time jitter"
+    else self_test_result 0 "Weekly self-test eligibility tolerates daily start-time jitter"; fi
 
-    local soak_now soak_old soak_persist_file
-    soak_now=$(date +%s)
-    soak_old=$((soak_now - 172800))
-    soak_persist_file="$fixture_dir/soak-persist.tsv"
-    : > "$soak_persist_file"
-    fixture_soak_record "$soak_persist_file" "$soak_old" "$((soak_old + 30))" \
-        0 boot-old delivered 0 0 initial_lookback disk_health_old.log
-    printf 'malformed evidence row\n' >> "$soak_persist_file"
-    SOAK_RUN_HISTORY_FILE="$soak_persist_file"
-    SOAK_TELEMETRY_ENABLED=1
-    SOAK_RUN_STARTED=1
-    SOAK_RETENTION_DAYS=1
-    SOAK_MAX_RECORDS=2
-    COLLECTOR_ORDER=(soak_ok soak_deferred)
-    COLLECTOR_STATUS=([soak_ok]="OK" [soak_deferred]="DEFERRED")
-    COLLECTOR_DURATION=([soak_ok]=2 [soak_deferred]=1)
-    COLLECTOR_DETAIL=([soak_ok]="" [soak_deferred]="deferred=1")
-    SMART_DEFERRED=([/dev/sda]="standby")
-    DISCOVERED_DISKS=(/dev/sda /dev/nvme0n1)
-    NOTIFICATION_PHASE_REACHED=0
-    PARITY_ACTIVE=0
-    SYSLOG_CURSOR_MODE="cursor_continuation"
-    MASTER_LOG="$fixture_dir/disk_health_soak.log"
-    RUN_EPOCH=$((soak_now - 20))
-    persist_soak_observation 0
-    RUN_EPOCH=$((soak_now - 10))
-    persist_soak_observation 0
-    RUN_EPOCH="$soak_now"
-    persist_soak_observation 0
-    local soak_persist_lines soak_persist_invalid=0
-    soak_persist_lines=$(wc -l < "$soak_persist_file" | tr -d ' ')
-    while IFS= read -r line; do
-        IFS=$'\t' read -r -a fields <<< "$line"
-        soak_record_is_valid "${fields[@]}" || soak_persist_invalid=$((soak_persist_invalid + 1))
-    done < "$soak_persist_file"
-    if [[ "$soak_persist_lines" == "2" && "$soak_persist_invalid" == "0" ]] &&
-       ! grep -Fq 'boot-old' "$soak_persist_file"
-    then
-        self_test_result 1 "Atomic bounded soak evidence persistence"
-    else
-        self_test_result 0 "Atomic bounded soak evidence persistence" \
-            "lines=$soak_persist_lines invalid=$soak_persist_invalid"
-    fi
+    if (
+        local STATE_DIR="$fixture_dir/units" TBW_HISTORY_FILE="$fixture_dir/units/tbw_history.log" disk=/dev/sdz
+        mkdir -m 700 "$STATE_DIR"
+        DEVICE_ID_BY_PATH[$disk]=fixture_units
+        PREV_ATTR["$disk|udma"]=12
+        PREV_ATTR["$disk|pending"]=2
+        PREV_ATTR["$disk|tbw_bytes"]=100
+        printf '2026-11-26 fixture_units tbw=100\n2026-11-26 unrelated tbw=200\n' > "$TBW_HISTORY_FILE"
+        rebaseline_ata_host_writes "$disk" &&
+        [[ "${CUR_ATTR["$disk|host_write_units_revision"]}" == 2 &&
+           "${PREV_ATTR["$disk|udma"]}" == 12 && "${PREV_ATTR["$disk|pending"]}" == 2 &&
+           -z "${PREV_ATTR["$disk|tbw_bytes"]:-}" && "$(wc -l < "$TBW_HISTORY_FILE")" == 1 ]]
+    ); then self_test_result 1 "Unit migration resets only affected write history, retaining fault counters"
+    else self_test_result 0 "Unit migration resets only affected write history, retaining fault counters"; fi
 
-    local soak_collecting_file="$fixture_dir/soak-collecting.tsv"
-    : > "$soak_collecting_file"
-    fixture_soak_record "$soak_collecting_file" 1780000000 1780000030 \
-        0 boot-a delivered 0 0 initial_lookback disk_health_collecting.log
-    SOAK_RUN_HISTORY_FILE="$soak_collecting_file"
-    SOAK_MIN_RUNS=2
-    SOAK_MIN_DAYS=2
-    SOAK_REQUIRE_REBOOT=1
-    SOAK_REQUIRE_STANDBY=1
-    SOAK_REQUIRE_SYSLOG_ROTATION=1
-    SOAK_REQUIRE_NOTIFICATION_DELIVERY=1
-    SOAK_REQUIRE_NOTIFICATION_SUPPRESSION=1
-    SOAK_REQUIRE_PARITY=0
-    analyze_soak_history
-    if [[ "$SOAK_ANALYSIS_STATUS" == "COLLECTING" &&
-          "$SOAK_ANALYSIS_VALID_RUNS" == "1" &&
-          "$SOAK_ANALYSIS_MISSING" == *reboot* &&
-          "$SOAK_ANALYSIS_MISSING" == *"standby deferral"* ]]
-    then
-        self_test_result 1 "Soak readiness remains collecting until coverage completes"
-    else
-        self_test_result 0 "Soak readiness remains collecting until coverage completes" \
-            "$SOAK_ANALYSIS_STATUS: $SOAK_ANALYSIS_DETAIL"
-    fi
+    if (
+        local SMART_LONG_STARTED=1 SMART_FLEET_LONG_RUNNING=0
+        mdcmd() { printf 'mdResync=0\nmdResyncAction=\n'; }
+        timeout() { shift; "$@"; }
+        pgrep() { return 1; }
+        findmnt() { :; }
+        flock() { return 0; }
+        ! smart_test_start_allowed long && smart_test_start_allowed short
+    ); then self_test_result 1 "Only one new long self-test; short collection remains independently eligible"
+    else self_test_result 0 "Only one new long self-test; short collection remains independently eligible"; fi
 
-    local soak_ready_file="$fixture_dir/soak-ready.tsv"
-    : > "$soak_ready_file"
-    fixture_soak_record "$soak_ready_file" 1770000000 1770000030 \
-        1 boot-old failed 0 0 initial_lookback disk_health_previous_release.log 2.19.0
-    fixture_soak_record "$soak_ready_file" 1780000000 1780000030 \
-        0 boot-a delivered 1 1 rotation_recovery disk_health_ready_a.log
-    fixture_soak_record "$soak_ready_file" 1780172800 1780172830 \
-        0 boot-b suppressed 0 0 cursor_continuation disk_health_ready_b.log
-    SOAK_RUN_HISTORY_FILE="$soak_ready_file"
-    SOAK_REQUIRE_PARITY=1
-    analyze_soak_history
-    if [[ "$SOAK_ANALYSIS_STATUS" == "READY" &&
-          "$SOAK_ANALYSIS_CLEAN_RUNS" == "2" &&
-          "$SOAK_ANALYSIS_BOOT_COUNT" == "2" &&
-          "$SOAK_ANALYSIS_SYSLOG_ROTATION_RUNS" == "1" &&
-          "$SOAK_ANALYSIS_NOTIFICATION_DELIVERED" == "1" &&
-          "$SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED" == "1" ]]
-    then
-        self_test_result 1 "Complete soak coverage reaches readiness"
-    else
-        self_test_result 0 "Complete soak coverage reaches readiness" \
-            "$SOAK_ANALYSIS_STATUS: $SOAK_ANALYSIS_DETAIL"
-    fi
+    if (
+        flock() { return 0; }
+        timeout() { shift; "$@"; }
+        findmnt() { :; }
+        pgrep() { return 1; }
+        mdcmd() { printf 'mdResync=123\nmdResyncAction=check\n'; }
+        ! smart_test_start_allowed short &&
+        mdcmd() { printf 'mdResync=0\nmdResyncAction=check\n'; } &&
+        smart_test_start_allowed short &&
+        pgrep() { return 0; } && ! smart_test_start_allowed short
+    ); then self_test_result 1 "Active parity and Mover defer new tests; stale action text does not"
+    else self_test_result 0 "Active parity and Mover defer new tests; stale action text does not"; fi
 
-    local soak_attention_file="$fixture_dir/soak-attention.tsv"
-    : > "$soak_attention_file"
-    fixture_soak_record "$soak_attention_file" 1780000000 1780000030 \
-        1 boot-a failed 0 0 initial_lookback disk_health_failed.log
-    printf 'broken\n' >> "$soak_attention_file"
-    SOAK_RUN_HISTORY_FILE="$soak_attention_file"
-    SOAK_REQUIRE_REBOOT=0
-    SOAK_REQUIRE_STANDBY=0
-    SOAK_REQUIRE_SYSLOG_ROTATION=0
-    SOAK_REQUIRE_NOTIFICATION_DELIVERY=0
-    SOAK_REQUIRE_NOTIFICATION_SUPPRESSION=0
-    SOAK_REQUIRE_PARITY=0
-    analyze_soak_history
-    if [[ "$SOAK_ANALYSIS_STATUS" == "ATTENTION" &&
-          "$SOAK_ANALYSIS_ATTENTION_RUNS" == "1" &&
-          "$SOAK_ANALYSIS_INVALID_RUNS" == "1" &&
-          "$SOAK_ANALYSIS_NOTIFICATION_FAILED" == "1" ]]
-    then
-        self_test_result 1 "Soak failures and malformed evidence require attention"
-    else
-        self_test_result 0 "Soak failures and malformed evidence require attention" \
-            "$SOAK_ANALYSIS_STATUS: $SOAK_ANALYSIS_DETAIL"
-    fi
-
-    local soak_status_output="$fixture_dir/soak-status.txt"
-    SOAK_RUN_HISTORY_FILE="$soak_ready_file"
-    SOAK_MIN_RUNS=2
-    SOAK_MIN_DAYS=2
-    SOAK_REQUIRE_REBOOT=1
-    SOAK_REQUIRE_STANDBY=1
-    SOAK_REQUIRE_SYSLOG_ROTATION=1
-    SOAK_REQUIRE_NOTIFICATION_DELIVERY=1
-    SOAK_REQUIRE_NOTIFICATION_SUPPRESSION=1
-    SOAK_REQUIRE_PARITY=1
-    print_soak_status > "$soak_status_output"
-    if grep -Fq 'Readiness: READY' "$soak_status_output" &&
-       grep -Fq 'Notification suppression: PASS; observed=1' "$soak_status_output" &&
-       grep -Fq 'Parity activity: PASS; observed=1' "$soak_status_output"
-    then
-        self_test_result 1 "Human-readable soak readiness report"
-    else
-        self_test_result 0 "Human-readable soak readiness report"
-    fi
+    if (
+        local disk=/dev/sdz fixture_overall=PASSED fixture_crc=12 fixture_pending=0
+        get_sata_raw() { printf '%s\n' \
+            '5 Reallocated_Sector_Ct 0x0033 100 100 010 Pre-fail Always - 0' \
+            '9 Power_On_Hours 0x0032 095 095 000 Old_age Always - 7000' \
+            '194 Temperature_Celsius 0x0022 068 050 000 Old_age Always - 32' \
+            "197 Current_Pending_Sector 0x0012 100 100 000 Old_age Always - $fixture_pending" \
+            '198 Offline_Uncorrectable 0x0030 100 100 000 Old_age Offline - 0' \
+            "199 UDMA_CRC_Error_Count 0x003e 200 200 000 Old_age Always - $fixture_crc" \
+            '230 Media_Wearout_Indicator 0x0032 004 004 000 Old_age Always - 1040' \
+            '241 Host_Writes_GiB 0x0032 100 100 000 Old_age Always - 27187'; }
+        smartctl_cached() { printf 'SMART overall-health self-assessment test result: %s\n' "$fixture_overall"; }
+        get_sata_info() { :; }
+        get_device_model() { printf 'WDC WDS500G1R0A-68A4W0'; }
+        get_device_capacity_tb() { printf '0.500'; }
+        lsblk_rota_cached() { printf 0; }
+        get_latest_selftest_info() { printf '1|Short|Completed without error|7000|0%%'; }
+        collector_upsert_daily_history() { :; }
+        rebaseline_ata_host_writes() { :; }
+        PREV_ATTR["$disk|udma"]=12
+        evaluate_smart "$disk" && [[ "${SMART_STATE[$disk]}" == OK && -z "${CUR_ATTR["$disk|life_remain"]:-}" ]] || exit 1
+        fixture_crc=13
+        evaluate_smart "$disk" && [[ "${SMART_STATE[$disk]}" == WARNING ]] || exit 1
+        fixture_crc=12; fixture_pending=2
+        evaluate_smart "$disk" && [[ "${SMART_STATE[$disk]}" == CRITICAL ]] || exit 1
+        fixture_pending=0; fixture_overall=FAILED
+        evaluate_smart "$disk" && [[ "${SMART_STATE[$disk]}" == CRITICAL && "${SMART_MSGS[$disk]}" == *'overall health FAILED'* ]]
+    ); then self_test_result 1 "Historic CRC and ambiguous wear stay informational; CRC growth, pending sectors and native SMART failure remain actionable"
+    else self_test_result 0 "Historic CRC and ambiguous wear stay informational; CRC growth, pending sectors and native SMART failure remain actionable"; fi
 
     if (( SELF_TEST_TOTAL != REGRESSION_FIXTURE_COUNT )); then
         SELF_TEST_FAILED=$((SELF_TEST_FAILED + 1))

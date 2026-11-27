@@ -1,5 +1,5 @@
 #!/bin/bash
-clearLog=true
+#clearLog=true
 # shellcheck disable=SC2034,SC2155
 # BEGIN EMBEDDED OPERATIONS CONTRACT
 OPS_SCRIPT_ID="health_monitoring"
@@ -59,7 +59,6 @@ usr_ops_append_log() {
     fi
     printf '%s\n' "$line" >>"$file"
 }
-
 
 # Durable failed-delivery evidence for producers without their own outbox.
 # Existing media/DNS/watchdog outboxes keep ownership of their delivery policy.
@@ -206,11 +205,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
     usr_ops_supervise "$0";exit $?
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
-noParity=true
 set -uo pipefail
 umask 077
 
-readonly SCRIPT_VERSION="2.22.2"
+readonly SCRIPT_VERSION="3.0.0"
 readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 PATH="$TRUSTED_PATH"
 export PATH
@@ -222,72 +220,34 @@ if (( BASH_VERSINFO[0] < 4 )); then
 fi
 
 # Disk Health Monitor for Unraid v2.22.0
-# Purpose: Run SMART tests, parse SMART/NVMe attributes, track endurance & risk, capture filesystem health,
-# check capacity thresholds, detect firmware/regression events, surface I/O error frequency, and emit concise
-# notifications.
-#
-# v2.15 adds bounded, atomic soak-test evidence for every monitoring run and a
-# read-only readiness report. It observes existing collector, standby, parity,
-# syslog-cursor, and notification behavior without adding disk reads or changing
-# health, scheduling, or delivery decisions.
-# v2.15.1 hardens empty-array handling under nounset, including Btrfs histories
-# containing no positive deltas, and safely resolves legitimate Unraid
-# exclusive-share paths to their physical pool target before managed paths are
-# derived.
-# v2.15.2 restores the external configuration to the private state directory so
-# normal Unraid share ownership and setgid permissions on LOG_DIR do not make a
-# trusted configuration unsafe. Legacy shared-directory copies are ignored.
-# v2.15.3 separates concise, grouped notification trends from full run-log
-# diagnostics, caps noisy device lists, and suppresses invalid or negligible
-# endurance and power-on-hour evidence from user-facing summaries.
-# v2.15.4 separates recent SSD workload intensity from the longer endurance
-# forecast, tracks improvement against the preceding window, makes workload-
-# only health findings opt-in, and uses plain-text notification markers.
-# v2.15.5 consolidates duplicate disk-health notification output into canonical
-# findings and collector status, applies role-aware array/pool workload policy
-# with per-pool overrides and sustained array anomaly gates, and confirms
-# recovery across consecutive safe runs before clearing an alert.
-# v2.15.6 makes aggregate array/pool capacity the default notification view,
-# keeps the legacy per-device inventory available as an explicit opt-in, and
-# labels aggregate pool counts as pools rather than disks.
-# v2.16.0 adds monitor receipts, assigned storage and completed parity checks,
-# and requires fresh observations before reporting recovery.
-# v2.17.0 removes legacy tables and advisory rankings from notifications.
-# v2.18.0 ships monitoring separately from its regression suite and keeps
-# calendar age and planned maintenance in the run log.
-# v2.18.1 reads full SMART identity responses before parsing model names.
-# v2.19.0 retires report-only state and limits temperature-rate alerts to hot drives.
-################################################################################
-# ---------------- Configuration ----------------
-# Disks health script settings. Tuned for performance and reliability.
-################################################################################
+# Purpose: Monitor Unraid disk, filesystem, capacity and parity health with grouped
+# actionable alerts, stable device identities and conservative recovery evidence.
+# v3.0.0: documented host-write units, calendar SMART scheduling, asynchronous
+# tests, maintenance gates, observed scrub dates, and syslog-watchdog delegation.
+# Removed speculative risk/lifetime forecasts, soak readiness and XFS workload alerts.
+# Native SMART failures, pending/uncorrectable sectors, temperature, NVMe faults,
+# rated TBW, filesystem errors, parity results and stale SMART coverage remain active.
+# Sleeping disks stay asleep; deferred collection never proves recovery. Only a
+# successful fresh scan advances relevant baselines. Healthy runs remain quiet.
+# Self-tests are started only on eligible awake disks outside backup/parity/Mover/
+# scrub work. At most one new long test starts per run; results are collected later.
+# Native Unraid scheduling owns Btrfs scrubs; this monitor never starts a scrub.
+# State: existing schema remains compatible. ATA write-history is rebaselined once
+# per stable identity when unit revision changes; physical fault counters are kept.
+# Legacy analytic files are left for rollback but no longer written or recreated.
+# Use --help for supported read-only diagnostics and state administration commands.
+# No Docker image, startup or application configuration is modified.
 
-# Built-in defaults remain the complete fallback configuration. After all
-# functions are defined, a protected state-directory file may override this
-# allowlisted setting layer before validation and execution.
 load_builtin_defaults() {
 
 # === SMART Test Scheduling ===
 SHORT_TEST_INTERVAL_DAYS=7                      # Run automatic short tests no more often than this (0=disable)
 SMART_ALLOW_SPINUP=0                            # Allow SMART collection/tests to wake standby SATA HDDs (0=defer)
-SHORT_TEST_POLL=1                               # Poll short test until it completes (0=fire-and-forget)
-SHORT_TEST_MAX_WAIT=180                         # Max seconds to wait while polling short tests
-SHORT_TEST_POLL_INTERVAL=10                     # Interval between polls (seconds)
-LONG_TEST_ACCEL_FACTOR=2                        # Accelerate next long test interval (divide) after recent risk spike
-LONG_TEST_MIN_INTERVAL_DAYS=45                  # Do not recommend long test sooner than this many days after last long
-LONG_TEST_MAX_INTERVAL_DAYS=120                 # Maximum fallback days between long tests when no recent risk spike
-LONG_TEST_RISK_LOOKBACK_DAYS=7                  # Consider risk spikes within this many days for acceleration
-LONG_TEST_RISK_THRESHOLD=60                     # Risk score >= triggers long test consideration
+LONG_TEST_MAX_INTERVAL_DAYS=120                 # Powered-on days between routine long tests
 LONG_TEST_CRITICAL_MIN_DAYS=7                   # Critical SMART & last long age >= days -> force long
-LONG_TEST_RISK_MIN_DAYS=0                       # Min days since last long before risk-based scheduling applies
 LONG_TEST_DECISION=""                           # Accumulator for long test scheduling decisions
 LONG_TEST_NEAR_WINDOW_DAYS=5                    # Show health alert when long test is due within N days
 LONG_TEST_INITIAL_FORCE=0                       # When no prior long test record, force an immediate long (1=enable, 0=skip)
-REPLACEMENT_AUTO_RESET=1                        # Automatically detect drive replacement via POH drop and reset state
-REPLACEMENT_POH_DROP_THRESHOLD_HOURS=24         # Default fallback drop threshold (hours) if type unknown
-REPLACEMENT_POH_DROP_THRESHOLD_HOURS_HDD=24     # HDD: POH drop >= threshold => replacement
-REPLACEMENT_POH_DROP_THRESHOLD_HOURS_SSD=12     # SATA SSD: smaller drop threshold
-REPLACEMENT_POH_DROP_THRESHOLD_HOURS_NVME=6     # NVMe: smallest drop threshold
 
 # === Capacity Thresholds ===
 WARN_THRESHOLD_PERCENT=96                       # Per-disk usage percent -> warning
@@ -299,15 +259,8 @@ POOL_EXCLUDES=("ramtmp" "user0")                # Pool names excluded from pool 
 # === Storage Validation / Discrepancy Alerts ===
 
 # === Filesystem / Device Monitoring Toggles ===
-ENABLE_BTRFS_SCRUB=0                            # Start btrfs scrub vs just parse last status
-FIRST_RUN_FORCE=0                               # Keep disabled scrubs fully disabled; set 1 only for an intentional baseline
 BTRFS_SCRUB_STATE_TTL_DAYS=90                   # Days to retain scrub state files
 ENABLE_BTRFS_DEVICE_STATS=1                     # Parse btrfs per-device stats and integrate (0=disable)
-ENABLE_XFS_PROC_STATS=1                         # Parse /proc/fs/xfs/stat counters (0=disable)
-XFS_PROC_REQUIRE_RATIO_FOR_ALERT=1             # 1: only alert on burst ratio triggers; 0: also alert on absolute deltas
-XFS_PROC_KEYS=""                               # Space-separated keys to monitor; empty uses sane defaults
-XFS_PROC_KEYS_EXCLUDE="extent_alloc dir_create dir_lookup delalloc flush" # Space-separated keys to exclude (e.g., "extent_alloc dir_create")
-XFS_PROC_SUPPRESS_DURING_PARITY=1              # 1: suppress XFS proc alerts while parity is running
 IO_ERROR_LOG_FILE="/var/log/syslog"             # Syslog path fallback to dmesg
 IO_ERROR_WINDOW_MINUTES=60                      # Time window (minutes) for de-dup/frequency
 IO_ERROR_WARN_THRESHOLD=5                       # Unique error events >= warning
@@ -320,7 +273,6 @@ SYSLOG_FAST_HEARTBEAT="/tmp/syslog_watchdog_state/storage-watch.epoch"
 # === Trends & Alerts: Toggles ===
 NVME_WEAR_REGRESSION_WARN=1                     # Flag any NVMe Percentage Used regression (0=disable)
 SATA_LINK_INSTABILITY_ENABLED=1                 # Enable SATA link instability frequency tracking (0=disable)
-RISK_SCORING_ENABLED=1                          # Show risk scores section (0=disable)
 TEMP_RATE_ALERT_ENABLED=1                       # Enable temperature change rate alerts (0=disable)
 IO_ERROR_MONITOR_ENABLED=1                      # Enable syslog scanning for disk I/O frequency (0=disable)
 IO_ERROR_DEDUP_ENABLED=1                        # De-duplicate identical message hashes inside window (0=disable)
@@ -375,17 +327,6 @@ COLLECTOR_SLOW_SECONDS=300                      # Log a collector as slow after 
 COLLECTOR_FAILURE_NOTIFICATIONS=1               # Add a warning finding when a collector times out/fails
 
 # === Phase 15 Soak Evidence ===
-SOAK_TELEMETRY_ENABLED=1                       # Persist one bounded observation after each normal monitoring run
-SOAK_MIN_RUNS=14                               # Minimum valid runs required before readiness can be reached
-SOAK_MIN_DAYS=14                               # Minimum elapsed observation span in days
-SOAK_RETENTION_DAYS=90                         # Retain evidence no older than this many days
-SOAK_MAX_RECORDS=500                           # Hard maximum retained observation records
-SOAK_REQUIRE_REBOOT=1                          # Require evidence from at least two boot IDs
-SOAK_REQUIRE_STANDBY=1                         # Require at least one safely deferred standby disk
-SOAK_REQUIRE_SYSLOG_ROTATION=1                 # Require rotation recovery/fallback evidence
-SOAK_REQUIRE_NOTIFICATION_DELIVERY=1           # Require at least one confirmed notification delivery
-SOAK_REQUIRE_NOTIFICATION_SUPPRESSION=1        # Require at least one lifecycle-suppressed notification
-SOAK_REQUIRE_PARITY=0                          # Optionally require a run observed during parity activity
 
 # === Paths / Integration ===
 LOG_DIR="/mnt/vault/cloud/logs/script/health_monitoring" # Deployed run logs and persistent state
@@ -406,8 +347,6 @@ HDD_TEMP_WARNING=55                             # HDD temp C >= warning
 HDD_TEMP_CRITICAL=60                            # HDD temp C >= critical
 LOAD_CYCLE_WARN=300000                          # HDD load cycle count >= warning
 LOAD_CYCLE_CRIT=600000                          # HDD load cycle count >= critical
-SSD_WEAR_WARN=20                                # SSD life remaining (%) <= warning
-SSD_WEAR_CRIT=10                                # SSD life remaining (%) <= critical
 REPORTED_UNC_CRIT=1                             # SATA attr 187 any >0 critical
 CMD_TIMEOUT_WARN=5                              # SATA attr 188 >= warning
 CMD_TIMEOUT_CRIT=50                             # SATA attr 188 >= critical
@@ -423,28 +362,10 @@ NVME_TEMP_WARNING=70                             # NVMe temp C >= warning
 NVME_TEMP_CRITICAL=80                            # NVMe temp C >= critical
 NVME_PERCENT_USED_WARN=80                        # NVMe wear percent >= warning
 NVME_PERCENT_USED_CRIT=90                        # NVMe wear percent >= critical
-WEAR_TREND_ENABLED=1                             # Enable NVMe wear depletion projection
-WEAR_TREND_WINDOW_DAYS=120                       # Window for percent_used slope (days)
-WEAR_TREND_TOP_N=5                               # Top N soonest depletion estimates
-WEAR_STABLE_MIN_RATE=0.001                       # Percent/day below which treat as stable (shows ∞)
-WEAR_DAYS_LEFT_WARN=120                          # Projected days-left <= warning threshold (0=disable)
-WEAR_DAYS_LEFT_CRIT=60                           # Projected days-left <= critical threshold (0=disable)
+WEAR_TREND_ENABLED=1                             # Retain measured NVMe wear history
 HEAVY_WRITER_RECENT_DAYS=3                       # Recent window used for workload intensity and improvement tracking
 HEAVY_WRITER_MIN_RECENT_SAMPLES=2                # Minimum recent counter samples required before using the recent rate
 HEAVY_WRITER_IMPROVEMENT_PCT=20                  # Recent rate change needed to label improving or rising
-HEAVY_WRITER_ALERTS_ENABLED=1                    # Master gate for role-specific workload anomaly findings
-ARRAY_WRITER_ALERTS_ENABLED=1                    # Alert on sustained array anomalies that pass every array gate
-POOL_WRITER_ALERTS_ENABLED=0                     # Pools are workload information by default; endurance remains health
-ARRAY_WRITER_TIER_MODERATE_PCT=2                 # Array moderate tier (% of device capacity/week)
-ARRAY_WRITER_WEEKLY_WARN_PCT=5                   # Array warning tier (% of device capacity/week)
-ARRAY_WRITER_WEEKLY_CRIT_PCT=15                  # Array critical tier (% of device capacity/week)
-ARRAY_WRITER_MIN_DAILY_GB=25                     # Ignore small array changes below this absolute daily write floor
-ARRAY_WRITER_MIN_RECENT_SAMPLES=3                # Recent daily samples required for a sustained array anomaly
-ARRAY_WRITER_BASELINE_INCREASE_PCT=50            # Array recent rate must exceed its preceding-window baseline by this %
-WRITER_WEEKLY_WARN_PCT=100                       # Default pool high tier (% of device capacity/week)
-WRITER_WEEKLY_CRIT_PCT=350                       # Default pool very-high tier (% of device capacity/week)
-WRITER_TIER_MODERATE_PCT=50                      # Default pool moderate tier (% of device capacity/week)
-POOL_WRITER_POLICY="cache:100:350,data:500:1000" # Optional pool:warning:critical overrides, comma-separated
 UNSAFE_SDWN_DELTA_WARN=5                         # Unsafe shutdowns delta >= warning (M)
 UNSAFE_SDWN_ABSOLUTE_MIN=100                     # Only warn if total unsafe shutdowns >= N (0=disable)
 UNSAFE_SDWN_COOLDOWN_DAYS=3                      # Suppress repeat warnings for X days after one triggers (0=disable)
@@ -467,61 +388,16 @@ BTRFS_DEV_CORR_WARN_DELTA=1                      # Per-device corruption/gen err
 BTRFS_DEV_CORR_CRIT_DELTA=1                      # Per-device corruption/gen err delta >= critical
 BTRFS_ERR_BURST_WARN_RATIO=5                     # Btrfs device error delta / previous delta >= warn ratio
 BTRFS_ERR_BURST_CRIT_RATIO=10                    # Btrfs device error delta / previous delta >= critical ratio
-XFS_PROC_WARN_DELTA=1000                         # xfs stat delta >= warning
-XFS_PROC_CRIT_DELTA=4000                         # xfs stat delta >= critical
-XFS_ERR_BURST_WARN_RATIO=8                       # xfs delta / previous-delta >= warn ratio
-XFS_ERR_BURST_CRIT_RATIO=20                      # xfs delta / previous-delta >= critical ratio
 BURST_WARN_BOOST=15                              # Composite SMART boost for warning burst events
 BURST_CRIT_BOOST=30                              # Composite SMART boost for critical burst events
 
 # === POH (Power-On Hours) Age Thresholds ===
-HDD_POH_WARN_HOURS=17520                         # HDD warn
-HDD_POH_CRIT_HOURS=43800                         # HDD critical
-SSD_POH_WARN_HOURS=26280                         # SATA SSD warn
-SSD_POH_CRIT_HOURS=43800                         # SATA SSD critical
-NVME_POH_WARN_HOURS=26280                        # NVMe warn
-NVME_POH_CRIT_HOURS=43800                        # NVMe critical
 
 # === TBW / Endurance Forecast Thresholds ===
-TBW_DAYS_WARN=14                                 # Remaining TBW forecast days < warning
-TBW_DAYS_CRIT=3                                  # Remaining TBW forecast days < critical
-TBW_WARN_TB=480                                  # Fallback TBW absolute threshold (TB)
-DEFAULT_SSD_ENDURANCE_PER_TB=300                 # Fallback endurance (TB) for unknown SATA/NVMe SSD models
 TBW_CONSUMED_WARN=80                             # Consumed percent of model TBW >= warning
 TBW_CONSUMED_CRIT=95                             # Consumed percent of model TBW >= critical
 
 # === Risk Scoring Weights ===
-W_SEV_CRIT=70                                    # Base score for CRITICAL devices
-W_SEV_WARN=30                                    # Base score for WARNING devices
-W_PENDING=40                                     # Pending sectors weight
-W_UNCORR=50                                      # Uncorrectables weight
-W_REALLOC=15                                     # Reallocated sectors present
-W_REALLOC_EVENTS=10                              # Reallocation events weight
-W_CMD_TIMEOUT=10                                 # Command timeouts weight
-W_CRC=5                                          # UDMA CRC errors weight
-W_SSD_LIFE=20                                    # Low SSD life remaining weight
-W_NVME_WEAR=20                                   # High NVMe wear weight
-W_NVME_ERR_LOG=15                                # NVMe error log entries growth weight
-W_NVME_PCIE_CORR=10                              # NVMe PCIe correctable errors growth weight
-W_NVME_PCIE_UNC=50                               # NVMe PCIe uncorrectable errors growth weight
-W_NVME_THERM_TRANS=10                            # NVMe thermal transition growth weight
-W_NVME_TEMP_TIME=15                              # NVMe temperature time accumulation weight
-W_TEMP=5                                         # High temperature weight
-W_E2E=40                                         # End-to-End errors weight
-W_SOFT_READ=10                                   # Soft read error rate weight
-W_NVME_RO=80                                     # NVMe read-only mode weight
-W_NVME_REL=60                                    # NVMe reliability degraded weight
-W_AGE_NEAR=30                                    # Near endurance extra weight
-W_POH_HDD=10                                     # High HDD POH age weight
-W_POH_SSD=10                                     # High SATA SSD POH age weight
-W_POH_NVME=10                                    # High NVMe POH age weight
-W_BTRFS_DEV_ERR=3                                # Btrfs per-device I/O/corruption errors weight
-W_XFS_META_ERR=3                                 # XFS metadata/stat anomalies weight
-W_SATA_LINK_DOWN=10                              # SATA negotiated link downshift weight
-W_SELFTEST_CRIT=40                               # SMART self-test critical result weight
-W_SELFTEST_WARN=15                               # SMART self-test warning/ambiguous result weight
-W_TBW_CONS_WARN=10                               # TBW consumed over warn threshold
-W_TBW_CONS_CRIT=25                               # TBW consumed over critical threshold
 
 # === Model-Specific Overrides ===
 # Rule format uses ';'-separated key:value pairs per line. Supported keys:
@@ -534,22 +410,13 @@ W_TBW_CONS_CRIT=25                               # TBW consumed over critical th
 # TBW endurance per TB overrides (model + optional capacity window)
 TBW_MODEL_RULES='\
 regex:MX500;per_tb:350
-regex:WD[[:space:]]+Red.*SA500;cap_min:0.45;cap_max:0.55;per_tb:700
+regex:WD[[:space:]]+Red.*SA500|WDS500G1R0A;cap_min:0.45;cap_max:0.55;per_tb:700
 regex:WD[[:space:]]+Red.*SA500;cap_min:0.95;cap_max:1.05;per_tb:600
-regex:Crucial[[:space:]]*T500;cap_min:0.95;cap_max:1.05;per_tb:600
-regex:Crucial[[:space:]]*P5(\\+|[[:space:]]*Plus|P5P);cap_min:0.95;cap_max:1.05;per_tb:600
+regex:Crucial[[:space:]]*T500|CT1000T500SSD[58];cap_min:0.95;cap_max:1.05;per_tb:600
+regex:Crucial[[:space:]]*P5(\\+|[[:space:]]*Plus|P5P)|CT1000P5PSSD8;cap_min:0.95;cap_max:1.05;per_tb:600
 '
 # POH threshold overrides by device type and model
-POH_MODEL_RULES='\
-type:nvme;regex:Crucial[[:space:]]*T500;warn:4000;crit:6000
-type:nvme;regex:Crucial.*P5P|Crucial[[:space:]]*P5[[:space:]]*Plus|P5\\+;cap_min:0.95;cap_max:1.05;warn:4000;crit:6000
-type:sata-hdd;regex:Ultrastar;warn:50000;crit:70000
-type:sata-ssd;regex:SA500|WD[[:space:]]+Red[[:space:]]+SA500;warn:6000;crit:10000
-'
 # Parsing/compatibility quirks (e.g., vendor-reported life remaining anomalies)
-QUIRK_MWI_RULES='\
-action:invert_mwi_small;regex:WD[[:space:]]+Red.*SA500;cap_min:0.48;cap_max:0.52
-'
 
 }
 
@@ -673,16 +540,12 @@ readonly HISTORY_SCHEMA_VERSION=3
 readonly DEVICE_ID_SCHEMA_VERSION=2
 readonly STATE_SCHEMA_FORMAT="health-monitoring-state"
 
-
 # === Runtime State (do not modify) ===
 declare -A SMART_STATE=()                         # Map device -> OK/WARNING/CRITICAL
 declare -A SMART_MSGS=()                          # Map device -> aggregated SMART message string
 declare -A MOUNT_TO_DEV=()                        # Map /mnt/diskX -> /dev/sdX|nvme
 declare -A POOL_MEMBER_MAP=()                     # Map base device (/dev/sdX|nvme0n1) -> pool name
 declare -A BURST_BOOST=()                         # Base device -> accumulated burst boost this run (0-100)
-declare -A TBW_STATUS_MAP=()                      # Map device -> TBW status (OK/WARNING/CRITICAL)
-declare -A TBW_DAILY=()                           # Map device -> long-window daily TBW bytes (endurance forecast)
-declare -A TBW_DAYS_LEFT=()                       # Map device -> forecasted days left to endurance
 declare -A WRITER_DAILY=()                        # Map device -> recent daily bytes (workload presentation)
 declare -A WRITER_PREVIOUS_DAILY=()               # Map device -> preceding-window daily bytes
 declare -A WRITER_DIRECTION=()                    # Map device -> IMPROVING/RISING/STEADY/COLLECTING
@@ -690,9 +553,7 @@ declare -A WRITER_CHANGE_PCT=()                   # Map device -> signed recent-
 declare -A WRITER_RECENT_READY=()                 # Map device -> 1 when recent window has sufficient evidence
 declare -A WRITER_RECENT_SAMPLES=()               # Map device -> sample count in the recent workload window
 declare -A WRITER_PREVIOUS_SAMPLES=()             # Map device -> sample count in the preceding workload window
-declare -A NVME_WEAR_DAYS_LEFT=() NVME_WEAR_RATE=() # NVMe depletion projection
 declare -A TBW_FORECAST_CONFIDENCE=()             # Per-device TBW forecast confidence
-declare -A NVME_WEAR_CONFIDENCE=()                # Per-device NVMe wear forecast confidence
 declare -A TEMP_RATE_CONFIDENCE=()                # Per-device temperature-rate confidence
 declare -A LAST_TEST=()                           # Map device -> last SMART test timestamp
 declare -A LAST_TEST_EPOCH=() LAST_TEST_KIND=()   # Actual test-start epoch/type (legacy date state remains supported)
@@ -711,7 +572,6 @@ declare -A LONG_LAST_POH=()                       # Map device -> last long self
 declare -A LONG_TEST_DUE_SOON=()                  # Map device -> days until next long test when near
 declare -A CMD_TIMEOUT_LAST=()                    # Map device -> previous command timeout count
 declare -A LONG_TEST_RUNNING_LONG=()              # Map device -> 1 if a long/extended self-test is currently in progress
-declare -A RISK_SPIKE_TS=()                       # Map device -> epoch timestamp of last captured risk spike
 declare -a FINDING_IDS=()                         # Ordered canonical finding identifiers
 declare -A FINDING_SEEN=()                        # Canonical finding de-duplication within a run
 declare -A FINDING_SEVERITY=() FINDING_CATEGORY=() # Finding classification
@@ -728,11 +588,9 @@ PARITY_RESULT_OBSERVED=0
 PARITY_HISTORY_OBSERVED=0
 RUN_COMPLETION_READY=0
 MONITOR_LAST_COMPLETE_EPOCH=0
-declare -A PREVIOUS_RISK=()                       # Previous persisted risk, retained when a disk stays asleep
 declare -A DEVICE_ID_BY_PATH=() DEVICE_PATH_BY_ID=() # Runtime path <-> stable persistent identity
 declare -A DEVICE_ID_SOURCE=()                    # Identity source: WWN, by-id, serial, or path fallback
 declare -a DISCOVERED_DISKS=()                    # Ordered SMART-capable base-device candidates
-declare -A RISK_MAP=()                           # Canonical per-device risk scores
 declare -a NOTIFY_SECTIONS=()                     # Final notification sections
 declare -a TBW_EVAL_MESSAGES=()                   # Output from direct TBW evaluation
 declare -a COLLECTOR_ORDER=()                     # Deterministic collector report order
@@ -795,26 +653,6 @@ NOTIFICATION_JOURNAL_COMMIT_ALLOWED=0
 NOTIFICATION_DELIVERY_ATTEMPTS=0
 NOTIFICATION_DELIVERY_RC=0
 NOTIFICATION_PHASE_REACHED=0
-SOAK_RUN_STARTED=0
-SOAK_ANALYSIS_STATUS="COLLECTING"
-SOAK_ANALYSIS_DETAIL="no observations"
-SOAK_ANALYSIS_VALID_RUNS=0
-SOAK_ANALYSIS_INVALID_RUNS=0
-SOAK_ANALYSIS_CLEAN_RUNS=0
-SOAK_ANALYSIS_ATTENTION_RUNS=0
-SOAK_ANALYSIS_SPAN_DAYS=0
-SOAK_ANALYSIS_BOOT_COUNT=0
-SOAK_ANALYSIS_REBOOT_OBSERVED=0
-SOAK_ANALYSIS_STANDBY_RUNS=0
-SOAK_ANALYSIS_PARITY_RUNS=0
-SOAK_ANALYSIS_SYSLOG_ROTATION_RUNS=0
-SOAK_ANALYSIS_NOTIFICATION_DELIVERED=0
-SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED=0
-SOAK_ANALYSIS_NOTIFICATION_FAILED=0
-SOAK_ANALYSIS_SLOW_COLLECTORS=0
-SOAK_ANALYSIS_MAX_DURATION=0
-SOAK_ANALYSIS_AVG_DURATION=0
-SOAK_ANALYSIS_MISSING=""
 EXTERNAL_CONFIG_STATUS="NOT_LOADED"
 EXTERNAL_CONFIG_DETAIL=""
 EXTERNAL_CONFIG_OVERRIDE_COUNT=0
@@ -860,16 +698,6 @@ log_smart() { log "SMART"  "INFO" "$*"; }
 log_btrfs() { log "BTRFS"  "INFO" "$*"; }
 log_xfs()   { log "XFS"    "INFO" "$*"; }
 
-log_master_only() {
-    local category="$1" level="$2"
-    shift 2
-
-    [[ -n "$MASTER_LOG" ]] || return 0
-    printf '%s [%s][%s] %s\n' \
-        "$(date '+%Y-%m-%d %H:%M:%S')" "$category" "$level" "$*" \
-        >> "$MASTER_LOG" 2>/dev/null || true
-}
-
 # === State Files ===
 # --- Alerting & Runtime (immediate health evaluation, deltas, cooldowns, recent events) ---
 SMART_LONG_STATE_FILE="$STATE_DIR/smart_long_processed.log"         # Long SMART test last run time per disk (scheduling)
@@ -879,15 +707,12 @@ SMART_SELFTEST_DIR="$STATE_DIR/smart_selftest"                      # Per-disk S
 NVME_STATE_FILE="$STATE_DIR/counters_last.log"                      # NVMe counters last snapshot (delta alerts)
 PREV_ATTR_FILE="$STATE_DIR/smart_prev_attrs.log"                    # Previous SMART/NVMe attribute raw values (delta calculations)
 ALERT_NEW_SEEN_FILE="$STATE_DIR/new_alerts_seen.log"                # Newly seen alert/device tracking (de-dup noise)
-RISK_PREV_FILE="$STATE_DIR/risk_prev.log"                           # Previous risk score per disk (change detection)
 CMD_TIMEOUT_LAST_FILE="$STATE_DIR/cmd_timeout_last.log"             # Previous command timeout counts (delta alerting)
 CMD_TIMEOUT_STATE_DIR="$STATE_DIR/cmd_timeout"                      # Per-disk command timeout cooldown files
 UNSAFE_SDWN_STATE_DIR="$STATE_DIR/unsafe_shutdown"                  # Per-NVMe unsafe shutdown cooldown files
 BTRFS_SCRUB_STATE_DIR="$STATE_DIR/btrfs_scrub_status"               # Per-pool scrub status (in-progress vs last)
-XFS_PROC_PREV_FILE="$STATE_DIR/xfs_proc_stats_prev.log"             # Previous XFS /proc snapshot (delta anomaly detection)
 BTRFS_DEV_PREV_FILE="$STATE_DIR/btrfs_device_stats.prev"            # Previous Btrfs per-device counters and capture metadata
 SYSLOG_CURSOR_STATE_FILE="$STATE_DIR/syslog_cursor.state"            # Persistent inode/line cursor for incremental syslog reads
-RISK_SPIKE_FILE="$STATE_DIR/risk_spikes.log"                        # Persisted risk spike timestamps (accelerated scheduling)
 DEVICE_ID_MAP_FILE="$STATE_DIR/device_identity_map.log"             # Stable ID to current /dev path inventory
 DEVICE_ID_SCHEMA_FILE="$STATE_DIR/device_identity_schema.version"   # One-time /dev history migration marker
 STATE_SCHEMA_MANIFEST_FILE="$STATE_DIR/state_schema.manifest"       # Coordinated persisted-format versions
@@ -895,20 +720,18 @@ REPLACEMENT_EVENTS_FILE="$STATE_DIR/replacement_events.log"         # Drive repl
 SATA_LINK_HISTORY_FILE="$STATE_DIR/sata_link_downshift_history.log" # SATA link instability events (alert context)
 NOTIFICATION_JOURNAL_FILE="$STATE_DIR/notification_lifecycle.state" # Last successfully delivered canonical finding set
 NOTIFICATION_RECOVERY_STATE_FILE="$STATE_DIR/notification_recovery.state" # Consecutive safe-run recovery candidates
-SOAK_RUN_HISTORY_FILE="$STATE_DIR/soak_runs.tsv"                    # Phase 15 atomic run-level soak evidence
 # --- Trend / Historical Analytics (longer-term forecasting, prioritization, trajectory) ---
 IO_ERROR_HISTORY_FILE="$STATE_DIR/io_error_history.log"             # I/O error frequency timeline (acceleration)
 BTRFS_DEV_HIST_FILE="$STATE_DIR/btrfs_device_stats_history.log"     # Btrfs per-device error deltas over time
-XFS_PROC_HISTORY_FILE="$STATE_DIR/xfs_proc_stats_history.log"       # XFS stat counters history (metadata pressure trend)
 TBW_HISTORY_FILE="$STATE_DIR/tbw_history.log"                       # Total bytes written progression (wear modeling)
 SMART_ATTR_HISTORY_FILE="$STATE_DIR/smart_attr_history.log"         # Attribute growth time-series (trend alerts)
 TEMP_HISTORY_FILE="$STATE_DIR/temp_history.log"                     # Temperature samples (rate & exposure)
 STATE_FILES_ALERT_RUNTIME=(
     "$MONITOR_RECEIPT_FILE" "$SMART_COVERAGE_FILE"
-    "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$ALERT_NEW_SEEN_FILE" "$RISK_PREV_FILE" "$XFS_PROC_PREV_FILE" "$BTRFS_DEV_PREV_FILE" "$SYSLOG_CURSOR_STATE_FILE" "$RISK_SPIKE_FILE" "$REPLACEMENT_EVENTS_FILE" "$SATA_LINK_HISTORY_FILE" "$NOTIFICATION_JOURNAL_FILE" "$NOTIFICATION_RECOVERY_STATE_FILE" "$SOAK_RUN_HISTORY_FILE"
+    "$SMART_LONG_STATE_FILE" "$SMART_LONG_LAST_POH_FILE" "$SMART_LAST" "$ALERT_NEW_SEEN_FILE"   "$BTRFS_DEV_PREV_FILE" "$SYSLOG_CURSOR_STATE_FILE"  "$REPLACEMENT_EVENTS_FILE" "$SATA_LINK_HISTORY_FILE" "$NOTIFICATION_JOURNAL_FILE" "$NOTIFICATION_RECOVERY_STATE_FILE"
 )
 STATE_FILES_TREND_HISTORY=(
-    "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE" "$XFS_PROC_HISTORY_FILE" "$TBW_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$TEMP_HISTORY_FILE"
+    "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE"  "$TBW_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$TEMP_HISTORY_FILE"
 )
 # === Notification Settings ===
 NOTIFY_TITLE_SMART="SMART Test Alert"                       # SMART test notifications
@@ -1430,13 +1253,12 @@ ensure_external_config_template() {
 #
 # Syntax: one KEY=VALUE per line. This file is parsed as data, not sourced.
 # LOG_DIR and LOCK_FILE are bootstrap settings and cannot be overridden here.
-# POOL_EXCLUDES uses comma-separated pool names. POOL_WRITER_POLICY uses
-# comma-separated pool:warning:critical percentage records.
+# POOL_EXCLUDES uses comma-separated pool names.
 #
 # Examples (remove the leading '# ' to enable):
 # SMART_ALLOW_SPINUP=0
 # SHORT_TEST_INTERVAL_DAYS=7
-# ENABLE_BTRFS_SCRUB=0
+# HISTORY_WINDOW_DAYS=14
 # WARN_THRESHOLD_PERCENT=96
 # CRITICAL_THRESHOLD_PERCENT=98
 # NOTIFICATION_WARNING_REMINDER_HOURS=24
@@ -1445,22 +1267,6 @@ ensure_external_config_template() {
 # NOTIFICATION_RECOVERY_CONFIRM_RUNS=2
 # NOTIFICATION_DRY_RUN=0
 # HEAVY_WRITER_RECENT_DAYS=3
-# HEAVY_WRITER_ALERTS_ENABLED=1
-# ARRAY_WRITER_ALERTS_ENABLED=1
-# POOL_WRITER_ALERTS_ENABLED=0
-# ARRAY_WRITER_TIER_MODERATE_PCT=2
-# ARRAY_WRITER_WEEKLY_WARN_PCT=5
-# ARRAY_WRITER_WEEKLY_CRIT_PCT=15
-# ARRAY_WRITER_MIN_DAILY_GB=25
-# ARRAY_WRITER_MIN_RECENT_SAMPLES=3
-# ARRAY_WRITER_BASELINE_INCREASE_PCT=50
-# WRITER_WEEKLY_WARN_PCT=100
-# WRITER_WEEKLY_CRIT_PCT=350
-# POOL_WRITER_POLICY=cache:100:350,data:500:1000
-# SOAK_TELEMETRY_ENABLED=1
-# SOAK_MIN_RUNS=14
-# SOAK_MIN_DAYS=14
-# SOAK_REQUIRE_PARITY=0
 # POOL_EXCLUDES=ramtmp,user0
 "
     atomic_write_text "$EXTERNAL_CONFIG_FILE" "$content" || return 1
@@ -1494,7 +1300,6 @@ join_by() {
 
     printf '%s' "$output"
 }
-
 
 state_temp_file() {
     local target="$1"
@@ -2287,7 +2092,6 @@ btrfs_bounded_optional() {
     run_bounded "$BTRFS_COMMAND_TIMEOUT_SECONDS" "btrfs $*" btrfs "$@"
 }
 
-
 df_bounded() {
     run_bounded_checked "$SYSTEM_COMMAND_TIMEOUT_SECONDS" "df ${*: -1}" df "$@"
 }
@@ -2304,7 +2108,6 @@ lsblk_bounded() {
 hdparm_bounded() {
     run_bounded "$SYSTEM_COMMAND_TIMEOUT_SECONDS" "hdparm ${*: -1}" hdparm "$@"
 }
-
 
 collector_status_is_safe() {
     case "${COLLECTOR_STATUS[$1]:-NOT_RUN}" in
@@ -2417,7 +2220,6 @@ run_collector() {
     return 0
 }
 
-
 # Classify forecast evidence. RESET is supplied by callers when a monotonic
 # endurance counter regresses and STALE when the newest sample is too old.
 forecast_confidence() {
@@ -2498,8 +2300,8 @@ acquire_lock() {
 
 write_monitor_receipt() {
     local status="$1" exit_code="$2" outcome finished=0
-    set_soak_notification_outcome
-    outcome="$SOAK_NOTIFICATION_OUTCOME_RESULT"
+    set_notification_outcome
+    outcome="$RECEIPT_NOTIFICATION_OUTCOME_RESULT"
     if [[ "$status" != running ]]; then finished=$(date +%s); fi
     if [[ "$status" == complete ]]; then MONITOR_LAST_COMPLETE_EPOCH="$finished"; fi
     atomic_write_text "$MONITOR_RECEIPT_FILE" "$(printf \
@@ -2558,7 +2360,6 @@ initialize_runtime() {
         }
     done
 
-    SOAK_RUN_STARTED=1
     log "INIT" "INFO" "Runtime initialized (state: $STATE_DIR)"
 }
 
@@ -2576,11 +2377,6 @@ cleanup() {
             log "STATE" "ERROR" "Unable to persist monitor completion receipt"
             (( exit_code != 0 )) || exit_code=1
         fi
-    fi
-
-    if (( SOAK_RUN_STARTED == 1 && SOAK_TELEMETRY_ENABLED == 1 )); then
-        persist_soak_observation "$exit_code" ||
-            log "SOAK" "WARN" "Unable to persist this run's soak observation"
     fi
 
     if [[ -n "$RUN_DIR" && -d "$RUN_DIR" ]]; then
@@ -2604,410 +2400,23 @@ handle_signal() {
     exit "$exit_code"
 }
 
-
 # ---------------------------------------------------------------------------
-# Phase 15 soak evidence
 # ---------------------------------------------------------------------------
 
-soak_record_is_valid() {
-    (( $# == 24 )) || return 1
-    local schema="$1" start_epoch="$2" end_epoch="$3" duration="$4"
-    local exit_status="$5" boot_id="$6" ok_count="$7" deferred_count="$8"
-    local timeout_count="$9" failed_count="${10}" slow_count="${11}"
-    local collector_seconds="${12}" critical_count="${13}" warning_count="${14}"
-    local decision="${15}" outcome="${16}" notification_rc="${17}"
-    local notification_attempts="${18}" parity_active="${19}"
-    local standby_count="${20}" syslog_mode="${21}" device_count="${22}"
-    local log_file="${23}" writer_version="${24}" value
-
-    [[ "$schema" == "v1" ]] || return 1
-    for value in \
-        "$start_epoch" "$end_epoch" "$duration" "$exit_status" \
-        "$ok_count" "$deferred_count" "$timeout_count" "$failed_count" \
-        "$slow_count" "$collector_seconds" "$critical_count" "$warning_count" \
-        "$notification_rc" "$notification_attempts" "$parity_active" \
-        "$standby_count" "$device_count"
-    do
-        [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
-    done
-    (( end_epoch >= start_epoch )) || return 1
-    (( parity_active == 0 || parity_active == 1 )) || return 1
-    [[ "$boot_id" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
-    [[ "$decision" =~ ^(SEND|SUPPRESS|not_evaluated)$ ]] || return 1
-    [[ "$outcome" =~ ^(delivered|failed|suppressed|dry_run|not_evaluated)$ ]] || return 1
-    [[ "$syslog_mode" =~ ^(not_run|initial_lookback|cursor_continuation|rotation_recovery|rotation_fallback|concurrent_rotation|dmesg_fallback)$ ]] || return 1
-    [[ "$log_file" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
-    [[ "$writer_version" =~ ^[0-9]+([.][0-9]+)*$ ]] || return 1
-}
-
-set_soak_notification_outcome() {
-    SOAK_NOTIFICATION_DECISION_RESULT="not_evaluated"
-    SOAK_NOTIFICATION_OUTCOME_RESULT="not_evaluated"
+set_notification_outcome() {
+    RECEIPT_NOTIFICATION_OUTCOME_RESULT="not_evaluated"
 
     (( NOTIFICATION_PHASE_REACHED == 1 )) || return 0
-    SOAK_NOTIFICATION_DECISION_RESULT="$NOTIFICATION_DECISION"
     if [[ "$NOTIFICATION_DECISION" == "SUPPRESS" ]]; then
-        SOAK_NOTIFICATION_OUTCOME_RESULT="suppressed"
+        RECEIPT_NOTIFICATION_OUTCOME_RESULT="suppressed"
     elif (( NOTIFICATION_DRY_RUN == 1 )); then
-        SOAK_NOTIFICATION_OUTCOME_RESULT="dry_run"
+        RECEIPT_NOTIFICATION_OUTCOME_RESULT="dry_run"
     elif (( NOTIFICATION_DELIVERY_ATTEMPTS > 0 && NOTIFICATION_DELIVERY_RC == 0 )); then
-        SOAK_NOTIFICATION_OUTCOME_RESULT="delivered"
+        RECEIPT_NOTIFICATION_OUTCOME_RESULT="delivered"
     else
-        SOAK_NOTIFICATION_OUTCOME_RESULT="failed"
+        RECEIPT_NOTIFICATION_OUTCOME_RESULT="failed"
     fi
 }
-
-persist_soak_observation() {
-    local exit_status="${1:-1}" end_epoch duration boot_id="unknown"
-    local collector ok_count=0 deferred_count=0 timeout_count=0 failed_count=0
-    local slow_count=0 collector_seconds=0 collector_duration collector_detail
-    local standby_count=0 device_count=0 notification_rc notification_attempts
-    local parity_active=0 syslog_mode log_file temp_file filtered_file line_count
-    local existing_line_count=0 retained_line_count=0
-    local cutoff_epoch=0
-
-    (( SOAK_TELEMETRY_ENABLED == 1 && SOAK_RUN_STARTED == 1 )) || return 0
-    [[ "$RUN_EPOCH" =~ ^[0-9]+$ && "$exit_status" =~ ^[0-9]+$ ]] || return 1
-
-    end_epoch=$(date +%s)
-    [[ "$end_epoch" =~ ^[0-9]+$ ]] || return 1
-    duration=$((end_epoch - RUN_EPOCH))
-    (( duration >= 0 )) || duration=0
-    if [[ -r /proc/sys/kernel/random/boot_id ]]; then
-        read -r boot_id < /proc/sys/kernel/random/boot_id || boot_id="unknown"
-    fi
-    [[ "$boot_id" =~ ^[A-Za-z0-9._-]+$ ]] || boot_id="unknown"
-
-    for collector in "${COLLECTOR_ORDER[@]}"; do
-        collector_duration="${COLLECTOR_DURATION[$collector]:-0}"
-        collector_detail="${COLLECTOR_DETAIL[$collector]:-}"
-        [[ "$collector_duration" =~ ^[0-9]+$ ]] || collector_duration=0
-        collector_seconds=$((collector_seconds + collector_duration))
-        [[ "$collector_detail" == *slow* ]] && slow_count=$((slow_count + 1))
-        case "${COLLECTOR_STATUS[$collector]:-FAILED}" in
-            OK)        ok_count=$((ok_count + 1)) ;;
-            DEFERRED)  deferred_count=$((deferred_count + 1)) ;;
-            TIMED_OUT) timeout_count=$((timeout_count + 1)) ;;
-            *)         failed_count=$((failed_count + 1)) ;;
-        esac
-    done
-
-    standby_count="${#SMART_DEFERRED[@]}"
-    device_count="${#DISCOVERED_DISKS[@]}"
-    (( PARITY_ACTIVE == 1 )) && parity_active=1
-    syslog_mode="${SYSLOG_CURSOR_MODE:-not_run}"
-    case "$syslog_mode" in
-        not_run|initial_lookback|cursor_continuation|rotation_recovery|rotation_fallback|concurrent_rotation|dmesg_fallback) ;;
-        *) syslog_mode="not_run" ;;
-    esac
-    set_soak_notification_outcome
-    notification_rc="${NOTIFICATION_DELIVERY_RC:-1}"
-    notification_attempts="${NOTIFICATION_DELIVERY_ATTEMPTS:-0}"
-    [[ "$notification_rc" =~ ^[0-9]+$ ]] || notification_rc=1
-    [[ "$notification_attempts" =~ ^[0-9]+$ ]] || notification_attempts=0
-    log_file="${MASTER_LOG##*/}"
-    [[ "$log_file" =~ ^[A-Za-z0-9._-]+$ ]] || log_file="unknown.log"
-
-    temp_file="$(state_temp_file "$SOAK_RUN_HISTORY_FILE")" || return 1
-    if [[ -s "$SOAK_RUN_HISTORY_FILE" ]]; then
-        existing_line_count=$(wc -l < "$SOAK_RUN_HISTORY_FILE" 2>/dev/null || echo 0)
-        existing_line_count=${existing_line_count//[[:space:]]/}
-        awk -F '\t' '
-            function uint(value) { return value ~ /^(0|[1-9][0-9]*)$/ }
-            NF == 24 && $1 == "v1" &&
-            uint($2) && uint($3) && uint($4) && uint($5) &&
-            $6 ~ /^[A-Za-z0-9._-]+$/ &&
-            uint($7) && uint($8) && uint($9) && uint($10) &&
-            uint($11) && uint($12) && uint($13) && uint($14) &&
-            $15 ~ /^(SEND|SUPPRESS|not_evaluated)$/ &&
-            $16 ~ /^(delivered|failed|suppressed|dry_run|not_evaluated)$/ &&
-            uint($17) && uint($18) && $19 ~ /^[01]$/ && uint($20) &&
-            $21 ~ /^(not_run|initial_lookback|cursor_continuation|rotation_recovery|rotation_fallback|concurrent_rotation|dmesg_fallback)$/ &&
-            uint($22) && $23 ~ /^[A-Za-z0-9._-]+$/ &&
-            $24 ~ /^[0-9]+([.][0-9]+)*$/ && $3 >= $2
-        ' "$SOAK_RUN_HISTORY_FILE" > "$temp_file" || {
-            rm -f -- "$temp_file" 2>/dev/null || true
-            return 1
-        }
-        retained_line_count=$(wc -l < "$temp_file" 2>/dev/null || echo 0)
-        retained_line_count=${retained_line_count//[[:space:]]/}
-        if (( existing_line_count > retained_line_count )); then
-            log "SOAK" "WARN" \
-                "Discarded $((existing_line_count - retained_line_count)) malformed soak evidence record(s) before appending this run"
-        fi
-    else
-        : > "$temp_file" || return 1
-    fi
-
-    printf 'v1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$RUN_EPOCH" "$end_epoch" "$duration" "$exit_status" "$boot_id" \
-        "$ok_count" "$deferred_count" "$timeout_count" "$failed_count" \
-        "$slow_count" "$collector_seconds" "$FINDING_CRITICAL_COUNT" \
-        "$FINDING_WARNING_COUNT" "$SOAK_NOTIFICATION_DECISION_RESULT" \
-        "$SOAK_NOTIFICATION_OUTCOME_RESULT" "$notification_rc" \
-        "$notification_attempts" "$parity_active" "$standby_count" \
-        "$syslog_mode" "$device_count" "$log_file" "$SCRIPT_VERSION" \
-        >> "$temp_file" || {
-            rm -f -- "$temp_file" 2>/dev/null || true
-            return 1
-        }
-
-    if (( SOAK_RETENTION_DAYS > 0 )); then
-        cutoff_epoch=$((end_epoch - SOAK_RETENTION_DAYS * 86400))
-        (( cutoff_epoch >= 0 )) || cutoff_epoch=0
-        filtered_file="$(state_temp_file "$SOAK_RUN_HISTORY_FILE")" || {
-            rm -f -- "$temp_file" 2>/dev/null || true
-            return 1
-        }
-        awk -F '\t' -v cutoff="$cutoff_epoch" '$2 >= cutoff' \
-            "$temp_file" > "$filtered_file" || {
-                rm -f -- "$temp_file" "$filtered_file" 2>/dev/null || true
-                return 1
-            }
-        mv -f -- "$filtered_file" "$temp_file" || {
-            rm -f -- "$temp_file" "$filtered_file" 2>/dev/null || true
-            return 1
-        }
-    fi
-
-    line_count=$(wc -l < "$temp_file" 2>/dev/null || echo 0)
-    line_count=${line_count//[[:space:]]/}
-    if (( line_count > SOAK_MAX_RECORDS )); then
-        filtered_file="$(state_temp_file "$SOAK_RUN_HISTORY_FILE")" || {
-            rm -f -- "$temp_file" 2>/dev/null || true
-            return 1
-        }
-        tail -n "$SOAK_MAX_RECORDS" "$temp_file" > "$filtered_file" || {
-            rm -f -- "$temp_file" "$filtered_file" 2>/dev/null || true
-            return 1
-        }
-        mv -f -- "$filtered_file" "$temp_file" || {
-            rm -f -- "$temp_file" "$filtered_file" 2>/dev/null || true
-            return 1
-        }
-    fi
-
-    atomic_commit "$temp_file" "$SOAK_RUN_HISTORY_FILE" || return 1
-    log "SOAK" "INFO" \
-        "Recorded run duration=${duration}s exit=$exit_status collectors=OK:$ok_count/DEFERRED:$deferred_count/TIMED_OUT:$timeout_count/FAILED:$failed_count notification=$SOAK_NOTIFICATION_OUTCOME_RESULT"
-}
-
-soak_add_missing_requirement() {
-    local requirement="$1"
-
-    if [[ -n "$SOAK_ANALYSIS_MISSING" ]]; then
-        SOAK_ANALYSIS_MISSING+=", $requirement"
-    else
-        SOAK_ANALYSIS_MISSING="$requirement"
-    fi
-}
-
-analyze_soak_history() {
-    local line start_epoch end_epoch duration exit_status boot_id ok_count
-    local deferred_count timeout_count failed_count slow_count collector_seconds
-    local critical_count warning_count decision outcome notification_rc
-    local notification_attempts parity_active standby_count syslog_mode
-    local device_count log_file writer_version run_attention first_epoch=0 last_epoch=0
-    local duration_total=0 boot
-    local -a fields=()
-    local -A boot_seen=()
-
-    SOAK_ANALYSIS_STATUS="COLLECTING"
-    SOAK_ANALYSIS_DETAIL="no observations"
-    SOAK_ANALYSIS_VALID_RUNS=0
-    SOAK_ANALYSIS_INVALID_RUNS=0
-    SOAK_ANALYSIS_CLEAN_RUNS=0
-    SOAK_ANALYSIS_ATTENTION_RUNS=0
-    SOAK_ANALYSIS_SPAN_DAYS=0
-    SOAK_ANALYSIS_BOOT_COUNT=0
-    SOAK_ANALYSIS_REBOOT_OBSERVED=0
-    SOAK_ANALYSIS_STANDBY_RUNS=0
-    SOAK_ANALYSIS_PARITY_RUNS=0
-    SOAK_ANALYSIS_SYSLOG_ROTATION_RUNS=0
-    SOAK_ANALYSIS_NOTIFICATION_DELIVERED=0
-    SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED=0
-    SOAK_ANALYSIS_NOTIFICATION_FAILED=0
-    SOAK_ANALYSIS_SLOW_COLLECTORS=0
-    SOAK_ANALYSIS_MAX_DURATION=0
-    SOAK_ANALYSIS_AVG_DURATION=0
-    SOAK_ANALYSIS_MISSING=""
-
-    if (( SOAK_TELEMETRY_ENABLED == 0 )); then
-        SOAK_ANALYSIS_STATUS="DISABLED"
-        SOAK_ANALYSIS_DETAIL="SOAK_TELEMETRY_ENABLED=0"
-        return 0
-    fi
-    if [[ ! -e "$SOAK_RUN_HISTORY_FILE" && ! -L "$SOAK_RUN_HISTORY_FILE" ]]; then
-        SOAK_ANALYSIS_DETAIL="no monitoring observations recorded yet"
-        return 0
-    fi
-    if ! validate_secure_owned_file "$SOAK_RUN_HISTORY_FILE"; then
-        SOAK_ANALYSIS_STATUS="ATTENTION"
-        SOAK_ANALYSIS_DETAIL="unsafe evidence file: $PATH_VALIDATION_REASON"
-        return 1
-    fi
-
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        IFS=$'\t' read -r -a fields <<< "$line"
-        if ! soak_record_is_valid "${fields[@]}"; then
-            SOAK_ANALYSIS_INVALID_RUNS=$((SOAK_ANALYSIS_INVALID_RUNS + 1))
-            continue
-        fi
-        start_epoch="${fields[1]}"
-        end_epoch="${fields[2]}"
-        duration="${fields[3]}"
-        exit_status="${fields[4]}"
-        boot_id="${fields[5]}"
-        ok_count="${fields[6]}"
-        deferred_count="${fields[7]}"
-        timeout_count="${fields[8]}"
-        failed_count="${fields[9]}"
-        slow_count="${fields[10]}"
-        collector_seconds="${fields[11]}"
-        critical_count="${fields[12]}"
-        warning_count="${fields[13]}"
-        decision="${fields[14]}"
-        outcome="${fields[15]}"
-        notification_rc="${fields[16]}"
-        notification_attempts="${fields[17]}"
-        parity_active="${fields[18]}"
-        standby_count="${fields[19]}"
-        syslog_mode="${fields[20]}"
-        device_count="${fields[21]}"
-        log_file="${fields[22]}"
-        writer_version="${fields[23]}"
-        [[ "$writer_version" == "$SCRIPT_VERSION" ]] || continue
-
-        # These fields are intentionally decoded even when the readiness model
-        # does not yet consume them, so schema drift cannot pass unnoticed.
-        : "$ok_count" "$deferred_count" "$collector_seconds" \
-            "$critical_count" "$warning_count" "$decision" "$notification_rc" \
-            "$notification_attempts" "$device_count" "$log_file" "$writer_version"
-
-        SOAK_ANALYSIS_VALID_RUNS=$((SOAK_ANALYSIS_VALID_RUNS + 1))
-        (( first_epoch == 0 || start_epoch < first_epoch )) && first_epoch="$start_epoch"
-        (( end_epoch > last_epoch )) && last_epoch="$end_epoch"
-        duration_total=$((duration_total + duration))
-        (( duration > SOAK_ANALYSIS_MAX_DURATION )) && SOAK_ANALYSIS_MAX_DURATION="$duration"
-        [[ "$boot_id" == "unknown" ]] || boot_seen[$boot_id]=1
-        SOAK_ANALYSIS_SLOW_COLLECTORS=$((SOAK_ANALYSIS_SLOW_COLLECTORS + slow_count))
-        (( standby_count > 0 )) && SOAK_ANALYSIS_STANDBY_RUNS=$((SOAK_ANALYSIS_STANDBY_RUNS + 1))
-        (( parity_active == 1 )) && SOAK_ANALYSIS_PARITY_RUNS=$((SOAK_ANALYSIS_PARITY_RUNS + 1))
-        case "$syslog_mode" in
-            rotation_recovery|rotation_fallback|concurrent_rotation)
-                SOAK_ANALYSIS_SYSLOG_ROTATION_RUNS=$((SOAK_ANALYSIS_SYSLOG_ROTATION_RUNS + 1)) ;;
-        esac
-        case "$outcome" in
-            delivered)  SOAK_ANALYSIS_NOTIFICATION_DELIVERED=$((SOAK_ANALYSIS_NOTIFICATION_DELIVERED + 1)) ;;
-            suppressed) SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED=$((SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED + 1)) ;;
-            failed)     SOAK_ANALYSIS_NOTIFICATION_FAILED=$((SOAK_ANALYSIS_NOTIFICATION_FAILED + 1)) ;;
-        esac
-
-        run_attention=0
-        (( exit_status != 0 || timeout_count > 0 || failed_count > 0 )) && run_attention=1
-        [[ "$outcome" == "failed" ]] && run_attention=1
-        if (( run_attention == 1 )); then
-            SOAK_ANALYSIS_ATTENTION_RUNS=$((SOAK_ANALYSIS_ATTENTION_RUNS + 1))
-        else
-            SOAK_ANALYSIS_CLEAN_RUNS=$((SOAK_ANALYSIS_CLEAN_RUNS + 1))
-        fi
-    done < "$SOAK_RUN_HISTORY_FILE"
-
-    for boot in "${!boot_seen[@]}"; do
-        SOAK_ANALYSIS_BOOT_COUNT=$((SOAK_ANALYSIS_BOOT_COUNT + 1))
-    done
-    (( SOAK_ANALYSIS_BOOT_COUNT >= 2 )) && SOAK_ANALYSIS_REBOOT_OBSERVED=1
-    if (( SOAK_ANALYSIS_VALID_RUNS > 0 )); then
-        SOAK_ANALYSIS_SPAN_DAYS=$(( (last_epoch - first_epoch) / 86400 ))
-        (( SOAK_ANALYSIS_SPAN_DAYS >= 0 )) || SOAK_ANALYSIS_SPAN_DAYS=0
-        SOAK_ANALYSIS_AVG_DURATION=$((duration_total / SOAK_ANALYSIS_VALID_RUNS))
-    fi
-
-    (( SOAK_ANALYSIS_VALID_RUNS >= SOAK_MIN_RUNS )) ||
-        soak_add_missing_requirement "runs ${SOAK_ANALYSIS_VALID_RUNS}/${SOAK_MIN_RUNS}"
-    (( SOAK_ANALYSIS_SPAN_DAYS >= SOAK_MIN_DAYS )) ||
-        soak_add_missing_requirement "span ${SOAK_ANALYSIS_SPAN_DAYS}/${SOAK_MIN_DAYS}d"
-    (( SOAK_REQUIRE_REBOOT == 0 || SOAK_ANALYSIS_REBOOT_OBSERVED == 1 )) ||
-        soak_add_missing_requirement "reboot"
-    (( SOAK_REQUIRE_STANDBY == 0 || SOAK_ANALYSIS_STANDBY_RUNS > 0 )) ||
-        soak_add_missing_requirement "standby deferral"
-    (( SOAK_REQUIRE_SYSLOG_ROTATION == 0 || SOAK_ANALYSIS_SYSLOG_ROTATION_RUNS > 0 )) ||
-        soak_add_missing_requirement "syslog rotation"
-    (( SOAK_REQUIRE_NOTIFICATION_DELIVERY == 0 || SOAK_ANALYSIS_NOTIFICATION_DELIVERED > 0 )) ||
-        soak_add_missing_requirement "notification delivery"
-    (( SOAK_REQUIRE_NOTIFICATION_SUPPRESSION == 0 || SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED > 0 )) ||
-        soak_add_missing_requirement "notification suppression"
-    (( SOAK_REQUIRE_PARITY == 0 || SOAK_ANALYSIS_PARITY_RUNS > 0 )) ||
-        soak_add_missing_requirement "parity activity"
-
-    if (( SOAK_ANALYSIS_INVALID_RUNS > 0 || SOAK_ANALYSIS_ATTENTION_RUNS > 0 )); then
-        SOAK_ANALYSIS_STATUS="ATTENTION"
-        SOAK_ANALYSIS_DETAIL="${SOAK_ANALYSIS_ATTENTION_RUNS} run(s) failed/incomplete; ${SOAK_ANALYSIS_INVALID_RUNS} malformed record(s)"
-    elif [[ -n "$SOAK_ANALYSIS_MISSING" ]]; then
-        SOAK_ANALYSIS_STATUS="COLLECTING"
-        SOAK_ANALYSIS_DETAIL="waiting for $SOAK_ANALYSIS_MISSING"
-    else
-        SOAK_ANALYSIS_STATUS="READY"
-        SOAK_ANALYSIS_DETAIL="all configured soak requirements satisfied"
-    fi
-    return 0
-}
-
-soak_requirement_label() {
-    local required="$1" observed="$2"
-
-    if (( required == 0 )); then
-        printf 'optional; observed=%s' "$observed"
-    elif (( observed > 0 )); then
-        printf 'PASS; observed=%s' "$observed"
-    else
-        printf 'WAITING; observed=0'
-    fi
-}
-
-print_soak_status() {
-    local analysis_rc=0
-
-    analyze_soak_history || analysis_rc=$?
-
-    printf 'Disk Health Monitor for Unraid v%s - Phase 15 soak status\n' "$SCRIPT_VERSION"
-    printf 'Evidence file: %s\n' "$SOAK_RUN_HISTORY_FILE"
-    printf 'Readiness: %s — %s\n\n' "$SOAK_ANALYSIS_STATUS" "$SOAK_ANALYSIS_DETAIL"
-    printf 'Progress: valid=%d required=%d span=%dd required=%dd malformed=%d\n' \
-        "$SOAK_ANALYSIS_VALID_RUNS" "$SOAK_MIN_RUNS" \
-        "$SOAK_ANALYSIS_SPAN_DAYS" "$SOAK_MIN_DAYS" \
-        "$SOAK_ANALYSIS_INVALID_RUNS"
-    printf 'Stability: clean=%d attention=%d slow_collectors=%d\n' \
-        "$SOAK_ANALYSIS_CLEAN_RUNS" "$SOAK_ANALYSIS_ATTENTION_RUNS" \
-        "$SOAK_ANALYSIS_SLOW_COLLECTORS"
-    printf 'Runtime: average=%ds maximum=%ds\n' \
-        "$SOAK_ANALYSIS_AVG_DURATION" "$SOAK_ANALYSIS_MAX_DURATION"
-    printf 'Coverage:\n'
-    printf ' - Reboot: %s (boot IDs=%d)\n' \
-        "$(soak_requirement_label "$SOAK_REQUIRE_REBOOT" "$SOAK_ANALYSIS_REBOOT_OBSERVED")" \
-        "$SOAK_ANALYSIS_BOOT_COUNT"
-    printf ' - Standby deferral: %s (runs=%d)\n' \
-        "$(soak_requirement_label "$SOAK_REQUIRE_STANDBY" "$SOAK_ANALYSIS_STANDBY_RUNS")" \
-        "$SOAK_ANALYSIS_STANDBY_RUNS"
-    printf ' - Syslog rotation: %s (runs=%d)\n' \
-        "$(soak_requirement_label "$SOAK_REQUIRE_SYSLOG_ROTATION" "$SOAK_ANALYSIS_SYSLOG_ROTATION_RUNS")" \
-        "$SOAK_ANALYSIS_SYSLOG_ROTATION_RUNS"
-    printf ' - Notification delivery: %s (runs=%d)\n' \
-        "$(soak_requirement_label "$SOAK_REQUIRE_NOTIFICATION_DELIVERY" "$SOAK_ANALYSIS_NOTIFICATION_DELIVERED")" \
-        "$SOAK_ANALYSIS_NOTIFICATION_DELIVERED"
-    printf ' - Notification suppression: %s (runs=%d)\n' \
-        "$(soak_requirement_label "$SOAK_REQUIRE_NOTIFICATION_SUPPRESSION" "$SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED")" \
-        "$SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED"
-    printf ' - Parity activity: %s (runs=%d)\n' \
-        "$(soak_requirement_label "$SOAK_REQUIRE_PARITY" "$SOAK_ANALYSIS_PARITY_RUNS")" \
-        "$SOAK_ANALYSIS_PARITY_RUNS"
-    printf 'Notifications: delivered=%d suppressed=%d failed=%d\n' \
-        "$SOAK_ANALYSIS_NOTIFICATION_DELIVERED" \
-        "$SOAK_ANALYSIS_NOTIFICATION_SUPPRESSED" \
-        "$SOAK_ANALYSIS_NOTIFICATION_FAILED"
-    return "$analysis_rc"
-}
-
 
 # ---------------------------------------------------------------------------
 # Retention
@@ -3059,7 +2468,7 @@ prune_history_files() {
         cutoff_epoch=$(date -d "$cutoff 00:00:00" +%s 2>/dev/null || echo 0)
     fi
     local files=(
-        "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE" "$XFS_PROC_HISTORY_FILE" "$SMART_ATTR_HISTORY_FILE" "$TEMP_HISTORY_FILE" "$TBW_HISTORY_FILE" "$SATA_LINK_HISTORY_FILE" "$REPLACEMENT_EVENTS_FILE"
+        "$IO_ERROR_HISTORY_FILE" "$BTRFS_DEV_HIST_FILE"  "$SMART_ATTR_HISTORY_FILE" "$TEMP_HISTORY_FILE" "$TBW_HISTORY_FILE" "$SATA_LINK_HISTORY_FILE" "$REPLACEMENT_EVENTS_FILE"
     )
     local f retain_days file_cutoff file_epoch
     for f in "${files[@]}"; do
@@ -3068,7 +2477,7 @@ prune_history_files() {
         case "$f" in
             "$TEMP_HISTORY_FILE") retain_days=$(( ${TEMP_TREND_WINDOW_DAYS:-14} + 7 )) ;;
             "$TBW_HISTORY_FILE") retain_days=$(( HISTORY_WINDOW_DAYS + 7 )) ;;
-            "$SMART_ATTR_HISTORY_FILE") retain_days=$(( WEAR_TREND_WINDOW_DAYS + 14 )) ;;
+            "$SMART_ATTR_HISTORY_FILE") retain_days=$((  + 14 )) ;;
             "$SATA_LINK_HISTORY_FILE") retain_days=$(( SATA_LINK_INSTABILITY_WINDOW_DAYS + 7 )) ;;
         esac
         file_cutoff="$cutoff"; file_epoch="$cutoff_epoch"
@@ -3258,7 +2667,10 @@ short_test_is_due() {
     [[ "$last_epoch" =~ ^[0-9]+$ ]] || return 0
 
     now_epoch=$(date +%s)
-    (( now_epoch - last_epoch >= 10#$interval_days * 86400 ))
+    local today_day last_day
+    today_day=$(date -d "$(date -d "@$now_epoch" +%F)" +%s) || return 1
+    last_day=$(date -d "$(date -d "@$last_epoch" +%F)" +%s) || return 1
+    (( today_day - last_day >= 10#$interval_days * 86400 ))
 }
 
 short_test_next_date() {
@@ -3271,7 +2683,7 @@ short_test_next_date() {
         last_epoch=$(date -d "$last_date" +%s 2>/dev/null || true)
     fi
     if [[ "$last_epoch" =~ ^[0-9]+$ && "$interval_days" =~ ^[0-9]+$ ]]; then
-        date -d "@$(( last_epoch + 10#$interval_days * 86400 ))" '+%Y-%m-%d %H:%M' 2>/dev/null || true
+        date -d "$(date -d "@$last_epoch" +%F) +${interval_days} days" '+%Y-%m-%d 00:00' 2>/dev/null || true
     fi
 }
 
@@ -3711,10 +3123,6 @@ record_finding() {
         fi
     fi
 
-    if [[ -n "$device" && "$signal" != workload.* ]]; then
-        RISK_SPIKE_TS[$device]="$(date +%s)"
-    fi
-
     return 0
 }
 
@@ -3759,9 +3167,9 @@ finding_category_rank() {
 }
 
 # Emit canonical finding IDs in deterministic priority order: critical first,
-# then device risk, category, scope, title, and stable ID.
+# then category, scope, title, and stable ID.
 emit_sorted_finding_ids() {
-    local id severity_rank risk category_rank scope title device
+    local id severity_rank category_rank scope title device
 
     for id in "${FINDING_IDS[@]}"; do
         if [[ "${FINDING_SEVERITY[$id]:-warning}" == "critical" ]]; then
@@ -3770,20 +3178,11 @@ emit_sorted_finding_ids() {
             severity_rank=1
         fi
         device="${FINDING_DEVICE[$id]:-}"
-        risk=0
-        # Global, pool, and mount findings intentionally have no device. Bash
-        # associative arrays reject an empty subscript, so only perform the
-        # lookup for a normalized non-empty device key.
-        if [[ -n "$device" ]]; then
-            risk="${RISK_MAP[$device]:-0}"
-        fi
-        [[ "$risk" =~ ^[0-9]+$ ]] || risk=0
-        (( risk > 999 )) && risk=999
         category_rank="$(finding_category_rank "${FINDING_CATEGORY[$id]:-general}")"
         scope="${FINDING_SCOPE[$id]:-${id%%|*}}"
         title="${FINDING_TITLE[$id]:-Finding}"
         printf '%d\t%03d\t%02d\t%s\t%s\t%s\n' \
-            "$severity_rank" "$((999 - risk))" "$category_rank" \
+            "$severity_rank" 0 "$category_rank" \
             "$scope" "$title" "$id"
     done | LC_ALL=C sort -t $'\t' -k1,1n -k2,2n -k3,3n -k4,4 -k5,5 -k6,6 |
         cut -f6-
@@ -4028,14 +3427,6 @@ parse_btrfs_device_stats_text() {
         [[ -n "$dev" && -n "$key" && "$value" =~ ^[0-9]+$ ]] || continue
         printf '%s\t%s\t%s\n' "$dev" "$key" "$value"
     done <<< "$text"
-}
-
-xfs_stat_value_from_text() {
-    local text="$1"
-    local wanted="$2"
-
-    printf '%s\n' "$text" | awk -v wanted="$wanted" \
-        '$1 == wanted && $2 ~ /^[0-9]+$/ {print $2; exit}'
 }
 
 syslog_line_is_disk_io_error() {
@@ -4286,7 +3677,6 @@ eval_tbw_state() {
     model=$(get_device_model "$disk")
     cap=$(get_device_capacity_tb "$disk")
     tbw_thresh=$(tbw_threshold_tb_for_device "$model" "$cap")
-    local TB=$((1000*1000*1000*1000))
 
     if [[ -n "$tbw_thresh" && "$tbw_thresh" =~ ^[0-9]+$ ]]; then
         if [[ "$cap" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
@@ -4307,75 +3697,8 @@ eval_tbw_state() {
             fi
         fi
         return 0
-    elif [[ $TBW_WARN_TB -gt 0 ]]; then
-        if (( tbw_bytes >= TBW_WARN_TB * TB )) && [[ $TBW_EVAL_STATE != CRITICAL ]]; then
-            [[ $TBW_EVAL_STATE == OK ]] && TBW_EVAL_STATE="WARNING"
-            TBW_EVAL_MESSAGES+=("TBW exceeds ${TBW_WARN_TB} TB")
-            record_alert warning "TBW Exceeds" "Disk $disk TBW exceeds ${TBW_WARN_TB} TB (bytes=$tbw_bytes)"
-        fi
-        return 0
-    fi
-}
 
-# === Helper Function ===
-# Derive power-on-hours warning/critical thresholds adjusted for device class & model hints
-poh_thresholds_for_device() {
-    local dev="$1"; shift
-    local dtype="$1"; shift # nvme|sata
-    local rota="${1:-}"    # for sata: 1=HDD, 0=SSD
-    local model
-    model=$(get_device_model "$dev")
-    local warn=0 crit=0
-    if [[ "$dtype" == "nvme" ]]; then
-        warn=$NVME_POH_WARN_HOURS; crit=$NVME_POH_CRIT_HOURS
-    else
-        if [[ "$rota" == "1" ]]; then
-            warn=$HDD_POH_WARN_HOURS; crit=$HDD_POH_CRIT_HOURS
-        else
-            warn=$SSD_POH_WARN_HOURS; crit=$SSD_POH_CRIT_HOURS
-        fi
     fi
-    # Apply configuration-driven overrides
-    if [[ -n "${POH_MODEL_RULES:-}" ]]; then
-        local cap; cap=$(get_device_capacity_tb "$dev")
-        while IFS= read -r __rline; do
-            [[ -z "$__rline" || "$__rline" =~ ^# ]] && continue
-            local _type="" _regex="" _warn="" _crit="" _min="" _max=""
-            IFS=';' read -r -a __parts <<< "$__rline"
-            for __p in "${__parts[@]}"; do
-                case "$__p" in
-                    type:*) _type="${__p#type:}" ;;
-                    regex:*) _regex="${__p#regex:}" ;;
-                    warn:*) _warn="${__p#warn:}" ;;
-                    crit:*) _crit="${__p#crit:}" ;;
-                    cap_min:*) _min="${__p#cap_min:}" ;;
-                    cap_max:*) _max="${__p#cap_max:}" ;;
-                esac
-            done
-            [[ -z "$_type" || -z "$_regex" ]] && continue
-            # Match type to current device
-            local _dtype=""
-            case "${dtype}:${rota}" in
-                nvme:*) _dtype="nvme" ;;
-                *:1) _dtype="sata-hdd" ;;
-                *) _dtype="sata-ssd" ;;
-            esac
-            [[ "$_dtype" != "$_type" ]] && continue
-            if echo "$model" | grep -qiE "$_regex"; then
-                local _cap_ok=1
-                if [[ -n "$_min" || -n "$_max" ]]; then
-                    _cap_ok=0
-                    if awk -v c="$cap" -v a="${_min:-0}" -v b="${_max:-9999}" 'BEGIN{exit !(c+0>=a+0 && c+0<=b+0)}'; then _cap_ok=1; fi
-                fi
-                if (( _cap_ok == 1 )); then
-                    [[ -n "$_warn" ]] && warn="$_warn"
-                    [[ -n "$_crit" ]] && crit="$_crit"
-                    break
-                fi
-            fi
-        done <<< "${POH_MODEL_RULES}"
-    fi
-    echo "$warn $crit"
 }
 
 # === Device discovery and stable identity ===
@@ -4938,29 +4261,6 @@ evaluate_live_parity() {
 }
 
 # === Helper Function ===
-# Persist risk spike timestamps (prune entries older than lookback before write)
-save_risk_spikes() {
-    local lookback_days=${LONG_TEST_RISK_LOOKBACK_DAYS:-14}
-    local now_ts; now_ts=$(date +%s)
-    # Prune in-memory map
-    for dev in "${!RISK_SPIKE_TS[@]}"; do
-        local ts=${RISK_SPIKE_TS[$dev]:-0}
-        [[ $ts =~ ^[0-9]+$ ]] || { unset 'RISK_SPIKE_TS[$dev]'; continue; }
-        local age_days=$(( (now_ts - ts) / 86400 ))
-        if (( age_days > lookback_days )); then unset 'RISK_SPIKE_TS[$dev]'; fi
-    done
-    # Write file atomically
-    local tmp state_key
-    tmp="$(state_temp_file "$RISK_SPIKE_FILE")" || {
-        log_warn "Unable to create risk-spike state temporary file"
-        return 1
-    }
-    for dev in "${!RISK_SPIKE_TS[@]}"; do
-        state_key=$(persistent_device_key "$dev")
-        printf '%s %s\n' "$state_key" "${RISK_SPIKE_TS[$dev]}" >> "$tmp" || return 1
-    done
-    atomic_commit "$tmp" "$RISK_SPIKE_FILE"
-}
 
 # === Helper Function ===
 # Resolve SMART-capable device for a given /mnt path
@@ -5014,12 +4314,8 @@ prepare_smart_baseline_inputs() {
 
 load_persistent_state() {
     local disk date dev rest token k v line key poh cnt ts score stored_key
-    local now_ts prune_days age_days
     local nvme_input="$NVME_STATE_FILE" smart_input="$PREV_ATTR_FILE" timeout_input="$CMD_TIMEOUT_LAST_FILE"
     prepare_smart_baseline_inputs || return 1
-
-    now_ts="$(date +%s)"
-    prune_days=${LONG_TEST_RISK_LOOKBACK_DAYS:-14}
 
 if [ -f "$SMART_LAST" ]; then
     while read -r stored_key date rest; do
@@ -5090,13 +4386,6 @@ if [ -f "$smart_input" ]; then
     done < "$smart_input"
 fi
 
-if [ -f "$RISK_PREV_FILE" ]; then
-    while read -r stored_key score; do
-        disk=$(runtime_device_path "$stored_key" 2>/dev/null || true)
-        [[ -n "$disk" && "$score" =~ ^[0-9]+$ ]] || continue
-        PREVIOUS_RISK["$disk"]="$score"
-    done < "$RISK_PREV_FILE"
-fi
 if [ -f "$ALERT_NEW_SEEN_FILE" ]; then
     while IFS= read -r key; do
         key=$(runtime_seen_key "$key")
@@ -5124,19 +4413,6 @@ if [ -f "$timeout_input" ]; then
     done < "$timeout_input"
 fi
 
-# Load persisted risk spike timestamps (prune entries older than lookback)
-if [ -f "$RISK_SPIKE_FILE" ]; then
-    while read -r stored_key ts; do
-        disk=$(runtime_device_path "$stored_key" 2>/dev/null || true)
-        [[ -z "$disk" || -z "$ts" ]] && continue
-        [[ "$ts" =~ ^[0-9]+$ ]] || continue
-        # Apply lookback pruning at load time
-        age_days=$(( (now_ts - ts) / 86400 ))
-        if (( age_days <= prune_days )); then
-            RISK_SPIKE_TS["$disk"]="$ts"
-        fi
-    done < "$RISK_SPIKE_FILE"
-fi
 }
 
 # === Helper Function ===
@@ -5203,18 +4479,6 @@ save_cmd_timeout_last() {
 
 # Use model-aware age thresholds for replacement planning without elevating
 # SMART health or opening a notification incident.
-log_drive_age_advisory() {
-    local disk="$1" hours="$2" model_class="$3" rotational="${4:-0}"
-    local warning critical threshold
-    [[ "$hours" =~ ^(0|[1-9][0-9]*)$ ]] || return 0
-    read -r warning critical < <(poh_thresholds_for_device "$disk" "$model_class" "$rotational")
-    [[ "$warning" =~ ^[0-9]+$ && "$critical" =~ ^[0-9]+$ ]] || return 0
-    if (( hours >= critical )); then threshold="$critical"
-    elif (( hours >= warning )); then threshold="$warning"
-    else return 0
-    fi
-    log "SMART" "INFO" "$disk power-on hours $hours reached the $threshold-hour replacement-planning threshold."
-}
 
 # SCSI devices expose labeled counters instead of ATA attribute IDs.
 evaluate_scsi_smart() {
@@ -5276,8 +4540,6 @@ evaluate_scsi_smart() {
             "Disk $disk SAS HDD Temp ${temperature}C >= ${HDD_TEMP_WARNING}C"
     fi
 
-    log_drive_age_advisory "$disk" "$poh" sata 1
-
     CUR_ATTR["$disk|realloc"]="$grown_defects"
     CUR_ATTR["$disk|pending"]=0
     CUR_ATTR["$disk|offunc"]="$total_uncorrected"
@@ -5331,6 +4593,43 @@ evaluate_scsi_smart() {
 
 # === Main Function ===
 # Collect SMART data, classify device health, and raise alerts
+# Only host counters with explicit units are converted. NAND writes are a different
+# metric; raw IDs 241/242 vary by vendor and must never imply 512-byte sectors.
+ata_host_counter_bytes() {
+    local text="$1" direction="$2" name value multiplier
+    case "$direction" in
+        writes) name='Host_Writes_GiB|Host_Writes_32MiB|Total_LBAs_Written' ;;
+        reads) name='Host_Reads_GiB|Host_Reads_32MiB|Total_LBAs_Read' ;;
+        *) return 1 ;;
+    esac
+    local row
+    row=$(awk -v names="$name" '$1 ~ /^[0-9]+$/ && $2 ~ "^(" names ")$" {print $2, $10; exit}' <<< "$text")
+    read -r name value <<< "$row"
+    [[ "$value" =~ ^[0-9]{1,15}$ ]] || return 1
+    case "$name" in
+        *_GiB) multiplier=1073741824 ;;
+        *_32MiB) multiplier=33554432 ;;
+        Total_LBAs_*) multiplier=512 ;;
+        *) return 1 ;;
+    esac
+    # Exact integer text, avoiding signed shell arithmetic overflow.
+    awk -v value="$value" -v unit="$multiplier" 'BEGIN {printf "%.0f\n", value*unit}'
+}
+
+# v3 recalculates ATA writes in documented units. Ignore old-unit history for that
+# device until its new baseline is persisted; preserve all physical fault counters.
+rebaseline_ata_host_writes() {
+    local disk="$1" key tmp
+    CUR_ATTR["$disk|host_write_units_revision"]=2
+    [[ "${PREV_ATTR["$disk|host_write_units_revision"]:-0}" == 2 ]] && return 0
+    key=$(persistent_device_key "$disk") || return 1
+    tmp=$(state_temp_file "$TBW_HISTORY_FILE") || return 1
+    awk -v key="$key" -v disk="$disk" '$2 != key && $2 != disk' "$TBW_HISTORY_FILE" > "$tmp" || return 1
+    collector_atomic_commit "$tmp" "$TBW_HISTORY_FILE" || return 1
+    unset 'PREV_ATTR["$disk|tbw_bytes"]'
+    log "SMART" "INFO" "$disk: host-write units corrected; write-rate history rebaselined; fault counters retained"
+}
+
 evaluate_smart() {
     local disk=$1
     local ctx=${2:-}
@@ -5607,7 +4906,7 @@ evaluate_smart() {
         elif [[ "$st_sev" == "WARNING" && $state != CRITICAL ]]; then
             [[ $state == OK ]] && state="WARNING"; messages+=("Self-test warning: $st_msg")
         fi
-        log_drive_age_advisory "$disk" "$poh" nvme
+
     else
         # Query raw SATA SMART attributes and parse key metrics
         local attr realloc pending offunc temp udma reported_uncorr cmd_timeout realloc_events end2end soft_read_err lcc poh
@@ -5626,6 +4925,18 @@ evaluate_smart() {
                 log_warn "Incomplete ATA/SCSI SMART output for $disk; retaining the previous device baseline"
                 return 0
             fi
+        fi
+        local overall_output overall_health
+        overall_output=$(smartctl_cached -H "$disk" 2>/dev/null || true)
+        overall_health=$(sed -nE 's/^SMART overall-health self-assessment test result:[[:space:]]*//p' <<< "$overall_output")
+        if [[ "$overall_health" == PASSED* ]]; then :
+        elif [[ "$overall_health" == FAILED* ]]; then
+            state="CRITICAL"; messages+=("Native SMART overall health FAILED")
+            record_alert critical "SMART Overall Health" "Disk $disk native SMART overall health FAILED; back up and inspect immediately"
+        else
+            record_collector_event FAILED "smartctl $disk" "overall_health_unavailable"
+            log "SMART" "WARN" "$disk: native overall-health response unavailable; retaining previous health baseline"
+            return 0
         fi
         # Evaluate reallocated sectors thresholds (warn/crit)
         realloc=$(ata_smart_attribute_value "$attr" "Reallocated_Sector_Ct")
@@ -5759,89 +5070,32 @@ evaluate_smart() {
         # Check UDMA CRC errors and head parking (Load Cycle Count)
         udma=$(ata_smart_attribute_value "$attr" "UDMA_CRC_Error_Count")
         udma=${udma:-0}
-        if [[ $udma -gt 0 && $state != CRITICAL ]]; then
-            [[ $state == OK ]] && state="WARNING"; messages+=("UDMA CRC Errors = $udma")
-            record_alert warning "UDMA CRC Errors" "Disk $disk UDMA CRC errors $udma (cabling/power check)"
+        local prior_udma="${PREV_ATTR["$disk|udma"]:-}"
+        if [[ "$prior_udma" =~ ^[0-9]+$ && "$udma" =~ ^[0-9]+$ ]] && (( udma > prior_udma )); then
+            [[ $state == OK ]] && state="WARNING"
+            messages+=("UDMA CRC errors increased by $((udma-prior_udma)) (total=$udma)")
+            record_alert warning "UDMA CRC Errors" "Disk $disk UDMA CRC errors increased by $((udma-prior_udma)); inspect SATA cable/power"
+        elif [[ "$udma" =~ ^[0-9]+$ ]] && (( udma > 0 )); then
+            log "SMART" "INFO" "$disk historical UDMA CRC count=$udma; no proven new growth"
         fi
         local lcc
         lcc=$(ata_smart_attribute_value "$attr" "Load_Cycle_Count")
         if [[ "$lcc" =~ ^(0|[1-9][0-9]*)$ ]] && (( lcc >= LOAD_CYCLE_WARN )); then
             log "SMART" "INFO" "$disk load-cycle count $lcc (review thresholds: $LOAD_CYCLE_WARN / $LOAD_CYCLE_CRIT)."
         fi
-        # Evaluate SSD wear indicators (MWI/Wear Leveling) with heuristics and vendor overrides
-        local wear_norm mwi_norm life_remain=""
-        wear_norm=$(ata_smart_attribute_value "$attr" "Wear_Leveling_Count" normalized)
+        # Vendor MWI encodings are not interchangeable percentages. Keep the raw
+        # normalized value for review; native SMART failure and rated TBW remain active.
+        local mwi_norm
         mwi_norm=$(ata_smart_attribute_value "$attr" "Media_Wearout_Indicator" normalized)
-        # Compute a local TBW estimate from available SMART fields for heuristic decisions
-        # Prefer Total_LBAs_Written (or attribute 241 mapped as LBAs) else convert Host_Writes_GiB or NAND_GB_Written
-        local _lbasw _lbaw_241 _hw32mib _host_gib _nand_tlc_gb _nand_slc_gb _tbw_bytes=""
-        _lbasw=$(ata_smart_attribute_value "$attr" "Total_LBAs_Written")
-        _lbaw_241=$(ata_smart_attribute_value "$attr" "241")
-        if [[ -n "$_lbasw" ]]; then _tbw_bytes=$(( _lbasw * 512 ))
-        elif [[ -n "$_lbaw_241" ]]; then _tbw_bytes=$(( _lbaw_241 * 512 ))
-        fi
-        if [[ -z "${_tbw_bytes:-}" ]]; then
-            _host_gib=$(ata_smart_attribute_value "$attr" "Host_Writes_GiB")
-            if [[ -n "$_host_gib" && "$_host_gib" =~ ^[0-9]+$ ]]; then _tbw_bytes=$(( _host_gib * 1024 * 1024 * 1024 )); fi
-        fi
-        if [[ -z "${_tbw_bytes:-}" ]]; then
-            _nand_tlc_gb=$(ata_smart_attribute_value "$attr" "NAND_GB_Written_TLC")
-            if [[ -n "$_nand_tlc_gb" && "$_nand_tlc_gb" =~ ^[0-9]+$ ]]; then _tbw_bytes=$(( _nand_tlc_gb * 1024 * 1024 * 1024 )); fi
-        fi
-        if [[ -z "${_tbw_bytes:-}" ]]; then
-            _nand_slc_gb=$(ata_smart_attribute_value "$attr" "NAND_GB_Written_SLC")
-            if [[ -n "$_nand_slc_gb" && "$_nand_slc_gb" =~ ^[0-9]+$ ]]; then _tbw_bytes=$(( _nand_slc_gb * 1024 * 1024 * 1024 )); fi
-        fi
-        # Prefer MWI normalized when present, but apply heuristics for inverted/ambiguous reports
         if [[ -n "$mwi_norm" ]]; then
-            local model
-            model=$(get_device_model "$disk")
-            # Vendor override: WD Red SA500 500GB sometimes reports small normalized values that should be inverted
-            if echo "$model" | grep -qi 'WD Red' && echo "$model" | grep -qi 'SA500'; then
-                local cap_tb
-                cap_tb=$(get_device_capacity_tb "$disk")
-                if awk -v c="$cap_tb" 'BEGIN{exit !(c>=0.48 && c<=0.52)}'; then
-                    if [[ $mwi_norm -le 10 ]]; then
-                        # Treat small normalized as percent used -> compute remaining
-                        life_remain=$((100 - mwi_norm))
-                    else
-                        life_remain=$mwi_norm
-                    fi
-                else
-                    life_remain=$mwi_norm
-                fi
-            else
-                # Generic heuristic for new or quirky devices
-                if [[ -n "$_tbw_bytes" && $_tbw_bytes -lt $((10*1024*1024*1024)) && $mwi_norm -le 10 ]]; then
-                    # Tiny TBW (<10GB) and small normalized value (<=10) -> treat as new drive, assume full life
-                    life_remain=100; messages+=("(info: inverted initial wear value $mwi_norm)")
-                elif [[ $mwi_norm -le 100 ]]; then
-                    # Treat low normalized as percent used when overall writes are still modest
-                    if [[ -n "$_tbw_bytes" && $_tbw_bytes -lt $((50*1024*1024*1024)) && $mwi_norm -lt 20 ]]; then
-                        life_remain=$((100 - mwi_norm))
-                    else
-                        life_remain=$mwi_norm
-                    fi
-                fi
-            fi
-        elif [[ -n "$wear_norm" ]]; then
-            life_remain=$wear_norm
-        fi
-
-        if [[ -n "$life_remain" ]]; then
-            if [[ $life_remain -le $SSD_WEAR_CRIT ]]; then
-                state="CRITICAL"; messages+=("SSD life remaining ${life_remain}% <= ${SSD_WEAR_CRIT}%")
-                record_alert critical "SSD life remaining" "Disk $disk SSD life remaining ${life_remain}% <= ${SSD_WEAR_CRIT}%"
-            elif [[ $life_remain -le $SSD_WEAR_WARN && $state != CRITICAL ]]; then
-                [[ $state == OK ]] && state="WARNING"; messages+=("SSD life remaining ${life_remain}% <= ${SSD_WEAR_WARN}%")
-                record_alert warning "SSD life remaining" "Disk $disk SSD life remaining ${life_remain}% <= ${SSD_WEAR_WARN}%"
-            fi
+            messages+=("Vendor wear value=$mwi_norm (remaining-life percentage unverified)")
+            CUR_ATTR["$disk|vendor_mwi"]="$mwi_norm"
         fi
         # Retain hours for device history and replacement planning.
         poh=$(ata_smart_attribute_value "$attr" "Power_On_Hours|Power_On_Hours_and_Msec")
         poh=${poh:-0}
         CUR_ATTR["$disk|poh"]="$poh"
-        log_drive_age_advisory "$disk" "$poh" sata "$rota"
+
         CUR_ATTR["$disk|realloc"]="${realloc:-0}"
         CUR_ATTR["$disk|pending"]="${pending:-0}"
         CUR_ATTR["$disk|offunc"]="${offunc:-0}"
@@ -5889,22 +5143,12 @@ evaluate_smart() {
             fi
         fi
         # Persist commonly used parsed SMART attributes for downstream logic and JSON export
-        [[ -n "$life_remain" ]] && CUR_ATTR["$disk|life_remain"]="$life_remain"
-        local lbasw hw32mib lbasr tbw_bytes tbw_hr reads_bytes reads_hr
-        lbasw=$(ata_smart_attribute_value "$attr" "Total_LBAs_Written")
-        if [[ -z "$lbasw" ]]; then lbasw=$(ata_smart_attribute_value "$attr" "241"); fi
-        if [[ -z "$lbasw" ]]; then
-            hw32mib=$(ata_smart_attribute_value "$attr" "Host_Writes_32MiB")
-            if [[ -z "$hw32mib" ]]; then hw32mib=$(ata_smart_attribute_value "$attr" "246"); fi
-            if [[ -n "$hw32mib" ]]; then
-                tbw_bytes=$(( hw32mib * 32 * 1024 * 1024 ))
-            fi
-        else
-            tbw_bytes=$(( lbasw * 512 ))
+        local tbw_bytes="" tbw_hr reads_bytes="" reads_hr
+        tbw_bytes=$(ata_host_counter_bytes "$attr" writes || true)
+        reads_bytes=$(ata_host_counter_bytes "$attr" reads || true)
+        if [[ -n "$tbw_bytes" ]]; then
+            rebaseline_ata_host_writes "$disk" || return 1
         fi
-        lbasr=$(ata_smart_attribute_value "$attr" "Total_LBAs_Read")
-        if [[ -z "$lbasr" ]]; then lbasr=$(ata_smart_attribute_value "$attr" "242"); fi
-        if [[ -n "$lbasr" ]]; then reads_bytes=$(( lbasr * 512 )); fi
         # Summarize TBW/Read totals and evaluate TBW thresholds (model-aware or global)
         if [[ -n "${tbw_bytes:-}" ]]; then
             tbw_hr=$(human_readable "$tbw_bytes")
@@ -6064,173 +5308,53 @@ save_selftest_snapshot() {
 
 # === Helper Function ===
 # Poll a short self-test until completion or timeout
-poll_short_test_completion() {
-    local disk=$1
-    local waited=0
-    while (( waited < SHORT_TEST_MAX_WAIT )); do
-        # Poll execution status directly to detect running short test
-        local exec_status
-        if [[ $disk == /dev/nvme* ]]; then
-            log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART capability read (-c) on $disk"
-            exec_status=$(smartctl_bounded -c -d nvme "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
-        else
-            exec_status=$(smartctl_bounded -c "$disk" 2>/dev/null | awk -F: '/Self-test execution status/ {print $2}') || true
-        fi
-        if echo "$exec_status" | grep -qi 'in progress'; then
-            sleep $SHORT_TEST_POLL_INTERVAL
-            waited=$(( waited + SHORT_TEST_POLL_INTERVAL ))
-            continue
-        fi
-        # Not in progress: try to read latest self-test log entry for classification
-        local info
-        info=$(get_latest_selftest_info "$disk")
-        local num type status remaining
-        IFS='|' read -r num type status remaining <<< "$info"
-        # If self-test log is not populated yet, reflect that explicitly
-        if [[ "$type" == "unknown" ]]; then
-            echo "OK|Self-test log not yet populated"
-            return 0
-        fi
-        local class sev msg
-        class=$(classify_selftest_status "$status")
-        sev=$(echo "$class" | awk -F'|' '{print $1}')
-        msg=$(echo "$class" | awk -F'|' '{print $2}')
-        echo "$sev|$msg"
-        return 0
-    done
-    echo "INPROGRESS|Short test still running after ${SHORT_TEST_MAX_WAIT}s"
-    return 0
-}
 
 # === Helper Functions ===
-# Map a canonical signal to one risk contribution. Severity is used only where
 # the configured weights distinguish warning from critical evidence.
-risk_points_for_signal() {
-    local signal="$1"
-    local severity="$2"
-    local points=0
-
-    case "$signal" in
-        smart.media)             points=$W_UNCORR ;;
-        smart.reallocation)      points=$W_REALLOC ;;
-        smart.selftest)
-            if [[ "$severity" == "critical" ]]; then
-                points=$W_SELFTEST_CRIT
-            else
-                points=$W_SELFTEST_WARN
-            fi
-            ;;
-        smart.end_to_end)        points=$W_E2E ;;
-        smart.soft_read)         points=$W_SOFT_READ ;;
-        smart.read_only)         points=$W_NVME_RO ;;
-        smart.reliability)       points=$W_NVME_REL ;;
-        smart.nvme_error_log)    points=$W_NVME_ERR_LOG ;;
-        io.command_timeout)      points=$W_CMD_TIMEOUT ;;
-        io.sata_link)            points=$W_SATA_LINK_DOWN ;;
-        io.pcie_link)
-            if [[ "$severity" == "critical" ]]; then
-                points=$W_NVME_PCIE_UNC
-            else
-                points=$W_NVME_PCIE_CORR
-            fi
-            ;;
-        io.kernel)
-            if [[ "$severity" == "critical" ]]; then
-                points=$W_UNCORR
-            else
-                points=$W_CMD_TIMEOUT
-            fi
-            ;;
-        io.power)                points=$W_CMD_TIMEOUT ;;
-        thermal.exposure)        points=$W_NVME_TEMP_TIME ;;
-        endurance.tbw)
-            if [[ "$severity" == "critical" ]]; then
-                points=$W_TBW_CONS_CRIT
-            else
-                points=$W_TBW_CONS_WARN
-            fi
-            ;;
-        endurance.wear)          points=$W_NVME_WEAR ;;
-        lifecycle.age)           points=$W_POH_HDD ;;
-        lifecycle.regression)    points=$W_AGE_NEAR ;;
-        filesystem.btrfs)        points=$W_BTRFS_DEV_ERR ;;
-        filesystem.xfs)          points=$W_XFS_META_ERR ;;
-    esac
-
-    printf '%s\n' "$points"
-}
 
 # Canonical scorer used by SMART scheduling, ranking, persistence, and lifecycle
 # classification. Each underlying signal contributes at most once per device,
 # even when several collectors report different evidence for that signal.
-risk_score_for_device() {
-    local dev="$1"
-    local state="$2"
-    local _legacy_message="${3:-}"
-    local base_dev=""
-    local score=0 id signal severity points existing
-    local percent_used life_remaining tbw_consumed
-    declare -A SIGNAL_POINTS=()
-
-    if [[ -n "$dev" ]]; then
-        base_dev="$(base_device "$dev")"
-    fi
-
-    case "$state" in
-        CRITICAL) ((score += W_SEV_CRIT)) ;;
-        WARNING)  ((score += W_SEV_WARN)) ;;
-    esac
-
-    if [[ -n "$base_dev" ]]; then
-        for id in "${FINDING_IDS[@]}"; do
-            [[ "${FINDING_DEVICE[$id]:-}" == "$base_dev" ]] || continue
-            signal="${FINDING_SIGNAL[$id]:-advisory}"
-            severity="${FINDING_SEVERITY[$id]:-warning}"
-            points="$(risk_points_for_signal "$signal" "$severity")"
-            [[ "$points" =~ ^[0-9]+$ ]] || points=0
-            existing="${SIGNAL_POINTS[$signal]:-0}"
-            if (( points > existing )); then
-                SIGNAL_POINTS[$signal]=$points
-            fi
-        done
-
-        # Direct attribute fallbacks cover retained/migrated state even when a
-        # device was not awake long enough to emit a fresh finding this run.
-        percent_used=${CUR_ATTR["$base_dev|nvme_percent_used"]:-0}
-        life_remaining=${CUR_ATTR["$base_dev|life_remain"]:-0}
-        tbw_consumed=${CUR_ATTR["$base_dev|tbw_consumed_pct"]:-0}
-
-        if [[ "$percent_used" =~ ^[0-9]+$ ]] && (( percent_used >= 90 )); then
-            existing="${SIGNAL_POINTS["endurance.wear"]:-0}"
-            (( W_AGE_NEAR > existing )) && SIGNAL_POINTS["endurance.wear"]=$W_AGE_NEAR
-        elif [[ "$life_remaining" =~ ^[0-9]+$ ]] &&
-             (( life_remaining > 0 && life_remaining <= 10 ))
-        then
-            existing="${SIGNAL_POINTS["endurance.wear"]:-0}"
-            (( W_AGE_NEAR > existing )) && SIGNAL_POINTS["endurance.wear"]=$W_AGE_NEAR
-        fi
-
-        if [[ "$tbw_consumed" =~ ^[0-9]+$ ]]; then
-            existing="${SIGNAL_POINTS["endurance.tbw"]:-0}"
-            if (( tbw_consumed >= TBW_CONSUMED_CRIT && W_TBW_CONS_CRIT > existing )); then
-                SIGNAL_POINTS["endurance.tbw"]=$W_TBW_CONS_CRIT
-            elif (( tbw_consumed >= TBW_CONSUMED_WARN && W_TBW_CONS_WARN > existing )); then
-                SIGNAL_POINTS["endurance.tbw"]=$W_TBW_CONS_WARN
-            fi
-        fi
-    fi
-
-    for signal in "${!SIGNAL_POINTS[@]}"; do
-        points="${SIGNAL_POINTS[$signal]:-0}"
-        ((score += points))
-    done
-    (( score > 100 )) && score=100
-
-    printf '%s\n' "$score"
-}
 
 # === Helper Function ===
 # Launch SMART tests (short/long) as configured
+SMART_LONG_STARTED=0
+SMART_FLEET_LONG_RUNNING=0
+smart_test_start_allowed() {
+    local kind="$1" lock values active action mount status mover_pid=0
+    for lock in /tmp/backup_cache_appdata.lock /tmp/backup_boot_disk.lock; do
+        if [[ -e "$lock" ]] && ! flock -s -n "$lock" -c true; then
+            log "SMART" "INFO" "New $kind self-test deferred: ${lock##*/} active"; return 1
+        fi
+    done
+    values=$(timeout 5 mdcmd status 2>/dev/null) || {
+        log "SMART" "INFO" "New $kind self-test deferred: parity status unavailable"; return 1;
+    }
+    active=$(awk -F= '$1=="mdResync" {gsub(/"/,"",$2);print $2}' <<< "$values")
+    action=$(awk -F= '$1=="mdResyncAction" {gsub(/"/,"",$2);print $2}' <<< "$values")
+    [[ "$active" =~ ^[0-9]+$ ]] || return 1
+    if [[ -r /var/run/mover.pid ]]; then read -r mover_pid < /var/run/mover.pid || mover_pid=0; fi
+    if [[ "$mover_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$mover_pid" 2>/dev/null; then
+        log "SMART" "INFO" "New $kind self-test deferred: Mover PID $mover_pid active"; return 1
+    fi
+    if (( active > 0 )) || pgrep -f '^(/bin/bash |/bin/sh )?(/usr/local/sbin/)?mover( |$)' >/dev/null; then
+        log "SMART" "INFO" "New $kind self-test deferred: parity/Mover active ($action)"; return 1
+    fi
+    while IFS= read -r mount; do
+        status=$(btrfs_bounded_optional scrub status "$mount" 2>&1) || {
+            grep -qi 'no stats available' <<< "$status" && continue
+            log "SMART" "INFO" "New $kind self-test deferred: scrub status unavailable on $mount"; return 1;
+        }
+        if grep -qiE 'status:[[:space:]]*running|scrub.*running' <<< "$status"; then
+            log "SMART" "INFO" "New $kind self-test deferred: scrub active on $mount"; return 1
+        fi
+    done < <(findmnt -rn -t btrfs -o TARGET | sort -u)
+    if [[ "$kind" == long ]] && (( SMART_LONG_STARTED || SMART_FLEET_LONG_RUNNING )); then
+        log "SMART" "INFO" "New long self-test deferred: another long test is running/started"; return 1
+    fi
+    return 0
+}
+
 run_smart_test() {
     local disk=$1
     if ! prepare_smart_access "$disk"; then
@@ -6278,51 +5402,6 @@ run_smart_test() {
     if collector_device_has_blocking_event smart "$disk"; then
         log_warn "SMART collection incomplete on $disk; skipping replacement detection, evaluation, and test scheduling"
         return 0
-    fi
-    # Automatic replacement detection/reset: if current POH is much lower than persisted last-long POH
-    if (( REPLACEMENT_AUTO_RESET == 1 )); then
-        local persisted_ll=${LONG_LAST_POH["$disk"]:-}
-        # Determine device-type-aware threshold
-        local drop_threshold=$REPLACEMENT_POH_DROP_THRESHOLD_HOURS
-        if [[ $disk == /dev/nvme* ]]; then
-            drop_threshold=$REPLACEMENT_POH_DROP_THRESHOLD_HOURS_NVME
-        else
-            # Distinguish SATA SSD vs HDD via ROTA
-            local bdv rota
-            bdv=$(base_device "$disk")
-            rota=$(lsblk_rota_cached "$bdv" 2>/dev/null || echo 1)
-            if [[ "$rota" == "0" ]]; then
-                drop_threshold=$REPLACEMENT_POH_DROP_THRESHOLD_HOURS_SSD
-            else
-                drop_threshold=$REPLACEMENT_POH_DROP_THRESHOLD_HOURS_HDD
-            fi
-        fi
-        if [[ -n "$persisted_ll" && "$persisted_ll" =~ ^[0-9]+$ && "$current_poh" =~ ^[0-9]+$ ]]; then
-            if (( persisted_ll - current_poh >= drop_threshold )); then
-                log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Possible replacement detected on $disk: current POH ${current_poh}h << last-long POH ${persisted_ll}h (≥${drop_threshold}h drop). Resetting state and forcing initial long test."
-                record_alert warning "Drive Replacement" "Detected possible drive replacement on $disk (POH drop ${persisted_ll}->${current_poh} ≥ ${drop_threshold}h). Baseline reset and long test forced."
-                printf '%s %s prev_poh=%s new_poh=%s drop=%s threshold=%s captured_epoch=%s schema=%s\n' \
-                    "$(date '+%Y-%m-%d %H:%M:%S')" "$(persistent_device_key "$disk")" \
-                    "$persisted_ll" "$current_poh" "$(( persisted_ll - current_poh ))" \
-                    "$drop_threshold" "$RUN_EPOCH" "$HISTORY_SCHEMA_VERSION" \
-                    >> "$REPLACEMENT_EVENTS_FILE" 2>/dev/null || true
-                unset 'LONG_LAST_POH["$disk"]'
-                # Prune processed long-test id for this disk to avoid stale suppression
-                if [[ -f "$SMART_LONG_STATE_FILE" ]]; then
-                    local processed_temp processed_state_key
-                    processed_temp="$(state_temp_file "$SMART_LONG_STATE_FILE")" || processed_temp=""
-                    if [[ -n "$processed_temp" ]]; then
-                        processed_state_key=$(persistent_device_key "$disk")
-                        awk -v dev="$disk" -v stable="$processed_state_key" \
-                            '$1 != dev && $1 != stable' \
-                            "$SMART_LONG_STATE_FILE" > "$processed_temp" 2>/dev/null || true
-                        collector_atomic_commit "$processed_temp" "$SMART_LONG_STATE_FILE" || true
-                    fi
-                fi
-                # Mark a hint variable for later scheduling block
-                local __replacement_forced=1
-            fi
-        fi
     fi
     # Determine model/vendor and apply hardcoded pattern expansion
     local model_raw
@@ -6372,8 +5451,8 @@ run_smart_test() {
             last_long_hours_diff=$(( current_poh - persisted ))
         fi
     fi
-    # SMART scheduling: evaluate SMART state & risk once, then decide if long test needed.
-    local state_pre msgs_pre risk_pre previous_risk_pre schedule_long=0 test_due=0 test_started=0 reasons=()
+    # Schedule from measured state and test age; no weighted risk score is used.
+    local state_pre msgs_pre schedule_long=0 test_due=0 test_started=0 reasons=()
     evaluate_smart "$disk" "pre-test"
     if collector_device_has_blocking_event smart "$disk"; then
         log_warn "SMART evaluation incomplete on $disk; skipping SMART test scheduling"
@@ -6381,21 +5460,9 @@ run_smart_test() {
     fi
     state_pre="${SMART_STATE[$disk]:-OK}"
     msgs_pre="${SMART_MSGS[$disk]:-}"
-    risk_pre=$(risk_score_for_device "$disk" "$state_pre" "$msgs_pre")
-    # The previous value is the last fully finalized canonical score (including
-    # filesystem, I/O, endurance, and trend findings). Keep the higher value so
-    # test scheduling does not ignore a recent non-SMART risk signal merely
-    # because those collectors run later in the current cycle.
-    previous_risk_pre="${PREVIOUS_RISK[$disk]:-}"
-    if [[ "$previous_risk_pre" =~ ^[0-9]+$ ]] &&
-       (( previous_risk_pre > risk_pre ))
-    then
-        risk_pre=$previous_risk_pre
-    fi
     local crit_age_hours=$(( LONG_TEST_CRITICAL_MIN_DAYS * 24 ))
-    local risk_age_hours=$(( LONG_TEST_RISK_MIN_DAYS * 24 ))
     # No previous long test record: optionally force initial long only if LONG_TEST_INITIAL_FORCE=1
-    # If disabled, we simply skip auto-scheduling and rely on interval/risk/critical triggers later.
+    # If disabled, we simply skip auto-scheduling and rely on interval/critical triggers later.
     if [[ -z "${last_long_hours_diff:-}" ]]; then
         if (( LONG_TEST_INITIAL_FORCE == 1 )); then
             schedule_long=1; reasons+=("no record")
@@ -6408,12 +5475,8 @@ run_smart_test() {
     fi
     # Interval elapsed
     if [[ -n "${last_long_hours_diff:-}" && ${last_long_hours_diff} -ge $threshold_hours ]]; then schedule_long=1; reasons+=("interval ${last_long_hours_diff}h >= ${threshold_hours}h"); fi
-    # Force long test on detected replacement regardless of LONG_TEST_INITIAL_FORCE
-    if [[ -n "${__replacement_forced:-}" ]]; then schedule_long=1; reasons+=("replacement detected"); fi
     # Critical SMART state with sufficient age
     if [[ "$state_pre" == CRITICAL && ( -z "${last_long_hours_diff:-}" || ${last_long_hours_diff} -ge $crit_age_hours ) ]]; then schedule_long=1; reasons+=("critical state"); fi
-    # Risk threshold (ignore rising requirement for simplicity)
-    if (( risk_pre >= LONG_TEST_RISK_THRESHOLD )) && [[ -z "${last_long_hours_diff:-}" || ${last_long_hours_diff} -ge $risk_age_hours ]]; then schedule_long=1; reasons+=("risk ${risk_pre} >= ${LONG_TEST_RISK_THRESHOLD}"); fi    # Removed explicit SMART_TEST_TYPE override; long tests are scheduled only via risk/critical/interval logic
     if (( schedule_long == 1 )); then
         test_kind="long"
         test_due=1
@@ -6422,11 +5485,11 @@ run_smart_test() {
         local reason_join
         reason_join=$(join_by ', ' "${reasons[@]}")
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - LONG test scheduled on $disk (last_long=${last_note}; reasons=${reason_join})"
-        LONG_TEST_DECISION+="$disk: long scheduled (last=${last_note}; reasons=${reason_join}; risk=${risk_pre}; state=${state_pre})\n"
+        LONG_TEST_DECISION+="$disk: long scheduled (last=${last_note}; reasons=${reason_join}; state=${state_pre})\n"
     else
         if short_test_is_due "$disk"; then
             test_due=1
-            log_smart "SHORT test due on $disk (interval=${SHORT_TEST_INTERVAL_DAYS}d, risk=${risk_pre}, state=${state_pre})"
+            log_smart "SHORT test due on $disk (interval=${SHORT_TEST_INTERVAL_DAYS}d, state=${state_pre})"
         elif [[ "${SHORT_TEST_INTERVAL_DAYS:-0}" =~ ^0+$ ]]; then
             log_smart "Automatic SHORT tests disabled for $disk (SHORT_TEST_INTERVAL_DAYS=0)"
         else
@@ -6457,7 +5520,7 @@ run_smart_test() {
         log_warn "SMART capability read incomplete on $disk; skipping SMART test start"
         return 0
     fi
-    if echo "$exec_status" | grep -qi 'in progress'; then
+    if printf '%s\n%s\n' "$exec_status" "$selftest" | grep -qi 'in progress'; then
         existing_in_progress=1
         # Attempt to classify running test type via latest self-test log entry
         local latest
@@ -6471,7 +5534,7 @@ run_smart_test() {
     fi
     if [[ $existing_in_progress -eq 1 ]]; then
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Self-test already in progress on $disk; skipping new start (status: ${exec_status})"
-    elif (( test_due == 1 )); then
+    elif (( test_due == 1 )) && smart_test_start_allowed "$test_kind"; then
         local test_start_output="" test_start_rc=0
         if [[ $disk == /dev/nvme* ]]; then
             log_smart "Starting NVMe SMART test (-t ${test_kind}) on $disk"
@@ -6491,6 +5554,7 @@ run_smart_test() {
             mark_test_started "$disk" "$test_kind"
             if [[ $test_kind == long || $test_kind == extended ]]; then
                 LONG_TEST_RUNNING_LONG["$disk"]=1
+                SMART_LONG_STARTED=1
             fi
         else
             local start_error
@@ -6499,26 +5563,8 @@ run_smart_test() {
             record_alert warning "SMART Test Start Failed" "Disk $disk failed to start $test_kind SMART test"
         fi
     fi
-    if [[ $test_kind == short && $SHORT_TEST_POLL -eq 1 && $test_started -eq 1 ]]; then
-        local result
-        result=$(poll_short_test_completion "$disk")
-        local s sev msg
-        sev=$(echo "$result" | awk -F'|' '{print $1}')
-        msg=$(echo "$result" | awk -F'|' '{print $2}')
-        if [[ $sev != INPROGRESS ]]; then
-            log_smart "$(date '+%Y-%m-%d %H:%M:%S') - $disk short self-test status: $msg"
-            if [[ $sev == WARNING ]]; then
-                record_alert warning "$NOTIFY_TITLE_SMART" "Disk $disk short self-test warning: $msg"
-            fi
-        else
-            log_smart "$(date '+%Y-%m-%d %H:%M:%S') - $disk short self-test still in progress after wait window"
-        fi
-    else
-        if [[ $existing_in_progress -eq 1 ]]; then
-            log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Skipping poll (different test still running)"
-        elif (( test_started == 1 )); then
-            sleep 5
-        fi
+    if (( test_started == 1 )); then
+        log "SMART" "INFO" "$disk: $test_kind self-test started asynchronously; results collected on a later run"
     fi
     # A test can change self-test/capability output. Drop only this run's cache before
     # the post-test read so no pre-test snapshot is accidentally reused.
@@ -6601,6 +5647,22 @@ check_completed_long_tests() {
         done < "$SMART_LONG_STATE_FILE"
     fi
     mapfile -t disks < <(get_all_disks)
+    SMART_FLEET_LONG_RUNNING=0
+    local capabilities fleet_log
+    for disk in "${disks[@]}"; do
+        prepare_smart_access "$disk" || continue
+        if [[ "$disk" == /dev/nvme* ]]; then
+            capabilities=$(smartctl_cached -c -d nvme "$disk" 2>/dev/null || true)
+            fleet_log=$(smartctl_cached -l selftest -d nvme "$disk" 2>/dev/null || true)
+        else
+            capabilities=$(smartctl_cached -c "$disk" 2>/dev/null || true)
+            fleet_log=$(smartctl_cached -l selftest "$disk" 2>/dev/null || true)
+        fi
+        if grep -qi 'in progress' <<< "$capabilities$fleet_log"; then
+            # An unidentified in-progress self-test also holds new long tests.
+            SMART_FLEET_LONG_RUNNING=1
+        fi
+    done
     for disk in "${disks[@]}"; do
         [[ -n "$disk" ]] || continue
         # Sanitize disk before smartctl invocations
@@ -6727,11 +5789,7 @@ monitor_btrfs() {
         done
         (( skip==0 )) && filtered+=("$m")
     done
-    if [[ ${ENABLE_BTRFS_SCRUB:-0} -eq 1 ]]; then
-        log_btrfs "BTRFS scrubbing starting (${#filtered[@]} mount(s))"
-    else
-        log_btrfs "BTRFS scrubbing disabled; summarizing last recorded status for ${#filtered[@]} mount(s)"
-    fi
+    log_btrfs "Reading recorded Btrfs scrub status for ${#filtered[@]} mount(s); no scrub is started"
     for m in "${filtered[@]}"; do
         # Per-mount persisted file key
         local key file
@@ -6744,30 +5802,6 @@ monitor_btrfs() {
         meta_raid="${BTRFS_DF_CACHE_META[$m]:-UNKNOWN}"
         data_raid=${data_raid:-UNKNOWN}
         meta_raid=${meta_raid:-UNKNOWN}
-        local initial_status=""
-        if (( ENABLE_BTRFS_SCRUB == 1 || FIRST_RUN_FORCE == 1 )); then
-            initial_status=$(btrfs_bounded_optional scrub status "$m" 2>/dev/null || true)
-        fi
-        if [[ ${ENABLE_BTRFS_SCRUB:-0} -eq 1 ]]; then
-            if echo "$initial_status" | grep -qi 'running'; then
-                log_btrfs "Scrub already running on $m (Data: $data_raid Meta: $meta_raid)"
-            else
-                log_btrfs "Starting async scrub on $m (Data: $data_raid Meta: $meta_raid)"
-                local _scrub_out
-                _scrub_out=$(btrfs_bounded scrub start "$m" 2>&1 || true)
-                while IFS= read -r _ln; do [[ -n "$_ln" ]] && log_btrfs "$m scrub start: $_ln"; done <<< "$_scrub_out"
-            fi
-        else
-            # If disabled but no persisted status exists and configured to force baseline, kick off one-time scrub
-            if [[ ${FIRST_RUN_FORCE:-0} -eq 1 && ! -s "$file" ]]; then
-                if echo "$initial_status" | grep -qi 'no stats available'; then
-                    log_btrfs "Force baseline scrub (first-run) on $m (Data: $data_raid Meta: $meta_raid)"
-                    local _scrub_force
-                    _scrub_force=$(btrfs_bounded scrub start "$m" 2>&1 || true)
-                    while IFS= read -r _ln; do [[ -n "$_ln" ]] && log_btrfs "$m scrub start (forced baseline): $_ln"; done <<< "$_scrub_force"
-                fi
-            fi
-        fi
         local status corrected uncorrectable msg fresh=0
         if ! status=$(btrfs_bounded_optional scrub status "$m" 2>&1) &&
            ! grep -qi "no stats available" <<< "$status"; then
@@ -6811,6 +5845,15 @@ monitor_btrfs() {
         if echo "$status" | grep -qi "no stats available"; then
             log_btrfs "$m: Last scrub: none recorded"
         fi
+        local scrub_date scrub_epoch scrub_age
+        scrub_date=$(sed -nE 's/^[[:space:]]*Scrub started:[[:space:]]*//p; s/.*scrub started at[[:space:]]*//p' <<< "$status" | head -n1)
+        scrub_epoch=$(date -d "$scrub_date" +%s 2>/dev/null || true)
+        if [[ -n "$scrub_date" && "$scrub_epoch" =~ ^[0-9]+$ ]] && (( scrub_epoch <= RUN_EPOCH )); then
+            scrub_age=$(( (RUN_EPOCH-scrub_epoch)/86400 ))
+            log_btrfs "$m: recorded scrub started=$scrub_date; age=${scrub_age}d; observation=${fresh:-0} (1=live status, 0=cached)"
+        else
+            log_btrfs "$m: recorded scrub date unavailable; freshness is unverified"
+        fi
         corrected=$(awk '{for(i=1;i<NF;i++) if ($i=="Corrected:" || ($i=="corrected" && $(i+1)=="errors:")) {print $(i+($i=="Corrected:"?1:2)); exit}}' <<< "$status")
         uncorrectable=$(awk '{for(i=1;i<NF;i++) if ($i=="Uncorrectable:" || ($i=="unrecoverable" && $(i+1)=="errors:")) {print $(i+($i=="Uncorrectable:"?1:2)); exit}}' <<< "$status")
         [[ "$corrected" =~ ^[0-9]+$ ]] || corrected=0
@@ -6829,7 +5872,7 @@ monitor_btrfs() {
             record_alert warning "$NOTIFY_TITLE_BTRFS" "$msg"
         fi
     done
-    log_btrfs "Btrfs scrubbing completed"
+    log_btrfs "Btrfs scrub status collection completed; reported dates belong to recorded scrubs"
 }
 
 # === Main Function ===
@@ -6864,7 +5907,7 @@ evaluate_capacity_alerts() {
 # shellcheck disable=SC2329
 
 # === Main Collection Phase ===
-# Run SMART tests, record daily SMART history, and calculate NVMe wear projection.
+# Collect SMART health and measured wear history; schedule tests without waiting.
 update_smart_coverage() {
     local disk identity first last rows="" age=0
     local -A first_seen=() last_fresh=()
@@ -6896,11 +5939,26 @@ update_smart_coverage() {
 collect_smart_health() {
     local -a disks=()
     local disk today tmp poh line key val stored_key
-    local win_wear cutoff_wear dt dev rest pu fv lv span_days growth rate remaining dl warn_thr crit_thr
 
-    log_smart "Starting SMART tests (short by default; long scheduled per risk)"
+    log_smart "Collecting SMART health and scheduling eligible asynchronous self-tests"
     check_completed_long_tests
     mapfile -t disks < <(get_all_disks)
+    SMART_FLEET_LONG_RUNNING=0
+    local capabilities fleet_log
+    for disk in "${disks[@]}"; do
+        prepare_smart_access "$disk" || continue
+        if [[ "$disk" == /dev/nvme* ]]; then
+            capabilities=$(smartctl_cached -c -d nvme "$disk" 2>/dev/null || true)
+            fleet_log=$(smartctl_cached -l selftest -d nvme "$disk" 2>/dev/null || true)
+        else
+            capabilities=$(smartctl_cached -c "$disk" 2>/dev/null || true)
+            fleet_log=$(smartctl_cached -l selftest "$disk" 2>/dev/null || true)
+        fi
+        if grep -qi 'in progress' <<< "$capabilities$fleet_log"; then
+            # An unidentified in-progress self-test also holds new long tests.
+            SMART_FLEET_LONG_RUNNING=1
+        fi
+    done
     for disk in "${disks[@]}"; do
         [[ -n "$disk" ]] || continue
         run_smart_test "$disk"
@@ -6916,10 +5974,10 @@ collect_smart_health() {
         fi
     done
     update_smart_coverage "${disks[@]}" || return 1
-    log_smart "SMART tests completed"
+    log_smart "SMART collection and test scheduling completed; pending tests are not declared complete"
     augment_messages_with_deltas
 
-    # Keep only the NVMe wear signal and timestamps used by the projection.
+    # Keep the measured NVMe wear signal and timestamps for history and regressions.
     # Existing rows with additional SMART fields remain readable.
     if (( WEAR_TREND_ENABLED == 1 )); then
         today=$(date '+%Y-%m-%d')
@@ -6933,105 +5991,7 @@ collect_smart_health() {
         collector_replace_daily_history "$SMART_ATTR_HISTORY_FILE" "$today" "${wear_records[@]}" ||
             log_warn "Unable to atomically update NVMe wear history"
     fi
-     # NVMe wear projection (percent_used -> depletion ETA)
-     if (( WEAR_TREND_ENABLED == 1 )); then
-        win_wear=${WEAR_TREND_WINDOW_DAYS:-90}
-        cutoff_wear=$(date -d "-${win_wear} days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
-        if [[ -f "$SMART_ATTR_HISTORY_FILE" ]]; then
-            declare -A _WEAR_SAMPLE_VALUE=() _WEAR_SAMPLE_EPOCH=() _WEAR_DEVICE_SEEN=() _WEAR_SEQUENCE=()
-            declare -g -A NVME_WEAR_DAYS_LEFT NVME_WEAR_RATE NVME_WEAR_CONFIDENCE
-            NVME_WEAR_DAYS_LEFT=()
-            NVME_WEAR_RATE=()
-            NVME_WEAR_CONFIDENCE=()
-            while read -r dt stored_key rest; do
-                dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
-                [[ "$dt" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
-                [[ -z "$dev" || "$dt" < "$cutoff_wear" ]] && continue
-                [[ "$dev" != /dev/nvme* ]] && continue
-                pu=$(history_field_value "$rest" nvme_percent_used 2>/dev/null || true)
-                [[ "$pu" =~ ^[0-9]+$ ]] || continue
-                local wear_sample_key="$dev|$dt" wear_epoch
-                wear_epoch=$(history_record_epoch "$dt" "$rest" 2>/dev/null || true)
-                [[ "$wear_epoch" =~ ^[0-9]+$ ]] || continue
-                _WEAR_SAMPLE_VALUE[$wear_sample_key]="$pu"
-                _WEAR_SAMPLE_EPOCH[$wear_sample_key]="$wear_epoch"
-                _WEAR_DEVICE_SEEN[$dev]=1
-            done < <(tail -n 50000 "$SMART_ATTR_HISTORY_FILE" 2>/dev/null || cat "$SMART_ATTR_HISTORY_FILE")
 
-            local wear_sample
-            for wear_sample in "${!_WEAR_SAMPLE_VALUE[@]}"; do
-                dev="${wear_sample%|*}"
-                _WEAR_SEQUENCE[$dev]="${_WEAR_SEQUENCE[$dev]:-}${_WEAR_SAMPLE_EPOCH[$wear_sample]} ${_WEAR_SAMPLE_VALUE[$wear_sample]}"$'\n'
-            done
-
-            for dev in "${!_WEAR_DEVICE_SEEN[@]}"; do
-                local wear_first_epoch=0 wear_last_epoch=0 wear_previous_epoch=0
-                local wear_first_value="" wear_last_value="" wear_previous_value=""
-                local wear_samples=0 wear_max_gap_seconds=0 wear_reset=0 wear_gap
-                while read -r wear_epoch pu; do
-                    [[ "$wear_epoch" =~ ^[0-9]+$ && "$pu" =~ ^[0-9]+$ ]] || continue
-                    if (( wear_samples == 0 )); then
-                        wear_first_epoch=$wear_epoch
-                        wear_first_value=$pu
-                    else
-                        wear_gap=$(( wear_epoch - wear_previous_epoch ))
-                        (( wear_gap > wear_max_gap_seconds )) && wear_max_gap_seconds=$wear_gap
-                        (( pu < wear_previous_value )) && wear_reset=1
-                    fi
-                    wear_last_epoch=$wear_epoch
-                    wear_last_value=$pu
-                    wear_previous_epoch=$wear_epoch
-                    wear_previous_value=$pu
-                    ((wear_samples++)) || true
-                done < <(printf '%s' "${_WEAR_SEQUENCE[$dev]:-}" | sort -n -k1,1)
-
-                (( wear_samples > 0 )) || continue
-                fv=$wear_first_value
-                lv=$wear_last_value
-                span_days=$(awk -v first="$wear_first_epoch" -v last="$wear_last_epoch" \
-                    'BEGIN { printf "%.3f", (last-first)/86400.0 }')
-                local wear_latest_age wear_max_gap_days wear_confidence
-                wear_latest_age=$(awk -v now="$RUN_EPOCH" -v last="$wear_last_epoch" \
-                    'BEGIN { age=(now-last)/86400.0; if(age<0) age=0; printf "%.3f", age }')
-                wear_max_gap_days=$(awk -v gap="$wear_max_gap_seconds" \
-                    'BEGIN { printf "%.3f", gap/86400.0 }')
-                wear_confidence=$(forecast_confidence \
-                    "$wear_samples" "$span_days" "$wear_latest_age" "$wear_max_gap_days")
-                if (( wear_reset == 1 )); then
-                    wear_confidence="RESET"
-                fi
-                NVME_WEAR_CONFIDENCE[$dev]="$wear_confidence"
-
-                if (( wear_reset == 1 )); then
-                    NVME_WEAR_RATE[$dev]="0"
-                    NVME_WEAR_DAYS_LEFT[$dev]="INF"
-                    continue
-                fi
-                growth=$(( lv - fv ))
-                if (( growth > 0 )) &&
-                   awk -v span="$span_days" 'BEGIN { exit !(span > 0) }'
-                then
-                    rate=$(awk -v g="$growth" -v s="$span_days" 'BEGIN{printf "%.4f", g/s}')
-                    NVME_WEAR_RATE[$dev]="$rate"
-                    remaining=$(( 100 - lv ))
-                    if (( remaining <= 0 )); then
-                        NVME_WEAR_DAYS_LEFT[$dev]=0
-                    else
-                        if awk -v r="$rate" -v min="${WEAR_STABLE_MIN_RATE}" 'BEGIN{exit (r>min)?0:1}'; then
-                            # days_left = remaining / rate
-                            dl=$(awk -v rem="$remaining" -v r="$rate" 'BEGIN{printf "%d", (rem/r)}')
-                            NVME_WEAR_DAYS_LEFT[$dev]="$dl"
-                        else
-                            NVME_WEAR_DAYS_LEFT[$dev]="INF"
-                        fi
-                    fi
-                else
-                    NVME_WEAR_RATE[$dev]="0"
-                    NVME_WEAR_DAYS_LEFT[$dev]="INF"
-                fi
-            done
-        fi
-     fi
 }
 
 # === Helper Function ===
@@ -7294,6 +6254,16 @@ scan_syslog_disk_errors() {
         map_xfs_syslog_sources || return 1
     fi
 
+    if (( SYSLOG_FAST_STORAGE_OWNER == 1 )) && [[ "$heartbeat" =~ ^[1-9][0-9]{0,11}$ ]] &&
+       (( heartbeat <= now && now-heartbeat <= 1200 )) &&
+       ! grep -Eq '^finding.*(disk_i_o_alert|disk_io_burst|xfs_kernel_error)' "$NOTIFICATION_JOURNAL_FILE" 2>/dev/null; then
+        log "IO" "INFO" "Current syslog_watchdog owns storage-error notifications; duplicate daily parsing skipped"
+        return 0
+    fi
+    # Primary watcher unavailable: activate the existing bounded cursor-based fallback,
+    # including real XFS corruption attribution. Do not silence errors because ownership is configured.
+    map_xfs_syslog_sources || return 1
+    local SYSLOG_FAST_STORAGE_OWNER=0
     if [[ -r "$IO_ERROR_HISTORY_FILE" ]]; then
         while read -r timestamp key hash; do
             [[ "$timestamp" =~ ^[1-9][0-9]*$ && -n "$key" && -n "$hash" ]] || continue
@@ -7671,7 +6641,7 @@ load_notification_journal() {
                 label="${fields[4]}"
                 # A retired alert is a policy change, not an observed recovery.
                 case "${id#*|}" in
-                    poh_age_*|load_cycle_count|smart_scheduling|temperature_rate|storage_validation|nvme_wear_projection|tbw_endurance) continue ;;
+                    poh_age_*|load_cycle_count|smart_scheduling|temperature_rate|storage_validation|nvme_wear_projection|tbw_endurance|endurance_forecast|ssd_life_remaining*|heavy_writer|write_workload|sustained_array_write_workload) continue ;;
                 esac
                 if [[ -n "${NOTIFY_PREV_FINGERPRINT[$id]+present}" ]]; then
                     malformed=1
@@ -7850,13 +6820,7 @@ finding_has_fresh_recovery_evidence() {
                     [[ -n "${DEVICE_ID_BY_PATH[$device]:-}" &&
                        "$SYSLOG_CURSOR_MODE" =~ ^(cursor_continuation|rotation_recovery)$ ]] &&
                         collector_status_is_safe syslog_io ;;
-                endurance_forecast)
-                    [[ -n "${FRESH_SMART[$device]:-}" ]] &&
-                        forecast_confidence_is_actionable "${TBW_FORECAST_CONFIDENCE[$device]:-INSUFFICIENT}" || return 1
-                    if [[ "$device" == /dev/nvme* ]] && (( WEAR_TREND_ENABLED == 1 )); then
-                        forecast_confidence_is_actionable "${NVME_WEAR_CONFIDENCE[$device]:-INSUFFICIENT}"
-                    fi
-                    ;;
+                endurance_forecast) return 1 ;; # Retired policy; not physical recovery evidence.
                 *)
                     [[ -n "${FRESH_SMART[$device]:-}" ]] ;;
             esac
@@ -8103,7 +7067,7 @@ process_notification_delivery() {
 }
 
 # Trend stages intentionally communicate through the structured globals used
-# by risk evaluation and final rendering. Each stage otherwise owns its local
+# by trend evaluation and final rendering. Each stage otherwise owns its local
 # parsing state and can fail independently.
 declare -a TREND_DIAGNOSTIC_ITEMS=()
 declare -A TREND_HISTORY_CACHE=()
@@ -8120,7 +7084,7 @@ trend_log_diagnostics() {
     local item
 
     for item in "${TREND_DIAGNOSTIC_ITEMS[@]}"; do
-        log_master_only "TREND" "INFO" "Diagnostic $item"
+        log "TREND" "INFO" "$item"
     done
     return 0
 }
@@ -8145,7 +7109,6 @@ format_bytes_per_day() {
         printf 'unknown/day'
     fi
 }
-
 
 # Copy a bounded history tail once per run. Trend stages share the cached file
 # instead of repeatedly reading the same persistent history into shell strings.
@@ -8385,10 +7348,6 @@ analyze_temperature_trends() {
     return 0
 }
 
-
-
-
-
 analyze_sata_link_trends() {
     (( SATA_LINK_INSTABILITY_ENABLED == 1 )) || return 0
     prepare_trend_history_cache sata-links "$SATA_LINK_HISTORY_FILE" 20000 || return 0
@@ -8430,17 +7389,8 @@ analyze_sata_link_trends() {
 log_health_trends() {
     local device
     trend_add_diagnostic "temperature history" "${TEMP_FORECAST_CONFIDENCE_LINE:-}"
-    for device in "${!TBW_DAYS_LEFT[@]}"; do
-        trend_add_diagnostic "TBW endurance" "device=${device##*/} bytes_per_day=${TBW_DAILY[$device]:-0} days_left=${TBW_DAYS_LEFT[$device]} confidence=${TBW_FORECAST_CONFIDENCE[$device]:-INSUFFICIENT}"
-    done
-    # The wear map is declared by the SMART collector when enabled.
-    if declare -p NVME_WEAR_DAYS_LEFT >/dev/null 2>&1; then
-        for device in "${!NVME_WEAR_DAYS_LEFT[@]}"; do
-            trend_add_diagnostic "NVMe wear" "device=${device##*/} days_left=${NVME_WEAR_DAYS_LEFT[$device]} rate_percent_per_day=${NVME_WEAR_RATE[$device]:-0} confidence=${NVME_WEAR_CONFIDENCE[$device]:-INSUFFICIENT}"
-        done
-    fi
     for device in "${!WRITER_DAILY[@]}"; do
-        trend_add_diagnostic "write workload" "device=${device##*/} bytes_per_day=${WRITER_DAILY[$device]} direction=${WRITER_DIRECTION[$device]:-COLLECTING} change_percent=${WRITER_CHANGE_PCT[$device]:-0}"
+        trend_add_diagnostic "write workload" "device=${device##*/} bytes_per_day=${WRITER_DAILY[$device]} direction=${WRITER_DIRECTION[$device]:-COLLECTING} change_percent=${WRITER_CHANGE_PCT[$device]:-0} confidence=${TBW_FORECAST_CONFIDENCE[$device]:-INSUFFICIENT}"
     done
     trend_log_diagnostics
 }
@@ -8483,20 +7433,6 @@ build_subject() {
 
 # Keep the current per-device score for alert ordering and SMART scheduling.
 # shellcheck disable=SC2329
-compute_risk_scores() {
-    (( RISK_SCORING_ENABLED == 1 )) || return 0
-    local dev score previous
-    RISK_MAP=()
-    for dev in "${!SMART_STATE[@]}"; do
-        score=$(risk_score_for_device "$dev" "${SMART_STATE[$dev]:-OK}" "${SMART_MSGS[$dev]:-}")
-        previous="${PREVIOUS_RISK[$dev]:-}"
-        if [[ -n "${SMART_DEFERRED[$dev]:-}" && "$previous" =~ ^[0-9]+$ ]] &&
-           (( previous > score )); then
-            score="$previous"
-        fi
-        RISK_MAP[$dev]="$score"
-    done
-}
 
 # Compute a monotonic counter rate inside one bounded epoch range. Results are
 # returned through globals so callers do not lose side effects in a subshell.
@@ -8505,8 +7441,6 @@ COUNTER_WINDOW_SPAN_DAYS="0"
 COUNTER_WINDOW_SAMPLES=0
 WRITER_DIRECTION_RESULT="COLLECTING"
 WRITER_CHANGE_RESULT="0.0"
-WRITER_TIER_RESULT="L"
-WRITER_TIER_TEXT_RESULT="light workload"
 
 calculate_counter_window_rate() {
     local sequence="$1" minimum_epoch="$2" maximum_epoch="$3" minimum_samples="$4"
@@ -8578,150 +7512,12 @@ classify_writer_direction() {
     fi
 }
 
-classify_writer_tier() {
-    local weekly_pct="$1"
-    local moderate_pct="${2:-$WRITER_TIER_MODERATE_PCT}"
-    local warn_pct="${3:-$WRITER_WEEKLY_WARN_PCT}"
-    local crit_pct="${4:-$WRITER_WEEKLY_CRIT_PCT}"
-
-    WRITER_TIER_RESULT="L"
-    WRITER_TIER_TEXT_RESULT="light workload"
-    [[ "$weekly_pct" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 0
-    if awk -v value="$weekly_pct" -v threshold="$crit_pct" \
-        'BEGIN { exit !(value >= threshold) }'
-    then
-        WRITER_TIER_RESULT="V"
-        WRITER_TIER_TEXT_RESULT="very high workload"
-    elif awk -v value="$weekly_pct" -v threshold="$warn_pct" \
-        'BEGIN { exit !(value >= threshold) }'
-    then
-        WRITER_TIER_RESULT="H"
-        WRITER_TIER_TEXT_RESULT="high workload"
-    elif awk -v value="$weekly_pct" -v threshold="$moderate_pct" \
-        'BEGIN { exit !(value >= threshold) }'
-    then
-        WRITER_TIER_RESULT="M"
-        WRITER_TIER_TEXT_RESULT="moderate workload"
-    fi
-}
-
-set_writer_policy_for_device() {
-    local dev="$1" base mapped_mount mapped_device mapped_base
-    local pool_name entry policy_name policy_warn policy_crit extra
-    local -a policy_entries=()
-
-    base="$(base_device "$dev")"
-    WRITER_POLICY_ROLE="unassigned"
-    WRITER_POLICY_LABEL="unassigned"
-    WRITER_POLICY_MODERATE_PCT="$WRITER_TIER_MODERATE_PCT"
-    WRITER_POLICY_WARN_PCT="$WRITER_WEEKLY_WARN_PCT"
-    WRITER_POLICY_CRIT_PCT="$WRITER_WEEKLY_CRIT_PCT"
-    WRITER_POLICY_ALERTS_ENABLED=0
-
-    for mapped_mount in "${!MOUNT_TO_DEV[@]}"; do
-        [[ "$mapped_mount" == /mnt/disk* ]] || continue
-        mapped_device="${MOUNT_TO_DEV[$mapped_mount]:-}"
-        mapped_base="$(base_device "$mapped_device")"
-        [[ "$mapped_base" == "$base" ]] || continue
-        WRITER_POLICY_ROLE="array"
-        WRITER_POLICY_LABEL="array $(basename "$mapped_mount")"
-        WRITER_POLICY_MODERATE_PCT="$ARRAY_WRITER_TIER_MODERATE_PCT"
-        WRITER_POLICY_WARN_PCT="$ARRAY_WRITER_WEEKLY_WARN_PCT"
-        WRITER_POLICY_CRIT_PCT="$ARRAY_WRITER_WEEKLY_CRIT_PCT"
-        WRITER_POLICY_ALERTS_ENABLED="$ARRAY_WRITER_ALERTS_ENABLED"
-        return 0
-    done
-
-    pool_name="${POOL_MEMBER_MAP[$base]:-}"
-    [[ -n "$pool_name" ]] || return 0
-    WRITER_POLICY_ROLE="pool"
-    WRITER_POLICY_LABEL="pool $pool_name"
-    WRITER_POLICY_ALERTS_ENABLED="$POOL_WRITER_ALERTS_ENABLED"
-
-    [[ -n "$POOL_WRITER_POLICY" ]] || return 0
-    IFS=',' read -r -a policy_entries <<< "$POOL_WRITER_POLICY"
-    for entry in "${policy_entries[@]}"; do
-        trim_external_config_field "$entry"
-        entry="$TRIMMED_EXTERNAL_CONFIG_FIELD"
-        IFS=':' read -r policy_name policy_warn policy_crit extra <<< "$entry"
-        [[ "$policy_name" == "$pool_name" && -z "$extra" ]] || continue
-        WRITER_POLICY_WARN_PCT="$policy_warn"
-        WRITER_POLICY_CRIT_PCT="$policy_crit"
-        WRITER_POLICY_MODERATE_PCT=$(awk -v warn="$policy_warn" \
-            'BEGIN { printf "%.3f", warn/2 }')
-        return 0
-    done
-}
-
-record_writer_workload_alert() {
-    local dev="$1" weekly_pct="$2" daily_bytes="$3" direction="$4"
-    local change_pct="$5" recent_samples="$6" previous_samples="$7"
-    local direction_text="" tier severity minimum_daily_bytes
-
-    (( HEAVY_WRITER_ALERTS_ENABLED == 1 )) || return 0
-    set_writer_policy_for_device "$dev"
-    (( WRITER_POLICY_ALERTS_ENABLED == 1 )) || return 0
-    classify_writer_tier "$weekly_pct" "$WRITER_POLICY_MODERATE_PCT" \
-        "$WRITER_POLICY_WARN_PCT" "$WRITER_POLICY_CRIT_PCT"
-    tier="$WRITER_TIER_RESULT"
-    [[ "$tier" == "H" || "$tier" == "V" ]] || return 0
-
-    if [[ "$WRITER_POLICY_ROLE" == "array" ]]; then
-        minimum_daily_bytes=$(awk -v gb="$ARRAY_WRITER_MIN_DAILY_GB" \
-            'BEGIN { printf "%.0f", gb*1000000000 }')
-        [[ "$daily_bytes" =~ ^[0-9]+$ && "$recent_samples" =~ ^[0-9]+$ &&
-           "$previous_samples" =~ ^[0-9]+$ ]] || return 0
-        (( daily_bytes >= minimum_daily_bytes )) || return 0
-        (( recent_samples >= ARRAY_WRITER_MIN_RECENT_SAMPLES )) || return 0
-        (( previous_samples >= HEAVY_WRITER_MIN_RECENT_SAMPLES )) || return 0
-        [[ "$direction" == "RISING" ]] || return 0
-        awk -v change="$change_pct" -v minimum="$ARRAY_WRITER_BASELINE_INCREASE_PCT" \
-            'BEGIN { exit !(change >= minimum) }' || return 0
-    fi
-
-    case "$direction" in
-        IMPROVING) direction_text="; improving by ${change_pct#-}% versus the previous ${HEAVY_WRITER_RECENT_DAYS}-day window" ;;
-        RISING)    direction_text="; rising by ${change_pct}% versus the previous ${HEAVY_WRITER_RECENT_DAYS}-day window" ;;
-        STEADY)    direction_text="; steady versus the previous ${HEAVY_WRITER_RECENT_DAYS}-day window" ;;
-    esac
-    [[ "$tier" == "V" ]] && severity="critical" || severity="warning"
-    record_alert "$severity" "Write Workload Anomaly" \
-        "Disk $dev (${WRITER_POLICY_LABEL}) recent writes project to $(printf '%.1f' "$weekly_pct")% of capacity/week${direction_text}; policy thresholds are ${WRITER_POLICY_WARN_PCT}% warning and ${WRITER_POLICY_CRIT_PCT}% critical"
-}
-
-evaluate_writer_workload_alerts() {
-    local dev daily cap_tb daily_pct weekly_pct
-
-    (( HEAVY_WRITER_ALERTS_ENABLED == 1 )) || return 0
-    for dev in "${!WRITER_DAILY[@]}"; do
-        (( ${WRITER_RECENT_READY[$dev]:-0} == 1 )) || continue
-        forecast_confidence_is_actionable \
-            "${TBW_FORECAST_CONFIDENCE[$dev]:-INSUFFICIENT}" || continue
-        daily="${WRITER_DAILY[$dev]:-0}"
-        [[ "$daily" =~ ^[0-9]+$ ]] || continue
-        cap_tb="$(get_device_capacity_tb "$dev")"
-        [[ "$cap_tb" =~ ^[0-9]+([.][0-9]+)?$ ]] || continue
-        daily_pct=$(awk -v daily="$daily" -v cap_tb="$cap_tb" \
-            'BEGIN { if (cap_tb > 0) printf "%.6f", (daily/(cap_tb*1000000000000.0))*100; else print "0" }')
-        weekly_pct=$(awk -v daily_pct="$daily_pct" \
-            'BEGIN { printf "%.6f", daily_pct*7 }')
-        record_writer_workload_alert "$dev" "$weekly_pct" "$daily" \
-            "${WRITER_DIRECTION[$dev]:-COLLECTING}" \
-            "${WRITER_CHANGE_PCT[$dev]:-0.0}" \
-            "${WRITER_RECENT_SAMPLES[$dev]:-0}" \
-            "${WRITER_PREVIOUS_SAMPLES[$dev]:-0}"
-    done
-}
-
 # === Main Function ===
 # Analyze TBW history for a smoothed endurance forecast and a separate recent
 # workload rate that can respond quickly when writes are reduced.
 # shellcheck disable=SC2329
-tbw_forecast_and_heavy_writers() {
-    # Forecast days-to-endurance threshold and list heavy writers (normalized by capacity)
-    TBW_DAILY=()
-    TBW_DAYS_LEFT=()
-    TBW_STATUS_MAP=()
+collect_write_rates() {
+    # Measured write rates only; rated TBW is not a failure-date prediction.
     TBW_FORECAST_CONFIDENCE=()
     WRITER_DAILY=()
     WRITER_PREVIOUS_DAILY=()
@@ -8750,7 +7546,6 @@ tbw_forecast_and_heavy_writers() {
     lines=$(tail -n 50000 "$TBW_HISTORY_FILE" 2>/dev/null || true)
     [[ -n "$lines" ]] || return 0
     declare -A _TBW_SAMPLE_VALUE=() _TBW_SAMPLE_EPOCH=() _TBW_DEVICE_SEEN=() _TBW_SEQUENCE=()
-    declare -A first_v=() last_v=() TBW_SPAN_DAYS=()
     local stored_key dt rest v sample_key sample_epoch
     while read -r dt stored_key rest; do
         [[ "$dt" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
@@ -8786,14 +7581,12 @@ tbw_forecast_and_heavy_writers() {
             [[ "$sample_epoch" =~ ^[0-9]+$ && "$v" =~ ^[0-9]+$ ]] || continue
             if (( samples == 0 )); then
                 first_epoch=$sample_epoch
-                first_v[$dev]="$v"
             else
                 gap_seconds=$(( sample_epoch - previous_epoch ))
                 (( gap_seconds > max_gap_seconds )) && max_gap_seconds=$gap_seconds
                 (( v < previous_value )) && reset_seen=1
             fi
             last_epoch=$sample_epoch
-            last_v[$dev]="$v"
             previous_epoch=$sample_epoch
             previous_value=$v
             ((samples++)) || true
@@ -8810,7 +7603,6 @@ tbw_forecast_and_heavy_writers() {
             confidence="RESET"
         fi
         TBW_FORECAST_CONFIDENCE[$dev]="$confidence"
-        TBW_SPAN_DAYS[$dev]="$span_days"
 
         if calculate_counter_window_rate "${_TBW_SEQUENCE[$dev]:-}" \
             "$writer_recent_min" "$RUN_EPOCH" "$HEAVY_WRITER_MIN_RECENT_SAMPLES"
@@ -8842,111 +7634,6 @@ tbw_forecast_and_heavy_writers() {
         fi
     done
 
-    for dev in "${!last_v[@]}"; do
-        local start=${first_v[$dev]:-0} end=${last_v[$dev]:-0}
-        [[ ! "$start" =~ ^[0-9]+$ || ! "$end" =~ ^[0-9]+$ ]] && continue
-        local days="${TBW_SPAN_DAYS[$dev]:-0}"
-        # Debug: log values if anything is non-numeric before proceeding
-        if ! awk -v e="$end" -v s="$start" -v d="$days" 'BEGIN{exit (e ~ /^[0-9]+$/ && s ~ /^[0-9]+$/ && d+0>0)?0:1}'; then
-            log_warn "TBW debug: skipping dev=$(basename "$dev") start='$start' end='$end' days='$days' (non-numeric)"
-            continue
-        fi
-        if awk -v e="$end" -v s="$start" 'BEGIN{exit !(e+0>s+0)}'; then
-            local daily
-            daily=$(awk -v e="$end" -v s="$start" -v d="$days" 'BEGIN{printf "%d", int(((e+0)-(s+0))/(d+0))}')
-            TBW_DAILY[$dev]=$daily
-            if [[ -z "${WRITER_DAILY[$dev]+present}" ]]; then
-                WRITER_DAILY[$dev]="$daily"
-            fi
-            local model cap tbw_thresh
-            model=$(get_device_model "$dev")
-            cap=$(get_device_capacity_tb "$dev")
-            tbw_thresh=$(tbw_threshold_tb_for_device "$model" "$cap")
-            local total_bytes="" remaining_bytes="" days_left=""
-            if [[ -n "$tbw_thresh" ]]; then
-                # Compute total_bytes using awk to avoid arithmetic errors on non-numeric inputs
-                if [[ "$tbw_thresh" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-                    total_bytes=$(awk -v th="$tbw_thresh" 'BEGIN{printf "%d", int(th * 1000*1000*1000*1000)}')
-                else
-                    log_warn "TBW debug: non-numeric tbw_thresh for dev=$(basename "$dev") model='$model' cap='$cap' tbw_thresh='$tbw_thresh'"
-                    total_bytes=""
-                fi
-            else
-                local used_pct=${CUR_ATTR["$dev|nvme_percent_used"]:-}
-                if [[ -n "$used_pct" && "$used_pct" =~ ^[0-9]+$ ]] && awk -v u="$used_pct" 'BEGIN{exit !(u+0>0)}'; then
-                    total_bytes=$(awk -v e="$end" -v u="$used_pct" 'BEGIN{printf "%d", int((e+0)*100/(u+0))}')
-                else
-                    # Fallback for SATA/NVMe SSDs with unknown model endurance: use DEFAULT_SSD_ENDURANCE_PER_TB
-                    local bd rota
-                    bd=$(base_device "$dev")
-                    rota=$(lsblk_rota_cached "$bd" 2>/dev/null || echo 1)
-                    if [[ "$rota" == "0" ]]; then
-                        # SSD: use capacity * DEFAULT_SSD_ENDURANCE_PER_TB
-                        if [[ -n "$cap" && "$cap" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-                            total_bytes=$(awk -v c="$cap" -v p="$DEFAULT_SSD_ENDURANCE_PER_TB" 'BEGIN{printf "%d", int(c*p*1000*1000*1000*1000)}')
-                        fi
-                    fi
-                fi
-            fi
-            [[ ! "$total_bytes" =~ ^[0-9]+$ ]] && total_bytes=""
-            if [[ -n "$total_bytes" ]] && awk -v t="$total_bytes" -v e="$end" -v d="$daily" 'BEGIN{exit !(t+0>e+0 && d+0>0)}'; then
-                remaining_bytes=$(awk -v t="$total_bytes" -v e="$end" 'BEGIN{printf "%d", (t+0) - (e+0)}')
-                days_left=$(awk -v r="$remaining_bytes" -v d="$daily" 'BEGIN{printf "%.1f", (r+0)/(d+0)}')
-                TBW_DAYS_LEFT[$dev]=$days_left
-                local status="OK"
-                if [[ -n "$days_left" ]]; then
-                    if awk -v dl="$days_left" -v c="$TBW_DAYS_CRIT" 'BEGIN{exit !(dl+0<c+0)}'; then
-                        status="CRITICAL"
-                    elif awk -v dl="$days_left" -v w="$TBW_DAYS_WARN" 'BEGIN{exit !(dl+0<w+0)}'; then
-                        status="WARNING"
-                    fi
-                fi
-                TBW_STATUS_MAP[$dev]="$status"
-            else
-                log_warn "TBW debug: insufficient data for dev=$(basename "$dev") total_bytes='$total_bytes' end='$end' daily='$daily'"
-            fi
-        fi
-    done
-    evaluate_writer_workload_alerts
-}
-
-# Correlate the forecasts for one disk. Choose the higher severity, then the
-# shorter horizon on ties. Retain a second actionable estimate as evidence.
-record_endurance_forecasts() {
-    local dev tbw wear tbw_rank wear_rank tbw_text wear_text primary secondary severity
-    for dev in "${!FRESH_SMART[@]}"; do
-        tbw="${TBW_DAYS_LEFT[$dev]:-}"
-        wear="${NVME_WEAR_DAYS_LEFT[$dev]:-}"
-        tbw_rank=0; wear_rank=0
-        tbw_text=""; wear_text=""; secondary=""
-        if [[ "$tbw" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
-           forecast_confidence_is_actionable "${TBW_FORECAST_CONFIDENCE[$dev]:-INSUFFICIENT}"; then
-            tbw_rank=$(severity_rank "${TBW_STATUS_MAP[$dev]:-OK}")
-            tbw_text="write-volume estimate: $tbw days"
-        fi
-        if [[ "$wear" =~ ^(0|[1-9][0-9]*)$ ]] &&
-           forecast_confidence_is_actionable "${NVME_WEAR_CONFIDENCE[$dev]:-INSUFFICIENT}"; then
-            if (( WEAR_DAYS_LEFT_CRIT > 0 && wear <= WEAR_DAYS_LEFT_CRIT )); then wear_rank=2
-            elif (( WEAR_DAYS_LEFT_WARN > 0 && wear <= WEAR_DAYS_LEFT_WARN )); then wear_rank=1
-            fi
-            wear_text="measured wear estimate: $wear days"
-        fi
-        (( tbw_rank > 0 || wear_rank > 0 )) || continue
-        if (( wear_rank > tbw_rank )) || {
-            (( wear_rank == tbw_rank )) && awk -v wear="$wear" -v tbw="$tbw" 'BEGIN { exit !(wear <= tbw) }'
-        }; then
-            primary="$wear_text"
-            (( tbw_rank == 0 )) || secondary="$tbw_text"
-        else
-            primary="$tbw_text"
-            (( wear_rank == 0 )) || secondary="$wear_text"
-        fi
-        severity=warning
-        if (( tbw_rank == 2 || wear_rank == 2 )); then severity=critical; fi
-        record_finding "$severity" endurance endurance.wear "$dev" "SSD endurance forecast" \
-            "$primary remaining${secondary:+ ($secondary remaining)}." \
-            "Verify backups, review workload, and plan SSD replacement." endurance_forecast
-    done
 }
 
 # === Helper Function ===
@@ -9011,30 +7698,6 @@ last_btrfs_history_metric() {
             else print "delta", delta
         }
     ' "$BTRFS_DEV_HIST_FILE" 2>/dev/null | tail -n 1
-}
-
-last_xfs_history_metric() {
-    local wanted_key="$1"
-    [[ -f "$XFS_PROC_HISTORY_FILE" ]] || return 0
-    awk -v wanted="$wanted_key" '
-        {
-            matched = 0
-            reset = 0
-            delta = ""
-            rate = ""
-            for (i = 2; i <= NF; i++) {
-                if ($i == "key=" wanted) matched = 1
-                if ($i == "event=reset") reset = 1
-                if ($i ~ /^delta=/) { delta=$i; sub(/^delta=/, "", delta) }
-                if ($i ~ /^rate_day=/) { rate=$i; sub(/^rate_day=/, "", rate) }
-            }
-            if (!matched) next
-            if (reset) { print "reset", 0; next }
-            if (delta !~ /^[0-9]+$/) next
-            if (rate ~ /^[0-9]+([.][0-9]+)?$/ && rate > 0) print "rate", rate
-            else print "delta", delta
-        }
-    ' "$XFS_PROC_HISTORY_FILE" 2>/dev/null | tail -n 1
 }
 
 # Collect Btrfs counters without resetting them. Missing baselines and counter
@@ -9188,165 +7851,6 @@ collect_btrfs_device_stats() {
 # === Main Function ===
 # Collect and integrate xfs /proc stats (global deltas)
 # shellcheck disable=SC2329
-collect_xfs_proc_stats() {
-    (( ${ENABLE_XFS_PROC_STATS:-0} == 1 )) || return 0
-    local stat_file="/proc/fs/xfs/stat" prev_file="$XFS_PROC_PREV_FILE"
-    [[ -r "$stat_file" ]] || return 0
-
-    local snapshot_temp now_epoch previous_epoch=0 current_boot_id="unknown" previous_boot_id=""
-    local stat_text
-    local first second rest token k ex skip val prev delta elapsed_seconds rate_day
-    local current_kind current_metric last_kind last_metric ratio absolute_severity
-    local alert_due alert_severity summary_lines="" final_severity
-    local message today
-    local suppress=0 baseline_all=0 snapshot_count=0 baseline_count=0 reset_count=0 delta_count=0
-    local had_any=0 had_crit=0
-    local -a keys=() filtered=()
-    declare -A PREV_XFS=() PREV_XFS_PRESENT=()
-
-    now_epoch=$(date +%s)
-    today=$(date '+%Y-%m-%d')
-    stat_text=$(<"$stat_file")
-    [[ -r /proc/sys/kernel/random/boot_id ]] && read -r current_boot_id < /proc/sys/kernel/random/boot_id || true
-
-    if (( XFS_PROC_SUPPRESS_DURING_PARITY == 1 && PARITY_ACTIVE == 1 )); then
-        suppress=1
-        log "XFS" "INFO" "Suppressing XFS proc alerts during parity action ${PARITY_ACTION:-unknown}"
-    fi
-
-    if [[ -f "$prev_file" ]]; then
-        while read -r first second rest; do
-            if [[ "$first" == "meta" ]]; then
-                for token in "$second" $rest; do
-                    [[ "$token" == captured_epoch=* ]] && previous_epoch="${token#*=}"
-                    [[ "$token" == boot_id=* ]] && previous_boot_id="${token#*=}"
-                done
-                continue
-            fi
-            [[ -n "$first" && "$second" =~ ^[0-9]+$ ]] || continue
-            PREV_XFS["$first"]="$second"
-            PREV_XFS_PRESENT["$first"]=1
-        done < "$prev_file"
-    fi
-    [[ "$previous_epoch" =~ ^[0-9]+$ ]] || previous_epoch=0
-    elapsed_seconds=$(( now_epoch - previous_epoch ))
-    (( elapsed_seconds > 0 )) || elapsed_seconds=0
-
-    if [[ -z "$previous_boot_id" || "$previous_boot_id" != "$current_boot_id" ]]; then
-        baseline_all=1
-    fi
-
-    if [[ -n "$XFS_PROC_KEYS" ]]; then
-        read -r -a keys <<< "$XFS_PROC_KEYS"
-    else
-        keys=(extent_alloc dir_lookup dir_create xs_xstrat delalloc flush)
-    fi
-    if [[ -n "$XFS_PROC_KEYS_EXCLUDE" ]]; then
-        for k in "${keys[@]}"; do
-            skip=0
-            for ex in $XFS_PROC_KEYS_EXCLUDE; do
-                [[ "$k" == "$ex" ]] && { skip=1; break; }
-            done
-            (( skip == 0 )) && filtered+=("$k")
-        done
-        keys=("${filtered[@]}")
-    fi
-
-    snapshot_temp="$(state_temp_file "$prev_file")" || return 0
-    printf 'meta schema=2 captured_epoch=%s boot_id=%s\n' "$now_epoch" "$current_boot_id" > "$snapshot_temp"
-
-    for k in "${keys[@]}"; do
-        val=$(xfs_stat_value_from_text "$stat_text" "$k")
-        [[ "$val" =~ ^[0-9]+$ ]] || continue
-        printf '%s %s\n' "$k" "$val" >> "$snapshot_temp"
-        ((snapshot_count++)) || true
-
-        if (( baseline_all == 1 )) || [[ -z "${PREV_XFS_PRESENT[$k]:-}" ]]; then
-            ((baseline_count++)) || true
-            continue
-        fi
-
-        prev=${PREV_XFS[$k]}
-        if (( val < prev )); then
-            ((reset_count++)) || true
-            printf '%s key=%s event=reset previous=%s value=%s boot_id=%s captured_epoch=%s schema=%s\n' \
-                "$today" "$k" "$prev" "$val" "$current_boot_id" \
-                "$RUN_EPOCH" "$HISTORY_SCHEMA_VERSION" >> "$XFS_PROC_HISTORY_FILE"
-            continue
-        fi
-
-        delta=$(( val - prev ))
-        (( delta > 0 )) || continue
-        ((delta_count++)) || true
-        rate_day=$(counter_rate_per_day "$delta" "$elapsed_seconds" 2>/dev/null || true)
-        if [[ -n "$rate_day" ]]; then
-            current_kind="rate"
-            current_metric="$rate_day"
-        else
-            current_kind="delta"
-            current_metric="$delta"
-        fi
-
-        last_kind=""; last_metric=""; ratio=0
-        read -r last_kind last_metric < <(last_xfs_history_metric "$k") || true
-        if [[ "$last_kind" == "$current_kind" && "$last_metric" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-            ratio=$(awk -v current="$current_metric" -v previous="$last_metric" \
-                'BEGIN { if (previous > 0) printf "%d", int(current / previous); else print 0 }')
-        fi
-
-        printf '%s key=%s delta=%s value=%s elapsed_sec=%s%s captured_epoch=%s schema=%s\n' \
-            "$today" "$k" "$delta" "$val" "$elapsed_seconds" \
-            "${rate_day:+ rate_day=$rate_day}" "$RUN_EPOCH" "$HISTORY_SCHEMA_VERSION" >> "$XFS_PROC_HISTORY_FILE"
-
-        absolute_severity=""
-        if (( delta >= XFS_PROC_CRIT_DELTA )); then absolute_severity="critical"
-        elif (( delta >= XFS_PROC_WARN_DELTA )); then absolute_severity="warning"
-        fi
-
-        alert_due=0
-        alert_severity="$absolute_severity"
-        message="$k +$delta"
-        if (( ratio >= XFS_ERR_BURST_CRIT_RATIO )); then
-            alert_due=1
-            alert_severity="critical"
-            message="$k rate burst +$delta (x${ratio})"
-        elif (( ratio >= XFS_ERR_BURST_WARN_RATIO )); then
-            alert_due=1
-            [[ "$alert_severity" == "critical" ]] || alert_severity="warning"
-            message="$k rate elevated +$delta (x${ratio})"
-        elif [[ -n "$absolute_severity" ]] && (( XFS_PROC_REQUIRE_RATIO_FOR_ALERT == 0 )); then
-            alert_due=1
-        fi
-
-        (( alert_due == 1 )) || continue
-        had_any=1
-        [[ "$alert_severity" == "critical" ]] && had_crit=1
-        summary_lines+="$message; "
-
-    done
-
-    if (( snapshot_count > 0 )); then
-        collector_atomic_commit "$snapshot_temp" "$prev_file" || true
-    else
-        rm -f -- "$snapshot_temp" 2>/dev/null || true
-    fi
-
-    if (( baseline_all == 1 && baseline_count > 0 )); then
-        log "XFS" "INFO" \
-            "Established a boot-aware XFS baseline for $baseline_count counter(s) without alerting"
-    elif (( baseline_count > 0 )); then
-        log "XFS" "INFO" "Established $baseline_count new XFS counter baseline(s) without alerting"
-    fi
-    (( reset_count > 0 )) && log "XFS" "WARN" \
-        "Detected $reset_count XFS counter reset(s); affected counters were re-baselined"
-    log "XFS" "INFO" "Recorded $delta_count positive XFS counter delta(s)"
-
-    if (( had_any == 1 && suppress == 0 )); then
-        message="XFS metadata activity spike: ${summary_lines%%; }"
-        [[ $had_crit -eq 1 ]] && final_severity="critical" || final_severity="warning"
-        record_alert "$final_severity" "$NOTIFY_TITLE_XFS" "$message"
-    fi
-}
 
 # ---------------------------------------------------------------------------
 # Notification assembly
@@ -9378,9 +7882,6 @@ add_notification_section() {
 
     [[ -n "$cleaned" ]] && NOTIFY_SECTIONS+=("$cleaned")
 }
-
-
-
 
 limit_notification_body() {
     local max_chars="${NOTIFY_MAX_BODY_CHARS:-12000}"
@@ -9438,7 +7939,6 @@ limit_notification_body() {
     fi
 }
 
-
 compose_notification() {
     local index
 
@@ -9471,7 +7971,6 @@ compose_notification() {
     limit_notification_body
 }
 
-
 # ---------------------------------------------------------------------------
 # Atomic persistence
 # ---------------------------------------------------------------------------
@@ -9488,7 +7987,7 @@ persist_current_attrs() {
 
         for key in \
             realloc pending offunc reported_uncorr cmd_timeout realloc_events \
-            udma lcc end2end soft_read_err temp poh life_remain tbw_bytes \
+            udma lcc end2end soft_read_err temp poh vendor_mwi host_write_units_revision tbw_bytes \
             tbw_consumed_pct nvme_percent_used unsafe_shutdowns media_errors \
             err_logs avail_spare pcie_corr pcie_unc therm_t1 therm_t2 \
             warn_temp_time crit_temp_time selftest_status
@@ -9503,7 +8002,6 @@ persist_current_attrs() {
     atomic_commit "$temp_file" "$target"
 }
 
-
 persist_new_seen() {
     local temp_file key state_key
 
@@ -9516,42 +8014,6 @@ persist_new_seen() {
 
     atomic_commit "$temp_file" "$ALERT_NEW_SEEN_FILE"
 }
-
-
-persist_risk_scores() {
-    local temp_file dev score previous delta state_key
-
-    temp_file="$(state_temp_file "$RISK_PREV_FILE")" || return 1
-
-    for dev in "${!SMART_STATE[@]}"; do
-        previous=${PREVIOUS_RISK["$dev"]:-}
-        score="${RISK_MAP[$dev]:-}"
-        if [[ ! "$score" =~ ^[0-9]+$ ]]; then
-            score="$(risk_score_for_device \
-                "$dev" \
-                "${SMART_STATE[$dev]}" \
-                "${SMART_MSGS[$dev]:-}")"
-        fi
-        if [[ -n "${SMART_DEFERRED[$dev]:-}" && "$previous" =~ ^[0-9]+$ ]]; then
-            (( previous > score )) && score="$previous"
-        fi
-
-        if [[ "$previous" =~ ^[0-9]+$ && "$score" =~ ^[0-9]+$ ]]; then
-            delta=$((score - previous))
-            if (( delta != 0 )); then
-                log "RISK" "INFO" \
-                    "Risk score change for $dev: $previous -> $score (delta=$delta)"
-            fi
-        fi
-
-        state_key=$(persistent_device_key "$dev")
-        printf '%s %s\n' "$state_key" "$score" >> "$temp_file" || return 1
-        PREVIOUS_RISK["$dev"]="$score"
-    done
-
-    atomic_commit "$temp_file" "$RISK_PREV_FILE"
-}
-
 
 persist_smart_baselines() {
     local nvme="$RUN_DIR/nvme-baseline" smart="$RUN_DIR/smart-baseline"
@@ -9583,17 +8045,9 @@ persist_all_state() {
         log "STATE" "WARN" \
             "Preserved SMART/NVMe baselines because the SMART collector was incomplete"
     fi
-    save_risk_spikes || { record_collector_event FAILED "Risk spike baseline" "write failed"; failed=1; }
     persist_new_seen || { record_collector_event FAILED "Seen alert baseline" "write failed"; failed=1; }
-    if all_collectors_state_safe; then
-        persist_risk_scores || { record_collector_event FAILED "Risk score baseline" "write failed"; failed=1; }
-    else
-        log "STATE" "WARN" \
-            "Preserved prior risk scores because one or more collectors were incomplete"
-    fi
     return "$failed"
 }
-
 
 # ---------------------------------------------------------------------------
 # Validation and orchestration
@@ -9813,73 +8267,33 @@ validate_model_rule_block() {
     done <<< "$block"
 }
 
-validate_pool_writer_policy() {
-    local raw="${POOL_WRITER_POLICY:-}" entry name warn critical extra
-    local -a entries=()
-    local -A seen=()
-
-    [[ -n "$raw" ]] || return 0
-    IFS=',' read -r -a entries <<< "$raw"
-    for entry in "${entries[@]}"; do
-        trim_external_config_field "$entry"
-        entry="$TRIMMED_EXTERNAL_CONFIG_FIELD"
-        IFS=':' read -r name warn critical extra <<< "$entry"
-        if [[ -n "$extra" || ! "$name" =~ ^[A-Za-z0-9._-]+$ ||
-              ! "$warn" =~ ^[0-9]+([.][0-9]+)?$ ||
-              ! "$critical" =~ ^[0-9]+([.][0-9]+)?$ ]]
-        then
-            configuration_error \
-                "POOL_WRITER_POLICY entry '$entry' must be pool:warning:critical"
-            continue
-        fi
-        if [[ -n "${seen[$name]+present}" ]]; then
-            configuration_error \
-                "POOL_WRITER_POLICY repeats pool '$name'"
-            continue
-        fi
-        seen[$name]=1
-        if ! awk -v warn="$warn" -v critical="$critical" \
-            'BEGIN { exit !(warn > 0 && warn <= critical) }'
-        then
-            configuration_error \
-                "POOL_WRITER_POLICY entry '$entry' requires 0 < warning <= critical"
-        fi
-    done
-}
-
 validate_configuration() {
     CONFIG_ERROR_COUNT=0
     CONFIG_WARNING_COUNT=0
 
     local setting pair excluded_pool
     local -a boolean_settings=(
-        SMART_ALLOW_SPINUP SHORT_TEST_POLL LONG_TEST_INITIAL_FORCE
-        REPLACEMENT_AUTO_RESET
-        ENABLE_BTRFS_SCRUB FIRST_RUN_FORCE ENABLE_BTRFS_DEVICE_STATS
-        ENABLE_XFS_PROC_STATS
-        XFS_PROC_REQUIRE_RATIO_FOR_ALERT
-        XFS_PROC_SUPPRESS_DURING_PARITY
+        SMART_ALLOW_SPINUP  LONG_TEST_INITIAL_FORCE
+
+          ENABLE_BTRFS_DEVICE_STATS
+
         SATA_LINK_INSTABILITY_ENABLED
-        RISK_SCORING_ENABLED
+
         TEMP_RATE_ALERT_ENABLED
         IO_ERROR_MONITOR_ENABLED IO_ERROR_DEDUP_ENABLED LOG_PRUNE_ENABLED
         HISTORY_PRUNE_ENABLED LOG_MIRROR_STDOUT
-        HEAVY_WRITER_ALERTS_ENABLED ARRAY_WRITER_ALERTS_ENABLED
-        POOL_WRITER_ALERTS_ENABLED
+
         WEAR_TREND_ENABLED ENABLE_MODEL_IN_ALERTS
         LOG_FULL_NOTIFICATION_ON_TRUNCATION COLLECTOR_FAILURE_NOTIFICATIONS
         NOTIFICATION_LIFECYCLE_ENABLED NOTIFICATION_DRY_RUN
-        SOAK_TELEMETRY_ENABLED SOAK_REQUIRE_REBOOT SOAK_REQUIRE_STANDBY
-        SOAK_REQUIRE_SYSLOG_ROTATION SOAK_REQUIRE_NOTIFICATION_DELIVERY
-        SOAK_REQUIRE_NOTIFICATION_SUPPRESSION SOAK_REQUIRE_PARITY
+
     )
     local -a integer_settings=(
-        SHORT_TEST_INTERVAL_DAYS SHORT_TEST_MAX_WAIT SHORT_TEST_POLL_INTERVAL
-        LONG_TEST_ACCEL_FACTOR LONG_TEST_MIN_INTERVAL_DAYS LONG_TEST_MAX_INTERVAL_DAYS
-        LONG_TEST_RISK_LOOKBACK_DAYS LONG_TEST_RISK_THRESHOLD
-        LONG_TEST_CRITICAL_MIN_DAYS LONG_TEST_RISK_MIN_DAYS LONG_TEST_NEAR_WINDOW_DAYS
-        REPLACEMENT_POH_DROP_THRESHOLD_HOURS REPLACEMENT_POH_DROP_THRESHOLD_HOURS_HDD
-        REPLACEMENT_POH_DROP_THRESHOLD_HOURS_SSD REPLACEMENT_POH_DROP_THRESHOLD_HOURS_NVME
+        SHORT_TEST_INTERVAL_DAYS
+          LONG_TEST_MAX_INTERVAL_DAYS
+
+        LONG_TEST_CRITICAL_MIN_DAYS  LONG_TEST_NEAR_WINDOW_DAYS
+
         WARN_THRESHOLD_PERCENT CRITICAL_THRESHOLD_PERCENT THRESHOLD NEAR_THRESHOLD_DELTA
         BTRFS_SCRUB_STATE_TTL_DAYS
         IO_ERROR_WINDOW_MINUTES
@@ -9894,18 +8308,15 @@ validate_configuration() {
         HISTORY_MAX_LINES
         RELOC_WARNING RELOC_CRITICAL PEND_WARNING
         SSD_TEMP_WARNING SSD_TEMP_CRITICAL HDD_TEMP_WARNING HDD_TEMP_CRITICAL
-        LOAD_CYCLE_WARN LOAD_CYCLE_CRIT SSD_WEAR_WARN SSD_WEAR_CRIT
+        LOAD_CYCLE_WARN LOAD_CYCLE_CRIT
         REPORTED_UNC_CRIT CMD_TIMEOUT_WARN CMD_TIMEOUT_CRIT CMD_TIMEOUT_DELTA_WARN
         CMD_TIMEOUT_COOLDOWN_DAYS REALLOC_EVENT_WARN REALLOC_EVENT_CRIT
         END_TO_END_ERR_CRIT SOFT_READ_ERR_WARN NVME_TEMP_WARNING NVME_TEMP_CRITICAL
-        NVME_PERCENT_USED_WARN NVME_PERCENT_USED_CRIT WEAR_TREND_WINDOW_DAYS
-        WEAR_TREND_TOP_N WEAR_DAYS_LEFT_WARN WEAR_DAYS_LEFT_CRIT
+        NVME_PERCENT_USED_WARN NVME_PERCENT_USED_CRIT
+
         HEAVY_WRITER_RECENT_DAYS HEAVY_WRITER_MIN_RECENT_SAMPLES
         HEAVY_WRITER_IMPROVEMENT_PCT
-        ARRAY_WRITER_TIER_MODERATE_PCT ARRAY_WRITER_WEEKLY_WARN_PCT
-        ARRAY_WRITER_WEEKLY_CRIT_PCT ARRAY_WRITER_MIN_RECENT_SAMPLES
-        ARRAY_WRITER_BASELINE_INCREASE_PCT
-        WRITER_WEEKLY_WARN_PCT WRITER_WEEKLY_CRIT_PCT WRITER_TIER_MODERATE_PCT
+
         UNSAFE_SDWN_DELTA_WARN UNSAFE_SDWN_ABSOLUTE_MIN UNSAFE_SDWN_COOLDOWN_DAYS
         NVME_AVAIL_SPARE_WARN NVME_ERR_LOG_DELTA_WARN NVME_ERR_LOG_DELTA_CRIT
         NVME_PCIE_CORR_DELTA_WARN NVME_PCIE_CORR_DELTA_CRIT
@@ -9915,18 +8326,12 @@ validate_configuration() {
         BTRFS_DEV_ERR_WARN_DELTA BTRFS_DEV_ERR_CRIT_DELTA
         BTRFS_DEV_CORR_WARN_DELTA BTRFS_DEV_CORR_CRIT_DELTA
         BTRFS_ERR_BURST_WARN_RATIO BTRFS_ERR_BURST_CRIT_RATIO
-        XFS_PROC_WARN_DELTA XFS_PROC_CRIT_DELTA XFS_ERR_BURST_WARN_RATIO
-        XFS_ERR_BURST_CRIT_RATIO BURST_WARN_BOOST BURST_CRIT_BOOST
-        HDD_POH_WARN_HOURS HDD_POH_CRIT_HOURS SSD_POH_WARN_HOURS SSD_POH_CRIT_HOURS
-        NVME_POH_WARN_HOURS NVME_POH_CRIT_HOURS TBW_DAYS_WARN TBW_DAYS_CRIT
-        TBW_WARN_TB TBW_CONSUMED_WARN TBW_CONSUMED_CRIT
-        W_SEV_CRIT W_SEV_WARN W_PENDING W_UNCORR W_REALLOC W_REALLOC_EVENTS
-        W_CMD_TIMEOUT W_CRC W_SSD_LIFE W_NVME_WEAR W_NVME_ERR_LOG
-        W_NVME_PCIE_CORR W_NVME_PCIE_UNC W_NVME_THERM_TRANS W_NVME_TEMP_TIME
-        W_TEMP W_E2E W_SOFT_READ W_NVME_RO W_NVME_REL W_AGE_NEAR
-        W_POH_HDD W_POH_SSD W_POH_NVME W_BTRFS_DEV_ERR W_XFS_META_ERR
-        W_SATA_LINK_DOWN W_SELFTEST_CRIT W_SELFTEST_WARN W_TBW_CONS_WARN
-        W_TBW_CONS_CRIT NOTIFY_MAX_BODY_CHARS NOTIFY_MAX_BODY_LINES
+
+         BURST_WARN_BOOST BURST_CRIT_BOOST
+
+         TBW_CONSUMED_WARN TBW_CONSUMED_CRIT
+
+         NOTIFY_MAX_BODY_CHARS NOTIFY_MAX_BODY_LINES
         SMARTCTL_TIMEOUT_SECONDS BTRFS_COMMAND_TIMEOUT_SECONDS
         SYSTEM_COMMAND_TIMEOUT_SECONDS
         NOTIFICATION_TIMEOUT_SECONDS
@@ -9935,41 +8340,38 @@ validate_configuration() {
         NOTIFICATION_OK_REMINDER_HOURS NOTIFICATION_RECOVERY_CONFIRM_RUNS
         NOTIFICATION_MAX_ATTEMPTS
         NOTIFICATION_RETRY_INITIAL_DELAY_SECONDS NOTIFICATION_RETRY_MAX_DELAY_SECONDS
-        SOAK_MIN_RUNS SOAK_MIN_DAYS SOAK_RETENTION_DAYS SOAK_MAX_RECORDS
+
     )
     local -a number_settings=(
         FORECAST_MIN_SPAN_DAYS FORECAST_HIGH_SPAN_DAYS FORECAST_STALE_AFTER_DAYS
         TEMP_RATE_WARN_C_PER_DAY TEMP_RATE_MIN_SPAN_DAYS
-        WEAR_STABLE_MIN_RATE
-        ARRAY_WRITER_MIN_DAILY_GB
+
     )
     local -a percent_settings=(
         WARN_THRESHOLD_PERCENT CRITICAL_THRESHOLD_PERCENT THRESHOLD NEAR_THRESHOLD_DELTA
-        LONG_TEST_RISK_THRESHOLD
-        SSD_WEAR_WARN SSD_WEAR_CRIT NVME_PERCENT_USED_WARN NVME_PERCENT_USED_CRIT
+
+          NVME_PERCENT_USED_WARN NVME_PERCENT_USED_CRIT
         NVME_AVAIL_SPARE_WARN TBW_CONSUMED_WARN TBW_CONSUMED_CRIT
         HEAVY_WRITER_IMPROVEMENT_PCT
-        ARRAY_WRITER_BASELINE_INCREASE_PCT
+
     )
     local -a positive_integer_settings=(
-        LONG_TEST_ACCEL_FACTOR IO_ERROR_WINDOW_MINUTES
+         IO_ERROR_WINDOW_MINUTES
         SYSLOG_CURSOR_STARTUP_LOOKBACK_LINES SYSLOG_CURSOR_ROTATION_LOOKBACK_LINES
         HISTORY_WINDOW_DAYS HISTORY_SCHEMA_VERSION FORECAST_MIN_SAMPLES
         FORECAST_HIGH_SAMPLES FORECAST_MAX_GAP_DAYS
         HEAVY_WRITER_RECENT_DAYS HEAVY_WRITER_MIN_RECENT_SAMPLES
-        ARRAY_WRITER_TIER_MODERATE_PCT ARRAY_WRITER_WEEKLY_WARN_PCT
-        ARRAY_WRITER_WEEKLY_CRIT_PCT ARRAY_WRITER_MIN_RECENT_SAMPLES
-        WRITER_WEEKLY_WARN_PCT WRITER_WEEKLY_CRIT_PCT WRITER_TIER_MODERATE_PCT
+
         NOTIFY_MAX_BODY_CHARS NOTIFY_MAX_BODY_LINES
         SMARTCTL_TIMEOUT_SECONDS BTRFS_COMMAND_TIMEOUT_SECONDS
         SYSTEM_COMMAND_TIMEOUT_SECONDS
         NOTIFICATION_TIMEOUT_SECONDS COMMAND_KILL_GRACE_SECONDS
         NOTIFICATION_MAX_ATTEMPTS
         NOTIFICATION_RECOVERY_CONFIRM_RUNS
-        SOAK_MIN_RUNS SOAK_RETENTION_DAYS SOAK_MAX_RECORDS
+
     )
     local -a ordered_pairs=(
-        LONG_TEST_MIN_INTERVAL_DAYS:LONG_TEST_MAX_INTERVAL_DAYS
+
         WARN_THRESHOLD_PERCENT:CRITICAL_THRESHOLD_PERCENT
         IO_ERROR_WARN_THRESHOLD:IO_ERROR_CRIT_THRESHOLD
         PARITY_SYNC_ERR_WARN:PARITY_SYNC_ERR_CRIT
@@ -9979,24 +8381,19 @@ validate_configuration() {
         RELOC_WARNING:RELOC_CRITICAL CMD_TIMEOUT_WARN:CMD_TIMEOUT_CRIT
         REALLOC_EVENT_WARN:REALLOC_EVENT_CRIT SSD_TEMP_WARNING:SSD_TEMP_CRITICAL
         HDD_TEMP_WARNING:HDD_TEMP_CRITICAL LOAD_CYCLE_WARN:LOAD_CYCLE_CRIT
-        SSD_WEAR_CRIT:SSD_WEAR_WARN NVME_TEMP_WARNING:NVME_TEMP_CRITICAL
+         NVME_TEMP_WARNING:NVME_TEMP_CRITICAL
         NVME_PERCENT_USED_WARN:NVME_PERCENT_USED_CRIT
-        WEAR_DAYS_LEFT_CRIT:WEAR_DAYS_LEFT_WARN
-        ARRAY_WRITER_TIER_MODERATE_PCT:ARRAY_WRITER_WEEKLY_WARN_PCT
-        ARRAY_WRITER_WEEKLY_WARN_PCT:ARRAY_WRITER_WEEKLY_CRIT_PCT
-        WRITER_TIER_MODERATE_PCT:WRITER_WEEKLY_WARN_PCT
-        WRITER_WEEKLY_WARN_PCT:WRITER_WEEKLY_CRIT_PCT
+
         NVME_ERR_LOG_DELTA_WARN:NVME_ERR_LOG_DELTA_CRIT
         NVME_PCIE_CORR_DELTA_WARN:NVME_PCIE_CORR_DELTA_CRIT
         NVME_PCIE_UNC_DELTA_WARN:NVME_PCIE_UNC_DELTA_CRIT
         BTRFS_DEV_ERR_WARN_DELTA:BTRFS_DEV_ERR_CRIT_DELTA
         BTRFS_DEV_CORR_WARN_DELTA:BTRFS_DEV_CORR_CRIT_DELTA
         BTRFS_ERR_BURST_WARN_RATIO:BTRFS_ERR_BURST_CRIT_RATIO
-        XFS_PROC_WARN_DELTA:XFS_PROC_CRIT_DELTA
-        XFS_ERR_BURST_WARN_RATIO:XFS_ERR_BURST_CRIT_RATIO
-        BURST_WARN_BOOST:BURST_CRIT_BOOST HDD_POH_WARN_HOURS:HDD_POH_CRIT_HOURS
-        SSD_POH_WARN_HOURS:SSD_POH_CRIT_HOURS NVME_POH_WARN_HOURS:NVME_POH_CRIT_HOURS
-        TBW_DAYS_CRIT:TBW_DAYS_WARN TBW_CONSUMED_WARN:TBW_CONSUMED_CRIT
+
+        BURST_WARN_BOOST:BURST_CRIT_BOOST
+
+        TBW_CONSUMED_WARN:TBW_CONSUMED_CRIT
         NOTIFICATION_RETRY_INITIAL_DELAY_SECONDS:NOTIFICATION_RETRY_MAX_DELAY_SECONDS
     )
 
@@ -10014,8 +8411,6 @@ validate_configuration() {
     for setting in "${number_settings[@]}"; do
         validate_nonnegative_number_setting "$setting"
     done
-    validate_positive_number_setting DEFAULT_SSD_ENDURANCE_PER_TB
-    validate_positive_number_setting ARRAY_WRITER_MIN_DAILY_GB
     for setting in "${percent_settings[@]}"; do
         validate_percent_setting "$setting"
     done
@@ -10033,12 +8428,6 @@ validate_configuration() {
 
     [[ -z "${LONG_TEST_DECISION:-}" ]] ||
         configuration_error "LONG_TEST_DECISION is runtime state and must start empty"
-    for setting in XFS_PROC_KEYS XFS_PROC_KEYS_EXCLUDE; do
-        if [[ "$(configuration_value "$setting" 2>/dev/null || true)" =~ [^A-Za-z0-9_[:space:]-] ]]; then
-            configuration_error \
-                "$setting may contain only XFS key names separated by whitespace"
-        fi
-    done
 
     if [[ "${HISTORY_SCHEMA_VERSION:-}" =~ ^[0-9]+$ ]] &&
        (( HISTORY_SCHEMA_VERSION != 3 ))
@@ -10062,13 +8451,6 @@ validate_configuration() {
         configuration_error \
             "HEAVY_WRITER_MIN_RECENT_SAMPLES exceeds the expected daily samples in its window"
     fi
-    if [[ "${ARRAY_WRITER_MIN_RECENT_SAMPLES:-}" =~ ^[0-9]+$ &&
-          "${HEAVY_WRITER_RECENT_DAYS:-}" =~ ^[0-9]+$ ]] &&
-       (( ARRAY_WRITER_MIN_RECENT_SAMPLES > HEAVY_WRITER_RECENT_DAYS + 1 ))
-    then
-        configuration_error \
-            "ARRAY_WRITER_MIN_RECENT_SAMPLES exceeds the expected daily samples in its window"
-    fi
     if [[ "${NOTIFY_MAX_BODY_CHARS:-}" =~ ^[0-9]+$ ]] &&
        (( NOTIFY_MAX_BODY_CHARS < 512 ))
     then
@@ -10078,26 +8460,6 @@ validate_configuration() {
        (( NOTIFY_MAX_BODY_LINES < 20 ))
     then
         configuration_error "NOTIFY_MAX_BODY_LINES must be at least 20"
-    fi
-    if [[ "${SHORT_TEST_POLL:-}" == "1" ]]; then
-        [[ "${SHORT_TEST_MAX_WAIT:-}" =~ ^[1-9][0-9]*$ ]] ||
-            configuration_error "SHORT_TEST_MAX_WAIT must be positive when SHORT_TEST_POLL=1"
-        [[ "${SHORT_TEST_POLL_INTERVAL:-}" =~ ^[1-9][0-9]*$ ]] ||
-            configuration_error "SHORT_TEST_POLL_INTERVAL must be positive when SHORT_TEST_POLL=1"
-    fi
-    if [[ "${SOAK_MIN_RUNS:-}" =~ ^[0-9]+$ &&
-          "${SOAK_MAX_RECORDS:-}" =~ ^[0-9]+$ ]] &&
-       (( SOAK_MIN_RUNS > SOAK_MAX_RECORDS ))
-    then
-        configuration_error \
-            "SOAK_MIN_RUNS must not exceed SOAK_MAX_RECORDS"
-    fi
-    if [[ "${SOAK_MIN_DAYS:-}" =~ ^[0-9]+$ &&
-          "${SOAK_RETENTION_DAYS:-}" =~ ^[0-9]+$ ]] &&
-       (( SOAK_MIN_DAYS > SOAK_RETENTION_DAYS ))
-    then
-        configuration_error \
-            "SOAK_MIN_DAYS must not exceed SOAK_RETENTION_DAYS"
     fi
 
     if ! declare -p POOL_EXCLUDES 2>/dev/null | grep -q '^declare -a'; then
@@ -10112,9 +8474,6 @@ validate_configuration() {
     fi
 
     validate_model_rule_block TBW_MODEL_RULES tbw
-    validate_model_rule_block POH_MODEL_RULES poh
-    validate_model_rule_block QUIRK_MWI_RULES quirk
-    validate_pool_writer_policy
 
     if [[ "${ENABLE_BTRFS_SCRUB:-}" == "0" && "${FIRST_RUN_FORCE:-}" == "1" ]]; then
         configuration_warning \
@@ -10245,7 +8604,6 @@ Usage:
   health_monitoring.sh --rollback-state BACKUP_ID
                                        Restore one explicit state backup and exit
   health_monitoring.sh --diagnostics   Run read-only environment diagnostics
-  health_monitoring.sh --soak-status   Show Phase 15 soak progress and readiness
   health_monitoring.sh --self-test     Run tests/health_monitoring_test.sh from a full checkout
   health_monitoring.sh --test-notification
                                        Send one notification without monitoring or state changes
@@ -10254,7 +8612,7 @@ Usage:
   health_monitoring.sh --version       Print the script version
   health_monitoring.sh --help          Show this help
 
-The configuration, state-status, state-backups, diagnostics, soak-status, and self-test
+The configuration, state-status, state-backups, diagnostics and self-test
 modes do not run SMART commands against disks, start tests or scrubs, write monitoring state,
 advance the syslog cursor, send notifications, or spin up disks. The explicit
 notification test sends only its fixed test message. Notification dry-run is a
@@ -10297,10 +8655,6 @@ parse_arguments() {
         --diagnostics)
             (( $# == 1 )) || return 2
             RUN_MODE="diagnostics"
-            ;;
-        --soak-status)
-            (( $# == 1 )) || return 2
-            RUN_MODE="soak-status"
             ;;
         --self-test)
             (( $# == 1 )) || return 2
@@ -10376,25 +8730,6 @@ run_diagnostics() {
     diagnostic_result INFO "Command deadlines" \
         "SMART=${SMARTCTL_TIMEOUT_SECONDS}s Btrfs=${BTRFS_COMMAND_TIMEOUT_SECONDS}s System=${SYSTEM_COMMAND_TIMEOUT_SECONDS}s Notify=${NOTIFICATION_TIMEOUT_SECONDS}s"
     diagnostic_result INFO "Regression fixtures" "run tests/health_monitoring_test.sh from the repository"
-
-    if analyze_soak_history; then
-        case "$SOAK_ANALYSIS_STATUS" in
-            READY)
-                diagnostic_result PASS "Phase 15 soak" \
-                    "$SOAK_ANALYSIS_VALID_RUNS run(s), ${SOAK_ANALYSIS_SPAN_DAYS}d; ready"
-                ;;
-            ATTENTION)
-                warnings=$((warnings + 1))
-                diagnostic_result WARN "Phase 15 soak" "$SOAK_ANALYSIS_DETAIL"
-                ;;
-            *)
-                diagnostic_result INFO "Phase 15 soak" "$SOAK_ANALYSIS_DETAIL"
-                ;;
-        esac
-    else
-        failures=$((failures + 1))
-        diagnostic_result FAIL "Phase 15 soak" "$SOAK_ANALYSIS_DETAIL"
-    fi
 
     if inspect_state_schema_manifest; then
         diagnostic_result PASS "State schema" "$STATE_SCHEMA_DETAIL"
@@ -10554,8 +8889,7 @@ collect_capacity_phase() {
 
 # shellcheck disable=SC2329
 collect_endurance_phase() {
-    collector_step "TBW forecast" tbw_forecast_and_heavy_writers
-    record_endurance_forecasts
+    collector_step "Host-write rates" collect_write_rates
     collector_step "Counter regression detection" detect_counter_resets
     return 0
 }
@@ -10583,7 +8917,6 @@ run_notification_test() {
         return "$rc"
     fi
 }
-
 
 main() {
     local exit_code previous_complete
@@ -10628,11 +8961,6 @@ main() {
             ;;
         diagnostics)
             run_diagnostics
-            return $?
-            ;;
-        soak-status)
-            validate_configuration || return 1
-            print_soak_status
             return $?
             ;;
         self-test)
@@ -10699,23 +9027,17 @@ main() {
     log "BTRFS" "INFO" "Collecting non-destructive device statistics"
     run_collector btrfs_devices "Btrfs device counters" collector_step "Btrfs device counters" collect_btrfs_device_stats
 
-    log "XFS" "INFO" "Collecting XFS activity counters"
-    run_collector xfs_counters "XFS activity counters" collector_step "XFS activity counters" collect_xfs_proc_stats
-
-    log "IO" "INFO" "Scanning syslog once for disk I/O errors"
+    log "IO" "INFO" "Checking syslog-watchdog freshness and storage-error fallback"
     run_collector syslog_io "Syslog I/O scan" collector_step "Syslog I/O scan" scan_syslog_disk_errors
 
-
-    log "ENDURANCE" "INFO" "Updating TBW and heavy-writer forecasts"
-    run_collector endurance "Endurance forecasts" collect_endurance_phase
+    log "ENDURANCE" "INFO" "Updating measured host-write history and rates"
+    run_collector endurance "Host-write history" collect_endurance_phase
 
     # Trend analysis can raise findings, so it must complete before canonical
-    # risk, lifecycle classification, and alert rendering.
+    # lifecycle classification, and alert rendering.
     log "TREND" "INFO" "Compiling trend analytics"
     run_collector trends "Trend analytics" collector_step "Trend analytics" build_trend_section
 
-    log "RISK" "INFO" "Computing per-device risk scores"
-    run_collector risk "Risk scores" collector_step "Risk scores" compute_risk_scores
     run_collector state "Essential state" persist_all_state
     finalize_finding_counts
 
@@ -10754,7 +9076,6 @@ main() {
     fi
     return "$exit_code"
 }
-
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     if harden_existing_external_config_path; then
