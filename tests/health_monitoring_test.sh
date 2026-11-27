@@ -7,7 +7,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../user_script/health_monitoring.sh
 source "$REPO_ROOT/user_script/health_monitoring.sh"
 
-readonly REGRESSION_FIXTURE_COUNT=103
+readonly REGRESSION_FIXTURE_COUNT=118
 
 self_test_result() {
     local passed="$1" name="$2" detail="${3:-}"
@@ -1812,6 +1812,194 @@ run_regression_tests() (
         evaluate_smart "$disk" && [[ "${SMART_STATE[$disk]}" == CRITICAL && "${SMART_MSGS[$disk]}" == *'overall health FAILED'* ]]
     ); then self_test_result 1 "Historic CRC and ambiguous wear stay informational; CRC growth, pending sectors and native SMART failure remain actionable"
     else self_test_result 0 "Historic CRC and ambiguous wear stay informational; CRC growth, pending sectors and native SMART failure remain actionable"; fi
+
+    if (
+        [[ "$(selftest_current_operation /dev/nvme0n1 '' 'Self-test status: No self-test in progress')" == idle &&
+           "$(selftest_current_operation /dev/nvme0n1 '' 'Self-test status: Short self-test in progress (10% completed)')" == short &&
+           "$(selftest_current_operation /dev/nvme0n1 '' 'Self-test status: Extended self-test in progress (10% completed)')" == long &&
+           "$(selftest_current_operation /dev/nvme0n1 '' 'garbled response')" == unknown &&
+           "$(selftest_current_operation /dev/sdz 'Self-test execution status: ( 249) Self-test routine in progress...' '')" == running &&
+           "$(selftest_current_operation /dev/sdz 'Self-test execution status: ( 0) The previous self-test routine completed' '')" == idle ]]
+    ); then self_test_result 1 "Explicit current-operation parsing separates idle, running and unknown status"
+    else self_test_result 0 "Explicit current-operation parsing separates idle, running and unknown status"; fi
+
+    if (
+        local disk=/dev/sdz RUN_EPOCH=1795750200 id=fixture_calendar
+        DEVICE_ID_BY_PATH[$disk]="$id"
+        TEST_TRACK=()
+        LAST_TEST_EPOCH[$disk]="$RUN_EPOCH"
+        ensure_test_tracking_device "$disk" &&
+        [[ "$(test_track_get "$id" longObserved)" == 0 ]] &&
+        ! calendar_test_due "$disk" long 120 &&
+        RUN_EPOCH=$((RUN_EPOCH+8*86400)) && calendar_test_due "$disk" long 120
+    ); then self_test_result 1 "Long baseline adoption has bounded grace and never fabricates success"
+    else self_test_result 0 "Long baseline adoption has bounded grace and never fabricates success"; fi
+
+    if (
+        local disk=/dev/sdz RUN_EPOCH id=fixture_calendar
+        RUN_EPOCH=$(date -d 'today 06:30' +%s)
+        DEVICE_ID_BY_PATH[$disk]="$id"
+        TEST_TRACK=()
+        TEST_TRACK["$id|shortAnchor"]=$(date -d '7 days ago 06:32' +%s)
+        calendar_test_due "$disk" short 7
+    ); then self_test_result 1 "Successful-result calendar scheduling tolerates daily run jitter"
+    else self_test_result 0 "Successful-result calendar scheduling tolerates daily run jitter"; fi
+
+    if (
+        local disk=/dev/nvme9n1 id=fixture_observation RUN_EPOCH=1795750200
+        local first=$'Self-test status: No self-test in progress\n 0 Short Completed without error 100 - - - - -'
+        local second=${first/100/110}
+        DEVICE_ID_BY_PATH[$disk]="$id"
+        TEST_TRACK=(); SMART_OPERATION[$disk]=idle
+        ensure_test_tracking_device "$disk"
+        observe_test_results "$disk" "$first" 120 && [[ "$(test_track_get "$id" shortObserved)" == 0 ]] || exit 1
+        observe_test_results "$disk" "$second" 120 && [[ "$(test_track_get "$id" shortObserved)" == "$RUN_EPOCH" ]]
+    ); then self_test_result 1 "Historical log adoption is not fresh success; a changed native success is"
+    else self_test_result 0 "Historical log adoption is not fresh success; a changed native success is"; fi
+
+    if (
+        local disk=/dev/nvme9n1 id=fixture_pending RUN_EPOCH=1795750200
+        local history=$'Self-test status: No self-test in progress\n 0 Extended Completed without error 110 - - - - -'
+        DEVICE_ID_BY_PATH[$disk]="$id"; TEST_TRACK=(); SMART_OPERATION[$disk]=idle
+        TEST_TRACK["$id|pending"]=1; TEST_TRACK["$id|startEpoch"]=$((RUN_EPOCH-86400))
+        TEST_TRACK["$id|startPOH"]=105; TEST_TRACK["$id|startKind"]=long; TEST_TRACK["$id|startToken"]=none
+        observe_test_results "$disk" "$history" 120 &&
+        [[ "$(test_track_get "$id" pending)" == 0 && "$(test_track_get "$id" longObserved)" == "$RUN_EPOCH" ]]
+    ); then self_test_result 1 "Pending long start reconciles only with a matching newer successful result"
+    else self_test_result 0 "Pending long start reconciles only with a matching newer successful result"; fi
+
+    if (
+        local disk=/dev/nvme9n1 id=fixture_failure RUN_EPOCH=1795750200
+        local history=$'Self-test status: No self-test in progress\n 0 Extended Aborted: Controller Reset 110 - - - - -'
+        DEVICE_ID_BY_PATH[$disk]="$id"; TEST_TRACK=(); SMART_OPERATION[$disk]=idle
+        TEST_TRACK["$id|pending"]=1; TEST_TRACK["$id|startEpoch"]=$((RUN_EPOCH-86400))
+        TEST_TRACK["$id|startPOH"]=105; TEST_TRACK["$id|startKind"]=long; TEST_TRACK["$id|startToken"]=none
+        observe_test_results "$disk" "$history" 120 &&
+        [[ "$(test_track_get "$id" pending)" == 0 && "$(test_track_get "$id" longObserved)" == 0 ]]
+    ); then self_test_result 1 "An aborted test never advances successful coverage"
+    else self_test_result 0 "An aborted test never advances successful coverage"; fi
+
+    if (
+        local disk=/dev/nvme9n1 id=fixture_unverified RUN_EPOCH=1795750200 emitted=''
+        DEVICE_ID_BY_PATH[$disk]="$id"; TEST_TRACK=(); SMART_OPERATION[$disk]=idle
+        TEST_TRACK["$id|pending"]=1; TEST_TRACK["$id|startEpoch"]=$((RUN_EPOCH-4*86400))
+        TEST_TRACK["$id|startKind"]=short; TEST_TRACK["$id|startPOH"]=105
+        record_finding() { emitted="$*"; }
+        observe_test_results "$disk" 'Self-test status: No self-test in progress' 120 &&
+        [[ "$(test_track_get "$id" pending)" == 0 && "$(test_track_get "$id" unverified)" == 1 && "$emitted" == *'result overdue'* ]] || exit 1
+        emitted=''
+        observe_test_results "$disk" 'Self-test status: No self-test in progress' 120 && [[ "$emitted" == *'result overdue'* ]]
+    ); then self_test_result 1 "Missing completion stays unverified across retries instead of falsely recovering"
+    else self_test_result 0 "Missing completion stays unverified across retries instead of falsely recovering"; fi
+
+    if (
+        local STATE_DIR="$fixture_dir/tracker" RUN_DIR="$fixture_dir/tracker/run" RUN_EPOCH=1795750200
+        local SMART_TEST_TRACKING_FILE="$STATE_DIR/tracking.json"
+        mkdir -m 700 "$STATE_DIR" "$RUN_DIR"
+        TEST_TRACK=([fixture_id\|firstSeen]=1795750200 [fixture_id\|shortToken]=none)
+        SMART_TEST_TRACKING_READY=1
+        persist_test_tracking && TEST_TRACK=() && load_test_tracking && [[ "$(test_track_get fixture_id firstSeen)" == 1795750200 ]] || exit 1
+        printf '{"schema":99,"devices":{}}' > "$SMART_TEST_TRACKING_FILE"
+        ! load_test_tracking
+    ); then self_test_result 1 "Atomic calendar receipts round-trip; future schemas withhold maintenance"
+    else self_test_result 0 "Atomic calendar receipts round-trip; future schemas withhold maintenance"; fi
+
+    if (
+        local RUN_EPOCH=1795750200 SMART_FLEET_TEST_RUNNING=0 SMART_FLEET_STATUS_UNKNOWN=0
+        local wakes=0 disk=/dev/sdy other=/dev/sdz
+        DEVICE_ID_BY_PATH[$disk]=wake_a; DEVICE_ID_BY_PATH[$other]=wake_b
+        TEST_TRACK=([wake_a\|shortAnchor]=$((RUN_EPOCH-40*86400)) [wake_b\|shortAnchor]=$((RUN_EPOCH-39*86400)))
+        SATA_POWER_STATE=([$disk]=standby [$other]=standby)
+        maintenance_window_open() { return 0; }; smart_test_start_allowed() { return 0; }
+        lsblk_rota_cached() { printf 1; }
+        run_bounded_checked() { wakes=$((wakes+1)); return 0; }
+        refresh_sata_power_state() { SATA_POWER_STATE[$1]=active; }
+        select_overdue_wake "$disk" "$other"
+        [[ "$wakes" == 1 && "$SMART_WAKE_SELECTED" == "$disk" && "${SATA_POWER_STATE[$other]}" == standby ]]
+    ); then self_test_result 1 "Controlled overdue maintenance wakes at most one oldest eligible sleeping disk"
+    else self_test_result 0 "Controlled overdue maintenance wakes at most one oldest eligible sleeping disk"; fi
+
+    if (
+        local RUN_EPOCH=1795750200 SMART_FLEET_TEST_RUNNING=1 wakes=0
+        maintenance_window_open() { return 0; }
+        run_bounded_checked() { wakes=$((wakes+1)); }
+        select_overdue_wake /dev/sdz && [[ "$wakes" == 0 ]]
+    ); then self_test_result 1 "Existing self-tests prevent overdue wake work"
+    else self_test_result 0 "Existing self-tests prevent overdue wake work"; fi
+
+    if (
+        local RUN_EPOCH=1795750200 DOCKER_SCRUB_TRACKING_FILE="$fixture_dir/docker-scrub.json"
+        local dispatched='' journalled=false SMART_FLEET_TEST_RUNNING=0 SMART_FLEET_STATUS_UNKNOWN=0
+        findmnt() { case "$*" in *FSTYPE*) printf btrfs;; *UUID*) printf '11111111-2222-3333-4444-555555555555';; esac; }
+        date() { case "$*" in +%Y-%m) printf 2026-11;; +%d) printf 27;; *) command date "$@";; esac; }
+        btrfs_bounded_optional() {
+            if [[ "$*" == 'scrub status /var/lib/docker' ]]; then printf 'no stats available\n'; return 1; fi
+            dispatched="$*"; [[ "$journalled" == true ]] || return 1
+        }
+        maintenance_window_open() { return 0; }; smart_test_start_allowed() { return 0; }
+        atomic_write_text() { printf '%s' "$2" > "$1"; journalled=true; }
+        maintain_docker_scrub && [[ "$dispatched" == 'scrub start -r /var/lib/docker' && "$DOCKER_SCRUB_STARTED" == 1 ]] &&
+        jq -e '.pending and .requests==1' "$DOCKER_SCRUB_TRACKING_FILE" >/dev/null
+    ); then self_test_result 1 "Docker scrub is read-only and journaled before dispatch"
+    else self_test_result 0 "Docker scrub is read-only and journaled before dispatch"; fi
+
+    if (
+        local RUN_EPOCH=1795750200 DOCKER_SCRUB_TRACKING_FILE="$fixture_dir/docker-verified.json" dispatched=0
+        printf '{"schema":1,"uuid":"11111111-2222-3333-4444-555555555555","pending":false,"requests":1,"requestedEpoch":0,"requestMonth":"2026-11","lastSuccessEpoch":1795740000}' > "$DOCKER_SCRUB_TRACKING_FILE"
+        findmnt() { case "$*" in *FSTYPE*) printf btrfs;; *UUID*) printf '11111111-2222-3333-4444-555555555555';; esac; }
+        btrfs_bounded_optional() { if [[ "$2" == status ]]; then printf 'no stats available\n'; return 1; fi; dispatched=$((dispatched+1)); }
+        maintain_docker_scrub && [[ "$dispatched" == 0 ]]
+    ); then self_test_result 1 "Reboot-cleared native scrub status does not repeat a verified monthly scrub"
+    else self_test_result 0 "Reboot-cleared native scrub status does not repeat a verified monthly scrub"; fi
+
+    if (
+        local DOCKER_SCRUB_TRACKING_FILE="$fixture_dir/docker-retry-cap.json" RUN_EPOCH=1795750200 dispatched=0
+        printf '{"schema":1,"uuid":"11111111-2222-3333-4444-555555555555","pending":true,"requests":3,"requestedEpoch":1795400000,"requestMonth":"2026-11","lastSuccessEpoch":0}' > "$DOCKER_SCRUB_TRACKING_FILE"
+        findmnt() { case "$*" in *FSTYPE*) printf btrfs;; *UUID*) printf '11111111-2222-3333-4444-555555555555';; esac; }
+        btrfs_bounded_optional() { if [[ "$2" == status ]]; then printf 'no stats available\n'; return 1; fi; dispatched=$((dispatched+1)); }
+        record_finding() { :; }
+        maintain_docker_scrub && [[ "$dispatched" == 0 ]]
+    ); then self_test_result 1 "Monthly scrub retries remain capped after interrupted requests"
+    else self_test_result 0 "Monthly scrub retries remain capped after interrupted requests"; fi
+
+    if (
+        local disk=/dev/nvme9n1 id=fixture_start RUN_EPOCH=1795750200
+        local STATE_DIR="$fixture_dir/start-journal" RUN_DIR="$fixture_dir/start-journal/run"
+        local SMART_TEST_TRACKING_FILE="$STATE_DIR/tracking.json" trace="$STATE_DIR/dispatch"
+        mkdir -m 700 "$STATE_DIR" "$RUN_DIR"
+        DEVICE_ID_BY_PATH[$disk]="$id"; TEST_TRACK=(); SMART_TEST_TRACKING_READY=1
+        SMART_OPERATION[$disk]=idle
+        LAST_TEST_EPOCH[$disk]=$((RUN_EPOCH-8*86400))
+        ensure_test_tracking_device "$disk"
+        smartctl_bounded() {
+            case "$*" in
+                '-t short -d nvme /dev/nvme9n1')
+                    jq -e '.devices.fixture_start|.pending=="1" and .startKind=="short" and .startPOH=="120"' "$SMART_TEST_TRACKING_FILE" >/dev/null || return 2
+                    printf accepted > "$trace"; printf 'Self-test has begun\n' ;;
+                *) printf 'Self-test status: No self-test in progress\n 0 Short Completed without error 100 - - - - -\n' ;;
+            esac
+        }
+        smartctl_cached() { printf 'Power On Hours: 120\n'; }
+        nvme_smart_output_is_complete() { return 0; }
+        collector_device_has_blocking_event() { return 1; }
+        evaluate_smart() { SMART_STATE[$1]=OK; SMART_MSGS[$1]=''; }
+        smart_test_start_allowed() { return 0; }
+        save_selftest_snapshot() { :; }; invalidate_smart_cache() { :; }
+        run_smart_test "$disk" && [[ "$(cat "$trace")" == accepted && "$(test_track_get "$id" pending)" == 1 && "$(test_track_get "$id" shortObserved)" == 0 ]]
+    ); then self_test_result 1 "Actual test dispatch requires a durable pre-start journal and never immediately claims success"
+    else self_test_result 0 "Actual test dispatch requires a durable pre-start journal and never immediately claims success"; fi
+
+    if (
+        local disk=/dev/nvme9n1 id=fixture_unrelated RUN_EPOCH=1795750200
+        DEVICE_ID_BY_PATH[$disk]="$id"; SMART_OPERATION[$disk]=idle; TEST_TRACK=()
+        TEST_TRACK["$id|unverified"]=1; TEST_TRACK["$id|unverifiedKind"]=long
+        TEST_TRACK["$id|unverifiedSince"]=$((RUN_EPOCH-86400))
+        TEST_TRACK["$id|shortToken"]=$(printf 'short|Completed without error|100' | sha256sum | cut -d' ' -f1)
+        record_finding() { :; }
+        observe_test_results "$disk" $'Self-test status: No self-test in progress\n 0 Short Completed without error 110 - - - - -' 120 &&
+        [[ "$(test_track_get "$id" shortObserved)" == "$RUN_EPOCH" && "$(test_track_get "$id" unverified)" == 1 ]]
+    ); then self_test_result 1 "Unrelated short success cannot clear an unverified long test"
+    else self_test_result 0 "Unrelated short success cannot clear an unverified long test"; fi
 
     if (( SELF_TEST_TOTAL != REGRESSION_FIXTURE_COUNT )); then
         SELF_TEST_FAILED=$((SELF_TEST_FAILED + 1))
