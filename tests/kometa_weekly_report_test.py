@@ -65,3 +65,12 @@ with tempfile.TemporaryDirectory() as temp:
     assert not report(due+60,start['state'],empty)['send'],'Empty all-clear email'
     assert 'Coverage is partial' in report(due+60,start['state'],partial=True)['body']
     print('Weekly initialization, actionable details, timezone deadline, quiet-empty runs, partial coverage and once-weekly rendering passed')
+
+    maintenance={**empty,'issues':{'backup-only':{'id':'backup-only','message':'Config Error: No libraries were found in config','severity':'FATAL','context':{},'firstSeen':due-90,'lastSeen':due-80,'affectedRuns':[due-90],'maintenanceProofs':[{'status':'maintenance-blocked','nativeResult':'failed','successNotClaimed':True,'stoppedAt':due-100,'startedAt':due-90,'finishedAt':due-80,'restartedAt':due-70}]}}}
+    history=report(due+60,start['state'],maintenance)
+    assert history['actionable']==0 and 'MAINTENANCE-BLOCKED' in history['body'] and 'no YAML change is indicated' in history['body']
+    recorded={**history['state'],'nextDue':due+100}
+    assert not report(due+120,recorded,maintenance)['send'],'Maintenance-only history churned another report'
+    mixed=copy.deepcopy(maintenance);mixed['issues']['backup-only']['affectedRuns'].append(due-200)
+    assert report(due+60,start['state'],mixed)['actionable']==1,'Unproven earlier failure was hidden'
+    print('Exact maintenance-only history is explained once; native failure retained; mixed/unproven failures stay actionable')

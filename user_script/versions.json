@@ -30,8 +30,8 @@
       "sha256": "d4ecc5fb42a7e367ff6bc6ca305c9608bb3bafd460327054ae018750ff6a8419"
     },
     "docker_service_watchdog": {
-      "version": "3.18.1",
-      "sha256": "0df61dafed451fc335d7cdb629e9f7e357d8d9052e94f470b4e06577a1ed9df2"
+      "version": "3.18.2",
+      "sha256": "e98374ac54f724ee19c2c65e4d157f6ec8c49844791c35419d88731513148636"
     },
     "host_health_monitor": {
       "version": "3.4.1",
@@ -54,8 +54,8 @@
       "sha256": "db84286830c9185dac18575f3e0696b3b9d8b5fbbe4e01bbc68c4bb532b3f7ec"
     },
     "media_metadata_audit": {
-      "version": "3.4.1",
-      "sha256": "76739b46e9de4fd8f7b69c8fa1e4f8b72764603da55586f39b37b30af7cf5449"
+      "version": "3.4.2",
+      "sha256": "fb2312fec655bb360a9050db99733bd3c7296947a147c0e78e0332dfc5179c69"
     },
     "media_plex_dbrepair": {
       "version": "3.6.3",

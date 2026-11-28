@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="3.18.1"
+readonly SCRIPT_VERSION="3.18.2"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'docker_service_watchdog.sh %s\n' "$SCRIPT_VERSION"
@@ -732,10 +732,15 @@ load_state() {
 
 # Stable keys exclude counters, age, changing log size, and message text.
 observe() {
-    local key="$1" severity="$2" message="$3" threshold="${4:-$FAILURE_CONFIRM_SCANS}"
+    local key="$1" severity="$2" message="$3" threshold="${4:-$FAILURE_CONFIRM_SCANS}" evidence_identity="${5:-}"
     SEEN["$key"]=1
     log "$severity" "$key: $message" || return 1
-    mutate --arg key "$key" --arg severity "$severity" --arg message "$message" --argjson now "$NOW" --argjson threshold "$threshold" '
+    mutate --arg key "$key" --arg severity "$severity" --arg message "$message" --argjson now "$NOW" --argjson threshold "$threshold" --arg evidenceIdentity "$evidence_identity" '
+        if $evidenceIdentity!="" and (.observations[$key].evidenceIdentity // "")!=$evidenceIdentity then
+          (.observations[$key] // null) as $old |
+          if $old!=null then .jobIncidentHistory=((.jobIncidentHistory // [])+[{key:$key,observation:$old,archivedAt:$now,reason:"New failed-run identity or initial run-scoped tracking"}]) else . end |
+          .observations[$key]={bad:0,good:0,active:($old.active // false),first:$now,evidenceIdentity:$evidenceIdentity,runFinishedAt:($evidenceIdentity|split(":")|last|tonumber)}
+        else . end |
         .observations[$key] = ((.observations[$key] // {bad:0,good:0,active:false,first:$now}) |
             .bad += 1 | .good=0 | .severity=$severity | .message=$message |
             .active = (.active or .bad >= $threshold))'
@@ -765,6 +770,7 @@ finish_observations() {
 # EXPIRING MAINTENANCE LEASES
 ###############################################################################
 maintenance_active() {
+    ACTIVE_MAINTENANCE_LEASE=""
     local plex_journal="${PLEX_OPERATION_JOURNAL:-/mnt/vault/cloud/logs/script/media_plex_dbrepair/active-operation.json}"
     if [[ "$1" == plex-media || "$1" == plex-media-server ]] && [[ -e "$plex_journal" ]];then
         if [[ -L "$plex_journal" ]] || ! jq -e --arg name "$1" '.schema==1 and (.container|type)=="string" and .container!=$name' "$plex_journal" >/dev/null 2>&1;then return 0;fi
@@ -798,6 +804,7 @@ maintenance_active() {
         if [[ "$boot" == "$BOOT_ID" ]] && (( expires > wall_now && expires <= wall_now + MAX_MAINTENANCE_SECONDS )) &&
             { (( pid == 0 )) || [[ "$owner_alive" == true ]]; }; then
             active=0
+            ACTIVE_MAINTENANCE_LEASE="$lease"
         elif [[ "$owner_alive" == true ]]; then
             # An overlong backup must become visible, but never restart a
             # database while its verified maintenance process still owns it.
@@ -1329,6 +1336,224 @@ job_deadlines() {
     fi
 }
 
+# BEGIN JOB MAINTENANCE CORRELATION
+# shellcheck shell=bash
+# Exact native Docker stop/start windows, retained in existing watchdog state.
+# Only narrow Plex-connection failures qualify; no job is marked successful.
+wd_plex_dependency_url() {
+    local name="$1" info="$2" bound
+    # A stopped Docker container clears runtime ports/IPs; retained static
+    # bindings are inspection evidence, not a port scan or a config change.
+    bound=$(jq '.[0] |= (if ((.NetworkSettings.Ports // {})|length)==0 then .NetworkSettings.Ports=(.HostConfig.PortBindings // {}) else . end |
+      .NetworkSettings.Networks |= with_entries(if (.value.IPAddress // "")=="" then .value.IPAddress=(.value.IPAMConfig.IPv4Address // "") else . end))' <<<"$info") || return 1
+    probe_url "$name" "$bound" 32400 /identity
+}
+wd_capture_downtime() {
+    local name="$1" info="$2" lease="$3" profile="${PROFILE_BY_NAME[$1]:-$1}" stopped id created target key
+    case "$profile" in plex-media|plex-media-server) ;; *) return 0;; esac
+    [[ -n "$lease" && -f "$lease" && ! -L "$lease" ]] || return 0
+    [[ $(stat -c %u "$lease") == "$EUID" ]] || return 0
+    jq -e '.[0].State.Running==false' <<<"$info" >/dev/null || return 0
+    stopped=$(date -d "$(jq -r '.[0].State.FinishedAt' <<<"$info")" +%s 2>/dev/null) || return 0
+    created=$(stat -c %Y "$lease") || return 0
+    ((stopped>0 && stopped<=NOW && stopped>=NOW-86400 && created<=stopped && created>=stopped-300)) || return 0
+    id=$(jq -r '.[0].Id' <<<"$info")
+    target=$(wd_plex_dependency_url "$name" "$info" 2>/dev/null) || target=''
+    key=$(printf '%s' "$BOOT_ID|$name|$id|$stopped"|sha256sum|cut -d' ' -f1)
+    mutate --arg key "$key" --arg name "$name" --arg id "$id" --arg boot "$BOOT_ID" --arg target "${target%/identity}" \
+      --argjson stopped "$stopped" --argjson now "$NOW" --slurpfile lease "$lease" '
+      .plannedDowntime //= {} | .plannedDowntime[$key] //= {id:$key,container:$name,containerId:$id,boot:$boot,startedAt:$stopped,endedAt:0,
+        observedAt:$now,target:$target,source:"verified-maintenance-lease-and-native-docker",reason:$lease[0].reason,owner:$lease[0]}'
+}
+wd_close_downtime() {
+    local name="$1" info="$2" started id profile="${PROFILE_BY_NAME[$1]:-$1}"
+    case "$profile" in plex-media|plex-media-server) ;; *) return 0;; esac
+    jq -e --arg name "$name" 'any((.plannedDowntime // {})[];.container==$name and .endedAt==0)' "$STATE_WORK" >/dev/null || return 0
+    jq -e '.[0].State.Running==true' <<<"$info" >/dev/null || return 0
+    started=$(date -d "$(jq -r '.[0].State.StartedAt' <<<"$info")" +%s 2>/dev/null) || return 0
+    id=$(jq -r '.[0].Id' <<<"$info")
+    mutate --arg name "$name" --arg id "$id" --arg boot "$BOOT_ID" --argjson started "$started" --argjson now "$NOW" '
+      .plannedDowntime |= with_entries(if .value.container==$name and .value.containerId==$id and .value.boot==$boot and .value.endedAt==0
+       and .value.startedAt<$started and $started<=$now then .value.endedAt=$started | .value.closedObservedAt=$now else . end)'
+}
+wd_prune_downtime() {
+    mutate --argjson now "$NOW" '
+      .plannedDowntime=((.plannedDowntime // {})|to_entries|map(select(.value.startedAt >= $now-14*86400))|sort_by(.value.startedAt)|.[-128:]|from_entries) |
+      .jobIncidentHistory=((.jobIncidentHistory // [])|map(select(.archivedAt >= $now-14*86400))|.[-128:]) |
+      .maintenanceOutcomes=((.maintenanceOutcomes // {})|to_entries|map(select(.value.finishedAt >= $now-14*86400))|sort_by(.value.finishedAt)|.[-128:]|from_entries)'
+}
+wd_plex_job_signature() {
+    local profile="$1" file="$2"
+    if [[ "$profile" == metafusion ]];then
+        jq -e '.last_error=="Plex connector preflight failed"' "$file" >/dev/null
+    elif [[ "$profile" == kometa ]];then
+        jq -e '.backlog!=true and .incomplete!=true and (.reader.gap // false)!=true and ([.findings.fatal // {}, .findings.errors // {}] as $b |
+          ([$b[].keys[]?]|length)>0 and all($b[]; ((.keys // [])|length)==((.examples // [])|length)) and
+          all($b[].examples[]?; .=="Config Error: No libraries were found in config" or .=="Plex Error: Plex URL is probably invalid"))' "$file" >/dev/null
+    else return 1;fi
+}
+wd_plex_job_evidence() {
+    local name="$1" profile="$2" mode="$3" hint=''
+    if [[ "$profile" == kometa ]];then
+        hint=$(docker_cmd inspect "$name" | jq -r '.[0] | ((.Args // [])+(.Config.Cmd // [])) as $a |
+          [range(0;($a|length)-1)|select($a[.]=="--config" or $a[.]=="-c")|$a[.+1]]|unique|
+          if length==0 then "" elif length==1 then .[0] else "AMBIGUOUS" end') || return 1
+        [[ "$hint" != AMBIGUOUS ]] || return 1
+    fi
+    docker_cmd exec -i "$name" python3 - "$profile" "$mode" "$hint" <<'WD_PLEX_PY'
+"""Executed inside a producer: config + authenticated Plex metadata only; no media I/O."""
+import json
+import os
+from pathlib import Path
+import sys
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+import yaml
+
+
+def main():
+    profile, mode, hint = sys.argv[1:4]
+    if profile == 'kometa':
+        path = Path(hint or os.environ.get('KOMETA_CONFIG', '/config/config.yml'))
+    else:
+        base = Path('/config')
+        path = base / 'config.yml'
+        if not path.exists():
+            choices = [base / (name + '.yml') for name in ('kometa', 'plex') if (base / (name + '.yml')).exists()]
+            selected = base / (os.environ.get('RUN_MODE', '') + '.yml')
+            if selected in choices:
+                path = selected
+            elif len(choices) == 1:
+                path = choices[0]
+            elif len(choices) > 1:
+                raise ValueError('Ambiguous producer configuration')
+    config = {}
+    if path.exists():
+        if path.stat().st_size > 2 * 1024 * 1024:
+            raise ValueError('Producer configuration exceeds bounded reader')
+        config = yaml.safe_load(path.read_text()) or {}
+    plex = config.get('plex', {})
+    url, token = plex.get('url'), plex.get('token')
+    if profile == 'metafusion':
+        url, token = os.environ.get('PLEX_URL', url), os.environ.get('PLEX_TOKEN', token)
+    if not isinstance(url, str) or not isinstance(token, str) or not token:
+        raise ValueError('Plex endpoint/credential unavailable')
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError('Plex endpoint is not a safe HTTP origin/path')
+    target = urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip('/'), '', ''))
+    libraries = config.get('libraries', {}) if profile == 'kometa' else {}
+    if not isinstance(libraries, dict) or (profile == 'kometa' and not libraries):
+        raise ValueError('No configured libraries')
+    for library in libraries.values():
+        if not isinstance(library, dict):
+            raise ValueError('Invalid library configuration')
+        override = library.get('plex') or {}
+        if override.get('url', url).rstrip('/') != url.rstrip('/') or override.get('token', token) != token:
+            raise ValueError('Multiple Plex targets/credentials require explicit review')
+    output = {'schema': 1, 'target': target, 'configuration': str(path), 'verified': False}
+    if mode == 'config':
+        return output
+
+    class SameOrigin(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            other = urllib.parse.urlsplit(newurl)
+            if (other.scheme.lower(), other.netloc.lower()) != (parsed.scheme.lower(), parsed.netloc.lower()):
+                raise ValueError('Cross-origin redirect prohibited')
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    # Disable environment proxies; retain default TLS verification and never
+    # return a token, raw response, exception text or media filesystem path.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), SameOrigin())
+
+    def read(endpoint):
+        request = urllib.request.Request(target + endpoint, headers={'X-Plex-Token': token, 'Accept': 'application/xml'})
+        with opener.open(request, timeout=5) as response:
+            data = response.read(1024 * 1024 + 1)
+            if response.status != 200 or len(data) > 1024 * 1024:
+                raise ValueError('Invalid bounded Plex response')
+        return ET.fromstring(data)
+
+    identity, sections = read('/identity'), read('/library/sections')
+    machine = identity.get('machineIdentifier')
+    titles = {item.get('title') for item in sections.findall('Directory')}
+    if not machine or not titles or (libraries and not set(libraries).issubset(titles)):
+        raise ValueError('Plex identity/library selection unverified')
+    return dict(output, verified=True, machineIdentifier=machine, libraryCount=len(titles))
+
+
+try:
+    print(json.dumps(main(), separators=(',', ':')))
+except Exception:
+    print(json.dumps({'schema': 1, 'verified': False, 'reason': 'Producer Plex configuration or authenticated identity/library check is unverified'}))
+    sys.exit(1)
+WD_PLEX_PY
+}
+wd_match_job_maintenance() {
+    local name="$1" profile="$2" started="$3" finished="$4" file="$5" candidates config checked target dep info endpoint identity body row active
+    JOB_MAINTENANCE_DETAIL=''
+    [[ "$profile" == kometa || "$profile" == metafusion ]] || return 1
+    ((finished>0)) || return 1
+    if ((started>finished));then
+        started=$(jq -r --arg name "$name" '.jobs[$name].maintenanceOutcome.startedAt // .jobs[$name].runLog.completed.startedAt // 0' "$STATE_WORK") || return 1
+    fi
+    ((started>0 && started<=finished)) || return 1
+    wd_plex_job_signature "$profile" "$file" || return 1
+    candidates="$TMP_DIR/$name.maintenance-candidates.json"
+    jq -c --arg boot "$BOOT_ID" --argjson started "$started" --argjson finished "$finished" '
+      [(.plannedDowntime // {})[]|select((.endedAt>0 or .boot==$boot) and .startedAt<=$started and (.endedAt==0 or $finished<=.endedAt))]|sort_by(.startedAt)|reverse' "$STATE_WORK" >"$candidates" || return 1
+    jq -e 'length>0' "$candidates" >/dev/null || return 1
+    config="$TMP_DIR/$name.plex-config.json";checked="$TMP_DIR/$name.plex-auth.json"
+    wd_plex_job_evidence "$name" "$profile" config >"$config" 2>/dev/null || return 1
+    target=$(jq -er '.target|select(type=="string" and length>0)' "$config") || return 1
+    while IFS= read -r row;do
+        dep=$(jq -r .container <<<"$row")
+        info=$(docker_cmd inspect "$dep" 2>/dev/null) && inspect_valid "$info" || continue
+        if [[ $(jq -r '.[0].Id' <<<"$info") != "$(jq -r .containerId <<<"$row")" ]];then
+            [[ $(jq -r .endedAt <<<"$row") != 0 && -n "$(jq -r '.machineIdentifier // ""' <<<"$row")" ]] || continue
+        fi
+        endpoint=$(wd_plex_dependency_url "$dep" "$info" 2>/dev/null) || continue
+        identity=''
+        if [[ $(jq -r .endedAt <<<"$row") == 0 ]];then
+            # Open-window classification requires a currently stopped container
+            # and the exact still-live verified maintenance lease owner.
+            [[ "$target" == "${endpoint%/identity}" || "$target" == "$(jq -r .target <<<"$row")" ]] || continue
+            jq -e '.[0].State.Running==false' <<<"$info" >/dev/null || continue
+            maintenance_active "$dep";active=$?
+            [[ "$active" == 0 && -n "${ACTIVE_MAINTENANCE_LEASE:-}" ]] || continue
+        else
+            wd_plex_job_evidence "$name" "$profile" check >"$checked" 2>/dev/null || continue
+            jq -e '.schema==1 and .verified==true and (.machineIdentifier|type)=="string"' "$checked" >/dev/null || continue
+            body="$TMP_DIR/$name.dependency-identity.xml"
+            curl --silent --show-error --connect-timeout 4 --max-time 8 --max-filesize 65536 "$endpoint" >"$body" 2>/dev/null || continue
+            identity=$(sed -n 's/.*machineIdentifier="\([A-Za-z0-9_-]*\)".*/\1/p' "$body")
+            [[ -n "$identity" && "$identity" == "$(jq -r .machineIdentifier "$checked")" ]] || continue
+            [[ -z "$(jq -r '.machineIdentifier // ""' <<<"$row")" || "$identity" == "$(jq -r .machineIdentifier <<<"$row")" ]] || continue
+        fi
+        mutate --arg name "$name" --arg key "$name:$finished" --argjson row "$row" --argjson started "$started" --argjson finished "$finished" --argjson now "$NOW" --arg identity "$identity" '
+          (if $identity!="" then .plannedDowntime[$row.id].machineIdentifier=$identity else . end) |
+          {status:"maintenance-blocked",dependency:$row.container,windowId:$row.id,startedAt:$started,finishedAt:$finished,
+            stoppedAt:$row.startedAt,restartedAt:$row.endedAt,verifiedAt:$now,dependencyAccessVerified:($identity!=""),nativeResult:"failed",successNotClaimed:true} as $outcome |
+          .jobs[$name].maintenanceOutcome=$outcome | .maintenanceOutcomes[$key]=$outcome |
+          if $identity!="" and (.jobs[$name].runLog.maintenance.issues|type)=="object" then
+            .jobs[$name].runLog.maintenance.issues |= with_entries(
+              if (.value.message|IN("Config Error: No libraries were found in config","Plex Error: Plex URL is probably invalid"))
+                and ((.value.affectedRuns // [])|index($started))!=null
+              then .value.maintenanceProofs=(((.value.maintenanceProofs // [])+[$outcome])|unique_by(.startedAt)|sort_by(.startedAt)|.[-150:]) else . end)
+          else . end |
+          (.observations[$name+":job-failed"] // null) as $prior |
+          if $prior!=null then .jobIncidentHistory=((.jobIncidentHistory // [])+[{key:($name+":job-failed"),observation:$prior,archivedAt:$now,reason:"Reclassified from exact Plex maintenance evidence; no successful run claimed"}])|del(.observations[$name+":job-failed"]) else . end' || return 1
+        if [[ -n "$identity" ]];then
+            JOB_MAINTENANCE_DETAIL="$dep was stopped $(TZ=Asia/Singapore date -d "@$(jq -r .startedAt <<<"$row")" '+%Y-%m-%d %H:%M:%S %Z') to $(TZ=Asia/Singapore date -d "@$(jq -r .endedAt <<<"$row")" '+%H:%M:%S %Z'); current authenticated Plex and configured-library checks passed"
+        else JOB_MAINTENANCE_DETAIL="$dep is still stopped under its verified maintenance lease; backend recovery is not yet established";fi
+        log INFO "$name: failed run $finished matched verified stopped interval for $dep; retained as maintenance-blocked, never successful; normal completion deadlines remain active"
+        return 0
+    done < <(jq -c '.[]' "$candidates")
+    return 1
+}
+# END JOB MAINTENANCE CORRELATION
+
 check_job() {
     local name="$1" info="$2" profile rule max_age runtime source file started=0 finished=0 success=0 result=unknown
     local old first old_finished old_success scan since line stamp read_error=false rc key frequency min_runs hours count receipt_history='[]' log_state='{}' run_log='{}' findings='{}' detail="" retract_success=false replace_unverified=false
@@ -1483,9 +1708,9 @@ check_job() {
     mutate --arg name "$name" --arg result "$result" --argjson first "$first" --argjson started "$started" \
         --argjson finished "$finished" --argjson success "$success" --argjson scanned "$NOW" --slurpfile receipt_history_file "$TMP_DIR/$name.receipt-history.json" --slurpfile log_state_file "$TMP_DIR/$name.log-state.json" \
         --slurpfile run_log_file "$TMP_DIR/$name.reader.json" --argjson retract "$retract_success" --arg evidence_source "$source" \
-        '$run_log_file[0] as $run_log | .jobs //= {} | (.jobs[$name].history // []) as $history | (.jobs[$name].weeklyReview // null) as $review |
+        '$run_log_file[0] as $run_log | .jobs //= {} | (.jobs[$name].history // []) as $history | (.jobs[$name].weeklyReview // null) as $review | (.jobs[$name].maintenanceOutcome // null) as $priorMaintenance |
             .jobs[$name]={firstSeen:$first,started:$started,finished:$finished,success:$success,result:$result,scanned:$scanned,logState:$log_state_file[0],runLog:$run_log,evidenceSource:$evidence_source,
-                weeklyReview:$review,history:(($history + $receipt_history_file[0] + (if $result == "success" and $success > 0 then [$success] else [] end)) | unique | map(select(. >= ($scanned - 28*86400) and (($retract | not) or . != $finished))))}' || return 1
+                weeklyReview:$review,maintenanceOutcome:(if $result=="failed" and $priorMaintenance.finishedAt==$finished then $priorMaintenance else null end),history:(($history + $receipt_history_file[0] + (if $result == "success" and $success > 0 then [$success] else [] end)) | unique | map(select(. >= ($scanned - 28*86400) and (($retract | not) or . != $finished))))}' || return 1
     if [[ "$result" == failed ]]; then
         local error_detail=""
         if [[ "$source" == native:* ]]; then
@@ -1499,7 +1724,11 @@ check_job() {
         elif [[ "$profile" == recyclarr ]];then
             error_detail=$(jq -r '[.findings[]?.message]|.[0:4]|join("; ")|.[0:500]' <<< "$log_state") || return 1
         fi
-        observe "$name:job-failed" CRITICAL "Most recent scheduled job failed; finished_epoch=$finished; last_success_epoch=$success. ${error_detail:-Review the scheduled job log or completion record.} Container availability is checked separately" || return 1
+        if wd_match_job_maintenance "$name" "$profile" "$started" "$finished" "$file";then
+            observe "$name:job-maintenance" WARNING "Most recent job was blocked during verified Plex maintenance. $JOB_MAINTENANCE_DETAIL. Native result remains failed; no successful processing is claimed. Awaiting the next scheduled run; normal completion deadlines and Docker availability checks remain active." 1 "$profile:$finished" || return 1
+        else
+            observe "$name:job-failed" CRITICAL "Most recent scheduled job failed; finished_epoch=$finished; last_success_epoch=$success. ${error_detail:-Review the scheduled job log or completion record.} Container availability is checked separately" "$FAILURE_CONFIRM_SCANS" "$profile:$finished" || return 1
+        fi
     fi
     if [[ "$source" == runlog:* ]]; then
         if (( started > finished )); then
@@ -2468,6 +2697,10 @@ check_service() {
     maintenance_active "$name"; rc=$?
     if (( rc == 0 )); then
         FROZEN["$name"]=1
+        if [[ -n "${ACTIVE_MAINTENANCE_LEASE:-}" && "${PROFILE_BY_NAME[$name]:-$name}" == plex-media* ]];then
+            info=$(docker_cmd inspect "$name" 2>/dev/null) && inspect_valid "$info" &&
+              wd_capture_downtime "$name" "$info" "$ACTIVE_MAINTENANCE_LEASE" || log WARNING "$name: maintenance timing capture unavailable; no job suppression inferred"
+        fi
         log INFO "$name: maintenance active; availability/recovery suspended"
         return
     fi
@@ -2486,6 +2719,7 @@ check_service() {
         observe "$name:inspection" CRITICAL "Malformed Docker inspection; recovery prohibited"
         return
     fi
+    wd_close_downtime "$name" "$info" || log WARNING "$name: maintenance completion timing unavailable; job checks remain conservative"
     read -r status health count oom id < <(jq -r '.[0] | [.State.Status,(.State.Health.Status // "none"),.RestartCount,.State.OOMKilled,.Id] | @tsv' <<<"$info")
     if [[ "$expected" == on-demand && ( "$status" == exited || "$status" == created ) ]]; then
         log INFO "$name: expected on-demand stop"
@@ -2756,11 +2990,13 @@ notify_changes() {
     if ((retired_pending>0));then description='Monitoring inventory updated';fi
     if jq -e 'any(.[]; . == "CRITICAL")' <<<"$current" >/dev/null; then importance=alert
     elif [[ "$current" != '{}' ]]; then importance=warning; fi
-    body="$(jq -r --argjson now "$NOW" --argjson current "$current" '.observations | to_entries[] | .key as $key | select($current|has($key)) |
-        "[\(.value.severity)] \(.key)\n  Condition: \(.value.message)\n  Observed duration: \(($now - .value.first) / 60 | floor)m; consecutive failures: \(.value.bad)"' "$STATE_WORK")"
+    body="$(TZ=Asia/Singapore jq -r --argjson now "$NOW" --argjson current "$current" '.observations | to_entries[] | .key as $key | select($current|has($key)) |
+        "[\(.value.severity)] \(.key)\n  Condition: \(.value.message)\n  Observed duration: \(($now - .value.first) / 60 | floor)m; \(if (.value.evidenceIdentity // "")!="" then "monitor observations for this run" else "consecutive failed checks" end): \(.value.bad)" + (if (.value.runFinishedAt // 0)>0 then "\n  Native run finished: "+(.value.runFinishedAt|strflocaltime("%Y-%m-%d %H:%M:%S %Z")) else "" end)' "$STATE_WORK")"
     body+=$'\n'"$(jq -r --argjson current "$current" --argjson previous "$previous" '
-        (.inventory // {}) as $inventory | ($previous|keys)-($current|keys)|.[]|. as $key|
-        if ($inventory[($key|split(":")[0])].retiredAt // 0)>0 then "Retired alert: "+$key else "Resolved: "+$key end' "$STATE_WORK")"
+        . as $root | (.inventory // {}) as $inventory | ($previous|keys)-($current|keys)|.[]|. as $key|
+        if ($inventory[($key|split(":")[0])].retiredAt // 0)>0 then "Retired alert: "+$key
+        elif ($key|endswith(":job-failed")) and ($root.jobs[($key|split(":")[0])].maintenanceOutcome // null)!=null then "Reclassified as maintenance-blocked: "+$key+"; native job success is still unverified"
+        else "Resolved: "+$key end' "$STATE_WORK")"
     body+=$'\n'"$(jq -r '(.inventoryOutbox // {})|to_entries[]|(if (.key|startswith("schedule:")) then "Schedule reconciliation: " else "Retired monitoring: "+.key+"; " end)+.value.message' "$STATE_WORK")"
     body+=$'\n'"State: $STATE_FILE; log: $LOG_FILE"
     if [[ ! -x "$NOTIFY_BIN" ]] || ! usr_ops_notify timeout 30 "$NOTIFY_BIN" -i "$importance" -s "Docker Service Watchdog" -d "$description" -m "$body"; then
@@ -2853,6 +3089,7 @@ main() {
     TMP_DIR="$(mktemp -d /tmp/docker-watchdog.XXXXXX)" || return 1
     STATE_WORK="$TMP_DIR/state.json"
     load_state || return 1
+    wd_prune_downtime || return 1
     watchdog_schedule_inventory || return 1
     watchdog_check_execution_audit || return 1
     read -r uptime _ <"$UPTIME_FILE" || return 1

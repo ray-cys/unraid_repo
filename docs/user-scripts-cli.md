@@ -115,6 +115,9 @@ No help, diagnose or dry-run CLI is implemented; do not pass invented options.
 | `--maintenance CONTAINER MINUTES "REASON"` | Create a bounded manual maintenance lease; suppress availability/restarts and freeze findings until expiry. Maximum 24 hours. |
 | `--record-job PROFILE EXIT_CODE [START_EPOCH]` | Record an actual producer outcome. Use the real exit code and start time; never use this to fabricate success. |
 
+[Job maintenance classification and observation counters](docker-watchdog-job-maintenance.md)
+explain how backup-related Plex failures differ from genuine job faults.
+
 Example inspection: `us docker_service_watchdog --diagnose qbittorrent`.
 To end a manual lease early, remove only the reviewed container's
 `/run/docker-service-maintenance/CONTAINER.manual.json`; this is a separate file

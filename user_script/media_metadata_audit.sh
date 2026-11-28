@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="3.4.1"
+readonly SCRIPT_VERSION="3.4.2"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'media_metadata_audit.sh %s\n' "$SCRIPT_VERSION"
@@ -9,7 +9,7 @@ fi
 # shellcheck disable=SC2034
 clearLog=true
 arrayStarted=true
-# MetaFusion/Kometa/Recyclarr/ImageMaid weekly findings and guarded reconciliation v3.4.1. Schedule 55 3,7,11,15,19,23 * * *.
+# MetaFusion/Kometa/Recyclarr/ImageMaid weekly findings and guarded reconciliation v3.4.2. Schedule 55 3,7,11,15,19,23 * * *.
 # Run after MetaFusion and before the four-hour Kometa boundaries. MetaFusion
 # owns generated metadata; this wrapper only maintains personal overlay and
 # collection templates, under the MetaFusion/wrapper write lock.
@@ -636,8 +636,22 @@ def scheduled_job_reviews(data, now, cutoff, saved, safe, stamp):
 mf_blocks,mf_email_blocks,mf_summary,mf_active,mf_resolved,mf_partial=metafusion_review()
 job_blocks,job_summary,job_active,job_resolved,job_partial,job_handoff=scheduled_job_reviews(data,now,cutoff,saved,safe,stamp)
 
+# Retain raw producer failures. Exact downtime proof changes presentation, not
+# the native result or resolution status. A later unrelated affected run makes
+# the same issue actionable again; historical maintenance is reported once.
+def maintenance_only(issue):
+    if issue.get("message") not in ("Config Error: No libraries were found in config", "Plex Error: Plex URL is probably invalid"):
+        return False
+    affected=issue.get("affectedRuns",[])
+    rows=issue.get("maintenanceProofs",[])
+    if not isinstance(affected,list) or not isinstance(rows,list):
+        return False
+    proofs={p.get("startedAt") for p in rows if isinstance(p,dict) and all(isinstance(p.get(k),(int,float)) and not isinstance(p.get(k),bool) for k in ("stoppedAt","startedAt","finishedAt","restartedAt")) and p.get("status")=="maintenance-blocked" and
+            p.get("stoppedAt",0)<=p.get("startedAt",0)<=p.get("finishedAt",0)<=p.get("restartedAt",0) and p.get("nativeResult")=="failed" and p.get("successNotClaimed") is True}
+    return bool(affected) and all(start in proofs for start in affected)
+maintenance_issues=[dict(value) for value in catalogue.get("issues",{}).values() if maintenance_only(value) and value.get("lastSeen",0)>=max(cutoff,saved.get("lastReportAt",0)+1)]
 issues = [dict(value) for value in catalogue.get("issues", {}).values()
-          if not value.get("resolvedAt") or value.get("resolvedAt", 0) >= max(cutoff, saved.get("lastReportAt",0)+1)]
+          if not maintenance_only(value) and (not value.get("resolvedAt") or value.get("resolvedAt", 0) >= max(cutoff, saved.get("lastReportAt",0)+1))]
 issues.sort(key=lambda issue: (bool(issue.get("resolvedAt")), issue.get("severity") not in ("FATAL", "CRITICAL", "ERROR"), -issue.get("lastSeen", 0)))
 resolved = sum(bool(issue.get("resolvedAt")) for issue in issues)
 active = len(issues)-resolved
@@ -657,6 +671,12 @@ if kometa_problem:
     lines.append(kometa_problem)
 header = lines.copy()
 blocks = []
+if maintenance_issues:
+    history=["", "[Kometa] MAINTENANCE-BLOCKED | historical native failures",
+             "Verified Plex stop/start intervals cover these connection-only failures. Native runs remain failed; this is not a claim that processing succeeded.",
+             "Reasons: "+"; ".join(sorted({safe(issue["message"],250) for issue in maintenance_issues})),
+             "Action: no YAML change is indicated by these maintenance-only findings. The watchdog awaits a later scheduled completion and keeps normal deadlines active."]
+    blocks.append(history);lines.extend(history)
 for number, issue in enumerate(issues, 1):
     block_start = len(lines)
     context = dict(issue.get("context", {}))
