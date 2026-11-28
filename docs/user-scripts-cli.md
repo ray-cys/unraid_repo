@@ -50,6 +50,13 @@ passing `--help` is not a safe way to inspect this backup wrapper.
   archive verification, retention and optional share copies.
 - `us backup_cache_appdata --version`: release only.
 
+Appdata runs automatically coordinate blanket Docker watchdog deferral through a
+verified runtime lease, followed by two minutes of recovery grace. No schedule
+change or manual maintenance command is needed. Per-directory results append
+`[no container]` only when a complete inventory of installed container bind mounts
+(including stopped containers) proves no owner; `[owner unknown]` means inventory
+could not be verified. Neither label changes backup eligibility.
+
 No help, preview or restore CLI is implemented. Storage-mode overrides are
 configuration inputs, not CLI options. A supported one-run example is:
 

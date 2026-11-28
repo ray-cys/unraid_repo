@@ -49,6 +49,12 @@ make_mocks() {
 
     mkdir -p -- "$root/bin"
 
+    cat >"$root/bin/docker" <<'EOF'
+#!/bin/sh
+case "$1" in ps|info) exit 0;; *) exit 1;; esac
+EOF
+    chmod +x "$root/bin/docker"
+
     cat >"$root/bin/flock" <<'EOF'
 #!/bin/sh
 exit 0
@@ -128,6 +134,7 @@ run_backup() {
         ARR_BACKUP_GATE="$root/arr-gate.lock" \
         ARR_BACKUP_GRACE="$root/arr-grace" \
         ISS_REQUEST_FILE="$root/iss-request.json" \
+        DOCKER_WATCHDOG_LOCK_FILE="$root/watchdog.lock" \
         LOCK_FILE="$root/appdata.lock" \
         NOTIFY_BIN="$root/bin/notify" \
         MOCK_NOTIFY_LOG="$root/notify.log" \
@@ -619,7 +626,7 @@ fi
 assert_contains "$FAIL_ROOT/failure.out" \
     "compression was killed by SIGKILL; probable memory pressure"
 assert_contains "$FAIL_ROOT/notify.log" \
-    "[FAILED] [plex-media-server] compression was killed by SIGKILL"
+    "[FAILED] [plex-media-server] [no container] compression was killed by SIGKILL"
 
 if find "$FAIL_ROOT/destination" \
     -mindepth 1 \

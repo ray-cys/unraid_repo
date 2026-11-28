@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="3.11.2"
+readonly SCRIPT_VERSION="3.11.3"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'backup_cache_appdata.sh %s\n' "$SCRIPT_VERSION"
@@ -42,6 +42,10 @@ clearLog=true
 # - Shared or multi-directory owners remain stopped until all their mapped
 #   appdata directories have been archived.
 # - A failed owner stop prevents its live appdata from being archived.
+# - A verified runtime lease defers Docker watchdog checks, alerts and restarts
+#   across the backup and a two-minute successful-exit grace; never schedule based.
+# - Per-directory [no container] uses all installed mount owners, including stopped
+#   containers; [owner unknown] means inventory uncertainty, not a backup failure.
 # - An EXIT/signal trap attempts to restart containers if the script exits
 #   unexpectedly after stopping them.
 # - The previous successful backup is retained until the new backup has been
@@ -656,6 +660,10 @@ declare -a RUNNING_CONTAINERS=()
 declare -a TARGET_CONTAINERS=()
 declare -a PRIORITY_PREFIX=()
 declare -A APP_CONTAINERS=()
+# All installed mount owners are informational; only running owners are stopped.
+declare -A APP_INSTALLED_OWNERS=()
+APP_OWNER_INVENTORY_VERIFIED=false
+BACKUP_WATCHDOG_LEASE_HELD=false
 declare -A CONTAINER_APP_NAMES=()
 declare -A CONTAINER_PENDING_APPS=()
 declare -A CONTAINER_STOPPED=()
@@ -2193,6 +2201,68 @@ release_arr_backup_gate() {
     ARR_BACKUP_GATE_HELD=false
 }
 
+# One runtime-owned lease covers dependent apps as well as stopped containers.
+# Publishing under the watchdog lock lets any in-flight scan finish before stops.
+backup_watchdog_begin() {
+    local fd tmp boot process_start
+    mkdir -p -- "$DOCKER_MAINTENANCE_DIR" || return 1
+    exec {fd}>"${DOCKER_WATCHDOG_LOCK_FILE:-/run/docker_service_watchdog.lock}" || return 1
+    flock -w 180 "$fd" || { exec {fd}>&-; return 1; }
+    tmp=$(mktemp "$DOCKER_MAINTENANCE_DIR/.backup.XXXXXX") || { exec {fd}>&-; return 1; }
+    boot=$(cat /proc/sys/kernel/random/boot_id) || return 1
+    process_start=$(sed 's/.*) //' "/proc/$$/stat" | awk '{print $20}')
+    jq -n --arg boot "$boot" --argjson pid "$$" --arg start "$process_start" --argjson now "$(date +%s)" \
+       '{schema:1,producer:"backup_cache_appdata",boot:$boot,pid:$pid,processStart:$start,startedAt:$now,expires:($now+86400),phase:"active"}' > "$tmp" &&
+       chmod 600 "$tmp" && mv -f "$tmp" "$DOCKER_MAINTENANCE_DIR/backup-active.json"
+    local rc=$?
+    exec {fd}>&-
+    if ((rc==0));then BACKUP_WATCHDOG_LEASE_HELD=true;fi
+    return "$rc"
+}
+backup_watchdog_end() {
+    [[ "$BACKUP_WATCHDOG_LEASE_HELD" == true ]] || return 0
+    local file="$DOCKER_MAINTENANCE_DIR/backup-active.json" tmp
+    # A failed/interrupted producer must never leave a blanket health exemption.
+    if [[ "$1" != 0 ]];then rm -f -- "$file"; BACKUP_WATCHDOG_LEASE_HELD=false;return;fi
+    tmp=$(mktemp "$DOCKER_MAINTENANCE_DIR/.backup-grace.XXXXXX") || return 1
+    jq --argjson now "$(date +%s)" '.phase="grace" | .finishedAt=$now | .expires=($now+120)' "$file" > "$tmp" &&
+      chmod 600 "$tmp" && mv -f "$tmp" "$file" || { rm -f "$tmp";return 1; }
+    BACKUP_WATCHDOG_LEASE_HELD=false
+}
+
+# Enumerate stopped containers too, without adding them to restart/stop targets.
+# Unknown ownership is distinct from a proven absence of container mounts.
+discover_installed_appdata_owners() {
+    local ids mounts source root relative name owner
+    APP_INSTALLED_OWNERS=();APP_OWNER_INVENTORY_VERIFIED=false
+    ids=$(docker ps -aq 2>/dev/null) || return 0
+    if [[ -z "$ids" ]];then APP_OWNER_INVENTORY_VERIFIED=true;return 0;fi
+    # Docker IDs contain only hexadecimal characters; split deliberately.
+    local -a installed_ids=()
+    readarray -t installed_ids <<< "$ids"
+    mounts=$(docker inspect "${installed_ids[@]}" 2>/dev/null) || return 0
+    jq -e --argjson expected "${#installed_ids[@]}" 'type=="array" and length==$expected and all(.[]; (.Name|type)=="string" and (.Mounts|type)=="array" and all(.Mounts[]; (.Type|type)=="string" and (if .Type=="bind" then (.Source|type)=="string" and (.Source|startswith("/")) else true end)))' <<< "$mounts" >/dev/null || return 0
+    while IFS=$'\t' read -r owner source;do
+        for root in "${SRC_DIR%/}" "${APPDATA_PATH_ALIASES[@]}";do
+            root=${root%/}
+            if [[ "$source" == "$root" || "$source" == / || ( -n "$source" && "$root" == "${source%/}/"* ) ]];then
+                for name in "${!ELIGIBLE_APPDATA[@]}";do APP_INSTALLED_OWNERS["$name"]=1;done
+            elif [[ "$source" == "$root/"* ]];then
+                relative=${source#"$root"/};name=${relative%%/*}
+                APP_INSTALLED_OWNERS["$name"]=1
+            fi
+        done
+    done < <(jq -r '.[] | .Name as $name | .Mounts[] | select(.Type=="bind") | [$name,.Source]|@tsv' <<< "$mounts")
+    for name in "${!EXTRA_ARCHIVE_OWNER[@]}";do
+        [[ -z "${APP_INSTALLED_OWNERS[${EXTRA_ARCHIVE_OWNER[$name]}]:-}" ]] || APP_INSTALLED_OWNERS["$name"]=1
+    done
+    APP_OWNER_INVENTORY_VERIFIED=true
+}
+appdata_owner_label() {
+    if [[ "$APP_OWNER_INVENTORY_VERIFIED" != true ]];then printf ' [owner unknown]'
+    elif [[ -z "${APP_INSTALLED_OWNERS[$1]:-}" ]];then printf ' [no container]';fi
+}
+
 backup_maintenance_begin() {
     local name="$1" fd tmp boot process_start
     [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 1
@@ -2474,6 +2544,7 @@ handle_exit() {
         emergency_restart_containers
     fi
     release_arr_backup_gate
+    backup_watchdog_end "$exit_code" || log DOCKER WARNING "Unable to finalize watchdog backup grace; lease validation will resume normal checks"
 
     if [ "$exit_code" -ne 0 ] &&
        [ "$KEEP_PARTIAL" != "true" ] &&
@@ -3163,7 +3234,7 @@ run_backup_cache_appdata() {
         if array_contains "$name" "${SKIP_APPDATA_DIRS[@]}"; then
             APPDATA_SKIPPED=$((APPDATA_SKIPPED + 1))
 
-            APPDATA_REPORT+="[SKIPPED] [${name}] User exclusion"$'\n'
+            APPDATA_REPORT+="[SKIPPED] [${name}]$(appdata_owner_label "$name") User exclusion"$'\n'
 
             log "DOCKER" "INFO" \
                 "[${name}] Skipped due to SKIP_APPDATA_DIRS"
@@ -3173,7 +3244,7 @@ run_backup_cache_appdata() {
 
         if ! stop_containers_for_app "$name"; then
             APPDATA_FAILED=$((APPDATA_FAILED + 1))
-            APPDATA_REPORT+="[FAILED] [${name}] owning container could not be stopped safely"$'\n'
+            APPDATA_REPORT+="[FAILED] [${name}]$(appdata_owner_label "$name") owning container could not be stopped safely"$'\n'
             log "DOCKER" "ERROR" \
                 "[${name}] Archive skipped because an owning container did not stop"
             restart_target_containers || true
@@ -3199,7 +3270,7 @@ run_backup_cache_appdata() {
             previous_human="$(bytes_to_human "$previous_bytes")"
             change_label="$(format_archive_change "$archive_bytes" "$previous_bytes")"
 
-            APPDATA_REPORT+="[OK] [${name}] ${archive_human}"$'\n'
+            APPDATA_REPORT+="[OK] [${name}]$(appdata_owner_label "$name") ${archive_human}"$'\n'
 
             log "DOCKER" "INFO" \
                 "[${name}] Backup complete: size=${archive_human}, previous=${previous_human}, change=${change_label}, compression=$(format_duration "$LAST_COMPRESSION_SECONDS"), verification=$(format_duration "$LAST_VERIFICATION_SECONDS"), exclusions=${LAST_EXCLUSION_COUNT}"
@@ -3228,7 +3299,7 @@ run_backup_cache_appdata() {
                     true
             )"
 
-            APPDATA_REPORT+="[FAILED] [${name}] ${LAST_COMPRESSION_REASON:-unclassified compression failure}"$'\n'
+            APPDATA_REPORT+="[FAILED] [${name}]$(appdata_owner_label "$name") ${LAST_COMPRESSION_REASON:-unclassified compression failure}"$'\n'
 
             if [ -n "$excerpt" ]; then
                 APPDATA_REPORT+="---- stderr excerpt ----"$'\n'
@@ -4039,6 +4110,11 @@ ${LOG_FILE}"
     # Appdata backup
     # -----------------------------------------------------------------------
 
+    discover_installed_appdata_owners
+    if ! backup_watchdog_begin;then
+        log DOCKER ERROR "Unable to establish watchdog backup coordination; no containers stopped"
+        return 1
+    fi
     run_backup_cache_appdata || final_exit=1
     log_largest_archives_report
 

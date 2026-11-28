@@ -4,6 +4,20 @@ The watchdog monitors container availability independently from scheduled-job
 outcomes. A failed job never authorizes a container restart. Existing Docker
 health/readiness thresholds, permissions and restart budgets still apply.
 
+Appdata backup publishes `/run/docker-service-maintenance/backup-active.json`
+before its first container stop, after waiting for an in-flight watchdog scan.
+It covers the whole archive/share run, including dependent applications that
+remain running. No fixed backup schedule is assumed. The watchdog verifies the
+same boot, live producer PID/process start and a 24-hour bound, then defers all
+health checks, notifications and restarts. It preserves existing findings and
+publishes a `DEFERRED` receipt with availability `UNVERIFIED`, not healthy.
+Only bounded native Plex timing capture continues for later job reconciliation.
+Successful exit changes the lease to a two-minute recovery grace. Failed exit
+removes it after recovery attempts; a dead owner or expired active lease resumes
+monitoring with an attention finding. The backup's own failure notifications and
+independent liveness monitoring remain enabled. While blanket deferral applies,
+unrelated Docker problems are also not detected by this watchdog.
+
 For MetaFusion's exact `Plex connector preflight failed` outcome, or Kometa's
 complete two-reason Plex-connection/empty-library failure, the watchdog can
 classify a run as **maintenance-blocked** when all evidence agrees:
@@ -28,7 +42,8 @@ No native result is rewritten as success and no job is forced or rescheduled.
 The current maintenance-blocked outcome is a warning awaiting the next native
 scheduled run. A later unrelated failure remains critical; normal missed-run
 and overrun deadlines remain enabled. Maintenance-blocked outcomes stay visible
-as warnings until a later native outcome is available.
+as warnings in state/log until a later native outcome is available. These proven
+maintenance-only warnings do not send watchdog emails.
 Notification recovery text explicitly calls this reclassification rather than
 claiming the job ran successfully.
 

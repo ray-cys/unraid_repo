@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="3.18.2"
+readonly SCRIPT_VERSION="3.18.3"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'docker_service_watchdog.sh %s\n' "$SCRIPT_VERSION"
@@ -769,6 +769,54 @@ finish_observations() {
 ###############################################################################
 # EXPIRING MAINTENANCE LEASES
 ###############################################################################
+# Blanket suppression is runtime driven, never inferred from the backup schedule.
+# A dead owner, old boot or expired lease resumes monitoring and raises attention.
+watchdog_backup_suppressed() {
+    local file="$DOCKER_MAINTENANCE_DIR/backup-active.json" now pid start actual phase expires boot
+    [[ -e "$file" ]] || return 1
+    now=$(date +%s)
+    if [[ -L "$file" || $(stat -c %u "$file" 2>/dev/null) != "$(id -u)" ]] ||
+       ! jq -e '.schema==1 and .producer=="backup_cache_appdata" and (.phase|IN("active","grace")) and
+          (.pid|type=="number" and .>0 and .==floor) and (.processStart|type=="string") and
+          (.boot|type=="string") and (.startedAt|type=="number" and .>0 and .==floor) and
+          (.expires|type=="number" and .>0 and .==floor) and
+          (if .phase=="grace" then (.finishedAt|type=="number" and .>0 and .==floor) else true end)' "$file" >/dev/null 2>&1;then
+        observe monitor:backup-maintenance WARNING 'Appdata backup coordination invalid; blanket suppression disabled' 1 || return 2
+        return 1
+    fi
+    read -r pid start phase expires boot < <(jq -r '[.pid,.processStart,.phase,.expires,.boot]|@tsv' "$file")
+    if [[ "$boot" != "$BOOT_ID" ]];then return 1;fi
+    if [[ "$phase" == grace ]];then
+        if jq -e --argjson now "$now" '.finishedAt<= $now and .expires==(.finishedAt+120) and .expires>$now' "$file" >/dev/null;then
+            BACKUP_SUPPRESSION_REASON='Appdata backup recovery grace; health checks, alerts and restarts deferred'
+            return 0
+        fi
+        return 1
+    fi
+    actual=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')
+    if [[ -n "$actual" && "$actual" == "$start" ]] && kill -0 "$pid" 2>/dev/null &&
+       jq -e --argjson now "$now" '.startedAt<=$now and .expires==(.startedAt+86400) and .expires>$now' "$file" >/dev/null;then
+        BACKUP_SUPPRESSION_REASON='Appdata backup active; health checks, alerts and restarts deferred'
+        return 0
+    fi
+    observe monitor:backup-maintenance WARNING 'Appdata backup coordination interrupted or exceeded 24 hours; normal health checks resumed' 1 || return 2
+    return 1
+}
+
+watchdog_capture_backup_plex_windows() {
+    local name info lease
+    for name in plex-media-server plex-media;do
+        info=$(docker_cmd inspect "$name" 2>/dev/null) && inspect_valid "$info" || continue
+        wd_close_downtime "$name" "$info" || return 1
+        lease="$DOCKER_MAINTENANCE_DIR/$name.appdata.json"
+        if [[ -f "$lease" ]];then
+            maintenance_active "$name" || continue
+            [[ "$ACTIVE_MAINTENANCE_LEASE" == "$lease" ]] || continue
+            wd_capture_downtime "$name" "$info" "$lease" || return 1
+        fi
+    done
+}
+
 maintenance_active() {
     ACTIVE_MAINTENANCE_LEASE=""
     local plex_journal="${PLEX_OPERATION_JOURNAL:-/mnt/vault/cloud/logs/script/media_plex_dbrepair/active-operation.json}"
@@ -2976,12 +3024,12 @@ weekly_job_delegates() {
 notify_changes() {
     local current previous body importance=normal description delegates
     delegates=$(weekly_job_delegates) || return 1
-    current="$(jq -cS --argjson delegates "$delegates" '. as $state | .observations | with_entries(select(.value.active) |
+    current="$(jq -cS --argjson delegates "$delegates" '. as $state | .observations | with_entries(select(.value.active) | select((.key|endswith(":job-maintenance"))|not) |
         select(((.key|split(":")[0]) as $name|($delegates|index($name))!=null and (.key|test(":job-(errors|warnings)$")))|not) |
         select((.key | test(":(availability|missing)$") | not) or
             (($state.flapping[(.key | split(":")[0])].unstable // false | not) and
              ($state.observations["monitor:shared-dependency"].active // false | not)))) | map_values(.severity)' "$STATE_WORK")" || return 1
-    previous="$(jq -cS --argjson delegates "$delegates" '.notification.issues | with_entries(select(((.key|split(":")[0]) as $name|($delegates|index($name))!=null and (.key|test(":job-(errors|warnings)$")))|not))' "$STATE_WORK")" || return 1
+    previous="$(jq -cS --argjson delegates "$delegates" '.notification.issues | with_entries(select((.key|endswith(":job-maintenance"))|not) | select(((.key|split(":")[0]) as $name|($delegates|index($name))!=null and (.key|test(":job-(errors|warnings)$")))|not))' "$STATE_WORK")" || return 1
     local retired_pending
     retired_pending=$(jq -r '(.inventoryOutbox // {})|length' "$STATE_WORK")
     if [[ "$current" == "$previous" && "$retired_pending" == 0 ]]; then mutate --argjson current "$current" '.notification.issues=$current'; return $?; fi
@@ -3010,8 +3058,8 @@ write_receipt() {
     local status="$1" tmp
     tmp="$(mktemp "$STATUS_DIR/.docker-watchdog.XXXXXX")" || return 1
     jq -n --slurpfile state "$STATE_WORK" --arg name docker_service_watchdog --arg status "$status" --arg version "$SCRIPT_VERSION" \
-        --arg summary "Watchdog execution complete; status=$status; recovery_enabled=$AUTO_RESTART" --arg log "$LOG_FILE" --argjson epoch "$NOW" \
-        '$state[0] as $s | {name:$name,status:$status,scriptVersion:$version,summary:$summary,log:$log,epoch:$epoch,availabilityStatus:(if any($s.observations|to_entries[];.value.active and (.key|test(":(availability|probe-configuration|missing)$"))) then "ATTENTION" else "OK" end),jobReviewCount:([$s.observations|to_entries[]|select(.value.active and (.key|test(":job-(errors|warnings)$")))]|length)}' >"$tmp" &&
+        --arg summary "${BACKUP_SUPPRESSION_REASON:-Watchdog execution complete; status=$status; recovery_enabled=$AUTO_RESTART}" --arg log "$LOG_FILE" --argjson epoch "$NOW" \
+        '$state[0] as $s | {name:$name,status:$status,scriptVersion:$version,summary:$summary,log:$log,epoch:$epoch,availabilityStatus:(if $status=="DEFERRED" then "UNVERIFIED" elif any($s.observations|to_entries[];.value.active and (.key|test(":(availability|probe-configuration|missing)$"))) then "ATTENTION" else "OK" end),jobReviewCount:([$s.observations|to_entries[]|select(.value.active and (.key|test(":job-(errors|warnings)$")))]|length)}' >"$tmp" &&
         mv -f -- "$tmp" "$STATUS_DIR/docker_service_watchdog.json"
 }
 
@@ -3025,6 +3073,7 @@ main() {
         --help|-h) printf '%s\n' 'Usage: bash docker_service_watchdog.sh [--readiness CONTAINER|--update-readiness CONTAINER|--update-schedule CONTAINER|--version|--diagnose-vpn|--diagnose CONTAINER [URL]|--maintenance CONTAINER MINUTES REASON|--record-job PROFILE EXIT_CODE [START_EPOCH]]'
             printf '%s\n' 'Schedule every five minutes. Recovery requires global AND per-service permission.' \
                 'Maintenance suppresses availability checks/restarts, freezes active findings, and expires within 24h.' \
+                'Verified appdata backup defers all watchdog checks/alerts/restarts until completion plus two minutes; dead/expired owners resume checks.' \
                 'Remove /run/docker-service-maintenance/CONTAINER.manual.json to end a manual lease early.' \
                 'Healthy/unchanged runs stay silent. Failures and recovery require consecutive scans.' \
                 'Internal schedulers need native status, timestamped whole-run evidence, or producer receipts.' \
@@ -3090,6 +3139,18 @@ main() {
     STATE_WORK="$TMP_DIR/state.json"
     load_state || return 1
     wd_prune_downtime || return 1
+    local backup_gate_rc=0
+    watchdog_backup_suppressed || backup_gate_rc=$?
+    ((backup_gate_rc!=2)) || return 1
+    if ((backup_gate_rc==0));then
+        watchdog_capture_backup_plex_windows || log WARNING 'Plex maintenance timing capture unavailable; historical job classification remains conservative'
+        mutate --argjson now "$NOW" --arg reason "$BACKUP_SUPPRESSION_REASON" '.backupMonitoring={status:"DEFERRED",observedAt:$now,reason:$reason}' || return 1
+        log INFO "$BACKUP_SUPPRESSION_REASON; existing findings preserved; no notification sent"
+        save_state && write_receipt DEFERRED || return 1
+        EXECUTION_COMPLETE=true
+        return 0
+    fi
+    mutate '.backupMonitoring={status:"ACTIVE"}' || return 1
     watchdog_schedule_inventory || return 1
     watchdog_check_execution_audit || return 1
     read -r uptime _ <"$UPTIME_FILE" || return 1
