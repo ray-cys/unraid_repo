@@ -280,7 +280,7 @@ hh_log_observations() {
         log BTRFS INFO 'Btrfs pressure coverage: not collected; only mounted, verified all-SSD Btrfs pools are eligible. Rotating array disks remain excluded.'
     fi
     summary=$(jq -nr --argjson observations "$HH_OBSERVATIONS" --argjson state "$HH_STATE" '
-      "Host probes completed: observations=\($observations|length); OK=\([$observations[]|select(.severity=="ok")]|length); warning=\([$observations[]|select(.severity=="warning")]|length); critical=\([$observations[]|select(.severity=="critical")]|length); unverified=\([$observations[]|select(.severity=="unknown")]|length); unsupported=\([$observations[]|select(.severity=="unsupported")]|length); active incidents=\([$state.conditions[]|select(.active==true)]|length). RAM receipt saved; notifications follow the existing lifecycle policy."') || return 1
+      "Host probes completed: observations=\($observations|length); OK=\([$observations[]|select(.severity=="ok")]|length); warning=\([$observations[]|select(.severity=="warning")]|length); critical=\([$observations[]|select(.severity=="critical")]|length); unverified=\([$observations[]|select(.severity=="unknown")]|length); deferred=\([$observations[]|select(.severity=="deferred")]|length); unsupported=\([$observations[]|select(.severity=="unsupported")]|length); active incidents=\([$state.conditions[]|select(.active==true)]|length). RAM receipt saved; notifications follow the existing lifecycle policy."') || return 1
     log HOST INFO "$summary"
     log HOST INFO "Coordinated health=$(jq -r .health.healthStatus "$HH_RAM_ROOT/host-health-receipt.json"); daily freshness=$(jq -r .freshness <<< "$HC_DAILY_SNAPSHOT"). Scan completion and condition health are separate."
 }
