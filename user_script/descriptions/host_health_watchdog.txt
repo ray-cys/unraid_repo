@@ -1,1 +1,1 @@
-Monitor new Unraid syslog entries for configured error keywords and host health conditions; notify only for actionable findings<br>
+Monitor host syslog, mounts, memory, capacity/inodes, CPU and disk temperatures, LAN and monitoring freshness; notify only for actionable findings<br>

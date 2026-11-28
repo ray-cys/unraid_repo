@@ -1,0 +1,42 @@
+"""Conservatively project simple Bash helper modules onto their actual callers.
+
+Modules use column-zero function signatures and closing braces/parentheses.
+References include string literals so dynamic function dispatch is retained.
+The source module remains complete for fixtures and other consumers.
+"""
+import re
+
+
+def functions(source):
+    result = {}
+    for match in re.finditer(r'^([A-Za-z_][A-Za-z0-9_]*)\(\) [({]\n', source, re.M):
+        close = re.search(r'^[})]$', source[match.end():], re.M)
+        if close is None:
+            raise ValueError(f'Unclosed helper: {match[1]}')
+        if match[1] in result:
+            raise ValueError(f'Duplicate helper: {match[1]}')
+        result[match[1]] = source[match.start():match.end() + close.end()] + '\n'
+    return result
+
+
+def project_module(source, callers, header):
+    bodies = functions(source)
+    # Fail closed if a module gains executable top-level code that the supplied
+    # header would not preserve, or a heredoc breaks the simple block convention.
+    remainder = source
+    for body in bodies.values():
+        remainder = remainder.replace(body, '', 1)
+    header_lines = set(header.splitlines())
+    for line in remainder.splitlines():
+        if line.strip() and not line.lstrip().startswith('#') and line not in header_lines:
+            raise ValueError(f'Unpreserved module content: {line[:80]}')
+    roots = set(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', callers)) & bodies.keys()
+    retained = set(roots)
+    todo = list(roots)
+    while todo:
+        name = todo.pop()
+        dependencies = set(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', bodies[name])) & bodies.keys()
+        for dependency in dependencies - retained:
+            retained.add(dependency)
+            todo.append(dependency)
+    return header.rstrip() + '\n' + '\n'.join(body for name, body in bodies.items() if name in retained)

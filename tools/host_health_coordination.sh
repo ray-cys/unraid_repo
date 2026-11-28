@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Shared contract v1: collectors retain alert/recovery ownership; peer context
+# Shared health contract: collectors retain alert/recovery ownership; peer context
 # never creates or clears another collector's incidents. No extra scheduler.
 hc_owned_json() {
     local file="$1"

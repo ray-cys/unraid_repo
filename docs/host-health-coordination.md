@@ -81,3 +81,18 @@ near-limit temperature evidence: they support real maintenance decisions. Routin
 trend diagnostics remain in logs/history. They do not generate daily recommendation
 emails, failure-date predictions, weighted risk scores or automatic replacement.
 Action recommendations accompany actual findings, not every routine run.
+
+## Source maintenance
+
+Host deployments embed only the shared helpers reachable from their callers.
+The source modules remain complete for fixtures and other scripts; generation
+retains transitive and dynamically referenced helpers and rejects unsupported
+top-level module code. `sync_operations_contract.py --only host_health_monitor
+host_health_watchdog` limits regeneration to the two host scripts. The standalone
+call-dependency fixtures guard against missing helpers after regeneration.
+
+Measured-history confidence helpers describe sample quality. Existing
+`FORECAST_*` configuration keys remain supported for those active quality limits;
+they do not enable lifetime or failure-date predictions. Published TBW model rules
+accept only the fields used by current endurance monitoring. State migration and
+retired-alert filters remain because they protect restoration of existing state.

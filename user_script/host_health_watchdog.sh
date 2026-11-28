@@ -1,71 +1,27 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="1.10.1"
+readonly SCRIPT_VERSION="1.10.2"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'host_health_watchdog.sh %s\n' "$SCRIPT_VERSION"
     exit 0
 fi
-# FRESHNESS: successful scan/delivery publishes a current-boot receipt to the
-# central status directory. The hourly backup audit checks enabled dynamic cadence;
-# a failed invocation cannot advance that successful-scan timestamp.
-clearLog=true
-
-###############################################################################
-# Host Health Watchdog
-#
-# PURPOSE
-# -------
-# Monitor new Unraid syslog entries for configured error keywords and notify
-# only when new, non-ignored matching entries are detected.
-#
-# The existing five-minute invocation also owns required mounts, root/boot/Docker
-# capacity, available memory, trusted CPU limits, SSD-pool Btrfs pressure and LAN
-# degradation. It groups condition transitions, recovery and daily reminders with
-# new syslog findings. Unknown evidence cannot resolve an incident. No repair or
-# restart is performed. Native disk tests and scrub freshness remain daily owners.
-# Host state is RAM-first, mirrored hourly/on pending alerts when vault is writable.
-#
-#
-# WORKFLOW
-# --------
-#   1. Acquire single-instance lock
-#   2. Validate /var/log/syslog
-#   3. Determine new syslog lines since the previous run
-#   4. Recover across normal syslog rotation when possible
-#   5. Filter configured error keywords
-#   6. Remove known benign patterns
-#   7. Send one grouped Unraid notification for new matches
-#   8. Advance the syslog cursor
-#   9. Check /var/log filesystem utilization
-#
-#
-# STATE
-# -----
-# Runtime state is stored under /tmp and is intentionally non-persistent.
-#
-# After an Unraid reboot, the first run scans STARTUP_LOOKBACK_LINES from the
-# current syslog before establishing a new cursor.
-#
-#
-# SCHEDULING
-# ----------
-# Scheduling is managed externally by Unraid User Scripts.
-# This script does not create or modify its own schedule.
-#
-###############################################################################
+# Purpose: Frequent syslog, CPU/disk temperature, memory, mount, capacity,
+# LAN and monitoring-freshness checks with grouped actionable notifications.
+# Native Unraid temperature readings do not poll SMART or wake sleeping disks.
+# Missing evidence cannot clear an incident; recovery needs healthy confirmation.
+# The daily monitor owns SMART, endurance, disk tests and scrub verification.
+# Host lifecycle state is RAM-first and mirrored to the vault; syslog incident
+# history and review markers retain their existing durable storage and policies.
+# Bounded chronological syslog processing resumes from its cursor. A separate
+# critical-tail check protects urgent events when an ordinary backlog remains.
+# --health-status reads the coordinated receipt. --help lists supported read-only
+# status and incident-review commands. Scheduling remains in Unraid User Scripts.
 
 # BEGIN EMBEDDED OPERATIONS CONTRACT
 OPS_SCRIPT_ID="host_health_watchdog"
 # shellcheck shell=bash
-# Embedded operations contract v2; generated into standalone User Scripts.
-# Millisecond timing without spawning date on supported Bash; GNU fallback.
-usr_ops_now_ms() {
-    local stamp="${EPOCHREALTIME:-}"
-    if [[ "$stamp" =~ ^[0-9]+\.[0-9]{6}$ ]];then stamp=${stamp/./};printf '%s\n' "${stamp:0:${#stamp}-3}"
-    else stamp=$(date +%s%N) || return 1;printf '%s\n' "${stamp:0:${#stamp}-6}";fi
-}
-
+# Shared operational logs, notifications and execution receipts.
 usr_ops_log_line() {
     local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
     case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
@@ -75,8 +31,6 @@ usr_ops_log_line() {
     printf '%s\n' "$line"
 }
 
-# Accept the original command, including its timeout, so producer-specific
-# delivery/cooldown/acknowledgement semantics stay with the owning script.
 usr_ops_notify() {
     local -a args=("$@")
     local i importance=normal summary='' message='' index=-1 status=UPDATE
@@ -98,91 +52,9 @@ usr_ops_notify() {
     else args=(timeout --signal=TERM --kill-after=5 30 "${args[@]}");fi
     local delivery_rc=0
     "${args[@]}" || delivery_rc=$?
-    usr_ops_delivery_record "$delivery_rc" "$importance" "$summary" "$message" "${args[@]}" || printf 'Notification delivery evidence could not be queued; producer failure remains active.\n' >&2
     return "$delivery_rc"
 }
 
-# Bounded local history for scripts previously dependent on the plugin console.
-usr_ops_append_log() {
-    local file="$1" line="$2" max="${3:-2097152}" i
-    [[ -d "${file%/*}" && ! -L "$file" ]] || return 1
-    for i in 1 2;do [[ ! -L "$file.$i" ]] || return 1;done
-    find "${file%/*}" -maxdepth 1 -type f \( -name "${file##*/}.1" -o -name "${file##*/}.2" \) -mtime +29 -delete || return 1
-    if [[ -f "$file" ]] && (( $(stat -c %s "$file")+${#line}+1>max ));then
-        rm -f "$file.2";[[ ! -f "$file.1" ]] || mv "$file.1" "$file.2";mv "$file" "$file.1" || return 1
-    fi
-    printf '%s\n' "$line" >>"$file"
-}
-
-
-# Durable failed-delivery evidence for producers without their own outbox.
-# Existing media/DNS/watchdog outboxes keep ownership of their delivery policy.
-usr_ops_delivery_record() (
-    local rc="$1" importance="$2" summary="$3" message="$4" subject='' i key root fd tmp
-    shift 4
-    case "${OPS_SCRIPT_ID:-}" in backup_boot_disk|backup_cache_appdata|backup_media_remote|backup_vault_remote|backup_restore_drill|media_plex_dbrepair) ;; *) return 0;; esac
-    local -a original=("$@")
-    local native_delivery=false arg export_fd ram="${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}"
-    for arg in "${original[@]}";do [[ "$arg" != /usr/local/emhttp/webGui/scripts/notify ]] || native_delivery=true;done
-    [[ "$native_delivery" == true || -n "${USR_OPS_DELIVERY_ROOT:-}" ]] || return 0
-    for ((i=0;i<${#original[@]};i++));do [[ "${original[$i]}" != -s ]] || subject="${original[$((i+1))]:-}";done
-    root="${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}"
-    exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}"
-    if ! mountpoint -q "${USR_OPS_VAULT_MOUNT:-/mnt/vault}" || ! flock -s -n "$export_fd";then root="$ram";fi
-    [[ ! -L "$root" && $(realpath -m "$root") == "$root" ]] || return 1
-    mkdir -p "$root" || return 1;chmod 700 "$root" || return 1
-    exec {fd}>"${USR_OPS_DELIVERY_LOCK:-/run/user-script-delivery.lock}";flock -w 3 "$fd" || return 1
-    key=$(printf '%s\0' "$OPS_SCRIPT_ID" "$importance" "$subject" "$summary" "$message"|sha256sum|cut -d ' ' -f1)
-    if ((rc==0));then
-        if [[ "$OPS_SCRIPT_ID" == backup_vault_remote && -n "${USR_OPS_DELIVERY_CONTEXT:-}" ]];then
-            mkdir -p "$root/.delivery-receipts" || return 1
-            tmp=$(mktemp "$root/.delivery-receipts/.accepted.XXXXXX") || return 1
-            jq -n --arg context "$USR_OPS_DELIVERY_CONTEXT" --argjson at "$(date +%s)" '{schema:1,context:$context,acceptedAt:$at}' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$root/.delivery-receipts/backup_vault_remote.json" || return 1
-        fi
-        rm -f -- "$root/$OPS_SCRIPT_ID.$key.json" "$ram/$OPS_SCRIPT_ID.$key.json";return
-    fi
-    (( $(find "$root" -maxdepth 1 -type f -name '*.json'|wc -l)<100 )) || [[ -f "$root/$OPS_SCRIPT_ID.$key.json" ]] || return 1
-    tmp=$(mktemp "$root/.delivery.XXXXXX") || return 1
-    trap 'rm -f -- "$tmp"' EXIT
-    jq -n --arg context "${USR_OPS_DELIVERY_CONTEXT:-}" --arg id "$key" --arg script "$OPS_SCRIPT_ID" --arg importance "$importance" --arg subject "$subject" --arg summary "$summary" --arg message "$message" --argjson at "$(date +%s)" \
-      '{schema:1,context:$context,id:$id,script:$script,importance:$importance,subject:$subject,summary:$summary,message:$message,queuedAt:$at}' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$root/$OPS_SCRIPT_ID.$key.json"
-)
-
-usr_ops_vault_delivery_seen() {
-    local context="$1" cutoff="${2:-0}" root file
-    [[ -n "$context" ]] || return 1
-    for root in "${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}" "${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}";do
-        file="$root/.delivery-receipts/backup_vault_remote.json"
-        [[ -f "$file" && ! -L "$file" ]] || continue
-        jq -e --arg context "$context" --argjson cutoff "$cutoff" --argjson now "$(date +%s)" '.schema==1 and .context==$context and .acceptedAt>=$cutoff and .acceptedAt<=$now+300' "$file" >/dev/null 2>&1 && return 0
-    done
-    return 1
-}
-
-usr_ops_retry_deliveries() {
-    local root="${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}" file count=0 subject summary message importance owner old_owner="${OPS_SCRIPT_ID:-}" rc=0
-    local ram="${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}" digest old_context="${USR_OPS_DELIVERY_CONTEXT:-}" context
-    [[ ! -L "$root" && ! -L "$ram" ]] || return 1
-    [[ -d "$root" || -d "$ram" ]] || return 0
-    while IFS= read -r -d '' file;do
-        ((count<3)) || break
-        jq -e '(.schema==1) and (.script|test("^(backup_(boot_disk|cache_appdata|media_remote|vault_remote|restore_drill)|media_plex_dbrepair)$")) and (.importance|IN("normal","warning","alert")) and all(.subject,.summary,.message;type=="string")' "$file" >/dev/null 2>&1 || continue
-        owner=$(jq -r .script "$file");subject=$(jq -r .subject "$file");summary=$(jq -r .summary "$file");message=$(jq -r .message "$file");importance=$(jq -r .importance "$file")
-        context=$(jq -r '.context // ""' "$file")
-        if [[ "$owner" == backup_vault_remote ]] && usr_ops_vault_delivery_seen "$context" "$(jq -r .queuedAt "$file")";then rm -f -- "$file";continue;fi
-        USR_OPS_DELIVERY_CONTEXT="$context"
-        digest=$(sha256sum "$file"|cut -d ' ' -f1)
-        OPS_SCRIPT_ID="$owner";count=$((count+1))
-        if usr_ops_notify "${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}" -i "$importance" -s "$subject" -d "$summary" -m "$message";then
-            if [[ -f "$file" && $(sha256sum "$file"|cut -d ' ' -f1) == "$digest" ]];then rm -f -- "$file";fi
-        else rc=1;fi
-        OPS_SCRIPT_ID="$old_owner";USR_OPS_DELIVERY_CONTEXT="$old_context"
-    done < <(find "$root" "$ram" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null|sort -zu)
-    return "$rc"
-}
-
-# Scheduled executions have an independent parent recording the final exit,
-# after producer EXIT traps. CLI operations and sourced libraries are unchanged.
 usr_ops_execution_record() (
     local phase="$1" started="$2" pid="$3" rc="${4:-0}" process_start root="${USR_OPS_EXECUTION_ROOT:-/run/user-script-execution}" file tmp now boot old='{}' status
     [[ "${OPS_SCRIPT_ID:-}" =~ ^[a-z0-9_]+$ && ! -L "$root" ]] || return 1
@@ -237,22 +109,6 @@ usr_ops_supervise() {
     [[ "$record_owner" != true ]] || usr_ops_execution_record finish "$started" "$pid" "$rc" || printf 'Completion receipt unavailable for %s (exit=%s).\n' "$OPS_SCRIPT_ID" "$rc" >&2
     trap - TERM HUP INT
     return "$rc"
-}
-
-# Network observation after an accepted shutdown, never a power-state claim.
-# No WOL or second poweroff is issued. Native maintenance checks remain upstream.
-usr_ops_observe_shutdown() {
-    local BACKUP_SSH_COMMAND_TIMEOUT=6
-    local host="${REMOTE#*@}" deadline=$(( $(date +%s)+${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90} )) misses=0
-    [[ "${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90}" != 0 ]] || { SHUTDOWN_RESULT=requested_observation_disabled;return 0; }
-    while (( $(date +%s)<deadline ));do
-        if timeout --kill-after=1 5 ping -c 1 -W 2 "$host" >/dev/null 2>&1 || backup_ssh true >/dev/null 2>&1;then misses=0
-        else misses=$((misses+1));fi
-        if ((misses>=3));then SHUTDOWN_RESULT=offline_observed;return 0;fi
-        sleep 5
-    done
-    SHUTDOWN_RESULT=requested_still_reachable;REMOTE_SHUTDOWN_FAILED=1
-    return 1
 }
 # END EMBEDDED OPERATIONS CONTRACT
 # BEGIN SCHEDULED EXECUTION SUPERVISOR
@@ -537,15 +393,6 @@ get_plain_line_count() {
 }
 
 
-read_log_all() {
-    local file="$1"
-
-    if [[ "$file" == *.gz ]]; then
-        gzip -cd -- "$file"
-    else
-        cat -- "$file"
-    fi
-}
 
 
 read_log_from_line() {
@@ -1296,9 +1143,11 @@ hh_mount_info() {
     if [[ -z "$fs" ]];then printf '{"mounted":false,"readOnly":false,"type":""}\n';return;fi
     jq -nc --arg fs "$fs" --arg options "$options" '{mounted:true,type:$fs,readOnly:($options|split(",")|index("ro")!=null)}'
 }
+
 hh_array_state() {
     awk -F= 'tolower($1)=="mdstate" {gsub(/[" \r]/,"",$2);print tolower($2);exit}' "${HH_VAR_INI:-/var/local/emhttp/var.ini}" 2>/dev/null
 }
+
 hh_expected_mounts() {
     printf '/boot\n'
     [[ "$(hh_array_state)" == started ]] || return 0
@@ -1311,6 +1160,7 @@ hh_expected_mounts() {
     ' "${HH_DISKS_INI:-/var/local/emhttp/disks.ini}" 2>/dev/null
     if grep -Eqi '^DOCKER_ENABLED="?(yes|true|1)"?$' "${HH_DOCKER_CFG:-/boot/config/docker.cfg}" 2>/dev/null;then printf '/var/lib/docker\n';fi
 }
+
 hh_btrfs_metrics() {
     local usage="$1" show="${2:-}" parsed missing=false
     grep -qiE 'Some devices missing|path[[:space:]]+missing' <<< "$show" && missing=true
@@ -1332,8 +1182,7 @@ hh_btrfs_metrics() {
            (if .metadataPercent>=99 and .reserveUsedBytes>0 then "critical" else "warning" end)
          else "ok" end)}' <<< "$parsed"
 }
-# A cron deadline is computed from the actual native schedule, using local time.
-# Supports lists, ranges, steps, Sunday 0/7 and standard DOM/DOW OR semantics.
+
 hh_cron_last_due() {
     local expression="$1" now="$2"
     php /dev/stdin "$expression" "$now" "$HH_TIMEZONE" <<'PHP'
@@ -1350,12 +1199,6 @@ $match=$domStar&&$dowStar?($dom&&$dow):($domStar?$dow:($dowStar?$dom:($dom||$dow
 foreach($hours as$h)foreach($minutes as$m){$t=$day->setTime($h,$m)->getTimestamp();if($t<=$now){echo json_encode(['valid'=>true,'dueEpoch'=>$t,'dueLocal'=>$day->setTime($h,$m)->format('Y-m-d H:i:s T')]);exit;}}}
 echo '{"valid":true,"dueEpoch":0}';
 PHP
-}
-hh_fast_receipt_owns() {
-    local id="$1" now="$2" file="${HH_FAST_RECEIPT:-/run/host-health-receipt.json}" boot
-    [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file" 2>/dev/null) == "$EUID" && $(stat -c %h "$file" 2>/dev/null) == 1 ]] || return 1
-    boot=$(cat /proc/sys/kernel/random/boot_id)
-    jq -e --arg id "$id" --arg boot "$boot" --argjson now "$now" '.schema==1 and .status=="COMPLETE" and .bootId==$boot and .observedAt<=$now+60 and .observedAt>=$now-900 and any(.observations[]; .id==$id and (.severity|IN("ok","warning","critical")))' "$file" >/dev/null 2>&1
 }
 # END HOST HEALTH COMMON
 
@@ -1673,14 +1516,14 @@ host_external_status() {
 
 # BEGIN HOST HEALTH COORDINATION
 # shellcheck shell=bash
-# Shared contract v1: collectors retain alert/recovery ownership; peer context
-# never creates or clears another collector's incidents. No extra scheduler.
+# Coordinated health evidence; each producer retains incident ownership.
 hc_owned_json() {
     local file="$1"
     [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file" 2>/dev/null) == "$EUID" && $(stat -c %h "$file" 2>/dev/null) == 1 ]] || return 1
     (( $(stat -c %s "$file" 2>/dev/null || echo 9999999) <= 2097152 )) || return 1
     jq -e 'type=="object"' "$file" >/dev/null 2>&1
 }
+
 hc_daily_snapshot() {
     local now="$1" file="${HC_DAILY_RECEIPT:-/mnt/vault/cloud/logs/script/host_health_monitor/state/monitor_receipt.json}" schedule="${HC_SCHEDULE_FILE:-/boot/config/plugins/user.scripts/schedule.json}"
     local old='{}' evidence='{}' plan=unknown cron='' due='{"valid":false}' boot
@@ -1710,6 +1553,7 @@ hc_daily_snapshot() {
        findings:(if $freshness=="NOT_SCHEDULED" then [] else ($evidence.findings//[]) end),coverage:($evidence.coverage//null),thresholds:($evidence.thresholds//{}),
        delivery:($producer.notification//"unknown")}'
 }
+
 hc_probe_action() {
     case "$1" in
       cpu:*|disk-temperature:*) printf 'Inspect cooling and airflow; reduce load if overheating persists. No cooling or hardware settings were changed.';;
@@ -1722,6 +1566,7 @@ hc_probe_action() {
       *) printf 'Review the reported evidence and restore the affected collector or service. No automatic repair was attempted.';;
     esac
 }
+
 hc_daily_probe() {
     HC_DAILY_SNAPSHOT=$(hc_daily_snapshot "$HH_NOW") || HC_DAILY_SNAPSHOT='{"freshness":"UNVERIFIED","executionStatus":"unverified","findings":[],"thresholds":{}}'
     local freshness severity=ok detail
@@ -1735,6 +1580,7 @@ hc_daily_probe() {
     detail=$(jq -r '"Daily collector freshness=\(.freshness); latest execution=\(.executionStatus); retained disk findings=\(.findings|length). Last completed evidence="+(.observedAt|tostring)+". Findings remain owned by the daily monitor; schedule grace=2h."' <<< "$HC_DAILY_SNAPSHOT")
     hh_observe monitor:daily-health "$severity" 'Daily disk monitoring' "$detail" 2
 }
+
 hc_disk_temperatures() {
     local file="${HH_DISKS_INI:-/var/local/emhttp/disks.ini}" stamp slot dev native_id temp rota kind warn crit severity id count=0
     stamp=$(stat -c %Y "$file" 2>/dev/null) || stamp=0
@@ -1774,6 +1620,7 @@ hc_disk_temperatures() {
     if ((count==0));then hh_observe monitor:disk-temperatures unknown 'Native disk temperature coverage' 'No eligible device identities found in current Unraid metadata.'
     else hh_observe monitor:disk-temperatures ok 'Native disk temperature coverage' "$count device(s) inventoried; sleeping/unverified readings are deferred explicitly.";fi
 }
+
 hc_combined_health() {
     local observations="$1" state="$2" now="$3" daily active storage
     daily=${HC_DAILY_SNAPSHOT:-};[[ -n "$daily" ]] || daily=$(hc_daily_snapshot "$now") || daily='{"freshness":"UNVERIFIED","executionStatus":"unverified","findings":[]}'
@@ -1791,6 +1638,7 @@ hc_combined_health() {
         elif ($storage.evidenceVerified|not) or $storage.executionStatus=="FAILED" or ($storage.fresh|not) or ($daily.freshness|IN("STALE","UNVERIFIED")) or any($observations[];.severity=="unknown") then "UNVERIFIED" elif any($observations[];(.severity|IN("warning","critical")) and (.delegated//false|not)) then "CONFIRMING" else "OK" end),
        coverage:{observations:($observations|length),unverified:([$observations[]|select(.severity=="unknown")]|length),deferred:([$observations[]|select(.severity=="deferred")]|length),unsupported:([$observations[]|select(.severity=="unsupported")]|length)}}'
 }
+
 hc_peer_context() {
     local role="$1" now="$2" daily fast='{}' file="${HC_FAST_RECEIPT:-/run/host-health-receipt.json}"
     if [[ "$role" == watchdog ]];then
@@ -1802,58 +1650,7 @@ hc_peer_context() {
         else printf 'Fast host context: UNVERIFIED; recent same-boot watchdog evidence unavailable. Daily disk findings remain independently reported.\n';fi
     fi
 }
-hc_export_daily_evidence() {
-    local now="$1" id rows='[]' row prior='[]' file="${MONITOR_RECEIPT_FILE:-}" boot
-    boot=$(cat /proc/sys/kernel/random/boot_id) || return 1
-    for id in "${FINDING_IDS[@]}";do
-        row=$(jq -nc --arg id "$id" --arg severity "${FINDING_SEVERITY[$id]}" --arg title "${FINDING_TITLE[$id]}" --arg detail "${FINDING_EVIDENCE[$id]}" --arg action "${FINDING_ACTION[$id]}" --arg device "${FINDING_DEVICE[$id]:-}" '{device:$device,id:$id,severity:$severity,title:$title,detail:$detail,action:$action,verification:"observed"}') || return 1
-        rows=$(jq -nc --argjson rows "$rows" --argjson row "$row" '$rows+[$row]') || return 1
-    done
-    hc_owned_json "$file" && prior=$(jq -c '.healthEvidence.findings//[]' "$file")
-    for id in "${NOTIFY_CARRY_IDS[@]}";do
-        [[ -z "${FINDING_SEEN[$id]:-}" ]] || continue
-        row=$(jq -nc --argjson prior "$prior" --arg id "$id" --arg severity "${NOTIFY_PREV_SEVERITY[$id]:-warning}" --arg title "${NOTIFY_PREV_LABEL[$id]:-Previous disk finding}" '([$prior[]|select(.id==$id)][0]//{id:$id,severity:$severity,title:$title,detail:"Previous finding retained; fresh recovery confirmation remains outstanding.",action:"Review current disk evidence; absence of a sample is not recovery."})+{verification:"awaiting-confirmation"}') || return 1
-        rows=$(jq -nc --argjson rows "$rows" --argjson row "$row" '$rows+[$row]') || return 1
-    done
-    jq -nc --argjson at "$now" --arg boot "$boot" --argjson findings "$rows" --argjson coverage "${HOST_HEALTH_COVERAGE:-null}" --argjson hw "$HDD_TEMP_WARNING" --argjson hc "$HDD_TEMP_CRITICAL" --argjson sw "$SSD_TEMP_WARNING" --argjson sc "$SSD_TEMP_CRITICAL" --argjson nw "$NVME_TEMP_WARNING" --argjson nc "$NVME_TEMP_CRITICAL" '{schema:1,observedAt:$at,bootId:$boot,findings:$findings,coverage:$coverage,thresholds:{hdd:{warning:$hw,critical:$hc},ssd:{warning:$sw,critical:$sc},nvme:{warning:$nw,critical:$nc}}}'
-}
-hc_fast_temperature_owns() {
-    local disk="$1" severity="${2,,}" file="${HC_FAST_RECEIPT:-/run/host-health-receipt.json}" daily="${MONITOR_RECEIPT_FILE:-}" now boot
-    now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id)
-    # Once the daily fallback reported an incident, it retains recovery ownership.
-    if hc_owned_json "$daily" && jq -e --arg disk "$disk" 'any(.healthEvidence.findings[]?;.device==$disk and (.id|endswith("|temp")))' "$daily" >/dev/null;then return 1;fi
-    hc_owned_json "$file" || return 1
-    jq -e --arg disk "$disk" --arg severity "$severity" --arg boot "$boot" --argjson now "$now" '
-      ([.observations[]?|select(.device==$disk and (.id|startswith("disk-temperature:")))|.id]) as $ids |
-      .bootId==$boot and .observedAt<=$now+60 and .observedAt>=$now-900 and
-      any(.health.fastFindings[]?;(.id as $id|$ids|index($id))!=null and .pending=="" and
-       (.severity=="critical" or ($severity=="warning" and .severity=="warning")))' "$file" >/dev/null
-}
-hc_thermal_only_messages() {
-    local piece has_temperature=false
-    local -a pieces=()
-    IFS=';' read -r -a pieces <<< "$1"
-    for piece in "${pieces[@]}";do
-        piece=${piece#"${piece%%[![:space:]]*}"}
-        case "$piece" in
-          'NVMe Temp '*|'HDD Temp '*|'SSD Temp '*|'SAS HDD Temp '*) has_temperature=true;;
-          'TBW ~ '*|'Read ~ '*|'Endurance used='*|'') ;;
-          *) return 1;;
-        esac
-    done
-    [[ "$has_temperature" == true ]]
-}
-hc_daily_watchdog_guard() {
-    local now file="${HC_FAST_RECEIPT:-/run/host-health-receipt.json}" boot schedule="${HC_SCHEDULE_FILE:-/boot/config/plugins/user.scripts/schedule.json}"
-    now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id)
-    if hc_owned_json "$schedule" && jq -e '[to_entries[]|select(.key|endswith("/host_health_watchdog/script"))][0].value.frequency as $frequency | ($frequency==null or ($frequency|IN("manual","disabled","never")))' "$schedule" >/dev/null;then HC_FAST_FRESH=0;return 0;fi
-    if hc_owned_json "$file" && jq -e --arg boot "$boot" --argjson now "$now" '.status=="COMPLETE" and .bootId==$boot and .observedAt<=$now+60 and .observedAt>=$now-900' "$file" >/dev/null;then
-        HC_FAST_FRESH=1
-        return 0
-    fi
-    HC_FAST_FRESH=0
-    record_finding warning monitoring monitoring.freshness '' 'Fast host watchdog evidence unavailable' 'No recent same-boot fast host receipt; daily disk checks and mount/filesystem/syslog fallbacks continue independently.' 'Review host_health_watchdog and its existing five-minute schedule. No service or disk maintenance was forced.' host_watchdog_stale
-}
+
 hc_storage_snapshot() {
     local now="$1" file="${SYSLOG_INCIDENT_ROOT:-/mnt/vault/cloud/logs/script/host_health_watchdog}/incidents.json" events='[]' xfs='[]' heartbeat=0
     local ledger="${XFS_INCIDENT_FILE:-/boot/config/plugins/user.scripts/scripts/host_health_watchdog/xfs_faults.tsv}" verified=true
@@ -1869,6 +1666,7 @@ hc_storage_snapshot() {
     [[ "$heartbeat" =~ ^[0-9]+$ ]] || heartbeat=0
     jq -nc --argjson verified "$verified" --argjson events "$events" --argjson xfs "$xfs" --argjson heartbeat "$heartbeat" --argjson now "$now" --arg execution "${HC_SYSLOG_RUN_STATUS:-NOT_COLLECTED_THIS_INVOCATION}" '{evidenceVerified:$verified,executionStatus:$execution,lastSuccessfulScanEpoch:$heartbeat,fresh:($heartbeat>0 and $heartbeat<=$now+60 and $heartbeat>=$now-1200),recentCriticalEvents:$events,openXfsSources:$xfs}'
 }
+
 hc_print_status() {
     local file="${HC_FAST_RECEIPT:-/run/host-health-receipt.json}" now boot
     now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id)

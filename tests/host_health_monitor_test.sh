@@ -7,7 +7,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../user_script/host_health_monitor.sh
 source "$REPO_ROOT/user_script/host_health_monitor.sh"
 
-readonly REGRESSION_FIXTURE_COUNT=129
+readonly REGRESSION_FIXTURE_COUNT=127
 
 self_test_result() {
     local passed="$1" name="$2" detail="${3:-}"
@@ -150,7 +150,6 @@ run_regression_tests() (
     if (
         local BTRFS_SCRUB_STATE_DIR="$fixture_dir/scrub-state"
         hm_pool_health() { :; } # Allocation/deadline behaviour has separate native fixtures.
-        local ENABLE_BTRFS_SCRUB=0 FIRST_RUN_FORCE=0
         mkdir "$BTRFS_SCRUB_STATE_DIR"
         mount() { printf '/dev/sda on /mnt/cache type btrfs (rw)\n'; }
         btrfs_df_cached() { :; }
@@ -352,10 +351,9 @@ run_regression_tests() (
 
     SMART_DEFERRED=()
     DISCOVERED_DISKS=()
-    declare -A RISK_MAP=()
+
     if (( ${#SMART_DEFERRED[@]} == 0 &&
-          ${#DISCOVERED_DISKS[@]} == 0 &&
-          ${#RISK_MAP[@]} == 0 ))
+          ${#DISCOVERED_DISKS[@]} == 0 ))
     then
         self_test_result 1 "Empty global arrays remain safe under nounset"
     else
@@ -740,39 +738,22 @@ run_regression_tests() (
     for case_data in "${confidence_cases[@]}"; do
         expected="${case_data#*|}"
         read -r -a confidence_args <<< "${case_data%%|*}"
-        actual=$(forecast_confidence "${confidence_args[@]}")
+        actual=$(history_sample_confidence "${confidence_args[@]}")
         [[ "$actual" == "$expected" ]] || confidence_failures=$((confidence_failures + 1))
     done
     if (( confidence_failures == 0 )); then
-        self_test_result 1 "Forecast confidence classification"
+        self_test_result 1 "History sample confidence classification"
     else
-        self_test_result 0 "Forecast confidence classification" "$confidence_failures case(s) failed"
+        self_test_result 0 "History sample confidence classification" "$confidence_failures case(s) failed"
     fi
 
-    if forecast_confidence_is_actionable MEDIUM &&
-       forecast_confidence_is_actionable HIGH &&
-       ! forecast_confidence_is_actionable LOW
+    if history_confidence_is_actionable MEDIUM &&
+       history_confidence_is_actionable HIGH &&
+       ! history_confidence_is_actionable LOW
     then
-        self_test_result 1 "Forecast actionability gate"
+        self_test_result 1 "History evidence actionability gate"
     else
-        self_test_result 0 "Forecast actionability gate"
-    fi
-
-    actual="$(forecast_confidence_description HIGH)|$(forecast_confidence_description MEDIUM)|$(forecast_confidence_description RESET)"
-    if [[ "$actual" == \
-          'high forecast confidence|medium forecast confidence|counter reset detected; forecast rebuilding' ]]
-    then
-        self_test_result 1 "Human-readable forecast confidence descriptions"
-    else
-        self_test_result 0 "Human-readable forecast confidence descriptions" \
-            "found '$actual'"
-    fi
-
-    actual="$(format_bytes_per_day 1230000000)"
-    if [[ "$actual" == '1.23 GB/day' ]]; then
-        self_test_result 1 "Explicit daily byte-rate units"
-    else
-        self_test_result 0 "Explicit daily byte-rate units" "found '$actual'"
+        self_test_result 0 "History evidence actionability gate"
     fi
 
     local writer_base_epoch=1787000000 writer_day=86400
@@ -892,15 +873,15 @@ run_regression_tests() (
     RUN_EPOCH=$(date +%s)
     TREND_HISTORY_CACHE=()
     TEMP_RATE_ALERT_ENABLED=0
-    TEMP_FORECAST_CONFIDENCE_LINE=""
+    TEMP_HISTORY_QUALITY_LINE=""
     analyze_temperature_trends
-    if [[ "$TEMP_FORECAST_CONFIDENCE_LINE" == \
+    if [[ "$TEMP_HISTORY_QUALITY_LINE" == \
           'Temperature history is stale for 1 disk, likely because it is sleeping' ]]
     then
         self_test_result 1 "Human-readable stale temperature explanation"
     else
         self_test_result 0 "Human-readable stale temperature explanation" \
-            "found '$TEMP_FORECAST_CONFIDENCE_LINE'"
+            "found '$TEMP_HISTORY_QUALITY_LINE'"
     fi
     DEVICE_ID_BY_PATH=()
     DEVICE_PATH_BY_ID=()
@@ -1198,7 +1179,7 @@ run_regression_tests() (
     FINDING_TITLE=()
     FINDING_EVIDENCE=()
     FINDING_ACTION=()
-    declare -A RISK_MAP=()
+
     MOUNT_TO_DEV=()
     POOL_MEMBER_MAP=()
 
@@ -1266,7 +1247,7 @@ run_regression_tests() (
     FINDING_TITLE=()
     FINDING_EVIDENCE=()
     FINDING_ACTION=()
-    declare -A RISK_MAP=()
+
     LOG_MIRROR_STDOUT=0
     record_finding warning monitoring monitoring.timeout "" \
         "Collector timeout" "Fixture collector exceeded deadline." \
@@ -1353,7 +1334,7 @@ run_regression_tests() (
     NOTIFICATION_RECOVERY_STATE_FILE="$notification_dir/recovery.state"
     COLLECTOR_ORDER=()
     COLLECTOR_STATUS=()
-    declare -A RISK_MAP=()
+
     NOTIFICATION_LIFECYCLE_ENABLED=1
     NOTIFICATION_WARNING_REMINDER_HOURS=24
     NOTIFICATION_CRITICAL_REMINDER_HOURS=6
@@ -1766,7 +1747,10 @@ run_regression_tests() (
     if (
         local SHORT_TEST_INTERVAL_DAYS=7 disk=/dev/sdz
         LAST_TEST_EPOCH[$disk]=$(date -d '7 days ago 23:59' +%s)
-        short_test_is_due "$disk" && [[ "$(short_test_next_date "$disk")" == "$(date +%F) 00:00" ]]
+        local RUN_EPOCH=$(date +%s) id
+        id=$(persistent_device_key "$disk")
+        TEST_TRACK["$id|shortAnchor"]="${LAST_TEST_EPOCH[$disk]}"
+        calendar_test_due "$disk" short "$SHORT_TEST_INTERVAL_DAYS" && [[ "$(short_test_next_date "$disk")" == "$(date +%F) 00:00" ]]
     ); then self_test_result 1 "Weekly self-test eligibility tolerates daily start-time jitter"
     else self_test_result 0 "Weekly self-test eligibility tolerates daily start-time jitter"; fi
 

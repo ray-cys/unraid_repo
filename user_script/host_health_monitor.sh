@@ -1,24 +1,16 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="3.5.0"
+readonly SCRIPT_VERSION="3.5.1"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'host_health_monitor.sh %s\n' "$SCRIPT_VERSION"
     exit 0
 fi
-#clearLog=true
 # shellcheck disable=SC2034,SC2155
 # BEGIN EMBEDDED OPERATIONS CONTRACT
 OPS_SCRIPT_ID="host_health_monitor"
 # shellcheck shell=bash
-# Embedded operations contract v2; generated into standalone User Scripts.
-# Millisecond timing without spawning date on supported Bash; GNU fallback.
-usr_ops_now_ms() {
-    local stamp="${EPOCHREALTIME:-}"
-    if [[ "$stamp" =~ ^[0-9]+\.[0-9]{6}$ ]];then stamp=${stamp/./};printf '%s\n' "${stamp:0:${#stamp}-3}"
-    else stamp=$(date +%s%N) || return 1;printf '%s\n' "${stamp:0:${#stamp}-6}";fi
-}
-
+# Shared operational logs, notifications and execution receipts.
 usr_ops_log_line() {
     local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
     case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
@@ -28,113 +20,6 @@ usr_ops_log_line() {
     printf '%s\n' "$line"
 }
 
-# Accept the original command, including its timeout, so producer-specific
-# delivery/cooldown/acknowledgement semantics stay with the owning script.
-usr_ops_notify() {
-    local -a args=("$@")
-    local i importance=normal summary='' message='' index=-1 status=UPDATE
-    for ((i=0;i<${#args[@]};i++));do
-        case "${args[$i]}" in
-          -i) importance="${args[$((i+1))]:-normal}";;
-          -d) summary="${args[$((i+1))]:-}";;
-          -m) index=$((i+1));message="${args[$index]:-}";;
-        esac
-    done
-    case "$importance" in alert|warning) status=ATTENTION;;esac
-    if [[ "$message" != 'Status: '* ]];then
-        message="Status: $status"$'\n'"Summary: $summary"$'\n\n'"Actions and findings:"$'\n'"${message:-$summary}"
-        if ((index>=0));then args[$index]="$message";else args+=(-m "$message");fi
-    fi
-    # Every notifier has a termination escalation, including legacy callers.
-    if [[ "${args[0]##*/}" == timeout ]];then
-        if [[ " ${args[*]} " != *' --kill-after'* ]];then args=("${args[0]}" --kill-after=5 "${args[@]:1}");fi
-    else args=(timeout --signal=TERM --kill-after=5 30 "${args[@]}");fi
-    local delivery_rc=0
-    "${args[@]}" || delivery_rc=$?
-    usr_ops_delivery_record "$delivery_rc" "$importance" "$summary" "$message" "${args[@]}" || printf 'Notification delivery evidence could not be queued; producer failure remains active.\n' >&2
-    return "$delivery_rc"
-}
-
-# Bounded local history for scripts previously dependent on the plugin console.
-usr_ops_append_log() {
-    local file="$1" line="$2" max="${3:-2097152}" i
-    [[ -d "${file%/*}" && ! -L "$file" ]] || return 1
-    for i in 1 2;do [[ ! -L "$file.$i" ]] || return 1;done
-    find "${file%/*}" -maxdepth 1 -type f \( -name "${file##*/}.1" -o -name "${file##*/}.2" \) -mtime +29 -delete || return 1
-    if [[ -f "$file" ]] && (( $(stat -c %s "$file")+${#line}+1>max ));then
-        rm -f "$file.2";[[ ! -f "$file.1" ]] || mv "$file.1" "$file.2";mv "$file" "$file.1" || return 1
-    fi
-    printf '%s\n' "$line" >>"$file"
-}
-
-# Durable failed-delivery evidence for producers without their own outbox.
-# Existing media/DNS/watchdog outboxes keep ownership of their delivery policy.
-usr_ops_delivery_record() (
-    local rc="$1" importance="$2" summary="$3" message="$4" subject='' i key root fd tmp
-    shift 4
-    case "${OPS_SCRIPT_ID:-}" in backup_boot_disk|backup_cache_appdata|backup_media_remote|backup_vault_remote|backup_restore_drill|media_plex_dbrepair) ;; *) return 0;; esac
-    local -a original=("$@")
-    local native_delivery=false arg export_fd ram="${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}"
-    for arg in "${original[@]}";do [[ "$arg" != /usr/local/emhttp/webGui/scripts/notify ]] || native_delivery=true;done
-    [[ "$native_delivery" == true || -n "${USR_OPS_DELIVERY_ROOT:-}" ]] || return 0
-    for ((i=0;i<${#original[@]};i++));do [[ "${original[$i]}" != -s ]] || subject="${original[$((i+1))]:-}";done
-    root="${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}"
-    exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}"
-    if ! mountpoint -q "${USR_OPS_VAULT_MOUNT:-/mnt/vault}" || ! flock -s -n "$export_fd";then root="$ram";fi
-    [[ ! -L "$root" && $(realpath -m "$root") == "$root" ]] || return 1
-    mkdir -p "$root" || return 1;chmod 700 "$root" || return 1
-    exec {fd}>"${USR_OPS_DELIVERY_LOCK:-/run/user-script-delivery.lock}";flock -w 3 "$fd" || return 1
-    key=$(printf '%s\0' "$OPS_SCRIPT_ID" "$importance" "$subject" "$summary" "$message"|sha256sum|cut -d ' ' -f1)
-    if ((rc==0));then
-        if [[ "$OPS_SCRIPT_ID" == backup_vault_remote && -n "${USR_OPS_DELIVERY_CONTEXT:-}" ]];then
-            mkdir -p "$root/.delivery-receipts" || return 1
-            tmp=$(mktemp "$root/.delivery-receipts/.accepted.XXXXXX") || return 1
-            jq -n --arg context "$USR_OPS_DELIVERY_CONTEXT" --argjson at "$(date +%s)" '{schema:1,context:$context,acceptedAt:$at}' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$root/.delivery-receipts/backup_vault_remote.json" || return 1
-        fi
-        rm -f -- "$root/$OPS_SCRIPT_ID.$key.json" "$ram/$OPS_SCRIPT_ID.$key.json";return
-    fi
-    (( $(find "$root" -maxdepth 1 -type f -name '*.json'|wc -l)<100 )) || [[ -f "$root/$OPS_SCRIPT_ID.$key.json" ]] || return 1
-    tmp=$(mktemp "$root/.delivery.XXXXXX") || return 1
-    trap 'rm -f -- "$tmp"' EXIT
-    jq -n --arg context "${USR_OPS_DELIVERY_CONTEXT:-}" --arg id "$key" --arg script "$OPS_SCRIPT_ID" --arg importance "$importance" --arg subject "$subject" --arg summary "$summary" --arg message "$message" --argjson at "$(date +%s)" \
-      '{schema:1,context:$context,id:$id,script:$script,importance:$importance,subject:$subject,summary:$summary,message:$message,queuedAt:$at}' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$root/$OPS_SCRIPT_ID.$key.json"
-)
-
-usr_ops_vault_delivery_seen() {
-    local context="$1" cutoff="${2:-0}" root file
-    [[ -n "$context" ]] || return 1
-    for root in "${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}" "${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}";do
-        file="$root/.delivery-receipts/backup_vault_remote.json"
-        [[ -f "$file" && ! -L "$file" ]] || continue
-        jq -e --arg context "$context" --argjson cutoff "$cutoff" --argjson now "$(date +%s)" '.schema==1 and .context==$context and .acceptedAt>=$cutoff and .acceptedAt<=$now+300' "$file" >/dev/null 2>&1 && return 0
-    done
-    return 1
-}
-
-usr_ops_retry_deliveries() {
-    local root="${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}" file count=0 subject summary message importance owner old_owner="${OPS_SCRIPT_ID:-}" rc=0
-    local ram="${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}" digest old_context="${USR_OPS_DELIVERY_CONTEXT:-}" context
-    [[ ! -L "$root" && ! -L "$ram" ]] || return 1
-    [[ -d "$root" || -d "$ram" ]] || return 0
-    while IFS= read -r -d '' file;do
-        ((count<3)) || break
-        jq -e '(.schema==1) and (.script|test("^(backup_(boot_disk|cache_appdata|media_remote|vault_remote|restore_drill)|media_plex_dbrepair)$")) and (.importance|IN("normal","warning","alert")) and all(.subject,.summary,.message;type=="string")' "$file" >/dev/null 2>&1 || continue
-        owner=$(jq -r .script "$file");subject=$(jq -r .subject "$file");summary=$(jq -r .summary "$file");message=$(jq -r .message "$file");importance=$(jq -r .importance "$file")
-        context=$(jq -r '.context // ""' "$file")
-        if [[ "$owner" == backup_vault_remote ]] && usr_ops_vault_delivery_seen "$context" "$(jq -r .queuedAt "$file")";then rm -f -- "$file";continue;fi
-        USR_OPS_DELIVERY_CONTEXT="$context"
-        digest=$(sha256sum "$file"|cut -d ' ' -f1)
-        OPS_SCRIPT_ID="$owner";count=$((count+1))
-        if usr_ops_notify "${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}" -i "$importance" -s "$subject" -d "$summary" -m "$message";then
-            if [[ -f "$file" && $(sha256sum "$file"|cut -d ' ' -f1) == "$digest" ]];then rm -f -- "$file";fi
-        else rc=1;fi
-        OPS_SCRIPT_ID="$old_owner";USR_OPS_DELIVERY_CONTEXT="$old_context"
-    done < <(find "$root" "$ram" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null|sort -zu)
-    return "$rc"
-}
-
-# Scheduled executions have an independent parent recording the final exit,
-# after producer EXIT traps. CLI operations and sourced libraries are unchanged.
 usr_ops_execution_record() (
     local phase="$1" started="$2" pid="$3" rc="${4:-0}" process_start root="${USR_OPS_EXECUTION_ROOT:-/run/user-script-execution}" file tmp now boot old='{}' status
     [[ "${OPS_SCRIPT_ID:-}" =~ ^[a-z0-9_]+$ && ! -L "$root" ]] || return 1
@@ -190,22 +75,6 @@ usr_ops_supervise() {
     trap - TERM HUP INT
     return "$rc"
 }
-
-# Network observation after an accepted shutdown, never a power-state claim.
-# No WOL or second poweroff is issued. Native maintenance checks remain upstream.
-usr_ops_observe_shutdown() {
-    local BACKUP_SSH_COMMAND_TIMEOUT=6
-    local host="${REMOTE#*@}" deadline=$(( $(date +%s)+${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90} )) misses=0
-    [[ "${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90}" != 0 ]] || { SHUTDOWN_RESULT=requested_observation_disabled;return 0; }
-    while (( $(date +%s)<deadline ));do
-        if timeout --kill-after=1 5 ping -c 1 -W 2 "$host" >/dev/null 2>&1 || backup_ssh true >/dev/null 2>&1;then misses=0
-        else misses=$((misses+1));fi
-        if ((misses>=3));then SHUTDOWN_RESULT=offline_observed;return 0;fi
-        sleep 5
-    done
-    SHUTDOWN_RESULT=requested_still_reachable;REMOTE_SHUTDOWN_FAILED=1
-    return 1
-}
 # END EMBEDDED OPERATIONS CONTRACT
 # BEGIN SCHEDULED EXECUTION SUPERVISOR
 if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$OPS_SCRIPT_ID" ]];then
@@ -225,46 +94,19 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Daily disk health: observation-time scrub verification, same-run completion
-# reconciliation, stable loop-filesystem counters and precise SMART deferrals.
-# Coverage is logged and included in existing notifications/receipt; healthy
-# lifecycle runs stay silent. Self-test read cache lasts only this invocation.
-# Disk Health Monitor for Unraid
-# Purpose: Monitor Unraid disk, filesystem, capacity and parity health with grouped
-# actionable alerts, stable device identities and conservative recovery evidence.
-# v3.0.0: documented host-write units, calendar SMART scheduling, asynchronous
-# tests, maintenance gates, observed scrub dates, and syslog-watchdog delegation.
-# Removed speculative risk/lifetime forecasts, soak readiness and XFS workload alerts.
-# Native SMART failures, pending/uncorrectable sectors, temperature, NVMe faults,
-# rated TBW, filesystem errors, parity results and stale SMART coverage remain active.
-# Sleeping disks stay asleep except bounded overdue maintenance; deferral never proves recovery. Only a
-# successful fresh scan advances relevant baselines. Healthy runs remain quiet.
-# Self-tests start on eligible awake disks, or one overdue sleeping HDD, outside
-# backup/database-repair/parity/Mover/scrub work. At most one new long test starts per run; results are collected later.
-# Native Unraid scheduling owns cache/vault scrubs. A monthly read-only Docker
-# filesystem scrub is eligible from day 15 during 06:00-08:00, using this same run.
-# v3.1: explicit current-operation parsing, durable per-identity calendar receipts,
-# successful-result freshness, bounded weekly retries, and one overdue HDD wake.
-# Historical test logs do not establish exact completion dates. Newly changed,
-# successful native results establish observation timestamps. Long baseline adoption
-# has a seven-day grace; after that, eligible devices are staggered automatically.
-# A 14-day overdue grace permits one sleeping HDD wake in the maintenance window.
-# Pending starts are journaled before dispatch, and tests are never auto-aborted.
-# Healthy maintenance is logged, not emailed; overdue/unverified/fault findings use
-# the existing grouped lifecycle, cooldown and fresh-evidence recovery safeguards.
-# State: existing schema remains compatible. ATA write-history is rebaselined once
-# per stable identity when unit revision changes; physical fault counters are kept.
-# Legacy analytic files are left for rollback but no longer written or recreated.
-# Use --help for supported read-only diagnostics and state administration commands.
-# v3.2: standard ATA page-7/NVMe wear discovery, current-hardware endurance
-# inventory, and backed-up state layout migration. Unknown published TBW ratings
-# remain unknown; native wear/error monitoring continues for replacement models.
-# State folders: devices/, filesystems/, notifications/, history/, runtime/.
-# Root receipt/config/schema paths are stable for other scripts. Two state
-# migration/rollback snapshots are retained after successful normal runs.
-# Wear-used and published TBW consumption are different metrics; neither is
-# a guarantee of remaining service life. Unsupported wear/rating data is unknown.
-# No Docker image, startup or application configuration is modified.
+# Purpose: Daily SMART/NVMe, endurance, disk-test, scrub and storage-health
+# monitoring with grouped actionable notifications and a coordinated host view.
+# Stable device identities protect baselines across hardware path changes.
+# Only fresh, verified evidence can confirm recovery; sleeping disks are deferred.
+# SMART tests are asynchronous, journaled and bounded by maintenance/retry gates.
+# Native scheduling owns pool scrubs. The Docker filesystem has a bounded monthly
+# read-only scrub in the existing maintenance window; no new timer is installed.
+# Measured wear, writes, temperature and error history support actionable trends.
+# Unknown endurance ratings remain unknown; no failure-date estimate is produced.
+# State uses devices/, filesystems/, notifications/, history/ and runtime/ folders.
+# Root receipt/config/schema paths are stable. Two migration backups are retained.
+# --help documents supported diagnostics and state administration; --health-status
+# reads the current shared host-health receipt without running probes or notifying.
 
 load_builtin_defaults() {
 
@@ -273,7 +115,6 @@ SHORT_TEST_INTERVAL_DAYS=7                      # Run automatic short tests no m
 SMART_ALLOW_SPINUP=0                            # Allow SMART collection/tests to wake standby SATA HDDs (0=defer)
 LONG_TEST_MAX_INTERVAL_DAYS=120                 # Calendar days between newly witnessed successful long tests
 LONG_TEST_CRITICAL_MIN_DAYS=7                   # Critical SMART & last long age >= days -> force long
-LONG_TEST_DECISION=""                           # Accumulator for long test scheduling decisions
 LONG_TEST_NEAR_WINDOW_DAYS=5                    # Show health alert when long test is due within N days
 LONG_TEST_INITIAL_FORCE=0                       # Immediate initial baseline when enabled; otherwise use baseline grace
 SMART_TEST_BASELINE_GRACE_DAYS=7                # Calendar grace to establish a witnessed long-test baseline
@@ -293,7 +134,6 @@ THRESHOLD=90                                    # Array/pools overall usage perc
 NEAR_THRESHOLD_DELTA=5                          # "Near full" if within this percent of THRESHOLD
 POOL_EXCLUDES=("ramtmp" "user0")                # Pool names excluded from pool totals
 
-# === Storage Validation / Discrepancy Alerts ===
 
 # === Filesystem / Device Monitoring Toggles ===
 BTRFS_SCRUB_STATE_TTL_DAYS=90                   # Days to retain scrub state files
@@ -324,8 +164,8 @@ SATA_LINK_INSTABILITY_STREAK_CRIT=5             # Consecutive days with downshif
 
 # === Export / History / Logging ===
 HISTORY_WINDOW_DAYS=14                          # Days considered for usage growth trends
-FORECAST_MIN_SAMPLES=3                         # Minimum distinct daily samples for an actionable forecast
-FORECAST_MIN_SPAN_DAYS=2                       # Minimum elapsed days for an actionable forecast
+FORECAST_MIN_SAMPLES=3                         # Minimum distinct daily samples for actionable trend evidence
+FORECAST_MIN_SPAN_DAYS=2                       # Minimum elapsed days for actionable trend evidence
 FORECAST_HIGH_SAMPLES=7                        # Samples required for HIGH confidence
 FORECAST_HIGH_SPAN_DAYS=7                      # Elapsed days required for HIGH confidence
 FORECAST_STALE_AFTER_DAYS=3                    # Latest sample older than this is marked STALE
@@ -338,7 +178,6 @@ HISTORY_MAX_DAYS=180                            # Remove lines older than this m
 HISTORY_MAX_LINES=20000                         # Keep at most this many recent lines per history file (0=disable line pruning)
 LOG_MIRROR_STDOUT=1                             # Mirror log lines to the User Scripts console
 
-# === Risk / Lifecycle Settings ===
 
 # === Display / Notification Preferences ===
 NOTIFY_MAX_BODY_CHARS=12000                     # Maximum notification body length before safe truncation
@@ -418,19 +257,16 @@ NVME_THERM_T2_DELTA_WARN=1                       # NVMe Thermal Management T2 Tr
 NVME_WARN_TEMP_TIME_DELTA_WARN=300               # NVMe Warning Comp. Temperature Time delta (seconds) >= warn
 NVME_CRIT_TEMP_TIME_DELTA_WARN=60                # NVMe Critical Comp. Temperature Time delta (seconds) >= warn (usually critical if >0)
 
-# === Btrfs / XFS Snapshot & Device Thresholds ===
+# === Btrfs Device Error Thresholds ===
 BTRFS_DEV_ERR_WARN_DELTA=1                       # Per-device read/write/flush err delta >= warning
 BTRFS_DEV_ERR_CRIT_DELTA=10                      # Per-device read/write/flush err delta >= critical
 BTRFS_DEV_CORR_WARN_DELTA=1                      # Per-device corruption/gen err delta >= warning
 BTRFS_DEV_CORR_CRIT_DELTA=1                      # Per-device corruption/gen err delta >= critical
 BTRFS_ERR_BURST_WARN_RATIO=5                     # Btrfs device error delta / previous delta >= warn ratio
 BTRFS_ERR_BURST_CRIT_RATIO=10                    # Btrfs device error delta / previous delta >= critical ratio
-BURST_WARN_BOOST=15                              # Composite SMART boost for warning burst events
-BURST_CRIT_BOOST=30                              # Composite SMART boost for critical burst events
 
-# === POH (Power-On Hours) Age Thresholds ===
 
-# === TBW / Endurance Forecast Thresholds ===
+# === Published Endurance Thresholds ===
 TBW_CONSUMED_WARN=80                             # Consumed percent of model TBW >= warning
 TBW_CONSUMED_CRIT=95                             # Consumed percent of model TBW >= critical
 
@@ -441,16 +277,11 @@ TBW_CONSUMED_CRIT=95                             # Consumed percent of model TBW
 #  - regex: POSIX ERE to match model string (case-insensitive)
 #  - cap_min / cap_max: optional decimal TB capacity window (inclusive)
 #  - per_tb: TBW endurance per TB of capacity (numeric)
-#  - type: nvme | sata-ssd | sata-hdd (for POH overrides)
-#  - warn / crit: POH hours thresholds (numeric)
-#  - action: for quirks (e.g., invert_mwi_small)
 # TBW endurance per TB overrides (model + optional capacity window)
 TBW_MODEL_RULES='\
 regex:^(WDC[[:space:]]+)?WDS500G1R0A(-[A-Za-z0-9]+)?$;cap_min:0.49;cap_max:0.51;per_tb:700
 regex:^(CT1000T500SSD[58]|CT1000P5PSSD8)$;cap_min:0.99;cap_max:1.01;per_tb:600
 '
-# POH threshold overrides by device type and model
-# Parsing/compatibility quirks (e.g., vendor-reported life remaining anomalies)
 
 }
 
@@ -579,15 +410,10 @@ declare -A SMART_STATE=()                         # Map device -> OK/WARNING/CRI
 declare -A SMART_MSGS=()                          # Map device -> aggregated SMART message string
 declare -A MOUNT_TO_DEV=()                        # Map /mnt/diskX -> /dev/sdX|nvme
 declare -A POOL_MEMBER_MAP=()                     # Map base device (/dev/sdX|nvme0n1) -> pool name
-declare -A BURST_BOOST=()                         # Base device -> accumulated burst boost this run (0-100)
 declare -A WRITER_DAILY=()                        # Map device -> recent daily bytes (workload presentation)
-declare -A WRITER_PREVIOUS_DAILY=()               # Map device -> preceding-window daily bytes
 declare -A WRITER_DIRECTION=()                    # Map device -> IMPROVING/RISING/STEADY/COLLECTING
 declare -A WRITER_CHANGE_PCT=()                   # Map device -> signed recent-vs-previous rate change
-declare -A WRITER_RECENT_READY=()                 # Map device -> 1 when recent window has sufficient evidence
-declare -A WRITER_RECENT_SAMPLES=()               # Map device -> sample count in the recent workload window
-declare -A WRITER_PREVIOUS_SAMPLES=()             # Map device -> sample count in the preceding workload window
-declare -A TBW_FORECAST_CONFIDENCE=()             # Per-device TBW forecast confidence
+declare -A WRITE_RATE_CONFIDENCE=()             # Per-device write-rate evidence confidence
 declare -A TEMP_RATE_CONFIDENCE=()                # Per-device temperature-rate confidence
 declare -A LAST_TEST=()                           # Map device -> last SMART test timestamp
 declare -A LAST_TEST_EPOCH=() LAST_TEST_KIND=()   # Actual test-start epoch/type (legacy date state remains supported)
@@ -733,7 +559,6 @@ log_warn()  { log "HEALTH" "WARN" "$*"; }
 log_crit()  { log "HEALTH" "CRIT" "$*"; }
 log_smart() { log "SMART"  "INFO" "$*"; }
 log_btrfs() { log "BTRFS"  "INFO" "$*"; }
-log_xfs()   { log "XFS"    "INFO" "$*"; }
 
 # === State Files ===
 # --- Alerting & Runtime (immediate health evaluation, deltas, cooldowns, recent events) ---
@@ -756,10 +581,10 @@ STATE_SCHEMA_MANIFEST_FILE="$STATE_DIR/state_schema.manifest"       # Coordinate
 SATA_LINK_HISTORY_FILE="$STATE_DIR/history/sata_links.tsv" # SATA link instability events (alert context)
 NOTIFICATION_JOURNAL_FILE="$STATE_DIR/notifications/lifecycle.tsv" # Last successfully delivered canonical finding set
 NOTIFICATION_RECOVERY_STATE_FILE="$STATE_DIR/notifications/recovery.tsv" # Consecutive safe-run recovery candidates
-# --- Trend / Historical Analytics (longer-term forecasting, prioritization, trajectory) ---
+# --- Measured storage history and trends ---
 IO_ERROR_HISTORY_FILE="$STATE_DIR/history/kernel_errors.tsv"             # I/O error frequency timeline (acceleration)
 BTRFS_DEV_HIST_FILE="$STATE_DIR/history/btrfs_errors.tsv"     # Btrfs per-device error deltas over time
-TBW_HISTORY_FILE="$STATE_DIR/history/host_writes.tsv"                       # Total bytes written progression (wear modeling)
+TBW_HISTORY_FILE="$STATE_DIR/history/host_writes.tsv"                       # Measured host-write history
 SMART_ATTR_HISTORY_FILE="$STATE_DIR/history/wear.tsv"         # Attribute growth time-series (trend alerts)
 TEMP_HISTORY_FILE="$STATE_DIR/history/temperatures.tsv"                     # Temperature samples (rate & exposure)
 POOL_HEALTH_FILE="$STATE_DIR/filesystems/pool_health.json"
@@ -1763,7 +1588,7 @@ migrate_state_schema() {
     return 0
 }
 
-# Structured state layout v1. Public receipt/config/schema paths stay stable.
+# Managed state layout. Public receipt/config/schema paths stay stable.
 # Every relocation is backed up first; interrupted moves are safely resumable.
 ensure_state_layout() {
     local layout=0 rc=0 from_state=0 from_history="$HISTORY_SCHEMA_VERSION" from_identity=0
@@ -2353,9 +2178,9 @@ run_collector() {
     return 0
 }
 
-# Classify forecast evidence. RESET is supplied by callers when a monotonic
+# Classify observed-history evidence. RESET is supplied by callers when a monotonic
 # endurance counter regresses and STALE when the newest sample is too old.
-forecast_confidence() {
+history_sample_confidence() {
     local samples="${1:-0}"
     local span_days="${2:-0}"
     local latest_age_days="${3:-999999}"
@@ -2384,7 +2209,7 @@ forecast_confidence() {
     fi
 }
 
-forecast_confidence_is_actionable() {
+history_confidence_is_actionable() {
     [[ "$1" == "MEDIUM" || "$1" == "HIGH" ]]
 }
 
@@ -2608,7 +2433,6 @@ prune_old_run_logs() {
     log_info "Run log pruning: removed_total = $removed age = $removed_age count = $removed_count examined = $examined"
 }
 
-# === Helper Function ===
 # Prune history/state growth files by age and line count (first column date YYYY-MM-DD)
 prune_history_files() {
     (( HISTORY_PRUNE_ENABLED == 1 )) || return 0
@@ -2803,30 +2627,6 @@ retain_previous_smart_snapshot() {
     record_collector_event DEFERRED "SMART $disk" "power_state=$power_state"
 }
 
-short_test_is_due() {
-    local disk="$1"
-    local interval_days="${SHORT_TEST_INTERVAL_DAYS:-0}"
-    local last_epoch="${LAST_TEST_EPOCH[$disk]:-}"
-    local identity
-    identity=$(persistent_device_key "$disk")
-    [[ -z "${TEST_TRACK["$identity|shortAnchor"]:-}" ]] || last_epoch="${TEST_TRACK["$identity|shortAnchor"]}"
-    local last_date="${LAST_TEST[$disk]:-}"
-    local now_epoch
-
-    [[ "$interval_days" =~ ^[0-9]+$ ]] || return 1
-    (( 10#$interval_days > 0 )) || return 1
-
-    if [[ ! "$last_epoch" =~ ^[0-9]+$ && -n "$last_date" ]]; then
-        last_epoch=$(date -d "$last_date" +%s 2>/dev/null || true)
-    fi
-    [[ "$last_epoch" =~ ^[0-9]+$ ]] || return 0
-
-    now_epoch=$(date +%s)
-    local today_day last_day
-    today_day=$(date -d "$(date -d "@$now_epoch" +%F)" +%s) || return 1
-    last_day=$(date -d "$(date -d "@$last_epoch" +%F)" +%s) || return 1
-    (( today_day - last_day >= 10#$interval_days * 86400 ))
-}
 
 short_test_next_date() {
     local disk="$1"
@@ -2941,7 +2741,6 @@ btrfs_df_cached() {
     BTRFS_DF_CACHE_DATA[$key]="${BTRFS_DF_CACHE_DATA[$key]:-UNKNOWN}"; BTRFS_DF_CACHE_META[$key]="${BTRFS_DF_CACHE_META[$key]:-UNKNOWN}"
 }
 
-# === Helper Function ===
 # Send a notification through Unraid's notify script with severity
 notify_unraid() {
     local title="$1"
@@ -3372,7 +3171,6 @@ finalize_finding_counts() {
     done
 }
 
-# === Helper Function ===
 # Convert bytes to human readable units
 human_readable() {
     local bytes=${1:-0}
@@ -3384,7 +3182,6 @@ human_readable() {
     awk -v b="$bytes" -v t="$TB" 'BEGIN{printf "%.2f TB", b/t}'
 }
 
-# === Helper Function ===
 # Normalize partition path to its base device (e.g., /dev/sda1 -> /dev/sda)
 base_device() {
     local d="$1"
@@ -3711,7 +3508,6 @@ select_latest_long_selftest_line() {
     '
 }
 
-# === Helper Function ===
 # Return device model string using smartctl (cached when possible)
 get_device_model() {
     local d identity
@@ -3734,7 +3530,6 @@ get_device_model() {
     ' <<< "$identity"
 }
 
-# === Helper Function ===
 # Build optional model suffix for health alerts depending on toggle
 model_suffix_for() {
     local dev="$1"
@@ -3751,7 +3546,6 @@ model_suffix_for() {
     printf "%s" "$suffix"
 }
 
-# === Helper Function ===
 # Return device capacity in TB (decimal TB)
 get_device_capacity_tb() {
     local d
@@ -3763,7 +3557,6 @@ get_device_capacity_tb() {
     awk -v b="$bytes" 'BEGIN{printf "%.3f", b/1000000000000.0}'
 }
 
-# === Helper Function ===
 # Read a SATA SMART raw attribute value by ID
 get_sata_raw() {
     local d
@@ -3772,7 +3565,6 @@ get_sata_raw() {
     smartctl_cached -A "$d" 2>/dev/null || true
 }
 
-# === Helper Function ===
 # Parse SATA device basic info from smartctl --info
 get_sata_info() {
     local d
@@ -3781,7 +3573,6 @@ get_sata_info() {
     smartctl_cached -i "$d" 2>/dev/null || true
 }
 
-# === Helper Function ===
 # Read an NVMe SMART/health value by key
 get_nvme_raw() {
     local d
@@ -3791,7 +3582,6 @@ get_nvme_raw() {
     smartctl_cached -a -d nvme "$d" 2>/dev/null || true
 }
 
-# === Helper Function ===
 # Read extended NVMe statistics (device statistics & thermal/PCIe counters)
 get_nvme_extended_raw() {
     local d
@@ -3801,7 +3591,6 @@ get_nvme_extended_raw() {
     smartctl_cached -x -d nvme "$d" 2>/dev/null || true
 }
 
-# === Helper Function ===
 # Lookup or estimate TBW endurance threshold for a device
 tbw_threshold_tb_for_device() {
     # Map model hints to endurance (TB written per TB capacity); return empty if unknown
@@ -3837,7 +3626,6 @@ tbw_threshold_tb_for_device() {
     awk -v c="$cap" -v p="$per_tb" 'BEGIN{printf "%.0f", c*p}'
 }
 
-# === Helper Function ===
 # Evaluate TBW thresholds through explicit globals so alert side effects remain
 # in the current shell. Do not call this function through command substitution.
 eval_tbw_state() {
@@ -4191,7 +3979,6 @@ get_all_disks() {
     printf '%s\n' "${DISCOVERED_DISKS[@]}"
 }
 
-# === Helper Function ===
 # Construct mapping from /mnt/diskX mountpoints to block devices using disks.ini / disk.cfg definitions
 build_mount_device_map() {
     MOUNT_TO_DEV=()
@@ -4225,7 +4012,6 @@ build_mount_device_map() {
         tolower($1)=="id" && disk!="" {val=$2; gsub(/"/, "", val); sub(/^[ \t]+/, "", val); sub(/[ \t]+$/, "", val); printf "%s\t%s\n", disk, val}' "$src" 2>/dev/null)
 }
 
-# === Helper Function ===
 # Derive the active flag once from the cached parity snapshot.
 derive_parity_activity() {
     local action_lc="${PARITY_ACTION:-}"
@@ -4409,7 +4195,6 @@ parity_state() {
     return 1
 }
 
-# === Main Function ===
 # Evaluate current parity validity and errors without generating progress tables.
 # shellcheck disable=SC2329
 evaluate_live_parity() {
@@ -4435,18 +4220,8 @@ evaluate_live_parity() {
     return 0
 }
 
-# === Helper Function ===
 
-# === Helper Function ===
 # Resolve SMART-capable device for a given /mnt path
-smart_device_for_mount() {
-    local mp="$1"
-    local dev="${MOUNT_TO_DEV[$mp]:-}"
-    if [[ -n "$dev" && -b "$dev" ]]; then echo "$dev"; return 0; fi
-    local src
-    src=$(findmnt_bounded -n -o SOURCE "$mp" 2>/dev/null || true)
-    echo "$src"
-}
 
 prepare_smart_baseline_inputs() {
     local file group
@@ -4590,7 +4365,6 @@ fi
 
 }
 
-# === Helper Function ===
 # Persist actual SMART test-start metadata for a device
 save_last_test() {
     local temp_file disk state_key
@@ -4606,7 +4380,6 @@ save_last_test() {
     atomic_commit "$temp_file" "$SMART_LAST"
 }
 
-# === Helper Function ===
 # Persist last-run NVMe health snapshot for a device
 save_nvme_state() {
     local target="$1"
@@ -4627,7 +4400,6 @@ save_nvme_state() {
     atomic_commit "$temp_file" "$target"
 }
 
-# === Helper Function ===
 # Persist last observed long self-test lifetime hours per disk
 save_long_last_poh() {
     local temp_file disk state_key
@@ -4639,7 +4411,6 @@ save_long_last_poh() {
     atomic_commit "$temp_file" "$SMART_LONG_LAST_POH_FILE"
 }
 
-# === Helper Function ===
 # Persist last observed Command_Timeout counts per disk
 save_cmd_timeout_last() {
     local target="$1"
@@ -4766,7 +4537,6 @@ evaluate_scsi_smart() {
     fi
 }
 
-# === Main Function ===
 # Collect SMART data, classify device health, and raise alerts
 # Only host counters with explicit units are converted. NAND writes are a different
 # metric; raw IDs 241/242 vary by vendor and must never imply 512-byte sectors.
@@ -4790,7 +4560,7 @@ ata_host_counter_bytes() {
     awk -v value="$value" -v unit="$multiplier" 'BEGIN {printf "%.0f\n", value*unit}'
 }
 
-# v3 recalculates ATA writes in documented units. Ignore old-unit history for that
+# ATA write counters use documented units. Ignore mismatched-unit history for that
 # device until its new baseline is persisted; preserve all physical fault counters.
 rebaseline_ata_host_writes() {
     local disk="$1" key tmp
@@ -5496,7 +5266,6 @@ evaluate_smart() {
     return 0
 }
 
-# === Helper Function ===
 # Extract latest SMART self-test entry from smartctl output
 get_latest_selftest_info() {
     local disk=$1
@@ -5524,7 +5293,6 @@ get_latest_selftest_info() {
     parse_smart_selftest_output "$out" "$exec_status"
 }
 
-# === Helper Function ===
 # Map SMART self-test entries to severity
 classify_selftest_status() {
     local raw="$1"
@@ -5553,7 +5321,6 @@ classify_selftest_status() {
     echo "$sev|$msg"
 }
 
-# === Helper Function ===
 # Persist a compact snapshot of the latest SMART self-test (or capabilities fallback)
 save_selftest_snapshot() {
     local disk="$1"
@@ -5585,7 +5352,6 @@ save_selftest_snapshot() {
     collector_atomic_commit "$temp_file" "$target"
 }
 
-# === Helper Function ===
 # Calendar self-test receipts and bounded maintenance coordination.
 # Current operation is distinct from historical results. In particular NVMe's
 # "No self-test in progress" is idle, never an active test.
@@ -6011,7 +5777,7 @@ run_smart_test() {
         local reason_join
         reason_join=$(join_by ', ' "${reasons[@]}")
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - LONG test scheduled on $disk (last_long=${last_note}; reasons=${reason_join})"
-        LONG_TEST_DECISION+="$disk: long scheduled (last=${last_note}; reasons=${reason_join}; state=${state_pre})\n"
+
     else
         if calendar_test_due "$disk" short "$SHORT_TEST_INTERVAL_DAYS"; then
             test_due=1
@@ -6104,7 +5870,6 @@ run_smart_test() {
     save_selftest_snapshot "$disk"
 }
 
-# === Helper Function ===
 # Append trend deltas (e.g., pending, realloc) to SMART messages
 augment_messages_with_deltas() {
     for disk in "${!SMART_STATE[@]}"; do
@@ -6154,7 +5919,6 @@ augment_messages_with_deltas() {
     done
 }
 
-# === Helper Function ===
 # Detect newly completed long tests and summarize result
 check_completed_long_tests() {
     declare -A PROCESSED=()
@@ -6293,7 +6057,6 @@ check_completed_long_tests() {
     collector_atomic_commit "$temp_file" "$SMART_LONG_STATE_FILE" || true
 }
 
-# === Main Function ===
 # Monitor Btrfs filesystems for scrub status
 # shellcheck disable=SC2329
 monitor_btrfs() {
@@ -6402,11 +6165,9 @@ monitor_btrfs() {
     log_btrfs "Btrfs scrub status collection completed; reported dates belong to recorded scrubs"
 }
 
-# === Main Function ===
 # Monitor XFS filesystems for metadata issues
 # shellcheck disable=SC2329
 
-# === Main Function ===
 # Evaluate array and pool capacity against thresholds
 # shellcheck disable=SC2329
 evaluate_capacity_alerts() {
@@ -6429,7 +6190,6 @@ evaluate_capacity_alerts() {
     fi
 }
 
-# === Helper Function ===
 # Evaluate mountpoint usage against defined thresholds
 # shellcheck disable=SC2329
 
@@ -6544,7 +6304,6 @@ collect_smart_health() {
 
 }
 
-# === Helper Function ===
 # Check btrfs snapshot counts against thresholds.
 # shellcheck disable=SC2329
 
@@ -6865,12 +6624,9 @@ scan_syslog_disk_errors() {
 
 # === Notification Builder ===
 severity_rank() { case "$1" in CRITICAL) echo 2;; WARNING) echo 1;; *) echo 0;; esac; }
-status_word()   { case "$1" in 2) echo "CRITICAL";; 1) echo "WARNING";; *) echo "OK";; esac; }
 
-# === Helper Function ===
 # Condense and sanitize SMART message lists for inline display.
 
-# === Helper Function ===
 # Trim only leading and trailing blank-only lines, preserving internal blank lines
 trim_outer_blank_lines() {
     awk 'BEGIN{seen=0;pending=""} {
@@ -6880,7 +6636,6 @@ trim_outer_blank_lines() {
     } END{}'
 }
 
-# === Main Function ===
 # Sample each mount once for capacity alerts, recovery evidence, and totals.
 # shellcheck disable=SC2329
 collect_storage_usage() {
@@ -7652,26 +7407,6 @@ trend_log_diagnostics() {
     return 0
 }
 
-forecast_confidence_description() {
-    case "${1:-INSUFFICIENT}" in
-        HIGH)         printf 'high forecast confidence' ;;
-        MEDIUM)       printf 'medium forecast confidence' ;;
-        LOW)          printf 'low forecast confidence' ;;
-        STALE)        printf 'stale history' ;;
-        RESET)        printf 'counter reset detected; forecast rebuilding' ;;
-        *)            printf 'insufficient history' ;;
-    esac
-}
-
-format_bytes_per_day() {
-    local bytes="${1:-0}"
-
-    if [[ "$bytes" =~ ^[0-9]+$ ]]; then
-        printf '%s/day' "$(human_readable "$bytes")"
-    else
-        printf 'unknown/day'
-    fi
-}
 
 # Copy a bounded history tail once per run. Trend stages share the cached file
 # instead of repeatedly reading the same persistent history into shell strings.
@@ -7750,7 +7485,7 @@ record_temperature_approach() {
     fi
     # Let the absolute temperature alert own readings at or above the limit.
     (( temperature < limit && temperature >= limit - margin )) || return 0
-    forecast_confidence_is_actionable "$confidence" || return 0
+    history_confidence_is_actionable "$confidence" || return 0
     awk -v rate="$rate" -v threshold="$TEMP_RATE_WARN_C_PER_DAY" \
         -v days="$span" -v minimum="$TEMP_RATE_MIN_SPAN_DAYS" \
         'BEGIN { exit !(rate >= threshold && days >= minimum) }' || return 0
@@ -7761,7 +7496,7 @@ record_temperature_approach() {
 analyze_temperature_trends() {
     local dev
 
-    TEMP_FORECAST_CONFIDENCE_LINE=""
+    TEMP_HISTORY_QUALITY_LINE=""
     # Temperature Evolution subsection
     CURRENT_TREND_BLOCK="temperature"
     if prepare_trend_history_cache temperatures "$TEMP_HISTORY_FILE" 50000; then
@@ -7845,7 +7580,7 @@ analyze_temperature_trends() {
                 'BEGIN { if(last<=0) print 999999; else { age=(now-last)/86400.0; if(age<0) age=0; printf "%.3f", age } }')
             temp_max_gap_days=$(awk -v gap="${TT_MAX_GAP_SECONDS[$tdev]:-0}" \
                 'BEGIN { printf "%.3f", gap/86400.0 }')
-            temp_confidence=$(forecast_confidence \
+            temp_confidence=$(history_sample_confidence \
                 "${TT_CNT[$tdev]:-0}" "$days" "$temp_latest_age" "$temp_max_gap_days")
             TEMP_RATE_CONFIDENCE[$tdev]="$temp_confidence"
             trend_add_diagnostic "temperature trend" \
@@ -7905,7 +7640,7 @@ analyze_temperature_trends() {
             temp_quality_parts+=("${reset_count} ${reset_noun} ${reset_verb} reset temperature history")
         fi
         if (( ${#temp_quality_parts[@]} > 0 )); then
-            TEMP_FORECAST_CONFIDENCE_LINE="$(join_by '; ' "${temp_quality_parts[@]}")"
+            TEMP_HISTORY_QUALITY_LINE="$(join_by '; ' "${temp_quality_parts[@]}")"
         fi
     fi
     return 0
@@ -7951,9 +7686,9 @@ analyze_sata_link_trends() {
 
 log_health_trends() {
     local device
-    trend_add_diagnostic "temperature history" "${TEMP_FORECAST_CONFIDENCE_LINE:-}"
+    trend_add_diagnostic "temperature history" "${TEMP_HISTORY_QUALITY_LINE:-}"
     for device in "${!WRITER_DAILY[@]}"; do
-        trend_add_diagnostic "write workload" "device=${device##*/} bytes_per_day=${WRITER_DAILY[$device]} direction=${WRITER_DIRECTION[$device]:-COLLECTING} change_percent=${WRITER_CHANGE_PCT[$device]:-0} confidence=${TBW_FORECAST_CONFIDENCE[$device]:-INSUFFICIENT}"
+        trend_add_diagnostic "write workload" "device=${device##*/} bytes_per_day=${WRITER_DAILY[$device]} direction=${WRITER_DIRECTION[$device]:-COLLECTING} change_percent=${WRITER_CHANGE_PCT[$device]:-0} confidence=${WRITE_RATE_CONFIDENCE[$device]:-INSUFFICIENT}"
     done
     trend_log_diagnostics
 }
@@ -7963,7 +7698,7 @@ build_trend_section() {
     trap 'log_crit "Trend analysis failed in block: ${CURRENT_TREND_BLOCK:-unknown}"' ERR
 
     CURRENT_TREND_BLOCK="initialization"
-    TEMP_FORECAST_CONFIDENCE_LINE=""
+    TEMP_HISTORY_QUALITY_LINE=""
     TREND_DIAGNOSTIC_ITEMS=()
     TREND_HISTORY_CACHE=()
 
@@ -7975,7 +7710,6 @@ build_trend_section() {
     return 0
 }
 
-# === Helper Function ===
 # Build notification subject line
 build_subject() {
     if (( FINDING_CRITICAL_COUNT == 0 && FINDING_WARNING_COUNT == 0 &&
@@ -8075,20 +7809,14 @@ classify_writer_direction() {
     fi
 }
 
-# === Main Function ===
-# Analyze TBW history for a smoothed endurance forecast and a separate recent
-# workload rate that can respond quickly when writes are reduced.
+# Calculate measured host-write rates and recent changes from recorded counters.
 # shellcheck disable=SC2329
 collect_write_rates() {
     # Measured write rates only; rated TBW is not a failure-date prediction.
-    TBW_FORECAST_CONFIDENCE=()
+    WRITE_RATE_CONFIDENCE=()
     WRITER_DAILY=()
-    WRITER_PREVIOUS_DAILY=()
     WRITER_DIRECTION=()
     WRITER_CHANGE_PCT=()
-    WRITER_RECENT_READY=()
-    WRITER_RECENT_SAMPLES=()
-    WRITER_PREVIOUS_SAMPLES=()
     local today
     today=$(date '+%Y-%m-%d')
     local -a tbw_records=()
@@ -8102,7 +7830,7 @@ collect_write_rates() {
     collector_replace_daily_history "$TBW_HISTORY_FILE" "$today" "${tbw_records[@]}" ||
         log_warn "Unable to atomically update TBW history"
     local win=$HISTORY_WINDOW_DAYS
-    # Compute per-device daily TBW deltas over window and estimate days to threshold
+    # Compute per-device write rates over the configured history window.
     local cutoff
     cutoff=$(date -d "-$win days" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
     local lines
@@ -8138,7 +7866,7 @@ collect_write_rates() {
     (( writer_previous_min >= 0 )) || writer_previous_min=0
 
     for dev in "${!_TBW_DEVICE_SEEN[@]}"; do
-        local first_epoch=0 last_epoch=0 previous_epoch=0 previous_value=""
+        local first_epoch=0 last_epoch=0 previous_epoch=0 previous_value="" previous_daily_rate=0
         local samples=0 max_gap_seconds=0 gap_seconds reset_seen=0
         while read -r sample_epoch v; do
             [[ "$sample_epoch" =~ ^[0-9]+$ && "$v" =~ ^[0-9]+$ ]] || continue
@@ -8161,37 +7889,31 @@ collect_write_rates() {
         latest_age_days=$(awk -v now="$RUN_EPOCH" -v last="$last_epoch" \
             'BEGIN { age=(now-last)/86400.0; if(age<0) age=0; printf "%.3f", age }')
         max_gap_days=$(awk -v gap="$max_gap_seconds" 'BEGIN { printf "%.3f", gap/86400.0 }')
-        confidence=$(forecast_confidence "$samples" "$span_days" "$latest_age_days" "$max_gap_days")
+        confidence=$(history_sample_confidence "$samples" "$span_days" "$latest_age_days" "$max_gap_days")
         if (( reset_seen == 1 )); then
             confidence="RESET"
         fi
-        TBW_FORECAST_CONFIDENCE[$dev]="$confidence"
+        WRITE_RATE_CONFIDENCE[$dev]="$confidence"
 
         if calculate_counter_window_rate "${_TBW_SEQUENCE[$dev]:-}" \
             "$writer_recent_min" "$RUN_EPOCH" "$HEAVY_WRITER_MIN_RECENT_SAMPLES"
         then
             WRITER_DAILY[$dev]="$COUNTER_WINDOW_RATE"
-            WRITER_RECENT_READY[$dev]=1
-            WRITER_RECENT_SAMPLES[$dev]="$COUNTER_WINDOW_SAMPLES"
+
             if calculate_counter_window_rate "${_TBW_SEQUENCE[$dev]:-}" \
                 "$writer_previous_min" "$writer_previous_max" \
                 "$HEAVY_WRITER_MIN_RECENT_SAMPLES"
             then
-                WRITER_PREVIOUS_DAILY[$dev]="$COUNTER_WINDOW_RATE"
-                WRITER_PREVIOUS_SAMPLES[$dev]="$COUNTER_WINDOW_SAMPLES"
+                previous_daily_rate="$COUNTER_WINDOW_RATE"
                 classify_writer_direction "${WRITER_DAILY[$dev]}" \
-                    "${WRITER_PREVIOUS_DAILY[$dev]}" "$HEAVY_WRITER_IMPROVEMENT_PCT"
+                    "$previous_daily_rate" "$HEAVY_WRITER_IMPROVEMENT_PCT"
                 WRITER_DIRECTION[$dev]="$WRITER_DIRECTION_RESULT"
                 WRITER_CHANGE_PCT[$dev]="$WRITER_CHANGE_RESULT"
             else
-                WRITER_PREVIOUS_SAMPLES[$dev]=0
                 WRITER_DIRECTION[$dev]="COLLECTING"
                 WRITER_CHANGE_PCT[$dev]="0.0"
             fi
         else
-            WRITER_RECENT_READY[$dev]=0
-            WRITER_RECENT_SAMPLES[$dev]=0
-            WRITER_PREVIOUS_SAMPLES[$dev]=0
             WRITER_DIRECTION[$dev]="COLLECTING"
             WRITER_CHANGE_PCT[$dev]="0.0"
         fi
@@ -8199,7 +7921,6 @@ collect_write_rates() {
 
 }
 
-# === Helper Function ===
 # Detect firmware/controller resets by checking for Power-On Hours (POH) drops and NVMe Percentage Used regression
 # shellcheck disable=SC2329
 detect_counter_resets() {
@@ -8272,7 +7993,7 @@ collect_btrfs_device_stats() {
     local snapshot_temp now_epoch previous_epoch=0 current_boot_id="unknown"
     local stored_key state_key dev key val line token m stats show prev delta elapsed_seconds
     local rate_day current_kind current_metric last_kind last_metric ratio=0
-    local absolute_severity alert_severity alert_title alert_message boost bdev
+    local absolute_severity alert_severity alert_title alert_message bdev
     local out_has=0 baseline_count=0 reset_count=0 delta_count=0
     local today
     local -a mounts=()
@@ -8386,17 +8107,14 @@ collect_btrfs_device_stats() {
             alert_severity="$absolute_severity"
             alert_title="Btrfs Device"
             alert_message="Device $dev $key +$delta (now $val) on mount $m"
-            boost=0
             if (( ratio >= BTRFS_ERR_BURST_CRIT_RATIO )); then
                 alert_severity="critical"
                 alert_title="Btrfs Burst"
                 alert_message="Device $dev $key rate burst x${ratio} (+$delta) on mount $m"
-                boost=$BURST_CRIT_BOOST
             elif (( ratio >= BTRFS_ERR_BURST_WARN_RATIO )); then
                 [[ "$alert_severity" == "critical" ]] || alert_severity="warning"
                 alert_title="Btrfs Burst"
                 alert_message="Device $dev $key rate elevated x${ratio} (+$delta) on mount $m"
-                boost=$BURST_WARN_BOOST
             fi
 
             [[ -n "$alert_severity" ]] || continue
@@ -8405,11 +8123,6 @@ collect_btrfs_device_stats() {
             [[ -n "$bdev" ]] || continue
             [[ -n "${SMART_STATE[$bdev]:-}" ]] || SMART_STATE[$bdev]="OK"
             SMART_MSGS[$bdev]="${SMART_MSGS[$bdev]:-} Btrfs device errors: $key +$delta"
-            if (( boost > 0 )); then
-                boost=$(( ${BURST_BOOST[$bdev]:-0} + boost ))
-                (( boost > 100 )) && boost=100
-                BURST_BOOST[$bdev]=$boost
-            fi
         done < <(parse_btrfs_device_stats_text "$stats")
     done
 
@@ -8425,7 +8138,6 @@ collect_btrfs_device_stats() {
     log "BTRFS" "INFO" "Recorded $delta_count positive counter delta(s)"
 }
 
-# === Main Function ===
 # Collect and integrate xfs /proc stats (global deltas)
 # shellcheck disable=SC2329
 
@@ -8636,10 +8348,6 @@ configuration_error() {
     log "CONFIG" "ERROR" "$*"
 }
 
-configuration_warning() {
-    CONFIG_WARNING_COUNT=$((CONFIG_WARNING_COUNT + 1))
-    log "CONFIG" "WARN" "$*"
-}
 
 configuration_value() {
     local setting="$1"
@@ -8682,16 +8390,6 @@ validate_nonnegative_number_setting() {
         configuration_error "$setting must be a non-negative number (found '${value:-unset}')"
 }
 
-validate_positive_number_setting() {
-    local setting="$1" value
-
-    value=$(configuration_value "$setting" 2>/dev/null || true)
-    if [[ ! "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
-       ! awk -v value="$value" 'BEGIN { exit !(value > 0) }'
-    then
-        configuration_error "$setting must be a positive number (found '${value:-unset}')"
-    fi
-}
 
 validate_percent_setting() {
     local setting="$1" value
@@ -8749,8 +8447,8 @@ validate_absolute_path_setting() {
     fi
 }
 
-validate_model_rule_block() {
-    local setting="$1" kind="$2" block line line_number=0
+validate_tbw_model_rules() {
+    local setting=TBW_MODEL_RULES block line line_number=0
 
     block=$(configuration_value "$setting" 2>/dev/null || true)
     while IFS= read -r line; do
@@ -8769,10 +8467,8 @@ validate_model_rule_block() {
             fi
             key="${part%%:*}"
             value="${part#*:}"
-            case "$kind:$key" in
-                tbw:regex|tbw:per_tb|tbw:cap_min|tbw:cap_max|\
-                poh:type|poh:regex|poh:warn|poh:crit|poh:cap_min|poh:cap_max|\
-                quirk:action|quirk:regex|quirk:cap_min|quirk:cap_max)
+            case "$key" in
+                regex|per_tb|cap_min|cap_max)
                     ;;
                 *)
                     configuration_error \
@@ -8808,40 +8504,11 @@ validate_model_rule_block() {
             configuration_error "$setting line $line_number has cap_min greater than cap_max"
         fi
 
-        case "$kind" in
-            tbw)
-                if [[ ! "${fields[per_tb]:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
-                   ! awk -v value="${fields[per_tb]:-0}" 'BEGIN { exit !(value > 0) }'
-                then
-                    configuration_error "$setting line $line_number requires positive per_tb"
-                fi
-                ;;
-            poh)
-                case "${fields[type]:-}" in
-                    nvme|sata-ssd|sata-hdd) ;;
-                    *) configuration_error \
-                        "$setting line $line_number requires type nvme, sata-ssd, or sata-hdd" ;;
-                esac
-                for key in warn crit; do
-                    [[ "${fields[$key]:-}" =~ ^[1-9][0-9]*$ ]] ||
-                        configuration_error "$setting line $line_number requires positive $key"
-                done
-                if [[ "${fields[warn]:-}" =~ ^[0-9]+$ &&
-                      "${fields[crit]:-}" =~ ^[0-9]+$ ]] &&
-                   ! awk -v warn="${fields[warn]}" -v crit="${fields[crit]}" \
-                        'BEGIN { exit !(warn <= crit) }'
-                then
-                    configuration_error "$setting line $line_number has warn greater than crit"
-                fi
-                ;;
-            quirk)
-                case "${fields[action]:-}" in
-                    invert_mwi_small) ;;
-                    *) configuration_error \
-                        "$setting line $line_number has unsupported action '${fields[action]:-unset}'" ;;
-                esac
-                ;;
-        esac
+        if [[ ! "${fields[per_tb]:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+           ! awk -v value="${fields[per_tb]:-0}" 'BEGIN { exit !(value > 0) }'
+        then
+            configuration_error "$setting line $line_number requires positive per_tb"
+        fi
     done <<< "$block"
 }
 
@@ -8907,7 +8574,6 @@ validate_configuration() {
         BTRFS_DEV_CORR_WARN_DELTA BTRFS_DEV_CORR_CRIT_DELTA
         BTRFS_ERR_BURST_WARN_RATIO BTRFS_ERR_BURST_CRIT_RATIO
 
-         BURST_WARN_BOOST BURST_CRIT_BOOST
 
          TBW_CONSUMED_WARN TBW_CONSUMED_CRIT
 
@@ -8971,7 +8637,6 @@ validate_configuration() {
         BTRFS_DEV_CORR_WARN_DELTA:BTRFS_DEV_CORR_CRIT_DELTA
         BTRFS_ERR_BURST_WARN_RATIO:BTRFS_ERR_BURST_CRIT_RATIO
 
-        BURST_WARN_BOOST:BURST_CRIT_BOOST
 
         TBW_CONSUMED_WARN:TBW_CONSUMED_CRIT
         NOTIFICATION_RETRY_INITIAL_DELAY_SECONDS:NOTIFICATION_RETRY_MAX_DELAY_SECONDS
@@ -9016,8 +8681,6 @@ validate_configuration() {
     validate_absolute_path_setting NOTIFY_BIN
     validate_absolute_path_setting IO_ERROR_LOG_FILE
 
-    [[ -z "${LONG_TEST_DECISION:-}" ]] ||
-        configuration_error "LONG_TEST_DECISION is runtime state and must start empty"
 
     if [[ "${HISTORY_SCHEMA_VERSION:-}" =~ ^[0-9]+$ ]] &&
        (( HISTORY_SCHEMA_VERSION != 3 ))
@@ -9063,12 +8726,8 @@ validate_configuration() {
         done
     fi
 
-    validate_model_rule_block TBW_MODEL_RULES tbw
+    validate_tbw_model_rules
 
-    if [[ "${ENABLE_BTRFS_SCRUB:-}" == "0" && "${FIRST_RUN_FORCE:-}" == "1" ]]; then
-        configuration_warning \
-            "FIRST_RUN_FORCE=1 may start a one-time baseline Btrfs scrub even though ENABLE_BTRFS_SCRUB=0"
-    fi
 
     if (( CONFIG_ERROR_COUNT > 0 )); then
         log "CONFIG" "ERROR" \
@@ -9134,12 +8793,9 @@ validate_runtime_dependencies() {
     fi
 
     if [[ "$mode" == "monitor" || "$mode" == "diagnostics" ]]; then
-        if [[ "${ENABLE_BTRFS_SCRUB:-0}" == "1" ||
-              "${FIRST_RUN_FORCE:-0}" == "1" ||
-              "${ENABLE_BTRFS_DEVICE_STATS:-0}" == "1" ]] &&
-           ! command -v btrfs >/dev/null 2>&1
+        if ! command -v btrfs >/dev/null 2>&1
         then
-            dependency_error "btrfs is required by the enabled Btrfs monitoring settings"
+            dependency_error "btrfs is required for scrub-status and pool-health collection"
         fi
         command -v hdparm >/dev/null 2>&1 ||
             dependency_warning "hdparm is unavailable; standby detection will use smartctl -n"
@@ -9796,14 +9452,14 @@ hm_build_coverage_summary() {
 
 # BEGIN HOST HEALTH COORDINATION
 # shellcheck shell=bash
-# Shared contract v1: collectors retain alert/recovery ownership; peer context
-# never creates or clears another collector's incidents. No extra scheduler.
+# Coordinated health evidence; each producer retains incident ownership.
 hc_owned_json() {
     local file="$1"
     [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file" 2>/dev/null) == "$EUID" && $(stat -c %h "$file" 2>/dev/null) == 1 ]] || return 1
     (( $(stat -c %s "$file" 2>/dev/null || echo 9999999) <= 2097152 )) || return 1
     jq -e 'type=="object"' "$file" >/dev/null 2>&1
 }
+
 hc_daily_snapshot() {
     local now="$1" file="${HC_DAILY_RECEIPT:-/mnt/vault/cloud/logs/script/host_health_monitor/state/monitor_receipt.json}" schedule="${HC_SCHEDULE_FILE:-/boot/config/plugins/user.scripts/schedule.json}"
     local old='{}' evidence='{}' plan=unknown cron='' due='{"valid":false}' boot
@@ -9833,87 +9489,7 @@ hc_daily_snapshot() {
        findings:(if $freshness=="NOT_SCHEDULED" then [] else ($evidence.findings//[]) end),coverage:($evidence.coverage//null),thresholds:($evidence.thresholds//{}),
        delivery:($producer.notification//"unknown")}'
 }
-hc_probe_action() {
-    case "$1" in
-      cpu:*|disk-temperature:*) printf 'Inspect cooling and airflow; reduce load if overheating persists. No cooling or hardware settings were changed.';;
-      mount:*) printf 'Check native Unraid device and mount status. No remount or repair was attempted.';;
-      btrfs:*) printf 'Check pool capacity, member availability and filesystem errors. No balance or repair was attempted.';;
-      space:*|inodes:*) printf 'Review the affected filesystem and free space deliberately. No files were deleted.';;
-      memory) printf 'Identify sustained memory consumers and check recent OOM events. No application was restarted.';;
-      network:*) printf 'Check the LAN interface, cable and switch. No network settings were changed.';;
-      monitor:daily-health) printf 'Check the daily User Script execution and retained completion evidence. No disk test or backup was forced.';;
-      *) printf 'Review the reported evidence and restore the affected collector or service. No automatic repair was attempted.';;
-    esac
-}
-hc_daily_probe() {
-    HC_DAILY_SNAPSHOT=$(hc_daily_snapshot "$HH_NOW") || HC_DAILY_SNAPSHOT='{"freshness":"UNVERIFIED","executionStatus":"unverified","findings":[],"thresholds":{}}'
-    local freshness severity=ok detail
-    freshness=$(jq -r .freshness <<< "$HC_DAILY_SNAPSHOT")
-    case "$freshness" in
-      STALE|UNVERIFIED) severity=warning;;
-      AWAITING_SCHEDULED_COMPLETION) severity=unknown;;
-      NOT_SCHEDULED) severity=deferred;;
-    esac
-    if [[ "$freshness" == CURRENT ]] && jq -e '.executionStatus=="incomplete"' <<< "$HC_DAILY_SNAPSHOT" >/dev/null;then severity=warning;fi
-    detail=$(jq -r '"Daily collector freshness=\(.freshness); latest execution=\(.executionStatus); retained disk findings=\(.findings|length). Last completed evidence="+(.observedAt|tostring)+". Findings remain owned by the daily monitor; schedule grace=2h."' <<< "$HC_DAILY_SNAPSHOT")
-    hh_observe monitor:daily-health "$severity" 'Daily disk monitoring' "$detail" 2
-}
-hc_disk_temperatures() {
-    local file="${HH_DISKS_INI:-/var/local/emhttp/disks.ini}" stamp slot dev native_id temp rota kind warn crit severity id count=0
-    stamp=$(stat -c %Y "$file" 2>/dev/null) || stamp=0
-    if [[ ! "$stamp" =~ ^[0-9]+$ ]] || ((stamp>HH_NOW+60 || HH_NOW-stamp>900));then
-        hh_observe monitor:disk-temperatures warning 'Native disk temperatures unavailable' 'Unraid disk metadata is missing or older than 15 minutes; no SMART read or disk wake was performed.' 3
-        return
-    fi
-    local limits='{}'
-    if [[ ${HC_DAILY_SNAPSHOT:-} != '' ]];then limits=$(jq -c '.thresholds//{}' <<< "$HC_DAILY_SNAPSHOT");fi
-    while IFS=$'\t' read -r slot dev native_id temp;do
-        [[ "$dev" =~ ^(sd[a-z]+|nvme[0-9]+n[0-9]+)$ && -n "$native_id" && "$native_id" != none ]] || continue
-        id="disk-temperature:$(printf '%s' "$native_id"|sha256sum|cut -c1-24)";count=$((count+1))
-        if [[ "$dev" == nvme* ]];then kind=nvme;warn=70;crit=80
-        else
-            rota=$(cat "${HH_SYS_ROOT:-/sys}/class/block/$dev/queue/rotational" 2>/dev/null) || rota=''
-            case "$rota" in 0) kind=ssd;warn=65;crit=70;;1) kind=hdd;warn=55;crit=60;;*) hh_observe "$id" unknown "Disk temperature $slot" 'Device type could not be verified; no threshold guessed.';continue;;esac
-        fi
-        local w c
-        w=$(jq -r --arg kind "$kind" '.[$kind].warning//empty' <<< "$limits");c=$(jq -r --arg kind "$kind" '.[$kind].critical//empty' <<< "$limits")
-        if [[ "$w" =~ ^[0-9]+$ && "$c" =~ ^[0-9]+$ ]] && ((w>=20 && c>=w && c<=120));then warn=$w;crit=$c;fi
-        if [[ ! "$temp" =~ ^[0-9]+$ ]] || ((temp<=0 || temp>=150));then
-            hh_observe "$id" deferred "Disk temperature $slot" 'No current native temperature, commonly because the disk is sleeping. No healthy sample inferred and no disk woken.'
-            continue
-        fi
-        severity=ok;((temp>=warn)) && severity=warning;((temp>=crit)) && severity=critical
-        if [[ "$severity" == ok ]] && jq -e --arg id "$id" '.conditions[$id].active==true' <<< "$HH_STATE" >/dev/null && ((temp>warn-3));then severity=warning;fi
-        hh_observe "$id" "$severity" "Disk temperature $slot" "$dev: ${temp}C; warning=${warn}C, critical=${crit}C; source=Unraid native metadata; no SMART polling or disk wake." 1
-        HH_OBSERVATIONS=$(jq -c --arg id "$id" --arg device "/dev/$dev" 'map(if .id==$id then .+{device:$device} else . end)' <<< "$HH_OBSERVATIONS")
-        # A daily fallback incident keeps its recovery ownership until confirmed.
-        if [[ ${HC_DAILY_SNAPSHOT:-} != '' ]] && jq -e --arg device "/dev/$dev" '.freshness=="CURRENT" and any(.findings[]?;.device==$device and (.id|endswith("|temp")))' <<< "$HC_DAILY_SNAPSHOT" >/dev/null;then
-            HH_OBSERVATIONS=$(jq -c --arg id "$id" 'map(if .id==$id then .+{delegated:true} else . end)' <<< "$HH_OBSERVATIONS")
-        fi
-    done < <(awk -F= '
-      function emit(){if(dev!="" && slot!="flash")print slot"\t"dev"\t"(id==""?"none":id)"\t"(temp==""?"*":temp)}
-      /^\[/{emit();slot=$0;gsub(/[\[\]"]/,"",slot);dev=id=temp="";next}
-      {v=substr($0,index($0,"=")+1);gsub(/^"|"$/,"",v)} $1=="device"{dev=v}$1=="id"{id=v}$1=="temp"{temp=v} END{emit()}' "$file")
-    if ((count==0));then hh_observe monitor:disk-temperatures unknown 'Native disk temperature coverage' 'No eligible device identities found in current Unraid metadata.'
-    else hh_observe monitor:disk-temperatures ok 'Native disk temperature coverage' "$count device(s) inventoried; sleeping/unverified readings are deferred explicitly.";fi
-}
-hc_combined_health() {
-    local observations="$1" state="$2" now="$3" daily active storage
-    daily=${HC_DAILY_SNAPSHOT:-};[[ -n "$daily" ]] || daily=$(hc_daily_snapshot "$now") || daily='{"freshness":"UNVERIFIED","executionStatus":"unverified","findings":[]}'
-    active=$(jq -c '[.conditions|to_entries[]|select(.value.active)|{id:.key,severity:.value.severity,title:.value.title,detail:.value.detail,pending:(.value.pending//""),source:"host_health_watchdog"}]' <<< "$state") || return 1
-    local previous="${HC_FAST_RECEIPT:-${HH_RAM_ROOT:-/run}/host-health-receipt.json}" cached='[]'
-    if jq -e '.freshness|IN("UNVERIFIED","STALE")' <<< "$daily" >/dev/null && hc_owned_json "$previous";then
-        cached=$(jq -c --arg boot "$(cat /proc/sys/kernel/random/boot_id)" 'if .bootId==$boot then (.health.daily.findings//[]) else [] end' "$previous") || cached='[]'
-        daily=$(jq -c --argjson cached "$cached" 'if (.findings|length)==0 and ($cached|type)=="array" then .findings=$cached|.cachedUnverified=true else . end' <<< "$daily") || return 1
-    fi
-    storage=$(hc_storage_snapshot "$now") || return 1
-    jq -nc --argjson storage "$storage" --argjson daily "$daily" --argjson active "$active" --argjson observations "$observations" --argjson now "$now" '
-      {schema:1,observedAt:$now,daily:$daily,fastFindings:$active,storage:$storage,
-       healthStatus:(if any($active[];.severity=="critical") or any($daily.findings[];.severity=="critical") then "CRITICAL"
-        elif ($active|length)>0 or ($daily.findings|length)>0 or ($storage.openXfsSources|length)>0 then "ATTENTION"
-        elif ($storage.evidenceVerified|not) or $storage.executionStatus=="FAILED" or ($storage.fresh|not) or ($daily.freshness|IN("STALE","UNVERIFIED")) or any($observations[];.severity=="unknown") then "UNVERIFIED" elif any($observations[];(.severity|IN("warning","critical")) and (.delegated//false|not)) then "CONFIRMING" else "OK" end),
-       coverage:{observations:($observations|length),unverified:([$observations[]|select(.severity=="unknown")]|length),deferred:([$observations[]|select(.severity=="deferred")]|length),unsupported:([$observations[]|select(.severity=="unsupported")]|length)}}'
-}
+
 hc_peer_context() {
     local role="$1" now="$2" daily fast='{}' file="${HC_FAST_RECEIPT:-/run/host-health-receipt.json}"
     if [[ "$role" == watchdog ]];then
@@ -9925,6 +9501,7 @@ hc_peer_context() {
         else printf 'Fast host context: UNVERIFIED; recent same-boot watchdog evidence unavailable. Daily disk findings remain independently reported.\n';fi
     fi
 }
+
 hc_export_daily_evidence() {
     local now="$1" id rows='[]' row prior='[]' file="${MONITOR_RECEIPT_FILE:-}" boot
     boot=$(cat /proc/sys/kernel/random/boot_id) || return 1
@@ -9940,6 +9517,7 @@ hc_export_daily_evidence() {
     done
     jq -nc --argjson at "$now" --arg boot "$boot" --argjson findings "$rows" --argjson coverage "${HOST_HEALTH_COVERAGE:-null}" --argjson hw "$HDD_TEMP_WARNING" --argjson hc "$HDD_TEMP_CRITICAL" --argjson sw "$SSD_TEMP_WARNING" --argjson sc "$SSD_TEMP_CRITICAL" --argjson nw "$NVME_TEMP_WARNING" --argjson nc "$NVME_TEMP_CRITICAL" '{schema:1,observedAt:$at,bootId:$boot,findings:$findings,coverage:$coverage,thresholds:{hdd:{warning:$hw,critical:$hc},ssd:{warning:$sw,critical:$sc},nvme:{warning:$nw,critical:$nc}}}'
 }
+
 hc_fast_temperature_owns() {
     local disk="$1" severity="${2,,}" file="${HC_FAST_RECEIPT:-/run/host-health-receipt.json}" daily="${MONITOR_RECEIPT_FILE:-}" now boot
     now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id)
@@ -9952,6 +9530,7 @@ hc_fast_temperature_owns() {
       any(.health.fastFindings[]?;(.id as $id|$ids|index($id))!=null and .pending=="" and
        (.severity=="critical" or ($severity=="warning" and .severity=="warning")))' "$file" >/dev/null
 }
+
 hc_thermal_only_messages() {
     local piece has_temperature=false
     local -a pieces=()
@@ -9966,6 +9545,7 @@ hc_thermal_only_messages() {
     done
     [[ "$has_temperature" == true ]]
 }
+
 hc_daily_watchdog_guard() {
     local now file="${HC_FAST_RECEIPT:-/run/host-health-receipt.json}" boot schedule="${HC_SCHEDULE_FILE:-/boot/config/plugins/user.scripts/schedule.json}"
     now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id)
@@ -9977,21 +9557,7 @@ hc_daily_watchdog_guard() {
     HC_FAST_FRESH=0
     record_finding warning monitoring monitoring.freshness '' 'Fast host watchdog evidence unavailable' 'No recent same-boot fast host receipt; daily disk checks and mount/filesystem/syslog fallbacks continue independently.' 'Review host_health_watchdog and its existing five-minute schedule. No service or disk maintenance was forced.' host_watchdog_stale
 }
-hc_storage_snapshot() {
-    local now="$1" file="${SYSLOG_INCIDENT_ROOT:-/mnt/vault/cloud/logs/script/host_health_watchdog}/incidents.json" events='[]' xfs='[]' heartbeat=0
-    local ledger="${XFS_INCIDENT_FILE:-/boot/config/plugins/user.scripts/scripts/host_health_watchdog/xfs_faults.tsv}" verified=true
-    if hc_owned_json "$file";then
-        events=$(jq -ce --argjson now "$now" '[.incidents|to_entries[]?|select(.value.severity=="CRITICAL" and .value.lastSeen>=$now-86400 and .value.lastSeen<=$now+60)|{id:.key,observedAt:.value.lastSeen,evidence:.value.example,kind:"historical_event_not_proof_of_current_fault"}]|sort_by(.observedAt)|reverse|.[0:24]' "$file") || { events='[]';verified=false; }
-    elif [[ -e "$file" ]];then verified=false
-    fi
-    if [[ -f "$ledger" && ! -L "$ledger" && -O "$ledger" ]];then
-        xfs=$(jq -Rn '[inputs|split("\t")|select((.[0]|test("^[A-Za-z0-9_.-]+$")) and (.[1]|test("^[0-9]+$")))|{source:.[0],firstObserved:(.[1]|tonumber),action:"Review XFS shutdown/corruption evidence; --ack-xfs clears a reviewed marker and does not repair the filesystem."}]' "$ledger") || { xfs='[]';verified=false; }
-    fi
-    file="${HC_SYSLOG_HEARTBEAT:-${STATE_DIR:-/tmp/host_health_watchdog_state}/storage-watch.epoch}"
-    if [[ -f "$file" && ! -L "$file" && -O "$file" ]];then read -r heartbeat < "$file" || heartbeat=0;fi
-    [[ "$heartbeat" =~ ^[0-9]+$ ]] || heartbeat=0
-    jq -nc --argjson verified "$verified" --argjson events "$events" --argjson xfs "$xfs" --argjson heartbeat "$heartbeat" --argjson now "$now" --arg execution "${HC_SYSLOG_RUN_STATUS:-NOT_COLLECTED_THIS_INVOCATION}" '{evidenceVerified:$verified,executionStatus:$execution,lastSuccessfulScanEpoch:$heartbeat,fresh:($heartbeat>0 and $heartbeat<=$now+60 and $heartbeat>=$now-1200),recentCriticalEvents:$events,openXfsSources:$xfs}'
-}
+
 hc_print_status() {
     local file="${HC_FAST_RECEIPT:-/run/host-health-receipt.json}" now boot
     now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id)
