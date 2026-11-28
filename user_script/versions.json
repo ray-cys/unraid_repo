@@ -22,8 +22,8 @@
       "sha256": "a335681a0d833f5ad5f298009010943d188a3cd644175d5768ffb96e9bf4c500"
     },
     "backup_vault_remote": {
-      "version": "1.24.5",
-      "sha256": "b57f71f1dd1421a73428eb7fee4cec99c0ca736143b08f06a10167c24bcd5e8b"
+      "version": "1.24.6",
+      "sha256": "ee4361961833ddf03f7679a12396989b8728b2c5942104e98cb197e67bac1c22"
     },
     "dns_redundancy_watchdog": {
       "version": "1.4.1",
@@ -46,16 +46,16 @@
       "sha256": "baab0b51d46d1f5c024f51afb36514a5d89f8a01356479da7cfb1ff38f3953d6"
     },
     "media_health_monitor": {
-      "version": "3.29.1",
-      "sha256": "f36dd3e7d97ea32bcb36c8cf2a82a13ab62831e112fe1a05132c6a3b787b0106"
+      "version": "3.29.2",
+      "sha256": "6bdfab7482d9b07663cb6f9770b1c4c342e08e11473f8819875e2ba0db7032b1"
     },
     "media_integrity_audit": {
       "version": "2.7.2",
       "sha256": "db84286830c9185dac18575f3e0696b3b9d8b5fbbe4e01bbc68c4bb532b3f7ec"
     },
     "media_metadata_audit": {
-      "version": "3.4.2",
-      "sha256": "fb2312fec655bb360a9050db99733bd3c7296947a147c0e78e0332dfc5179c69"
+      "version": "3.4.3",
+      "sha256": "b1c99370d32f93df24ecb50308754d8ed0584eaad690d523c7ca66e4e63b8fa7"
     },
     "media_plex_dbrepair": {
       "version": "3.6.3",

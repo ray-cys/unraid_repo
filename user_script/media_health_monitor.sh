@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="3.29.1"
+readonly SCRIPT_VERSION="3.29.2"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'media_health_monitor.sh %s\n' "$SCRIPT_VERSION"
@@ -18174,10 +18174,52 @@ monitor_maintenance_availability() {
     jq -n --argjson at "$now" --argjson services "$data" --argjson since "$(cat "${ARR_BACKUP_DEFERRED_AT:-/run/media-health-monitor-backup-deferred-at}" 2>/dev/null || printf '%s' "$now")" '{schema:2,epoch:$at,deferredSince:$since,deferredSeconds:($at-$since),mode:"read_only_maintenance",actions:"Pipeline mutations and issue resolution deferred; service availability checked independently",services:$services}' >"$tmp" && mv "$tmp" "$STATE_DIR/maintenance-availability.json"
 }
 
+# BEGIN APPDATA BACKUP DEFERRAL
+# shellcheck shell=bash
+# Shared, embedded runtime check for media monitor backup deferral.
+# Return success only for a verified live producer or its bounded recovery grace.
+# Invalid/stale ownership never suppresses monitoring; the Docker watchdog reports it.
+appdata_backup_deferred() {
+    local file="${DOCKER_MAINTENANCE_DIR:-/run/docker-service-maintenance}/backup-active.json"
+    local now boot pid start phase actual
+    APPDATA_BACKUP_REASON=''
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    [[ $(stat -c %u "$file" 2>/dev/null) == "$(id -u)" ]] || return 1
+    now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id) || return 1
+    jq -e --arg boot "$boot" --argjson now "$now" '
+      .schema==1 and .producer=="backup_cache_appdata" and .boot==$boot and
+      (.pid|type=="number" and .>0 and .==floor) and (.processStart|type=="string" and length>0) and
+      (.startedAt|type=="number" and .>0 and .==floor) and .startedAt<=$now and
+      (.expires|type=="number" and .>0 and .==floor) and .expires>$now and
+      (if .phase=="active" then .expires==(.startedAt+86400)
+       elif .phase=="grace" then (.finishedAt|type=="number" and .>0 and .==floor) and
+         .finishedAt>=.startedAt and .finishedAt<=$now and .expires==(.finishedAt+120)
+       else false end)' "$file" >/dev/null 2>&1 || return 1
+    read -r pid start phase < <(jq -r '[.pid,.processStart,.phase]|@tsv' "$file")
+    if [[ "$phase" == active ]];then
+        kill -0 "$pid" 2>/dev/null || return 1
+        actual=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')
+        [[ -n "$actual" && "$actual" == "$start" ]] || return 1
+        APPDATA_BACKUP_REASON='Appdata backup active; checks, notifications and automated actions deferred'
+    else
+        APPDATA_BACKUP_REASON='Appdata backup recovery grace; checks, notifications and automated actions deferred'
+    fi
+}
+# END APPDATA BACKUP DEFERRAL
+
 ARR_BACKUP_GATE="${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}"
 ARR_BACKUP_GRACE="${ARR_BACKUP_GRACE:-/run/arr-appdata-recovery-until}"
 ARR_BACKUP_DEFERRED_AT="${ARR_BACKUP_DEFERRED_AT:-/run/media-health-monitor-backup-deferred-at}"
 if [[ $# == 0 ]]; then
+    if appdata_backup_deferred;then
+        [[ -s "$ARR_BACKUP_DEFERRED_AT" ]] || printf '%s\n' "$START_TIME" > "$ARR_BACKUP_DEFERRED_AT"
+        backup_deferral_tmp=$(mktemp "$STATE_DIR/.maintenance-availability.XXXXXX") || exit 3
+        jq -n --argjson at "$(date +%s)" --arg reason "$APPDATA_BACKUP_REASON" \
+          '{schema:2,epoch:$at,mode:"blanket_backup_deferral",actions:$reason,services:[],availability:"UNVERIFIED"}' > "$backup_deferral_tmp" &&
+          mv "$backup_deferral_tmp" "$STATE_DIR/maintenance-availability.json" || { rm -f "$backup_deferral_tmp";exit 3; }
+        log "MAINTENANCE: $APPDATA_BACKUP_REASON; existing issues and pending notifications preserved; no service probes performed"
+        exit 0
+    fi
     exec {ARR_BACKUP_GATE_FD}>"$ARR_BACKUP_GATE" || exit 3
     arr_backup_deferred=false
     flock -s -n "$ARR_BACKUP_GATE_FD" || arr_backup_deferred=true

@@ -100,6 +100,10 @@ A drill verifies recoverability; it does not restore live application data.
   transfer all configured backup jobs.
 - `us backup_vault_remote --help` (`-h`) / `--version`: usage / release.
 
+Production configuration uses `DRY_RUN=false`: eligible requests perform real
+transfers and verification. Existing completion/request guards still apply; no
+forced replay is needed after enabling production.
+
 ## 7. dns_redundancy_watchdog
 
 - `us dns_redundancy_watchdog`: test primary/fallback DNS and apply only the
@@ -198,6 +202,10 @@ Module releases are distinct from the wrapper's public release.
 
 ## 12. media_health_monitor
 
+Normal scheduled scans defer all checks, notifications and automated actions
+during a verified appdata backup and its two-minute recovery grace. Existing
+issues remain intact; explicit review CLI commands remain available.
+
 Normal `us media_health_monitor` polls Arr/SAB, reconciles evidence and runs
 configured guarded automation in its permitted action windows.
 
@@ -250,6 +258,10 @@ replacement/recycling; recovery modes can contact Arr and submit guarded work
 when enabled.
 
 ## 14. media_metadata_audit
+
+Normal and `--weekly-report` invocations defer collection, email and reconciliation
+during the same appdata lease/grace. Pending weekly delivery is retained for the
+next eligible invocation. `--report-preview` remains read-only and available.
 
 - `us media_metadata_audit`: check the weekly review deadline and then perform
   existing guarded metadata/configuration reconciliation when eligible.

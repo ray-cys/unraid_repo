@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="3.4.2"
+readonly SCRIPT_VERSION="3.4.3"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'media_metadata_audit.sh %s\n' "$SCRIPT_VERSION"
@@ -800,6 +800,39 @@ app_update_requested() {
     return 1
 }
 
+# BEGIN APPDATA BACKUP DEFERRAL
+# shellcheck shell=bash
+# Shared, embedded runtime check for media monitor backup deferral.
+# Return success only for a verified live producer or its bounded recovery grace.
+# Invalid/stale ownership never suppresses monitoring; the Docker watchdog reports it.
+appdata_backup_deferred() {
+    local file="${DOCKER_MAINTENANCE_DIR:-/run/docker-service-maintenance}/backup-active.json"
+    local now boot pid start phase actual
+    APPDATA_BACKUP_REASON=''
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    [[ $(stat -c %u "$file" 2>/dev/null) == "$(id -u)" ]] || return 1
+    now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id) || return 1
+    jq -e --arg boot "$boot" --argjson now "$now" '
+      .schema==1 and .producer=="backup_cache_appdata" and .boot==$boot and
+      (.pid|type=="number" and .>0 and .==floor) and (.processStart|type=="string" and length>0) and
+      (.startedAt|type=="number" and .>0 and .==floor) and .startedAt<=$now and
+      (.expires|type=="number" and .>0 and .==floor) and .expires>$now and
+      (if .phase=="active" then .expires==(.startedAt+86400)
+       elif .phase=="grace" then (.finishedAt|type=="number" and .>0 and .==floor) and
+         .finishedAt>=.startedAt and .finishedAt<=$now and .expires==(.finishedAt+120)
+       else false end)' "$file" >/dev/null 2>&1 || return 1
+    read -r pid start phase < <(jq -r '[.pid,.processStart,.phase]|@tsv' "$file")
+    if [[ "$phase" == active ]];then
+        kill -0 "$pid" 2>/dev/null || return 1
+        actual=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')
+        [[ -n "$actual" && "$actual" == "$start" ]] || return 1
+        APPDATA_BACKUP_REASON='Appdata backup active; checks, notifications and automated actions deferred'
+    else
+        APPDATA_BACKUP_REASON='Appdata backup recovery grace; checks, notifications and automated actions deferred'
+    fi
+}
+# END APPDATA BACKUP DEFERRAL
+
 main() {
     if [[ ${1:-} == --version ]]; then printf 'media_metadata_audit.sh %s\n' "$SCRIPT_VERSION"; return; fi
     if [[ ${1:-} == --help ]]; then
@@ -819,6 +852,11 @@ main() {
     if [[ ${1:-} == --report-preview ]]; then weekly_media_report true; return $?; fi
     METADATA_STARTED=$(date +%s);METADATA_RUN_ID="${METADATA_STARTED}_$$";METADATA_STATUS=RUNNING;METADATA_PHASE=weekly-report;METADATA_SUMMARY='Audit started';METADATA_WEEKLY_STATUS=RUNNING
     trap 'metadata_finish "$?"' EXIT
+    if appdata_backup_deferred;then
+        METADATA_STATUS=DEFERRED;METADATA_WEEKLY_STATUS=DEFERRED
+        METADATA_SUMMARY="$APPDATA_BACKUP_REASON; findings and weekly delivery deadline preserved"
+        return 0
+    fi
     # Planned container downtime is a maintenance deferral, not failed reporting.
     exec {gate}>"${ARR_BACKUP_GATE:-/run/arr-appdata-coordination.lock}";flock -s -n "$gate" && ! app_update_requested metadata || { METADATA_STATUS=DEFERRED;METADATA_WEEKLY_STATUS=DEFERRED;METADATA_SUMMARY='Scheduled application maintenance active; reporting and configuration changes deferred';return 0; }
     local weekly_rc=0

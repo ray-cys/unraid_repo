@@ -18,6 +18,18 @@ monitoring with an attention finding. The backup's own failure notifications and
 independent liveness monitoring remain enabled. While blanket deferral applies,
 unrelated Docker problems are also not detected by this watchdog.
 
+`media_health_monitor` and `media_metadata_audit` consume the same runtime lease
+and recovery grace. The health monitor exits before its normal Arr/SAB scan,
+read-only availability probes, issue processing, notification delivery and
+pipeline actions; its existing issues are retained. Metadata normal/weekly
+runs exit before collection, report delivery or reconciliation, preserving the
+weekly deadline so the next eligible invocation can deliver it. Explicit CLI
+review/preview commands remain available. Their existing Arr/update locks still
+protect in-flight scans and updater maintenance. Invalid/stale global leases
+never extend this deferral; the Docker watchdog owns the coordination alert.
+The shared validator is embedded by `tools/sync_appdata_backup_gate.py`; no extra
+installed script or timer is required.
+
 For MetaFusion's exact `Plex connector preflight failed` outcome, or Kometa's
 complete two-reason Plex-connection/empty-library failure, the watchdog can
 classify a run as **maintenance-blocked** when all evidence agrees:
