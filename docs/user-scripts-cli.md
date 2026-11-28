@@ -146,7 +146,7 @@ Daily coverage and warm-run evidence: [details](host-health-warm-runs.md).
 | --- | --- |
 | No arguments | Daily disk/system health and configured bounded SMART/scrub maintenance. |
 | `--help` (`-h`) / `--version` | Usage / release. |
-| `--health-status` | Read the shared current host/disk health receipt; no scan, state change or email. |
+| `--health-status` | Read shared health, partial disk coverage, readable times and separate maintenance assessment; no scan, state change or email. |
 | `--check-config` | Validate configuration only. |
 | `--diagnostics` | Read-only environment diagnostics. |
 | `--state-status` | Inspect schema compatibility. |

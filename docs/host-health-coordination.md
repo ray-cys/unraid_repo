@@ -96,3 +96,39 @@ Measured-history confidence helpers describe sample quality. Existing
 they do not enable lifetime or failure-date predictions. Published TBW model rules
 accept only the fields used by current endurance monitoring. State migration and
 retired-alert filters remain because they protect restoration of existing state.
+
+## Collection, maintenance assessment and partial coverage
+
+A completed collection can be diagnostic (`MAINTENANCE_ACTIONS_ALLOWED=0` at
+entry) or operational. Its `runPurpose` is captured before collectors execute.
+Temporary safety deferrals during an operational run do not relabel it diagnostic.
+Both modes can publish current observed health. Only an operational run updates
+`maintenance.lastAttemptEpoch`, `maintenance.status` and, after complete collection,
+`maintenance.lastOperationalCompleteEpoch`. Diagnostic runs preserve those fields.
+An interrupted operational run records its attempt without advancing completion.
+
+The watchdog shows collection freshness and maintenance-assessment freshness
+separately against the existing native daily schedule and two-hour grace. Old
+receipts without this distinction remain `UNCLASSIFIED_LEGACY` for maintenance;
+their timestamps are not invented as maintenance proof. A normal daily run supplies
+the classified evidence. A stale or incomplete classified assessment raises the
+existing daily-monitoring concern, independently of a fresh diagnostic collection.
+
+An operational assessment completing does **not** claim that a self-test or scrub
+completed. Native self-test journals remain authoritative. The receipt retains
+clean live scrub results with their native start times separately; starting a test
+is not recorded as a successful completed test.
+
+Coverage now includes a `devices` array for the current discovered inventory only:
+stable identity, device path, reading status, last successful SMART read, sample
+age, never-sampled flag, precise deferral reason, retry conditions and the existing
+14-day coverage-warning deadline. Retired devices cannot inflate these totals.
+Sleeping/deferred readings never count as healthy observations and never-sampled
+is a subset of the inventory, not an additional device count. This adds no wake,
+probe, timer or maintenance action.
+
+`--health-status` uses readable local timestamps and explicitly says "no detected
+faults; coverage partial" when appropriate. It includes disk coverage, oldest sample,
+pending/overdue tests and per-device deferrals. Logs and otherwise-required daily
+notifications include the same coverage details; partial coverage alone does not
+create a new daily email. The command remains read-only and uses retained receipts.

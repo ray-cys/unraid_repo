@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="1.10.3"
+readonly SCRIPT_VERSION="1.10.4"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'host_health_watchdog.sh %s\n' "$SCRIPT_VERSION"
@@ -1564,7 +1564,14 @@ hc_daily_snapshot() {
        elif $plan!="enabled" or ($due.valid//false)!=true then "UNVERIFIED"
        elif ($at>0 and $evidence.bootId==$boot and $at >= $deadline and $now-$at<=129600) then "CURRENT"
        elif $now<=$deadline+7200 then "AWAITING_SCHEDULED_COMPLETION" else "STALE" end) as $freshness |
-      {freshness:$freshness,schedule:$plan,dueEpoch:$deadline,observedAt:$at,executionStatus:($producer.status//"unknown"),
+      ($producer.maintenance.lastOperationalCompleteEpoch//0) as $operational |
+      (if $plan=="disabled" then "NOT_SCHEDULED"
+       elif $plan!="enabled" or ($due.valid//false)!=true then "UNVERIFIED"
+       elif $operational>0 and $operational<=$now+60 and $operational>=$deadline and $evidence.bootId==$boot then "CURRENT"
+       elif $now<=$deadline+7200 then "AWAITING_SCHEDULED_COMPLETION"
+       elif ($producer|has("maintenance")) then (if $operational==0 and ($producer.maintenance.lastAttemptEpoch//0)==0 then "UNVERIFIED" else "STALE" end) else "UNCLASSIFIED_LEGACY" end) as $maintenanceFreshness |
+      {freshness:$freshness,schedule:$plan,dueEpoch:$deadline,observedAt:$at,runPurpose:($producer.runPurpose//"unclassified legacy"),
+       maintenance:{freshness:$maintenanceFreshness,lastAttemptEpoch:($producer.maintenance.lastAttemptEpoch//0),lastOperationalCompleteEpoch:$operational,status:($producer.maintenance.status//"unverified"),verifiedScrubResults:($producer.maintenance.verifiedScrubResults//[])},executionStatus:($producer.status//"unknown"),
        findings:(if $freshness=="NOT_SCHEDULED" then [] else ($evidence.findings//[]) end),coverage:($evidence.coverage//null),thresholds:($evidence.thresholds//{}),
        delivery:($producer.notification//"unknown")}'
 }
@@ -1592,7 +1599,9 @@ hc_daily_probe() {
       NOT_SCHEDULED) severity=deferred;;
     esac
     if [[ "$freshness" == CURRENT ]] && jq -e '.executionStatus=="incomplete"' <<< "$HC_DAILY_SNAPSHOT" >/dev/null;then severity=warning;fi
-    detail=$(jq -r '"Daily collector freshness=\(.freshness); latest execution=\(.executionStatus); retained disk findings=\(.findings|length). Last completed evidence="+(.observedAt|tostring)+". Findings remain owned by the daily monitor; schedule grace=2h."' <<< "$HC_DAILY_SNAPSHOT")
+    if [[ "$severity" == ok ]] && jq -e '.maintenance.freshness=="UNVERIFIED"' <<< "$HC_DAILY_SNAPSHOT" >/dev/null;then severity=unknown;fi
+    if jq -e '.maintenance.freshness=="STALE" or .maintenance.status=="incomplete"' <<< "$HC_DAILY_SNAPSHOT" >/dev/null;then severity=warning;fi
+    detail=$(jq -r '"Daily collector freshness=\(.freshness); latest execution=\(.executionStatus); retained disk findings=\(.findings|length). Last completed collection="+(.observedAt|tostring)+"; maintenance assessment="+(.maintenance.freshness//"unverified")+". Findings remain owned by the daily monitor; schedule grace=2h."' <<< "$HC_DAILY_SNAPSHOT")
     hh_observe monitor:daily-health "$severity" 'Daily disk monitoring' "$detail" 2
 }
 
@@ -1651,7 +1660,7 @@ hc_combined_health() {
        healthStatus:(if any($active[];.severity=="critical") or any($daily.findings[];.severity=="critical") then "CRITICAL"
         elif ($active|length)>0 or ($daily.findings|length)>0 or ($storage.openXfsSources|length)>0 then "ATTENTION"
         elif ($storage.evidenceVerified|not) or $storage.executionStatus=="FAILED" or ($storage.fresh|not) or ($daily.freshness|IN("STALE","UNVERIFIED")) or any($observations[];.severity=="unknown") then "UNVERIFIED" elif any($observations[];(.severity|IN("warning","critical")) and (.delegated//false|not)) then "CONFIRMING" else "OK" end),
-       coverage:{observations:($observations|length),unverified:([$observations[]|select(.severity=="unknown")]|length),deferred:([$observations[]|select(.severity=="deferred")]|length),unsupported:([$observations[]|select(.severity=="unsupported")]|length)}}'
+       coverage:{partial:(any($observations[];.severity|IN("unknown","deferred","unsupported")) or (($daily.coverage.smart.deferred//0)>0) or (($daily.coverage.smart.unverified//0)>0) or (($daily.coverage.smart.neverSampled//0)>0)),observations:($observations|length),unverified:([$observations[]|select(.severity=="unknown")]|length),deferred:([$observations[]|select(.severity=="deferred")]|length),unsupported:([$observations[]|select(.severity=="unsupported")]|length)}}'
 }
 
 hc_peer_context() {
@@ -1682,13 +1691,38 @@ hc_storage_snapshot() {
     jq -nc --argjson verified "$verified" --argjson events "$events" --argjson xfs "$xfs" --argjson heartbeat "$heartbeat" --argjson now "$now" --arg execution "${HC_SYSLOG_RUN_STATUS:-NOT_COLLECTED_THIS_INVOCATION}" '{evidenceVerified:$verified,executionStatus:$execution,lastSuccessfulScanEpoch:$heartbeat,fresh:($heartbeat>0 and $heartbeat<=$now+60 and $heartbeat>=$now-1200),recentCriticalEvents:$events,openXfsSources:$xfs}'
 }
 
+hc_time_label() {
+    local epoch="${1:-0}"
+    if [[ "$epoch" =~ ^[1-9][0-9]*$ ]];then date -d "@$epoch" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || printf 'unverified';else printf 'not recorded';fi
+}
+
 hc_print_status() {
-    local file="${HC_FAST_RECEIPT:-/run/host-health-receipt.json}" now boot
+    local file="${HC_FAST_RECEIPT:-/run/host-health-receipt.json}" now boot fast_time disk_time maintenance_time oldest_time
     now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id)
     if ! hc_owned_json "$file" || ! jq -e --arg boot "$boot" --argjson now "$now" '.bootId==$boot and .observedAt<=$now+60 and .observedAt>=$now-900 and .health.schema==1' "$file" >/dev/null;then
         printf 'Host health: UNVERIFIED\nNo current same-boot coordinated receipt. No probes, state changes or notifications performed.\n';return 0
     fi
-    jq -r '"Host health: \(.health.healthStatus)\nFast probes observed: \(.observedAt)\nDaily disk evidence: \(.health.daily.freshness); execution=\(.health.daily.executionStatus)\nFast active incidents: \(.health.fastFindings|length); disk findings: \(.health.daily.findings|length)\nCoverage: unverified=\(.health.coverage.unverified), deferred=\(.health.coverage.deferred), unsupported=\(.health.coverage.unsupported//0)\nSyslog scan: \(.health.storage.executionStatus); freshness=\(.health.storage.fresh)\nOpen XFS review markers: \(.health.storage.openXfsSources|length)",(.health.fastFindings[]?|"- [\(.severity|ascii_upcase)] \(.title): \(.detail)"),(.health.daily.findings[]?|"- [\(.severity|ascii_upcase)] \(.title): \(.detail)\n  Action: \(.action)")' "$file"
+    fast_time=$(hc_time_label "$(jq -r '.observedAt' "$file")")
+    disk_time=$(hc_time_label "$(jq -r '.health.daily.observedAt//0' "$file")")
+    maintenance_time=$(hc_time_label "$(jq -r '.health.daily.maintenance.lastOperationalCompleteEpoch//0' "$file")")
+    oldest_time=$(hc_time_label "$(jq -r '.health.daily.coverage.smart.oldestFreshEpoch//0' "$file")")
+    jq -r --arg fast "$fast_time" --arg disk "$disk_time" --arg maintenance "$maintenance_time" --arg oldest "$oldest_time" '
+      def partial: (.health.coverage.partial//false) or (.health.coverage.deferred//0)>0 or (.health.daily.coverage.smart.deferred//0)>0 or (.health.daily.coverage.smart.neverSampled//0)>0;
+      "Host health: \(.health.healthStatus)"+(if .health.healthStatus=="OK" then "; no detected faults" else "" end)+(if partial then "; coverage partial" else "" end),
+      "Fast probes observed: \($fast)",
+      "Daily disk collection: \(.health.daily.freshness); observed \($disk); mode=\(.health.daily.runPurpose//"unclassified legacy")",
+      "Maintenance assessment: \(.health.daily.maintenance.freshness//"UNCLASSIFIED_LEGACY"); latest execution=\(.health.daily.maintenance.status//"unverified"); last completed operational assessment: \($maintenance)",
+      "An assessment completion is not proof that a native test or scrub completed.",
+      "Fast active incidents: \(.health.fastFindings|length); disk findings: \(.health.daily.findings|length)",
+      "Fast coverage: unverified=\(.health.coverage.unverified), deferred=\(.health.coverage.deferred), unsupported=\(.health.coverage.unsupported//0)",
+      "Disk coverage: \(.health.daily.coverage.inventory//0) inventoried; SMART read this collection=\(.health.daily.coverage.smart.fresh//0); deferred=\(.health.daily.coverage.smart.deferred//0); unverified=\(.health.daily.coverage.smart.unverified//0); never sampled=\(.health.daily.coverage.smart.neverSampled//0)",
+      "Oldest retained SMART sample: \($oldest)",
+      "Native tests: pending=\(.health.daily.coverage.tests.pending//0); overdue=\(.health.daily.coverage.tests.overdue//0); deferred=\(.health.daily.coverage.tests.deferrals//[]|length)",
+      (.health.daily.coverage.devices[]?|select(.status!="observed")|"- \(.device): \(.status); last successful read: \(if .lastSuccessfulReadEpoch>0 then (.ageSeconds/86400|floor|tostring)+" day(s) ago" else "never sampled" end). \(.reason) Next: \(.nextEligibleAttempt)"),
+      "Syslog scan: \(.health.storage.executionStatus); freshness=\(.health.storage.fresh)",
+      "Open XFS review markers: \(.health.storage.openXfsSources|length)",
+      (.health.fastFindings[]?|"- [\(.severity|ascii_upcase)] \(.title): \(.detail)"),
+      (.health.daily.findings[]?|"- [\(.severity|ascii_upcase)] \(.title): \(.detail)\n  Action: \(.action)")' "$file"
 }
 # END HOST HEALTH COORDINATION
 

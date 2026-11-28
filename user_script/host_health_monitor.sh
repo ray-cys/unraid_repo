@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="3.5.2"
+readonly SCRIPT_VERSION="3.5.3"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'host_health_monitor.sh %s\n' "$SCRIPT_VERSION"
@@ -2273,7 +2273,13 @@ acquire_lock() {
 }
 
 write_monitor_receipt() {
-    local status="$1" exit_code="$2" outcome finished=0 evidence='null' payload
+    local status="$1" exit_code="$2" outcome finished=0 evidence='null' payload old='{}' purpose
+    if hc_owned_json "$MONITOR_RECEIPT_FILE";then old=$(cat "$MONITOR_RECEIPT_FILE") || return 1;fi
+    if [[ "$status" == running || -z "${MONITOR_RUN_PURPOSE:-}" ]];then
+        MONITOR_RUN_PURPOSE=operational
+        ((MAINTENANCE_ACTIONS_ALLOWED!=0)) || MONITOR_RUN_PURPOSE=diagnostic
+    fi
+    purpose=$MONITOR_RUN_PURPOSE
     set_notification_outcome
     outcome="$RECEIPT_NOTIFICATION_OUTCOME_RESULT"
     if [[ "$status" != running ]];then finished=$(date +%s);fi
@@ -2283,7 +2289,14 @@ write_monitor_receipt() {
     elif hc_owned_json "$MONITOR_RECEIPT_FILE";then
         evidence=$(jq -c '.healthEvidence//null' "$MONITOR_RECEIPT_FILE") || return 1
     fi
-    payload=$(jq -nc --arg status "$status" --arg version "$SCRIPT_VERSION" --argjson at "$RUN_EPOCH" --argjson finished "$finished" --argjson complete "$MONITOR_LAST_COMPLETE_EPOCH" --arg notification "$outcome" --argjson rc "$exit_code" --argjson coverage "${HOST_HEALTH_COVERAGE:-null}" --argjson evidence "$evidence" '{schema:1,status:$status,version:$version,lastAttemptEpoch:$at,finishedEpoch:$finished,lastCompleteEpoch:$complete,notification:$notification,exitCode:$rc,coverage:$coverage,healthEvidence:$evidence}') || return 1
+    payload=$(jq -nc --argjson old "$old" --arg purpose "$purpose" --arg status "$status" --arg version "$SCRIPT_VERSION" --argjson at "$RUN_EPOCH" --argjson finished "$finished" --argjson complete "$MONITOR_LAST_COMPLETE_EPOCH" --arg notification "$outcome" --argjson rc "$exit_code" --argjson coverage "${HOST_HEALTH_COVERAGE:-null}" --argjson evidence "$evidence" '
+      {schema:1,status:$status,version:$version,runPurpose:$purpose,lastAttemptEpoch:$at,finishedEpoch:$finished,lastCompleteEpoch:$complete,notification:$notification,exitCode:$rc,coverage:$coverage,healthEvidence:$evidence,
+       maintenance:($old.maintenance // {status:"unverified",lastAttemptEpoch:0,lastOperationalCompleteEpoch:0,verifiedScrubResults:[]})} |
+      if $purpose=="operational" then
+        .maintenance.lastAttemptEpoch=$at|.maintenance.status=$status|
+        if $status=="complete" then .maintenance.lastOperationalCompleteEpoch=$finished|
+          .maintenance.verifiedScrubResults=[$coverage.scrubs[]?|select(.clean==true and .live==true)] else . end
+      else . end') || return 1
     atomic_write_text "$MONITOR_RECEIPT_FILE" "$payload"
 }
 
@@ -8251,6 +8264,9 @@ compose_notification() {
     add_notification_section "${HEALTH_ALERTS_SECTION:-}"
     add_notification_section "${NOTIFICATION_RECOVERY_SECTION:-}"
     add_notification_section "${HOST_HEALTH_COVERAGE_LINE:-}"
+    if [[ "${HOST_HEALTH_COVERAGE:-null}" != null ]];then
+        add_notification_section "$(jq -r '.devices[]?|select(.status!="observed")|"- \(.device): \(.reason) Last read: \(if .lastSuccessfulReadEpoch>0 then (.ageSeconds/86400|floor|tostring)+" day(s) ago" else "never sampled" end). Next: \(.nextEligibleAttempt)"' <<< "$HOST_HEALTH_COVERAGE")"
+    fi
     if [[ -n "${HEALTH_ALERTS_SECTION:-}" || -z "${NOTIFICATION_RECOVERY_SECTION:-}" ]]; then
         add_notification_section "${STORAGE_TOP_LINES:-}"
     fi
@@ -9434,21 +9450,33 @@ hm_test_deferred() {
     log SMART INFO "${disk:+$disk: }New $kind self-test deferred: $reason; original calendar deadline retained"
 }
 hm_build_coverage_summary() {
-    local disk id first last fresh=0 deferred=0 unknown=0 never=0 oldest=0 pending=0 key rows='' tests scrubs total observed
+    local disk id first last fresh=0 deferred=0 unknown=0 never=0 oldest=0 pending=0 key rows='' tests scrubs total observed devices='[]' status reason next row
+    local -A first_seen=() last_seen=()
     observed=$(hm_observed_epoch);total=${#DISCOVERED_DISKS[@]}
-    for disk in "${DISCOVERED_DISKS[@]}";do
-        if [[ -n "${FRESH_SMART[$disk]:-}" ]];then fresh=$((fresh+1))
-        elif [[ -n "${SMART_DEFERRED[$disk]:-}" ]];then deferred=$((deferred+1))
-        else unknown=$((unknown+1));fi
-        id=$(persistent_device_key "$disk")
-        [[ "$(test_track_get "$id" pending)" != 1 ]] || pending=$((pending+1))
-    done
     if [[ -s "$SMART_COVERAGE_FILE" ]];then
         while IFS=$'\t' read -r id first last;do
-            [[ "$last" =~ ^[0-9]+$ ]] || continue
-            if ((last==0));then never=$((never+1));elif ((oldest==0 || last<oldest));then oldest=$last;fi
+            [[ "$first" =~ ^[0-9]+$ && "$last" =~ ^[0-9]+$ ]] || continue
+            first_seen["$id"]=$first;last_seen["$id"]=$last
         done < "$SMART_COVERAGE_FILE"
     fi
+    for disk in "${DISCOVERED_DISKS[@]}";do
+        id=$(persistent_device_key "$disk");first=${first_seen[$id]:-$observed};last=${last_seen[$id]:-0}
+        status=unverified;reason='SMART reading unavailable or collector did not complete.'
+        next='Retry on the next normal daily run when device access and maintenance guards permit.'
+        if [[ -n "${FRESH_SMART[$disk]:-}" ]];then
+            fresh=$((fresh+1));status=observed;last=$RUN_EPOCH;reason='SMART read succeeded during this collection.'
+            next='Next normal daily collection; native self-tests retain their own calendar.'
+        elif [[ -n "${SMART_DEFERRED[$disk]:-}" ]];then
+            deferred=$((deferred+1));status=deferred;reason="SMART deferred: ${SMART_DEFERRED[$disk]}. No healthy reading inferred."
+            next='Next normal daily run while awake; existing bounded overdue-wake policy remains in force.'
+        else unknown=$((unknown+1));fi
+        if ((last==0));then never=$((never+1));elif ((oldest==0 || last<oldest));then oldest=$last;fi
+        [[ "$(test_track_get "$id" pending)" != 1 ]] || pending=$((pending+1))
+        [[ -z "${SMART_TEST_DEFERRALS[$disk]:-}" ]] || reason+=" Self-test: ${SMART_TEST_DEFERRALS[$disk]}."
+        row=$(jq -nc --arg device "$disk" --arg id "$id" --arg status "$status" --arg reason "$reason" --arg next "$next" --argjson first "$first" --argjson last "$last" --argjson now "$observed" \
+          '{device:$device,id:$id,status:$status,lastSuccessfulReadEpoch:$last,ageSeconds:(if $last>0 then ([$now-$last,0]|max) else null end),neverSampled:($last==0),reason:$reason,nextEligibleAttempt:$next,coverageWarningDueEpoch:((if $last>0 then $last else $first end)+1209600)}') || return 1
+        devices=$(jq -nc --argjson rows "$devices" --argjson row "$row" '$rows+[$row]') || return 1
+    done
     for key in "${!SMART_TEST_DEFERRALS[@]}";do
         printf -v rows '%s%s\t%s\n' "$rows" "$key" "${SMART_TEST_DEFERRALS[$key]}"
     done
@@ -9457,12 +9485,13 @@ hm_build_coverage_summary() {
     if [[ -s "$POOL_HEALTH_FILE" ]];then
         scrubs=$(jq -ce --argjson started "$RUN_EPOCH" '[.pools[]|select(.observedAt >= $started)|{mount,clean:.recordedClean,live:.liveStatus,start:.lastRecordedStart}]' "$POOL_HEALTH_FILE") || return 1
     fi
-    HOST_HEALTH_COVERAGE=$(jq -nc --argjson at "$observed" --argjson total "$total" --argjson fresh "$fresh" --argjson deferred "$deferred" --argjson unknown "$unknown" --argjson never "$never" --argjson oldest "$oldest" --argjson started "$SMART_TEST_STARTED_THIS_RUN" --argjson pending "$pending" --argjson overdue "$SMART_TEST_OVERDUE_COUNT" --argjson deferrals "$tests" --argjson scrubs "$scrubs" '{observedAt:$at,inventory:$total,smart:{fresh:$fresh,deferred:$deferred,unverified:$unknown,neverSampled:$never,oldestFreshEpoch:$oldest},tests:{started:$started,pending:$pending,overdue:$overdue,deferrals:$deferrals},scrubs:$scrubs}') || return 1
+    HOST_HEALTH_COVERAGE=$(jq -nc --argjson at "$observed" --argjson total "$total" --argjson fresh "$fresh" --argjson deferred "$deferred" --argjson unknown "$unknown" --argjson never "$never" --argjson oldest "$oldest" --argjson started "$SMART_TEST_STARTED_THIS_RUN" --argjson pending "$pending" --argjson overdue "$SMART_TEST_OVERDUE_COUNT" --argjson deferrals "$tests" --argjson scrubs "$scrubs" --argjson devices "$devices" '{devices:$devices,observedAt:$at,inventory:$total,smart:{fresh:$fresh,deferred:$deferred,unverified:$unknown,neverSampled:$never,oldestFreshEpoch:$oldest},tests:{started:$started,pending:$pending,overdue:$overdue,deferrals:$deferrals},scrubs:$scrubs}') || return 1
     local age='none' clean count
     ((oldest==0)) || age="$(((observed-oldest)/86400))d"
     clean=$(jq '[.[]|select(.clean and .live)]|length' <<< "$scrubs");count=$(jq 'length' <<< "$scrubs")
     HOST_HEALTH_COVERAGE_LINE="Coverage: disks=$total; SMART fresh=$fresh, sleeping/deferred=$deferred, unverified=$unknown, never-sampled=$never, oldest sample=$age. Tests: started=$SMART_TEST_STARTED_THIS_RUN, pending=$pending, overdue=$SMART_TEST_OVERDUE_COUNT. Scrubs: clean live results=$clean/$count."
     log COVERAGE INFO "$HOST_HEALTH_COVERAGE_LINE"
+    while IFS= read -r row;do log COVERAGE INFO "$row";done < <(jq -r '.devices[]|select(.status!="observed")|"\(.device): \(.status); last successful SMART epoch=\(.lastSuccessfulReadEpoch); \(.reason) Next: \(.nextEligibleAttempt)"' <<< "$HOST_HEALTH_COVERAGE")
 }
 # END WARM RUN EVIDENCE
 
@@ -9501,7 +9530,14 @@ hc_daily_snapshot() {
        elif $plan!="enabled" or ($due.valid//false)!=true then "UNVERIFIED"
        elif ($at>0 and $evidence.bootId==$boot and $at >= $deadline and $now-$at<=129600) then "CURRENT"
        elif $now<=$deadline+7200 then "AWAITING_SCHEDULED_COMPLETION" else "STALE" end) as $freshness |
-      {freshness:$freshness,schedule:$plan,dueEpoch:$deadline,observedAt:$at,executionStatus:($producer.status//"unknown"),
+      ($producer.maintenance.lastOperationalCompleteEpoch//0) as $operational |
+      (if $plan=="disabled" then "NOT_SCHEDULED"
+       elif $plan!="enabled" or ($due.valid//false)!=true then "UNVERIFIED"
+       elif $operational>0 and $operational<=$now+60 and $operational>=$deadline and $evidence.bootId==$boot then "CURRENT"
+       elif $now<=$deadline+7200 then "AWAITING_SCHEDULED_COMPLETION"
+       elif ($producer|has("maintenance")) then (if $operational==0 and ($producer.maintenance.lastAttemptEpoch//0)==0 then "UNVERIFIED" else "STALE" end) else "UNCLASSIFIED_LEGACY" end) as $maintenanceFreshness |
+      {freshness:$freshness,schedule:$plan,dueEpoch:$deadline,observedAt:$at,runPurpose:($producer.runPurpose//"unclassified legacy"),
+       maintenance:{freshness:$maintenanceFreshness,lastAttemptEpoch:($producer.maintenance.lastAttemptEpoch//0),lastOperationalCompleteEpoch:$operational,status:($producer.maintenance.status//"unverified"),verifiedScrubResults:($producer.maintenance.verifiedScrubResults//[])},executionStatus:($producer.status//"unknown"),
        findings:(if $freshness=="NOT_SCHEDULED" then [] else ($evidence.findings//[]) end),coverage:($evidence.coverage//null),thresholds:($evidence.thresholds//{}),
        delivery:($producer.notification//"unknown")}'
 }
@@ -9574,13 +9610,38 @@ hc_daily_watchdog_guard() {
     record_finding warning monitoring monitoring.freshness '' 'Fast host watchdog evidence unavailable' 'No recent same-boot fast host receipt; daily disk checks and mount/filesystem/syslog fallbacks continue independently.' 'Review host_health_watchdog and its existing five-minute schedule. No service or disk maintenance was forced.' host_watchdog_stale
 }
 
+hc_time_label() {
+    local epoch="${1:-0}"
+    if [[ "$epoch" =~ ^[1-9][0-9]*$ ]];then date -d "@$epoch" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || printf 'unverified';else printf 'not recorded';fi
+}
+
 hc_print_status() {
-    local file="${HC_FAST_RECEIPT:-/run/host-health-receipt.json}" now boot
+    local file="${HC_FAST_RECEIPT:-/run/host-health-receipt.json}" now boot fast_time disk_time maintenance_time oldest_time
     now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id)
     if ! hc_owned_json "$file" || ! jq -e --arg boot "$boot" --argjson now "$now" '.bootId==$boot and .observedAt<=$now+60 and .observedAt>=$now-900 and .health.schema==1' "$file" >/dev/null;then
         printf 'Host health: UNVERIFIED\nNo current same-boot coordinated receipt. No probes, state changes or notifications performed.\n';return 0
     fi
-    jq -r '"Host health: \(.health.healthStatus)\nFast probes observed: \(.observedAt)\nDaily disk evidence: \(.health.daily.freshness); execution=\(.health.daily.executionStatus)\nFast active incidents: \(.health.fastFindings|length); disk findings: \(.health.daily.findings|length)\nCoverage: unverified=\(.health.coverage.unverified), deferred=\(.health.coverage.deferred), unsupported=\(.health.coverage.unsupported//0)\nSyslog scan: \(.health.storage.executionStatus); freshness=\(.health.storage.fresh)\nOpen XFS review markers: \(.health.storage.openXfsSources|length)",(.health.fastFindings[]?|"- [\(.severity|ascii_upcase)] \(.title): \(.detail)"),(.health.daily.findings[]?|"- [\(.severity|ascii_upcase)] \(.title): \(.detail)\n  Action: \(.action)")' "$file"
+    fast_time=$(hc_time_label "$(jq -r '.observedAt' "$file")")
+    disk_time=$(hc_time_label "$(jq -r '.health.daily.observedAt//0' "$file")")
+    maintenance_time=$(hc_time_label "$(jq -r '.health.daily.maintenance.lastOperationalCompleteEpoch//0' "$file")")
+    oldest_time=$(hc_time_label "$(jq -r '.health.daily.coverage.smart.oldestFreshEpoch//0' "$file")")
+    jq -r --arg fast "$fast_time" --arg disk "$disk_time" --arg maintenance "$maintenance_time" --arg oldest "$oldest_time" '
+      def partial: (.health.coverage.partial//false) or (.health.coverage.deferred//0)>0 or (.health.daily.coverage.smart.deferred//0)>0 or (.health.daily.coverage.smart.neverSampled//0)>0;
+      "Host health: \(.health.healthStatus)"+(if .health.healthStatus=="OK" then "; no detected faults" else "" end)+(if partial then "; coverage partial" else "" end),
+      "Fast probes observed: \($fast)",
+      "Daily disk collection: \(.health.daily.freshness); observed \($disk); mode=\(.health.daily.runPurpose//"unclassified legacy")",
+      "Maintenance assessment: \(.health.daily.maintenance.freshness//"UNCLASSIFIED_LEGACY"); latest execution=\(.health.daily.maintenance.status//"unverified"); last completed operational assessment: \($maintenance)",
+      "An assessment completion is not proof that a native test or scrub completed.",
+      "Fast active incidents: \(.health.fastFindings|length); disk findings: \(.health.daily.findings|length)",
+      "Fast coverage: unverified=\(.health.coverage.unverified), deferred=\(.health.coverage.deferred), unsupported=\(.health.coverage.unsupported//0)",
+      "Disk coverage: \(.health.daily.coverage.inventory//0) inventoried; SMART read this collection=\(.health.daily.coverage.smart.fresh//0); deferred=\(.health.daily.coverage.smart.deferred//0); unverified=\(.health.daily.coverage.smart.unverified//0); never sampled=\(.health.daily.coverage.smart.neverSampled//0)",
+      "Oldest retained SMART sample: \($oldest)",
+      "Native tests: pending=\(.health.daily.coverage.tests.pending//0); overdue=\(.health.daily.coverage.tests.overdue//0); deferred=\(.health.daily.coverage.tests.deferrals//[]|length)",
+      (.health.daily.coverage.devices[]?|select(.status!="observed")|"- \(.device): \(.status); last successful read: \(if .lastSuccessfulReadEpoch>0 then (.ageSeconds/86400|floor|tostring)+" day(s) ago" else "never sampled" end). \(.reason) Next: \(.nextEligibleAttempt)"),
+      "Syslog scan: \(.health.storage.executionStatus); freshness=\(.health.storage.fresh)",
+      "Open XFS review markers: \(.health.storage.openXfsSources|length)",
+      (.health.fastFindings[]?|"- [\(.severity|ascii_upcase)] \(.title): \(.detail)"),
+      (.health.daily.findings[]?|"- [\(.severity|ascii_upcase)] \(.title): \(.detail)\n  Action: \(.action)")' "$file"
 }
 # END HOST HEALTH COORDINATION
 

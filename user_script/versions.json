@@ -34,12 +34,12 @@
       "sha256": "ce50ece58fdb8a9a1b1d2f928bce71df151354951895059c8d903a7881d69e33"
     },
     "host_health_monitor": {
-      "version": "3.5.2",
-      "sha256": "76e6440d400639b62b4dfc0212d30bb3373610c09bf21e452ecd102d4327b44f"
+      "version": "3.5.3",
+      "sha256": "7769e73cbf84dea809b574e6451ff4683869ea327d8cf5e7dd2d5b4a39f2b508"
     },
     "host_health_watchdog": {
-      "version": "1.10.3",
-      "sha256": "cb9ac5a4c669c14f097da7d47de057a95e89d726bf44ee11f2538f55540aefb6"
+      "version": "1.10.4",
+      "sha256": "ae3148b897a0cf6666f3962e344afb0f704e3628bcb1222a8c9234f8be63efa5"
     },
     "media_cleanup": {
       "version": "1.11.3",
