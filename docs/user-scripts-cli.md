@@ -83,6 +83,28 @@ sufficient capacity. It is not an inspection command.
   receipts and show whether the first native receipt is still pending; no transfer, SSH or wake.
 - `us backup_media_remote --version`: release only. No `--help` mode.
 
+Both remote backup scripts use bounded adaptive admission by default. They start
+one job, sample Hubble and ISS every 30 seconds, and admit up to two independent
+jobs after five quiet minutes. CPU and I/O priorities recover independently;
+pressure stops new parallel admission while admitted jobs finish. These controls
+use native `/proc` counters and do not require PSI or matching Unraid versions.
+
+Configuration/environment overrides (no new CLI mode or schedule):
+
+- `BACKUP_ADAPTIVE_ENABLED=true`: use the controller; `false` retains serial work.
+- `BACKUP_ADAPTIVE_MAX_WORKERS=2`: hard admission ceiling; supported values 1 or 2.
+- `BACKUP_ADAPTIVE_SAMPLE_SECONDS=30`: samples every 10–300 seconds.
+- `BACKUP_ADAPTIVE_QUIET_SECONDS=300`: quiet recovery window, 60–3600 seconds.
+- `BACKUP_ISS_RECONSTRUCT_WRITE=true`: temporary ISS-only boost when parity and
+  healthy array evidence are present. No parity means no setting change. Hubble's
+  mode is unchanged. Prior runtime mode is restored; flash settings are untouched.
+
+For example, `BACKUP_ADAPTIVE_MAX_WORKERS=1 us backup_media_remote` keeps adaptive
+priorities while preventing a second transfer. Original checksum, retry, capacity,
+retention, request, lease and shutdown guards still apply. The completion summary
+records peak workers, missing/control evidence and ISS write-mode outcome.
+See [adaptive backup safeguards](user-script-operational-evidence.md#adaptive-remote-backups).
+
 ## 5. backup_restore_drill
 
 - `us backup_restore_drill`: select backup coverage and perform bounded temporary

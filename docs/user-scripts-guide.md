@@ -86,11 +86,11 @@ Source: [backup_media_remote.sh](../user_script/backup_media_remote.sh).
 
 **Purpose.** Maintain a remote mirror of configured media shares on ISS for recovery after loss of Hubble.
 
-**Workflow.** Check local/remote mounts, paths, space and rsync capabilities; wake ISS if needed, transfer under a shared remote-use lease, publish completion evidence and request shutdown when safe.
+**Workflow.** Check local/remote mounts, paths, space and rsync capabilities; wake ISS if needed, transfer under a shared remote-use lease, publish completion evidence and request shutdown when safe. Adapt CPU/I/O priority on both hosts and admit at most two independent jobs after sustained quiet; guard any temporary ISS Reconstruct Write setting and restore its previous runtime mode.
 
 **Coordination.** Shares ISS coordination with backup_vault_remote; backup_health_audit reads its completion/verification receipt.
 
-**Limits.** This is a mirror: source removals can propagate. Compatibility uses available features rather than requiring identical rsync versions. Shutdown acknowledgement and observed shutdown are separate results.
+**Limits.** This is a mirror: source removals can propagate. Compatibility uses available features rather than requiring identical rsync versions. Shutdown acknowledgement and observed shutdown are separate results. Reconstruct Write is skipped when ISS has no parity; unknown resource evidence restricts concurrency. Priority is not a hard bandwidth or CPU limit.
 
 **Reporting.** Report transfer, verification and shutdown outcomes; retain failed delivery evidence for retry.
 
@@ -101,11 +101,11 @@ Source: [backup_vault_remote.sh](../user_script/backup_vault_remote.sh).
 
 **Purpose.** Copy completed local backups and configured vault data into independently restorable generations on ISS.
 
-**Workflow.** Consume a valid appdata completion request, wake and validate ISS, transfer and verify a staged generation, promote it atomically, acknowledge completion, then apply retention and eligible remote restore checks.
+**Workflow.** Consume a valid appdata completion request, wake and validate ISS, transfer and verify a staged generation, promote it atomically, acknowledge completion, then apply retention and eligible remote restore checks. Adapt CPU/I/O priority on both hosts and admit at most two independent jobs after sustained quiet; guard any temporary ISS Reconstruct Write setting and restore its previous runtime mode.
 
 **Coordination.** backup_cache_appdata produces requests; boot backups and configured GitHub/photos data join the generation. Shares the ISS lease with backup_media_remote; backup_restore_drill and backup_health_audit consume evidence.
 
-**Limits.** An idle scheduled check does not start a transfer or wake ISS. Invalid, stale or changed requests are withheld. Dry run is disabled for production; hashing and transfer profiling remain separate.
+**Limits.** An idle scheduled check does not start a transfer or wake ISS. Invalid, stale or changed requests are withheld. Dry run is disabled for production; hashing and transfer profiling remain separate. Reconstruct Write is skipped when ISS has no parity; unknown resource evidence restricts concurrency. Priority is not a hard bandwidth or CPU limit.
 
 **Reporting.** Report generation, verification, retention, restore-check and shutdown results, including unresolved failures; idle checks stay quiet.
 

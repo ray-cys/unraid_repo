@@ -14,16 +14,16 @@
       "sha256": "d56be32b0d41f34324209d9691dd006464caf30fd7a98dfeaf8408756644b3dd"
     },
     "backup_media_remote": {
-      "version": "2.10.0",
-      "sha256": "f12fd7e3fb7f623a6ff4a180fcb3862c3d3b187d7aa832d66ad2209fc3d3a33b"
+      "version": "2.11.0",
+      "sha256": "34e46b79488be2e0caced96607438478d948fc319bac90e07c1f4218574f5c66"
     },
     "backup_restore_drill": {
       "version": "1.6.2",
       "sha256": "87194f0a2ec9981c173d9a82c4330f6a7f84430515337af727a3a2ec86d34cb9"
     },
     "backup_vault_remote": {
-      "version": "1.24.7",
-      "sha256": "66ae48f622d9d956c127d6767927428acabdd267ec1410faad73a02a574730e8"
+      "version": "1.25.0",
+      "sha256": "72ee1083f2ee7cc95fa9165390887e836eb33b9628285d575639de982a131e12"
     },
     "dns_redundancy_watchdog": {
       "version": "1.4.2",

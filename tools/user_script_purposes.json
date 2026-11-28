@@ -22,16 +22,16 @@
   ],
   "backup_media_remote": [
     "Maintain a remote mirror of configured media shares on ISS for recovery after loss of Hubble.",
-    "Check local/remote mounts, paths, space and rsync capabilities; wake ISS if needed, transfer under a shared remote-use lease, publish completion evidence and request shutdown when safe.",
+    "Check local/remote mounts, paths, space and rsync capabilities; wake ISS if needed, transfer under a shared remote-use lease, publish completion evidence and request shutdown when safe. Adapt CPU/I/O priority on both hosts and admit at most two independent jobs after sustained quiet; guard any temporary ISS Reconstruct Write setting and restore its previous runtime mode.",
     "Shares ISS coordination with backup_vault_remote; backup_health_audit reads its completion/verification receipt.",
-    "This is a mirror: source removals can propagate. Compatibility uses available features rather than requiring identical rsync versions. Shutdown acknowledgement and observed shutdown are separate results.",
+    "This is a mirror: source removals can propagate. Compatibility uses available features rather than requiring identical rsync versions. Shutdown acknowledgement and observed shutdown are separate results. Reconstruct Write is skipped when ISS has no parity; unknown resource evidence restricts concurrency. Priority is not a hard bandwidth or CPU limit.",
     "Report transfer, verification and shutdown outcomes; retain failed delivery evidence for retry."
   ],
   "backup_vault_remote": [
     "Copy completed local backups and configured vault data into independently restorable generations on ISS.",
-    "Consume a valid appdata completion request, wake and validate ISS, transfer and verify a staged generation, promote it atomically, acknowledge completion, then apply retention and eligible remote restore checks.",
+    "Consume a valid appdata completion request, wake and validate ISS, transfer and verify a staged generation, promote it atomically, acknowledge completion, then apply retention and eligible remote restore checks. Adapt CPU/I/O priority on both hosts and admit at most two independent jobs after sustained quiet; guard any temporary ISS Reconstruct Write setting and restore its previous runtime mode.",
     "backup_cache_appdata produces requests; boot backups and configured GitHub/photos data join the generation. Shares the ISS lease with backup_media_remote; backup_restore_drill and backup_health_audit consume evidence.",
-    "An idle scheduled check does not start a transfer or wake ISS. Invalid, stale or changed requests are withheld. Dry run is disabled for production; hashing and transfer profiling remain separate.",
+    "An idle scheduled check does not start a transfer or wake ISS. Invalid, stale or changed requests are withheld. Dry run is disabled for production; hashing and transfer profiling remain separate. Reconstruct Write is skipped when ISS has no parity; unknown resource evidence restricts concurrency. Priority is not a hard bandwidth or CPU limit.",
     "Report generation, verification, retention, restore-check and shutdown results, including unresolved failures; idle checks stay quiet."
   ],
   "backup_restore_drill": [
