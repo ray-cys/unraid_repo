@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="3.5.3"
+readonly SCRIPT_VERSION="3.5.4"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'host_health_monitor.sh %s\n' "$SCRIPT_VERSION"
@@ -6765,7 +6765,7 @@ set_finding_target_label() {
     local device="${FINDING_DEVICE[$id]:-}"
     local category="${FINDING_CATEGORY[$id]:-general}"
     local base_device_path="" array_slot="" pool_name="" mount_path=""
-    local mapped_mount mapped_device mapped_base model_suffix=""
+    local mapped_mount mapped_device mapped_base model_suffix="" native_label=""
 
     FINDING_TARGET_LABEL_RESULT="System"
     if [[ -n "$device" ]]; then
@@ -6786,6 +6786,11 @@ set_finding_target_label() {
             FINDING_TARGET_LABEL_RESULT="$pool_name [$(basename "$base_device_path")]"
         else
             FINDING_TARGET_LABEL_RESULT="$(basename "$base_device_path")"
+        fi
+        native_label=$(hc_device_label "$base_device_path")
+        if [[ "$native_label" != "$base_device_path" && -n "$native_label" ]];then
+            FINDING_TARGET_LABEL_RESULT="$native_label"
+            return 0
         fi
         model_suffix="$(model_suffix_for "$base_device_path")"
         FINDING_TARGET_LABEL_RESULT+="$model_suffix"
@@ -8265,7 +8270,7 @@ compose_notification() {
     add_notification_section "${NOTIFICATION_RECOVERY_SECTION:-}"
     add_notification_section "${HOST_HEALTH_COVERAGE_LINE:-}"
     if [[ "${HOST_HEALTH_COVERAGE:-null}" != null ]];then
-        add_notification_section "$(jq -r '.devices[]?|select(.status!="observed")|"- \(.device): \(.reason) Last read: \(if .lastSuccessfulReadEpoch>0 then (.ageSeconds/86400|floor|tostring)+" day(s) ago" else "never sampled" end). Next: \(.nextEligibleAttempt)"' <<< "$HOST_HEALTH_COVERAGE")"
+        add_notification_section "$(jq -r '.devices[]?|select(.status!="observed")|"- \(.label//.device): \(.reason) Last read: \(if .lastSuccessfulReadEpoch>0 then (.ageSeconds/86400|floor|tostring)+" day(s) ago" else "never sampled" end). Next: \(.nextEligibleAttempt)"' <<< "$HOST_HEALTH_COVERAGE")"
     fi
     if [[ -n "${HEALTH_ALERTS_SECTION:-}" || -z "${NOTIFICATION_RECOVERY_SECTION:-}" ]]; then
         add_notification_section "${STORAGE_TOP_LINES:-}"
@@ -9450,7 +9455,7 @@ hm_test_deferred() {
     log SMART INFO "${disk:+$disk: }New $kind self-test deferred: $reason; original calendar deadline retained"
 }
 hm_build_coverage_summary() {
-    local disk id first last fresh=0 deferred=0 unknown=0 never=0 oldest=0 pending=0 key rows='' tests scrubs total observed devices='[]' status reason next row
+    local disk id first last fresh=0 deferred=0 unknown=0 never=0 oldest=0 pending=0 key rows='' tests scrubs total observed devices='[]' status reason next row identity
     local -A first_seen=() last_seen=()
     observed=$(hm_observed_epoch);total=${#DISCOVERED_DISKS[@]}
     if [[ -s "$SMART_COVERAGE_FILE" ]];then
@@ -9473,8 +9478,9 @@ hm_build_coverage_summary() {
         if ((last==0));then never=$((never+1));elif ((oldest==0 || last<oldest));then oldest=$last;fi
         [[ "$(test_track_get "$id" pending)" != 1 ]] || pending=$((pending+1))
         [[ -z "${SMART_TEST_DEFERRALS[$disk]:-}" ]] || reason+=" Self-test: ${SMART_TEST_DEFERRALS[$disk]}."
-        row=$(jq -nc --arg device "$disk" --arg id "$id" --arg status "$status" --arg reason "$reason" --arg next "$next" --argjson first "$first" --argjson last "$last" --argjson now "$observed" \
-          '{device:$device,id:$id,status:$status,lastSuccessfulReadEpoch:$last,ageSeconds:(if $last>0 then ([$now-$last,0]|max) else null end),neverSampled:($last==0),reason:$reason,nextEligibleAttempt:$next,coverageWarningDueEpoch:((if $last>0 then $last else $first end)+1209600)}') || return 1
+        identity=$(hc_device_identity "$disk") || return 1
+        row=$(jq -nc --argjson identity "$identity" --arg device "$disk" --arg id "$id" --arg status "$status" --arg reason "$reason" --arg next "$next" --argjson first "$first" --argjson last "$last" --argjson now "$observed" \
+          '$identity+{device:$device,id:$id,status:$status,lastSuccessfulReadEpoch:$last,ageSeconds:(if $last>0 then ([$now-$last,0]|max) else null end),neverSampled:($last==0),reason:$reason,nextEligibleAttempt:$next,coverageWarningDueEpoch:((if $last>0 then $last else $first end)+1209600)}') || return 1
         devices=$(jq -nc --argjson rows "$devices" --argjson row "$row" '$rows+[$row]') || return 1
     done
     for key in "${!SMART_TEST_DEFERRALS[@]}";do
@@ -9491,7 +9497,7 @@ hm_build_coverage_summary() {
     clean=$(jq '[.[]|select(.clean and .live)]|length' <<< "$scrubs");count=$(jq 'length' <<< "$scrubs")
     HOST_HEALTH_COVERAGE_LINE="Coverage: disks=$total; SMART fresh=$fresh, sleeping/deferred=$deferred, unverified=$unknown, never-sampled=$never, oldest sample=$age. Tests: started=$SMART_TEST_STARTED_THIS_RUN, pending=$pending, overdue=$SMART_TEST_OVERDUE_COUNT. Scrubs: clean live results=$clean/$count."
     log COVERAGE INFO "$HOST_HEALTH_COVERAGE_LINE"
-    while IFS= read -r row;do log COVERAGE INFO "$row";done < <(jq -r '.devices[]|select(.status!="observed")|"\(.device): \(.status); last successful SMART epoch=\(.lastSuccessfulReadEpoch); \(.reason) Next: \(.nextEligibleAttempt)"' <<< "$HOST_HEALTH_COVERAGE")
+    while IFS= read -r row;do log COVERAGE INFO "$row";done < <(jq -r '.devices[]|select(.status!="observed")|"\(.label//.device): \(.status); last successful SMART epoch=\(.lastSuccessfulReadEpoch); \(.reason) Next: \(.nextEligibleAttempt)"' <<< "$HOST_HEALTH_COVERAGE")
 }
 # END WARM RUN EVIDENCE
 
@@ -9503,6 +9509,37 @@ hc_owned_json() {
     [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file" 2>/dev/null) == "$EUID" && $(stat -c %h "$file" 2>/dev/null) == 1 ]] || return 1
     (( $(stat -c %s "$file" 2>/dev/null || echo 9999999) <= 2097152 )) || return 1
     jq -e 'type=="object"' "$file" >/dev/null 2>&1
+}
+
+hc_device_identity() {
+    local device="$1" base slot='' native='' model='' serial='' suffix='' label row
+    base=${device#/dev/}
+    if [[ "$device" =~ ^/dev/(sd[a-z]+|nvme[0-9]+n[0-9]+)$ ]];then
+        row=$(awk -F= -v wanted="$base" '
+          function emit(){if(dev==wanted && slot!="flash"){matches++;result=slot "|" identity}}
+          /^\[/{emit();slot=$0;gsub(/[\[\]"\r]/,"",slot);dev=identity="";next}
+          {v=substr($0,index($0,"=")+1);gsub(/["\r]/,"",v)}
+          $1=="device"{dev=v} $1=="id"{identity=v} END{emit();if(matches==1)print result}
+        ' "${HH_DISKS_INI:-/var/local/emhttp/disks.ini}" 2>/dev/null) || row=''
+        IFS='|' read -r slot native <<< "$row"
+        [[ "$slot" =~ ^[A-Za-z0-9_.-]+$ ]] || slot=''
+        if [[ -n "$native" && "$native" == *_* ]];then model=${native%_*};serial=${native##*_};fi
+        if [[ -r "${HH_SYS_ROOT:-/sys}/class/block/$base/device/model" ]];then
+            model=$(head -c 256 "${HH_SYS_ROOT:-/sys}/class/block/$base/device/model" 2>/dev/null) || model=''
+        fi
+        model=$(printf '%s' "$model" | LC_ALL=C tr -cd '[:print:]' | sed -E 's/_/ /g;s/^[[:space:]]+//;s/[[:space:]]+$//');model=${model:0:96}
+        serial=$(printf '%s' "$serial" | LC_ALL=C tr -cd '[:alnum:]-');suffix=${serial: -6}
+    fi
+    label="$device"
+    if [[ -n "$slot" || -n "$model" || -n "$suffix" ]];then
+        label="${slot:-slot unverified} | ${model:-model unavailable} | serial ${suffix:+...}${suffix:-unavailable} ($device)"
+    fi
+    jq -nc --arg device "$device" --arg slot "$slot" --arg model "$model" --arg serial "$suffix" --arg label "$label" \
+      '{device:$device,slot:$slot,model:$model,serialSuffix:$serial,label:$label}'
+}
+
+hc_device_label() {
+    hc_device_identity "$1" | jq -r .label
 }
 
 hc_daily_snapshot() {
@@ -9558,7 +9595,7 @@ hc_export_daily_evidence() {
     local now="$1" id rows='[]' row prior='[]' file="${MONITOR_RECEIPT_FILE:-}" boot
     boot=$(cat /proc/sys/kernel/random/boot_id) || return 1
     for id in "${FINDING_IDS[@]}";do
-        row=$(jq -nc --arg id "$id" --arg severity "${FINDING_SEVERITY[$id]}" --arg title "${FINDING_TITLE[$id]}" --arg detail "${FINDING_EVIDENCE[$id]}" --arg action "${FINDING_ACTION[$id]}" --arg device "${FINDING_DEVICE[$id]:-}" '{device:$device,id:$id,severity:$severity,title:$title,detail:$detail,action:$action,verification:"observed"}') || return 1
+        row=$(jq -nc --arg id "$id" --arg severity "${FINDING_SEVERITY[$id]}" --arg title "${FINDING_TITLE[$id]}" --arg detail "${FINDING_EVIDENCE[$id]}" --arg action "${FINDING_ACTION[$id]}" --arg device "${FINDING_DEVICE[$id]:-}" --arg label "$(hc_device_label "${FINDING_DEVICE[$id]:-}")" '{displayLabel:$label,device:$device,id:$id,severity:$severity,title:$title,detail:$detail,action:$action,verification:"observed"}') || return 1
         rows=$(jq -nc --argjson rows "$rows" --argjson row "$row" '$rows+[$row]') || return 1
     done
     hc_owned_json "$file" && prior=$(jq -c '.healthEvidence.findings//[]' "$file")
@@ -9637,11 +9674,11 @@ hc_print_status() {
       "Disk coverage: \(.health.daily.coverage.inventory//0) inventoried; SMART read this collection=\(.health.daily.coverage.smart.fresh//0); deferred=\(.health.daily.coverage.smart.deferred//0); unverified=\(.health.daily.coverage.smart.unverified//0); never sampled=\(.health.daily.coverage.smart.neverSampled//0)",
       "Oldest retained SMART sample: \($oldest)",
       "Native tests: pending=\(.health.daily.coverage.tests.pending//0); overdue=\(.health.daily.coverage.tests.overdue//0); deferred=\(.health.daily.coverage.tests.deferrals//[]|length)",
-      (.health.daily.coverage.devices[]?|select(.status!="observed")|"- \(.device): \(.status); last successful read: \(if .lastSuccessfulReadEpoch>0 then (.ageSeconds/86400|floor|tostring)+" day(s) ago" else "never sampled" end). \(.reason) Next: \(.nextEligibleAttempt)"),
+      (.health.daily.coverage.devices[]?|select(.status!="observed")|"- \(.label//.device): \(.status); last successful read: \(if .lastSuccessfulReadEpoch>0 then (.ageSeconds/86400|floor|tostring)+" day(s) ago" else "never sampled" end). \(.reason) Next: \(.nextEligibleAttempt)"),
       "Syslog scan: \(.health.storage.executionStatus); freshness=\(.health.storage.fresh)",
       "Open XFS review markers: \(.health.storage.openXfsSources|length)",
       (.health.fastFindings[]?|"- [\(.severity|ascii_upcase)] \(.title): \(.detail)"),
-      (.health.daily.findings[]?|"- [\(.severity|ascii_upcase)] \(.title): \(.detail)\n  Action: \(.action)")' "$file"
+      (.health.daily.findings[]?|"- [\(.severity|ascii_upcase)] \(if (.displayLabel//"")!="" then .displayLabel+": " else "" end)\(.title): \(.detail)\n  Action: \(.action)")' "$file"
 }
 # END HOST HEALTH COORDINATION
 

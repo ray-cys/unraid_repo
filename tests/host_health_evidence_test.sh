@@ -44,3 +44,19 @@ grep -q 'never sampled' <<< "$output"
 grep -q 'Maintenance assessment: STALE' <<< "$output"
 grep -Eq 'Fast probes observed: [0-9]{4}-[0-9]{2}-[0-9]{2}' <<< "$output"
 printf 'PASS: exact current-device coverage, explicit retry conditions and readable partial-health status\n'
+# Labels use metadata only. A changed device letter follows the current slot,
+# while absent/ambiguous assignments never inherit an invented serial identity.
+HH_DISKS_INI="$work/disks.ini";HH_SYS_ROOT="$work/sys"
+mkdir -p "$HH_SYS_ROOT/class/block/sda/device"
+printf 'WDC Example Model\n' > "$HH_SYS_ROOT/class/block/sda/device/model"
+printf '["disk4"]\ndevice="sda"\nid="WDC_Example_Model_SERIAL123456"\n["cache"]\ndevice="nvme0n1"\nid="NVMe_Model_ABCDEF987654"\n' > "$HH_DISKS_INI"
+identity=$(hc_device_identity /dev/sda)
+jq -e '.slot=="disk4" and .model=="WDC Example Model" and .serialSuffix=="123456" and (.label|contains("/dev/sda"))' <<< "$identity" >/dev/null
+if grep -q SERIAL123456 <<< "$identity";then echo 'FAIL: full serial leaked in display metadata';exit 1;fi
+sed 's/device="sda"/device="sdb"/' "$HH_DISKS_INI" > "$work/changed";mv "$work/changed" "$HH_DISKS_INI"
+jq -e '.slot=="disk4" and .serialSuffix=="123456"' <<< "$(hc_device_identity /dev/sdb)" >/dev/null
+jq -e '.slot=="" and .serialSuffix==""' <<< "$(hc_device_identity /dev/sda)" >/dev/null
+printf '["other"]\ndevice="sdb"\nid="Wrong_Fake_654321"\n' >> "$HH_DISKS_INI"
+jq -e '.slot=="" and .serialSuffix=="" and .label=="/dev/sdb"' <<< "$(hc_device_identity /dev/sdb)" >/dev/null
+jq -e '.device=="/dev/../sda" and .label=="/dev/../sda"' <<< "$(hc_device_identity /dev/../sda)" >/dev/null
+printf 'PASS: native slot/model/serial suffix, changed device letters and missing/ambiguous label safeguards\n'

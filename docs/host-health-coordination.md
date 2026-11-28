@@ -132,3 +132,17 @@ faults; coverage partial" when appropriate. It includes disk coverage, oldest sa
 pending/overdue tests and per-device deferrals. Logs and otherwise-required daily
 notifications include the same coverage details; partial coverage alone does not
 create a new daily email. The command remains read-only and uses retained receipts.
+
+## Disk identification in reports
+
+Disk coverage, native temperature observations and daily disk finding labels use
+`slot | model | serial ...LAST6 (/dev/path)` when current Unraid metadata identifies
+the device. Model text can also come from sysfs. Only a serial suffix is added to
+these display fields. Stable finding keys, acknowledgement identities, test
+journals and recovery ownership are unchanged.
+
+Labels are captured with the observation and retained in its receipt; a later
+status read does not relabel an old finding using a newly assigned device letter.
+A missing or duplicate assignment leaves the slot/serial unverified rather than
+guessing. No SMART reads, disk wake, new state files, application changes or
+schedule changes are needed for these labels.

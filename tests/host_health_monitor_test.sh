@@ -1223,6 +1223,8 @@ run_regression_tests() (
     fi
 
     MOUNT_TO_DEV['/mnt/disk1']='/dev/sda'
+    HH_DISKS_INI="$fixture_dir/no-native-labels.ini"
+    HH_SYS_ROOT="$fixture_dir/no-native-sysfs"
     ENABLE_MODEL_IN_ALERTS=0
     finalize_finding_counts
     build_health_alerts

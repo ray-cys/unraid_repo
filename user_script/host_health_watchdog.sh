@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="1.10.4"
+readonly SCRIPT_VERSION="1.10.5"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'host_health_watchdog.sh %s\n' "$SCRIPT_VERSION"
@@ -1539,6 +1539,37 @@ hc_owned_json() {
     jq -e 'type=="object"' "$file" >/dev/null 2>&1
 }
 
+hc_device_identity() {
+    local device="$1" base slot='' native='' model='' serial='' suffix='' label row
+    base=${device#/dev/}
+    if [[ "$device" =~ ^/dev/(sd[a-z]+|nvme[0-9]+n[0-9]+)$ ]];then
+        row=$(awk -F= -v wanted="$base" '
+          function emit(){if(dev==wanted && slot!="flash"){matches++;result=slot "|" identity}}
+          /^\[/{emit();slot=$0;gsub(/[\[\]"\r]/,"",slot);dev=identity="";next}
+          {v=substr($0,index($0,"=")+1);gsub(/["\r]/,"",v)}
+          $1=="device"{dev=v} $1=="id"{identity=v} END{emit();if(matches==1)print result}
+        ' "${HH_DISKS_INI:-/var/local/emhttp/disks.ini}" 2>/dev/null) || row=''
+        IFS='|' read -r slot native <<< "$row"
+        [[ "$slot" =~ ^[A-Za-z0-9_.-]+$ ]] || slot=''
+        if [[ -n "$native" && "$native" == *_* ]];then model=${native%_*};serial=${native##*_};fi
+        if [[ -r "${HH_SYS_ROOT:-/sys}/class/block/$base/device/model" ]];then
+            model=$(head -c 256 "${HH_SYS_ROOT:-/sys}/class/block/$base/device/model" 2>/dev/null) || model=''
+        fi
+        model=$(printf '%s' "$model" | LC_ALL=C tr -cd '[:print:]' | sed -E 's/_/ /g;s/^[[:space:]]+//;s/[[:space:]]+$//');model=${model:0:96}
+        serial=$(printf '%s' "$serial" | LC_ALL=C tr -cd '[:alnum:]-');suffix=${serial: -6}
+    fi
+    label="$device"
+    if [[ -n "$slot" || -n "$model" || -n "$suffix" ]];then
+        label="${slot:-slot unverified} | ${model:-model unavailable} | serial ${suffix:+...}${suffix:-unavailable} ($device)"
+    fi
+    jq -nc --arg device "$device" --arg slot "$slot" --arg model "$model" --arg serial "$suffix" --arg label "$label" \
+      '{device:$device,slot:$slot,model:$model,serialSuffix:$serial,label:$label}'
+}
+
+hc_device_label() {
+    hc_device_identity "$1" | jq -r .label
+}
+
 hc_daily_snapshot() {
     local now="$1" file="${HC_DAILY_RECEIPT:-/mnt/vault/cloud/logs/script/host_health_monitor/state/monitor_receipt.json}" schedule="${HC_SCHEDULE_FILE:-/boot/config/plugins/user.scripts/schedule.json}"
     local old='{}' evidence='{}' plan=unknown cron='' due='{"valid":false}' boot
@@ -1606,7 +1637,7 @@ hc_daily_probe() {
 }
 
 hc_disk_temperatures() {
-    local file="${HH_DISKS_INI:-/var/local/emhttp/disks.ini}" stamp slot dev native_id temp rota kind warn crit severity id count=0
+    local file="${HH_DISKS_INI:-/var/local/emhttp/disks.ini}" stamp slot dev native_id temp rota kind warn crit severity id label count=0
     stamp=$(stat -c %Y "$file" 2>/dev/null) || stamp=0
     if [[ ! "$stamp" =~ ^[0-9]+$ ]] || ((stamp>HH_NOW+60 || HH_NOW-stamp>900));then
         hh_observe monitor:disk-temperatures warning 'Native disk temperatures unavailable' 'Unraid disk metadata is missing or older than 15 minutes; no SMART read or disk wake was performed.' 3
@@ -1616,22 +1647,23 @@ hc_disk_temperatures() {
     if [[ ${HC_DAILY_SNAPSHOT:-} != '' ]];then limits=$(jq -c '.thresholds//{}' <<< "$HC_DAILY_SNAPSHOT");fi
     while IFS=$'\t' read -r slot dev native_id temp;do
         [[ "$dev" =~ ^(sd[a-z]+|nvme[0-9]+n[0-9]+)$ && -n "$native_id" && "$native_id" != none ]] || continue
+        label=$(hc_device_label "/dev/$dev")
         id="disk-temperature:$(printf '%s' "$native_id"|sha256sum|cut -c1-24)";count=$((count+1))
         if [[ "$dev" == nvme* ]];then kind=nvme;warn=70;crit=80
         else
             rota=$(cat "${HH_SYS_ROOT:-/sys}/class/block/$dev/queue/rotational" 2>/dev/null) || rota=''
-            case "$rota" in 0) kind=ssd;warn=65;crit=70;;1) kind=hdd;warn=55;crit=60;;*) hh_observe "$id" unknown "Disk temperature $slot" 'Device type could not be verified; no threshold guessed.';continue;;esac
+            case "$rota" in 0) kind=ssd;warn=65;crit=70;;1) kind=hdd;warn=55;crit=60;;*) hh_observe "$id" unknown "Disk temperature $label" 'Device type could not be verified; no threshold guessed.';continue;;esac
         fi
         local w c
         w=$(jq -r --arg kind "$kind" '.[$kind].warning//empty' <<< "$limits");c=$(jq -r --arg kind "$kind" '.[$kind].critical//empty' <<< "$limits")
         if [[ "$w" =~ ^[0-9]+$ && "$c" =~ ^[0-9]+$ ]] && ((w>=20 && c>=w && c<=120));then warn=$w;crit=$c;fi
         if [[ ! "$temp" =~ ^[0-9]+$ ]] || ((temp<=0 || temp>=150));then
-            hh_observe "$id" deferred "Disk temperature $slot" 'No current native temperature, commonly because the disk is sleeping. No healthy sample inferred and no disk woken.'
+            hh_observe "$id" deferred "Disk temperature $label" 'No current native temperature, commonly because the disk is sleeping. No healthy sample inferred and no disk woken.'
             continue
         fi
         severity=ok;((temp>=warn)) && severity=warning;((temp>=crit)) && severity=critical
         if [[ "$severity" == ok ]] && jq -e --arg id "$id" '.conditions[$id].active==true' <<< "$HH_STATE" >/dev/null && ((temp>warn-3));then severity=warning;fi
-        hh_observe "$id" "$severity" "Disk temperature $slot" "$dev: ${temp}C; warning=${warn}C, critical=${crit}C; source=Unraid native metadata; no SMART polling or disk wake." 1
+        hh_observe "$id" "$severity" "Disk temperature $label" "$dev: ${temp}C; warning=${warn}C, critical=${crit}C; source=Unraid native metadata; no SMART polling or disk wake." 1
         HH_OBSERVATIONS=$(jq -c --arg id "$id" --arg device "/dev/$dev" 'map(if .id==$id then .+{device:$device} else . end)' <<< "$HH_OBSERVATIONS")
         # A daily fallback incident keeps its recovery ownership until confirmed.
         if [[ ${HC_DAILY_SNAPSHOT:-} != '' ]] && jq -e --arg device "/dev/$dev" '.freshness=="CURRENT" and any(.findings[]?;.device==$device and (.id|endswith("|temp")))' <<< "$HC_DAILY_SNAPSHOT" >/dev/null;then
@@ -1718,11 +1750,11 @@ hc_print_status() {
       "Disk coverage: \(.health.daily.coverage.inventory//0) inventoried; SMART read this collection=\(.health.daily.coverage.smart.fresh//0); deferred=\(.health.daily.coverage.smart.deferred//0); unverified=\(.health.daily.coverage.smart.unverified//0); never sampled=\(.health.daily.coverage.smart.neverSampled//0)",
       "Oldest retained SMART sample: \($oldest)",
       "Native tests: pending=\(.health.daily.coverage.tests.pending//0); overdue=\(.health.daily.coverage.tests.overdue//0); deferred=\(.health.daily.coverage.tests.deferrals//[]|length)",
-      (.health.daily.coverage.devices[]?|select(.status!="observed")|"- \(.device): \(.status); last successful read: \(if .lastSuccessfulReadEpoch>0 then (.ageSeconds/86400|floor|tostring)+" day(s) ago" else "never sampled" end). \(.reason) Next: \(.nextEligibleAttempt)"),
+      (.health.daily.coverage.devices[]?|select(.status!="observed")|"- \(.label//.device): \(.status); last successful read: \(if .lastSuccessfulReadEpoch>0 then (.ageSeconds/86400|floor|tostring)+" day(s) ago" else "never sampled" end). \(.reason) Next: \(.nextEligibleAttempt)"),
       "Syslog scan: \(.health.storage.executionStatus); freshness=\(.health.storage.fresh)",
       "Open XFS review markers: \(.health.storage.openXfsSources|length)",
       (.health.fastFindings[]?|"- [\(.severity|ascii_upcase)] \(.title): \(.detail)"),
-      (.health.daily.findings[]?|"- [\(.severity|ascii_upcase)] \(.title): \(.detail)\n  Action: \(.action)")' "$file"
+      (.health.daily.findings[]?|"- [\(.severity|ascii_upcase)] \(if (.displayLabel//"")!="" then .displayLabel+": " else "" end)\(.title): \(.detail)\n  Action: \(.action)")' "$file"
 }
 # END HOST HEALTH COORDINATION
 

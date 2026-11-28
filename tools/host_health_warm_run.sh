@@ -50,7 +50,7 @@ hm_test_deferred() {
     log SMART INFO "${disk:+$disk: }New $kind self-test deferred: $reason; original calendar deadline retained"
 }
 hm_build_coverage_summary() {
-    local disk id first last fresh=0 deferred=0 unknown=0 never=0 oldest=0 pending=0 key rows='' tests scrubs total observed devices='[]' status reason next row
+    local disk id first last fresh=0 deferred=0 unknown=0 never=0 oldest=0 pending=0 key rows='' tests scrubs total observed devices='[]' status reason next row identity
     local -A first_seen=() last_seen=()
     observed=$(hm_observed_epoch);total=${#DISCOVERED_DISKS[@]}
     if [[ -s "$SMART_COVERAGE_FILE" ]];then
@@ -73,8 +73,9 @@ hm_build_coverage_summary() {
         if ((last==0));then never=$((never+1));elif ((oldest==0 || last<oldest));then oldest=$last;fi
         [[ "$(test_track_get "$id" pending)" != 1 ]] || pending=$((pending+1))
         [[ -z "${SMART_TEST_DEFERRALS[$disk]:-}" ]] || reason+=" Self-test: ${SMART_TEST_DEFERRALS[$disk]}."
-        row=$(jq -nc --arg device "$disk" --arg id "$id" --arg status "$status" --arg reason "$reason" --arg next "$next" --argjson first "$first" --argjson last "$last" --argjson now "$observed" \
-          '{device:$device,id:$id,status:$status,lastSuccessfulReadEpoch:$last,ageSeconds:(if $last>0 then ([$now-$last,0]|max) else null end),neverSampled:($last==0),reason:$reason,nextEligibleAttempt:$next,coverageWarningDueEpoch:((if $last>0 then $last else $first end)+1209600)}') || return 1
+        identity=$(hc_device_identity "$disk") || return 1
+        row=$(jq -nc --argjson identity "$identity" --arg device "$disk" --arg id "$id" --arg status "$status" --arg reason "$reason" --arg next "$next" --argjson first "$first" --argjson last "$last" --argjson now "$observed" \
+          '$identity+{device:$device,id:$id,status:$status,lastSuccessfulReadEpoch:$last,ageSeconds:(if $last>0 then ([$now-$last,0]|max) else null end),neverSampled:($last==0),reason:$reason,nextEligibleAttempt:$next,coverageWarningDueEpoch:((if $last>0 then $last else $first end)+1209600)}') || return 1
         devices=$(jq -nc --argjson rows "$devices" --argjson row "$row" '$rows+[$row]') || return 1
     done
     for key in "${!SMART_TEST_DEFERRALS[@]}";do
@@ -91,5 +92,5 @@ hm_build_coverage_summary() {
     clean=$(jq '[.[]|select(.clean and .live)]|length' <<< "$scrubs");count=$(jq 'length' <<< "$scrubs")
     HOST_HEALTH_COVERAGE_LINE="Coverage: disks=$total; SMART fresh=$fresh, sleeping/deferred=$deferred, unverified=$unknown, never-sampled=$never, oldest sample=$age. Tests: started=$SMART_TEST_STARTED_THIS_RUN, pending=$pending, overdue=$SMART_TEST_OVERDUE_COUNT. Scrubs: clean live results=$clean/$count."
     log COVERAGE INFO "$HOST_HEALTH_COVERAGE_LINE"
-    while IFS= read -r row;do log COVERAGE INFO "$row";done < <(jq -r '.devices[]|select(.status!="observed")|"\(.device): \(.status); last successful SMART epoch=\(.lastSuccessfulReadEpoch); \(.reason) Next: \(.nextEligibleAttempt)"' <<< "$HOST_HEALTH_COVERAGE")
+    while IFS= read -r row;do log COVERAGE INFO "$row";done < <(jq -r '.devices[]|select(.status!="observed")|"\(.label//.device): \(.status); last successful SMART epoch=\(.lastSuccessfulReadEpoch); \(.reason) Next: \(.nextEligibleAttempt)"' <<< "$HOST_HEALTH_COVERAGE")
 }
