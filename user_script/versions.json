@@ -6,8 +6,8 @@
       "sha256": "95c99006f1efb8028c6032ab480ab5ea2b27d8ca3839e1365cecfb9065dffbd8"
     },
     "backup_cache_appdata": {
-      "version": "3.11.1",
-      "sha256": "3e6dbff06b6f4f43f666ad301a03a7b4b4bb8d8c1c23f8e8c37f81e69a90bff9"
+      "version": "3.11.2",
+      "sha256": "7b565138a4321c70d339e1e6350113622aef79be97274a7435c95e76230d14d3"
     },
     "backup_health_audit": {
       "version": "1.14.4",

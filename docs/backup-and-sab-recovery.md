@@ -60,3 +60,20 @@ Missing commands/options or failed fixture verification still stop the backup
 before real transfer; logs identify Hubble versus ISS and the actual error.
 Normal SSH transport negotiates a shared rsync protocol. This feature check is
 not a guarantee against unrelated network/storage failures during real transfer.
+
+## Appdata startup readiness and archive validity
+
+`backup_cache_appdata` distinguishes Docker start/running-state failure from
+unverified backend startup. A running container whose application is still warming
+up keeps an explicit readiness warning; archiving other applications continues.
+Outstanding readiness is checked again before finalization, without issuing a
+second start/restart to an already running container. Native probe classifications
+and reasons appear in the log and grouped outcome. A later successful check is
+reported as recovered. Unresolved backend readiness produces a warning while
+verified archives remain eligible for promotion and ISS handoff. Docker Service
+Watchdog continues independent application monitoring/recovery.
+
+A stopped or uninspectable container still fails recovery and prevents normal
+finalization. Compression, manifest, capacity and retention guards are unchanged.
+Interrupted runs explicitly report sources not attempted, alongside actual archive
+failures, so successful partial work cannot be mistaken for a complete backup.

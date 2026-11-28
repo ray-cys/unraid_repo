@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="3.11.1"
+readonly SCRIPT_VERSION="3.11.2"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'backup_cache_appdata.sh %s\n' "$SCRIPT_VERSION"
@@ -9,7 +9,7 @@ fi
 clearLog=true
 
 ###############################################################################
-# Appdata + Optional Shares Backup v3.11.1
+# Appdata + Optional Shares Backup v3.11.2
 #
 # PURPOSE
 # -------
@@ -660,6 +660,10 @@ declare -A CONTAINER_APP_NAMES=()
 declare -A CONTAINER_PENDING_APPS=()
 declare -A CONTAINER_STOPPED=()
 declare -A CONTAINER_STOP_STARTED=()
+# Application readiness is independent of archive integrity and Docker restart.
+declare -A CONTAINER_READINESS_PENDING=()
+declare -A CONTAINER_READINESS_RECOVERED=()
+APPDATA_READINESS_REASON=""
 declare -A ELIGIBLE_APPDATA=()
 declare -A NORMAL_APPDATA=()
 declare -A ARCHIVE_NAME_BY_PATH=()
@@ -2263,6 +2267,7 @@ stop_containers_for_app() {
 appdata_wait_readiness() {
     local container="$1" deadline=$(( $(date +%s)+${APPDATA_READINESS_WAIT_SECONDS:-90} )) provider="${DOCKER_WATCHDOG_SCRIPT:-/boot/config/plugins/user.scripts/scripts/docker_service_watchdog/script}" result state
     local elapsed_start=$(date +%s)
+    APPDATA_READINESS_REASON="Readiness provider did not return valid evidence"
     # Removed/unclassified services retain Docker-state evidence; absence of a
     # supported backend probe is not an invented application failure.
     case "$container" in sonarr|radarr|sabnzbd|bazarr|tautulli|photoprism|seerr|prowlarr|plex-media|plex-media-server|qbittorrent|metafusion|kometa|imagemaid|recyclarr) ;;
@@ -2270,15 +2275,18 @@ appdata_wait_readiness() {
     [[ -f "$provider" && ! -L "$provider" ]] || { log DOCKER WARNING "Container running; readiness provider absent: $container";return 0; }
     while (( $(date +%s)<deadline ));do
         result=$(timeout --kill-after=2 15 /bin/bash "$provider" --readiness "$container" 2>/dev/null) || result='{}'
-        if jq -e '.schema==1 and .ready==true' <<<"$result" >/dev/null 2>&1;then
-            log DOCKER INFO "Application readiness verified after restart: $container; readiness wait=$(( $(date +%s)-elapsed_start ))s"
-            return 0
-        fi
+        if jq -e '.schema==1 and (.ready|type)=="boolean" and (.detail|type)=="string"' <<<"$result" >/dev/null 2>&1;then
+            APPDATA_READINESS_REASON=$(jq -r '((.classification // "unverified")+": "+.detail)|gsub("[\\r\\n]";" ")|.[0:700]' <<<"$result")
+            if jq -e '.ready==true' <<<"$result" >/dev/null;then
+                log DOCKER INFO "Application readiness verified after restart: $container; readiness wait=$(( $(date +%s)-elapsed_start ))s"
+                return 0
+            fi
+        else APPDATA_READINESS_REASON="Readiness provider timed out or returned invalid evidence";fi
         state=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)
         [[ "$state" == true ]] || break
         sleep 5
     done
-    log DOCKER ERROR "Container restarted but application readiness remains unverified after bounded startup allowance: $container. Watchdog retains independent recovery ownership; no second restart was forced."
+    log DOCKER WARNING "Container is running but application readiness remains unverified after bounded startup allowance: $container; $APPDATA_READINESS_REASON. Archive verification remains valid; startup will be rechecked before finalization. No second restart was forced."
     return 1
 }
 
@@ -2306,8 +2314,18 @@ start_container_with_retry() {
             appdata_wait_readiness "$container" || ready_rc=$?
             rm -f -- "$DOCKER_MAINTENANCE_DIR/$container.appdata.json"
             local downtime=$(( $(date +%s)-${CONTAINER_STOP_STARTED[$container]:-$(date +%s)} ))
-            log "DOCKER" "INFO" "Container started: $container; readiness result=$ready_rc; stop-to-readiness elapsed=${downtime}s"
-            return "$ready_rc"
+            if ((ready_rc!=0));then
+                running_state=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)
+                if [[ "$running_state" != true ]];then
+                    CONTAINER_STOPPED["$container"]=true
+                    log DOCKER ERROR "Container is no longer confirmed running after startup: $container; archive phase must stop for recovery"
+                    return 1
+                fi
+                CONTAINER_READINESS_PENDING["$container"]="$APPDATA_READINESS_REASON"
+                log DOCKER WARNING "Container restart verified: $container; application readiness pending. Backup continues; the final check and Docker watchdog retain the outstanding condition."
+            else unset 'CONTAINER_READINESS_PENDING[$container]';fi
+            log "DOCKER" "INFO" "Container started: $container; readiness result=$ready_rc; stop-to-startup-check elapsed=${downtime}s"
+            return 0
         fi
 
         [ "$attempt" -lt 2 ] && sleep 2
@@ -2318,6 +2336,33 @@ start_container_with_retry() {
     return 1
 }
 
+
+# Recheck only outstanding startup evidence after the remaining archives. A
+# backend warning cannot invalidate verified archives or pretend Docker stopped.
+# An actually stopped/uninspectable container still prevents finalization.
+recheck_application_readiness() {
+    local container state failed=0
+    for container in "${!CONTAINER_READINESS_PENDING[@]}";do
+        state=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)
+        if [[ "$state" != true ]];then
+            log DOCKER ERROR "Final recovery check cannot confirm container running: $container"
+            RESTART_FAILED=$((RESTART_FAILED+1));failed=1;continue
+        fi
+        if appdata_wait_readiness "$container";then
+            CONTAINER_READINESS_RECOVERED["$container"]="Startup readiness verified during the final recovery check"
+            unset 'CONTAINER_READINESS_PENDING[$container]'
+            log DOCKER INFO "Application startup recovered: $container; final backend readiness verified"
+        else
+            CONTAINER_READINESS_PENDING["$container"]="$APPDATA_READINESS_REASON"
+            state=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)
+            if [[ "$state" != true ]];then
+                RESTART_FAILED=$((RESTART_FAILED+1));failed=1
+                log DOCKER ERROR "Container stopped or inspection failed during final readiness check: $container"
+            else log DOCKER WARNING "Final application readiness unresolved: $container; $APPDATA_READINESS_REASON. Verified backup remains eligible; watchdog retains the live application alert.";fi
+        fi
+    done
+    return "$failed"
+}
 
 refresh_restart_requirement() {
     local container=""
@@ -3106,6 +3151,8 @@ run_backup_cache_appdata() {
     APP_COMPRESSION_SECONDS=()
     APP_VERIFICATION_SECONDS=()
     APP_EXCLUSION_COUNTS=()
+    CONTAINER_READINESS_PENDING=()
+    CONTAINER_READINESS_RECOVERED=()
 
     log "BACKUP" "INFO" \
         "Starting appdata archive phase"
@@ -3206,9 +3253,9 @@ run_backup_cache_appdata() {
 
         if ! complete_container_scope_for_app "$name"; then
             log "DOCKER" "ERROR" \
-                "[${name}] One or more owning containers remain stopped; final recovery will retry them"
+                "[${name}] Owning-container recovery could not confirm running state; final recovery will retry"
             APPDATA_FINALIZE_FAILED=1
-            APPDATA_REPORT+="[FAILED] Archive phase stopped for container recovery"$'\n'
+            APPDATA_REPORT+="[FAILED] Archive phase stopped: owning-container recovery for $name could not confirm running state"$'\n'
             stop_archive_phase=true
         fi
 
@@ -3224,6 +3271,11 @@ run_backup_cache_appdata() {
         APPDATA_REPORT+="[FAILED] One or more containers could not be restarted"$'\n'
         log "DOCKER" "ERROR" \
             "Generation finalization skipped while appdata-owned containers remain stopped"
+    fi
+
+    if ! recheck_application_readiness;then
+        APPDATA_FINALIZE_FAILED=1
+        APPDATA_REPORT+="[FAILED] Final container running-state verification failed"$'\n'
     fi
 
     if [ "$APPDATA_FAILED" -eq 0 ] &&
@@ -3651,6 +3703,7 @@ send_final_notification() {
     if [ "$ISS_HANDOFF_RESULT" = "failed" ] && [ "$overall_status" = "OK" ]; then
         overall_status="WARNING"
     fi
+    if (( ${#CONTAINER_READINESS_PENDING[@]}>0 )) && [[ "$overall_status" == OK ]];then overall_status=WARNING;fi
     if [ "$overall_status" = "FAILED" ]; then
         importance="alert"
     elif [ "$overall_status" = "WARNING" ]; then
@@ -3667,6 +3720,8 @@ send_final_notification() {
     body+="  OK:      ${APPDATA_OK}"$'\n'
     body+="  Failed:  ${APPDATA_FAILED}"$'\n'
     body+="  Skipped: ${APPDATA_SKIPPED}"$'\n'
+    local not_attempted=$((APPDATA_TOTAL-APPDATA_OK-APPDATA_FAILED-APPDATA_SKIPPED))
+    if ((not_attempted>0));then body+="  Not attempted: $not_attempted (archive phase interrupted before these sources)"$'\n';fi
     body+="  Size:    ${appdata_size_human}"$'\n'
 
     if [ "$APPDATA_FINALIZE_FAILED" -gt 0 ]; then
@@ -3695,6 +3750,16 @@ send_final_notification() {
 
     body+=$'\n'
     body+="Container restart: ${restart_status}"$'\n'
+    local container
+    if (( ${#CONTAINER_READINESS_PENDING[@]}>0 ));then
+        body+="Application readiness: UNVERIFIED (${#CONTAINER_READINESS_PENDING[@]} running container(s)); verified archive integrity is unaffected."$'\n'
+        for container in "${!CONTAINER_READINESS_PENDING[@]}";do
+            body+="  - $container: ${CONTAINER_READINESS_PENDING[$container]}. Rechecked before finalization; Docker watchdog continues monitoring."$'\n'
+        done
+    else body+="Application readiness: no outstanding startup warnings from this backup run."$'\n';fi
+    for container in "${!CONTAINER_READINESS_RECOVERED[@]}";do
+        body+="  [RECOVERED] $container: ${CONTAINER_READINESS_RECOVERED[$container]}."$'\n'
+    done
     case "$ISS_HANDOFF_RESULT" in
         queued) body+="ISS backup: verified generation queued; next hourly check will transfer it and acknowledge remote verification."$'\n';;
         failed) body+="ISS backup: local generation completed, but its request could not be saved; no remote freshness is established. Check status-directory write access and retry the handoff."$'\n';;
