@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="3.11.4"
+readonly SCRIPT_VERSION="3.12.0"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'backup_cache_appdata.sh %s\n' "$SCRIPT_VERSION"
@@ -623,6 +623,7 @@ declare -A PREVIOUS_ARCHIVE_BYTES=()
 declare -A PREDICTED_ARCHIVE_BYTES=()
 declare -A APP_ARCHIVE_BYTES=()
 declare -A APP_COMPRESSION_SECONDS=()
+declare -A APP_COMPRESSION_PROFILE=()
 declare -A APP_VERIFICATION_SECONDS=()
 declare -A APP_EXCLUSION_COUNTS=()
 
@@ -2737,6 +2738,8 @@ compress_directory() {
     local exclusion_path=""
     local exclusion_summary=""
     local streamed_checksum=""
+    local compressor_profile="${TEMP_DIR}/${name}.compressor-time"
+    local cpu_user=0 cpu_system=0 cpu_wall=0
     local compression_started=0
     local verification_started=0
     local elapsed=0
@@ -2750,6 +2753,7 @@ compress_directory() {
     LAST_COMPRESSION_FATAL=false
     LAST_COMPRESSION_ATTEMPTS=0
     LAST_COMPRESSION_SECONDS=0
+    LAST_COMPRESSION_PROFILE="unavailable"
     LAST_VERIFICATION_SECONDS=0
     LAST_EXCLUSION_COUNT=0
 
@@ -2824,9 +2828,7 @@ compress_directory() {
             "${effective_tar_options[@]}" \
             -- "$source_entry" \
             2>>"$error_file" |
-            "${PRIORITY_PREFIX[@]}" \
-                "${compressor[@]}" \
-                2>>"$error_file" |
+            { export LC_ALL=C; TIMEFORMAT='%R %U %S'; time "${PRIORITY_PREFIX[@]}" "${compressor[@]}" 2>>"$error_file"; } 2>"$compressor_profile" |
             "${PRIORITY_PREFIX[@]}" \
                 tee "$archive_tmp" \
                 2>>"$error_file" |
@@ -2849,6 +2851,13 @@ compress_directory() {
         streamed_checksum="$(awk 'NR == 1 {print $1}' "$checksum_tmp" 2>/dev/null || true)"
 
         temp_bytes="$(file_size_bytes "$archive_tmp")"
+        # Bash times the existing compressor process. No second source traversal,
+        # trial archive, extra payload copy or relaxed verification is required.
+        if read -r cpu_wall cpu_user cpu_system <"$compressor_profile" &&
+           [[ "$cpu_wall $cpu_user $cpu_system" =~ ^[0-9]+[.][0-9]+\ [0-9]+[.][0-9]+\ [0-9]+[.][0-9]+$ ]];then
+            LAST_COMPRESSION_PROFILE=$(LC_ALL=C awk -v raw="$streamed_raw" -v packed="$temp_bytes" -v wall="$cpu_wall" -v user="$cpu_user" -v cpu_sys="$cpu_system" -v threads="$EFFECTIVE_PIGZ_THREADS" -v level="$PIGZ_LEVEL"               'BEGIN{if(wall>0)printf "input=%.1f MiB/s, output=%.1f MiB/s, compressor CPU=%.2f core(s), level=%d, configured workers=%d",raw/1048576/wall,packed/1048576/wall,(user+cpu_sys)/wall,level,threads;else printf "timing unavailable"}') || LAST_COMPRESSION_PROFILE="timing unavailable"
+            log "PROFILE" "INFO" "[$name] Attempt $attempt: $LAST_COMPRESSION_PROFILE; pipeline wall=${elapsed}s. CPU use is measured; source/destination wait is not attributed to a specific device."
+        fi
         available_after="$(available_bytes_for_path "$WORK_ROOT")" || available_after=0
 
         printf 'Pipeline status: tar=%s, compressor=%s, tee=%s, checksum=%s, temporary=%s, available=%s\n' \
@@ -3161,6 +3170,7 @@ run_backup_cache_appdata() {
     APPDATA_BACKUP_PATH=""
     APP_ARCHIVE_BYTES=()
     APP_COMPRESSION_SECONDS=()
+    APP_COMPRESSION_PROFILE=()
     APP_VERIFICATION_SECONDS=()
     APP_EXCLUSION_COUNTS=()
     CONTAINER_READINESS_PENDING=()
@@ -3204,6 +3214,7 @@ run_backup_cache_appdata() {
             APPDATA_TOTAL_BYTES=$((APPDATA_TOTAL_BYTES + archive_bytes))
             APP_ARCHIVE_BYTES["$name"]="$archive_bytes"
             APP_COMPRESSION_SECONDS["$name"]="$LAST_COMPRESSION_SECONDS"
+            APP_COMPRESSION_PROFILE["$name"]="${LAST_COMPRESSION_PROFILE:-unavailable}"
             APP_VERIFICATION_SECONDS["$name"]="$LAST_VERIFICATION_SECONDS"
             APP_EXCLUSION_COUNTS["$name"]="$LAST_EXCLUSION_COUNT"
 
@@ -3622,6 +3633,7 @@ build_largest_archives_report() {
         output+=" compress $(format_duration "${APP_COMPRESSION_SECONDS[$name]:-0}"),"
         output+=" verify $(format_duration "${APP_VERIFICATION_SECONDS[$name]:-0}"),"
         output+=" exclusions ${APP_EXCLUSION_COUNTS[$name]:-0})"$'\n'
+        output+="    Stream profile: ${APP_COMPRESSION_PROFILE[$name]:-unavailable}"$'\n'
     done < <(
         for name in "${!APP_ARCHIVE_BYTES[@]}"; do
             printf '%s\t%s\n' "${APP_ARCHIVE_BYTES[$name]}" "$name"

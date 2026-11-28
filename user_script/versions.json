@@ -6,16 +6,16 @@
       "sha256": "ae226eaaa38f1adb44578b54c54a917d885eb8a85a83a8fb985df8ceab9f90e7"
     },
     "backup_cache_appdata": {
-      "version": "3.11.4",
-      "sha256": "cec06b046a5765b24a8de9ca3c8dc12c3e2706f0a44ec4014308083054098bdb"
+      "version": "3.12.0",
+      "sha256": "160736c088c16f108879161d58d70d3c62caa14c9183779a73c32eeff3c4252c"
     },
     "backup_health_audit": {
-      "version": "1.14.5",
-      "sha256": "322011ec476ca87d69f8c106ab88553fd0a34dab4597c7c83c3863f7d849785a"
+      "version": "1.15.0",
+      "sha256": "d56be32b0d41f34324209d9691dd006464caf30fd7a98dfeaf8408756644b3dd"
     },
     "backup_media_remote": {
-      "version": "2.9.2",
-      "sha256": "22b91cb4b8866552e50572c76c99b0dfea6e5d8585a0820be0f569d6c6deebdf"
+      "version": "2.10.0",
+      "sha256": "f12fd7e3fb7f623a6ff4a180fcb3862c3d3b187d7aa832d66ad2209fc3d3a33b"
     },
     "backup_restore_drill": {
       "version": "1.6.2",
@@ -30,8 +30,8 @@
       "sha256": "1f508f5630c650e5f2cfe7f1d1c87b1770529945776302bc116bf4943b27f98b"
     },
     "docker_service_watchdog": {
-      "version": "3.18.4",
-      "sha256": "ce50ece58fdb8a9a1b1d2f928bce71df151354951895059c8d903a7881d69e33"
+      "version": "3.19.0",
+      "sha256": "a5314d58a01527fb7da0a1e9837a9596e62f62b1ab8ad4cd9a4bee98351155b2"
     },
     "host_health_monitor": {
       "version": "3.5.5",
@@ -42,20 +42,20 @@
       "sha256": "104776389062ac7eb4d37e8fb50d6db0461e78c778c42ba99e744382edfb7964"
     },
     "media_cleanup": {
-      "version": "1.11.3",
-      "sha256": "41e6e2c9abad37870899e245c835ec2341c31f8571ff4f296821a3632aeb9a5a"
+      "version": "1.12.0",
+      "sha256": "de20d745b764c1488e4101ef81d802fe23fef72bfd4ce772b1400fbd18222605"
     },
     "media_health_monitor": {
       "version": "3.29.3",
       "sha256": "3bb1a31ec7e1f6a58ad54d680e46331fa6d481544cc89dca3621b1d238b3afdb"
     },
     "media_integrity_audit": {
-      "version": "2.7.3",
-      "sha256": "de4d14362a90c829b73845127654ae7df81400bd5ddf6ead1e3629db911441ee"
+      "version": "2.8.0",
+      "sha256": "b35b6f1edcd8d6f36d36c265ba52a655edab94b63230d31d50b2b207f547e040"
     },
     "media_metadata_audit": {
-      "version": "3.4.4",
-      "sha256": "29f285ec0ec480a5aa2c9837ee6910c105af8e61eda744135522ec152ed7ecdd"
+      "version": "3.5.0",
+      "sha256": "af29f4c8932a09c146c9c827ee38fa0275b74acacc4eb00a8435c64cee94c714"
     },
     "media_plex_dbrepair": {
       "version": "3.6.4",

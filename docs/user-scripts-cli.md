@@ -79,8 +79,8 @@ sufficient capacity. It is not an inspection command.
 
 - `us backup_media_remote`: run the configured media copy to ISS, verification,
   retention and guarded shutdown workflow.
-- `us backup_media_remote --evidence-status`: print saved success/failed-attempt
-  receipts; no transfer, SSH or wake.
+- `us backup_media_remote --evidence-status`: validate saved success/failed-attempt
+  receipts and show whether the first native receipt is still pending; no transfer, SSH or wake.
 - `us backup_media_remote --version`: release only. No `--help` mode.
 
 ## 5. backup_restore_drill
@@ -187,6 +187,7 @@ logs and checkpoints; it is not a zero-write mode.
 | Command after `us media_cleanup` | Purpose |
 | --- | --- |
 | `--help` (`-h`) / `--version` | Wrapper usage / release. |
+| `--status` | Saved latest full run, latest invocation and per-module results; no API calls, media scan, cleanup or notification. |
 | `all [--dry-run\|--execute]` | All modules with explicit execution mode. |
 | `--dry-run` / `--execute` | Equivalent global mode for all modules. |
 | `--flush-notifications` | Retry eligible queued grouped delivery; no cleanup. |
@@ -252,6 +253,7 @@ for evidence-based reconciliation.
 
 ## 13. media_integrity_audit
 
+- `us media_integrity_audit --evidence-status`: concise saved normal-scan, decode-progress and pending-coverage evidence; no media or Docker access.
 - `us media_integrity_audit`: bounded media inventory/decoding scan and configured
   recovery follow-up; the recovery enable switch remains authoritative.
 - `--help` (`-h`) / `--version`: usage / release.

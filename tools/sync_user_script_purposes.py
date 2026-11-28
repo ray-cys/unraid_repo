@@ -60,4 +60,5 @@ guide += ['## Retained compatibility and archived references', '',
           'replacement workflows.', '',
           'Standalone files embed only shared helpers reachable by their callers. Full',
           'shared module sources remain under tools/ for generation and fixture coverage.', '']
+guide += ['## Operational details', '', 'See [operational evidence and performance](user-script-operational-evidence.md) for scoped repairs, cache validity, profiling and inspection semantics.', '']
 (root / 'docs/user-scripts-guide.md').write_text('\n'.join(guide))

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="3.4.4"
+readonly SCRIPT_VERSION="3.5.0"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'media_metadata_audit.sh %s\n' "$SCRIPT_VERSION"
@@ -412,7 +412,7 @@ def metafusion_review():
         if run.get("unreadable_audits"):
             problem=(problem+" " if problem else "")+"MetaFusion reported unreadable application audits; inspect native reports."
         action_map={
-            "review_ownership":"Review the recorded owner/lock and exact destination. Confirm identity before changing ownership or generated artwork.",
+            "review_ownership":"Compare the recorded owner and current Plex rating key using MetaFusion --explain-item. If the prior Plex item is proven absent and both records have the same provider identity/destination, use native --output-action preview, then forget only the stale artwork claim and run an exact-item artwork retry. Retain the artwork and media; do not remove another live owner or infer identity from title alone.",
             "verify_application":"Review the native application audit. Generated YAML or artwork on disk does not prove Plex applied it.",
             "inspect_retry_queue":"Review the native retry queue and failure class; correct the provider, identity or storage problem before retrying.",
             "check_storage_permissions":"Check the recorded destination, container-visible mount and write permissions.",

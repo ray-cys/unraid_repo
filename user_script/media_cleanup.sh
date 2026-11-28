@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-MC_VERSION="1.11.3"
+MC_VERSION="1.12.0"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'media_cleanup.sh %s\n' "$MC_VERSION"
@@ -470,13 +470,31 @@ mc_flush() (
 
 mc_help() {
     printf '%s\n' "media_cleanup.sh $MC_VERSION" \
-      'Usage: /bin/bash SCRIPT [all [--dry-run|--execute]|--dry-run|--execute|--flush-notifications|--version|--help]' \
+      'Usage: /bin/bash SCRIPT [all [--dry-run|--execute]|--dry-run|--execute|--flush-notifications|--status|--version|--help]' \
       '       /bin/bash SCRIPT arr [all|sonarr|radarr|--list-pending|--resolve-pending ID NOTE] [--dry-run|--execute]' \
       '       /bin/bash SCRIPT sab [--dry-run|--execute|--no-purge|--inspect|--restore WRAPPER|--pending-operations|--resolve-operation ID NOTE|--recover-orphan NAME --execute]' \
       '       /bin/bash SCRIPT quarantine [--dry-run|--execute] [audit|purge|restore RUN_ID movies|series RELATIVE_PATH|--pending-operations|--resolve-operation ID NOTE]' \
+      '--status: saved full-run, latest invocation and per-module outcomes; no API, media scan or cleanup.' \
       'No arguments: Arr, SAB cleanup, metadata retention sequentially; one daily grouped notification.' \
       'Preview: records observations/logs without payload or Arr mutations. Module --help provides further details.' \
       "State/logs: $MC_ROOT; original quarantine payload roots and retention are preserved."
+}
+
+# Fixed-size receipt set: latest full run and latest terminal result per module.
+mc_publish_scoped_receipts() {
+    local receipt="$1" tmp prior="$MC_ROOT/latest-module-results.json"
+    [[ ! -L "$prior" && ! -L "$MC_ROOT/latest-full-run.json" ]] || return 1
+    if [[ -f "$prior" ]];then jq -e '.schema==1 and (.modules|type)=="object"' "$prior" >/dev/null || return 1;fi
+    tmp=$(mktemp "$MC_ROOT/.module-results.XXXXXX") || return 1
+    jq -n --slurpfile run "$receipt" --slurpfile saved <(if [[ -f "$prior" ]];then cat "$prior";else printf '{"schema":1,"modules":{}}';fi) '
+      $run[0] as $r|$saved[0]|if $r.dryRun!=true and ($r.mode|IN("all","--execute","arr","sab","quarantine")) then
+      reduce ($r.modules[]|select(.status|IN("COMPLETED","WARNING","FAILED"))) as $m (. ;
+       .modules[$m.module]=($m+{epoch:$r.epoch,runId:$r.runId,bootId:$r.bootId,mode:$r.mode,dryRun:$r.dryRun,startedAt:$r.startedAt})) else . end' >"$tmp" && mc_publish "$tmp" "$prior" || return 1
+    case "${MC_MODE:-manual}" in all|--execute)
+      [[ "${MC_DRY_RUN:-false}" != true ]] || return 0
+      tmp=$(mktemp "$MC_ROOT/.full-run.XXXXXX") || return 1
+      cp -- "$receipt" "$tmp" && mc_publish "$tmp" "$MC_ROOT/latest-full-run.json" || return 1;;
+    esac
 }
 
 mc_record_status() (
@@ -486,10 +504,11 @@ mc_record_status() (
     tmp=$(mktemp "$MC_ROOT/.status.XXXXXX") || return 1
     jq -n --arg name media_cleanup --arg version "$MC_VERSION" --arg status "$MC_RESULT" --arg summary "$MC_OUTCOMES" \
       --arg phase "${MC_ACTIVE_MODULE:-none}" --arg run "$MC_RUN_ID" --arg boot "${MC_BOOT_ID:-unknown}" \
-      --arg mode "${MC_MODE:-manual}" --argjson epoch "$now" --argjson started "$MC_STARTED" --argjson pid "$$" \
+      --arg mode "${MC_MODE:-manual}" --argjson dryRun "${MC_DRY_RUN:-false}" --argjson epoch "$now" --argjson started "$MC_STARTED" --argjson pid "$$" \
       --slurpfile modules "$MC_TMP/outcomes.json" --slurpfile backlog "$MC_TMP/backlog.json" \
-      '{schema:1,name:$name,scriptVersion:$version,status:$status,mode:$mode,summary:$summary,phase:$phase,runId:$run,bootId:$boot,pid:$pid,
+      '{schema:1,name:$name,scriptVersion:$version,status:$status,mode:$mode,dryRun:$dryRun,summary:$summary,phase:$phase,runId:$run,bootId:$boot,pid:$pid,
         startedAt:$started,epoch:$epoch,duration_seconds:($epoch-$started),modules:$modules[0],notificationBacklog:$backlog[0]}' >"$tmp" && mc_publish "$tmp" "$MC_ROOT/latest-run.json" || return 1
+    mc_publish_scoped_receipts "$MC_ROOT/latest-run.json" || return 1
     case "${MC_MODE:-manual}" in all|--execute) ;; *) return 0;; esac
     [[ ! -L "$MC_STATUS_DIR" ]] || return 1
     mkdir -p -- "$MC_STATUS_DIR" || return 1
@@ -573,6 +592,13 @@ mc_main() {
     mc_parse_cli "$@" || { mc_help >&2;return 2; }
     case "$MC_ROUTE" in
       --version) printf 'media_cleanup.sh %s\n' "$MC_VERSION";return 0;;
+      --status)
+        local full="$MC_STATUS_DIR/media_cleanup.json" latest="$MC_ROOT/latest-run.json" scoped="$MC_ROOT/latest-module-results.json"
+        jq -n --arg version "$MC_VERSION" --slurpfile full <(if [[ -f "$full" && ! -L "$full" ]];then cat "$full";else printf null;fi) \
+          --slurpfile latest <(if [[ -f "$latest" && ! -L "$latest" ]];then cat "$latest";else printf null;fi) \
+          --slurpfile scoped <(if [[ -f "$scoped" && ! -L "$scoped" ]];then cat "$scoped";else printf null;fi) \
+          '{scriptVersion:$version,scope:"Saved evidence only; previews and scoped repairs do not certify a full scheduled run",lastFullRun:$full[0],latestInvocation:$latest[0],moduleResults:$scoped[0]}'
+        return $?;;
       --help|-h) mc_help;return 0;;
     esac
     if [[ "${MC_ARGS[0]:-}" == --help || "${MC_ARGS[0]:-}" == --version ]]; then
@@ -712,7 +738,7 @@ mc_parse_cli() {
         choice="$value"; MC_EFFECTIVE_DRY=$value
     }
     case "$MC_ROUTE" in
-      --help|-h|--version|--flush-notifications)
+      --help|-h|--version|--status|--flush-notifications)
         (( $#==0 )) || return 2; return 0;;
       --dry-run|--execute)
         (( $#==0 )) || { printf 'Use all --dry-run or a module command; extra global-mode arguments are rejected.\n' >&2;return 2; }
@@ -1084,6 +1110,17 @@ mc_sidecar_fingerprint() {
     { printf '%s\0%s\0' "${MC_POLICY_FINGERPRINT:-unknown}|${MC_SIDECAR_EVIDENCE:-unknown}" "$media";sort -z "$dirs";sort -z "$records"; }|sha256sum|cut -d ' ' -f1 >"$output"
 }
 
+mc_sidecar_policy_fingerprint() {
+    local recovery="${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}" proof=absent
+    if [[ -e "$recovery" ]];then
+      [[ -f "$recovery" && ! -L "$recovery" ]] || return 1
+      proof=$(jq -ceS 'select(.schema==1 and .workflow=="arr-native" and (.actions|type)=="object" and all(.actions[];(.app|type)=="string" and (.parentId|type)=="number" and (.status|type)=="string"))|
+        [.actions|to_entries[]|{id:.key,app:.value.app,parentId:.value.parentId,status:.value.status}]|sort_by(.id)' "$recovery") || return 1
+    fi
+    # Bump this rule contract when sidecar recognition/proof requirements change.
+    printf '%s\0' 'sidecar-inventory-policy-2' "$MAX_SIDECAR_SIZE_MB" "$EXTRA_SIDECAR_EXTENSIONS" "$AUTO_RECOGNIZE_KNOWN_AUXILIARY" "$CAPTURE_LATE_KODI_SIDECARS" "$QUARANTINE_KODI_SIDECARS" "$proof"|sha256sum|cut -d ' ' -f1
+}
+
 mc_capture_sidecars() {
     local app="$1" path="$2" root="$3" media="$4" key="$5" out="$6" previous current now last pending=false before after temp read_state="$WORK_STATE"
     if [[ -d "${MC_SIDECAR_STATE_DIR:-}" ]];then
@@ -1104,6 +1141,13 @@ mc_capture_sidecars() {
         printf 'reused\n' >>"$VERIFY_RUNTIME_DIR/$APP_CONTEXT.sidecar-work"
         rm -f "$current" "$current.dirs" "$current.records" "$current.records.paths" "$current.changed" "$current.started" "$previous";return 0
     fi
+    local miss=changed_fingerprint
+    if [[ "$pending" == true ]];then miss=pending_work
+    elif [[ -z "$before" ]];then miss=missing_or_unusable_manifest
+    elif ((last==0));then miss=no_previous_capture
+    elif ((now<last || now-last>=7*86400));then miss=age_refresh
+    elif [[ -f "${MC_ROTATING_IDS:-/nonexistent}" ]] && grep -Fxq -- "$key" "$MC_ROTATING_IDS";then miss=rotation_refresh;fi
+    printf '%s\n' "$miss" >>"$VERIFY_RUNTIME_DIR/$APP_CONTEXT.sidecar-miss-reasons"
     touch "$current.started" || return 1
     capture_kodi_sidecars "$app" "$path" "$root" "$media" >"$out" || return 1
     # Only stable captures become reusable. A concurrent change invalidates the
@@ -1183,7 +1227,8 @@ mc_timed_call() {
 
 mc_arr_metrics() {
     [[ -d "${MC_TMP:-}" ]] || return 0
-    local inventory_complete=false
+    local inventory_complete=false misses='{}'
+    if [[ -f "${VERIFY_RUNTIME_DIR:-}/$APP_CONTEXT.sidecar-miss-reasons" ]];then misses=$(jq -Rn '[inputs]|group_by(.)|map({key:.[0],value:length})|from_entries' "$VERIFY_RUNTIME_DIR/$APP_CONTEXT.sidecar-miss-reasons") || return 1;fi
     [[ "${MC_COMPONENT_COMPLETED:-false}" != true || -f "$MC_TMP/deferred-$APP_CONTEXT" ]] || inventory_complete=true
     (($((${API_FAILURES:-0}+${HISTORY_FAILURES:-0}+${SIDECAR_FAILURES:-0}))==0)) || inventory_complete=false
     local discovery=0 history=0 reconciliation=0 state=0 publication=0 filesystem=0 reused=0 captured=0 requests=0
@@ -1199,7 +1244,7 @@ mc_arr_metrics() {
     log INFO "PERFORMANCE | discovery=${discovery}ms history=${history}ms reconciliation=${reconciliation}ms state=${state}ms publication=${publication}ms filesystem=${filesystem}ms planning-reads=$requests sidecar-reused=$reused sidecar-captured=$captured | nested timings may overlap"
     other=$((total*1000-api-hashing)); ((other>=0)) || other=0
     log INFO "TIMING | total=${total}s api=${api}ms sidecar-capture=${hashing}ms planning-state-other=${other}ms"
-    jq -n --argjson discovery "$discovery" --argjson history "$history" --argjson reconciliation "$reconciliation" --argjson state "$state" --argjson publication "$publication" --argjson filesystem "$filesystem" --argjson reused "$reused" --argjson captured "$captured" --argjson requests "$requests" --arg app "$APP_CONTEXT" --argjson inventoryComplete "$inventory_complete" --argjson api "$api" --argjson hashing "$hashing" --argjson other "$other" \
+    jq -n --argjson cacheMissReasons "$misses" --argjson discovery "$discovery" --argjson history "$history" --argjson reconciliation "$reconciliation" --argjson state "$state" --argjson publication "$publication" --argjson filesystem "$filesystem" --argjson reused "$reused" --argjson captured "$captured" --argjson requests "$requests" --arg app "$APP_CONTEXT" --argjson inventoryComplete "$inventory_complete" --argjson api "$api" --argjson hashing "$hashing" --argjson other "$other" \
       --argjson scanned "$((${SERIES_SCANNED:-0}+${MOVIES_SCANNED:-0}))" --argjson present "${FILES_PRESENT:-0}" \
       --argjson sidecars "${SIDECARS_CAPTURED:-0}" --argjson moved "${SIDECARS_QUARANTINED:-0}" --argjson folders "${FOLDERS_REMOVED:-0}" \
       --argjson retired "${ARR_REMOVALS:-0}" --argjson episodeActions "${EPISODE_ACTIONS:-0}" --argjson seasonActions "${SEASON_ACTIONS:-0}" \
@@ -1207,7 +1252,7 @@ mc_arr_metrics() {
       --argjson confirmed "$((${EPISODES_CONFIRMED:-0}+${MOVIES_CONFIRMED:-0}))" --argjson pending "${FOLDER_CLEANUP_PENDING:-0}" --argjson mover "${MOVER_DEFERRALS:-0}" \
       --argjson errors "$((${API_FAILURES:-0}+${HISTORY_FAILURES:-0}+${SIDECAR_FAILURES:-0}))" \
       '{application:$app,inventoryComplete:$inventoryComplete,confirmedCandidates:$confirmed,episodeActions:$episodeActions,seasonActions:$seasonActions,seriesActions:$seriesActions,tagActions:$tagActions,scanned:$scanned,filesPresent:$present,sidecarsCaptured:$sidecars,sidecarsQuarantined:$moved,foldersRemoved:$folders,
-        retired:$retired,pendingFolderCleanup:$pending,moverDeferrals:$mover,errors:$errors,planningReads:$requests,sidecarInventoriesReused:$reused,sidecarInventoriesCaptured:$captured,timingMs:{discovery:$discovery,history:$history,reconciliation:$reconciliation,state:$state,publication:$publication,filesystem:$filesystem,api:$api,sidecarCapture:$hashing,planningStateOther:$other}}' >"$MC_TMP/arr-$APP_CONTEXT.metrics.json" || return 1
+        retired:$retired,pendingFolderCleanup:$pending,moverDeferrals:$mover,errors:$errors,planningReads:$requests,sidecarInventoriesReused:$reused,sidecarInventoriesCaptured:$captured,cacheMissReasons:$cacheMissReasons,timingMs:{discovery:$discovery,history:$history,reconciliation:$reconciliation,state:$state,publication:$publication,filesystem:$filesystem,api:$api,sidecarCapture:$hashing,planningStateOther:$other}}' >"$MC_TMP/arr-$APP_CONTEXT.metrics.json" || return 1
     if (( ${MOVER_DEFERRALS:-0}>0 || ${FOLDER_CLEANUP_PENDING:-0}>0 )); then
       jq -n --arg reason "Mover deferrals=${MOVER_DEFERRALS:-0}; pending folders=${FOLDER_CLEANUP_PENDING:-0}; completed actions retained" \
         '{module:"arr",status:"WARNING",reason:$reason,exit:0}' >"$MC_TMP/arr.result.json" || return 1
@@ -4848,7 +4893,7 @@ STATE_BACKUP="$SONARR_STATE_BACKUP"
 RUN_AT="$(date '+%Y-%m-%dT%H:%M:%S%z')"
 WORK_STATE=""
 MC_READ_CACHE="$VERIFY_RUNTIME_DIR/$APP_CONTEXT-read-cache";mkdir -p "$MC_READ_CACHE" || return 1
-MC_POLICY_FINGERPRINT=$(printf '%s\0' "$MC_VERSION" "$MAX_SIDECAR_SIZE_MB" "$EXTRA_SIDECAR_EXTENSIONS" "$AUTO_RECOGNIZE_KNOWN_AUXILIARY" "$CAPTURE_LATE_KODI_SIDECARS" "$QUARANTINE_KODI_SIDECARS" "$(stat -c '%d:%i:%s:%y:%z' "${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}" 2>/dev/null || printf missing)"|sha256sum|cut -d ' ' -f1)
+MC_POLICY_FINGERPRINT=$(mc_sidecar_policy_fingerprint) || return 1
 CURRENT_SNAPSHOT_FILE=""
 SIDECAR_BATCH_FILE=""
 SIDECAR_ENTRY_FILE=""
@@ -6394,7 +6439,7 @@ STATE_BACKUP="$RADARR_STATE_BACKUP"
 RUN_AT="$(date '+%Y-%m-%dT%H:%M:%S%z')"
 WORK_STATE=""
 MC_READ_CACHE="$VERIFY_RUNTIME_DIR/$APP_CONTEXT-read-cache";mkdir -p "$MC_READ_CACHE" || return 1
-MC_POLICY_FINGERPRINT=$(printf '%s\0' "$MC_VERSION" "$MAX_SIDECAR_SIZE_MB" "$EXTRA_SIDECAR_EXTENSIONS" "$AUTO_RECOGNIZE_KNOWN_AUXILIARY" "$CAPTURE_LATE_KODI_SIDECARS" "$QUARANTINE_KODI_SIDECARS" "$(stat -c '%d:%i:%s:%y:%z' "${MEDIA_INTEGRITY_RECOVERY_FILE:-/mnt/vault/cloud/logs/script/media_integrity_audit/recovery.json}" 2>/dev/null || printf missing)"|sha256sum|cut -d ' ' -f1)
+MC_POLICY_FINGERPRINT=$(mc_sidecar_policy_fingerprint) || return 1
 CURRENT_SNAPSHOT_FILE=""
 SIDECAR_BATCH_FILE=""
 SIDECAR_ENTRY_FILE=""

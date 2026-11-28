@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="3.18.4"
+readonly SCRIPT_VERSION="3.19.0"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'docker_service_watchdog.sh %s\n' "$SCRIPT_VERSION"
@@ -1235,6 +1235,17 @@ PY
     printf '%s' "$context" | docker_cmd exec -i "$name" python3 -c "$program" "$profile" "$path" "$JOB_LOG_SCAN_MAX_BYTES" "$NOW" "$id"
 }
 
+# A native failed run can contain proven successful and failed item outcomes.
+# Missing/ambiguous accounting and preflight/service failures remain critical.
+wd_native_partial_counts() {
+    jq -ce 'select(.state=="idle" and .last_run_status=="failed" and (.library_results|type)=="object" and (.library_results|length)>0)|
+      [.library_results[]] as $rows|
+      select(all($rows[];(.status|IN("success","failed")) and all(.items_processed,.items_succeeded,.items_failed;type=="number" and .>=0 and .==floor) and
+       .items_processed==(.items_succeeded+.items_failed) and (if .status=="failed" then .items_failed>0 else .items_failed==0 end)))|
+      {succeeded:([$rows[].items_succeeded]|add),failed:([$rows[].items_failed]|add),processed:([$rows[].items_processed]|add)}|
+      select(.succeeded>0 and .failed>0)' "$1"
+}
+
 job_deadlines() {
     local name="$1" first="$2" started="$3" finished="$4" max_age="$5" runtime="$6" stamp="$4"
     if (( started > finished && runtime > 0 && NOW - started > runtime * 3600 )); then
@@ -1622,7 +1633,7 @@ check_job() {
             .jobs[$name]={firstSeen:$first,started:$started,finished:$finished,success:$success,result:$result,scanned:$scanned,logState:$log_state_file[0],runLog:$run_log,evidenceSource:$evidence_source,
                 weeklyReview:$review,maintenanceOutcome:(if $result=="failed" and $priorMaintenance.finishedAt==$finished then $priorMaintenance else null end),history:(($history + $receipt_history_file[0] + (if $result == "success" and $success > 0 then [$success] else [] end)) | unique | map(select(. >= ($scanned - 28*86400) and (($retract | not) or . != $finished))))}' || return 1
     if [[ "$result" == failed ]]; then
-        local error_detail=""
+        local error_detail="" partial_counts=""
         if [[ "$source" == native:* ]]; then
             error_detail="$(jq -r '(.last_error // "No failure detail recorded") | tostring |
                 gsub("(?i)authorization[=: ]+(bearer[ ]+|basic[ ]+)?[^ ,;\\r\\n]+"; "authorization=[REDACTED]") |
@@ -1636,6 +1647,15 @@ check_job() {
         fi
         if wd_match_job_maintenance "$name" "$profile" "$started" "$finished" "$file";then
             observe "$name:job-maintenance" WARNING "Most recent job was blocked during verified Plex maintenance. $JOB_MAINTENANCE_DETAIL. Native result remains failed; no successful processing is claimed. Awaiting the next scheduled run; normal completion deadlines and Docker availability checks remain active." 1 "$profile:$finished" || return 1
+        elif [[ "$source" == native:* ]] && ((started>finished)) && jq -e --arg key "$name:job-partial" --arg evidence "$profile:$finished" '.observations[$key].evidenceIdentity==$evidence' "$STATE_WORK" >/dev/null;then
+            FROZEN_KEYS["$name:job-partial"]=1
+            log INFO "$name: retaining the prior completed partial outcome while the next native run is active; no new completion claimed" || return 1
+        elif [[ "$source" == native:* ]] && partial_counts=$(wd_native_partial_counts "$file");then
+            mutate --arg name "$name" --argjson finished "$finished" --argjson now "$NOW" '
+              (.observations[$name+":job-failed"] // null) as $prior|
+              if $prior!=null and (.jobs[$name].finished==$finished) then
+               .jobIncidentHistory=((.jobIncidentHistory // [])+[{key:($name+":job-failed"),observation:$prior,archivedAt:$now,reason:"Native per-item accounting proves partial processing; no successful whole-run claim"}])|del(.observations[$name+":job-failed"]) else . end' || return 1
+            observe "$name:job-partial" WARNING "Native run completed with item failures: $(jq -r '"succeeded=\(.succeeded), failed=\(.failed), processed=\(.processed)"' <<< "$partial_counts"). Native overall result remains failed; last successful run is unchanged. ${error_detail:-Review native findings.} Docker availability and recovery are independent." "$FAILURE_CONFIRM_SCANS" "$profile:$finished" || return 1
         else
             observe "$name:job-failed" CRITICAL "Most recent scheduled job failed; finished_epoch=$finished; last_success_epoch=$success. ${error_detail:-Review the scheduled job log or completion record.} Container availability is checked separately" "$FAILURE_CONFIRM_SCANS" "$profile:$finished" || return 1
         fi
@@ -2880,6 +2900,7 @@ weekly_job_delegates() {
           select(($state[0].jobs[$name].weeklyReview.profile|IN("recyclarr","imagemaid")) and ($state[0].jobs[$name].weeklyReviewError//0)==0 and
                  $state[0].jobs[$name].weeklyReview.lastScanAt>=$now-3600 and ($state[0].inventory[$name].retiredAt//0)==0)|$name]' "$KOMETA_WEEKLY_STATE") || return 1
     fi
+    if [[ "$STACK_WEEKLY_REPORTING" == true && -f "$KOMETA_WEEKLY_STATE" && ! -L "$KOMETA_WEEKLY_STATE" ]] && jq -e --argjson now "$NOW" '.schema==1 and .metafusionEvidenceOk==true and .lastCheckedAt>=$now-8*3600 and .lastCheckedAt<=$now+300 and .nextDue>=$now-8*3600' "$KOMETA_WEEKLY_STATE" >/dev/null;then base=$(jq -c '.+["metafusion"]|unique' <<< "$base");fi
     jq -nc --argjson base "$base" --argjson extra "$extra" '$base+$extra|unique'
 }
 
@@ -2887,16 +2908,17 @@ notify_changes() {
     local current previous body importance=normal description delegates
     delegates=$(weekly_job_delegates) || return 1
     current="$(jq -cS --argjson delegates "$delegates" '. as $state | .observations | with_entries(select(.value.active) | select((.key|endswith(":job-maintenance"))|not) |
-        select(((.key|split(":")[0]) as $name|($delegates|index($name))!=null and (.key|test(":job-(errors|warnings)$")))|not) |
+        select(((.key|split(":")[0]) as $name|($delegates|index($name))!=null and (.key|test(":job-(errors|warnings|partial)$")))|not) |
         select((.key | test(":(availability|missing)$") | not) or
             (($state.flapping[(.key | split(":")[0])].unstable // false | not) and
              ($state.observations["monitor:shared-dependency"].active // false | not)))) | map_values(.severity)' "$STATE_WORK")" || return 1
-    previous="$(jq -cS --argjson delegates "$delegates" '.notification.issues | with_entries(select((.key|endswith(":job-maintenance"))|not) | select(((.key|split(":")[0]) as $name|($delegates|index($name))!=null and (.key|test(":job-(errors|warnings)$")))|not))' "$STATE_WORK")" || return 1
+    previous="$(jq -cS --argjson delegates "$delegates" '.notification.issues | with_entries(select((.key|endswith(":job-maintenance"))|not) | select(((.key|split(":")[0]) as $name|($delegates|index($name))!=null and (.key|test(":job-(errors|warnings|partial)$")))|not))' "$STATE_WORK")" || return 1
     local retired_pending
     retired_pending=$(jq -r '(.inventoryOutbox // {})|length' "$STATE_WORK")
     if [[ "$current" == "$previous" && "$retired_pending" == 0 ]]; then mutate --argjson current "$current" '.notification.issues=$current'; return $?; fi
     description="Docker watchdog UPDATED"
     [[ "$current" != '{}' ]] || description="Docker watchdog findings cleared"
+    if [[ "$current" == '{}' ]] && jq -e 'any(.observations|to_entries[];.value.active and (.key|endswith(":job-partial")))' "$STATE_WORK" >/dev/null;then description="Service availability clear; partial job findings delegated to weekly review";fi
     if ((retired_pending>0));then description='Monitoring inventory updated';fi
     if jq -e 'any(.[]; . == "CRITICAL")' <<<"$current" >/dev/null; then importance=alert
     elif [[ "$current" != '{}' ]]; then importance=warning; fi
@@ -2905,6 +2927,7 @@ notify_changes() {
     body+=$'\n'"$(jq -r --argjson current "$current" --argjson previous "$previous" '
         . as $root | (.inventory // {}) as $inventory | ($previous|keys)-($current|keys)|.[]|. as $key|
         if ($inventory[($key|split(":")[0])].retiredAt // 0)>0 then "Retired alert: "+$key
+        elif ($key|endswith(":job-failed")) and ($root.observations[(($key|split(":")[0])+":job-partial")].active // false) then "Reclassified using native item accounting: "+$key+"; overall job remains failed with partial item results; weekly metadata review retains content findings"
         elif ($key|endswith(":job-failed")) and ($root.jobs[($key|split(":")[0])].maintenanceOutcome // null)!=null then "Reclassified as maintenance-blocked: "+$key+"; native job success is still unverified"
         else "Resolved: "+$key end' "$STATE_WORK")"
     body+=$'\n'"$(jq -r '(.inventoryOutbox // {})|to_entries[]|(if (.key|startswith("schedule:")) then "Schedule reconciliation: " else "Retired monitoring: "+.key+"; " end)+.value.message' "$STATE_WORK")"
@@ -2921,7 +2944,7 @@ write_receipt() {
     tmp="$(mktemp "$STATUS_DIR/.docker-watchdog.XXXXXX")" || return 1
     jq -n --slurpfile state "$STATE_WORK" --arg name docker_service_watchdog --arg status "$status" --arg version "$SCRIPT_VERSION" \
         --arg summary "${BACKUP_SUPPRESSION_REASON:-Watchdog execution complete; status=$status; recovery_enabled=$AUTO_RESTART}" --arg log "$LOG_FILE" --argjson epoch "$NOW" \
-        '$state[0] as $s | {name:$name,status:$status,scriptVersion:$version,summary:$summary,log:$log,epoch:$epoch,availabilityStatus:(if $status=="DEFERRED" then "UNVERIFIED" elif any($s.observations|to_entries[];.value.active and (.key|test(":(availability|probe-configuration|missing)$"))) then "ATTENTION" else "OK" end),jobReviewCount:([$s.observations|to_entries[]|select(.value.active and (.key|test(":job-(errors|warnings)$")))]|length)}' >"$tmp" &&
+        '$state[0] as $s | {name:$name,status:$status,scriptVersion:$version,summary:$summary,log:$log,epoch:$epoch,availabilityStatus:(if $status=="DEFERRED" then "UNVERIFIED" elif any($s.observations|to_entries[];.value.active and (.key|test(":(availability|probe-configuration|missing)$"))) then "ATTENTION" else "OK" end),jobReviewCount:([$s.observations|to_entries[]|select(.value.active and (.key|test(":job-(errors|warnings|partial)$")))]|length)}' >"$tmp" &&
         mv -f -- "$tmp" "$STATUS_DIR/docker_service_watchdog.json"
 }
 

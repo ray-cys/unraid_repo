@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="1.14.5"
+readonly SCRIPT_VERSION="1.15.0"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'backup_health_audit.sh %s\n' "$SCRIPT_VERSION"
@@ -526,6 +526,43 @@ audit_snapshot_execution() {
     return 0
 }
 
+# A scoped, real repair can reconcile failed modules without rewriting history
+# or claiming that a complete scheduled cleanup ran successfully.
+audit_cleanup_repaired() {
+    local root="${AUDIT_CLEANUP_ROOT:-/mnt/vault/cloud/logs/script/media_cleanup}"
+    local full="$STATUS_DIR/media_cleanup.json" latest="$root/latest-run.json" modules="$root/latest-module-results.json" saved='{"schema":1,"modules":{}}' recent='{}' run preview legacy=false summary
+    [[ -f "$full" && ! -L "$full" ]] || return 1
+    if [[ -f "$modules" && ! -L "$modules" ]];then saved=$(jq -ce 'select(.schema==1 and (.modules|type)=="object")' "$modules") || return 1;fi
+    if [[ -f "$latest" && ! -L "$latest" ]];then recent=$(jq -ce 'select(.schema==1)' "$latest") || return 1;fi
+    preview=$(jq -r 'if has("dryRun") then (.dryRun|tostring) else "unknown" end' <<< "$recent")
+    if [[ "$preview" == unknown ]];then
+        run=$(jq -r '.runId // ""' <<< "$recent")
+        if [[ "$run" =~ ^[A-Za-z0-9_]+$ ]];then
+          # Older module receipts omitted preview mode. Exact matching start-log
+          # evidence is required; its absence cannot turn a preview into a repair.
+          local file
+          for file in "$root/media-cleanup.log" "$root/media-cleanup.log.1" "$root/media-cleanup.log.2";do
+            [[ -f "$file" && ! -L "$file" ]] || continue
+            if grep -F "run=$run |" "$file" | grep -F 'Started mode=arr preview=false' >/dev/null;then legacy=true;break;fi
+          done
+        fi
+    fi
+    summary=$(jq -nr --slurpfile full "$full" --argjson recent "$recent" --argjson saved "$saved" --argjson legacy "$legacy" --argjson now "$NOW" --argjson execution "$(cat "$record")" '
+      $full[0] as $f | [$f.modules[]?|select(.status=="FAILED")|.module] as $failed |
+      ($saved.modules + (if $recent.dryRun==false or $legacy then
+       ([$recent.modules[]?|{key:.module,value:(.+{epoch:$recent.epoch,bootId:$recent.bootId,runId:$recent.runId,dryRun:false})}]|from_entries) else {} end)) as $repairs |
+      select(($failed|length)>0 and $f.bootId==$execution.boot and $f.startedAt>=$execution.startedAt-5 and $f.epoch<=$execution.finishedAt+5) |
+      select(all($failed[];. as $m|$repairs[$m] as $r|$r.status=="COMPLETED" and $r.exit==0 and $r.dryRun==false and $r.bootId==$f.bootId and $r.epoch>$f.epoch and $r.epoch<=$now+300 and $r.runId!=$f.runId and
+       (if $m=="arr" then
+        ([$f.modules[]|select(.module=="arr")|.metrics.applications[]?|select((.errors // 0)>0 or .inventoryComplete!=true)|.application]|unique) as $affected|
+        (if ($affected|length)>0 then $affected else ["SONARR","RADARR"] end) as $required|
+        all($required[];. as $app|any($r.metrics.applications[]?;.application==$app and .inventoryComplete==true and .errors==0))
+        else true end))) |
+      "Prior full cleanup failed; its affected module(s) subsequently completed a verified execute run: "+($failed|join(", "))+". Original full-run failure is retained; next full scheduled confirmation remains pending."') || return 1
+    [[ -n "$summary" ]] || return 1
+    audit_log "$summary";ACTIONS+=("$summary")
+}
+
 audit_script_executions() {
     [[ -s "${AUDIT_CATALOG_FILE:-}" ]] || return 0
     local name role record epoch window cutoff now="$NOW" pid boot status first grace max_active native_summary inventory="$STATE_DIR/execution-inventory.json" tmp
@@ -552,7 +589,7 @@ audit_script_executions() {
         if ! audit_snapshot_execution "$source_record" "$AUDIT_EXECUTION_SNAPSHOT" "$boot";then execution_finding "$role" "$name: execution receipt invalid; previous workflow data retained";continue;fi
         record="$AUDIT_EXECUTION_SNAPSHOT"
         status=$(jq -r .executionStatus "$record");epoch=$(jq -r '.lastCompletedAt // 0' "$record")
-        if [[ "$status" == FAILED ]];then
+        if [[ "$status" == FAILED ]] && ! { [[ "$role" == media_cleanup ]] && audit_cleanup_repaired; };then
           native_summary=$(jq -r '.summary // "No separate producer summary was saved"' "$STATUS_DIR/$role.json" 2>/dev/null) || native_summary='No separate producer summary was saved'
           [[ "$role" != media_health_monitor ]] || native_summary=$(jq -r '.monitor.lastError // "Monitor exited before publishing a detailed failure"' /mnt/vault/cloud/logs/script/media_health_monitor/state.json 2>/dev/null)
           execution_finding "$role" "$name: latest execution failed (exit=$(jq -r .lastExitCode "$record")). Outcome: ${native_summary:0:1500}"

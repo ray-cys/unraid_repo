@@ -309,6 +309,20 @@ for recovery_scan in 1 2; do
 done
 active metafusion:job-failed && fail 'verified successful job did not clear prior failure'
 
+# A failed native run with exact item accounting is partial processing, not
+# an outage. The next active run must not flap it back to critical.
+fresh; PROFILE_BY_NAME[metafusion]=metafusion
+MOCK_NATIVE="$(jq -nc --argjson now "$NOW" '{state:"idle",heartbeat_at:"2026-11-21T00:00:00Z",pid:1,last_run_started:($now-60),last_run_finished:$now,last_success:($now-3600),last_run_status:"failed",last_error:"One artwork claim conflicts",library_results:{Movies:{status:"failed",items_processed:10,items_succeeded:9,items_failed:1}}}')"
+check_job metafusion "$MOCK_INFO";check_job metafusion "$MOCK_INFO"
+active metafusion:job-partial || fail 'partial item result not reported'
+active metafusion:job-failed && fail 'partial processing became critical'
+jq -e --argjson prior "$((NOW-3600))" '.jobs.metafusion.result=="failed" and .jobs.metafusion.success==$prior' "$STATE_WORK" >/dev/null || fail 'partial result invented whole-run success'
+NOW=$((NOW+60));MOCK_NATIVE="$(jq --argjson now "$NOW" '.state="running"|.last_run_started=$now' <<< "$MOCK_NATIVE")"
+SEEN=();FROZEN_KEYS=();check_job metafusion "$MOCK_INFO";finish_observations
+active metafusion:job-partial || fail 'prior partial result lost during active retry'
+active metafusion:job-failed && fail 'active retry flapped partial result to critical'
+printf 'Native partial accounting, last-success retention and active-retry stability passed\n'
+
 # A whole-run log banner counts completion but must not invent success.
 fresh; NOW="$(date +%s)"
 saved_job_rules=("${JOB_RULES[@]}")

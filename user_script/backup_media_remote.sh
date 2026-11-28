@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="2.9.2"
+readonly SCRIPT_VERSION="2.10.0"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'backup_media_remote.sh %s\n' "$SCRIPT_VERSION"
@@ -2539,7 +2539,14 @@ main() {
       --evidence-status) jq -n --arg scope 'Producer receipts only; no transfer, SSH or wake performed' \
         --slurpfile success <(if [[ -f "$STATUS_DIR/backup_media_remote.last-success.json" ]];then cat "$STATUS_DIR/backup_media_remote.last-success.json";else printf null;fi) \
         --slurpfile attempt <(if [[ -f "$STATUS_DIR/backup_media_remote.last-attempt.json" ]];then cat "$STATUS_DIR/backup_media_remote.last-attempt.json";else printf null;fi) \
-        '{scope:$scope,lastVerifiedSuccess:$success[0],lastFailedAttempt:$attempt[0]}';return $?;;
+        --arg version "$SCRIPT_VERSION" --argjson now "$(date +%s)" '
+        ($success[0]) as $s |
+        (if $s==null then "AWAITING_NATIVE_COMPLETION_RECEIPT" elif
+          ($s.schema==2 and $s.name=="backup_media_remote" and $s.status=="OK" and $s.copy=="OK" and $s.verification=="rsync_transfer_verified" and
+           ($s.epoch|type)=="number" and $s.epoch>0 and $s.epoch<=$now+300 and ($s.jobs|type)=="array" and ($s.jobs|length)>0 and all($s.jobs[];.exitCode==0))
+         then "VERIFIED_TRANSFER_RECEIPT" else "INVALID_OR_UNSUPPORTED_RECEIPT" end) as $status |
+        {scope:$scope,scriptVersion:$version,evidenceStatus:$status,lastVerifiedSuccess:$s,lastFailedAttempt:$attempt[0],
+         nextAction:(if $status=="AWAITING_NATIVE_COMPLETION_RECEIPT" then "Next normal scheduled mirror must publish its receipt; legacy freshness remains separately visible in the backup audit. No remote wake or transfer was performed." elif $status=="VERIFIED_TRANSFER_RECEIPT" then "Transferred-data verification recorded; unchanged mirror files are not fully rehashed." else "Review retained receipt; no verification claim or automatic deletion of evidence." end)}' ;return $?;;
       --version) printf 'backup_media_remote.sh %s\n' "$SCRIPT_VERSION";return 0;;
       '') ;; *) printf 'Usage: bash script [--evidence-status|--version]\n';return 2;;
     esac

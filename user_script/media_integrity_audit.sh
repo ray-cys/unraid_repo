@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="2.7.3"
+readonly SCRIPT_VERSION="2.8.0"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'media_integrity_audit.sh %s\n' "$SCRIPT_VERSION"
@@ -2000,11 +2000,12 @@ main() {
     ARR_MUTATION_COORDINATION_ACTIVE=true
     case "${1:-}" in
       --version) printf 'media_integrity_audit.sh %s\n' "$SCRIPT_VERSION";return 0;;
-      --help|-h) printf '%s\n' 'Usage: bash script [--version|--status|--inventory-only|--recovery-status|--recover-only|--help]' \
+      --help|-h) printf '%s\n' 'Usage: bash script [--version|--status|--evidence-status|--inventory-only|--recovery-status|--recover-only|--help]' \
         'Default: Wednesday/Sunday scan through Bazarr. Recovery is disabled by configuration; no installation or Docker changes.' \
         'Wednesday/Sunday 07:00 SGT, two-hour runtime, two video threads, low CPU/I/O priority.' \
         'Quick probes and resumable overlapping decode ranges are separate evidence; pending files remain unverified.' \
         'Missing mounts, maintenance, active parity/Mover/backups or Plex transcoding defer/stop work.' \
+        '--evidence-status summarises normal-scan/decoding evidence separately from report generation; no media reads.' \
         '--status reads only saved receipts. --inventory-only stats library paths and saves inventory; no decoding or normal email.' \
         'AUTO_RECOVERY_ENABLED=false: observe for several weeks before changing it. No CLI option bypasses the switch.' \
         '--recovery-tick performs bounded API follow-up only; no media decoding and no scan-freshness advance.' \
@@ -2012,6 +2013,15 @@ main() {
         'When enabled: two distinct confirming audit runs, exact monitored Arr file/target IDs, no active work, original retained in place, durable intents, one exact release grab, full replacement verification.' \
         'Originals remain in their library locations until Arr replaces/recycles them. No repair_hold, file deletion or forced import. Required/blocked/completed replacement updates are grouped.' \
         'Timeouts, read errors, unsupported codecs, unmonitored/ambiguous/unmanaged media never authorize recovery.';return 0;;
+      --evidence-status)
+        local receipt="$STATUS_DIR/media_integrity_audit.json"
+        [[ -f "$receipt" && ! -L "$receipt" ]] || { printf '{"evidenceStatus":"NO_RECEIPT","scope":"Saved evidence only; no media access"}\n';return 0; }
+        jq --arg version "$SCRIPT_VERSION" '{scope:"Saved evidence only; no media or Docker access",scriptVersion:$version,reportedAt:.epoch,
+         normalScanAt:(if .evidenceSchema==2 then (.lastRealScanAt // 0) else 0 end),decodeProgressAt:(.lastDecodeProgressAt // 0),
+         evidenceStatus:(if .evidenceSchema!=2 then "LEGACY_UNCLASSIFIED" elif (.lastRealScanAt // 0)==0 then "AWAITING_NORMAL_SCAN" else "NORMAL_SCAN_RECORDED" end),
+         coverageStatus:(.coverageStatus // "UNCLASSIFIED"),fullyVerified:(.coverage.fullyVerified // .progress.overall.verified // 0),knownFiles:(.coverage.knownFiles // .progress.overall.total // 0),
+         pendingVerification:(.coverage.pendingVerification // .progress.overall.awaitingVerification // 0),lastRun:.progress.run,
+         recoveryEnabled,action:"Run/report success does not certify pending media. Scheduled scans retain guards; native replacement remains opt-in."}' "$receipt";return $?;;
       --status) [[ ! -f "$STATUS_DIR/media_integrity_audit.json" ]] || jq . "$STATUS_DIR/media_integrity_audit.json";return 0;;
       --inventory-only) MODE=inventory;;
       --recovery-status) recovery_valid || return 1; jq '{schema,workflow,actions:[.actions|to_entries[]|{id:.key,app:.value.app,path:.value.path,status:.value.status,reason:.value.reason,parentId:.value.parentId,fileId:.value.fileId,targets:.value.targets,selected:.value.selected.title,downloadId:.value.downloadId,replacementFiles:.value.replacementFiles,replacementVerifiedAt:.value.replacementVerifiedAt,events:.value.events}]}' "$RECOVERY_FILE";return 0;;
