@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="1.9.3"
+readonly SCRIPT_VERSION="1.10.0"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'host_health_watchdog.sh %s\n' "$SCRIPT_VERSION"
@@ -465,7 +465,9 @@ notify_unraid() {
     local description="$2"
     local message="$3"
 
-    local host_attached=0
+    local host_attached=0 peer_context
+    peer_context=$(hc_peer_context watchdog "$(date +%s)") || peer_context="Daily disk context unavailable; no healthy state assumed."
+    message+=$'\n\n'"$peer_context"
     if [[ "${HH_PREPARED:-0}" == 1 && -n "${HH_PENDING_BODY:-}" ]];then
         message+=$'\n\nHost conditions:\n'"$HH_PENDING_BODY"
         host_attached=1
@@ -1300,6 +1302,8 @@ hh_array_state() {
 hh_expected_mounts() {
     printf '/boot\n'
     [[ "$(hh_array_state)" == started ]] || return 0
+    # Native Unraid shareUser=e enables the /mnt/user FUSE share mount.
+    if grep -Eq '^shareUser="?e"?[[:space:]]*$' "${HH_VAR_INI:-/var/local/emhttp/var.ini}" 2>/dev/null;then printf '/mnt/user\n';fi
     awk -F= '
       function emit(){if(slot ~ /^[A-Za-z0-9_.-]+$/ && (type=="Data" || type=="Cache") && fs!="" && (device!="" || identity!="" || assigned!="" || status=="DISK_DSBL" || status=="DISK_MISSING"))print "/mnt/"slot}
       /^\[/{emit();slot=$0;gsub(/[\[\]"\r]/,"",slot);type=fs=device=status=identity=assigned="";next}
@@ -1375,8 +1379,9 @@ hh_atomic() {
     rm -f -- "$temp";return 1
 }
 hh_observe() {
-    local id="$1" severity="$2" title="$3" detail="$4" confirmations="${5:-3}"
-    HH_OBSERVATIONS=$(jq -c --arg id "$id" --arg severity "$severity" --arg title "$title" --arg detail "$detail" --argjson confirmations "$confirmations" '.+[{id:$id,severity:$severity,title:$title,detail:$detail,confirmations:$confirmations}]' <<< "$HH_OBSERVATIONS")
+    local id="$1" severity="$2" title="$3" detail="$4" confirmations="${5:-3}" action
+    action=$(hc_probe_action "$id")
+    HH_OBSERVATIONS=$(jq -c --arg id "$id" --arg severity "$severity" --arg title "$title" --arg detail "$detail" --argjson confirmations "$confirmations" --arg action "$action" '.+[{id:$id,severity:$severity,title:$title,detail:$detail,confirmations:$confirmations,action:$action}]' <<< "$HH_OBSERVATIONS")
 }
 hh_usage() {
     local path="$1" numbers total avail inode_total inode_free used severity=ok
@@ -1411,7 +1416,11 @@ hh_cpu() {
             hh_observe "$id" "$severity" 'CPU temperature' "$label $((current/1000))C; driver limit $((maximum/1000))C, critical $((critical/1000))C." 1
         done
     done
-    ((found)) || hh_observe cpu:coverage unsupported 'CPU temperature coverage' 'No trusted package sensor with firmware limits; no guessed limit applied.'
+    if ((found==0));then
+        if jq -e 'any(.conditions|keys[];startswith("cpu:") and .!="cpu:coverage")' <<< "$HH_STATE" >/dev/null;then
+            hh_observe cpu:coverage warning 'CPU temperature sensor unavailable' 'A previously observed CPU sensor is unavailable; previous incidents are retained and no healthy temperature inferred.' 3
+        else hh_observe cpu:coverage unsupported 'CPU temperature coverage' 'No trusted package sensor with firmware limits; no guessed limit applied.';fi
+    else hh_observe cpu:coverage ok 'CPU temperature coverage' 'Trusted CPU package sensors were collected.';fi
 }
 hh_network() {
     local iface base carrier speed supported max_speed expected mac old previous_at delta_e delta_p errors packets severity detail flags
@@ -1523,6 +1532,8 @@ hh_collect() {
             ;;
         esac
     done < <(hh_expected_mounts | sort -u)
+    hc_daily_probe || return 1
+    hc_disk_temperatures
     hh_usage /
     read -r total available < <(awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{print t+0,a+0}' "$HH_PROC_ROOT/meminfo")
     if ((total>0));then
@@ -1543,9 +1554,10 @@ hh_lifecycle() {
       .conditions //= {} | . as $root |
       reduce $observations[] as $o (. ; .conditions[$o.id] as $previous |
         ($previous//{active:false,bad:0,good:0,notifiedAt:0}) as $p |
-        ($p + {title:$o.title,detail:$o.detail,lastSeen:$now}) as $c |
+        ($p + {title:$o.title,detail:$o.detail,action:($o.action//"Review reported evidence; no repair was attempted."),lastSeen:$now}) as $c |
         (if (($p.lastSeen//0)<$now-1200) then $c+{bad:0,good:0} else $c end) as $c |
-        if ($o.severity=="warning" or $o.severity=="critical") then
+        if ($o.delegated//false) then .conditions[$o.id]=($c+{active:false,pending:"",bad:0,good:0,delegatedTo:"host_health_monitor"})
+        elif ($o.severity=="warning" or $o.severity=="critical") then
           ($c+{bad:($c.bad+1),good:0}) as $c |
           (if $o.severity=="critical" then $o.confirmations else 3 end) as $required |
           if $c.bad >= $required then
@@ -1558,16 +1570,17 @@ hh_lifecycle() {
           .conditions[$o.id]=(if $p.active==true and $c.good>=2 then $c+{active:false,pending:"RECOVERED"} else $c end)
         else .conditions[$o.id]=($c+{bad:0,good:0}) end) |
       # Removed hardware is retired, never described as a proven recovery.
-      .conditions |= with_entries(select(.value.lastSeen >= $now-604800)) |
+      .conditions |= with_entries(select(.value.active==true or (.value.pending//"")!="" or .value.lastSeen >= $now-604800)) |
       .baselines.network |= with_entries(select(.value.at >= $now-604800)) |
       .lastSampleAt=$now' <<< "$HH_STATE") || return 1
-    HH_PENDING_BODY=$(jq -r '.conditions|to_entries|map(select((.value.pending//"")!=""))|.[0:24][]|"- [\(.value.pending)] \(.value.title) [\(.value.severity//"info")]\n  \(.value.detail)"' <<< "$HH_STATE")
+    HH_PENDING_BODY=$(jq -r '.conditions|to_entries|map(select((.value.pending//"")!=""))|sort_by(if .value.severity=="critical" then 0 else 1 end,.key)|.[0:24][]|"- [\(.value.pending)] \(.value.title) [\(.value.severity//"info")]\n  \(.value.detail)\n  Action: \(.value.action//"Review reported evidence; no automatic repair was attempted.")"' <<< "$HH_STATE")
     HH_PENDING_IMPORTANCE=$(jq -r 'if any(.conditions[];(.pending//"")!="" and .active==true and .severity=="critical") then "alert" elif any(.conditions[];(.pending//"")!="" and .active==true) then "warning" else "normal" end' <<< "$HH_STATE")
 }
 hh_save() {
-    local receipt info mirror_at
+    local receipt info mirror_at combined
+    combined=$(hc_combined_health "$HH_OBSERVATIONS" "$HH_STATE" "$HH_NOW") || return 1
     hh_atomic "$HH_RAM_ROOT/host-health-state.json" "$HH_STATE" || return 1
-    receipt=$(jq -nc --arg boot "$HH_BOOT" --argjson now "$HH_NOW" --argjson observations "$HH_OBSERVATIONS" --argjson state "$HH_STATE" '{schema:1,bootId:$boot,observedAt:$now,status:"COMPLETE",activeConditions:([$state.conditions[]|select(.active)]|length),observations:$observations}')
+    receipt=$(jq -nc --arg boot "$HH_BOOT" --argjson now "$HH_NOW" --argjson observations "$HH_OBSERVATIONS" --argjson state "$HH_STATE" --argjson combined "$combined" '{health:$combined,schema:1,bootId:$boot,observedAt:$now,status:"COMPLETE",activeConditions:([$state.conditions[]|select(.active)]|length),observations:$observations}')
     hh_atomic "$HH_RAM_ROOT/host-health-receipt.json" "$receipt" || return 1
     info=$(hh_mount_info /mnt/vault)
     if jq -e '.mounted and (.readOnly|not)' <<< "$info" >/dev/null;then
@@ -1599,6 +1612,7 @@ hh_log_observations() {
         case "$id" in
           mount:*|monitor:mount-inventory) category=MOUNTS;;
           space:*) category=CAPACITY;; inodes:*) category=INODES;;
+          disk-temperature:*|monitor:disk-temperatures) category=TEMPERATURE;;
           memory) category=MEMORY;; cpu:*) category=CPU;; network:*) category=LAN;;
           btrfs:*) category=BTRFS;; monitor:external-observer) category=OBSERVER;;
           monitor:disk-state) category=DISK_STATE;;
@@ -1630,9 +1644,10 @@ hh_log_observations() {
     summary=$(jq -nr --argjson observations "$HH_OBSERVATIONS" --argjson state "$HH_STATE" '
       "Host probes completed: observations=\($observations|length); OK=\([$observations[]|select(.severity=="ok")]|length); warning=\([$observations[]|select(.severity=="warning")]|length); critical=\([$observations[]|select(.severity=="critical")]|length); unverified=\([$observations[]|select(.severity=="unknown")]|length); unsupported=\([$observations[]|select(.severity=="unsupported")]|length); active incidents=\([$state.conditions[]|select(.active==true)]|length). RAM receipt saved; notifications follow the existing lifecycle policy."') || return 1
     log HOST INFO "$summary"
+    log HOST INFO "Coordinated health=$(jq -r .health.healthStatus "$HH_RAM_ROOT/host-health-receipt.json"); daily freshness=$(jq -r .freshness <<< "$HC_DAILY_SNAPSHOT"). Scan completion and condition health are separate."
 }
 hh_delivered() {
-    HH_STATE=$(jq -c --argjson now "$HH_NOW" '[.conditions|to_entries[]|select((.value.pending//"")!="")|.key][0:24] as $ids | reduce $ids[] as $id (. ; .conditions[$id].pending=""|.conditions[$id].notifiedAt=$now)' <<< "$HH_STATE") || return 1
+    HH_STATE=$(jq -c --argjson now "$HH_NOW" '([.conditions|to_entries[]|select((.value.pending//"")!="")]|sort_by(if .value.severity=="critical" then 0 else 1 end,.key)|.[0:24]|map(.key)) as $ids | reduce $ids[] as $id (. ; .conditions[$id].pending=""|.conditions[$id].notifiedAt=$now)' <<< "$HH_STATE") || return 1
     HH_PENDING_BODY='';HH_DIRTY=1;hh_save
 }
 hh_flush() {
@@ -1656,15 +1671,225 @@ host_external_status() {
         '{schema:1,name:$name,bootId:$boot,epoch:$epoch,uptimeSeconds:$uptime,arrayState:$array,probeVersion:$version,fastWatchdog:$receipt}'
 }
 
+# BEGIN HOST HEALTH COORDINATION
+# shellcheck shell=bash
+# Shared contract v1: collectors retain alert/recovery ownership; peer context
+# never creates or clears another collector's incidents. No extra scheduler.
+hc_owned_json() {
+    local file="$1"
+    [[ -f "$file" && ! -L "$file" && $(stat -c %u "$file" 2>/dev/null) == "$EUID" && $(stat -c %h "$file" 2>/dev/null) == 1 ]] || return 1
+    (( $(stat -c %s "$file" 2>/dev/null || echo 9999999) <= 2097152 )) || return 1
+    jq -e 'type=="object"' "$file" >/dev/null 2>&1
+}
+hc_daily_snapshot() {
+    local now="$1" file="${HC_DAILY_RECEIPT:-/mnt/vault/cloud/logs/script/host_health_monitor/state/monitor_receipt.json}" schedule="${HC_SCHEDULE_FILE:-/boot/config/plugins/user.scripts/schedule.json}"
+    local old='{}' evidence='{}' plan=unknown cron='' due='{"valid":false}' boot
+    boot=$(cat "${HH_PROC_ROOT:-/proc}/sys/kernel/random/boot_id") || return 1
+    if hc_owned_json "$schedule";then
+        plan=$(jq -r '[to_entries[]|select(.key|endswith("/host_health_monitor/script"))][0].value.frequency // "absent"' "$schedule")
+        if [[ "$plan" == custom ]];then
+            cron=$(jq -r '[to_entries[]|select(.key|endswith("/host_health_monitor/script"))][0].value.custom // ""' "$schedule")
+            due=$(hh_cron_last_due "$cron" "$now") || due='{"valid":false}'
+            plan=enabled
+        elif [[ "$plan" == absent || "$plan" == never || "$plan" == disabled || "$plan" == manual ]];then plan=disabled
+        else plan=unknown;fi
+    fi
+    if hc_owned_json "$file";then
+        old=$(cat "$file")
+        if jq -e --argjson now "$now" '.healthEvidence.schema==1 and (.healthEvidence.observedAt|type)=="number" and .healthEvidence.observedAt>0 and .healthEvidence.observedAt<=$now+60 and (.healthEvidence.bootId|type)=="string" and (.healthEvidence.findings|type)=="array" and (.healthEvidence.findings|length)<=256 and all(.healthEvidence.findings[];(.id|type)=="string" and (.severity|IN("warning","critical")) and (.title|type)=="string" and (.detail|type)=="string" and (.action|type)=="string")' <<< "$old" >/dev/null;then
+            evidence=$(jq -c .healthEvidence <<< "$old")
+        fi
+    fi
+    jq -nc --argjson evidence "$evidence" --argjson producer "$old" --argjson due "$due" --arg plan "$plan" --arg boot "$boot" --argjson now "$now" '
+      ($evidence.observedAt//0) as $at | ($due.dueEpoch//0) as $deadline |
+      (if $plan=="disabled" then "NOT_SCHEDULED"
+       elif $plan!="enabled" or ($due.valid//false)!=true then "UNVERIFIED"
+       elif ($at>0 and $evidence.bootId==$boot and $at >= $deadline and $now-$at<=129600) then "CURRENT"
+       elif $now<=$deadline+7200 then "AWAITING_SCHEDULED_COMPLETION" else "STALE" end) as $freshness |
+      {freshness:$freshness,schedule:$plan,dueEpoch:$deadline,observedAt:$at,executionStatus:($producer.status//"unknown"),
+       findings:(if $freshness=="NOT_SCHEDULED" then [] else ($evidence.findings//[]) end),coverage:($evidence.coverage//null),thresholds:($evidence.thresholds//{}),
+       delivery:($producer.notification//"unknown")}'
+}
+hc_probe_action() {
+    case "$1" in
+      cpu:*|disk-temperature:*) printf 'Inspect cooling and airflow; reduce load if overheating persists. No cooling or hardware settings were changed.';;
+      mount:*) printf 'Check native Unraid device and mount status. No remount or repair was attempted.';;
+      btrfs:*) printf 'Check pool capacity, member availability and filesystem errors. No balance or repair was attempted.';;
+      space:*|inodes:*) printf 'Review the affected filesystem and free space deliberately. No files were deleted.';;
+      memory) printf 'Identify sustained memory consumers and check recent OOM events. No application was restarted.';;
+      network:*) printf 'Check the LAN interface, cable and switch. No network settings were changed.';;
+      monitor:daily-health) printf 'Check the daily User Script execution and retained completion evidence. No disk test or backup was forced.';;
+      *) printf 'Review the reported evidence and restore the affected collector or service. No automatic repair was attempted.';;
+    esac
+}
+hc_daily_probe() {
+    HC_DAILY_SNAPSHOT=$(hc_daily_snapshot "$HH_NOW") || HC_DAILY_SNAPSHOT='{"freshness":"UNVERIFIED","executionStatus":"unverified","findings":[],"thresholds":{}}'
+    local freshness severity=ok detail
+    freshness=$(jq -r .freshness <<< "$HC_DAILY_SNAPSHOT")
+    case "$freshness" in
+      STALE|UNVERIFIED) severity=warning;;
+      AWAITING_SCHEDULED_COMPLETION) severity=unknown;;
+      NOT_SCHEDULED) severity=deferred;;
+    esac
+    if [[ "$freshness" == CURRENT ]] && jq -e '.executionStatus=="incomplete"' <<< "$HC_DAILY_SNAPSHOT" >/dev/null;then severity=warning;fi
+    detail=$(jq -r '"Daily collector freshness=\(.freshness); latest execution=\(.executionStatus); retained disk findings=\(.findings|length). Last completed evidence="+(.observedAt|tostring)+". Findings remain owned by the daily monitor; schedule grace=2h."' <<< "$HC_DAILY_SNAPSHOT")
+    hh_observe monitor:daily-health "$severity" 'Daily disk monitoring' "$detail" 2
+}
+hc_disk_temperatures() {
+    local file="${HH_DISKS_INI:-/var/local/emhttp/disks.ini}" stamp slot dev native_id temp rota kind warn crit severity id count=0
+    stamp=$(stat -c %Y "$file" 2>/dev/null) || stamp=0
+    if [[ ! "$stamp" =~ ^[0-9]+$ ]] || ((stamp>HH_NOW+60 || HH_NOW-stamp>900));then
+        hh_observe monitor:disk-temperatures warning 'Native disk temperatures unavailable' 'Unraid disk metadata is missing or older than 15 minutes; no SMART read or disk wake was performed.' 3
+        return
+    fi
+    local limits='{}'
+    if [[ ${HC_DAILY_SNAPSHOT:-} != '' ]];then limits=$(jq -c '.thresholds//{}' <<< "$HC_DAILY_SNAPSHOT");fi
+    while IFS=$'\t' read -r slot dev native_id temp;do
+        [[ "$dev" =~ ^(sd[a-z]+|nvme[0-9]+n[0-9]+)$ && -n "$native_id" && "$native_id" != none ]] || continue
+        id="disk-temperature:$(printf '%s' "$native_id"|sha256sum|cut -c1-24)";count=$((count+1))
+        if [[ "$dev" == nvme* ]];then kind=nvme;warn=70;crit=80
+        else
+            rota=$(cat "${HH_SYS_ROOT:-/sys}/class/block/$dev/queue/rotational" 2>/dev/null) || rota=''
+            case "$rota" in 0) kind=ssd;warn=65;crit=70;;1) kind=hdd;warn=55;crit=60;;*) hh_observe "$id" unknown "Disk temperature $slot" 'Device type could not be verified; no threshold guessed.';continue;;esac
+        fi
+        local w c
+        w=$(jq -r --arg kind "$kind" '.[$kind].warning//empty' <<< "$limits");c=$(jq -r --arg kind "$kind" '.[$kind].critical//empty' <<< "$limits")
+        if [[ "$w" =~ ^[0-9]+$ && "$c" =~ ^[0-9]+$ ]] && ((w>=20 && c>=w && c<=120));then warn=$w;crit=$c;fi
+        if [[ ! "$temp" =~ ^[0-9]+$ ]] || ((temp<=0 || temp>=150));then
+            hh_observe "$id" deferred "Disk temperature $slot" 'No current native temperature, commonly because the disk is sleeping. No healthy sample inferred and no disk woken.'
+            continue
+        fi
+        severity=ok;((temp>=warn)) && severity=warning;((temp>=crit)) && severity=critical
+        if [[ "$severity" == ok ]] && jq -e --arg id "$id" '.conditions[$id].active==true' <<< "$HH_STATE" >/dev/null && ((temp>warn-3));then severity=warning;fi
+        hh_observe "$id" "$severity" "Disk temperature $slot" "$dev: ${temp}C; warning=${warn}C, critical=${crit}C; source=Unraid native metadata; no SMART polling or disk wake." 1
+        HH_OBSERVATIONS=$(jq -c --arg id "$id" --arg device "/dev/$dev" 'map(if .id==$id then .+{device:$device} else . end)' <<< "$HH_OBSERVATIONS")
+        # A daily fallback incident keeps its recovery ownership until confirmed.
+        if [[ ${HC_DAILY_SNAPSHOT:-} != '' ]] && jq -e --arg device "/dev/$dev" '.freshness=="CURRENT" and any(.findings[]?;.device==$device and (.id|endswith("|temp")))' <<< "$HC_DAILY_SNAPSHOT" >/dev/null;then
+            HH_OBSERVATIONS=$(jq -c --arg id "$id" 'map(if .id==$id then .+{delegated:true} else . end)' <<< "$HH_OBSERVATIONS")
+        fi
+    done < <(awk -F= '
+      function emit(){if(dev!="" && slot!="flash")print slot"\t"dev"\t"(id==""?"none":id)"\t"(temp==""?"*":temp)}
+      /^\[/{emit();slot=$0;gsub(/[\[\]"]/,"",slot);dev=id=temp="";next}
+      {v=substr($0,index($0,"=")+1);gsub(/^"|"$/,"",v)} $1=="device"{dev=v}$1=="id"{id=v}$1=="temp"{temp=v} END{emit()}' "$file")
+    if ((count==0));then hh_observe monitor:disk-temperatures unknown 'Native disk temperature coverage' 'No eligible device identities found in current Unraid metadata.'
+    else hh_observe monitor:disk-temperatures ok 'Native disk temperature coverage' "$count device(s) inventoried; sleeping/unverified readings are deferred explicitly.";fi
+}
+hc_combined_health() {
+    local observations="$1" state="$2" now="$3" daily active storage
+    daily=${HC_DAILY_SNAPSHOT:-};[[ -n "$daily" ]] || daily=$(hc_daily_snapshot "$now") || daily='{"freshness":"UNVERIFIED","executionStatus":"unverified","findings":[]}'
+    active=$(jq -c '[.conditions|to_entries[]|select(.value.active)|{id:.key,severity:.value.severity,title:.value.title,detail:.value.detail,pending:(.value.pending//""),source:"host_health_watchdog"}]' <<< "$state") || return 1
+    local previous="${HC_FAST_RECEIPT:-${HH_RAM_ROOT:-/run}/host-health-receipt.json}" cached='[]'
+    if jq -e '.freshness|IN("UNVERIFIED","STALE")' <<< "$daily" >/dev/null && hc_owned_json "$previous";then
+        cached=$(jq -c --arg boot "$(cat /proc/sys/kernel/random/boot_id)" 'if .bootId==$boot then (.health.daily.findings//[]) else [] end' "$previous") || cached='[]'
+        daily=$(jq -c --argjson cached "$cached" 'if (.findings|length)==0 and ($cached|type)=="array" then .findings=$cached|.cachedUnverified=true else . end' <<< "$daily") || return 1
+    fi
+    storage=$(hc_storage_snapshot "$now") || return 1
+    jq -nc --argjson storage "$storage" --argjson daily "$daily" --argjson active "$active" --argjson observations "$observations" --argjson now "$now" '
+      {schema:1,observedAt:$now,daily:$daily,fastFindings:$active,storage:$storage,
+       healthStatus:(if any($active[];.severity=="critical") or any($daily.findings[];.severity=="critical") then "CRITICAL"
+        elif ($active|length)>0 or ($daily.findings|length)>0 or ($storage.openXfsSources|length)>0 then "ATTENTION"
+        elif ($storage.evidenceVerified|not) or $storage.executionStatus=="FAILED" or ($storage.fresh|not) or ($daily.freshness|IN("STALE","UNVERIFIED")) or any($observations[];.severity=="unknown") then "UNVERIFIED" elif any($observations[];(.severity|IN("warning","critical")) and (.delegated//false|not)) then "CONFIRMING" else "OK" end),
+       coverage:{observations:($observations|length),unverified:([$observations[]|select(.severity=="unknown")]|length),deferred:([$observations[]|select(.severity=="deferred")]|length),unsupported:([$observations[]|select(.severity=="unsupported")]|length)}}'
+}
+hc_peer_context() {
+    local role="$1" now="$2" daily fast='{}' file="${HC_FAST_RECEIPT:-/run/host-health-receipt.json}"
+    if [[ "$role" == watchdog ]];then
+        daily=${HC_DAILY_SNAPSHOT:-};[[ -n "$daily" ]] || daily=$(hc_daily_snapshot "$now") || return 1
+        jq -r '"Daily disk context (existing findings; not additional notification events): freshness=\(.freshness); execution=\(.executionStatus).", (.findings|sort_by(if .severity=="critical" then 0 else 1 end)|.[0:24][]|"- [\(.severity|ascii_upcase)] \(.title): \(.detail|.[0:1200])\n  Action: \(.action|.[0:500])"), (if (.findings|length)>24 then "Additional existing disk findings: \((.findings|length)-24); retained in daily findings and their original notifications. Peer context does not acknowledge them." else empty end)' <<< "$daily"
+    else
+        if hc_owned_json "$file" && jq -e --argjson now "$now" --arg boot "$(cat /proc/sys/kernel/random/boot_id)" '.schema==1 and .bootId==$boot and .observedAt<=$now+60 and .observedAt>=$now-900' "$file" >/dev/null;then
+            jq -r '"Fast host context (existing findings; watchdog owns notification/recovery): active incidents=\(.health.fastFindings//[]|length); observed epoch=\(.observedAt).",(.health.fastFindings[]?|"- [\(.severity|ascii_upcase)] \(.title): \(.detail)")' "$file"
+        else printf 'Fast host context: UNVERIFIED; recent same-boot watchdog evidence unavailable. Daily disk findings remain independently reported.\n';fi
+    fi
+}
+hc_export_daily_evidence() {
+    local now="$1" id rows='[]' row prior='[]' file="${MONITOR_RECEIPT_FILE:-}" boot
+    boot=$(cat /proc/sys/kernel/random/boot_id) || return 1
+    for id in "${FINDING_IDS[@]}";do
+        row=$(jq -nc --arg id "$id" --arg severity "${FINDING_SEVERITY[$id]}" --arg title "${FINDING_TITLE[$id]}" --arg detail "${FINDING_EVIDENCE[$id]}" --arg action "${FINDING_ACTION[$id]}" --arg device "${FINDING_DEVICE[$id]:-}" '{device:$device,id:$id,severity:$severity,title:$title,detail:$detail,action:$action,verification:"observed"}') || return 1
+        rows=$(jq -nc --argjson rows "$rows" --argjson row "$row" '$rows+[$row]') || return 1
+    done
+    hc_owned_json "$file" && prior=$(jq -c '.healthEvidence.findings//[]' "$file")
+    for id in "${NOTIFY_CARRY_IDS[@]}";do
+        [[ -z "${FINDING_SEEN[$id]:-}" ]] || continue
+        row=$(jq -nc --argjson prior "$prior" --arg id "$id" --arg severity "${NOTIFY_PREV_SEVERITY[$id]:-warning}" --arg title "${NOTIFY_PREV_LABEL[$id]:-Previous disk finding}" '([$prior[]|select(.id==$id)][0]//{id:$id,severity:$severity,title:$title,detail:"Previous finding retained; fresh recovery confirmation remains outstanding.",action:"Review current disk evidence; absence of a sample is not recovery."})+{verification:"awaiting-confirmation"}') || return 1
+        rows=$(jq -nc --argjson rows "$rows" --argjson row "$row" '$rows+[$row]') || return 1
+    done
+    jq -nc --argjson at "$now" --arg boot "$boot" --argjson findings "$rows" --argjson coverage "${HOST_HEALTH_COVERAGE:-null}" --argjson hw "$HDD_TEMP_WARNING" --argjson hc "$HDD_TEMP_CRITICAL" --argjson sw "$SSD_TEMP_WARNING" --argjson sc "$SSD_TEMP_CRITICAL" --argjson nw "$NVME_TEMP_WARNING" --argjson nc "$NVME_TEMP_CRITICAL" '{schema:1,observedAt:$at,bootId:$boot,findings:$findings,coverage:$coverage,thresholds:{hdd:{warning:$hw,critical:$hc},ssd:{warning:$sw,critical:$sc},nvme:{warning:$nw,critical:$nc}}}'
+}
+hc_fast_temperature_owns() {
+    local disk="$1" severity="${2,,}" file="${HC_FAST_RECEIPT:-/run/host-health-receipt.json}" daily="${MONITOR_RECEIPT_FILE:-}" now boot
+    now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id)
+    # Once the daily fallback reported an incident, it retains recovery ownership.
+    if hc_owned_json "$daily" && jq -e --arg disk "$disk" 'any(.healthEvidence.findings[]?;.device==$disk and (.id|endswith("|temp")))' "$daily" >/dev/null;then return 1;fi
+    hc_owned_json "$file" || return 1
+    jq -e --arg disk "$disk" --arg severity "$severity" --arg boot "$boot" --argjson now "$now" '
+      ([.observations[]?|select(.device==$disk and (.id|startswith("disk-temperature:")))|.id]) as $ids |
+      .bootId==$boot and .observedAt<=$now+60 and .observedAt>=$now-900 and
+      any(.health.fastFindings[]?;(.id as $id|$ids|index($id))!=null and .pending=="" and
+       (.severity=="critical" or ($severity=="warning" and .severity=="warning")))' "$file" >/dev/null
+}
+hc_thermal_only_messages() {
+    local piece has_temperature=false
+    local -a pieces=()
+    IFS=';' read -r -a pieces <<< "$1"
+    for piece in "${pieces[@]}";do
+        piece=${piece#"${piece%%[![:space:]]*}"}
+        case "$piece" in
+          'NVMe Temp '*|'HDD Temp '*|'SSD Temp '*|'SAS HDD Temp '*) has_temperature=true;;
+          'TBW ~ '*|'Read ~ '*|'Endurance used='*|'') ;;
+          *) return 1;;
+        esac
+    done
+    [[ "$has_temperature" == true ]]
+}
+hc_daily_watchdog_guard() {
+    local now file="${HC_FAST_RECEIPT:-/run/host-health-receipt.json}" boot schedule="${HC_SCHEDULE_FILE:-/boot/config/plugins/user.scripts/schedule.json}"
+    now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id)
+    if hc_owned_json "$schedule" && jq -e '[to_entries[]|select(.key|endswith("/host_health_watchdog/script"))][0].value.frequency as $frequency | ($frequency==null or ($frequency|IN("manual","disabled","never")))' "$schedule" >/dev/null;then HC_FAST_FRESH=0;return 0;fi
+    if hc_owned_json "$file" && jq -e --arg boot "$boot" --argjson now "$now" '.status=="COMPLETE" and .bootId==$boot and .observedAt<=$now+60 and .observedAt>=$now-900' "$file" >/dev/null;then
+        HC_FAST_FRESH=1
+        return 0
+    fi
+    HC_FAST_FRESH=0
+    record_finding warning monitoring monitoring.freshness '' 'Fast host watchdog evidence unavailable' 'No recent same-boot fast host receipt; daily disk checks and mount/filesystem/syslog fallbacks continue independently.' 'Review host_health_watchdog and its existing five-minute schedule. No service or disk maintenance was forced.' host_watchdog_stale
+}
+hc_storage_snapshot() {
+    local now="$1" file="${SYSLOG_INCIDENT_ROOT:-/mnt/vault/cloud/logs/script/host_health_watchdog}/incidents.json" events='[]' xfs='[]' heartbeat=0
+    local ledger="${XFS_INCIDENT_FILE:-/boot/config/plugins/user.scripts/scripts/host_health_watchdog/xfs_faults.tsv}" verified=true
+    if hc_owned_json "$file";then
+        events=$(jq -ce --argjson now "$now" '[.incidents|to_entries[]?|select(.value.severity=="CRITICAL" and .value.lastSeen>=$now-86400 and .value.lastSeen<=$now+60)|{id:.key,observedAt:.value.lastSeen,evidence:.value.example,kind:"historical_event_not_proof_of_current_fault"}]|sort_by(.observedAt)|reverse|.[0:24]' "$file") || { events='[]';verified=false; }
+    elif [[ -e "$file" ]];then verified=false
+    fi
+    if [[ -f "$ledger" && ! -L "$ledger" && -O "$ledger" ]];then
+        xfs=$(jq -Rn '[inputs|split("\t")|select((.[0]|test("^[A-Za-z0-9_.-]+$")) and (.[1]|test("^[0-9]+$")))|{source:.[0],firstObserved:(.[1]|tonumber),action:"Review XFS shutdown/corruption evidence; --ack-xfs clears a reviewed marker and does not repair the filesystem."}]' "$ledger") || { xfs='[]';verified=false; }
+    fi
+    file="${HC_SYSLOG_HEARTBEAT:-${STATE_DIR:-/tmp/host_health_watchdog_state}/storage-watch.epoch}"
+    if [[ -f "$file" && ! -L "$file" && -O "$file" ]];then read -r heartbeat < "$file" || heartbeat=0;fi
+    [[ "$heartbeat" =~ ^[0-9]+$ ]] || heartbeat=0
+    jq -nc --argjson verified "$verified" --argjson events "$events" --argjson xfs "$xfs" --argjson heartbeat "$heartbeat" --argjson now "$now" --arg execution "${HC_SYSLOG_RUN_STATUS:-NOT_COLLECTED_THIS_INVOCATION}" '{evidenceVerified:$verified,executionStatus:$execution,lastSuccessfulScanEpoch:$heartbeat,fresh:($heartbeat>0 and $heartbeat<=$now+60 and $heartbeat>=$now-1200),recentCriticalEvents:$events,openXfsSources:$xfs}'
+}
+hc_print_status() {
+    local file="${HC_FAST_RECEIPT:-/run/host-health-receipt.json}" now boot
+    now=$(date +%s);boot=$(cat /proc/sys/kernel/random/boot_id)
+    if ! hc_owned_json "$file" || ! jq -e --arg boot "$boot" --argjson now "$now" '.bootId==$boot and .observedAt<=$now+60 and .observedAt>=$now-900 and .health.schema==1' "$file" >/dev/null;then
+        printf 'Host health: UNVERIFIED\nNo current same-boot coordinated receipt. No probes, state changes or notifications performed.\n';return 0
+    fi
+    jq -r '"Host health: \(.health.healthStatus)\nFast probes observed: \(.observedAt)\nDaily disk evidence: \(.health.daily.freshness); execution=\(.health.daily.executionStatus)\nFast active incidents: \(.health.fastFindings|length); disk findings: \(.health.daily.findings|length)\nCoverage: unverified=\(.health.coverage.unverified), deferred=\(.health.coverage.deferred), unsupported=\(.health.coverage.unsupported//0)\nSyslog scan: \(.health.storage.executionStatus); freshness=\(.health.storage.fresh)\nOpen XFS review markers: \(.health.storage.openXfsSources|length)",(.health.fastFindings[]?|"- [\(.severity|ascii_upcase)] \(.title): \(.detail)"),(.health.daily.findings[]?|"- [\(.severity|ascii_upcase)] \(.title): \(.detail)\n  Action: \(.action)")' "$file"
+}
+# END HOST HEALTH COORDINATION
+
 main() {
     local final_exit=0
     case "${1:-}" in
       --version) printf 'host_health_watchdog.sh %s\n' "$SCRIPT_VERSION"; return 0 ;;
-      --help|-h) printf '%s\n' 'Usage: /bin/bash SCRIPT [--version|--help|--external-status|--open-xfs|--ack-xfs SOURCE]' \
+      --help|-h) printf '%s\n' 'Usage: /bin/bash SCRIPT [--version|--help|--health-status|--external-status|--open-xfs|--ack-xfs SOURCE]' \
         'No arguments: collect host probes, print each observation and scan summary, process new syslog and log capacity, then deliver existing lifecycle notifications when due.' \
+        '--health-status reads the current coordinated health receipt; no scan, state change or notification.' \
         '--external-status reads native/RAM freshness for the external observer; no scan, state update or notification.' \
         '--open-xfs lists retained XFS incidents. --ack-xfs SOURCE removes one reviewed incident marker; it does not repair a filesystem.' \
         'Console output includes healthy, unverified and unsupported probes without changing email policy. See docs/user-scripts-cli.md in GitHub for all 18 scripts.';return 0;;
+      --health-status) [[ $# == 1 ]] || return 2;hc_print_status;return;;
       --external-status) [[ $# == 1 ]] || return 2; host_external_status;return ;;
       ''|--open-xfs|--ack-xfs) ;;
       *) return 2 ;;
@@ -1755,12 +1980,14 @@ main() {
     # Exit status
     # -----------------------------------------------------------------------
 
+    HC_SYSLOG_RUN_STATUS=COMPLETED;((final_exit==0)) || HC_SYSLOG_RUN_STATUS=FAILED
+    hh_save || final_exit=1
     hh_flush || final_exit=1
     if ((final_exit==0)) && hh_mount_info /mnt/vault | jq -e '.mounted and (.readOnly|not)' >/dev/null;then
         local receipt_root="${STATUS_DIR:-/mnt/vault/cloud/logs/script/user_scripts_status}" receipt
         mkdir -p "$receipt_root" || return 1
         receipt=$(mktemp "$receipt_root/.syslog-watchdog.XXXXXX") || return 1
-        jq -n --arg boot "$(cat /proc/sys/kernel/random/boot_id)" --argjson at "$(date +%s)" --argjson host "$(jq '[.conditions[]|select(.active)]|length' <<< "$HH_STATE")" '{schema:1,name:"host_health_watchdog",activeHostConditions:$host,bootId:$boot,lastSuccessfulScanAt:$at,epoch:$at,status:"OK",scope:"Syslog, log capacity and fast host conditions checked; condition state is separate from successful scan freshness"}' >"$receipt" && chmod 600 "$receipt" && mv "$receipt" "$receipt_root/host_health_watchdog.json" || return 1
+        jq -n --arg boot "$(cat /proc/sys/kernel/random/boot_id)" --argjson at "$(date +%s)" --argjson host "$(jq '[.conditions[]|select(.active)]|length' <<< "$HH_STATE")" --argjson health "$(hc_combined_health "$HH_OBSERVATIONS" "$HH_STATE" "$(date +%s)")" '{health:$health,schema:1,name:"host_health_watchdog",activeHostConditions:$host,bootId:$boot,lastSuccessfulScanAt:$at,epoch:$at,status:"OK",scope:"Syslog, log capacity and fast host conditions checked; condition state is separate from successful scan freshness"}' >"$receipt" && chmod 600 "$receipt" && mv "$receipt" "$receipt_root/host_health_watchdog.json" || return 1
     fi
     [[ "${SYSLOG_BACKLOG:-false}" != true ]] || log SYSLOG INFO 'Bounded scan completed with unread backlog; next scheduled pass resumes from the last consumed line'
     return "$final_exit"

@@ -4,9 +4,12 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 source "$ROOT/tools/host_health_common.sh"
+source "$ROOT/tools/host_health_coordination.sh"
 source "$ROOT/tools/host_health_probes.sh"
 work=$(mktemp -d /tmp/host-health-test.XXXXXX)
 trap 'rm -rf "$work"' EXIT
+HC_SCHEDULE_FILE="$work/schedule.json";printf '{}\n' > "$HC_SCHEDULE_FILE"
+HC_DAILY_RECEIPT="$work/no-daily"
 HH_RAM_ROOT=$work;HH_MIRROR="$work/mirror.json";HH_BOOT=fixture;HH_NOW=1000000
 HH_STATE='{"schema":1,"bootId":"fixture","conditions":{},"baselines":{"network":{}}}'
 HH_OBSERVATIONS='[]';count=0
@@ -138,7 +141,7 @@ mkdir -p "$HH_SYS_ROOT/class/hwmon/hwmon0" "$HH_SYS_ROOT/class/hwmon/hwmon1"
 cpu="$HH_SYS_ROOT/class/hwmon/hwmon0";printf 'coretemp\n' > "$cpu/name";printf 'Package id 0\n' > "$cpu/temp1_label";printf '81000\n' > "$cpu/temp1_input";printf '80000\n' > "$cpu/temp1_max";printf '100000\n' > "$cpu/temp1_crit"
 printf 'nct6798\n' > "$HH_SYS_ROOT/class/hwmon/hwmon1/name";printf '150000\n' > "$HH_SYS_ROOT/class/hwmon/hwmon1/temp1_input"
 HH_OBSERVATIONS='[]';hh_cpu
-assert 'length==1 and .[0].severity=="warning"' "$HH_OBSERVATIONS" 'CPU uses trusted package limits and ignores arbitrary motherboard inputs'
+assert '([.[]|select(.id|startswith("cpu:coretemp:"))]|length)==1 and .[0].severity=="warning"' "$HH_OBSERVATIONS" 'CPU uses trusted package limits and ignores arbitrary motherboard inputs'
 printf '101000\n' > "$cpu/temp1_input";HH_OBSERVATIONS='[]';hh_cpu
 assert '.[0].severity=="critical"' "$HH_OBSERVATIONS" 'Firmware CPU critical limit is recognized'
 # No test sends a notification or touches native network configuration.

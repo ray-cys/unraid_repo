@@ -17,8 +17,9 @@ hh_atomic() {
     rm -f -- "$temp";return 1
 }
 hh_observe() {
-    local id="$1" severity="$2" title="$3" detail="$4" confirmations="${5:-3}"
-    HH_OBSERVATIONS=$(jq -c --arg id "$id" --arg severity "$severity" --arg title "$title" --arg detail "$detail" --argjson confirmations "$confirmations" '.+[{id:$id,severity:$severity,title:$title,detail:$detail,confirmations:$confirmations}]' <<< "$HH_OBSERVATIONS")
+    local id="$1" severity="$2" title="$3" detail="$4" confirmations="${5:-3}" action
+    action=$(hc_probe_action "$id")
+    HH_OBSERVATIONS=$(jq -c --arg id "$id" --arg severity "$severity" --arg title "$title" --arg detail "$detail" --argjson confirmations "$confirmations" --arg action "$action" '.+[{id:$id,severity:$severity,title:$title,detail:$detail,confirmations:$confirmations,action:$action}]' <<< "$HH_OBSERVATIONS")
 }
 hh_usage() {
     local path="$1" numbers total avail inode_total inode_free used severity=ok
@@ -53,7 +54,11 @@ hh_cpu() {
             hh_observe "$id" "$severity" 'CPU temperature' "$label $((current/1000))C; driver limit $((maximum/1000))C, critical $((critical/1000))C." 1
         done
     done
-    ((found)) || hh_observe cpu:coverage unsupported 'CPU temperature coverage' 'No trusted package sensor with firmware limits; no guessed limit applied.'
+    if ((found==0));then
+        if jq -e 'any(.conditions|keys[];startswith("cpu:") and .!="cpu:coverage")' <<< "$HH_STATE" >/dev/null;then
+            hh_observe cpu:coverage warning 'CPU temperature sensor unavailable' 'A previously observed CPU sensor is unavailable; previous incidents are retained and no healthy temperature inferred.' 3
+        else hh_observe cpu:coverage unsupported 'CPU temperature coverage' 'No trusted package sensor with firmware limits; no guessed limit applied.';fi
+    else hh_observe cpu:coverage ok 'CPU temperature coverage' 'Trusted CPU package sensors were collected.';fi
 }
 hh_network() {
     local iface base carrier speed supported max_speed expected mac old previous_at delta_e delta_p errors packets severity detail flags
@@ -165,6 +170,8 @@ hh_collect() {
             ;;
         esac
     done < <(hh_expected_mounts | sort -u)
+    hc_daily_probe || return 1
+    hc_disk_temperatures
     hh_usage /
     read -r total available < <(awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{print t+0,a+0}' "$HH_PROC_ROOT/meminfo")
     if ((total>0));then
@@ -185,9 +192,10 @@ hh_lifecycle() {
       .conditions //= {} | . as $root |
       reduce $observations[] as $o (. ; .conditions[$o.id] as $previous |
         ($previous//{active:false,bad:0,good:0,notifiedAt:0}) as $p |
-        ($p + {title:$o.title,detail:$o.detail,lastSeen:$now}) as $c |
+        ($p + {title:$o.title,detail:$o.detail,action:($o.action//"Review reported evidence; no repair was attempted."),lastSeen:$now}) as $c |
         (if (($p.lastSeen//0)<$now-1200) then $c+{bad:0,good:0} else $c end) as $c |
-        if ($o.severity=="warning" or $o.severity=="critical") then
+        if ($o.delegated//false) then .conditions[$o.id]=($c+{active:false,pending:"",bad:0,good:0,delegatedTo:"host_health_monitor"})
+        elif ($o.severity=="warning" or $o.severity=="critical") then
           ($c+{bad:($c.bad+1),good:0}) as $c |
           (if $o.severity=="critical" then $o.confirmations else 3 end) as $required |
           if $c.bad >= $required then
@@ -200,16 +208,17 @@ hh_lifecycle() {
           .conditions[$o.id]=(if $p.active==true and $c.good>=2 then $c+{active:false,pending:"RECOVERED"} else $c end)
         else .conditions[$o.id]=($c+{bad:0,good:0}) end) |
       # Removed hardware is retired, never described as a proven recovery.
-      .conditions |= with_entries(select(.value.lastSeen >= $now-604800)) |
+      .conditions |= with_entries(select(.value.active==true or (.value.pending//"")!="" or .value.lastSeen >= $now-604800)) |
       .baselines.network |= with_entries(select(.value.at >= $now-604800)) |
       .lastSampleAt=$now' <<< "$HH_STATE") || return 1
-    HH_PENDING_BODY=$(jq -r '.conditions|to_entries|map(select((.value.pending//"")!=""))|.[0:24][]|"- [\(.value.pending)] \(.value.title) [\(.value.severity//"info")]\n  \(.value.detail)"' <<< "$HH_STATE")
+    HH_PENDING_BODY=$(jq -r '.conditions|to_entries|map(select((.value.pending//"")!=""))|sort_by(if .value.severity=="critical" then 0 else 1 end,.key)|.[0:24][]|"- [\(.value.pending)] \(.value.title) [\(.value.severity//"info")]\n  \(.value.detail)\n  Action: \(.value.action//"Review reported evidence; no automatic repair was attempted.")"' <<< "$HH_STATE")
     HH_PENDING_IMPORTANCE=$(jq -r 'if any(.conditions[];(.pending//"")!="" and .active==true and .severity=="critical") then "alert" elif any(.conditions[];(.pending//"")!="" and .active==true) then "warning" else "normal" end' <<< "$HH_STATE")
 }
 hh_save() {
-    local receipt info mirror_at
+    local receipt info mirror_at combined
+    combined=$(hc_combined_health "$HH_OBSERVATIONS" "$HH_STATE" "$HH_NOW") || return 1
     hh_atomic "$HH_RAM_ROOT/host-health-state.json" "$HH_STATE" || return 1
-    receipt=$(jq -nc --arg boot "$HH_BOOT" --argjson now "$HH_NOW" --argjson observations "$HH_OBSERVATIONS" --argjson state "$HH_STATE" '{schema:1,bootId:$boot,observedAt:$now,status:"COMPLETE",activeConditions:([$state.conditions[]|select(.active)]|length),observations:$observations}')
+    receipt=$(jq -nc --arg boot "$HH_BOOT" --argjson now "$HH_NOW" --argjson observations "$HH_OBSERVATIONS" --argjson state "$HH_STATE" --argjson combined "$combined" '{health:$combined,schema:1,bootId:$boot,observedAt:$now,status:"COMPLETE",activeConditions:([$state.conditions[]|select(.active)]|length),observations:$observations}')
     hh_atomic "$HH_RAM_ROOT/host-health-receipt.json" "$receipt" || return 1
     info=$(hh_mount_info /mnt/vault)
     if jq -e '.mounted and (.readOnly|not)' <<< "$info" >/dev/null;then
@@ -241,6 +250,7 @@ hh_log_observations() {
         case "$id" in
           mount:*|monitor:mount-inventory) category=MOUNTS;;
           space:*) category=CAPACITY;; inodes:*) category=INODES;;
+          disk-temperature:*|monitor:disk-temperatures) category=TEMPERATURE;;
           memory) category=MEMORY;; cpu:*) category=CPU;; network:*) category=LAN;;
           btrfs:*) category=BTRFS;; monitor:external-observer) category=OBSERVER;;
           monitor:disk-state) category=DISK_STATE;;
@@ -272,9 +282,10 @@ hh_log_observations() {
     summary=$(jq -nr --argjson observations "$HH_OBSERVATIONS" --argjson state "$HH_STATE" '
       "Host probes completed: observations=\($observations|length); OK=\([$observations[]|select(.severity=="ok")]|length); warning=\([$observations[]|select(.severity=="warning")]|length); critical=\([$observations[]|select(.severity=="critical")]|length); unverified=\([$observations[]|select(.severity=="unknown")]|length); unsupported=\([$observations[]|select(.severity=="unsupported")]|length); active incidents=\([$state.conditions[]|select(.active==true)]|length). RAM receipt saved; notifications follow the existing lifecycle policy."') || return 1
     log HOST INFO "$summary"
+    log HOST INFO "Coordinated health=$(jq -r .health.healthStatus "$HH_RAM_ROOT/host-health-receipt.json"); daily freshness=$(jq -r .freshness <<< "$HC_DAILY_SNAPSHOT"). Scan completion and condition health are separate."
 }
 hh_delivered() {
-    HH_STATE=$(jq -c --argjson now "$HH_NOW" '[.conditions|to_entries[]|select((.value.pending//"")!="")|.key][0:24] as $ids | reduce $ids[] as $id (. ; .conditions[$id].pending=""|.conditions[$id].notifiedAt=$now)' <<< "$HH_STATE") || return 1
+    HH_STATE=$(jq -c --argjson now "$HH_NOW" '([.conditions|to_entries[]|select((.value.pending//"")!="")]|sort_by(if .value.severity=="critical" then 0 else 1 end,.key)|.[0:24]|map(.key)) as $ids | reduce $ids[] as $id (. ; .conditions[$id].pending=""|.conditions[$id].notifiedAt=$now)' <<< "$HH_STATE") || return 1
     HH_PENDING_BODY='';HH_DIRTY=1;hh_save
 }
 hh_flush() {

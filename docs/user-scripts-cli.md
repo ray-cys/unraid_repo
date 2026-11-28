@@ -136,12 +136,15 @@ operation, not a watchdog CLI mode.
 
 ## 9. host_health_monitor
 
+Both host scripts share a [coordinated health view and notification context](host-health-coordination.md).
+
 Daily coverage and warm-run evidence: [details](host-health-warm-runs.md).
 
 | Command after `us host_health_monitor` | Purpose |
 | --- | --- |
 | No arguments | Daily disk/system health and configured bounded SMART/scrub maintenance. |
 | `--help` (`-h`) / `--version` | Usage / release. |
+| `--health-status` | Read the shared current host/disk health receipt; no scan, state change or email. |
 | `--check-config` | Validate configuration only. |
 | `--diagnostics` | Read-only environment diagnostics. |
 | `--state-status` | Inspect schema compatibility. |
@@ -156,6 +159,8 @@ start disk tests/scrubs or wake disks. **Notification dry-run is not a maintenan
 or state dry-run**; normal monitoring work still runs.
 
 ## 10. host_health_watchdog
+
+- `us host_health_watchdog --health-status`: read the same coordinated host/disk status; no probes, state changes or notification.
 
 - `us host_health_watchdog`: collect fast host probes, print observations and summary,
   process syslog/log-capacity checks and deliver eligible lifecycle events.

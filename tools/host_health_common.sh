@@ -14,6 +14,8 @@ hh_array_state() {
 hh_expected_mounts() {
     printf '/boot\n'
     [[ "$(hh_array_state)" == started ]] || return 0
+    # Native Unraid shareUser=e enables the /mnt/user FUSE share mount.
+    if grep -Eq '^shareUser="?e"?[[:space:]]*$' "${HH_VAR_INI:-/var/local/emhttp/var.ini}" 2>/dev/null;then printf '/mnt/user\n';fi
     awk -F= '
       function emit(){if(slot ~ /^[A-Za-z0-9_.-]+$/ && (type=="Data" || type=="Cache") && fs!="" && (device!="" || identity!="" || assigned!="" || status=="DISK_DSBL" || status=="DISK_MISSING"))print "/mnt/"slot}
       /^\[/{emit();slot=$0;gsub(/[\[\]"\r]/,"",slot);type=fs=device=status=identity=assigned="";next}
