@@ -48,7 +48,7 @@ printf 'PASS: exact current-device coverage, explicit retry conditions and reada
 # while absent/ambiguous assignments never inherit an invented serial identity.
 HH_DISKS_INI="$work/disks.ini";HH_SYS_ROOT="$work/sys"
 mkdir -p "$HH_SYS_ROOT/class/block/sda/device"
-printf 'WDC Example Model\n' > "$HH_SYS_ROOT/class/block/sda/device/model"
+printf 'TRUNCATED\n' > "$HH_SYS_ROOT/class/block/sda/device/model"
 printf '["disk4"]\ndevice="sda"\nid="WDC_Example_Model_SERIAL123456"\n["cache"]\ndevice="nvme0n1"\nid="NVMe_Model_ABCDEF987654"\n' > "$HH_DISKS_INI"
 identity=$(hc_device_identity /dev/sda)
 jq -e '.slot=="disk4" and .model=="WDC Example Model" and .serialSuffix=="123456" and (.label|contains("/dev/sda"))' <<< "$identity" >/dev/null

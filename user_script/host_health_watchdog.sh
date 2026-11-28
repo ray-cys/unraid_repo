@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="1.10.5"
+readonly SCRIPT_VERSION="1.10.6"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'host_health_watchdog.sh %s\n' "$SCRIPT_VERSION"
@@ -1552,10 +1552,10 @@ hc_device_identity() {
         IFS='|' read -r slot native <<< "$row"
         [[ "$slot" =~ ^[A-Za-z0-9_.-]+$ ]] || slot=''
         if [[ -n "$native" && "$native" == *_* ]];then model=${native%_*};serial=${native##*_};fi
-        if [[ -r "${HH_SYS_ROOT:-/sys}/class/block/$base/device/model" ]];then
+        if [[ -z "$model" && -r "${HH_SYS_ROOT:-/sys}/class/block/$base/device/model" ]];then
             model=$(head -c 256 "${HH_SYS_ROOT:-/sys}/class/block/$base/device/model" 2>/dev/null) || model=''
         fi
-        model=$(printf '%s' "$model" | LC_ALL=C tr -cd '[:print:]' | sed -E 's/_/ /g;s/^[[:space:]]+//;s/[[:space:]]+$//');model=${model:0:96}
+        model=$(printf '%s' "$model" | LC_ALL=C tr -cd '[:print:]' | sed -E 's/_/ /g;s/[[:space:]]+/ /g;s/^[[:space:]]+//;s/[[:space:]]+$//');model=${model:0:96}
         serial=$(printf '%s' "$serial" | LC_ALL=C tr -cd '[:alnum:]-');suffix=${serial: -6}
     fi
     label="$device"
