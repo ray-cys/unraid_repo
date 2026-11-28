@@ -48,7 +48,7 @@ hm_storage_guard() {
     return 1
 }
 hm_pool_health() {
-    local mount="$1" status="$2" fresh="$3" now="${RUN_EPOCH:-$(date +%s)}" usage show metrics severity
+    local mount="$1" status="$2" fresh="$3" now="$(hm_observed_epoch)" usage show metrics severity
     local cron_file expression due due_epoch start epoch=0 clean=false grace=259200 entry file tmp existing schedule_status=disabled
     file="$POOL_HEALTH_FILE"
     usage=$(timeout --kill-after=1 8 btrfs filesystem usage -b "$mount" 9>&- 2>/dev/null) || usage=''

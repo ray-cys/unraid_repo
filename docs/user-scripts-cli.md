@@ -136,6 +136,8 @@ operation, not a watchdog CLI mode.
 
 ## 9. host_health_monitor
 
+Daily coverage and warm-run evidence: [details](host-health-warm-runs.md).
+
 | Command after `us host_health_monitor` | Purpose |
 | --- | --- |
 | No arguments | Daily disk/system health and configured bounded SMART/scrub maintenance. |

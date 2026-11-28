@@ -34,8 +34,8 @@
       "sha256": "2669247b79442a0ac4a31b4575c6a0c33b5aba61d9861d26b8467cfd2e7d6ea8"
     },
     "host_health_monitor": {
-      "version": "3.4.1",
-      "sha256": "c6457382188e0fea1c1991e3608b1dc8883daa76237ea9aa3140479a890f2d16"
+      "version": "3.4.2",
+      "sha256": "18d107e8838af366a499b690e14529609a1b68966b566ac4feb0a93ab7a8ba77"
     },
     "host_health_watchdog": {
       "version": "1.9.3",

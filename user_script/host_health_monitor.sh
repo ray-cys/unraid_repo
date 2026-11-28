@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="3.4.1"
+readonly SCRIPT_VERSION="3.4.2"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'host_health_monitor.sh %s\n' "$SCRIPT_VERSION"
@@ -225,7 +225,11 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
-# Disk Health Monitor for Unraid v2.22.0
+# Daily disk health: observation-time scrub verification, same-run completion
+# reconciliation, stable loop-filesystem counters and precise SMART deferrals.
+# Coverage is logged and included in existing notifications/receipt; healthy
+# lifecycle runs stay silent. Self-test read cache lasts only this invocation.
+# Disk Health Monitor for Unraid
 # Purpose: Monitor Unraid disk, filesystem, capacity and parity health with grouped
 # actionable alerts, stable device identities and conservative recovery evidence.
 # v3.0.0: documented host-write units, calendar SMART scheduling, asynchronous
@@ -2436,7 +2440,7 @@ write_monitor_receipt() {
     atomic_write_text "$MONITOR_RECEIPT_FILE" "$(printf \
         '{"schema":1,"status":"%s","version":"%s","lastAttemptEpoch":%d,"finishedEpoch":%d,"lastCompleteEpoch":%d,"notification":"%s","exitCode":%d}\n' \
         "$status" "$SCRIPT_VERSION" "$RUN_EPOCH" "$finished" \
-        "$MONITOR_LAST_COMPLETE_EPOCH" "$outcome" "$exit_code")"
+        "$MONITOR_LAST_COMPLETE_EPOCH" "$outcome" "$exit_code" | jq -c --argjson coverage "${HOST_HEALTH_COVERAGE:-null}" '. + {coverage:$coverage}')"
 }
 
 initialize_runtime() {
@@ -2850,6 +2854,8 @@ mark_test_started() {
 }
 
 smartctl_cached() {
+    # Standalone parser fixtures/diagnostics may have no initialized run cache.
+    if [[ -z "${SMART_CACHE_DIR:-}" || ! -d "$SMART_CACHE_DIR" ]];then smartctl_bounded "$@";return $?;fi
     local key cache_file temp_file device_arg device_key rc=0
 
     key="$(printf '%s\0' "$@" | cksum | awk '{print $1 "_" $2}')"
@@ -2876,6 +2882,9 @@ smartctl_cached() {
             record_collector_event FAILED "smartctl $device_arg" "empty_output rc=$rc"
             rm -f -- "$temp_file" 2>/dev/null || true
             return "$rc"
+        fi
+        if [[ " $* " == *' -l selftest '* ]];then
+            log SMART INFO "$device_arg: native self-test log collected; unchanged observations reuse this run cache" >&2
         fi
         mv -f -- "$temp_file" "$cache_file" || {
             rm -f -- "$temp_file" 2>/dev/null || true
@@ -2904,9 +2913,9 @@ get_selftest_live() {
     local disk="$1"
     if [[ ! "$disk" =~ ^/dev/[A-Za-z0-9]+([p0-9]+)?$ ]]; then printf ""; return; fi
     if [[ $disk == /dev/nvme* ]]; then
-        smartctl_bounded -l selftest -d nvme "$disk" 2>/dev/null || true
+        smartctl_cached -l selftest -d nvme "$disk" 2>/dev/null || true
     else
-        smartctl_bounded -l selftest "$disk" 2>/dev/null || true
+        smartctl_cached -l selftest "$disk" 2>/dev/null || true
     fi
 }
 get_capabilities_live() {
@@ -5484,7 +5493,6 @@ get_latest_selftest_info() {
     local disk=$1
     local out
     if [[ $disk == /dev/nvme* ]]; then
-        log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART self-test log read (-l selftest) on $disk"
         out=$(get_selftest_live "$disk")
     else
         out=$(get_selftest_live "$disk")
@@ -5770,6 +5778,7 @@ select_overdue_wake() {
 }
 
 report_test_freshness() {
+    SMART_TEST_OVERDUE_COUNT=0
     local disk id kind interval anchor overdue observed
     for disk in "$@"; do
         id=$(persistent_device_key "$disk") || continue
@@ -5782,6 +5791,7 @@ report_test_freshness() {
             overdue=$(( (RUN_EPOCH-anchor)/86400 - interval ))
             log "SMART" "INFO" "$disk: $kind test calendar overdue=${overdue}d; last newly successful result observed=${observed}; pending=$(test_track_get "$id" pending)"
             if (( overdue >= SMART_TEST_OVERDUE_GRACE_DAYS )); then
+                SMART_TEST_OVERDUE_COUNT=$((SMART_TEST_OVERDUE_COUNT+1))
                 record_finding warning monitoring monitoring.smart_tests "$disk" "SMART $kind test overdue" \
                     "No newly confirmed successful $kind result within its calendar interval; overdue=${overdue}d; previous result observation=${observed}; sleeping/maintenance deferrals do not prove failure." \
                     "Automatic retries and at most one overdue wake per maintenance run remain bounded; persistent failure to complete needs controller/device review." "smart_${kind}_test_overdue"
@@ -5794,7 +5804,7 @@ report_test_freshness() {
 # Docker images/configuration or container startup. Existing pool schedules own
 # cache/vault scrubs. No extra cron entry or background polling loop is installed.
 maintain_docker_scrub() {
-    local mount=/var/lib/docker fs uuid status month day old='{}' started=0 started_text started_epoch=0
+    local observed_at mount=/var/lib/docker fs uuid status month day old='{}' started=0 started_text started_epoch=0
     local pending=0 requested=0 requests=0 result_json previous_start=0 observed_success=0 previous_success=0 uncorrectable
 
     (( DOCKER_SCRUB_ENABLED == 1 )) || return 0
@@ -5816,6 +5826,7 @@ maintain_docker_scrub() {
     status=$(btrfs_bounded_optional scrub status "$mount" 2>&1) || {
         grep -qi 'no stats available' <<< "$status" || { record_collector_event FAILED "Docker scrub" "native status unavailable"; return 1; }
     }
+    observed_at=$(hm_observed_epoch)
     if grep -qiE 'status:[[:space:]]*running|scrub.*running' <<< "$status"; then
         log "BTRFS" "INFO" "Docker scrub is running; no duplicate start"; return 0
     fi
@@ -5826,14 +5837,14 @@ maintain_docker_scrub() {
     started_text=$(sed -nE 's/^[[:space:]]*Scrub started:[[:space:]]*//p' <<< "$status" | head -n1)
     [[ -z "$started_text" ]] || started_epoch=$(date -d "$started_text" +%s 2>/dev/null || echo 0)
     if grep -qiE 'status:[[:space:]]*finished|scrub finished' <<< "$status"; then
-        if grep -qi 'no errors found' <<< "$status"; then
-            if [[ "$pending" == true ]] && (( started_epoch >= requested-5 && started_epoch <= RUN_EPOCH )); then
-                old=$(jq --argjson now "$RUN_EPOCH" '.pending=false|.lastSuccessEpoch=$now' <<< "$old")
+        if hm_scrub_clean "$status" "$started_epoch" "$observed_at"; then
+            if [[ "$pending" == true ]] && (( started_epoch >= requested-5 && started_epoch <= observed_at )); then
+                old=$(jq --argjson now "$observed_at" '.pending=false|.lastSuccessEpoch=$now' <<< "$old")
                 log "BTRFS" "INFO" "Docker read-only scrub completed without recorded errors; success newly observed"
             fi
-            if (( started_epoch > 0 && started_epoch <= RUN_EPOCH )) && [[ "$(date -d "@$started_epoch" +%Y-%m)" == "$month" ]]; then
+            if (( started_epoch > 0 && started_epoch <= observed_at )) && [[ "$(date -d "@$started_epoch" +%Y-%m)" == "$month" ]]; then
                 previous_start=$(jq -r '.lastSuccessfulStartEpoch//0' <<< "$old")
-                observed_success="$RUN_EPOCH"
+                observed_success="$observed_at"
                 if (( previous_start == started_epoch )); then observed_success=$(jq -r '.lastSuccessEpoch' <<< "$old"); fi
                 result_json=$(jq -nc --arg uuid "$uuid" --arg month "$month" --argjson success "$observed_success" --argjson start "$started_epoch" --argjson requests "$requests" '{schema:1,uuid:$uuid,pending:false,requests:$requests,requestedEpoch:0,requestMonth:$month,lastSuccessEpoch:$success,lastSuccessfulStartEpoch:$start}')
                 atomic_write_text "$DOCKER_SCRUB_TRACKING_FILE" "$result_json"$'\n'; return $?
@@ -5880,32 +5891,34 @@ SMART_FLEET_LONG_RUNNING=0
 SMART_FLEET_STATUS_UNKNOWN=0
 smart_test_start_allowed() {
     local kind="$1" lock values active action mount status mover_pid=0
-    (( MAINTENANCE_ACTIONS_ALLOWED == 1 && DOCKER_SCRUB_STARTED == 0 && SMART_FLEET_STATUS_UNKNOWN == 0 )) || return 1
+    if ((MAINTENANCE_ACTIONS_ALLOWED!=1));then hm_test_deferred "$kind" 'Maintenance actions withheld by collector safety';return 1;fi
+    if ((DOCKER_SCRUB_STARTED!=0));then hm_test_deferred "$kind" 'Docker filesystem scrub started during this run';return 1;fi
+    if ((SMART_FLEET_STATUS_UNKNOWN!=0));then hm_test_deferred "$kind" 'Another device self-test operation is unverified';return 1;fi
     for lock in /tmp/backup_cache_appdata.lock /tmp/backup_boot_disk.lock /run/media_plex_dbrepair.lock; do
         if [[ -e "$lock" ]] && ! flock -s -n "$lock" -c true; then
-            log "SMART" "INFO" "New $kind self-test deferred: ${lock##*/} active"; return 1
+            hm_test_deferred "$kind" "${lock##*/} active"; return 1
         fi
     done
     values=$(timeout 5 mdcmd status 2>/dev/null) || {
-        log "SMART" "INFO" "New $kind self-test deferred: parity status unavailable"; return 1;
+        hm_test_deferred "$kind" "Parity status unavailable"; return 1;
     }
     active=$(awk -F= '$1=="mdResync" {gsub(/"/,"",$2);print $2}' <<< "$values")
     action=$(awk -F= '$1=="mdResyncAction" {gsub(/"/,"",$2);print $2}' <<< "$values")
-    [[ "$active" =~ ^[0-9]+$ ]] || return 1
+    [[ "$active" =~ ^[0-9]+$ ]] || { hm_test_deferred "$kind" "Parity status malformed";return 1; }
     if [[ -r /var/run/mover.pid ]]; then read -r mover_pid < /var/run/mover.pid || mover_pid=0; fi
     if [[ "$mover_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$mover_pid" 2>/dev/null; then
-        log "SMART" "INFO" "New $kind self-test deferred: Mover PID $mover_pid active"; return 1
+        hm_test_deferred "$kind" "Mover PID $mover_pid active"; return 1
     fi
     if (( active > 0 )) || pgrep -f '^(/bin/bash |/bin/sh )?(/usr/local/sbin/)?mover( |$)' >/dev/null; then
-        log "SMART" "INFO" "New $kind self-test deferred: parity/Mover active ($action)"; return 1
+        hm_test_deferred "$kind" "parity/Mover active ($action)"; return 1
     fi
     while IFS= read -r mount; do
         status=$(btrfs_bounded_optional scrub status "$mount" 2>&1) || {
             grep -qi 'no stats available' <<< "$status" && continue
-            log "SMART" "INFO" "New $kind self-test deferred: scrub status unavailable on $mount"; return 1;
+            hm_test_deferred "$kind" "scrub status unavailable on $mount"; return 1;
         }
         if grep -qiE 'status:[[:space:]]*running|scrub.*running' <<< "$status"; then
-            log "SMART" "INFO" "New $kind self-test deferred: scrub active on $mount"; return 1
+            hm_test_deferred "$kind" "scrub active on $mount"; return 1
         fi
     done < <(findmnt -rn -t btrfs -o TARGET | sort -u)
     if [[ "$kind" == long ]] && (( SMART_LONG_STARTED || SMART_FLEET_LONG_RUNNING )); then
@@ -5916,15 +5929,16 @@ smart_test_start_allowed() {
 
 run_smart_test() {
     local disk=$1
+    local SMART_TEST_CANDIDATE="$disk"
     if ! prepare_smart_access "$disk"; then
+        hm_test_deferred automatic "Disk sleeping or safe SMART access unverified; no routine spin-up" "$disk"
         retain_previous_smart_snapshot "$disk" "${SATA_POWER_STATE[$disk]:-standby}"
         return 0
     fi
     local test_kind="short"
     local selftest poh_attr current_poh initial_smart_output
     if [[ $disk == /dev/nvme* ]]; then
-        log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART self-test log read (-l selftest) on $disk"
-        selftest=$(smartctl_bounded -l selftest -d nvme "$disk" 2>/dev/null || true)
+        selftest=$(smartctl_cached -l selftest -d nvme "$disk" 2>/dev/null || true)
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART attribute read (-a) on $disk"
         initial_smart_output=$(smartctl_cached -a -d nvme "$disk" 2>/dev/null || true)
         if ! nvme_smart_output_is_complete "$initial_smart_output"; then
@@ -5934,7 +5948,7 @@ run_smart_test() {
         fi
         poh_attr=$(smart_labeled_field_value "$initial_smart_output" "Power On Hours" number)
     else
-        selftest=$(smartctl_bounded -l selftest "$disk" 2>/dev/null || true)
+        selftest=$(smartctl_cached -l selftest "$disk" 2>/dev/null || true)
         initial_smart_output=$(smartctl_cached -A "$disk" 2>/dev/null || true)
         if ata_smart_output_is_complete "$initial_smart_output"; then
             poh_attr=$(ata_smart_attribute_value "$initial_smart_output" "Power_On_Hours|Power_On_Hours_and_Msec")
@@ -6006,17 +6020,19 @@ run_smart_test() {
         idle) ;;
         short|long|running) existing_in_progress=1 ;;
         unsupported)
-            log "SMART" "INFO" "$disk: native self-test unsupported; health collection continues"
+            hm_test_deferred "$test_kind" "Native self-test unsupported; health collection continues" "$disk"
             return 0 ;;
         *)
+            hm_test_deferred "$test_kind" "Current self-test operation unverified" "$disk"
             record_collector_event FAILED "SMART operation $disk" "current operation unverified; new test withheld"
             return 0 ;;
     esac
     if (( pending == 1 || (last_attempt > 0 && RUN_EPOCH-last_attempt < SMART_TEST_RETRY_DAYS*86400) )); then
         test_due=0
-        log "SMART" "INFO" "$disk: pending/retry protection retained; pending=$pending; last attempt=$last_attempt"
+        hm_test_deferred "$test_kind" "Pending/retry protection; pending=$pending; last attempt=$last_attempt" "$disk"
     fi
     if [[ $existing_in_progress -eq 1 ]]; then
+        hm_test_deferred "$test_kind" "Existing native $operation self-test active" "$disk"
         log_smart "$(date '+%Y-%m-%d %H:%M:%S') - Self-test already in progress on $disk; skipping new start (operation: ${operation})"
     elif (( test_due == 1 )) && smart_test_start_allowed "$test_kind"; then
         local test_start_output="" test_start_rc=0
@@ -6042,6 +6058,8 @@ run_smart_test() {
         then
             test_started=1
             mark_test_started "$disk" "$test_kind"
+            SMART_TEST_STARTED_THIS_RUN=$((SMART_TEST_STARTED_THIS_RUN+1))
+            unset 'SMART_TEST_DEFERRALS[$disk]'
             if [[ $test_kind == long || $test_kind == extended ]]; then
                 LONG_TEST_RUNNING_LONG["$disk"]=1
                 SMART_LONG_STARTED=1
@@ -6169,10 +6187,9 @@ check_completed_long_tests() {
         fi
         local out model_raw
         if [[ $disk == /dev/nvme* ]]; then
-            log_smart "$(date '+%Y-%m-%d %H:%M:%S') - NVMe SMART self-test log read (-l selftest) on $disk"
-            out=$(smartctl_bounded -l selftest -d nvme "$disk" 2>/dev/null || true)
+                out=$(smartctl_cached -l selftest -d nvme "$disk" 2>/dev/null || true)
         else
-            out=$(smartctl_bounded -l selftest "$disk" 2>/dev/null || true)
+            out=$(smartctl_cached -l selftest "$disk" 2>/dev/null || true)
         fi
         model_raw=$(get_device_model "$disk") || model_raw=""
         # Build unified long-test pattern list (include generic "Extended" for NVMe devices)
@@ -6342,13 +6359,16 @@ monitor_btrfs() {
         fi
         local scrub_date scrub_epoch scrub_age
         scrub_date=$(sed -nE 's/^[[:space:]]*Scrub started:[[:space:]]*//p; s/.*scrub started at[[:space:]]*//p' <<< "$status" | head -n1)
+        local scrub_observed
+        scrub_observed=$(hm_observed_epoch)
         scrub_epoch=$(date -d "$scrub_date" +%s 2>/dev/null || true)
-        if [[ -n "$scrub_date" && "$scrub_epoch" =~ ^[0-9]+$ ]] && (( scrub_epoch <= RUN_EPOCH )); then
-            scrub_age=$(( (RUN_EPOCH-scrub_epoch)/86400 ))
+        if [[ -n "$scrub_date" && "$scrub_epoch" =~ ^[0-9]+$ ]] && (( scrub_epoch <= scrub_observed )); then
+            scrub_age=$(( (scrub_observed-scrub_epoch)/86400 ))
             log_btrfs "$m: recorded scrub started=$scrub_date; age=${scrub_age}d; observation=${fresh:-0} (1=live status, 0=cached)"
         else
             log_btrfs "$m: recorded scrub date unavailable; freshness is unverified"
         fi
+        hm_reconcile_docker_scrub "$m" "$status" "$fresh" || { record_collector_event FAILED "Docker scrub reconciliation" "Native completion could not be matched/persisted; request retained"; }
         hm_pool_health "$m" "$status" "$fresh" || return 1
         corrected=$(awk '{for(i=1;i<NF;i++) if ($i=="Corrected:" || ($i=="corrected" && $(i+1)=="errors:")) {print $(i+($i=="Corrected:"?1:2)); exit}}' <<< "$status")
         uncorrectable=$(awk '{for(i=1;i<NF;i++) if ($i=="Uncorrectable:" || ($i=="unrecoverable" && $(i+1)=="errors:")) {print $(i+($i=="Uncorrectable:"?1:2)); exit}}' <<< "$status")
@@ -8235,13 +8255,13 @@ collect_btrfs_device_stats() {
     (( ${ENABLE_BTRFS_DEVICE_STATS:-0} == 1 )) || return 0
     local prev_file="$BTRFS_DEV_PREV_FILE"
     local snapshot_temp now_epoch previous_epoch=0 current_boot_id="unknown"
-    local stored_key state_key dev key val line token m stats prev delta elapsed_seconds
+    local stored_key state_key dev key val line token m stats show prev delta elapsed_seconds
     local rate_day current_kind current_metric last_kind last_metric ratio=0
     local absolute_severity alert_severity alert_title alert_message boost bdev
     local out_has=0 baseline_count=0 reset_count=0 delta_count=0
     local today
     local -a mounts=()
-    declare -A PREV_STAT=() PREV_PRESENT=()
+    declare -A PREV_STAT=() PREV_PRESENT=() COUNTER_SEEN=()
 
     now_epoch=$(date +%s)
     [[ -r /proc/sys/kernel/random/boot_id ]] && read -r current_boot_id < /proc/sys/kernel/random/boot_id || true
@@ -8254,10 +8274,14 @@ collect_btrfs_device_stats() {
                 done
                 continue
             fi
-            dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
-            [[ -n "$dev" && -n "$key" && "$val" =~ ^[0-9]+$ ]] || continue
-            PREV_STAT["$dev|$key"]="$val"
-            PREV_PRESENT["$dev|$key"]=1
+            [[ -n "$stored_key" && -n "$key" && "$val" =~ ^[0-9]+$ ]] || continue
+            if [[ "$stored_key" == btrfs:* ]];then
+                PREV_STAT["$stored_key|$key"]="$val";PREV_PRESENT["$stored_key|$key"]=1
+            else
+                dev=$(runtime_device_path "$stored_key" 2>/dev/null || true)
+                [[ -n "$dev" ]] || continue
+                PREV_STAT["$dev|$key"]="$val";PREV_PRESENT["$dev|$key"]=1
+            fi
         done < "$prev_file"
     fi
     [[ "$previous_epoch" =~ ^[0-9]+$ ]] || previous_epoch=0
@@ -8275,20 +8299,30 @@ collect_btrfs_device_stats() {
         # Never pass -z: the monitor must preserve filesystem diagnostic evidence.
         stats=$(btrfs_bounded device stats "$m" 2>/dev/null || true)
         [[ -n "$stats" ]] || continue
+        show=''
+        if [[ "$stats" == *'/dev/loop'* ]];then
+            show=$(btrfs_bounded filesystem show "$m" 2>/dev/null) || show=''
+        fi
 
         while IFS=$'\t' read -r dev key val; do
             [[ -n "$dev" && -n "$key" && "$val" =~ ^[0-9]+$ ]] || continue
             FRESH_FILESYSTEM["btrfs:$(base_device "$dev"):$key"]=1
-            state_key=$(persistent_device_key "$dev")
+            state_key=$(hm_btrfs_counter_key "$m" "$dev" "$show") || {
+                record_collector_event FAILED "Btrfs identity $m" "Loop filesystem UUID/device identity unavailable; no baseline inferred";continue;
+            }
+            [[ -z "${COUNTER_SEEN[$state_key|$key]:-}" ]] || continue
+            COUNTER_SEEN["$state_key|$key"]=1
+            local baseline_key="$dev|$key"
+            [[ "$state_key" != btrfs:* ]] || baseline_key="$state_key|$key"
             printf '%s %s %s\n' "$state_key" "$key" "$val" >> "$snapshot_temp"
             out_has=1
 
-            if [[ -z "${PREV_PRESENT["$dev|$key"]:-}" ]]; then
+            if [[ -z "${PREV_PRESENT["$baseline_key"]:-}" ]]; then
                 ((baseline_count++)) || true
                 continue
             fi
 
-            prev=${PREV_STAT["$dev|$key"]}
+            prev=${PREV_STAT["$baseline_key"]}
             if (( val < prev )); then
                 ((reset_count++)) || true
                 printf '%s %s mount=%s key=%s event=reset previous=%s value=%s captured_epoch=%s schema=%s\n' \
@@ -8473,6 +8507,7 @@ compose_notification() {
     NOTIFY_SECTIONS=()
     add_notification_section "${HEALTH_ALERTS_SECTION:-}"
     add_notification_section "${NOTIFICATION_RECOVERY_SECTION:-}"
+    add_notification_section "${HOST_HEALTH_COVERAGE_LINE:-}"
     if [[ -n "${HEALTH_ALERTS_SECTION:-}" || -z "${NOTIFICATION_RECOVERY_SECTION:-}" ]]; then
         add_notification_section "${STORAGE_TOP_LINES:-}"
     fi
@@ -9592,7 +9627,7 @@ hm_storage_guard() {
     return 1
 }
 hm_pool_health() {
-    local mount="$1" status="$2" fresh="$3" now="${RUN_EPOCH:-$(date +%s)}" usage show metrics severity
+    local mount="$1" status="$2" fresh="$3" now="$(hm_observed_epoch)" usage show metrics severity
     local cron_file expression due due_epoch start epoch=0 clean=false grace=259200 entry file tmp existing schedule_status=disabled
     file="$POOL_HEALTH_FILE"
     usage=$(timeout --kill-after=1 8 btrfs filesystem usage -b "$mount" 9>&- 2>/dev/null) || usage=''
@@ -9655,6 +9690,91 @@ hm_mount_fallback() {
     done < <(hh_expected_mounts | sort -u)
 }
 # END DISK HOST HEALTH
+
+# BEGIN WARM RUN EVIDENCE
+# shellcheck shell=bash
+# Warm-run evidence: observation time is distinct from the run's start timestamp.
+hm_observed_epoch() { date +%s; }
+hm_scrub_start_epoch() {
+    local text epoch
+    text=$(sed -nE 's/^[[:space:]]*Scrub started:[[:space:]]*//p; s/.*scrub started at[[:space:]]*//p' <<< "$1" | head -n1)
+    epoch=0;[[ -z "$text" ]] || epoch=$(date -d "$text" +%s 2>/dev/null) || epoch=0
+    [[ "$epoch" =~ ^[0-9]+$ ]] || epoch=0
+    printf '%s' "$epoch"
+}
+hm_scrub_clean() {
+    local status="$1" start="$2" observed="$3"
+    ((start>0 && start<=observed)) &&
+      grep -qiE 'Status:[[:space:]]*finished|scrub finished' <<< "$status" &&
+      grep -qi 'no errors found' <<< "$status" &&
+      ! grep -qiE '(Corrected|Uncorrectable):[[:space:]]*[1-9]|(corrected|unrecoverable) errors:[[:space:]]*[1-9]' <<< "$status"
+}
+# Consume matching native proof only; this function never starts maintenance.
+hm_reconcile_docker_scrub() {
+    local mount="$1" status="$2" fresh="$3" observed start uuid old result requested
+    [[ "$mount" == /var/lib/docker && "$fresh" == 1 && -s "$DOCKER_SCRUB_TRACKING_FILE" ]] || return 0
+    observed=$(hm_observed_epoch);start=$(hm_scrub_start_epoch "$status")
+    hm_scrub_clean "$status" "$start" "$observed" || return 0
+    uuid=$(timeout --kill-after=1 5 findmnt -rn -M "$mount" -o UUID 2>/dev/null) || return 1
+    old=$(jq -ce --arg uuid "$uuid" 'select(.schema==1 and .uuid==$uuid and (.pending|type)=="boolean")' "$DOCKER_SCRUB_TRACKING_FILE") || return 1
+    [[ $(jq -r .pending <<< "$old") == true ]] || return 0
+    requested=$(jq -er '.requestedEpoch|select(type=="number" and .>0 and .==floor)' <<< "$old") || return 1
+    ((requested<=observed && start>=requested-5)) || return 0
+    result=$(jq --argjson at "$observed" --argjson start "$start" '.pending=false|.requestedEpoch=0|.lastSuccessEpoch=$at|.lastSuccessfulStartEpoch=$start' <<< "$old") || return 1
+    atomic_write_text "$DOCKER_SCRUB_TRACKING_FILE" "$result"$'\n' || return 1
+    log BTRFS INFO 'Docker read-only scrub completion verified during this run; matching request closed without another scrub'
+}
+# Loop numbering is not persistent identity. Image recreation changes the UUID.
+hm_btrfs_counter_key() {
+    local mount="$1" dev="$2" show="$3" uuid devid
+    if [[ "$dev" != /dev/loop* ]];then persistent_device_key "$dev";return;fi
+    uuid=$(sed -nE 's/.*uuid:[[:space:]]*([A-Fa-f0-9-]{36}).*/\1/p' <<< "$show" | head -n1)
+    devid=$(awk -v dev="$dev" '$1=="devid" && $NF==dev {print $2;exit}' <<< "$show")
+    [[ "$uuid" =~ ^[A-Fa-f0-9-]{36}$ && "$devid" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf 'btrfs:%s:devid:%s' "${uuid,,}" "$devid"
+}
+declare -A SMART_TEST_DEFERRALS=()
+SMART_TEST_STARTED_THIS_RUN=0
+SMART_TEST_OVERDUE_COUNT=0
+HOST_HEALTH_COVERAGE=null
+HOST_HEALTH_COVERAGE_LINE=''
+hm_test_deferred() {
+    local kind="$1" reason="$2" disk="${3:-${SMART_TEST_CANDIDATE:-}}"
+    [[ -z "$disk" ]] || SMART_TEST_DEFERRALS["$disk"]="$reason"
+    log SMART INFO "${disk:+$disk: }New $kind self-test deferred: $reason; original calendar deadline retained"
+}
+hm_build_coverage_summary() {
+    local disk id first last fresh=0 deferred=0 unknown=0 never=0 oldest=0 pending=0 key rows='' tests scrubs total observed
+    observed=$(hm_observed_epoch);total=${#DISCOVERED_DISKS[@]}
+    for disk in "${DISCOVERED_DISKS[@]}";do
+        if [[ -n "${FRESH_SMART[$disk]:-}" ]];then fresh=$((fresh+1))
+        elif [[ -n "${SMART_DEFERRED[$disk]:-}" ]];then deferred=$((deferred+1))
+        else unknown=$((unknown+1));fi
+        id=$(persistent_device_key "$disk")
+        [[ "$(test_track_get "$id" pending)" != 1 ]] || pending=$((pending+1))
+    done
+    if [[ -s "$SMART_COVERAGE_FILE" ]];then
+        while IFS=$'\t' read -r id first last;do
+            [[ "$last" =~ ^[0-9]+$ ]] || continue
+            if ((last==0));then never=$((never+1));elif ((oldest==0 || last<oldest));then oldest=$last;fi
+        done < "$SMART_COVERAGE_FILE"
+    fi
+    for key in "${!SMART_TEST_DEFERRALS[@]}";do
+        printf -v rows '%s%s\t%s\n' "$rows" "$key" "${SMART_TEST_DEFERRALS[$key]}"
+    done
+    tests=$(jq -Rn '[inputs|select(length>0)|split("\t")|{device:.[0],reason:.[1]}]' <<< "$rows") || return 1
+    scrubs='[]'
+    if [[ -s "$POOL_HEALTH_FILE" ]];then
+        scrubs=$(jq -ce --argjson started "$RUN_EPOCH" '[.pools[]|select(.observedAt >= $started)|{mount,clean:.recordedClean,live:.liveStatus,start:.lastRecordedStart}]' "$POOL_HEALTH_FILE") || return 1
+    fi
+    HOST_HEALTH_COVERAGE=$(jq -nc --argjson at "$observed" --argjson total "$total" --argjson fresh "$fresh" --argjson deferred "$deferred" --argjson unknown "$unknown" --argjson never "$never" --argjson oldest "$oldest" --argjson started "$SMART_TEST_STARTED_THIS_RUN" --argjson pending "$pending" --argjson overdue "$SMART_TEST_OVERDUE_COUNT" --argjson deferrals "$tests" --argjson scrubs "$scrubs" '{observedAt:$at,inventory:$total,smart:{fresh:$fresh,deferred:$deferred,unverified:$unknown,neverSampled:$never,oldestFreshEpoch:$oldest},tests:{started:$started,pending:$pending,overdue:$overdue,deferrals:$deferrals},scrubs:$scrubs}') || return 1
+    local age='none' clean count
+    ((oldest==0)) || age="$(((observed-oldest)/86400))d"
+    clean=$(jq '[.[]|select(.clean and .live)]|length' <<< "$scrubs");count=$(jq 'length' <<< "$scrubs")
+    HOST_HEALTH_COVERAGE_LINE="Coverage: disks=$total; SMART fresh=$fresh, sleeping/deferred=$deferred, unverified=$unknown, never-sampled=$never, oldest sample=$age. Tests: started=$SMART_TEST_STARTED_THIS_RUN, pending=$pending, overdue=$SMART_TEST_OVERDUE_COUNT. Scrubs: clean live results=$clean/$count."
+    log COVERAGE INFO "$HOST_HEALTH_COVERAGE_LINE"
+}
+# END WARM RUN EVIDENCE
 
 main() {
     local exit_code previous_complete
@@ -9779,6 +9899,7 @@ main() {
     run_collector trends "Trend analytics" collector_step "Trend analytics" build_trend_section
 
     run_collector state "Essential state" persist_all_state
+    hm_build_coverage_summary || { record_collector_event FAILED "Coverage summary" "Could not assemble current-run coverage";return 1; }
     finalize_finding_counts
 
     log "REPORT" "INFO" "Finalizing canonical alert and status sections"

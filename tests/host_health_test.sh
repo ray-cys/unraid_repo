@@ -95,6 +95,7 @@ STATE_DIR="$work/disk-state";POOL_HEALTH_FILE="$STATE_DIR/filesystems/pool_healt
 mkdir -p "$STATE_DIR/filesystems" "$work/cron";chmod 700 "$STATE_DIR" "$STATE_DIR/filesystems"
 HH_SCRUB_CRON_ROOT="$work/cron";printf '30 2 28 * * /native/btrfs_scrub start /mnt/vault -r\n' > "$work/cron/scrub_vault.cron"
 RUN_EPOCH=$(TZ=Asia/Singapore date -d '2026-11-27 12:00' +%s)
+hm_observed_epoch(){ printf '%s' "$RUN_EPOCH"; }
 CURRENT_COLLECTOR='';RUN_DIR=$work;COLLECTOR_EVENT_FILE="$work/events";touch "$COLLECTOR_EVENT_FILE"
 # Mock only read-only Btrfs output; all atomic-write and deadline code is real.
 timeout(){
