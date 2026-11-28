@@ -87,7 +87,7 @@ values are accepted. No change is made to `/boot/config/disk.cfg`.
 
 A RAM journal records the original mode and the exact kernel apply receipt. Normal,
 failed and interrupted runs restore that mode before shutdown. A short-lived ISS
-guard restores after a lost lease or a heartbeat older than 120 seconds; a new
+guard restores after a lost lease or a heartbeat older than 120 seconds at the default polling interval (scaled to three sampling intervals plus 30 seconds for a longer configured interval); a new
 exclusive backup lease reconciles stale helper evidence before starting. A later
 administrator/controller write command takes precedence and is preserved. Missing
 apply/read-back evidence is reported as unverified rather than claiming restoration.

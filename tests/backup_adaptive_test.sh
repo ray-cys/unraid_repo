@@ -91,6 +91,12 @@ VAULT
 # Write-mode restoration needs our exact kernel receipt; later manual changes win.
 source <(sed '/^case ${1:-} in/,$d' "$ROOT/tools/backup_adaptive_remote.sh")
 root="$fixture/write";mkdir "$root"
+[[ $(guard_timeout) == 120 ]] || fail 'default guardian timeout changed'
+printf '930\n' >"$root/guard-timeout"
+[[ $(guard_timeout) == 930 ]] || fail 'custom sampling interval guard rejected'
+printf 'invalid\n' >"$root/guard-timeout"
+[[ $(guard_timeout) == 120 ]] || fail 'invalid guardian timeout accepted'
+
 write_record(){ cat "$root/kernel"; }
 write_set(){ printf 'mdcmd (99): set md_write_method %s\n' "$1" >"$root/kernel"; }
 printf 'auto\n' >"$root/write.original"

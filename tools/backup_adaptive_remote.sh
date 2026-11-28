@@ -55,6 +55,11 @@ apply() {
 }
 # Kernel command evidence is authoritative for runtime overrides; var.ini alone
 # can still show Auto after an mdcmd override. Unknown evidence disables tuning.
+guard_timeout() {
+    local value
+    value=$(cat "$root/guard-timeout" 2>/dev/null) || value=120
+    if [[ "$value" =~ ^[1-9][0-9]{2}$ ]] && ((value>=120&&value<=930));then printf '%s\n' "$value";else printf '120\n';fi
+}
 write_record() {
     dmesg --notime 2>/dev/null | awk '/mdcmd \([0-9]+\): set md_write_method( |$)/{v=$0}END{if(v!="")print v;else exit 1}'
 }
@@ -141,10 +146,11 @@ cleanup_run() {
 case ${1:-} in
  guard) # No inherited transport, lock or producer descriptors may keep a lease alive.
         for fd in /proc/$$/fd/*;do n=${fd##*/};[[ "$n" =~ ^[0-9]+$ ]] || continue;((n<3||n==255)) || eval "exec $n>&-";done
+        guard_seconds=$(guard_timeout)
         touch "$root/guard.ready"
         while [[ -d "$root" && -f "$root/write.original" ]];do
             age=$(( $(date +%s)-$(stat -c %Y "$root/heartbeat" 2>/dev/null || echo 0) ))
-            if ! lease_ok || ((age>120)) || ! write_safe;then write_restore;exit $?;fi
+            if ! lease_ok || ((age>guard_seconds)) || ! write_safe;then write_restore;exit $?;fi
             sleep 10
         done;;
  reconcile) # A new exclusive lease may finish an orphaned prior override.

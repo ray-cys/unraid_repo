@@ -125,10 +125,12 @@ ba_init() {
     command -v renice >/dev/null && command -v ionice >/dev/null && [[ -r /proc/stat ]] || { BA_SUMMARY='Adaptive controls unavailable; original serial priority retained';return 0; }
     BA_ROOT="$BACKUP_TMP/adaptive";mkdir -m 700 -- "$BA_ROOT" || return 1
     BA_REMOTE="/run/hubble-backup-adaptive/$LEASE_TOKEN"
+    local guard_seconds=$((BACKUP_ADAPTIVE_SAMPLE_SECONDS*3+30))
+    ((guard_seconds>=120)) || guard_seconds=120
     ba_remote_script >"$BA_ROOT/helper"
     # Mark ownership before installation so a partial setup is cleaned on EXIT.
     BA_REMOTE_READY=true BA_ACTIVE=true
-    backup_ssh "umask 077; mkdir -p /run/hubble-backup-adaptive; mkdir '$BA_REMOTE' && cat >'$BA_REMOTE/helper' && chmod 700 '$BA_REMOTE/helper' && printf '10 7\n' >'$BA_REMOTE/priority' && command -v renice >/dev/null && command -v ionice >/dev/null" <"$BA_ROOT/helper" || return 1
+    backup_ssh "umask 077; mkdir -p /run/hubble-backup-adaptive; mkdir '$BA_REMOTE' && cat >'$BA_REMOTE/helper' && chmod 700 '$BA_REMOTE/helper' && printf '10 7\n' >'$BA_REMOTE/priority' && printf '%s\n' '$guard_seconds' >'$BA_REMOTE/guard-timeout' && command -v renice >/dev/null && command -v ionice >/dev/null" <"$BA_ROOT/helper" || return 1
     backup_ssh "for h in /run/hubble-backup-adaptive/*/helper;do test -f \"\$h\" || continue;test \"\$h\" = '$BA_REMOTE/helper' || timeout 20 bash \"\$h\" reconcile || exit 75;done" || return 1
     if [[ "$BACKUP_ISS_RECONSTRUCT_WRITE" == true ]];then
         BA_WRITE_SUMMARY=$(backup_ssh "timeout 20 bash '$BA_REMOTE/helper' write-begin") || { ba_log 'ISS temporary write-mode initialisation failed; backup stopped for safe restoration';return 1; }
@@ -234,7 +236,7 @@ ba_pool() {
         ((next>=${#BACKUP_JOBS[@]}&&count==0)) || sleep 1
     done
     BA_POOL_FINISHED=true
-    BA_SUMMARY="$BA_WRITE_SUMMARY. Adaptive controls: peak=$BA_PEAK/$BACKUP_ADAPTIVE_MAX_WORKERS jobs; samples=$BA_SAMPLES; unavailable/control samples=$BA_DEGRADED; final CPU nice=$BA_CPU, I/O best-effort=$BA_IO. Concurrency reductions drain active work."
+    BA_SUMMARY="$BA_WRITE_SUMMARY. Adaptive controls: peak=$BA_PEAK/$BACKUP_ADAPTIVE_MAX_WORKERS jobs; samples=$BA_SAMPLES; unavailable/control events=$BA_DEGRADED; final CPU nice=$BA_CPU, I/O best-effort=$BA_IO. Concurrency reductions drain active work."
     ba_log "$BA_SUMMARY"
     return "$failed"
 }
@@ -242,7 +244,7 @@ ba_cleanup() {
     local index pid stamp failed=0
     [[ "$BA_ACTIVE" == true || "$BA_REMOTE_READY" == true ]] || return 0
     if [[ "$BA_POOL_FINISHED" != true ]];then
-        BA_SUMMARY+=" Unfinished run: peak=$BA_PEAK/$BACKUP_ADAPTIVE_MAX_WORKERS jobs; samples=$BA_SAMPLES; unavailable/control samples=$BA_DEGRADED; pending results are not reported as verified."
+        BA_SUMMARY+=" Unfinished run: peak=$BA_PEAK/$BACKUP_ADAPTIVE_MAX_WORKERS jobs; samples=$BA_SAMPLES; unavailable/control events=$BA_DEGRADED; pending results are not reported as verified."
     fi
     # On interruption, terminate only verified descendants of this run, then reap.
     for index in "${!BA_PIDS[@]}";do

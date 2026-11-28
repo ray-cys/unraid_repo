@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="2.11.0"
+readonly SCRIPT_VERSION="2.11.1"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'backup_media_remote.sh %s\n' "$SCRIPT_VERSION"
@@ -2681,10 +2681,12 @@ ba_init() {
     command -v renice >/dev/null && command -v ionice >/dev/null && [[ -r /proc/stat ]] || { BA_SUMMARY='Adaptive controls unavailable; original serial priority retained';return 0; }
     BA_ROOT="$BACKUP_TMP/adaptive";mkdir -m 700 -- "$BA_ROOT" || return 1
     BA_REMOTE="/run/hubble-backup-adaptive/$LEASE_TOKEN"
+    local guard_seconds=$((BACKUP_ADAPTIVE_SAMPLE_SECONDS*3+30))
+    ((guard_seconds>=120)) || guard_seconds=120
     ba_remote_script >"$BA_ROOT/helper"
     # Mark ownership before installation so a partial setup is cleaned on EXIT.
     BA_REMOTE_READY=true BA_ACTIVE=true
-    backup_ssh "umask 077; mkdir -p /run/hubble-backup-adaptive; mkdir '$BA_REMOTE' && cat >'$BA_REMOTE/helper' && chmod 700 '$BA_REMOTE/helper' && printf '10 7\n' >'$BA_REMOTE/priority' && command -v renice >/dev/null && command -v ionice >/dev/null" <"$BA_ROOT/helper" || return 1
+    backup_ssh "umask 077; mkdir -p /run/hubble-backup-adaptive; mkdir '$BA_REMOTE' && cat >'$BA_REMOTE/helper' && chmod 700 '$BA_REMOTE/helper' && printf '10 7\n' >'$BA_REMOTE/priority' && printf '%s\n' '$guard_seconds' >'$BA_REMOTE/guard-timeout' && command -v renice >/dev/null && command -v ionice >/dev/null" <"$BA_ROOT/helper" || return 1
     backup_ssh "for h in /run/hubble-backup-adaptive/*/helper;do test -f \"\$h\" || continue;test \"\$h\" = '$BA_REMOTE/helper' || timeout 20 bash \"\$h\" reconcile || exit 75;done" || return 1
     if [[ "$BACKUP_ISS_RECONSTRUCT_WRITE" == true ]];then
         BA_WRITE_SUMMARY=$(backup_ssh "timeout 20 bash '$BA_REMOTE/helper' write-begin") || { ba_log 'ISS temporary write-mode initialisation failed; backup stopped for safe restoration';return 1; }
@@ -2790,7 +2792,7 @@ ba_pool() {
         ((next>=${#BACKUP_JOBS[@]}&&count==0)) || sleep 1
     done
     BA_POOL_FINISHED=true
-    BA_SUMMARY="$BA_WRITE_SUMMARY. Adaptive controls: peak=$BA_PEAK/$BACKUP_ADAPTIVE_MAX_WORKERS jobs; samples=$BA_SAMPLES; unavailable/control samples=$BA_DEGRADED; final CPU nice=$BA_CPU, I/O best-effort=$BA_IO. Concurrency reductions drain active work."
+    BA_SUMMARY="$BA_WRITE_SUMMARY. Adaptive controls: peak=$BA_PEAK/$BACKUP_ADAPTIVE_MAX_WORKERS jobs; samples=$BA_SAMPLES; unavailable/control events=$BA_DEGRADED; final CPU nice=$BA_CPU, I/O best-effort=$BA_IO. Concurrency reductions drain active work."
     ba_log "$BA_SUMMARY"
     return "$failed"
 }
@@ -2798,7 +2800,7 @@ ba_cleanup() {
     local index pid stamp failed=0
     [[ "$BA_ACTIVE" == true || "$BA_REMOTE_READY" == true ]] || return 0
     if [[ "$BA_POOL_FINISHED" != true ]];then
-        BA_SUMMARY+=" Unfinished run: peak=$BA_PEAK/$BACKUP_ADAPTIVE_MAX_WORKERS jobs; samples=$BA_SAMPLES; unavailable/control samples=$BA_DEGRADED; pending results are not reported as verified."
+        BA_SUMMARY+=" Unfinished run: peak=$BA_PEAK/$BACKUP_ADAPTIVE_MAX_WORKERS jobs; samples=$BA_SAMPLES; unavailable/control events=$BA_DEGRADED; pending results are not reported as verified."
     fi
     # On interruption, terminate only verified descendants of this run, then reap.
     for index in "${!BA_PIDS[@]}";do
@@ -2887,6 +2889,11 @@ apply() {
 }
 # Kernel command evidence is authoritative for runtime overrides; var.ini alone
 # can still show Auto after an mdcmd override. Unknown evidence disables tuning.
+guard_timeout() {
+    local value
+    value=$(cat "$root/guard-timeout" 2>/dev/null) || value=120
+    if [[ "$value" =~ ^[1-9][0-9]{2}$ ]] && ((value>=120&&value<=930));then printf '%s\n' "$value";else printf '120\n';fi
+}
 write_record() {
     dmesg --notime 2>/dev/null | awk '/mdcmd \([0-9]+\): set md_write_method( |$)/{v=$0}END{if(v!="")print v;else exit 1}'
 }
@@ -2973,10 +2980,11 @@ cleanup_run() {
 case ${1:-} in
  guard) # No inherited transport, lock or producer descriptors may keep a lease alive.
         for fd in /proc/$$/fd/*;do n=${fd##*/};[[ "$n" =~ ^[0-9]+$ ]] || continue;((n<3||n==255)) || eval "exec $n>&-";done
+        guard_seconds=$(guard_timeout)
         touch "$root/guard.ready"
         while [[ -d "$root" && -f "$root/write.original" ]];do
             age=$(( $(date +%s)-$(stat -c %Y "$root/heartbeat" 2>/dev/null || echo 0) ))
-            if ! lease_ok || ((age>120)) || ! write_safe;then write_restore;exit $?;fi
+            if ! lease_ok || ((age>guard_seconds)) || ! write_safe;then write_restore;exit $?;fi
             sleep 10
         done;;
  reconcile) # A new exclusive lease may finish an orphaned prior override.
