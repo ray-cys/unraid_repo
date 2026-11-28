@@ -38,8 +38,19 @@ printf 'invalid' >"$MEDIA_ACTION_BUDGET_ROOT/action-budget.json"
 if usr_ops_arr_reserve command:seven Sonarr 7;then exit 1;fi
 [[ $(cat "$MEDIA_ACTION_BUDGET_ROOT/action-budget.json") == invalid ]]
 printf 'Common log vocabulary, notification evidence/exit status, shared per-run/day limits, known non-dispatch release and corrupt-budget preservation passed\n'
-for script in "$repo"/user_script/*.sh;do
-    grep -q '^# BEGIN EMBEDDED OPERATIONS CONTRACT$' "$script" || continue
-    cmp <(awk '/^# BEGIN EMBEDDED OPERATIONS CONTRACT$/{on=1;next}/^# END EMBEDDED OPERATIONS CONTRACT$/{exit} on && !/^OPS_SCRIPT_ID=/{print}' "$script") "$repo/tools/operations_contract.sh"
-done
-printf 'Every active standalone script embeds the same operational contract\n'
+while IFS= read -r name;do
+    script="$repo/user_script/$name.sh"
+    awk '/^# BEGIN EMBEDDED OPERATIONS CONTRACT$/{on=1;next}/^# END EMBEDDED OPERATIONS CONTRACT$/{exit} on{print}' "$script" >"$fixture/embedded"
+    cp "$repo/tools/operations_contract.sh" "$fixture/expected"
+    case "$name" in
+      backup_boot_disk|backup_cache_appdata|backup_media_remote|backup_vault_remote|backup_restore_drill|media_plex_dbrepair|backup_health_audit) ;;
+      *) sed '/^    usr_ops_delivery_record /d' "$fixture/expected" >"$fixture/next";mv "$fixture/next" "$fixture/expected";;
+    esac
+    # Projection may omit unreachable helpers. Every retained function must
+    # still have the exact shared implementation (comments are not behaviour).
+    while IFS= read -r helper;do
+        cmp <(bash -c 'source "$1";declare -f "$2"' bash "$fixture/embedded" "$helper") \
+            <(bash -c 'source "$1";declare -f "$2"' bash "$fixture/expected" "$helper")
+    done < <(bash -c 'source "$1";declare -F' bash "$fixture/embedded" | awk '{print $3}')
+done < <(jq -r '.scripts|keys[]' "$repo/user_script/versions.json")
+printf 'Every retained standalone operational helper matches the shared implementation\n'

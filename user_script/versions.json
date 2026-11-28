@@ -2,76 +2,76 @@
   "schema": 1,
   "scripts": {
     "backup_boot_disk": {
-      "version": "3.3.3",
-      "sha256": "95c99006f1efb8028c6032ab480ab5ea2b27d8ca3839e1365cecfb9065dffbd8"
+      "version": "3.3.4",
+      "sha256": "ae226eaaa38f1adb44578b54c54a917d885eb8a85a83a8fb985df8ceab9f90e7"
     },
     "backup_cache_appdata": {
-      "version": "3.11.3",
-      "sha256": "e35419a1ebe82fb0d204c227e52e0e6014e3b1b66130d1d8c36b6a4d1d9b09e5"
+      "version": "3.11.4",
+      "sha256": "cec06b046a5765b24a8de9ca3c8dc12c3e2706f0a44ec4014308083054098bdb"
     },
     "backup_health_audit": {
-      "version": "1.14.4",
-      "sha256": "65229c1aa12f168daf6d91e280db3fd10f513423275a016ab56f55411d259141"
+      "version": "1.14.5",
+      "sha256": "322011ec476ca87d69f8c106ab88553fd0a34dab4597c7c83c3863f7d849785a"
     },
     "backup_media_remote": {
-      "version": "2.9.1",
-      "sha256": "adec4b0ced55de43d4b215604c8e32b2ea9daad82d805947a2b027201f3ce6ba"
+      "version": "2.9.2",
+      "sha256": "22b91cb4b8866552e50572c76c99b0dfea6e5d8585a0820be0f569d6c6deebdf"
     },
     "backup_restore_drill": {
-      "version": "1.6.1",
-      "sha256": "a335681a0d833f5ad5f298009010943d188a3cd644175d5768ffb96e9bf4c500"
+      "version": "1.6.2",
+      "sha256": "87194f0a2ec9981c173d9a82c4330f6a7f84430515337af727a3a2ec86d34cb9"
     },
     "backup_vault_remote": {
-      "version": "1.24.6",
-      "sha256": "ee4361961833ddf03f7679a12396989b8728b2c5942104e98cb197e67bac1c22"
+      "version": "1.24.7",
+      "sha256": "66ae48f622d9d956c127d6767927428acabdd267ec1410faad73a02a574730e8"
     },
     "dns_redundancy_watchdog": {
-      "version": "1.4.1",
-      "sha256": "d4ecc5fb42a7e367ff6bc6ca305c9608bb3bafd460327054ae018750ff6a8419"
+      "version": "1.4.2",
+      "sha256": "1f508f5630c650e5f2cfe7f1d1c87b1770529945776302bc116bf4943b27f98b"
     },
     "docker_service_watchdog": {
-      "version": "3.18.3",
-      "sha256": "2669247b79442a0ac4a31b4575c6a0c33b5aba61d9861d26b8467cfd2e7d6ea8"
+      "version": "3.18.4",
+      "sha256": "ce50ece58fdb8a9a1b1d2f928bce71df151354951895059c8d903a7881d69e33"
     },
     "host_health_monitor": {
-      "version": "3.5.1",
-      "sha256": "01094058f5ff1cff10c8a5b88fd3924ac2b638da20196b135b5518946189ee3e"
+      "version": "3.5.2",
+      "sha256": "76e6440d400639b62b4dfc0212d30bb3373610c09bf21e452ecd102d4327b44f"
     },
     "host_health_watchdog": {
-      "version": "1.10.2",
-      "sha256": "967642fb4657174d65e311445169d4668cd6239ff682fdb8f7ac4a9b30650428"
+      "version": "1.10.3",
+      "sha256": "cb9ac5a4c669c14f097da7d47de057a95e89d726bf44ee11f2538f55540aefb6"
     },
     "media_cleanup": {
-      "version": "1.11.2",
-      "sha256": "baab0b51d46d1f5c024f51afb36514a5d89f8a01356479da7cfb1ff38f3953d6"
+      "version": "1.11.3",
+      "sha256": "41e6e2c9abad37870899e245c835ec2341c31f8571ff4f296821a3632aeb9a5a"
     },
     "media_health_monitor": {
-      "version": "3.29.2",
-      "sha256": "6bdfab7482d9b07663cb6f9770b1c4c342e08e11473f8819875e2ba0db7032b1"
+      "version": "3.29.3",
+      "sha256": "3bb1a31ec7e1f6a58ad54d680e46331fa6d481544cc89dca3621b1d238b3afdb"
     },
     "media_integrity_audit": {
-      "version": "2.7.2",
-      "sha256": "db84286830c9185dac18575f3e0696b3b9d8b5fbbe4e01bbc68c4bb532b3f7ec"
+      "version": "2.7.3",
+      "sha256": "de4d14362a90c829b73845127654ae7df81400bd5ddf6ead1e3629db911441ee"
     },
     "media_metadata_audit": {
-      "version": "3.4.3",
-      "sha256": "b1c99370d32f93df24ecb50308754d8ed0584eaad690d523c7ca66e4e63b8fa7"
+      "version": "3.4.4",
+      "sha256": "29f285ec0ec480a5aa2c9837ee6910c105af8e61eda744135522ec152ed7ecdd"
     },
     "media_plex_dbrepair": {
-      "version": "3.6.3",
-      "sha256": "e7f67a12e6ebc7cd7983bfaa23e4cff7048abd64f7e91b2b26f0bab914b34d7f"
+      "version": "3.6.4",
+      "sha256": "333bf7371c8d96648edcf305db2f2c728f7fa27b7f21fe251c41d9d7abcdc961"
     },
     "media_torrent_management": {
-      "version": "3.7.1",
-      "sha256": "b70a01dbc7d813f305bd597948db72cbfbdf60167d48a8e72413c3a2cd8be87e"
+      "version": "3.7.2",
+      "sha256": "b5114a89f0584a540c5a0c8d4b25e472dd75e08b692798bd762be74b8d7f41c9"
     },
     "ram_logs_watchdog": {
-      "version": "3.3.2",
-      "sha256": "a44b5b506ad08cf7c265ff7b49b7d076b9863a8f9018037448c4386b0ed0dc90"
+      "version": "3.3.3",
+      "sha256": "5069e118205b5cac1830a49858980de73699ede2c044b0829112aa9df7ecb74d"
     },
     "system_update_coordinator": {
-      "version": "1.10.2",
-      "sha256": "259ebd03a2f0797410e0cbc45c979b5b3632eb8841e5ca84e7ac30d8158af9d9"
+      "version": "1.10.3",
+      "sha256": "9d04c51904a6c33747f8781fc1d81eb1d289740562425a4b9421686fa2e11fdd"
     }
   }
 }

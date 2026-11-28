@@ -1,11 +1,26 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="1.10.2"
+readonly SCRIPT_VERSION="1.10.3"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'host_health_watchdog.sh %s\n' "$SCRIPT_VERSION"
     exit 0
 fi
+# BEGIN CURRENT OPERATIONAL PURPOSE
+# PURPOSE: Monitor fast-changing host conditions and syslog without repeating daily SMART
+#   maintenance or waking disks solely for temperature checks.
+# WORKFLOW: Process bounded resumable syslog input and probe mounts, memory, capacity/inodes,
+#   native temperatures, LAN and monitoring freshness; persist confirmed findings and shared
+#   host status.
+# COORDINATION: Shares lifecycle evidence with host_health_monitor, checks external Raspberry Pi
+#   observer freshness and consumes central execution/checkpoint evidence.
+# LIMITS: Distinguish unavailable collectors from confirmed faults. Critical conditions notify
+#   promptly; ordinary warnings and recovery require the configured observations. No automatic
+#   remount, filesystem repair or forced reboot.
+# REPORTING: Group actionable host findings and restoration with shared deduplication; expose
+#   all probe results in console/status output.
+# Commands and side effects: docs/user-scripts-cli.md in ray-cys/unraid_repo.
+# END CURRENT OPERATIONAL PURPOSE
 # Purpose: Frequent syslog, CPU/disk temperature, memory, mount, capacity,
 # LAN and monitoring-freshness checks with grouped actionable notifications.
 # Native Unraid temperature readings do not poll SMART or wake sleeping disks.

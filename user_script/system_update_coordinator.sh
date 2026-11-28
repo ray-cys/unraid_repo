@@ -1,11 +1,28 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="1.10.2"
+readonly SCRIPT_VERSION="1.10.3"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'system_update_coordinator.sh %s\n' "$SCRIPT_VERSION"
     exit 0
 fi
+# BEGIN CURRENT OPERATIONAL PURPOSE
+# PURPOSE: Discover Unraid, Docker and plugin updates and install approved current Docker/plugin
+#   candidates within guarded maintenance windows.
+# WORKFLOW: Reconcile dynamic inventory and native schedules, age candidates, check backups and
+#   active producers, archive recovery evidence, run one native installer, then verify
+#   digest/configuration/readiness before releasing holds.
+# COORDINATION: Coordinates backup producers, Docker watchdog, application leases and scheduled-
+#   job windows. Removed applications/plugins retire after complete inventories; new identities
+#   do not inherit broad approval.
+# LIMITS: Unraid OS updates are notification-only. Direct Plex playback and queued downloads do
+#   not inherently block updates; active transcodes, post-processing or protected maintenance
+#   can. Uncertain outcomes are reconciled, not blindly replayed; image rollback cannot reverse
+#   database migrations.
+# REPORTING: Group installed, failed and genuinely pending/deferred updates; omit up-to-date
+#   items. Critical/uncertain installation outcomes bypass ordinary batching.
+# Commands and side effects: docs/user-scripts-cli.md in ray-cys/unraid_repo.
+# END CURRENT OPERATIONAL PURPOSE
 # CRON VERIFICATION: before new installations, normalized live launcher timing
 # must match installed enabled dynamic schedules. Drift is reported; discovery
 # continues, but no extra timer is created and no launcher shell text is executed.
@@ -51,40 +68,10 @@ arrayStarted=true
 # unexpected digest and holds further updates rather than claiming verification.
 # Unknown OS majors/interfaces stop installation; read-only status remains usable.
 # CLI: --help documents policy management without editing this standalone script.
-# RELEASE HISTORY (runtime versions verified against Git history)
-# 1.10.1 2026-11-26  Make the version visible at the top and in completion logs;
-#                     document previous releases; remove the stale v1.8.0 title.
-# 1.10.0 2026-11-26  Complete queue visibility; retire verified installed candidates
-#                     without losing newer candidates; refresh after installation.
-# 1.9.0  2026-11-26  Ignore bind-list ordering only; record verification gates;
-#                     reconcile-only CLI and accurate historical/recovery reports.
-# 1.8.0  2026-11-26  Reliability review, cron verification and recovery evidence.
-# 1.7.0  2026-11-26  Stronger backup evidence, backend probes and freshness checks.
-# 1.6.1  2026-11-26  Completion/notification contracts, restore hardening and
-#                     supervisor signal-race follow-up (two code commits).
-# 1.6.0  2026-11-26  Dynamic User Scripts schedules and removed-app reconciliation.
-# 1.5.0  2026-11-26  Second maintenance window and fixed-job schedule protection.
-# 1.4.0  2026-11-26  Batched Arr/download activity rules and independent groups.
-# 1.3.0  2026-11-25  Bounded producer handoffs and Plex transcoding protection.
-# 1.2.0  2026-11-24  Separate Docker/plugin caps; suppress up-to-date entries.
-# 1.1.1  2026-11-24  Preserve late outcomes for the next grouped daily report.
-# 1.1.0  2026-11-24  Approved installed-app/plugin updates and daily outcomes.
-# 1.0.1  2026-11-24  Stop installation when the installed digest is unavailable.
-# 1.0.0  2026-11-24  Initial approved native updates and retired-service handling.
-# Version policy: patch for fixes/documentation, minor for added capabilities;
-# major for incompatible contracts. Update this history with each local release.
-# Live User Scripts descriptions remain user-owned and carry no release notes.
 # BEGIN EMBEDDED OPERATIONS CONTRACT
 OPS_SCRIPT_ID="system_update_coordinator"
 # shellcheck shell=bash
-# Embedded operations contract v2; generated into standalone User Scripts.
-# Millisecond timing without spawning date on supported Bash; GNU fallback.
-usr_ops_now_ms() {
-    local stamp="${EPOCHREALTIME:-}"
-    if [[ "$stamp" =~ ^[0-9]+\.[0-9]{6}$ ]];then stamp=${stamp/./};printf '%s\n' "${stamp:0:${#stamp}-3}"
-    else stamp=$(date +%s%N) || return 1;printf '%s\n' "${stamp:0:${#stamp}-6}";fi
-}
-
+# Shared operational logs, notifications and execution receipts.
 usr_ops_log_line() {
     local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
     case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
@@ -94,8 +81,6 @@ usr_ops_log_line() {
     printf '%s\n' "$line"
 }
 
-# Accept the original command, including its timeout, so producer-specific
-# delivery/cooldown/acknowledgement semantics stay with the owning script.
 usr_ops_notify() {
     local -a args=("$@")
     local i importance=normal summary='' message='' index=-1 status=UPDATE
@@ -117,11 +102,9 @@ usr_ops_notify() {
     else args=(timeout --signal=TERM --kill-after=5 30 "${args[@]}");fi
     local delivery_rc=0
     "${args[@]}" || delivery_rc=$?
-    usr_ops_delivery_record "$delivery_rc" "$importance" "$summary" "$message" "${args[@]}" || printf 'Notification delivery evidence could not be queued; producer failure remains active.\n' >&2
     return "$delivery_rc"
 }
 
-# Bounded local history for scripts previously dependent on the plugin console.
 usr_ops_append_log() {
     local file="$1" line="$2" max="${3:-2097152}" i
     [[ -d "${file%/*}" && ! -L "$file" ]] || return 1
@@ -133,75 +116,6 @@ usr_ops_append_log() {
     printf '%s\n' "$line" >>"$file"
 }
 
-
-# Durable failed-delivery evidence for producers without their own outbox.
-# Existing media/DNS/watchdog outboxes keep ownership of their delivery policy.
-usr_ops_delivery_record() (
-    local rc="$1" importance="$2" summary="$3" message="$4" subject='' i key root fd tmp
-    shift 4
-    case "${OPS_SCRIPT_ID:-}" in backup_boot_disk|backup_cache_appdata|backup_media_remote|backup_vault_remote|backup_restore_drill|media_plex_dbrepair) ;; *) return 0;; esac
-    local -a original=("$@")
-    local native_delivery=false arg export_fd ram="${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}"
-    for arg in "${original[@]}";do [[ "$arg" != /usr/local/emhttp/webGui/scripts/notify ]] || native_delivery=true;done
-    [[ "$native_delivery" == true || -n "${USR_OPS_DELIVERY_ROOT:-}" ]] || return 0
-    for ((i=0;i<${#original[@]};i++));do [[ "${original[$i]}" != -s ]] || subject="${original[$((i+1))]:-}";done
-    root="${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}"
-    exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}"
-    if ! mountpoint -q "${USR_OPS_VAULT_MOUNT:-/mnt/vault}" || ! flock -s -n "$export_fd";then root="$ram";fi
-    [[ ! -L "$root" && $(realpath -m "$root") == "$root" ]] || return 1
-    mkdir -p "$root" || return 1;chmod 700 "$root" || return 1
-    exec {fd}>"${USR_OPS_DELIVERY_LOCK:-/run/user-script-delivery.lock}";flock -w 3 "$fd" || return 1
-    key=$(printf '%s\0' "$OPS_SCRIPT_ID" "$importance" "$subject" "$summary" "$message"|sha256sum|cut -d ' ' -f1)
-    if ((rc==0));then
-        if [[ "$OPS_SCRIPT_ID" == backup_vault_remote && -n "${USR_OPS_DELIVERY_CONTEXT:-}" ]];then
-            mkdir -p "$root/.delivery-receipts" || return 1
-            tmp=$(mktemp "$root/.delivery-receipts/.accepted.XXXXXX") || return 1
-            jq -n --arg context "$USR_OPS_DELIVERY_CONTEXT" --argjson at "$(date +%s)" '{schema:1,context:$context,acceptedAt:$at}' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$root/.delivery-receipts/backup_vault_remote.json" || return 1
-        fi
-        rm -f -- "$root/$OPS_SCRIPT_ID.$key.json" "$ram/$OPS_SCRIPT_ID.$key.json";return
-    fi
-    (( $(find "$root" -maxdepth 1 -type f -name '*.json'|wc -l)<100 )) || [[ -f "$root/$OPS_SCRIPT_ID.$key.json" ]] || return 1
-    tmp=$(mktemp "$root/.delivery.XXXXXX") || return 1
-    trap 'rm -f -- "$tmp"' EXIT
-    jq -n --arg context "${USR_OPS_DELIVERY_CONTEXT:-}" --arg id "$key" --arg script "$OPS_SCRIPT_ID" --arg importance "$importance" --arg subject "$subject" --arg summary "$summary" --arg message "$message" --argjson at "$(date +%s)" \
-      '{schema:1,context:$context,id:$id,script:$script,importance:$importance,subject:$subject,summary:$summary,message:$message,queuedAt:$at}' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$root/$OPS_SCRIPT_ID.$key.json"
-)
-
-usr_ops_vault_delivery_seen() {
-    local context="$1" cutoff="${2:-0}" root file
-    [[ -n "$context" ]] || return 1
-    for root in "${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}" "${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}";do
-        file="$root/.delivery-receipts/backup_vault_remote.json"
-        [[ -f "$file" && ! -L "$file" ]] || continue
-        jq -e --arg context "$context" --argjson cutoff "$cutoff" --argjson now "$(date +%s)" '.schema==1 and .context==$context and .acceptedAt>=$cutoff and .acceptedAt<=$now+300' "$file" >/dev/null 2>&1 && return 0
-    done
-    return 1
-}
-
-usr_ops_retry_deliveries() {
-    local root="${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}" file count=0 subject summary message importance owner old_owner="${OPS_SCRIPT_ID:-}" rc=0
-    local ram="${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}" digest old_context="${USR_OPS_DELIVERY_CONTEXT:-}" context
-    [[ ! -L "$root" && ! -L "$ram" ]] || return 1
-    [[ -d "$root" || -d "$ram" ]] || return 0
-    while IFS= read -r -d '' file;do
-        ((count<3)) || break
-        jq -e '(.schema==1) and (.script|test("^(backup_(boot_disk|cache_appdata|media_remote|vault_remote|restore_drill)|media_plex_dbrepair)$")) and (.importance|IN("normal","warning","alert")) and all(.subject,.summary,.message;type=="string")' "$file" >/dev/null 2>&1 || continue
-        owner=$(jq -r .script "$file");subject=$(jq -r .subject "$file");summary=$(jq -r .summary "$file");message=$(jq -r .message "$file");importance=$(jq -r .importance "$file")
-        context=$(jq -r '.context // ""' "$file")
-        if [[ "$owner" == backup_vault_remote ]] && usr_ops_vault_delivery_seen "$context" "$(jq -r .queuedAt "$file")";then rm -f -- "$file";continue;fi
-        USR_OPS_DELIVERY_CONTEXT="$context"
-        digest=$(sha256sum "$file"|cut -d ' ' -f1)
-        OPS_SCRIPT_ID="$owner";count=$((count+1))
-        if usr_ops_notify "${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}" -i "$importance" -s "$subject" -d "$summary" -m "$message";then
-            if [[ -f "$file" && $(sha256sum "$file"|cut -d ' ' -f1) == "$digest" ]];then rm -f -- "$file";fi
-        else rc=1;fi
-        OPS_SCRIPT_ID="$old_owner";USR_OPS_DELIVERY_CONTEXT="$old_context"
-    done < <(find "$root" "$ram" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null|sort -zu)
-    return "$rc"
-}
-
-# Scheduled executions have an independent parent recording the final exit,
-# after producer EXIT traps. CLI operations and sourced libraries are unchanged.
 usr_ops_execution_record() (
     local phase="$1" started="$2" pid="$3" rc="${4:-0}" process_start root="${USR_OPS_EXECUTION_ROOT:-/run/user-script-execution}" file tmp now boot old='{}' status
     [[ "${OPS_SCRIPT_ID:-}" =~ ^[a-z0-9_]+$ && ! -L "$root" ]] || return 1
@@ -257,22 +171,6 @@ usr_ops_supervise() {
     trap - TERM HUP INT
     return "$rc"
 }
-
-# Network observation after an accepted shutdown, never a power-state claim.
-# No WOL or second poweroff is issued. Native maintenance checks remain upstream.
-usr_ops_observe_shutdown() {
-    local BACKUP_SSH_COMMAND_TIMEOUT=6
-    local host="${REMOTE#*@}" deadline=$(( $(date +%s)+${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90} )) misses=0
-    [[ "${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90}" != 0 ]] || { SHUTDOWN_RESULT=requested_observation_disabled;return 0; }
-    while (( $(date +%s)<deadline ));do
-        if timeout --kill-after=1 5 ping -c 1 -W 2 "$host" >/dev/null 2>&1 || backup_ssh true >/dev/null 2>&1;then misses=0
-        else misses=$((misses+1));fi
-        if ((misses>=3));then SHUTDOWN_RESULT=offline_observed;return 0;fi
-        sleep 5
-    done
-    SHUTDOWN_RESULT=requested_still_reachable;REMOTE_SHUTDOWN_FAILED=1
-    return 1
-}
 # END EMBEDDED OPERATIONS CONTRACT
 # BEGIN SCHEDULED EXECUTION SUPERVISOR
 if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$OPS_SCRIPT_ID" ]];then
@@ -280,9 +178,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
 # BEGIN EMBEDDED USER SCRIPTS CATALOG
-# shellcheck shell=bash
-# Shared User Scripts catalogue v1. Native schedule.json stays authoritative;
-# readers also verify the live/restored script file. No schedule is executed.
+# Shared read-only installed User Scripts and native schedule catalogue.
 usr_scripts_catalog() {
     local file="$1" root="${2:-$(dirname "$1")/scripts}" mode="${3:-live}" mapping='{}' native default_cron
     command -v php >/dev/null || { printf '{"schema":1,"valid":false,"detail":"Native PHP runtime unavailable"}\n';return 1; }
@@ -354,8 +250,6 @@ try {
 US_CATALOG_PHP
 }
 
-# Derive freshness from the current native cadence, allowing one missed run and
-# caller-specified finish grace. Required job removal never disables evidence.
 usr_scripts_due_window() {
     php /dev/stdin "$1" "$2" "$3" "${4:-0}" "${5:-288000}" <<'US_DUE_PHP'
 <?php
@@ -378,9 +272,6 @@ try {
 US_DUE_PHP
 }
 
-# Two stable observations (>=60s apart), actual file presence and native running
-# PID evidence precede pruning. The persistent JSON is authoritative; native RAM
-# copy and generated custom cron follow it. No lock file or script payload is removed.
 usr_scripts_reconcile() {
     local file="$1" root="$2" actor="$3" now="${4:-$(date +%s)}" catalog fd export_fd rc=0
     mountpoint -q "${USER_SCRIPTS_BOOT_MOUNT:-/boot}" && mountpoint -q "${USER_SCRIPTS_VAULT_MOUNT:-/mnt/vault}" || { printf '{"valid":true,"deferred":true,"detail":"Required mounts unavailable; schedule files preserved","events":[]}\n';return 0; }
@@ -465,20 +356,6 @@ usr_scripts_registry_ack() {
     rm -f -- "$tmp";exec {fd}>&-;return "$rc"
 }
 
-# A producer's receipt describes its current native schedule, not a copied cron.
-usr_scripts_schedule_evidence() {
-    local role="$1" file="${USER_SCRIPTS_SCHEDULE_FILE:-/boot/config/plugins/user.scripts/schedule.json}" tmp window
-    tmp=$(mktemp /tmp/user-script-schedule.XXXXXX) || return 1
-    if usr_scripts_catalog "$file" "${USER_SCRIPTS_PHYSICAL_ROOT:-$(dirname "$file")/scripts}" >"$tmp";then
-        window=$(usr_scripts_due_window "$tmp" "$role" "$(date +%s)" 0 288000) || window='{}'
-        jq -c --arg role "$role" --argjson window "$window" '[.jobs[]|select((.role==$role or .name==$role) and .present and .enabled)] |
-          if length==1 then .[0]|{verified:true,cron,frequency,event,timezone:"Asia/Singapore",intervalSeconds:(if ($window.lastDue|type)=="number" and ($window.cutoff|type)=="number" then $window.lastDue-$window.cutoff else null end)} else {verified:false,reason:"Enabled schedule missing or ambiguous"} end' "$tmp"
-    else printf '{"verified":false,"reason":"Native schedule inventory unavailable"}\n';fi
-    rm -f -- "$tmp"
-}
-
-# Compare normalized timing and exact launcher paths without evaluating shell.
-# A cached schedule or matching path alone does not prove correct dispatch.
 usr_scripts_verify_cron() {
     php /dev/stdin "$1" "$2" "${USER_SCRIPTS_NATIVE_HOOK_ROOT:-/usr/local/emhttp/plugins/user.scripts/cron}" <<'US_CRON_VERIFY'
 <?php

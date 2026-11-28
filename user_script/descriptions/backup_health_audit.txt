@@ -1,9 +1,1 @@
-Purpose: Check backup freshness and whether scheduled backup protection is operating correctly.
-
-Schedule: Custom 20 * * * * (hourly at minute 20, Singapore time).
-
-Checks local backup receipts, pending delivery to ISS, restore-drill age, required mounts, runtime capabilities and registered schedules. Reports changed problems and recovery, with at most daily reminders for unchanged problems.
-
-Does not start a backup, wake ISS, scan media contents or restart containers.
-
-Recovery metadata (v1.2): After the first recovery-enabled vault export, report incomplete Docker inventory and named-volume payload-backup gaps through the existing deduplicated findings. No bulk payload hashing or ISS connection is added.
+Check backup freshness and whether scheduled backup protection is operating correctly<br>

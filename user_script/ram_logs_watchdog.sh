@@ -1,16 +1,30 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="3.3.2"
+readonly SCRIPT_VERSION="3.3.3"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'ram_logs_watchdog.sh %s\n' "$SCRIPT_VERSION"
     exit 0
 fi
+# BEGIN CURRENT OPERATIONAL PURPOSE
+# PURPOSE: Keep dedicated RAM-log storage ready and preserve bounded recent logs on persistent
+#   storage for diagnosis.
+# WORKFLOW: Check RAM-log readiness and capacity, checkpoint logs to vault, verify retained
+#   archives periodically, and use the clean-stop hook for a final archive. After power loss,
+#   preserve the last completed checkpoint.
+# COORDINATION: Boot preparation supports applications using RAM-log mounts; backup_health_audit
+#   and host_health_watchdog independently check checkpoint/execution freshness.
+# LIMITS: Keep only the configured latest two archives. Sudden power loss cannot capture logs
+#   written after the last checkpoint; old logs are never restored into live RAM logs.
+# REPORTING: Report readiness, checkpoint/archive failures and recovery rather than every
+#   healthy checkpoint.
+# Commands and side effects: docs/user-scripts-cli.md in ray-cys/unraid_repo.
+# END CURRENT OPERATIONAL PURPOSE
 # CHECKPOINT EVIDENCE: records current-boot archive metadata after read-back;
 # backup_health_audit independently detects staleness without a new timer.
 # Unchanged archives stay valid; empty sources require independent empty read-back.
 clearLog=true
-# RAM-log readiness and lifecycle monitor v3.3.2 (Unraid User Scripts).
+# RAM-log readiness and lifecycle monitor (Unraid User Scripts).
 # Schedule: */10 * * * * (unchanged). Normal runs check RAM-log health and save
 # changed logs to vault at most once per interval. Application logs are never
 # deleted/truncated/rotated. --prepare is the existing PRE-DOCKER boot hook;
@@ -33,14 +47,7 @@ clearLog=true
 # BEGIN EMBEDDED OPERATIONS CONTRACT
 OPS_SCRIPT_ID="ram_logs_watchdog"
 # shellcheck shell=bash
-# Embedded operations contract v2; generated into standalone User Scripts.
-# Millisecond timing without spawning date on supported Bash; GNU fallback.
-usr_ops_now_ms() {
-    local stamp="${EPOCHREALTIME:-}"
-    if [[ "$stamp" =~ ^[0-9]+\.[0-9]{6}$ ]];then stamp=${stamp/./};printf '%s\n' "${stamp:0:${#stamp}-3}"
-    else stamp=$(date +%s%N) || return 1;printf '%s\n' "${stamp:0:${#stamp}-6}";fi
-}
-
+# Shared operational logs, notifications and execution receipts.
 usr_ops_log_line() {
     local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
     case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
@@ -50,8 +57,6 @@ usr_ops_log_line() {
     printf '%s\n' "$line"
 }
 
-# Accept the original command, including its timeout, so producer-specific
-# delivery/cooldown/acknowledgement semantics stay with the owning script.
 usr_ops_notify() {
     local -a args=("$@")
     local i importance=normal summary='' message='' index=-1 status=UPDATE
@@ -73,91 +78,9 @@ usr_ops_notify() {
     else args=(timeout --signal=TERM --kill-after=5 30 "${args[@]}");fi
     local delivery_rc=0
     "${args[@]}" || delivery_rc=$?
-    usr_ops_delivery_record "$delivery_rc" "$importance" "$summary" "$message" "${args[@]}" || printf 'Notification delivery evidence could not be queued; producer failure remains active.\n' >&2
     return "$delivery_rc"
 }
 
-# Bounded local history for scripts previously dependent on the plugin console.
-usr_ops_append_log() {
-    local file="$1" line="$2" max="${3:-2097152}" i
-    [[ -d "${file%/*}" && ! -L "$file" ]] || return 1
-    for i in 1 2;do [[ ! -L "$file.$i" ]] || return 1;done
-    find "${file%/*}" -maxdepth 1 -type f \( -name "${file##*/}.1" -o -name "${file##*/}.2" \) -mtime +29 -delete || return 1
-    if [[ -f "$file" ]] && (( $(stat -c %s "$file")+${#line}+1>max ));then
-        rm -f "$file.2";[[ ! -f "$file.1" ]] || mv "$file.1" "$file.2";mv "$file" "$file.1" || return 1
-    fi
-    printf '%s\n' "$line" >>"$file"
-}
-
-
-# Durable failed-delivery evidence for producers without their own outbox.
-# Existing media/DNS/watchdog outboxes keep ownership of their delivery policy.
-usr_ops_delivery_record() (
-    local rc="$1" importance="$2" summary="$3" message="$4" subject='' i key root fd tmp
-    shift 4
-    case "${OPS_SCRIPT_ID:-}" in backup_boot_disk|backup_cache_appdata|backup_media_remote|backup_vault_remote|backup_restore_drill|media_plex_dbrepair) ;; *) return 0;; esac
-    local -a original=("$@")
-    local native_delivery=false arg export_fd ram="${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}"
-    for arg in "${original[@]}";do [[ "$arg" != /usr/local/emhttp/webGui/scripts/notify ]] || native_delivery=true;done
-    [[ "$native_delivery" == true || -n "${USR_OPS_DELIVERY_ROOT:-}" ]] || return 0
-    for ((i=0;i<${#original[@]};i++));do [[ "${original[$i]}" != -s ]] || subject="${original[$((i+1))]:-}";done
-    root="${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}"
-    exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}"
-    if ! mountpoint -q "${USR_OPS_VAULT_MOUNT:-/mnt/vault}" || ! flock -s -n "$export_fd";then root="$ram";fi
-    [[ ! -L "$root" && $(realpath -m "$root") == "$root" ]] || return 1
-    mkdir -p "$root" || return 1;chmod 700 "$root" || return 1
-    exec {fd}>"${USR_OPS_DELIVERY_LOCK:-/run/user-script-delivery.lock}";flock -w 3 "$fd" || return 1
-    key=$(printf '%s\0' "$OPS_SCRIPT_ID" "$importance" "$subject" "$summary" "$message"|sha256sum|cut -d ' ' -f1)
-    if ((rc==0));then
-        if [[ "$OPS_SCRIPT_ID" == backup_vault_remote && -n "${USR_OPS_DELIVERY_CONTEXT:-}" ]];then
-            mkdir -p "$root/.delivery-receipts" || return 1
-            tmp=$(mktemp "$root/.delivery-receipts/.accepted.XXXXXX") || return 1
-            jq -n --arg context "$USR_OPS_DELIVERY_CONTEXT" --argjson at "$(date +%s)" '{schema:1,context:$context,acceptedAt:$at}' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$root/.delivery-receipts/backup_vault_remote.json" || return 1
-        fi
-        rm -f -- "$root/$OPS_SCRIPT_ID.$key.json" "$ram/$OPS_SCRIPT_ID.$key.json";return
-    fi
-    (( $(find "$root" -maxdepth 1 -type f -name '*.json'|wc -l)<100 )) || [[ -f "$root/$OPS_SCRIPT_ID.$key.json" ]] || return 1
-    tmp=$(mktemp "$root/.delivery.XXXXXX") || return 1
-    trap 'rm -f -- "$tmp"' EXIT
-    jq -n --arg context "${USR_OPS_DELIVERY_CONTEXT:-}" --arg id "$key" --arg script "$OPS_SCRIPT_ID" --arg importance "$importance" --arg subject "$subject" --arg summary "$summary" --arg message "$message" --argjson at "$(date +%s)" \
-      '{schema:1,context:$context,id:$id,script:$script,importance:$importance,subject:$subject,summary:$summary,message:$message,queuedAt:$at}' >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$root/$OPS_SCRIPT_ID.$key.json"
-)
-
-usr_ops_vault_delivery_seen() {
-    local context="$1" cutoff="${2:-0}" root file
-    [[ -n "$context" ]] || return 1
-    for root in "${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}" "${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}";do
-        file="$root/.delivery-receipts/backup_vault_remote.json"
-        [[ -f "$file" && ! -L "$file" ]] || continue
-        jq -e --arg context "$context" --argjson cutoff "$cutoff" --argjson now "$(date +%s)" '.schema==1 and .context==$context and .acceptedAt>=$cutoff and .acceptedAt<=$now+300' "$file" >/dev/null 2>&1 && return 0
-    done
-    return 1
-}
-
-usr_ops_retry_deliveries() {
-    local root="${USR_OPS_DELIVERY_ROOT:-/mnt/vault/cloud/logs/script/user_scripts_status/notification-outbox}" file count=0 subject summary message importance owner old_owner="${OPS_SCRIPT_ID:-}" rc=0
-    local ram="${USR_OPS_DELIVERY_RAM_ROOT:-/run/user-script-notification-outbox}" digest old_context="${USR_OPS_DELIVERY_CONTEXT:-}" context
-    [[ ! -L "$root" && ! -L "$ram" ]] || return 1
-    [[ -d "$root" || -d "$ram" ]] || return 0
-    while IFS= read -r -d '' file;do
-        ((count<3)) || break
-        jq -e '(.schema==1) and (.script|test("^(backup_(boot_disk|cache_appdata|media_remote|vault_remote|restore_drill)|media_plex_dbrepair)$")) and (.importance|IN("normal","warning","alert")) and all(.subject,.summary,.message;type=="string")' "$file" >/dev/null 2>&1 || continue
-        owner=$(jq -r .script "$file");subject=$(jq -r .subject "$file");summary=$(jq -r .summary "$file");message=$(jq -r .message "$file");importance=$(jq -r .importance "$file")
-        context=$(jq -r '.context // ""' "$file")
-        if [[ "$owner" == backup_vault_remote ]] && usr_ops_vault_delivery_seen "$context" "$(jq -r .queuedAt "$file")";then rm -f -- "$file";continue;fi
-        USR_OPS_DELIVERY_CONTEXT="$context"
-        digest=$(sha256sum "$file"|cut -d ' ' -f1)
-        OPS_SCRIPT_ID="$owner";count=$((count+1))
-        if usr_ops_notify "${NOTIFY_BIN:-/usr/local/emhttp/webGui/scripts/notify}" -i "$importance" -s "$subject" -d "$summary" -m "$message";then
-            if [[ -f "$file" && $(sha256sum "$file"|cut -d ' ' -f1) == "$digest" ]];then rm -f -- "$file";fi
-        else rc=1;fi
-        OPS_SCRIPT_ID="$old_owner";USR_OPS_DELIVERY_CONTEXT="$old_context"
-    done < <(find "$root" "$ram" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null|sort -zu)
-    return "$rc"
-}
-
-# Scheduled executions have an independent parent recording the final exit,
-# after producer EXIT traps. CLI operations and sourced libraries are unchanged.
 usr_ops_execution_record() (
     local phase="$1" started="$2" pid="$3" rc="${4:-0}" process_start root="${USR_OPS_EXECUTION_ROOT:-/run/user-script-execution}" file tmp now boot old='{}' status
     [[ "${OPS_SCRIPT_ID:-}" =~ ^[a-z0-9_]+$ && ! -L "$root" ]] || return 1
@@ -212,22 +135,6 @@ usr_ops_supervise() {
     [[ "$record_owner" != true ]] || usr_ops_execution_record finish "$started" "$pid" "$rc" || printf 'Completion receipt unavailable for %s (exit=%s).\n' "$OPS_SCRIPT_ID" "$rc" >&2
     trap - TERM HUP INT
     return "$rc"
-}
-
-# Network observation after an accepted shutdown, never a power-state claim.
-# No WOL or second poweroff is issued. Native maintenance checks remain upstream.
-usr_ops_observe_shutdown() {
-    local BACKUP_SSH_COMMAND_TIMEOUT=6
-    local host="${REMOTE#*@}" deadline=$(( $(date +%s)+${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90} )) misses=0
-    [[ "${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90}" != 0 ]] || { SHUTDOWN_RESULT=requested_observation_disabled;return 0; }
-    while (( $(date +%s)<deadline ));do
-        if timeout --kill-after=1 5 ping -c 1 -W 2 "$host" >/dev/null 2>&1 || backup_ssh true >/dev/null 2>&1;then misses=0
-        else misses=$((misses+1));fi
-        if ((misses>=3));then SHUTDOWN_RESULT=offline_observed;return 0;fi
-        sleep 5
-    done
-    SHUTDOWN_RESULT=requested_still_reachable;REMOTE_SHUTDOWN_FAILED=1
-    return 1
 }
 # END EMBEDDED OPERATIONS CONTRACT
 # BEGIN SCHEDULED EXECUTION SUPERVISOR

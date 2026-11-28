@@ -1,0 +1,1 @@
+Monitors Pi-hole on Unraid as the primary resolver and a Raspberry Pi as the independent fallback<br>

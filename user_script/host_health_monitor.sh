@@ -1,11 +1,27 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="3.5.1"
+readonly SCRIPT_VERSION="3.5.2"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'host_health_monitor.sh %s\n' "$SCRIPT_VERSION"
     exit 0
 fi
+# BEGIN CURRENT OPERATIONAL PURPOSE
+# PURPOSE: Run daily storage health and maintenance checks using SMART/NVMe data, endurance,
+#   capacity and supported filesystem evidence.
+# WORKFLOW: Identify current hardware dynamically, collect supported measurements, evaluate
+#   confirmed faults and configured thresholds, and schedule eligible disk tests/scrubs under
+#   maintenance guards.
+# COORDINATION: Shares host findings and notification ownership with host_health_watchdog. The
+#   daily job covers slower storage checks; the frequent watchdog covers fast-changing host
+#   conditions.
+# LIMITS: Unsupported endurance attributes remain unverified. Trends provide context, not
+#   predicted failure dates. Maintenance respects array/backup activity; no speculative disk
+#   replacement decision is made.
+# REPORTING: Coordinate actionable warnings, critical faults and recovery with the frequent
+#   watchdog; deferred or unavailable probes are shown separately.
+# Commands and side effects: docs/user-scripts-cli.md in ray-cys/unraid_repo.
+# END CURRENT OPERATIONAL PURPOSE
 # shellcheck disable=SC2034,SC2155
 # BEGIN EMBEDDED OPERATIONS CONTRACT
 OPS_SCRIPT_ID="host_health_monitor"

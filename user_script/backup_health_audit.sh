@@ -1,17 +1,32 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-readonly SCRIPT_VERSION="1.14.4"
+readonly SCRIPT_VERSION="1.14.5"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'backup_health_audit.sh %s\n' "$SCRIPT_VERSION"
     exit 0
 fi
+# BEGIN CURRENT OPERATIONAL PURPOSE
+# PURPOSE: Check whether configured backup protection and recovery evidence are current and
+#   internally consistent.
+# WORKFLOW: Read execution receipts, manifests, backup/verification freshness, deployed-code
+#   evidence and the installed native schedule; distinguish execution from successful
+#   protection.
+# COORDINATION: Consumes the backup producers, restore drill, RAM-log checkpoints and deployment
+#   registry. Retries eligible failed producer notifications without repeating the backup
+#   itself.
+# LIMITS: Metadata checks do not rehash every archive, wake ISS, restore applications or prove
+#   bootability. Unknown or missing evidence remains explicit.
+# REPORTING: Report changed findings, recovery and bounded reminders; unchanged healthy audits
+#   remain quiet.
+# Commands and side effects: docs/user-scripts-cli.md in ray-cys/unraid_repo.
+# END CURRENT OPERATIONAL PURPOSE
 # Execution audit: consistent receipt snapshots and bounded completion read-back
 # avoid false interruption alerts when a worker exits during the audit.
 # shellcheck disable=SC2034
 clearLog=true
 arrayStarted=true
-# Backup freshness, delivery and runtime-compatibility audit v1.14.4.
+# Backup freshness, delivery and runtime-compatibility audit.
 # Schedule: 20 * * * *. Reads local receipts/manifests only: no WOL, remote
 # connection, media hashing, container actions or cleanup. One lifecycle email
 # for changed findings, recovery, or a 24-hour reminder. Failed delivery retries.
@@ -19,14 +34,7 @@ arrayStarted=true
 # BEGIN EMBEDDED OPERATIONS CONTRACT
 OPS_SCRIPT_ID="backup_health_audit"
 # shellcheck shell=bash
-# Embedded operations contract v2; generated into standalone User Scripts.
-# Millisecond timing without spawning date on supported Bash; GNU fallback.
-usr_ops_now_ms() {
-    local stamp="${EPOCHREALTIME:-}"
-    if [[ "$stamp" =~ ^[0-9]+\.[0-9]{6}$ ]];then stamp=${stamp/./};printf '%s\n' "${stamp:0:${#stamp}-3}"
-    else stamp=$(date +%s%N) || return 1;printf '%s\n' "${stamp:0:${#stamp}-6}";fi
-}
-
+# Shared operational logs, notifications and execution receipts.
 usr_ops_log_line() {
     local level="${1^^}" phase="$2" message="$3" line LC_ALL=C
     case "$level" in WARN) level=WARNING;; ERR|FATAL) level=ERROR;; NOTICE) level=INFO;; esac
@@ -36,8 +44,6 @@ usr_ops_log_line() {
     printf '%s\n' "$line"
 }
 
-# Accept the original command, including its timeout, so producer-specific
-# delivery/cooldown/acknowledgement semantics stay with the owning script.
 usr_ops_notify() {
     local -a args=("$@")
     local i importance=normal summary='' message='' index=-1 status=UPDATE
@@ -63,7 +69,6 @@ usr_ops_notify() {
     return "$delivery_rc"
 }
 
-# Bounded local history for scripts previously dependent on the plugin console.
 usr_ops_append_log() {
     local file="$1" line="$2" max="${3:-2097152}" i
     [[ -d "${file%/*}" && ! -L "$file" ]] || return 1
@@ -75,9 +80,6 @@ usr_ops_append_log() {
     printf '%s\n' "$line" >>"$file"
 }
 
-
-# Durable failed-delivery evidence for producers without their own outbox.
-# Existing media/DNS/watchdog outboxes keep ownership of their delivery policy.
 usr_ops_delivery_record() (
     local rc="$1" importance="$2" summary="$3" message="$4" subject='' i key root fd tmp
     shift 4
@@ -142,8 +144,6 @@ usr_ops_retry_deliveries() {
     return "$rc"
 }
 
-# Scheduled executions have an independent parent recording the final exit,
-# after producer EXIT traps. CLI operations and sourced libraries are unchanged.
 usr_ops_execution_record() (
     local phase="$1" started="$2" pid="$3" rc="${4:-0}" process_start root="${USR_OPS_EXECUTION_ROOT:-/run/user-script-execution}" file tmp now boot old='{}' status
     [[ "${OPS_SCRIPT_ID:-}" =~ ^[a-z0-9_]+$ && ! -L "$root" ]] || return 1
@@ -199,22 +199,6 @@ usr_ops_supervise() {
     trap - TERM HUP INT
     return "$rc"
 }
-
-# Network observation after an accepted shutdown, never a power-state claim.
-# No WOL or second poweroff is issued. Native maintenance checks remain upstream.
-usr_ops_observe_shutdown() {
-    local BACKUP_SSH_COMMAND_TIMEOUT=6
-    local host="${REMOTE#*@}" deadline=$(( $(date +%s)+${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90} )) misses=0
-    [[ "${REMOTE_SHUTDOWN_OBSERVE_SECONDS:-90}" != 0 ]] || { SHUTDOWN_RESULT=requested_observation_disabled;return 0; }
-    while (( $(date +%s)<deadline ));do
-        if timeout --kill-after=1 5 ping -c 1 -W 2 "$host" >/dev/null 2>&1 || backup_ssh true >/dev/null 2>&1;then misses=0
-        else misses=$((misses+1));fi
-        if ((misses>=3));then SHUTDOWN_RESULT=offline_observed;return 0;fi
-        sleep 5
-    done
-    SHUTDOWN_RESULT=requested_still_reachable;REMOTE_SHUTDOWN_FAILED=1
-    return 1
-}
 # END EMBEDDED OPERATIONS CONTRACT
 # BEGIN SCHEDULED EXECUTION SUPERVISOR
 if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$OPS_SCRIPT_ID" ]];then
@@ -222,9 +206,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" && $# == 0 && "${USR_OPS_SUPERVISED:-}" != "$O
 fi
 # END SCHEDULED EXECUTION SUPERVISOR
 # BEGIN EMBEDDED USER SCRIPTS CATALOG
-# shellcheck shell=bash
-# Shared User Scripts catalogue v1. Native schedule.json stays authoritative;
-# readers also verify the live/restored script file. No schedule is executed.
+# Shared read-only installed User Scripts and native schedule catalogue.
 usr_scripts_catalog() {
     local file="$1" root="${2:-$(dirname "$1")/scripts}" mode="${3:-live}" mapping='{}' native default_cron
     command -v php >/dev/null || { printf '{"schema":1,"valid":false,"detail":"Native PHP runtime unavailable"}\n';return 1; }
@@ -296,8 +278,6 @@ try {
 US_CATALOG_PHP
 }
 
-# Derive freshness from the current native cadence, allowing one missed run and
-# caller-specified finish grace. Required job removal never disables evidence.
 usr_scripts_due_window() {
     php /dev/stdin "$1" "$2" "$3" "${4:-0}" "${5:-288000}" <<'US_DUE_PHP'
 <?php
@@ -320,107 +300,6 @@ try {
 US_DUE_PHP
 }
 
-# Two stable observations (>=60s apart), actual file presence and native running
-# PID evidence precede pruning. The persistent JSON is authoritative; native RAM
-# copy and generated custom cron follow it. No lock file or script payload is removed.
-usr_scripts_reconcile() {
-    local file="$1" root="$2" actor="$3" now="${4:-$(date +%s)}" catalog fd export_fd rc=0
-    mountpoint -q "${USER_SCRIPTS_BOOT_MOUNT:-/boot}" && mountpoint -q "${USER_SCRIPTS_VAULT_MOUNT:-/mnt/vault}" || { printf '{"valid":true,"deferred":true,"detail":"Required mounts unavailable; schedule files preserved","events":[]}\n';return 0; }
-    exec {fd}>"${USER_SCRIPTS_REGISTRY_LOCK:-/run/user-scripts-schedule-registry.lock}" || return 1
-    if ! flock -n "$fd";then exec {fd}>&-;printf '{"valid":true,"deferred":true,"events":[]}\n';return 0;fi
-    exec {export_fd}>"${STATE_EXPORT_LOCK:-/run/user-script-state-export.lock}" || { exec {fd}>&-;return 1; }
-    if ! flock -s -n "$export_fd";then exec {fd}>&-;exec {export_fd}>&-;printf '{"valid":true,"deferred":true,"detail":"State export active; schedule files preserved","events":[]}\n';return 0;fi
-    catalog=$(mktemp /tmp/user-script-catalog.XXXXXX) || { exec {fd}>&-;exec {export_fd}>&-;return 1; }
-    if ! usr_scripts_catalog "$file" "$root" >"$catalog";then cat "$catalog";rm -f "$catalog";exec {fd}>&-;exec {export_fd}>&-;return 1;fi
-    php /dev/stdin "$catalog" "$actor" "$now" "${USER_SCRIPTS_REGISTRY_FILE:-/run/user-scripts-schedule-registry.json}" "${USER_SCRIPTS_RUNTIME_SCHEDULE:-/tmp/user.scripts/schedule.json}" "${USER_SCRIPTS_CUSTOM_CRON:-$(dirname "$file")/customSchedule.cron}" "${USER_SCRIPTS_SCHEDULE_ROLLBACK:-/mnt/vault/backup/script_deployments/user-scripts-schedule.previous.json}" <<'US_RECONCILE_PHP'
-<?php
-try {
-    [$catPath,$actor,$now,$statePath,$runtime,$cronPath,$rollback]=array_slice($argv,1);$now=(int)$now;
-    $c=json_decode(file_get_contents($catPath),true,512,JSON_THROW_ON_ERROR);$file=$c['source'];$root=$c['scriptsRoot'];
-    if($actor==='docker_service_watchdog')foreach($c['jobs'] as $job)if($job['role']==='system_update_coordinator'&&$job['present']&&$job['enabled']){echo json_encode(['valid'=>true,'delegated'=>true,'events'=>[]]);exit;}
-    foreach([$file,$runtime,$cronPath,$statePath,$rollback] as $path)if(is_link($path))throw new RuntimeException('Symlink schedule/state path refused');
-    $boot=file_get_contents($file);if(hash('sha256',$boot)!==$c['sourceSha256'])throw new RuntimeException('Schedule changed during observation; retry');
-    $runtimeRaw=is_file($runtime)?file_get_contents($runtime):null;$cronRaw=is_file($cronPath)?file_get_contents($cronPath):null;
-    $fingerprint=hash('sha256',$boot."\0".($runtimeRaw??'MISSING')."\0".($cronRaw??'MISSING')."\0".$c['rootIdentity']);
-    $bootId=trim(file_get_contents('/proc/sys/kernel/random/boot_id'));
-    $state=is_file($statePath)?json_decode(file_get_contents($statePath),true,512,JSON_THROW_ON_ERROR):['schema'=>1,'events'=>[]];
-    if(($state['schema']??0)!==1)throw new RuntimeException('Schedule registry state invalid; original files preserved');
-    if(($state['boot']??'')!==$bootId)$state=['schema'=>1,'events'=>[]];
-    $same=($state['fingerprint']??'')===$fingerprint;
-    $observations=$same?($state['observations']??1):1;$last=$same?($state['lastObserved']??$now):$now;
-    if($same&&$now-$last>=60){$observations=min(2,$observations+1);$last=$now;}
-    $state['boot']=$bootId;$state['fingerprint']=$fingerprint;$state['observations']=$observations;$state['lastObserved']=$last;
-    $priorKnown=$state['knownScripts']??[];$known=$priorKnown;$retired=[];
-    if($observations>=2)foreach($known as $name=>$role){if(!in_array($name,$c['installed'],true)&&!in_array($name,$c['runningNames'],true)&&!in_array($name,$c['uncertainRunningNames'],true)){$retired[]=$name;unset($known[$name]);}}
-    foreach($c['roles'] as $name=>$role)$known[$name]=$role;
-    $state['knownScripts']=(object)$known;
-    $data=json_decode($boot,true,512,JSON_THROW_ON_ERROR);$bootObject=json_decode($boot,false,512,JSON_THROW_ON_ERROR);$removed=[];
-    if($observations>=2)foreach($c['jobs'] as $job){
-      if($job['present']||$job['running']||$job['runningUnknown'])continue;
-      if(!preg_match('/^[A-Za-z0-9_.-]+$/D',$job['name']))continue;
-      if(file_exists($job['physicalPath'])||is_link($job['physicalPath']))continue;
-      foreach($job['keys'] as $key){unset($data[$key]);unset($bootObject->{$key});}$removed[]=$job['name'];
-    }
-    $desiredBoot=$removed?json_encode($bootObject,JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR):$boot;
-    $managed='';
-    foreach($c['jobs'] as $job){
-      if(in_array($job['name'],$removed,true)||!$job['enabled']||$job['frequency']!=='custom')continue;
-      $entry=$data[$job['keys'][0]]??null;if(!$entry)continue;$custom=trim($entry['custom']);if($custom==='')continue;
-      $path=$entry['script']??$job['path'];if(!preg_match('~^/[A-Za-z0-9_./-]+$~D',$path))$path=escapeshellarg($path);
-      $managed.=$custom.' /usr/local/emhttp/plugins/user.scripts/startCustom.php '.$path." > /dev/null 2>&1\n";
-    }
-    // Preserve unrelated manual lines; rewrite only this native generated section.
-    $extra='';foreach(explode("\n",$cronRaw??'') as $line){if(trim($line)===''||str_starts_with($line,'# Generated cron schedule for user.scripts'))continue;if(!str_starts_with(ltrim($line),'#')&&str_contains($line,'/usr/local/emhttp/plugins/user.scripts/startCustom.php'))continue;$extra.=$line."\n";}
-    $desiredCron=$managed!==''||$extra!==''?"# Generated cron schedule for user.scripts\n".$managed.$extra."\n":null;
-    $changes=[];if($desiredBoot!==$boot)$changes[$file]=$desiredBoot;if($runtimeRaw!==$desiredBoot)$changes[$runtime]=$desiredBoot;if($cronRaw!==$desiredCron)$changes[$cronPath]=$desiredCron;
-    $changed=false;$cronChanged=false;
-    function atomicFile($path,$content,$mode=0600){$tmp=tempnam(dirname($path),'.schedule.');if($tmp===false)throw new RuntimeException('Schedule staging failed');$h=fopen($tmp,'wb');if(!$h||fwrite($h,$content)!==strlen($content)){@unlink($tmp);throw new RuntimeException('Schedule write failed');}fflush($h);if(function_exists('fsync'))fsync($h);fclose($h);chmod($tmp,$mode);if(!rename($tmp,$path)){@unlink($tmp);throw new RuntimeException('Schedule publish failed');}}
-    if(count($state['events']??[])>=200){$changes=[];$retired=[];$state['knownScripts']=(object)$priorKnown;} // Preserve pending actions; caller drains the outbox first.
-    if($changes&&$observations>=2){
-      if(!is_dir(dirname($runtime))||!is_dir(dirname($rollback)))throw new RuntimeException('Native runtime/rollback directory unavailable');
-      if(hash_file('sha256',$file)!==$c['sourceSha256']||(is_file($runtime)?file_get_contents($runtime):null)!==$runtimeRaw||(is_file($cronPath)?file_get_contents($cronPath):null)!==$cronRaw)throw new RuntimeException('Concurrent schedule edit detected; retry without overwrite');
-      foreach($removed as $name)if(file_exists($root.'/'.$name.'/script'))throw new RuntimeException('Script reappeared; retirement cancelled');
-      atomicFile($rollback,json_encode(['schema'=>1,'at'=>$now,'source'=>$file,'persistent'=>base64_encode($boot),'runtime'=>$runtimeRaw===null?null:base64_encode($runtimeRaw),'customCron'=>$cronRaw===null?null:base64_encode($cronRaw),'removed'=>$removed],JSON_THROW_ON_ERROR));
-      foreach($changes as $path=>$bytes){if($bytes===null){if(is_file($path)&&!unlink($path))throw new RuntimeException('Empty native cron could not be removed');}else{ $mode=is_file($path)?(fileperms($path)&0777):0644;atomicFile($path,$bytes,$mode); }if($path===$cronPath)$cronChanged=true;}
-      $changed=true;$state['observations']=0;$state['cronReloadPending']=$cronChanged||($state['cronReloadPending']??false);
-    }
-    if($changed||$retired){
-      $id=hash('sha256',$now.':'.$fingerprint.':'.$desiredBoot.':'.implode(',',$retired));
-      $state['events'][]=['id'=>$id,'at'=>$now,'actor'=>$actor,'removed'=>array_values(array_unique(array_merge($removed,$retired))),'pruned'=>$removed,'runtimeSynced'=>array_key_exists($runtime,$changes),'cronUpdated'=>$cronChanged];
-    }
-    atomicFile($statePath,json_encode($state,JSON_THROW_ON_ERROR));
-    echo json_encode(['valid'=>true,'changed'=>$changed,'events'=>$state['events']??[],'cronReloadPending'=>$state['cronReloadPending']??false]);
-} catch(Throwable $e){echo json_encode(['valid'=>false,'detail'=>$e->getMessage(),'events'=>[]]);exit(1);}
-US_RECONCILE_PHP
-    rc=$?
-    rm -f -- "$catalog"
-    exec {fd}>&-;exec {export_fd}>&-
-    return "$rc"
-}
-
-usr_scripts_registry_ack() {
-    local ids="$1" reload="${2:-false}" fd state="${USER_SCRIPTS_REGISTRY_FILE:-/run/user-scripts-schedule-registry.json}" tmp rc=0
-    exec {fd}>"${USER_SCRIPTS_REGISTRY_LOCK:-/run/user-scripts-schedule-registry.lock}" || return 1
-    flock -w 5 "$fd" || { exec {fd}>&-;return 1; }
-    tmp=$(mktemp "$(dirname "$state")/.schedule-registry.XXXXXX") || { exec {fd}>&-;return 1; }
-    jq --argjson ids "$ids" --argjson reload "$reload" '.events|=map(select(.id as $id|($ids|index($id))==null)) | if $reload then .cronReloadPending=false else . end' "$state" >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$state" || rc=$?
-    rm -f -- "$tmp";exec {fd}>&-;return "$rc"
-}
-
-# A producer's receipt describes its current native schedule, not a copied cron.
-usr_scripts_schedule_evidence() {
-    local role="$1" file="${USER_SCRIPTS_SCHEDULE_FILE:-/boot/config/plugins/user.scripts/schedule.json}" tmp window
-    tmp=$(mktemp /tmp/user-script-schedule.XXXXXX) || return 1
-    if usr_scripts_catalog "$file" "${USER_SCRIPTS_PHYSICAL_ROOT:-$(dirname "$file")/scripts}" >"$tmp";then
-        window=$(usr_scripts_due_window "$tmp" "$role" "$(date +%s)" 0 288000) || window='{}'
-        jq -c --arg role "$role" --argjson window "$window" '[.jobs[]|select((.role==$role or .name==$role) and .present and .enabled)] |
-          if length==1 then .[0]|{verified:true,cron,frequency,event,timezone:"Asia/Singapore",intervalSeconds:(if ($window.lastDue|type)=="number" and ($window.cutoff|type)=="number" then $window.lastDue-$window.cutoff else null end)} else {verified:false,reason:"Enabled schedule missing or ambiguous"} end' "$tmp"
-    else printf '{"verified":false,"reason":"Native schedule inventory unavailable"}\n';fi
-    rm -f -- "$tmp"
-}
-
-# Compare normalized timing and exact launcher paths without evaluating shell.
-# A cached schedule or matching path alone does not prove correct dispatch.
 usr_scripts_verify_cron() {
     php /dev/stdin "$1" "$2" "${USER_SCRIPTS_NATIVE_HOOK_ROOT:-/usr/local/emhttp/plugins/user.scripts/cron}" <<'US_CRON_VERIFY'
 <?php

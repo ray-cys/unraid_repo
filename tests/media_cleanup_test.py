@@ -12,6 +12,10 @@ REPO = Path(__file__).resolve().parents[1]
 BASH = shutil.which('bash')
 MODULES = {'arr': 'arr_delete_sync_tag', 'sab': 'sabnzbd_cleanup', 'quarantine': 'quarantine_lifecycle'}
 SHARED_LOG_REPLACEMENTS = {'log_file_size','log_file_mtime','rotate_log','record_removed_log','cleanup_existing_logs'}
+# Confirmed unreachable helpers are not part of the retained action contract.
+RETIRED_UNUSED_HELPERS = {'arr': {'sonarr_record_history_evidence'},
+                          'sab': {'stat_mtime', 'ops_rotate_log'},
+                          'quarantine': {'tree_bytes', 'tree_files', 'ops_rotate_log'}}
 text = (REPO/'user_script/media_cleanup.sh').read_text()
 common = text[:text.index('\n# MODULE: ARR')]
 with tempfile.TemporaryDirectory(prefix='media-cleanup-fixtures.') as temporary:
@@ -28,7 +32,9 @@ with tempfile.TemporaryDirectory(prefix='media-cleanup-fixtures.') as temporary:
         original_text = (REPO/'user_script'/f'{original}.sh').read_text()
         names = set(re.findall(r'^(\w+)\(\) [({]', original_text, re.M))
         available = set(re.findall(r'^(\w+)\(\) [({]', common+'\n'+body, re.M))
-        missing = names-available-(SHARED_LOG_REPLACEMENTS if module=='arr' else set())
+        for retired in RETIRED_UNUSED_HELPERS[module]:
+            assert not re.search(r'\b'+retired+r'\b', body), (module, retired, 'still referenced')
+        missing = names-available-(SHARED_LOG_REPLACEMENTS if module=='arr' else set())-RETIRED_UNUSED_HELPERS[module]
         assert not missing, (module, missing)
         path=target/'user_script'/f'{original}.sh'
         path.unlink()

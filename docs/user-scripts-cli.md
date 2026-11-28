@@ -4,6 +4,8 @@ This is the single CLI reference for all 18 deployed User Scripts. Commands belo
 match the script parsers, not options offered by the underlying Docker apps.
 Current release numbers and code hashes are in [versions.json](../user_script/versions.json).
 Update this reference whenever a public command changes.
+For each script's purpose, workflow and coordination with other jobs, see
+[the operational guide](user-scripts-guide.md).
 
 ## Invoke an installed script
 
