@@ -1,6 +1,6 @@
 #!/bin/bash
 # Release version: bump for every deployed code change; descriptions stay user-owned.
-MC_VERSION="1.11.1"
+MC_VERSION="1.11.2"
 # Version lookup exits before logging, locks, state, Docker or network activity.
 if [[ "${BASH_SOURCE[0]}" == "$0" && "${1:-}" == --version ]]; then
     printf 'media_cleanup.sh %s\n' "$MC_VERSION"
@@ -11,7 +11,7 @@ fi
 # identities, remaining inventory, active work, Mover and restore holds recheck.
 clearLog=true
 arrayStarted=true
-# Media Cleanup v1.11.1 -- personal Hubble operations
+# Media Cleanup v1.11.2 -- personal Hubble operations
 #
 # TAG LIFECYCLE: confirmed deletion -> plex-deleted (movie) or plex-deleted-
 # series/season (Sonarr). Eligible whole-item hold -> retirement-pending only.
@@ -632,7 +632,12 @@ mc_run_module() {
       if (( rc==0 )); then status=$(jq -r .status "$MC_TMP/$module.result.json");reason=$(jq -r .reason "$MC_TMP/$module.result.json");fi
     elif (( rc==0 )) && grep -Eiq 'deferred|Another .*run is active' "$preview"; then status=DEFERRED;reason='Startup coordination prevented work';fi
     case "$status" in
-      FAILED) MC_RESULT=ATTENTION;mc_note "$module" failed "$module workflow failed" "Exit=$rc; $reason. Completed work and pending journals retained."$'\n'"$(tail -c 6000 "$preview")" || return 1;;
+      FAILED) MC_RESULT=ATTENTION
+        local details_queued=false failure_detail
+        if jq -e --arg module "$module" --argjson start "$start" 'any(.events[];.module==$module and .importance=="alert" and .epoch>=$start)' "$MC_ROOT/notification-outbox.json" >/dev/null;then details_queued=true;fi
+        failure_detail=$(awk -F ' [|] ' '$2=="ERROR" {a[++n]=$5 ": " $6} END {for(i=(n>5?n-4:1);i<=n;i++) print "- " a[i]}' "$preview")
+        [[ -n "$failure_detail" ]] || failure_detail=$(tail -c 1500 "$preview")
+        mc_note "$module" failed "$module workflow failed" "Exit=$rc; $reason. Completed work and pending journals retained."$'\n'"$failure_detail" "$details_queued" || return 1;;
       DEFERRED) [[ "$MC_RESULT" != RUNNING && "$MC_RESULT" != OK ]] || MC_RESULT=DEFERRED
         mc_note "$module" deferred "$module deferred" "$reason. No protected operation was forced; next scheduled pass retries." || return 1;;
       WARNING) [[ "$MC_RESULT" == ATTENTION ]] || MC_RESULT=WARNING;mc_note "$module" healthy 'Workflow completed' "$reason" || return 1;;
@@ -924,14 +929,14 @@ mc_handoff_ops() (
 
 
 mc_note() (
-    local module="$1" status="$2" description="$3" message="$4" work
+    local module="$1" status="$2" description="$3" message="$4" details_queued="${5:-false}" work
     work=$(mktemp /tmp/media-cleanup-note.XXXXXX) || return 1
     trap 'rm -f -- "$work"' EXIT
     jq -n --arg module "$module" --arg status "$status" --arg description "$description" --arg message "$message" \
-      --arg date "$(date +%F)" --argjson now "$(date +%s)" '
+      --arg date "$(date +%F)" --argjson now "$(date +%s)" --argjson detailsQueued "$details_queued" '
       ("main:"+$module) as $topic | {topics:({($topic):{status:$status,summary:$description}} +
         (if $status=="healthy" then {((if $module=="orchestration" then "main" else $module end)+":preflight"):{status:"healthy",summary:$description}} else {} end)),
-       events:(if $status=="healthy" then [] else [{nativeId:($topic+"|"+$status+"|"+$date),module:"main",topic:$topic,
+       events:(if $status=="healthy" or $detailsQueued then [] else [{nativeId:($topic+"|"+$status+"|"+$date),module:"main",topic:$topic,
        eventGroup:($topic+"|"+$date),kind:"attention",importance:(if $status=="failed" then "alert" else "warning" end),
        subject:$description,description:$status,message:$message,epoch:$now}] end)}' >"$work" && mc_accept_records "$work"
 )
@@ -1688,7 +1693,7 @@ umask 077
 # Release version for logs, notifications, and the HTTP User-Agent. State-file
 # version fields below are independent schema versions and must not be changed
 # merely when this release version changes.
-readonly SCRIPT_VERSION="2.12.0"
+readonly SCRIPT_VERSION="2.12.1"
 
 ###############################################################################
 # CONFIGURATION
@@ -2299,7 +2304,7 @@ radarr_action_snapshot() {
 }
 
 current_workflow_error_details() {
-    awk -F ' \| ' -v run="run=$RUN_ID" '
+    awk -F ' [|] ' -v run="run=$RUN_ID" '
       index($0,run) && $2=="ERROR" {reasons[++n]=$5 ": " $6}
       END {start=n>5?n-4:1; for(i=start;i<=n;i++) print "- " reasons[i];
         if(n==0) print "- See the per-application attention entries for this run."}
@@ -3535,9 +3540,9 @@ arr_verification_get() {
     [[ "$http" == 200 || "$http" == 404 ]]
 }
 
-arr_expected_fields_match() {
-    local expected="$1" actual="$2" id="$3" tags_mode="${4:-replace}"
-    jq -e --slurpfile expected "$expected" --argjson id "$id" --arg tagsMode "$tags_mode" '
+arr_expected_fields_match_strict() {
+    local expected="$1" actual="$2" id="$3" tags_mode="${4:-replace}" ignored="${5:-[]}"
+    jq -e --slurpfile expected "$expected" --argjson id "$id" --arg tagsMode "$tags_mode" --argjson ignored "$ignored" '
       $expected[0] as $e
       | type=="object" and .id==$id
       and (if ($e|has("monitored")) then .monitored==$e.monitored else true end)
@@ -3545,13 +3550,51 @@ arr_expected_fields_match() {
           (.tags // []) as $actual
           | if $tagsMode=="add" then all($e.tags[]; . as $tag | ($actual|index($tag))!=null)
             elif $tagsMode=="remove" then all($e.tags[]; . as $tag | ($actual|index($tag))==null)
-            else ($actual|sort)==($e.tags|sort) end
+            else (($actual-$ignored)|sort)==(($e.tags-$ignored)|sort) end
         else true end)
       and (if ($e|has("seasons")) then
           (.seasons // []) as $actual
           | all($e.seasons[]; . as $season | any($actual[]; .seasonNumber==$season.seasonNumber and .monitored==$season.monitored))
         else true end)
     ' "$actual" >/dev/null
+}
+
+# Native auto-tag policies may recalculate unrelated tags during a PUT. Only
+# Sonarr tags proven removable by its current native policy may vary; script
+# lifecycle/exemption labels and all manual tags remain strict. No write/retry.
+arr_load_native_automatic_tags() {
+    local rules catalog ignored scope="${ARR_URL:-}|${APP_CONTEXT:-}"
+    [[ "${APP_CONTEXT:-}" == SONARR ]] || return 1
+    if [[ "${ARR_NATIVE_TAG_SCOPE:-}" == "$scope" ]];then [[ "${ARR_NATIVE_TAG_POLICY_VALID:-false}" == true ]];return;fi
+    ARR_NATIVE_TAG_SCOPE="$scope";ARR_NATIVE_TAG_POLICY_VALID=false;ARR_NATIVE_AUTOMATIC_TAG_IDS='[]'
+    rules=$(mktemp "${VERIFY_RUNTIME_DIR:-$RUNTIME_DIR}/.native-auto-tags.XXXXXX") || return 1
+    catalog=$(mktemp "${VERIFY_RUNTIME_DIR:-$RUNTIME_DIR}/.native-tag-catalog.XXXXXX") || return 1
+    if ! arr_verification_get /api/v3/autotagging "$rules" || [[ "$ARR_VERIFY_HTTP" != 200 ]] ||
+       ! jq -e 'type=="array" and all(.[];(.tags|type)=="array" and all(.tags[];type=="number" and .>0 and .==floor) and (.removeTagsAutomatically|type)=="boolean")' "$rules" >/dev/null ||
+       ! arr_verification_get /api/v3/tag "$catalog" || [[ "$ARR_VERIFY_HTTP" != 200 ]] ||
+       ! jq -e 'type=="array" and all(.[];(.id|type)=="number" and (.label|type)=="string")' "$catalog" >/dev/null;then
+        rm -f -- "$rules" "$catalog";return 1
+    fi
+    ignored=$(jq -c --slurpfile tags "$catalog" \
+      --arg season "${PLEX_DELETED_SEASON_TAG:-plex-deleted-season}" --arg series "${PLEX_DELETED_SERIES_TAG:-plex-deleted-series}" \
+      --arg movie "${PLEX_DELETED_MOVIE_TAG:-plex-deleted}" --arg pending "${SONARR_RETIREMENT_PENDING_TAG:-retirement-pending}" \
+      --arg exempt "${SONARR_RETIREMENT_EXEMPT_TAG:-keep-in-arr}" --arg required "${SONARR_RETIREMENT_REQUIRED_TAG:-retire-series}" '
+      [$season,$series,$movie,$pending,$exempt,$required] as $reserved |
+      [$tags[0][]|select(.label as $label|($reserved|index($label))==null)|.id] as $eligible |
+      [.[]|select(.removeTagsAutomatically==true)|.tags[]|select(. as $id|($eligible|index($id))!=null)]|unique' "$rules") || { rm -f -- "$rules" "$catalog";return 1; }
+    ARR_NATIVE_AUTOMATIC_TAG_IDS="$ignored";ARR_NATIVE_TAG_POLICY_VALID=true
+    rm -f -- "$rules" "$catalog"
+}
+arr_expected_fields_match() {
+    local expected="$1" actual="$2" id="$3" tags_mode="${4:-replace}"
+    ARR_NATIVE_TAG_NOTE=''
+    arr_expected_fields_match_strict "$expected" "$actual" "$id" "$tags_mode" && return 0
+    [[ "$tags_mode" == replace && "${APP_CONTEXT:-}" == SONARR ]] || return 1
+    arr_load_native_automatic_tags || return 1
+    [[ "$ARR_NATIVE_AUTOMATIC_TAG_IDS" != '[]' ]] || return 1
+    arr_expected_fields_match_strict "$expected" "$actual" "$id" "$tags_mode" "$ARR_NATIVE_AUTOMATIC_TAG_IDS" || return 1
+    ARR_NATIVE_TAG_NOTE="Native Sonarr automatic-tag policy owns permitted tag differences (eligible IDs=$ARR_NATIVE_AUTOMATIC_TAG_IDS); manual/lifecycle tags, monitoring and seasons verified strictly"
+    log INFO "$ARR_NATIVE_TAG_NOTE for exact object ID=$id. No mutation replayed."
 }
 
 journal_expected_resource() {
@@ -3635,7 +3678,7 @@ verify_arr_checkpoint() {
         object_id=${endpoint##*/}; [[ "$object_id" =~ ^[1-9][0-9]*$ ]] || return 1
         arr_verification_get "$endpoint" "$actual" || { ARR_VERIFY_REASON="Arr object read-back unavailable"; return 1; }
         if [[ "$ARR_VERIFY_HTTP" != 200 ]] || ! jq -e --argjson id "$object_id" '.id==$id' "$actual" >/dev/null; then ARR_VERIFY_REASON="Arr object identity missing or mismatched"; return 1; fi
-        if arr_expected_fields_match "$expected" "$actual" "$object_id"; then ARR_VERIFY_REASON="Monitoring, seasons and tags verified against exact object ID $object_id"; return 0; fi
+        if arr_expected_fields_match "$expected" "$actual" "$object_id"; then ARR_VERIFY_REASON="Monitoring, seasons and tags verified against exact object ID $object_id${ARR_NATIVE_TAG_NOTE:+; $ARR_NATIVE_TAG_NOTE}"; return 0; fi
         ARR_VERIFY_REASON="Exact object $object_id does not currently match requested monitoring/seasons/tags: $(jq -cr --slurpfile expected "$expected" '
           $expected[0] as $e | . as $a | {
             monitored:(if ($e|has("monitored")) then {expected:$e.monitored,actual:$a.monitored} else null end),
@@ -5303,9 +5346,11 @@ while IFS= read -r SERIES_ID; do
         *)
             ((API_FAILURES += 1))
             log ERROR "Full-series retirement processing failed for $SERIES_TITLE; it will be retried."
-            queue_attention_notification ERROR Sonarr \
-                "$SERIES_TITLE retirement processing failed" \
-                "No retirement removal occurred; the workflow will retry next run."
+            if ! jq -es --arg endpoint "/api/v3/series/$SERIES_ID" 'any(.[];.event=="attention" and .severity=="ERROR" and ((.detail // "")|contains($endpoint)))' "$NOTIFICATION_BATCH" >/dev/null;then
+                queue_attention_notification ERROR Sonarr \
+                    "$SERIES_TITLE retirement processing failed" \
+                    "Retirement processing was not completed. Existing media, successful actions and pending checkpoints were retained; the next run reevaluates current state."
+            fi
             continue
             ;;
     esac
@@ -5760,8 +5805,10 @@ main() {
     log INFO "Combined summary: sonarr-rc=$sonarr_rc, radarr-rc=$radarr_rc."
     if (( sonarr_rc != 0 || radarr_rc != 0 )); then
         log WARNING "Unified Arr delete workflow completed with one or more application failures."
-        queue_attention_notification ERROR MAIN "Application workflow failure" \
-            "Sonarr exit status: ${sonarr_rc}; Radarr exit status: ${radarr_rc}. Successful actions remain committed; only incomplete work is reconsidered next run. No unverified retirement removal is reported as successful."$'\n'"$(current_workflow_error_details)"
+        if ! jq -es 'any(.[];.app!="MAIN" and .event=="attention" and .severity=="ERROR")' "$NOTIFICATION_BATCH" >/dev/null;then
+            queue_attention_notification ERROR MAIN "Application workflow failure" \
+                "Sonarr exit status: ${sonarr_rc}; Radarr exit status: ${radarr_rc}. Successful actions remain committed; only incomplete work is reconsidered next run. No unverified retirement removal is reported as successful."$'\n'"$(current_workflow_error_details)"
+        fi
     fi
 
     send_grouped_notification || {

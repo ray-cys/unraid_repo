@@ -42,8 +42,8 @@
       "sha256": "7f0256c4a4a16d307f6a1956c6427be40aa81220a7103f319d099b649c962bea"
     },
     "media_cleanup": {
-      "version": "1.11.1",
-      "sha256": "31374aa53d938e3e01dd180940d273a650f0311037338809d76277c949e223c3"
+      "version": "1.11.2",
+      "sha256": "baab0b51d46d1f5c024f51afb36514a5d89f8a01356479da7cfb1ff38f3953d6"
     },
     "media_health_monitor": {
       "version": "3.29.1",
